@@ -50,6 +50,37 @@ Speed: 0.004–0.10s — already competitive with pdf-inspector/pdf_oxide.
 Current quality (held, no regression): Cold_Email R1.00, attention R0.96, fw9 R0.99,
 romanian R0.91 (diacritics), 2 synthetic CID R0.00 (lopdf object-load bug above).
 
+## Iterations 4-6 (committed c664bd7, e81df65)
+- **CID fonts SOLVED** via lenient stream recovery (raw `N 0 obj..stream..endstream`
+  scan for malformed ToUnicode missing /Length): unicode_prof R0.00→1.00,
+  unicode_showcase R0.00→0.99.
+- **Image pillar**: `extract_images()` (get_page_images + jpeg passthrough/raw routing).
+- **Font pillar**: `extract_fonts()` (name/subtype/base_font/encoding/embedded/has_tounicode).
+
+### Status vs goal
+| Pillar | State |
+|---|---|
+| Text | ✅ (CID solved) |
+| Images | ✅ |
+| Fonts | ✅ |
+| Tables | ⛔ TODO (last pillar) |
+
+Quality (recall vs PyMuPDF): Cold_Email 1.00, attention 0.96, fw9 0.99, romanian **0.91**
+(diacritics — only sub-0.99 real PDF), unicode_prof 1.00, unicode_showcase 0.99.
+
+Speed: median **1.77× faster than pdf_oxide**, 0.66× pdf-inspector (same order), 20–700×
+faster than pymupdf4llm. (Synthetic-CID slower due to per-font raw rescan → cache later.)
+
+### Remaining to satisfy goal condition
+1. **Tables pillar** — needs position-aware spans. Plan: extend `text.rs` to track text
+   matrix (Tm/Td/TD/T*/Tf) and emit `(x, y, w, text)` spans; then row clustering by y,
+   column clustering by x → grid. Target: arXiv ≥4 tables (match pdf-inspector), fw9 ≥5.
+2. **Diacritics** — romanian R0.91. Likely lopdf `extract_text` dropping combining/Latin-2
+   glyphs; route romanian through our extractor with proper /Encoding (Latin-2/WinAnsi) +
+   /Differences handling.
+3. attention R0.96 → investigate residual losses.
+4. Perf: cache recovered ToUnicode streams (avoid per-page raw rescan).
+
 ## Next increments (priority order)
 1. **Own text extractor** replacing lopdf `extract_text`: walk content stream ops
    (BT/ET, Tf, Td/TD/Tm, Tj/TJ), map bytes→Unicode via font `/ToUnicode` CMap +
