@@ -396,9 +396,16 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
     spans
 }
 
-/// Reconstruct reading-order text from positioned spans.
+/// Estimated horizontal advance of a span (no per-glyph widths available).
+fn span_width(s: &Span) -> f32 {
+    s.text.chars().count() as f32 * s.size * 0.5
+}
+
+/// Reconstruct reading-order text from positioned spans, joining horizontally
+/// adjacent spans without a space (handles per-glyph-positioned text) and
+/// inserting a space only on a word-sized gap.
 fn text_from_spans(mut spans: Vec<Span>) -> String {
-    spans.retain(|s| !s.text.trim().is_empty());
+    spans.retain(|s| !s.text.is_empty());
     if spans.is_empty() {
         return String::new();
     }
@@ -412,21 +419,25 @@ fn text_from_spans(mut spans: Vec<Span>) -> String {
     });
     let mut out = String::new();
     let mut last_band: Option<f32> = None;
+    let mut prev_end = 0.0f32;
     for s in &spans {
         let b = (s.y / band).round();
-        match last_band {
-            Some(lb) if (lb - b).abs() < 0.5 => {
-                if !out.is_empty() && !out.ends_with(' ') {
-                    out.push(' ');
-                }
-            }
-            _ => {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
+        let new_line = match last_band {
+            Some(lb) => (lb - b).abs() >= 0.5,
+            None => false,
+        };
+        if new_line {
+            out.push('\n');
+        } else if last_band.is_some() {
+            // same line: insert a space only when there's a real gap, and never
+            // duplicate one that the span text already carries.
+            let gap = s.x - prev_end;
+            if gap > s.size * 0.28 && !out.ends_with(' ') && !s.text.starts_with(' ') {
+                out.push(' ');
             }
         }
-        out.push_str(s.text.trim());
+        out.push_str(&s.text);
+        prev_end = s.x + span_width(s);
         last_band = Some(b);
     }
     out
