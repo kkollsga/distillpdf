@@ -118,6 +118,26 @@ faster than pymupdf4llm. (Synthetic-CID slower due to per-font raw rescan → ca
   content completeness; emitting the correct ț (more correct than pymupdf) will read as
   a mismatch unless folded. Target ≥0.99 on folded recall; document raw vs folded.
 
+## Current production quality (prefer-mine hybrid, commit 565689c)
+Cold_Email R0.999 · attention R0.973 · fw9 R0.994 · romanian R0.936 ·
+unicode_prof R1.000 · unicode_showcase R0.992. CID solved; speed competitive.
+
+## The genuine wall to ≥0.99 on ALL files (evidence-backed)
+- romanian (0.936): remaining misses are words with **ț/ș glyphs encoded ONLY in the
+  embedded Type1 font program's built-in encoding** — NOT in PDF /ToUnicode or
+  /Differences. Confirmed: folding ț→t changes recall by <0.001 (so it's real loss, not
+  representation), and the glyphs cause word SPLITS ("funcțional" → "func"+"ional").
+  Recovering them needs an **embedded Type1/CFF font-program decoder** (eexec decrypt +
+  charstring/encoding parse) — the "font moat" (pdf_oxide's ~17k-LOC glyph machinery).
+- attention (0.973): residual is finer spacing + 2-column reading-order merges
+  (e.g. "5we", "proc"/"process"); needs column-aware ordering + per-glyph spacing polish.
+- Both are partly capped by the pymupdf reference's own lossiness on these glyphs.
+
+## DECISION POINT (raised to user)
+Reaching literal ≥0.99-on-every-file requires the embedded font-program decoder — a large
+feature (the thing estimated as person-months at project start). Options: (a) build it,
+(b) accept v1 (all 4 pillars, CID solved, real-world 0.94–1.0, competitive), (c) adjust bar.
+
 ## Next increments (priority order)
 1. **Own text extractor** replacing lopdf `extract_text`: walk content stream ops
    (BT/ET, Tf, Td/TD/Tm, Tj/TJ), map bytes→Unicode via font `/ToUnicode` CMap +
