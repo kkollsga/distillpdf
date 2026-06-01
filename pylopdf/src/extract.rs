@@ -74,9 +74,10 @@ fn rows_of(mut spans: Vec<Span>) -> Vec<Vec<Span>> {
     rows
 }
 
-/// A merged cell: text plus its left x-edge.
+/// A merged cell: text, its left x-edge, and current right edge.
 struct Cell {
     x: f32,
+    end: f32,
     text: String,
 }
 
@@ -89,21 +90,18 @@ fn row_cells(row: &[Span]) -> Vec<Cell> {
         if txt.is_empty() {
             continue;
         }
+        let w = if s.width > 0.1 { s.width } else { txt.chars().count() as f32 * s.size * 0.5 };
         match cells.last_mut() {
             // gap small relative to font size -> same cell (continuous text)
-            Some(prev) if s.x - (prev.x + prev_end_offset(prev, s.size)) < s.size * 1.3 => {
+            Some(prev) if s.x - prev.end < s.size * 1.3 => {
                 prev.text.push(' ');
                 prev.text.push_str(txt);
+                prev.end = s.x + w;
             }
-            _ => cells.push(Cell { x: s.x, text: txt.to_string() }),
+            _ => cells.push(Cell { x: s.x, end: s.x + w, text: txt.to_string() }),
         }
     }
     cells
-}
-
-/// Approx right edge of an already-merged cell.
-fn prev_end_offset(c: &Cell, size: f32) -> f32 {
-    c.text.chars().count() as f32 * size * 0.5
 }
 
 /// Cluster cell x-positions into column anchors.
@@ -140,7 +138,7 @@ fn detect_tables(spans: Vec<Span>) -> Vec<Vec<Vec<String>>> {
         }
         let rows_ref: Vec<Vec<Cell>> = run
             .iter()
-            .map(|r| r.iter().map(|c| Cell { x: c.x, text: c.text.clone() }).collect())
+            .map(|r| r.iter().map(|c| Cell { x: c.x, end: c.end, text: c.text.clone() }).collect())
             .collect();
         let cols = columns(&rows_ref, tol);
         if cols.len() < 2 {

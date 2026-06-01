@@ -11,6 +11,17 @@ use std::collections::HashMap;
 struct FontInfo {
     two_byte: bool,
     to_unicode: Option<HashMap<u32, String>>,
+    /// Glyph advance widths in 1000-em units, keyed by code/CID.
+    widths: HashMap<u32, f32>,
+    default_width: f32,
+}
+
+fn obj_i64(o: &Object) -> Option<i64> {
+    match o {
+        Object::Integer(i) => Some(*i),
+        Object::Real(r) => Some(*r as i64),
+        _ => None,
+    }
 }
 
 /// Find the first occurrence of `needle` in `hay` starting at `from`.
@@ -79,9 +90,83 @@ fn build_fonts(doc: &Document, page_id: ObjectId, raw: &[u8]) -> HashMap<Vec<u8>
                 let bytes = from_lopdf.or_else(|| recover_stream(raw, r.0))?;
                 Some(parse_tounicode(&bytes))
             });
-        out.insert(name, FontInfo { two_byte, to_unicode });
+
+        // Glyph widths.
+        let mut widths = HashMap::new();
+        let mut default_width = if two_byte { 1000.0 } else { 500.0 };
+        if two_byte {
+            // Type0: widths live on the descendant CIDFont (/DW default, /W array).
+            if let Some(desc) = dict
+                .get(b"DescendantFonts")
+                .ok()
+                .and_then(|o| deref(doc, o))
+                .and_then(|o| o.as_array().ok())
+                .and_then(|a| a.first())
+                .and_then(|o| deref(doc, o))
+                .and_then(|o| o.as_dict().ok())
+            {
+                if let Some(dw) = desc.get(b"DW").ok().and_then(obj_i64) {
+                    default_width = dw as f32;
+                }
+                if let Some(w) = desc.get(b"W").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_array().ok()) {
+                    parse_cid_widths(w, &mut widths);
+                }
+            }
+        } else if let (Some(first), Some(ws)) = (
+            dict.get(b"FirstChar").ok().and_then(obj_i64),
+            dict.get(b"Widths").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_array().ok()),
+        ) {
+            for (i, w) in ws.iter().enumerate() {
+                if let Some(wd) = obj_i64(w) {
+                    widths.insert(first as u32 + i as u32, wd as f32);
+                }
+            }
+        }
+
+        out.insert(name, FontInfo { two_byte, to_unicode, widths, default_width });
     }
     out
+}
+
+/// Dereference an object that may be an indirect reference.
+fn deref<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Object> {
+    match o {
+        Object::Reference(r) => doc.get_object(*r).ok(),
+        other => Some(other),
+    }
+}
+
+/// Parse a Type0 /W array: `[ c [w...] ]` and `[ c1 c2 w ]` forms.
+fn parse_cid_widths(w: &[Object], widths: &mut HashMap<u32, f32>) {
+    let mut i = 0;
+    while i < w.len() {
+        let c1 = match obj_i64(&w[i]) {
+            Some(v) => v as u32,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        match w.get(i + 1) {
+            Some(Object::Array(list)) => {
+                for (k, wd) in list.iter().enumerate() {
+                    if let Some(v) = obj_i64(wd) {
+                        widths.insert(c1 + k as u32, v as f32);
+                    }
+                }
+                i += 2;
+            }
+            Some(o2) => {
+                let c2 = obj_i64(o2).unwrap_or(c1 as i64) as u32;
+                let wd = w.get(i + 2).and_then(obj_i64).unwrap_or(1000) as f32;
+                for c in c1..=c2 {
+                    widths.insert(c, wd);
+                }
+                i += 3;
+            }
+            None => break,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -221,7 +306,10 @@ fn push_norm(out: &mut String, ch: char) {
     }
 }
 
-fn decode_string(bytes: &[u8], font: Option<&FontInfo>, out: &mut String) {
+/// Decode a show-string into `out` and return the horizontal advance in points
+/// (font widths applied at `size`).
+fn decode_string(bytes: &[u8], font: Option<&FontInfo>, size: f32, out: &mut String) -> f32 {
+    let mut adv = 0.0f32;
     match font {
         Some(fi) => {
             let step = if fi.two_byte { 2 } else { 1 };
@@ -236,25 +324,27 @@ fn decode_string(bytes: &[u8], font: Option<&FontInfo>, out: &mut String) {
                                 push_norm(out, ch);
                             }
                         }
-                        // unmapped code with a ToUnicode present: skip (likely notdef)
                     }
                     None if !fi.two_byte => push_norm(out, bytes[i] as char),
                     None => {
-                        // 2-byte font, no ToUnicode: last-resort Identity decode.
                         if let Some(ch) = char::from_u32(code) {
                             push_norm(out, ch);
                         }
                     }
                 }
+                let w = fi.widths.get(&code).copied().unwrap_or(fi.default_width);
+                adv += w / 1000.0 * size;
                 i += step;
             }
         }
         None => {
             for &b in bytes {
                 push_norm(out, b as char);
+                adv += 0.5 * size;
             }
         }
     }
+    adv
 }
 
 /// 2x3 affine matrix (PDF row-vector convention): [a b c d e f].
@@ -289,6 +379,7 @@ pub struct Span {
     pub x: f32,
     pub y: f32,
     pub size: f32,
+    pub width: f32,
     pub text: String,
 }
 
@@ -314,9 +405,15 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
     let mut size = 0.0f32;
     let mut cur: Option<&FontInfo> = None;
 
-    let mut emit = |tm: &Mat, size: f32, s: String| {
+    let mut emit = |tm: &Mat, size: f32, width: f32, s: String| {
         if !s.is_empty() {
-            spans.push(Span { x: tm.e, y: tm.f, size: size.abs().max(1.0), text: s });
+            spans.push(Span {
+                x: tm.e,
+                y: tm.f,
+                size: size.abs().max(1.0),
+                width: width.abs(),
+                text: s,
+            });
         }
     };
 
@@ -363,8 +460,8 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
             "Tj" => {
                 if let Some(Object::String(s, _)) = o.first() {
                     let mut t = String::new();
-                    decode_string(s, cur, &mut t);
-                    emit(&tm, size * tm.d, t);
+                    let w = decode_string(s, cur, size, &mut t);
+                    emit(&tm, size * tm.d, w, t);
                 }
             }
             "'" | "\"" => {
@@ -372,22 +469,34 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
                 tm = tlm;
                 if let Some(Object::String(s, _)) = o.last() {
                     let mut t = String::new();
-                    decode_string(s, cur, &mut t);
-                    emit(&tm, size * tm.d, t);
+                    let w = decode_string(s, cur, size, &mut t);
+                    emit(&tm, size * tm.d, w, t);
                 }
             }
             "TJ" => {
                 if let Some(Object::Array(arr)) = o.first() {
                     let mut t = String::new();
+                    let mut w = 0.0f32;
                     for el in arr {
                         match el {
-                            Object::String(s, _) => decode_string(s, cur, &mut t),
-                            Object::Integer(n) if *n < -150 => t.push(' '),
-                            Object::Real(r) if *r < -150.0 => t.push(' '),
+                            Object::String(s, _) => w += decode_string(s, cur, size, &mut t),
+                            // numeric kern: subtract advance (units/1000 * size).
+                            Object::Integer(n) => {
+                                w -= *n as f32 / 1000.0 * size;
+                                if *n < -150 {
+                                    t.push(' ');
+                                }
+                            }
+                            Object::Real(r) => {
+                                w -= *r / 1000.0 * size;
+                                if *r < -150.0 {
+                                    t.push(' ');
+                                }
+                            }
                             _ => {}
                         }
                     }
-                    emit(&tm, size * tm.d, t);
+                    emit(&tm, size * tm.d, w, t);
                 }
             }
             _ => {}
@@ -396,9 +505,13 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
     spans
 }
 
-/// Estimated horizontal advance of a span (no per-glyph widths available).
+/// Effective span width (fall back to a char estimate if widths were absent).
 fn span_width(s: &Span) -> f32 {
-    s.text.chars().count() as f32 * s.size * 0.5
+    if s.width > 0.1 {
+        s.width
+    } else {
+        s.text.chars().count() as f32 * s.size * 0.5
+    }
 }
 
 /// Reconstruct reading-order text from positioned spans, joining horizontally

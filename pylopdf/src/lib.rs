@@ -54,14 +54,14 @@ impl Pdf {
         let pages = self.doc.get_pages();
         let mut out = String::new();
         for (&p, &page_id) in &pages {
-            // lopdf's mature extractor is the default. Our ToUnicode extractor is
-            // a *rescue* only when lopdf recovers nothing (the CID-font case), so
-            // simple-encoded PDFs can never regress.
-            let lopdf = self.doc.extract_text(&[p]).unwrap_or_default();
-            if lopdf.trim().chars().count() >= 2 {
-                out.push_str(&lopdf);
+            // Our position+width-aware extractor is primary (handles CID fonts,
+            // accurate word boundaries, reading order). Fall back to lopdf only if
+            // ours recovers nothing on a page.
+            let mine = text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default();
+            if mine.trim().chars().count() >= 2 {
+                out.push_str(&mine);
             } else {
-                out.push_str(&text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default());
+                out.push_str(&self.doc.extract_text(&[p]).unwrap_or_default());
             }
             out.push('\n');
         }
@@ -110,11 +110,11 @@ impl Pdf {
             .get_pages()
             .get(&page)
             .ok_or_else(|| PyValueError::new_err(format!("no page {page}")))?;
-        let lopdf = self.doc.extract_text(&[page]).unwrap_or_default();
-        Ok(if lopdf.trim().chars().count() >= 2 {
-            lopdf
+        let mine = text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default();
+        Ok(if mine.trim().chars().count() >= 2 {
+            mine
         } else {
-            text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default()
+            self.doc.extract_text(&[page]).unwrap_or_default()
         })
     }
 }
