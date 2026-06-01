@@ -2,15 +2,15 @@
   "Cold_Email_Hacks": {
     "file": "Cold_Email_Hacks.pdf",
     "bytes": 929918,
-    "t_text_s": 0.1078,
+    "t_text_s": 0.1074,
     "pages": 44,
-    "chars": 94401,
+    "chars": 94395,
     "ok": true
   },
   "attention_1706.03762": {
     "file": "attention_1706.03762.pdf",
     "bytes": 2215244,
-    "t_text_s": 0.048,
+    "t_text_s": 0.0468,
     "pages": 15,
     "chars": 38727,
     "ok": true
@@ -18,7 +18,7 @@
   "fw9_form": {
     "file": "fw9_form.pdf",
     "bytes": 140815,
-    "t_text_s": 0.0036,
+    "t_text_s": 0.0038,
     "pages": 6,
     "chars": 37556,
     "ok": true
@@ -34,17 +34,17 @@
   "unicode_professional_demo": {
     "file": "unicode_professional_demo.pdf",
     "bytes": 108143,
-    "t_text_s": 0.0042,
+    "t_text_s": 0.0039,
     "pages": 1,
-    "chars": 2969,
+    "chars": 2824,
     "ok": true
   },
   "unicode_showcase": {
     "file": "unicode_showcase.pdf",
     "bytes": 308736,
-    "t_text_s": 0.0198,
+    "t_text_s": 0.0193,
     "pages": 5,
-    "chars": 5637,
+    "chars": 5342,
     "ok": true
   }
 }

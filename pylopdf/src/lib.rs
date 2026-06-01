@@ -78,6 +78,16 @@ impl Pdf {
         extract::extract_fonts(py, &self.doc)
     }
 
+    /// Diagnostic: force our ToUnicode extractor for all pages (eval only).
+    fn _mine_text(&self) -> PyResult<String> {
+        let mut out = String::new();
+        for (_p, &page_id) in &self.doc.get_pages() {
+            out.push_str(&text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default());
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
     /// Diagnostic for one 1-indexed page.
     fn debug_page(&self, page: u32) -> PyResult<String> {
         let page_id = *self

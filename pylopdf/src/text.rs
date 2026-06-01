@@ -211,6 +211,16 @@ fn parse_tounicode(data: &[u8]) -> HashMap<u32, String> {
     map
 }
 
+/// Normalise a decoded char: map zero-width spaces to a real space, drop other
+/// zero-width / BOM noise that pollutes word boundaries.
+fn push_norm(out: &mut String, ch: char) {
+    match ch {
+        '\u{200B}' | '\u{00A0}' | '\u{2009}' | '\u{202F}' => out.push(' '),
+        '\u{FEFF}' | '\u{200C}' | '\u{200D}' | '\0' => {}
+        c => out.push(c),
+    }
+}
+
 fn decode_string(bytes: &[u8], font: Option<&FontInfo>, out: &mut String) {
     match font {
         Some(fi) => {
@@ -222,21 +232,17 @@ fn decode_string(bytes: &[u8], font: Option<&FontInfo>, out: &mut String) {
                 match &fi.to_unicode {
                     Some(map) => {
                         if let Some(s) = map.get(&code) {
-                            out.push_str(s);
+                            for ch in s.chars() {
+                                push_norm(out, ch);
+                            }
                         }
                         // unmapped code with a ToUnicode present: skip (likely notdef)
                     }
-                    None if !fi.two_byte => {
-                        // simple font, no ToUnicode: best-effort latin1
-                        out.push(bytes[i] as char);
-                    }
+                    None if !fi.two_byte => push_norm(out, bytes[i] as char),
                     None => {
-                        // 2-byte font, no ToUnicode: last-resort Identity decode
-                        // (Identity-H CIDs often equal Unicode code points).
+                        // 2-byte font, no ToUnicode: last-resort Identity decode.
                         if let Some(ch) = char::from_u32(code) {
-                            if ch != '\0' {
-                                out.push(ch);
-                            }
+                            push_norm(out, ch);
                         }
                     }
                 }
@@ -245,10 +251,185 @@ fn decode_string(bytes: &[u8], font: Option<&FontInfo>, out: &mut String) {
         }
         None => {
             for &b in bytes {
-                out.push(b as char);
+                push_norm(out, b as char);
             }
         }
     }
+}
+
+/// 2x3 affine matrix (PDF row-vector convention): [a b c d e f].
+#[derive(Clone, Copy)]
+struct Mat {
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    e: f32,
+    f: f32,
+}
+impl Mat {
+    const ID: Mat = Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
+    fn mul(self, r: Mat) -> Mat {
+        Mat {
+            a: self.a * r.a + self.b * r.c,
+            b: self.a * r.b + self.b * r.d,
+            c: self.c * r.a + self.d * r.c,
+            d: self.c * r.b + self.d * r.d,
+            e: self.e * r.a + self.f * r.c + r.e,
+            f: self.e * r.b + self.f * r.d + r.f,
+        }
+    }
+    fn translate(tx: f32, ty: f32) -> Mat {
+        Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: tx, f: ty }
+    }
+}
+
+/// A positioned run of text (origin in PDF user space, y increases upward).
+pub struct Span {
+    pub x: f32,
+    pub y: f32,
+    pub size: f32,
+    pub text: String,
+}
+
+fn num(o: &Object) -> f32 {
+    match o {
+        Object::Integer(i) => *i as f32,
+        Object::Real(r) => *r,
+        _ => 0.0,
+    }
+}
+
+/// Extract positioned text spans for one page via content-stream interpretation.
+pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span> {
+    let content = match doc.get_and_decode_page_content(page_id) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let fonts = build_fonts(doc, page_id, raw);
+    let mut spans = Vec::new();
+    let mut tm = Mat::ID;
+    let mut tlm = Mat::ID;
+    let mut leading = 0.0f32;
+    let mut size = 0.0f32;
+    let mut cur: Option<&FontInfo> = None;
+
+    let mut emit = |tm: &Mat, size: f32, s: String| {
+        if !s.is_empty() {
+            spans.push(Span { x: tm.e, y: tm.f, size: size.abs().max(1.0), text: s });
+        }
+    };
+
+    for op in &content.operations {
+        let o = &op.operands;
+        match op.operator.as_str() {
+            "BT" => {
+                tm = Mat::ID;
+                tlm = Mat::ID;
+            }
+            "Tf" => {
+                if let Some(Object::Name(n)) = o.first() {
+                    cur = fonts.get(n);
+                }
+                if let Some(s) = o.get(1) {
+                    size = num(s);
+                }
+            }
+            "Td" if o.len() >= 2 => {
+                tlm = Mat::translate(num(&o[0]), num(&o[1])).mul(tlm);
+                tm = tlm;
+            }
+            "TD" if o.len() >= 2 => {
+                leading = -num(&o[1]);
+                tlm = Mat::translate(num(&o[0]), num(&o[1])).mul(tlm);
+                tm = tlm;
+            }
+            "Tm" if o.len() >= 6 => {
+                tlm = Mat {
+                    a: num(&o[0]),
+                    b: num(&o[1]),
+                    c: num(&o[2]),
+                    d: num(&o[3]),
+                    e: num(&o[4]),
+                    f: num(&o[5]),
+                };
+                tm = tlm;
+            }
+            "TL" if !o.is_empty() => leading = num(&o[0]),
+            "T*" => {
+                tlm = Mat::translate(0.0, -leading).mul(tlm);
+                tm = tlm;
+            }
+            "Tj" => {
+                if let Some(Object::String(s, _)) = o.first() {
+                    let mut t = String::new();
+                    decode_string(s, cur, &mut t);
+                    emit(&tm, size * tm.d, t);
+                }
+            }
+            "'" | "\"" => {
+                tlm = Mat::translate(0.0, -leading).mul(tlm);
+                tm = tlm;
+                if let Some(Object::String(s, _)) = o.last() {
+                    let mut t = String::new();
+                    decode_string(s, cur, &mut t);
+                    emit(&tm, size * tm.d, t);
+                }
+            }
+            "TJ" => {
+                if let Some(Object::Array(arr)) = o.first() {
+                    let mut t = String::new();
+                    for el in arr {
+                        match el {
+                            Object::String(s, _) => decode_string(s, cur, &mut t),
+                            Object::Integer(n) if *n < -150 => t.push(' '),
+                            Object::Real(r) if *r < -150.0 => t.push(' '),
+                            _ => {}
+                        }
+                    }
+                    emit(&tm, size * tm.d, t);
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
+}
+
+/// Reconstruct reading-order text from positioned spans.
+fn text_from_spans(mut spans: Vec<Span>) -> String {
+    spans.retain(|s| !s.text.trim().is_empty());
+    if spans.is_empty() {
+        return String::new();
+    }
+    let band = (spans.iter().map(|s| s.size).sum::<f32>() / spans.len() as f32 * 0.6).max(2.0);
+    spans.sort_by(|p, q| {
+        let bp = (p.y / band).round();
+        let bq = (q.y / band).round();
+        bq.partial_cmp(&bp)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(p.x.partial_cmp(&q.x).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let mut out = String::new();
+    let mut last_band: Option<f32> = None;
+    for s in &spans {
+        let b = (s.y / band).round();
+        match last_band {
+            Some(lb) if (lb - b).abs() < 0.5 => {
+                if !out.is_empty() && !out.ends_with(' ') {
+                    out.push(' ');
+                }
+            }
+            _ => {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+            }
+        }
+        out.push_str(s.text.trim());
+        last_band = Some(b);
+    }
+    out
 }
 
 /// Diagnostic: report font table + content status for one page.
@@ -308,46 +489,9 @@ pub fn debug_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> String {
     s
 }
 
-/// Extract text for one page via content-stream interpretation + ToUnicode.
+/// Extract text for one page via positioned spans + reading-order reconstruction.
 /// Returns None if the page content cannot be decoded.
 pub fn extract_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Option<String> {
-    let content = doc.get_and_decode_page_content(page_id).ok()?;
-    let fonts = build_fonts(doc, page_id, raw);
-    let mut out = String::new();
-    let mut cur: Option<&FontInfo> = None;
-    for op in &content.operations {
-        match op.operator.as_str() {
-            "Tf" => {
-                if let Some(Object::Name(n)) = op.operands.first() {
-                    cur = fonts.get(n);
-                }
-            }
-            "Tj" => {
-                if let Some(Object::String(s, _)) = op.operands.first() {
-                    decode_string(s, cur, &mut out);
-                }
-            }
-            "'" | "\"" => {
-                out.push('\n');
-                if let Some(Object::String(s, _)) = op.operands.last() {
-                    decode_string(s, cur, &mut out);
-                }
-            }
-            "TJ" => {
-                if let Some(Object::Array(arr)) = op.operands.first() {
-                    for el in arr {
-                        match el {
-                            Object::String(s, _) => decode_string(s, cur, &mut out),
-                            Object::Integer(n) if *n < -100 => out.push(' '),
-                            Object::Real(r) if *r < -100.0 => out.push(' '),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            "Td" | "TD" | "T*" | "ET" => out.push('\n'),
-            _ => {}
-        }
-    }
-    Some(out)
+    let spans = extract_spans(doc, page_id, raw);
+    Some(text_from_spans(spans))
 }
