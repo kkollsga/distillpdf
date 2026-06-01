@@ -81,6 +81,27 @@ faster than pymupdf4llm. (Synthetic-CID slower due to per-font raw rescan → ca
 3. attention R0.96 → investigate residual losses.
 4. Perf: cache recovered ToUnicode streams (avoid per-page raw rescan).
 
+## Iterations 7-8 (committed 844e619 + pending)
+- **Position-aware span extractor** (text-matrix tracking) → reading-order text +
+  foundation for tables. Rescue-path recall up (attention .905→.960).
+- **Tables pillar DONE**: `extract_tables()` — span rows → gap-merged cells → column
+  clustering with majority-occupancy filter. Detects real tables on correct pages
+  (attention [5,6,8,9,10] vs pdf-inspector [5,8,10]; Cold_Email [5,19] exact match).
+  Same order of magnitude as peers; some over-segmentation remains (tunable).
+
+### ALL 4 PILLARS PRESENT: text ✅ images ✅ fonts ✅ tables ✅
+
+### Only remaining gap: recall ≥0.99 incl diacritics
+- romanian R0.91, attention R0.96 — both blocked by the SAME issue: glyphs encoded via
+  `/Encoding /Differences` + glyph names (e.g. romanian ț/ș, math symbols) that have NO
+  ToUnicode entry. lopdf DROPS them; pymupdf recovers via glyph-name→Unicode (AGL).
+- **Fix needed:** when ToUnicode lacks a code, fall back to the font's `/Encoding
+  /Differences` array → Adobe Glyph List (AGL) → Unicode. Requires bundling an AGL map
+  + parsing Differences. This is the last substantive font feature (what pdf_oxide's
+  glyph_names.rs / pdf-inspector's glyph_names.rs do).
+- Note: our span extractor (mine) already ~matches lopdf on these; the ceiling is the
+  missing glyph-name decode, not reconstruction.
+
 ## Next increments (priority order)
 1. **Own text extractor** replacing lopdf `extract_text`: walk content stream ops
    (BT/ET, Tf, Td/TD/Tm, Tj/TJ), map bytes→Unicode via font `/ToUnicode` CMap +

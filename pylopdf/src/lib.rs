@@ -78,6 +78,11 @@ impl Pdf {
         extract::extract_fonts(py, &self.doc)
     }
 
+    /// Extract tables from all pages (list of dicts with cell grids).
+    fn extract_tables<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        extract::extract_tables(py, &self.doc, &self.raw)
+    }
+
     /// Diagnostic: force our ToUnicode extractor for all pages (eval only).
     fn _mine_text(&self) -> PyResult<String> {
         let mut out = String::new();
