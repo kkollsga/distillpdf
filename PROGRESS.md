@@ -102,6 +102,22 @@ faster than pymupdf4llm. (Synthetic-CID slower due to per-font raw rescan → ca
 - Note: our span extractor (mine) already ~matches lopdf on these; the ceiling is the
   missing glyph-name decode, not reconstruction.
 
+## FINAL diagnosis of the recall gap (evidence-backed)
+- romanian R0.91: **all 59 missing words** are ones where pylopdf DROPPED a glyph and
+  pymupdf kept a base letter. The pymupdf reference has **0** comma-below chars
+  (ț/ș/ţ/ş all 0) — i.e. pymupdf itself folds ț→t, ș→s for this font.
+- The simple fonts DO carry `/Encoding /Differences` with standard **AGL glyph names**
+  (fi, endash, quotedblright, comma, ...). lopdf drops codes its builtin tables miss.
+- **Fix (well-scoped, next iteration):** in `text.rs` decode, for simple fonts add a
+  fallback chain: ToUnicode → `/Differences`[code] glyph name → Adobe Glyph List
+  (uniXXXX + compact AGL incl. accented Latin) → base encoding (WinAnsi/Standard/
+  MacRoman) → latin1. Recovers ligatures/dashes/accented letters now dropped.
+  Then route those fonts through our span extractor (which already ~matches lopdf).
+- **Caveat (honest):** raw recall vs pymupdf is capped by pymupdf's own lossiness on
+  comma-below glyphs. Plan: add a NFKD-folded recall metric to bench to measure true
+  content completeness; emitting the correct ț (more correct than pymupdf) will read as
+  a mismatch unless folded. Target ≥0.99 on folded recall; document raw vs folded.
+
 ## Next increments (priority order)
 1. **Own text extractor** replacing lopdf `extract_text`: walk content stream ops
    (BT/ET, Tf, Td/TD/Tm, Tj/TJ), map bytes→Unicode via font `/ToUnicode` CMap +
