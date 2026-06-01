@@ -1,0 +1,20 @@
+[package]
+name = "pylopdf"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Pure-Rust PyMuPDF-style PDF extraction (text/tables/images/fonts) on lopdf, for Python"
+
+[lib]
+name = "pylopdf"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py38"] }
+lopdf = "0.36"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true

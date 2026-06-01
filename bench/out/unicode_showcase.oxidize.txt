@@ -1,0 +1,86 @@
+ I n t e r n a t i o n a l L a n g u a g e S u p p o r t I n t e r n a t i o n a l L a n g u a g e S u p p o r t
+���� E u r o p e a n :���� E u r o p e a n :
+ E n g l i s h : T h e q u i c k b r o w n f o x j u m p s o v e r t h e l a z y d o g E n g l i s h : T h e q u i c k b r o w n f o x j u m p s o v e r t h e l a z y d o g
+ E s p a � o l : E l v e l o z m u r c i � l a g o h i n d � c o m � a f e l i z c a r d i l l o y k i w i E s p a � o l : E l v e l o z m u r c i � l a g o h i n d � c o m � a f e l i z c a r d i l l o y k i w i
+ F r a n � a i s : P o r t e z c e v i e u x w h i s k y a u j u g e b l o n d q u i f u m e F r a n � a i s : P o r t e z c e v i e u x w h i s k y a u j u g e b l o n d q u i f u m e
+ D e u t s c h : V i c t o r j a g t z w � l f B o x k � m p f e r q u e r � b e r d e n S y l t e r D e i c h D e u t s c h : V i c t o r j a g t z w � l f B o x k � m p f e r q u e r � b e r d e n S y l t e r D e i c h
+ I t a l i a n o : Q u e l v i t u p e r a b i l e x e n o f o b o z e l a n t e a s s a g g i a i l w h i s k y e d e s c l a m a : a l l e l u j a ! I t a l i a n o : Q u e l v i t u p e r a b i l e x e n o f o b o z e l a n t e a s s a g g i a i l w h i s k y e d e s c l a m a : a l l e l u j a !
+ P o r t u g u � s : L u � s a r g � i a � J � l i a q u e � b r a � � e s , f � , c h � , � x i d o , p � r , z � n g � o � P o r t u g u � s : L u � s a r g � i a � J � l i a q u e � b r a � � e s , f � , c h � , � x i d o , p � r , z � n g � o �
+ P o l s k i : P c h n w t B � dz j e| a l u b o[ m s k r z yD f i g P o l s k i : P c h n w t B � dz j e| a l u b o[ m s k r z yD f i g
+ e s k � : PY � l ia ~ l ue o u k � koH � p l � b e l s k � � d y e s k � : PY � l ia ~ l ue o u k � koH � p l � b e l s k � � d y
+���� C y r i l l i c :���� C y r i l l i c :
+ CAA:89 : !J5HL 65 5IQ MB8E <O3:8E D@0=FC7A:8E 1C;>: 40 2K?59 G0N CAA:89 : !J5HL 65 5IQ MB8E <O3:8E D@0=FC7A:8E 1C;>: 40 2K?59 G0N
+ #:@0W=AL:0 : 'CTH WE , 4>FN , 30 ? C<54=0 6 B8 , ?@>I09AO 157 �>;LDV2 ! #:@0W=AL:0 : 'CTH WE , 4>FN , 30 ? C<54=0 6 B8 , ?@>I09AO 157 �>;LDV2 !
+���� G r e e k :���� G r e e k :
+ �������� : ��������� �t� ��������� ��������� �������� : ��������� �t� ��������� ���������
+�� A s i a n :�� A s i a n :
+ J a p a n e s e : e�g,�� 0S0�0k0a0o ( K o n n i c h i w a ) J a p a n e s e : e�g,�� 0S0�0k0a0o ( K o n n i c h i w a )
+ K o r e a n : �\�mŴ �H�U�X�8Ɣ ( A n n y e o n g h a s e y o ) K o r e a n : �\�mŴ �H�U�X�8Ɣ ( A n n y e o n g h a s e y o )
+ C h i n e s e : N-e� O`Y} ( N� h� o ) C h i n e s e : N-e� O`Y} ( N� h� o )
+ T h a i : 2)2D" *'1*5 ( S w� s d+ ) T h a i : 2)2D" *'1*5 ( S w� s d+ )
+ M a t h e m a t i c a l & S c i e n t i f i c S y m b o l s M a t h e m a t i c a l & S c i e n t i f i c S y m b o l s
+ B a s i c O p e r a t i o n s : + " � � � " "H "` "a "d "e "j "k B a s i c O p e r a t i o n s : + " � � � " "H "` "a "d "e "j "k
+ C a l c u l u s : "+ ", "- ". " " " " " " C a l c u l u s : "+ ", "- ". " " " " " "
+ S e t T h e o r y : " "	"� "� "� "� ") "* " !5 ! S e t T h e o r y : " "	"� "� "� "� ") "* " !5 !
+ L o g i c : "' "( � "� !� !� !� !� !� !� " " L o g i c : "' "( � "� !� !� !� !� !� !� " "
+ G r e e k : � � � � � � � � � � � � � � � � � � � � � � G r e e k : � � � � � � � � � � � � � � � � � � � � � �
+ G e o m e t r y : " " "� "% %� %� %� + +" +! G e o m e t r y : " " "� "% %� %� %� + +" +!
+ P h y s i c s : ! ! !	� � 2 3 � � " P h y s i c s : ! ! !	� � 2 3 � � "
+ C h e m i s t r y : !� !� !� !� '� '� '� C h e m i s t r y : !� !� !� !� '� '� '�
+ E x a m p l e s : E x a m p l e s :
+ E = m c � E = m c �
+ "+ � ^" e ^ ( - x � ) d x = "� / 2 "+ � ^" e ^ ( - x � ) d x = "� / 2
+ " ( n = 1 t o " ) 1 / n � = � � / 6 " ( n = 1 t o " ) 1 / n � = � � / 6
+ " � B = � � ( J + � � " E /" t ) " � B = � � ( J + � � " E /" t )
+ B u s i n e s s & T e c h n i c a l S y m b o l s B u s i n e s s & T e c h n i c a l S y m b o l s
+ C u r r e n c y : $ � � � � � � � � � � � � � � � C u r r e n c y : $ � � � � � � � � � � � � � � �
+ C h e c k b o x e s : & & & "� "� & ' ' ' ' C h e c k b o x e s : & & & "� "� & ' ' ' '
+ B u l l e t s : " %� # C %� %� )� )� B u l l e t s : " %� # C %� %� )� )�
+ A r r o w s : !� !� !� !� !� !� !� !� !� !� !� !� '� '� + + + A r r o w s : !� !� !� !� !� !� !� !� !� !� !� !� '� '� + + +
+ R a t i n g s : & & +P '& '' #_ '/ '0 &� '* '+ ', '- R a t i n g s : & & +P '& '' #_ '/ '0 &� '* '+ ', ' L e g a l : � � !" ! � � ! ; L e g a l : � � !" ! � � ! ;
+ Q u o t e s : � � 9 : 0 0 0 0 0 0 0 Q u o t e s : � � 9 : 0 0 0 0 0 0 0
+ T e c h n i c a l : &� &� &� &� &" &# &� #� #� #� #� #� #� #� #� #� T e c h n i c a l : &� &� &� &� &" &# &� #� #� #� #� #� #� #� #� #�
+ F r a c t i o n s : � !S !T � � !U !V !W !X !Y !Z ![ !\ !] !^ F r a c t i o n s : � !S !T � � !U !V !W !X !Y !Z ![ !\ !] !^
+ C o m m u n i c a t i o n : & & '	' �� @ # !! C o m m u n i c a t i o n : & & '	' �� @ # !!
+ W e a t h e r : & & & & & &� &� & 'D 'E 'F W e a t h e r : & & & & & &� &� & 'D 'E 'F
+ E m o j i & M o d e r n C o m m u n i c a t i o n E m o j i & M o d e r n C o m m u n i c a t i o n
+ E m o t i o n s : �� �� �� �� �� �� �� �� �� �� �� �� �� �� �� E m o t i o n s : �� �� �� �� �� �� �� �� �� �� �� �� �� �� ��
+ M o r e : �� �� �� �� �� �� �� �� �� �� �� �� �� �� M o r e : �� �� �� �� �� �� �� �� �� �� �� �� �� ��
+ H a n d s : �� �� �� ' �� �� �� �� '� �� �� �� �� �� �� H a n d s : �� �� �� ' �� �� �� �� '� �� �� �� �� �� ��
+ M o r e : �� �� �� &� �� �� '
+ �� �� �� �� �� �� �� M o r e : �� �� �� &� �� �� '
+ �� �� �� �� �� �� ��
+ H e a r t s : 'd� �� �� �� �� �� �� �� �� �� 'c� �� �� �� H e a r t s : 'd� �� �� �� �� �� �� �� �� �� 'c� �� �� ��
+ T e c h : �� �� �� #(� �� �� �� �� �� �� &� �� �� �� T e c h : �� �� �� #(� �� �� �� �� �� �� &� �� �� ��
+ O f f i c e : �� �� �� �� �� �� �� �� �� �� �� �� �� �� O f f i c e : �� �� �� �� �� �� �� �� �� �� �� �� �� ��
+ T i m e : #� #� #� #� #� #� �� �� �� �� �� �� �� �� T i m e : #� #� #� #� #� #� �� �� �� �� �� �� �� ��
+ F l a g s : ���� ���� ���� ���� ���� ���� ���� ���� ���� ���� ���� ���� ���� ���� F l a g s : ���� ���� ���� ���� ���� ���� ���� ���� ���� ���� ���� ���� ���� ����
+ T r a n s p o r t : �� �� �� �� �� �� �� �� �� �� �� �� �� �� T r a n s p o r t : �� �� �� �� �� �� �� �� �� �� �� �� �� ��
+ N a t u r e : �� �� �� �� �� �� �� &� �� �� �� �� �� �� N a t u r e : �� �� �� �� �� �� �� &� �� �� �� �� �� ��
+ B o x D r a w i n g & U I E l e m e n t s B o x D r a w i n g & U I E l e m e n t s
+ B o x D r a w i n g : B o x D r a w i n g :
+%% % % % % % % % % %,% % % % % % % % % %%% % % % % % % % % %,% % % % % % % % % %
+% C e l l 1 % C e l l 2 %% C e l l 1 % C e l l 2 %
+%% % % % % % % % % %<% % % % % % % % % %$%% % % % % % % % % %<% % % % % % % % % %$
+% C e l l 3 % C e l l 4 %% C e l l 3 % C e l l 4 %
+%% % % % % % % % % %4% % % % % % % % % %%% % % % % % % % % %4% % % % % % % % % %
+ D o u b l e L i n e s : D o u b l e L i n e s :
+%T%P%P%P%P%P%P%P%P%P%f%P%P%P%P%P%P%P%P%P%W%T%P%P%P%P%P%P%P%P%P%f%P%P%P%P%P%P%P%P%P%W
+%Q H e a d e r 1 %Q H e a d e r 2 %Q%Q H e a d e r 1 %Q H e a d e r 2 %Q
+%`%P%P%P%P%P%P%P%P%P%l%P%P%P%P%P%P%P%P%P%c%`%P%P%P%P%P%P%P%P%P%l%P%P%P%P%P%P%P%P%P%c
+%Q D a t a 1 %Q D a t a 2 %Q%Q D a t a 1 %Q D a t a 2 %Q
+%Z%P%P%P%P%P%P%P%P%P%i%P%P%P%P%P%P%P%P%P%]%Z%P%P%P%P%P%P%P%P%P%i%P%P%P%P%P%P%P%P%P%]
+ R o u n d e d C o r n e r s : R o u n d e d C o r n e r s :
+%m% % % % % % % % % % % % % % % % % % % % % %n%m% % % % % % % % % % % % % % % % % % % % % %n
+% R o u n d e d B o x S t y l e %% R o u n d e d B o x S t y l e %
+%p% % % % % % % % % % % % % % % % % % % % % %o%p% % % % % % % % % % % % % % % % % % % % % %o
+ B l o c k E l e m e n t s : B l o c k E l e m e n t s :
+ P r o g r e s s b a r s : %�%�%�%�%�%�%�%� P r o g r e s s b a r s : %�%�%�%�%�%�%�%�
+ L o a d i n g : (�(�(�(�((�(�(� L o a d i n g : (�(�(�(�((�(�(�
+ B l o c k s : %�%�%�%�%�%�%�%� B l o c k s : %�%�%�%�%�%�%�%�
+ G e o m e t r i c S h a p e s : G e o m e t r i c S h a p e s :
+%� %� %� %� %� %� %� %� %� %� %� %� %� %� %� %� %� %�%� %� %� %� %� %� %� %� %� %� %� %� %� %� %� %� %� %�
+%� %� %� %� %� %� %� %� %� %� %� %� %� %� %� %�%� %� %� %� %� %� %� %� %� %� %� %� %� %� %� %�
+ M u s i c : &i &j &k &l &m &n &o �� �� �� �� M u s i c : &i &j &k &l &m &n &o �� �� �� ��
+ C h e s s : &T &U &V &W &X &Y &Z &[ &\ &] &^ &_ C h e s s : &T &U &V &W &X &Y &Z &[ &\ &] &^ &_
+ C a r d s : &` &c &e &f �� �� �� �� �� �� �� �� �� �� �� �� �� �� �� C a r d s : &` &c &e &f �� �� �� �� �� �� �� �� �� �� �� �� �� �� ��

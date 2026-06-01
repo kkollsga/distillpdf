@@ -1,0 +1,62 @@
+{
+  "Cold_Email_Hacks": {
+    "file": "Cold_Email_Hacks.pdf",
+    "bytes": 929918,
+    "pages": 44,
+    "t_markdown_s": 0.2047,
+    "md_chars": 49783,
+    "t_plain_s": 0.1958,
+    "tables": null,
+    "images": null
+  },
+  "attention_1706.03762": {
+    "file": "attention_1706.03762.pdf",
+    "bytes": 2215244,
+    "pages": 15,
+    "t_markdown_s": 0.0784,
+    "md_chars": 41109,
+    "t_plain_s": 0.0678,
+    "tables": null,
+    "images": null
+  },
+  "fw9_form": {
+    "file": "fw9_form.pdf",
+    "bytes": 140815,
+    "pages": 6,
+    "t_markdown_s": 0.0166,
+    "md_chars": 39661,
+    "t_plain_s": 0.0148,
+    "tables": null,
+    "images": null
+  },
+  "issue-93-romanian": {
+    "file": "issue-93-romanian.pdf",
+    "bytes": 134230,
+    "pages": 3,
+    "t_markdown_s": 0.0129,
+    "md_chars": 10402,
+    "t_plain_s": 0.007,
+    "tables": null,
+    "images": null
+  },
+  "unicode_professional_demo": {
+    "file": "unicode_professional_demo.pdf",
+    "bytes": 108143,
+    "pages": 1,
+    "t_markdown_s": 0.0012,
+    "md_chars": 1149,
+    "t_plain_s": 0.0004,
+    "tables": null,
+    "images": null
+  },
+  "unicode_showcase": {
+    "file": "unicode_showcase.pdf",
+    "bytes": 308736,
+    "pages": 5,
+    "t_markdown_s": 0.0044,
+    "md_chars": 3937,
+    "t_plain_s": 0.0021,
+    "tables": null,
+    "images": null
+  }
+}

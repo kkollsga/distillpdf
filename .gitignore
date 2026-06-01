@@ -1,0 +1,12 @@
+# Rust
+target/
+**/target/
+Cargo.lock
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.so
+# bench artifacts
+bench/out/imgs/
+bench/rust_extra/target/

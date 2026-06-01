@@ -1,0 +1,4 @@
+
+thread 'main' (5094018) panicked at /Volumes/EksternalHome/KristianEX/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/adobe-cmap-parser-0.4.1/src/lib.rs:169:31:
+failed to parse: Mismatch { message: "expect repeat at least 1 times, found 0 times", position: 0 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

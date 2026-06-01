@@ -1,0 +1,20 @@
+[package]
+name = "rust_extra"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+pdf-extract = "0.9"
+pdf-inspector = { git = "https://github.com/firecrawl/pdf-inspector", branch = "main" }
+
+[profile.release]
+opt-level = 3
+lto = true
+
+[[bin]]
+name = "bench_pdfextract"
+path = "src/pdfextract.rs"
+
+[[bin]]
+name = "bench_pdfinspector"
+path = "src/pdfinspector.rs"

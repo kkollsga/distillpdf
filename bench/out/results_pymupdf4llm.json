@@ -1,0 +1,56 @@
+{
+  "Cold_Email_Hacks": {
+    "file": "Cold_Email_Hacks.pdf",
+    "bytes": 929918,
+    "pages": 44,
+    "t_pymupdf4llm_s": 4.0202,
+    "md_chars": 49926,
+    "md_words": 8360,
+    "t_pymupdf_plain_s": 0.0445
+  },
+  "attention_1706.03762": {
+    "file": "attention_1706.03762.pdf",
+    "bytes": 2215244,
+    "pages": 15,
+    "t_pymupdf4llm_s": 2.1611,
+    "md_chars": 42272,
+    "md_words": 6186,
+    "t_pymupdf_plain_s": 0.0469
+  },
+  "fw9_form": {
+    "file": "fw9_form.pdf",
+    "bytes": 140815,
+    "pages": 6,
+    "t_pymupdf4llm_s": 2.1474,
+    "md_chars": 39288,
+    "md_words": 6207,
+    "t_pymupdf_plain_s": 0.0128
+  },
+  "issue-93-romanian": {
+    "file": "issue-93-romanian.pdf",
+    "bytes": 134230,
+    "pages": 3,
+    "t_pymupdf4llm_s": 0.4786,
+    "md_chars": 10416,
+    "md_words": 1377,
+    "t_pymupdf_plain_s": 0.0054
+  },
+  "unicode_professional_demo": {
+    "file": "unicode_professional_demo.pdf",
+    "bytes": 108143,
+    "pages": 1,
+    "t_pymupdf4llm_s": 0.234,
+    "md_chars": 1337,
+    "md_words": 228,
+    "t_pymupdf_plain_s": 0.0015
+  },
+  "unicode_showcase": {
+    "file": "unicode_showcase.pdf",
+    "bytes": 308736,
+    "pages": 5,
+    "t_pymupdf4llm_s": 0.5161,
+    "md_chars": 3045,
+    "md_words": 720,
+    "t_pymupdf_plain_s": 0.003
+  }
+}
