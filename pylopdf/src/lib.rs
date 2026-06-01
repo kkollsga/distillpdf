@@ -14,6 +14,8 @@ mod text;
 #[pyclass]
 struct Pdf {
     doc: Document,
+    /// Raw PDF bytes, kept for lenient recovery of malformed streams.
+    raw: Vec<u8>,
 }
 
 #[pymethods]
@@ -21,16 +23,19 @@ impl Pdf {
     /// Open a PDF from a filesystem path.
     #[staticmethod]
     fn open(path: &str) -> PyResult<Self> {
-        let doc = Document::load(path).map_err(|e| PyValueError::new_err(format!("open failed: {e}")))?;
-        Ok(Pdf { doc })
+        let raw = std::fs::read(path).map_err(|e| PyValueError::new_err(format!("read failed: {e}")))?;
+        let doc =
+            Document::load_mem(&raw).map_err(|e| PyValueError::new_err(format!("open failed: {e}")))?;
+        Ok(Pdf { doc, raw })
     }
 
     /// Open a PDF from raw bytes.
     #[staticmethod]
     fn from_bytes(data: &[u8]) -> PyResult<Self> {
+        let raw = data.to_vec();
         let doc =
-            Document::load_mem(data).map_err(|e| PyValueError::new_err(format!("parse failed: {e}")))?;
-        Ok(Pdf { doc })
+            Document::load_mem(&raw).map_err(|e| PyValueError::new_err(format!("parse failed: {e}")))?;
+        Ok(Pdf { doc, raw })
     }
 
     /// Number of pages.
@@ -54,7 +59,7 @@ impl Pdf {
             if lopdf.trim().chars().count() >= 2 {
                 out.push_str(&lopdf);
             } else {
-                out.push_str(&text::extract_page(&self.doc, page_id).unwrap_or_default());
+                out.push_str(&text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default());
             }
             out.push('\n');
         }
@@ -68,7 +73,7 @@ impl Pdf {
             .get_pages()
             .get(&page)
             .ok_or_else(|| PyValueError::new_err(format!("no page {page}")))?;
-        Ok(text::debug_page(&self.doc, page_id))
+        Ok(text::debug_page(&self.doc, page_id, &self.raw))
     }
 
     /// Extract text from a single 1-indexed page (hybrid).
@@ -82,7 +87,7 @@ impl Pdf {
         Ok(if lopdf.trim().chars().count() >= 2 {
             lopdf
         } else {
-            text::extract_page(&self.doc, page_id).unwrap_or_default()
+            text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default()
         })
     }
 }

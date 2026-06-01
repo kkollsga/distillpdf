@@ -13,8 +13,48 @@ struct FontInfo {
     to_unicode: Option<HashMap<u32, String>>,
 }
 
+/// Find the first occurrence of `needle` in `hay` starting at `from`.
+fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() || from > hay.len() {
+        return None;
+    }
+    hay[from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| p + from)
+}
+
+/// Lenient recovery of a stream's bytes straight from the raw PDF, for malformed
+/// streams that omit `/Length` (e.g. oxidize-pdf's ToUnicode CMaps), which lopdf
+/// reads as empty. Mirrors what PyMuPDF does: scan `N 0 obj ... stream..endstream`.
+fn recover_stream(raw: &[u8], obj_num: u32) -> Option<Vec<u8>> {
+    let marker = format!("{obj_num} 0 obj");
+    let obj_pos = find_from(raw, marker.as_bytes(), 0)?;
+    let s = find_from(raw, b"stream", obj_pos)? + b"stream".len();
+    let mut start = s;
+    if raw.get(start) == Some(&b'\r') {
+        start += 1;
+    }
+    if raw.get(start) == Some(&b'\n') {
+        start += 1;
+    }
+    let end = find_from(raw, b"endstream", start)?;
+    let mut e = end;
+    if e > start && raw[e - 1] == b'\n' {
+        e -= 1;
+    }
+    if e > start && raw[e - 1] == b'\r' {
+        e -= 1;
+    }
+    if e > start {
+        Some(raw[start..e].to_vec())
+    } else {
+        None
+    }
+}
+
 /// Build per-page font table: resource name -> FontInfo.
-fn build_fonts(doc: &Document, page_id: ObjectId) -> HashMap<Vec<u8>, FontInfo> {
+fn build_fonts(doc: &Document, page_id: ObjectId, raw: &[u8]) -> HashMap<Vec<u8>, FontInfo> {
     let mut out = HashMap::new();
     let fonts = match doc.get_page_fonts(page_id) {
         Ok(f) => f,
@@ -27,12 +67,18 @@ fn build_fonts(doc: &Document, page_id: ObjectId) -> HashMap<Vec<u8>, FontInfo> 
             .get(b"ToUnicode")
             .ok()
             .and_then(|o| o.as_reference().ok())
-            .and_then(|r| doc.get_object(r).ok())
-            .and_then(|o| o.as_stream().ok())
-            // CMap stream may be uncompressed (oxidize-pdf does this) — decompressed_content
-            // errors on an unfiltered stream, so fall back to the raw bytes.
-            .map(|s| s.decompressed_content().unwrap_or_else(|_| s.content.clone()))
-            .map(|bytes| parse_tounicode(&bytes));
+            .and_then(|r| {
+                // Prefer lopdf's loaded content; fall back to raw recovery when the
+                // stream is missing /Length (lopdf yields empty bytes).
+                let from_lopdf = doc
+                    .get_object(r)
+                    .ok()
+                    .and_then(|o| o.as_stream().ok())
+                    .map(|s| s.decompressed_content().unwrap_or_else(|_| s.content.clone()))
+                    .filter(|b| !b.is_empty());
+                let bytes = from_lopdf.or_else(|| recover_stream(raw, r.0))?;
+                Some(parse_tounicode(&bytes))
+            });
         out.insert(name, FontInfo { two_byte, to_unicode });
     }
     out
@@ -206,8 +252,8 @@ fn decode_string(bytes: &[u8], font: Option<&FontInfo>, out: &mut String) {
 }
 
 /// Diagnostic: report font table + content status for one page.
-pub fn debug_page(doc: &Document, page_id: ObjectId) -> String {
-    let fonts = build_fonts(doc, page_id);
+pub fn debug_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> String {
+    let fonts = build_fonts(doc, page_id, raw);
     let mut s = format!("fonts={}\n", fonts.len());
     for (k, fi) in &fonts {
         s += &format!(
@@ -264,9 +310,9 @@ pub fn debug_page(doc: &Document, page_id: ObjectId) -> String {
 
 /// Extract text for one page via content-stream interpretation + ToUnicode.
 /// Returns None if the page content cannot be decoded.
-pub fn extract_page(doc: &Document, page_id: ObjectId) -> Option<String> {
+pub fn extract_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Option<String> {
     let content = doc.get_and_decode_page_content(page_id).ok()?;
-    let fonts = build_fonts(doc, page_id);
+    let fonts = build_fonts(doc, page_id, raw);
     let mut out = String::new();
     let mut cur: Option<&FontInfo> = None;
     for op in &content.operations {

@@ -178,10 +178,10 @@
       "words": 179
     },
     "pylopdf": {
-      "recall": 0.0,
-      "jaccard": 0.0,
-      "seqratio": 0.0,
-      "words": 0
+      "recall": 1.0,
+      "jaccard": 0.835,
+      "seqratio": 0.863,
+      "words": 436
     }
   },
   "unicode_showcase": {
@@ -212,10 +212,10 @@
       "words": 378
     },
     "pylopdf": {
-      "recall": 0.0,
-      "jaccard": 0.0,
-      "seqratio": 0.0,
-      "words": 0
+      "recall": 0.992,
+      "jaccard": 0.988,
+      "seqratio": 0.998,
+      "words": 556
     }
   }
 }
