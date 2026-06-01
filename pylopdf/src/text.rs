@@ -29,7 +29,9 @@ fn build_fonts(doc: &Document, page_id: ObjectId) -> HashMap<Vec<u8>, FontInfo> 
             .and_then(|o| o.as_reference().ok())
             .and_then(|r| doc.get_object(r).ok())
             .and_then(|o| o.as_stream().ok())
-            .and_then(|s| s.decompressed_content().ok())
+            // CMap stream may be uncompressed (oxidize-pdf does this) — decompressed_content
+            // errors on an unfiltered stream, so fall back to the raw bytes.
+            .map(|s| s.decompressed_content().unwrap_or_else(|_| s.content.clone()))
             .map(|bytes| parse_tounicode(&bytes));
         out.insert(name, FontInfo { two_byte, to_unicode });
     }
@@ -171,14 +173,26 @@ fn decode_string(bytes: &[u8], font: Option<&FontInfo>, out: &mut String) {
             while i < bytes.len() {
                 let end = (i + step).min(bytes.len());
                 let code = be_u32(&bytes[i..end]);
-                if let Some(map) = &fi.to_unicode {
-                    if let Some(s) = map.get(&code) {
-                        out.push_str(s);
+                match &fi.to_unicode {
+                    Some(map) => {
+                        if let Some(s) = map.get(&code) {
+                            out.push_str(s);
+                        }
+                        // unmapped code with a ToUnicode present: skip (likely notdef)
                     }
-                    // unmapped code with a ToUnicode present: skip (likely notdef)
-                } else if !fi.two_byte {
-                    // simple font, no ToUnicode: best-effort latin1
-                    out.push(bytes[i] as char);
+                    None if !fi.two_byte => {
+                        // simple font, no ToUnicode: best-effort latin1
+                        out.push(bytes[i] as char);
+                    }
+                    None => {
+                        // 2-byte font, no ToUnicode: last-resort Identity decode
+                        // (Identity-H CIDs often equal Unicode code points).
+                        if let Some(ch) = char::from_u32(code) {
+                            if ch != '\0' {
+                                out.push(ch);
+                            }
+                        }
+                    }
                 }
                 i += step;
             }
@@ -189,6 +203,63 @@ fn decode_string(bytes: &[u8], font: Option<&FontInfo>, out: &mut String) {
             }
         }
     }
+}
+
+/// Diagnostic: report font table + content status for one page.
+pub fn debug_page(doc: &Document, page_id: ObjectId) -> String {
+    let fonts = build_fonts(doc, page_id);
+    let mut s = format!("fonts={}\n", fonts.len());
+    for (k, fi) in &fonts {
+        s += &format!(
+            "  '{}': two_byte={} tounicode_len={}\n",
+            String::from_utf8_lossy(k),
+            fi.two_byte,
+            fi.to_unicode.as_ref().map(|m| m.len() as i64).unwrap_or(-1)
+        );
+    }
+    // ToUnicode raw diagnostics per font.
+    if let Ok(fonts) = doc.get_page_fonts(page_id) {
+        for (name, dict) in fonts {
+            if let Some(r) = dict.get(b"ToUnicode").ok().and_then(|o| o.as_reference().ok()) {
+                if let Ok(st) = doc.get_object(r).and_then(|o| o.as_stream().map(|s| s.clone())) {
+                    let dec = st.decompressed_content();
+                    let raw_len = st.content.len();
+                    let dec_len = dec.as_ref().map(|d| d.len() as i64).unwrap_or(-1);
+                    let used = dec.unwrap_or_else(|_| st.content.clone());
+                    let parsed = parse_tounicode(&used).len();
+                    let sample: String = String::from_utf8_lossy(&used).chars().take(50).collect();
+                    s += &format!(
+                        "  TU '{}': ref={:?} raw={} dec={} parsed={} dict={:?} sample={:?}\n",
+                        String::from_utf8_lossy(&name),
+                        r,
+                        raw_len,
+                        dec_len,
+                        parsed,
+                        st.dict,
+                        sample
+                    );
+                }
+            }
+        }
+    }
+    match doc.get_and_decode_page_content(page_id) {
+        Ok(c) => {
+            s += &format!("ops={}\n", c.operations.len());
+            let tfs: Vec<String> = c
+                .operations
+                .iter()
+                .filter(|o| o.operator == "Tf")
+                .filter_map(|o| match o.operands.first() {
+                    Some(Object::Name(n)) => Some(String::from_utf8_lossy(n).into_owned()),
+                    _ => None,
+                })
+                .take(5)
+                .collect();
+            s += &format!("Tf_names={:?}\n", tfs);
+        }
+        Err(e) => s += &format!("content ERR: {e}\n"),
+    }
+    s
 }
 
 /// Extract text for one page via content-stream interpretation + ToUnicode.

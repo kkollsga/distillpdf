@@ -34,6 +34,22 @@ Speed: 0.004–0.10s — already competitive with pdf-inspector/pdf_oxide.
   - NEXT: dump `get_page_fonts` keys vs `Tf` operands + content ops for that file; verify
     CMap parses; fix simple-font /Encoding (WinAnsi/Standard) decoding, not just latin1.
 
+## Iteration 3 (commit pending)
+- Fixed ToUnicode read for **uncompressed** CMap streams (raw-bytes fallback) + added
+  Identity last-resort decode for 2-byte fonts. ToUnicode parser verified correct on
+  Cold_Email (Type0 F0/F1 → 96/68 entries, R1.00).
+- Bumped **lopdf 0.36 → 0.40** (also unlocks `get_page_images` for the image pillar).
+- Added `Pdf.debug_page(n)` diagnostic.
+- **Synthetic-CID root cause IDENTIFIED (lopdf bug, not ours):** for
+  unicode_professional_demo, lopdf returns ToUnicode object `(8,0)` with an **empty dict
+  `<<>>` + empty content** — it fails to load that object (pymupdf reads it fine). Affects
+  the 2 oxidize-pdf-generated synthetic PDFs (ObjStm/xref-stream handling). Real PDFs
+  unaffected. **Revisit options:** try `lopdf-parang` fork (lazy streams) or a raw-offset
+  re-read workaround. Tracked, not blocking real-world quality.
+
+Current quality (held, no regression): Cold_Email R1.00, attention R0.96, fw9 R0.99,
+romanian R0.91 (diacritics), 2 synthetic CID R0.00 (lopdf object-load bug above).
+
 ## Next increments (priority order)
 1. **Own text extractor** replacing lopdf `extract_text`: walk content stream ops
    (BT/ET, Tf, Td/TD/Tm, Tj/TJ), map bytes→Unicode via font `/ToUnicode` CMap +

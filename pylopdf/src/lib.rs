@@ -61,6 +61,16 @@ impl Pdf {
         Ok(out)
     }
 
+    /// Diagnostic for one 1-indexed page.
+    fn debug_page(&self, page: u32) -> PyResult<String> {
+        let page_id = *self
+            .doc
+            .get_pages()
+            .get(&page)
+            .ok_or_else(|| PyValueError::new_err(format!("no page {page}")))?;
+        Ok(text::debug_page(&self.doc, page_id))
+    }
+
     /// Extract text from a single 1-indexed page (hybrid).
     fn extract_page_text(&self, page: u32) -> PyResult<String> {
         let page_id = *self
