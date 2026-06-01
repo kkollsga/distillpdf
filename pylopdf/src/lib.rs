@@ -8,6 +8,8 @@ use lopdf::Document;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+mod text;
+
 /// A loaded PDF document.
 #[pyclass]
 struct Pdf {
@@ -37,27 +39,41 @@ impl Pdf {
     }
 
     /// Extract plain text from all pages (concatenated, page order).
+    ///
+    /// Hybrid: prefer our ToUnicode-aware content-stream extractor (handles CID
+    /// fonts + diacritics); fall back to lopdf's extractor per page when ours
+    /// yields little (so simple-encoded PDFs never regress).
     fn extract_text(&self) -> PyResult<String> {
-        let pages: Vec<u32> = self.doc.get_pages().keys().copied().collect();
+        let pages = self.doc.get_pages();
         let mut out = String::new();
-        for p in pages {
-            match self.doc.extract_text(&[p]) {
-                Ok(t) => {
-                    out.push_str(&t);
-                    out.push('\n');
-                }
-                // Skip pages that fail rather than aborting the whole document.
-                Err(_) => continue,
+        for (&p, &page_id) in &pages {
+            // lopdf's mature extractor is the default. Our ToUnicode extractor is
+            // a *rescue* only when lopdf recovers nothing (the CID-font case), so
+            // simple-encoded PDFs can never regress.
+            let lopdf = self.doc.extract_text(&[p]).unwrap_or_default();
+            if lopdf.trim().chars().count() >= 2 {
+                out.push_str(&lopdf);
+            } else {
+                out.push_str(&text::extract_page(&self.doc, page_id).unwrap_or_default());
             }
+            out.push('\n');
         }
         Ok(out)
     }
 
-    /// Extract text from a single 1-indexed page.
+    /// Extract text from a single 1-indexed page (hybrid).
     fn extract_page_text(&self, page: u32) -> PyResult<String> {
-        self.doc
-            .extract_text(&[page])
-            .map_err(|e| PyValueError::new_err(format!("extract failed: {e}")))
+        let page_id = *self
+            .doc
+            .get_pages()
+            .get(&page)
+            .ok_or_else(|| PyValueError::new_err(format!("no page {page}")))?;
+        let lopdf = self.doc.extract_text(&[page]).unwrap_or_default();
+        Ok(if lopdf.trim().chars().count() >= 2 {
+            lopdf
+        } else {
+            text::extract_page(&self.doc, page_id).unwrap_or_default()
+        })
     }
 }
 

@@ -18,6 +18,22 @@ Goal: see `GOAL.md`. Active loop building toward feature-complete PyMuPDF compet
 | unicode_showcase (CID) | **R0.00** | pdf_oxide .99 | **CID fonts** |
 Speed: 0.004–0.10s — already competitive with pdf-inspector/pdf_oxide.
 
+## Iteration 2 (commit pending)
+- Added `src/text.rs`: ToUnicode-CMap content-stream extractor (bfchar/bfrange parser,
+  Type0 2-byte + simple 1-byte codes, Tj/TJ/Td handling).
+- Wired as **rescue-only hybrid**: lopdf default, ours only when lopdf returns empty →
+  **no regression** (Cold_Email R1.00, attention .96, fw9 .99, romanian .91 all held).
+- Proven: our extractor *does* decode correct Type0 words (saw "Cold/Email/Hacks" on
+  Cold_Email), but pollutes with U+200B + over-splits lines → still worse than lopdf there,
+  so kept rescue-only.
+- **Still open:** synthetic CID PDFs (unicode_professional_demo, unicode_showcase) → R0.00.
+  Our extractor emits newlines but no letters on them. Diagnosis needed next:
+  - unicode_professional_demo fonts = Type1 Courier/Times/Helvetica (WinAnsi, NO ToUnicode)
+    + Type0 Arial (ToUnicode). Visible text likely in the simple fonts; our latin1 fallback
+    should fire but produced nothing → font-name matching or current-font tracking bug.
+  - NEXT: dump `get_page_fonts` keys vs `Tf` operands + content ops for that file; verify
+    CMap parses; fix simple-font /Encoding (WinAnsi/Standard) decoding, not just latin1.
+
 ## Next increments (priority order)
 1. **Own text extractor** replacing lopdf `extract_text`: walk content stream ops
    (BT/ET, Tf, Td/TD/Tm, Tj/TJ), map bytes→Unicode via font `/ToUnicode` CMap +
