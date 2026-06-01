@@ -8,7 +8,9 @@ use lopdf::Document;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+mod extract;
 mod text;
+use pyo3::types::PyList;
 
 /// A loaded PDF document.
 #[pyclass]
@@ -64,6 +66,16 @@ impl Pdf {
             out.push('\n');
         }
         Ok(out)
+    }
+
+    /// Extract images from all pages (list of dicts incl. raw bytes).
+    fn extract_images<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        extract::extract_images(py, &self.doc)
+    }
+
+    /// Extract per-page font info (list of dicts).
+    fn extract_fonts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        extract::extract_fonts(py, &self.doc)
     }
 
     /// Diagnostic for one 1-indexed page.
