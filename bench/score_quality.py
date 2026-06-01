@@ -31,6 +31,7 @@ TOOLS = {
     "pdfextract":  "pdfextract.txt",
     "pdfinspector":"pdfinspector.md",
     "pdfoxide":    "pdfoxide.md",
+    "pylopdf":     "pylopdf.txt",
 }
 
 rows = {}

@@ -1,0 +1,50 @@
+{
+  "Cold_Email_Hacks": {
+    "file": "Cold_Email_Hacks.pdf",
+    "bytes": 929918,
+    "t_text_s": 0.1042,
+    "pages": 44,
+    "chars": 94399,
+    "ok": true
+  },
+  "attention_1706.03762": {
+    "file": "attention_1706.03762.pdf",
+    "bytes": 2215244,
+    "t_text_s": 0.0459,
+    "pages": 15,
+    "chars": 38727,
+    "ok": true
+  },
+  "fw9_form": {
+    "file": "fw9_form.pdf",
+    "bytes": 140815,
+    "t_text_s": 0.0038,
+    "pages": 6,
+    "chars": 37556,
+    "ok": true
+  },
+  "issue-93-romanian": {
+    "file": "issue-93-romanian.pdf",
+    "bytes": 134230,
+    "t_text_s": 0.0037,
+    "pages": 3,
+    "chars": 10578,
+    "ok": true
+  },
+  "unicode_professional_demo": {
+    "file": "unicode_professional_demo.pdf",
+    "bytes": 108143,
+    "t_text_s": 0.0005,
+    "pages": 1,
+    "chars": 0,
+    "ok": true
+  },
+  "unicode_showcase": {
+    "file": "unicode_showcase.pdf",
+    "bytes": 308736,
+    "t_text_s": 0.0011,
+    "pages": 5,
+    "chars": 0,
+    "ok": true
+  }
+}

@@ -30,6 +30,12 @@
       "jaccard": 0.985,
       "seqratio": 0.501,
       "words": 8604
+    },
+    "pylopdf": {
+      "recall": 1.0,
+      "jaccard": 1.0,
+      "seqratio": 1.0,
+      "words": 8625
     }
   },
   "attention_1706.03762": {
@@ -63,6 +69,12 @@
       "jaccard": 0.94,
       "seqratio": 0.621,
       "words": 6503
+    },
+    "pylopdf": {
+      "recall": 0.959,
+      "jaccard": 0.951,
+      "seqratio": 0.979,
+      "words": 6331
     }
   },
   "fw9_form": {
@@ -96,6 +108,12 @@
       "jaccard": 0.99,
       "seqratio": 0.62,
       "words": 6610
+    },
+    "pylopdf": {
+      "recall": 0.995,
+      "jaccard": 0.957,
+      "seqratio": 0.999,
+      "words": 6481
     }
   },
   "issue-93-romanian": {
@@ -124,6 +142,12 @@
       "jaccard": 0.653,
       "seqratio": 0.066,
       "words": 1300
+    },
+    "pylopdf": {
+      "recall": 0.906,
+      "jaccard": 0.815,
+      "seqratio": 0.965,
+      "words": 1675
     }
   },
   "unicode_professional_demo": {
@@ -152,6 +176,12 @@
       "jaccard": 1.0,
       "seqratio": 0.583,
       "words": 179
+    },
+    "pylopdf": {
+      "recall": 0.0,
+      "jaccard": 0.0,
+      "seqratio": 0.0,
+      "words": 0
     }
   },
   "unicode_showcase": {
@@ -180,6 +210,12 @@
       "jaccard": 0.988,
       "seqratio": 0.705,
       "words": 378
+    },
+    "pylopdf": {
+      "recall": 0.0,
+      "jaccard": 0.0,
+      "seqratio": 0.0,
+      "words": 0
     }
   }
 }
