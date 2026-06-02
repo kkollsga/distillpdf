@@ -9,6 +9,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 mod extract;
+mod html;
+mod img;
 mod text;
 use pyo3::types::PyList;
 
@@ -83,6 +85,12 @@ impl Pdf {
         extract::extract_tables(py, &self.doc, &self.raw)
     }
 
+    /// Convert the PDF to thin, AI-ready HTML (per-page sections, headings,
+    /// bold/italic, lists, tables, monospace; inline images added separately).
+    fn to_html(&self) -> PyResult<String> {
+        Ok(html::to_html(&self.doc, &self.raw))
+    }
+
     /// Diagnostic: force our ToUnicode extractor for all pages (eval only).
     fn _mine_text(&self) -> PyResult<String> {
         let mut out = String::new();
@@ -91,6 +99,19 @@ impl Pdf {
             out.push('\n');
         }
         Ok(out)
+    }
+
+    /// Diagnostic: raw spans (text, x, width, size) for a 1-indexed page.
+    fn _dbg_spans(&self, page: u32) -> PyResult<Vec<(String, f32, f32, f32)>> {
+        let page_id = *self
+            .doc
+            .get_pages()
+            .get(&page)
+            .ok_or_else(|| PyValueError::new_err("no page"))?;
+        Ok(text::extract_spans(&self.doc, page_id, &self.raw)
+            .into_iter()
+            .map(|s| (s.text, s.x, s.width, s.size))
+            .collect())
     }
 
     /// Diagnostic for one 1-indexed page.

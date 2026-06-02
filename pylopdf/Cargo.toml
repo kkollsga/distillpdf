@@ -12,6 +12,8 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 pyo3 = { version = "0.25", features = ["extension-module", "abi3-py38"] }
 lopdf = "0.40"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [profile.release]
 lto = true

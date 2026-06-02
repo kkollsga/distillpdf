@@ -337,7 +337,16 @@ fn parse_tounicode(data: &[u8]) -> HashMap<u32, String> {
 /// zero-width / BOM noise that pollutes word boundaries.
 fn push_norm(out: &mut String, ch: char) {
     match ch {
+        // Latin ligatures -> ASCII (matches PyMuPDF; critical for LaTeX/arXiv text).
+        '\u{FB00}' => out.push_str("ff"),
+        '\u{FB01}' => out.push_str("fi"),
+        '\u{FB02}' => out.push_str("fl"),
+        '\u{FB03}' => out.push_str("ffi"),
+        '\u{FB04}' => out.push_str("ffl"),
+        '\u{FB05}' | '\u{FB06}' => out.push_str("st"),
+        // whitespace variants -> space
         '\u{200B}' | '\u{00A0}' | '\u{2009}' | '\u{202F}' => out.push(' '),
+        // zero-width / BOM noise -> drop
         '\u{FEFF}' | '\u{200C}' | '\u{200D}' | '\0' => {}
         c => out.push(c),
     }

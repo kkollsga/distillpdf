@@ -120,46 +120,69 @@ fn columns(rows: &[Vec<Cell>], tol: f32) -> Vec<f32> {
 /// Detect tables: runs of >=3 consecutive rows that each have >=2 gutter-separated
 /// cells and share >=2 columns occupied in a majority of rows. This rejects
 /// word-positioned prose (whose words merge into a single cell).
-fn detect_tables(spans: Vec<Span>) -> Vec<Vec<Vec<String>>> {
+/// A detected table with its vertical extent (PDF user space, y increases up).
+pub struct PosTable {
+    pub y_top: f32,
+    pub y_bottom: f32,
+    pub grid: Vec<Vec<String>>,
+}
+
+fn clone_span(s: &Span) -> Span {
+    Span {
+        x: s.x,
+        y: s.y,
+        size: s.size,
+        width: s.width,
+        text: s.text.clone(),
+        bold: s.bold,
+        italic: s.italic,
+        mono: s.mono,
+    }
+}
+
+/// Detect tables with vertical positions: runs of >=3 consecutive multi-cell rows
+/// sharing >=2 aligned columns (occupied in a majority of rows). Rejects word-
+/// positioned prose (whose words merge into a single cell).
+pub fn detect_tables_pos(spans: &[Span]) -> Vec<PosTable> {
     let avg_size = if spans.is_empty() {
         10.0
     } else {
         spans.iter().map(|s| s.size).sum::<f32>() / spans.len() as f32
     };
     let tol = (avg_size * 1.5).max(6.0);
-    let rows = rows_of(spans);
-    let celled: Vec<Vec<Cell>> = rows.iter().map(|r| row_cells(r)).collect();
+    let rows = rows_of(spans.iter().map(clone_span).collect());
+    let celled: Vec<(f32, Vec<Cell>)> = rows
+        .iter()
+        .map(|r| (r.first().map(|s| s.y).unwrap_or(0.0), row_cells(r)))
+        .collect();
     let mut tables = Vec::new();
-    let mut run: Vec<&Vec<Cell>> = Vec::new();
+    let mut run: Vec<&(f32, Vec<Cell>)> = Vec::new();
 
-    let mut flush = |run: &Vec<&Vec<Cell>>, tables: &mut Vec<Vec<Vec<String>>>| {
+    let mut flush = |run: &Vec<&(f32, Vec<Cell>)>, tables: &mut Vec<PosTable>| {
         if run.len() < 3 {
             return;
         }
-        let rows_ref: Vec<Vec<Cell>> = run
+        let owned: Vec<Vec<Cell>> = run
             .iter()
-            .map(|r| r.iter().map(|c| Cell { x: c.x, end: c.end, text: c.text.clone() }).collect())
+            .map(|(_, c)| c.iter().map(|x| Cell { x: x.x, end: x.end, text: x.text.clone() }).collect())
             .collect();
-        let cols = columns(&rows_ref, tol);
+        let cols = columns(&owned, tol);
         if cols.len() < 2 {
             return;
         }
-        // Require each kept column occupied in >=50% of rows.
         let mut occ = vec![0usize; cols.len()];
-        for row in &rows_ref {
+        for row in &owned {
             for c in row {
                 if let Some(ci) = nearest_col(&cols, c.x) {
                     occ[ci] += 1;
                 }
             }
         }
-        let keep: Vec<usize> = (0..cols.len())
-            .filter(|&i| occ[i] * 2 >= rows_ref.len())
-            .collect();
+        let keep: Vec<usize> = (0..cols.len()).filter(|&i| occ[i] * 2 >= owned.len()).collect();
         if keep.len() < 2 {
             return;
         }
-        let grid: Vec<Vec<String>> = rows_ref
+        let grid: Vec<Vec<String>> = owned
             .iter()
             .map(|row| {
                 let mut cells = vec![String::new(); keep.len()];
@@ -176,11 +199,32 @@ fn detect_tables(spans: Vec<Span>) -> Vec<Vec<Vec<String>>> {
                 cells
             })
             .collect();
-        tables.push(grid);
+        // Reject 2-column "tables" whose cells are long: that's two-column prose,
+        // not a table (real table cells are short; prose columns are sentences).
+        let (mut wc, mut nz) = (0usize, 0usize);
+        for row in &grid {
+            for c in row {
+                let w = c.split_whitespace().count();
+                if w > 0 {
+                    wc += w;
+                    nz += 1;
+                }
+            }
+        }
+        let mean_words = if nz > 0 { wc as f32 / nz as f32 } else { 0.0 };
+        if grid.first().map(|r| r.len()).unwrap_or(0) <= 2 && mean_words > 8.0 {
+            return;
+        }
+
+        tables.push(PosTable {
+            y_top: run.first().map(|(y, _)| *y).unwrap_or(0.0),
+            y_bottom: run.last().map(|(y, _)| *y).unwrap_or(0.0),
+            grid,
+        });
     };
 
     for row in &celled {
-        if row.len() >= 2 {
+        if row.1.len() >= 2 {
             run.push(row);
         } else {
             flush(&run, &mut tables);
@@ -189,6 +233,10 @@ fn detect_tables(spans: Vec<Span>) -> Vec<Vec<Vec<String>>> {
     }
     flush(&run, &mut tables);
     tables
+}
+
+fn detect_tables(spans: Vec<Span>) -> Vec<Vec<Vec<String>>> {
+    detect_tables_pos(&spans).into_iter().map(|t| t.grid).collect()
 }
 
 fn nearest_col(cols: &[f32], x: f32) -> Option<usize> {
