@@ -22,6 +22,8 @@ MAX_FALSE_POSITIVES = 0          # tables on negative PDFs
 MIN_COL_ACCURACY = 0.70
 MIN_CELL_RECALL = 0.85
 MIN_COUNT_ACCURACY = 0.70        # PDFs where detected table count == GT count
+MIN_COMPLEX_RECALL = 0.75        # detection recall on COMPLEX/messy tables
+MIN_COMPLEX_CELL = 0.70          # cell-content recall on complex tables
 
 
 def toks(grid):
@@ -50,6 +52,8 @@ def run():
     false_pos = 0
     count_ok = 0
     count_total = 0
+    cx_found = cx_total = 0
+    cx_cell = []
     rows = []
 
     for fname, info in sorted(gt.items()):
@@ -80,6 +84,12 @@ def run():
                 if r > best_r:
                     best_r, best_i = r, i
             cell_recalls.append(best_r)
+            is_cx = g.get("complex", False)
+            if is_cx:
+                cx_total += 1
+                cx_cell.append(best_r)
+                if best_r >= 0.5:
+                    cx_found += 1
             if best_r >= 0.5:
                 found += 1
                 dcols = det[best_i]["n_cols"]
@@ -94,6 +104,8 @@ def run():
     col_acc = col_ok / total_gt if total_gt else 0.0
     mean_cell = sum(cell_recalls) / len(cell_recalls) if cell_recalls else 0.0
     count_acc = count_ok / count_total if count_total else 0.0
+    cx_recall = cx_found / cx_total if cx_total else 0.0
+    cx_cell_mean = sum(cx_cell) / len(cx_cell) if cx_cell else 0.0
 
     print(f"{'PDF':34s} result")
     for n, r in rows:
@@ -104,6 +116,8 @@ def run():
     print(f"table-count acc  : {count_acc:.3f}  (need >={MIN_COUNT_ACCURACY}, {count_ok}/{count_total})")
     print(f"column accuracy  : {col_acc:.3f}  (need >={MIN_COL_ACCURACY})")
     print(f"cell recall mean : {mean_cell:.3f}  (need >={MIN_CELL_RECALL})")
+    print(f"COMPLEX recall   : {cx_recall:.3f}  (need >={MIN_COMPLEX_RECALL}, {cx_found}/{cx_total})")
+    print(f"COMPLEX cell mean: {cx_cell_mean:.3f}  (need >={MIN_COMPLEX_CELL})")
 
     fails = []
     if det_recall < MIN_DETECTION_RECALL: fails.append("detection recall")
@@ -111,6 +125,8 @@ def run():
     if count_acc < MIN_COUNT_ACCURACY: fails.append("table-count accuracy")
     if col_acc < MIN_COL_ACCURACY: fails.append("column accuracy")
     if mean_cell < MIN_CELL_RECALL: fails.append("cell recall")
+    if cx_recall < MIN_COMPLEX_RECALL: fails.append("complex recall")
+    if cx_cell_mean < MIN_COMPLEX_CELL: fails.append("complex cell recall")
     if fails:
         print("\n❌ FAIL:", ", ".join(fails))
         return False

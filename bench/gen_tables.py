@@ -14,7 +14,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
 from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer,
                                 BaseDocTemplate, Frame, PageTemplate)
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 OUT = os.path.join(os.path.dirname(__file__), "corpus_tables")
 os.makedirs(OUT, exist_ok=True)
@@ -78,7 +78,27 @@ def table_flow(cells, style_name, header, numeric_cols, colw=1.1*inch):
     t = Table(cells, colWidths=[colw]*len(cells[0]))
     t.setStyle(style_for(style_name, len(cells[0]), header, numeric_cols))
     return t, {"rows": len(cells), "cols": len(cells[0]), "cells": cells,
-               "style": style_name, "has_header": header}
+               "style": style_name, "has_header": header, "complex": False}
+
+
+CELL = ParagraphStyle("cell", fontSize=8, leading=9)
+
+
+def complex_table(cells, extra_cmds, feature, colw=1.0*inch, gridded=True):
+    """Build a complex table. `cells` is the LOGICAL grid (plain strings; '' for
+    spanned/empty slots). `extra_cmds` carries SPAN/wrap commands."""
+    # PDF cells: wrap long strings in Paragraphs so they actually multi-line.
+    pdf = [[Paragraph(c, CELL) if isinstance(c, str) and len(c) > 24 else c for c in row]
+           for row in cells]
+    t = Table(pdf, colWidths=[colw] * len(cells[0]))
+    cmds = [("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]
+    if gridded:
+        cmds.append(("GRID", (0, 0), (-1, -1), 0.5, colors.black))
+    cmds += extra_cmds
+    t.setStyle(TableStyle(cmds))
+    return t, {"rows": len(cells), "cols": len(cells[0]), "cells": cells,
+               "style": feature, "has_header": True, "complex": True}
 
 
 def main():
@@ -123,6 +143,83 @@ def main():
     cells = make_cells(6, 4, header=False, numeric_cols=(2, 3))
     t, gt = table_flow(cells, "grid", False, (2, 3))
     build(f"tbl_{idx:02d}_grid_noheader.pdf", [t], [gt]); idx += 1
+
+    # ---- COMPLEX / MESSY tables (part of the goalline) ----
+    # C1: spanning group header (colspan)
+    cells = [["Geochemistry", "", "", "Location", ""],
+             ["Sample", "Depth", "Grade", "Lat", "Lon"]]
+    for r in range(6):
+        cells.append([f"S{r+1}", f"{r*3+2}.1", f"{r+1}.4", f"{60+r}.2", f"{10+r}.5"])
+    t, gt = complex_table(cells, [("SPAN", (0, 0), (2, 0)), ("SPAN", (3, 0), (4, 0)),
+                                  ("FONTNAME", (0, 0), (-1, 1), "Helvetica-Bold")], "colspan_header", colw=0.85*inch)
+    build(f"tbl_{idx:02d}_cmplx_colspan.pdf", [t], [gt]); idx += 1
+
+    # C2: row-spanning category labels (rowspan)
+    cells = [["Zone", "Sample", "Value", "Unit"]]
+    for z, n in (("North", 3), ("South", 3)):
+        for i in range(n):
+            cells.append([z if i == 0 else "", f"{z[0]}{i+1}", f"{random.randint(1,99)}", "ppm"])
+    spans = [("SPAN", (0, 1), (0, 3)), ("SPAN", (0, 4), (0, 6)),
+             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold")]
+    t, gt = complex_table(cells, spans, "rowspan", colw=1.0*inch)
+    build(f"tbl_{idx:02d}_cmplx_rowspan.pdf", [t], [gt]); idx += 1
+
+    # C3: multi-line wrapped cells
+    cells = [["Method", "Description", "Result"]]
+    for i in range(5):
+        cells.append([f"M{i+1}",
+                      f"A fairly long description of method {i+1} that wraps across multiple lines within the cell",
+                      f"{random.choice(WORDS)} outcome {i+1}"])
+    t, gt = complex_table(cells, [("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold")],
+                          "multiline", colw=1.7*inch)
+    build(f"tbl_{idx:02d}_cmplx_multiline.pdf", [t], [gt]); idx += 1
+
+    # C4: nested two-row header (group + sub) + grid
+    cells = [["", "Phase 1", "", "Phase 2", ""],
+             ["ID", "Min", "Max", "Min", "Max"]]
+    for r in range(6):
+        cells.append([f"R{r+1}"] + [f"{random.randint(1,50)}" for _ in range(4)])
+    t, gt = complex_table(cells, [("SPAN", (1, 0), (2, 0)), ("SPAN", (3, 0), (4, 0)),
+                                  ("FONTNAME", (0, 0), (-1, 1), "Helvetica-Bold")], "nested_header", colw=0.8*inch)
+    build(f"tbl_{idx:02d}_cmplx_nested.pdf", [t], [gt]); idx += 1
+
+    # C5: sparse table (many empty cells)
+    cells = [["Item", "Q1", "Q2", "Q3", "Q4"]]
+    for r in range(6):
+        row = [f"Item{r+1}"] + ["" for _ in range(4)]
+        row[random.randint(1, 4)] = f"{random.randint(10,99)}"
+        cells.append(row)
+    t, gt = complex_table(cells, [("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold")], "sparse", colw=0.85*inch)
+    build(f"tbl_{idx:02d}_cmplx_sparse.pdf", [t], [gt]); idx += 1
+
+    # C6: wide table (9 columns)
+    cells = [[f"C{c}" for c in range(9)]]
+    for r in range(6):
+        cells.append([f"{random.randint(1,99)}" for _ in range(9)])
+    t, gt = complex_table(cells, [("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold")], "wide9", colw=0.62*inch)
+    build(f"tbl_{idx:02d}_cmplx_wide.pdf", [t], [gt]); idx += 1
+
+    # C7: borderless + colspan (hardest — no lines, merged header)
+    cells = [["Results Summary", "", ""], ["Sample", "Mean", "StdDev"]]
+    for r in range(6):
+        cells.append([f"X{r+1}", f"{r+1}.2", f"0.{r+1}"])
+    t, gt = complex_table(cells, [("SPAN", (0, 0), (2, 0)),
+                                  ("FONTNAME", (0, 0), (-1, 1), "Helvetica-Bold")],
+                          "borderless_merged", colw=1.0*inch, gridded=False)
+    build(f"tbl_{idx:02d}_cmplx_borderless_merged.pdf", [t], [gt]); idx += 1
+
+    # C8: table inside a two-column page (academic layout) — detection amid columns
+    twc = f"tbl_{idx:02d}_cmplx_in_twocol.pdf"; idx += 1
+    cells = make_cells(7, 3, header=True, numeric_cols=(1, 2))
+    tt, gtc = table_flow(cells, "grid", True, (1, 2), colw=0.7*inch)
+    gtc["complex"] = True; gtc["style"] = "in_twocol"
+    doc = BaseDocTemplate(os.path.join(OUT, twc), pagesize=letter, topMargin=0.8*inch, bottomMargin=0.8*inch)
+    fw = (letter[0] - 2*inch) / 2 - 8
+    doc.addPageTemplates(PageTemplate(frames=[Frame(inch, inch, fw, letter[1]-1.6*inch),
+                                              Frame(inch+fw+16, inch, fw, letter[1]-1.6*inch)]))
+    doc.build([Paragraph(PROSE, S["BodyText"]), Spacer(1, 8), tt, Spacer(1, 8),
+               Paragraph(PROSE, S["BodyText"]), Paragraph(PROSE, S["BodyText"])])
+    GT[twc] = {"tables": [gtc], "is_negative": False}
 
     # 7. NEGATIVES (no tables) — precision / false-positive checks
     build(f"tbl_{idx:02d}_neg_prose.pdf",

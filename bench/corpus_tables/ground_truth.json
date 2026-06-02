@@ -37,7 +37,8 @@
           ]
         ],
         "style": "grid",
-        "has_header": true
+        "has_header": true,
+        "complex": false
       }
     ],
     "is_negative": false
@@ -80,7 +81,8 @@
           ]
         ],
         "style": "box",
-        "has_header": true
+        "has_header": true,
+        "complex": false
       }
     ],
     "is_negative": false
@@ -123,7 +125,8 @@
           ]
         ],
         "style": "hrules",
-        "has_header": true
+        "has_header": true,
+        "complex": false
       }
     ],
     "is_negative": false
@@ -166,7 +169,8 @@
           ]
         ],
         "style": "header_shaded",
-        "has_header": true
+        "has_header": true,
+        "complex": false
       }
     ],
     "is_negative": false
@@ -209,7 +213,8 @@
           ]
         ],
         "style": "borderless",
-        "has_header": true
+        "has_header": true,
+        "complex": false
       }
     ],
     "is_negative": false
@@ -254,7 +259,8 @@
           ]
         ],
         "style": "grid",
-        "has_header": true
+        "has_header": true,
+        "complex": false
       }
     ],
     "is_negative": false
@@ -323,7 +329,8 @@
           ]
         ],
         "style": "grid",
-        "has_header": true
+        "has_header": true,
+        "complex": false
       }
     ],
     "is_negative": false
@@ -368,7 +375,8 @@
           ]
         ],
         "style": "borderless",
-        "has_header": true
+        "has_header": true,
+        "complex": false
       }
     ],
     "is_negative": false
@@ -437,7 +445,8 @@
           ]
         ],
         "style": "borderless",
-        "has_header": true
+        "has_header": true,
+        "complex": false
       }
     ],
     "is_negative": false
@@ -570,7 +579,8 @@
           ]
         ],
         "style": "grid",
-        "has_header": true
+        "has_header": true,
+        "complex": false
       }
     ],
     "is_negative": false
@@ -613,7 +623,8 @@
           ]
         ],
         "style": "grid",
-        "has_header": true
+        "has_header": true,
+        "complex": false
       }
     ],
     "is_negative": false
@@ -656,7 +667,8 @@
           ]
         ],
         "style": "borderless",
-        "has_header": true
+        "has_header": true,
+        "complex": false
       }
     ],
     "is_negative": false
@@ -694,7 +706,8 @@
           ]
         ],
         "style": "grid",
-        "has_header": true
+        "has_header": true,
+        "complex": false
       },
       {
         "rows": 5,
@@ -722,7 +735,8 @@
           ]
         ],
         "style": "header_shaded",
-        "has_header": true
+        "has_header": true,
+        "complex": false
       }
     ],
     "is_negative": false
@@ -771,28 +785,526 @@
           ]
         ],
         "style": "grid",
-        "has_header": false
+        "has_header": false,
+        "complex": false
       }
     ],
     "is_negative": false
   },
-  "tbl_14_neg_prose.pdf": {
+  "tbl_14_cmplx_colspan.pdf": {
+    "tables": [
+      {
+        "rows": 8,
+        "cols": 5,
+        "cells": [
+          [
+            "Geochemistry",
+            "",
+            "",
+            "Location",
+            ""
+          ],
+          [
+            "Sample",
+            "Depth",
+            "Grade",
+            "Lat",
+            "Lon"
+          ],
+          [
+            "S1",
+            "2.1",
+            "1.4",
+            "60.2",
+            "10.5"
+          ],
+          [
+            "S2",
+            "5.1",
+            "2.4",
+            "61.2",
+            "11.5"
+          ],
+          [
+            "S3",
+            "8.1",
+            "3.4",
+            "62.2",
+            "12.5"
+          ],
+          [
+            "S4",
+            "11.1",
+            "4.4",
+            "63.2",
+            "13.5"
+          ],
+          [
+            "S5",
+            "14.1",
+            "5.4",
+            "64.2",
+            "14.5"
+          ],
+          [
+            "S6",
+            "17.1",
+            "6.4",
+            "65.2",
+            "15.5"
+          ]
+        ],
+        "style": "colspan_header",
+        "has_header": true,
+        "complex": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_15_cmplx_rowspan.pdf": {
+    "tables": [
+      {
+        "rows": 7,
+        "cols": 4,
+        "cells": [
+          [
+            "Zone",
+            "Sample",
+            "Value",
+            "Unit"
+          ],
+          [
+            "North",
+            "N1",
+            "61",
+            "ppm"
+          ],
+          [
+            "",
+            "N2",
+            "29",
+            "ppm"
+          ],
+          [
+            "",
+            "N3",
+            "26",
+            "ppm"
+          ],
+          [
+            "South",
+            "S1",
+            "59",
+            "ppm"
+          ],
+          [
+            "",
+            "S2",
+            "45",
+            "ppm"
+          ],
+          [
+            "",
+            "S3",
+            "40",
+            "ppm"
+          ]
+        ],
+        "style": "rowspan",
+        "has_header": true,
+        "complex": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_16_cmplx_multiline.pdf": {
+    "tables": [
+      {
+        "rows": 6,
+        "cols": 3,
+        "cells": [
+          [
+            "Method",
+            "Description",
+            "Result"
+          ],
+          [
+            "M1",
+            "A fairly long description of method 1 that wraps across multiple lines within the cell",
+            "North outcome 1"
+          ],
+          [
+            "M2",
+            "A fairly long description of method 2 that wraps across multiple lines within the cell",
+            "North outcome 2"
+          ],
+          [
+            "M3",
+            "A fairly long description of method 3 that wraps across multiple lines within the cell",
+            "Alpha outcome 3"
+          ],
+          [
+            "M4",
+            "A fairly long description of method 4 that wraps across multiple lines within the cell",
+            "Shale outcome 4"
+          ],
+          [
+            "M5",
+            "A fairly long description of method 5 that wraps across multiple lines within the cell",
+            "Olivine outcome 5"
+          ]
+        ],
+        "style": "multiline",
+        "has_header": true,
+        "complex": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_17_cmplx_nested.pdf": {
+    "tables": [
+      {
+        "rows": 8,
+        "cols": 5,
+        "cells": [
+          [
+            "",
+            "Phase 1",
+            "",
+            "Phase 2",
+            ""
+          ],
+          [
+            "ID",
+            "Min",
+            "Max",
+            "Min",
+            "Max"
+          ],
+          [
+            "R1",
+            "22",
+            "18",
+            "5",
+            "50"
+          ],
+          [
+            "R2",
+            "18",
+            "23",
+            "42",
+            "33"
+          ],
+          [
+            "R3",
+            "26",
+            "44",
+            "35",
+            "22"
+          ],
+          [
+            "R4",
+            "2",
+            "8",
+            "17",
+            "12"
+          ],
+          [
+            "R5",
+            "38",
+            "17",
+            "3",
+            "7"
+          ],
+          [
+            "R6",
+            "39",
+            "28",
+            "23",
+            "47"
+          ]
+        ],
+        "style": "nested_header",
+        "has_header": true,
+        "complex": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_18_cmplx_sparse.pdf": {
+    "tables": [
+      {
+        "rows": 7,
+        "cols": 5,
+        "cells": [
+          [
+            "Item",
+            "Q1",
+            "Q2",
+            "Q3",
+            "Q4"
+          ],
+          [
+            "Item1",
+            "",
+            "",
+            "",
+            "50"
+          ],
+          [
+            "Item2",
+            "87",
+            "",
+            "",
+            ""
+          ],
+          [
+            "Item3",
+            "",
+            "59",
+            "",
+            ""
+          ],
+          [
+            "Item4",
+            "42",
+            "",
+            "",
+            ""
+          ],
+          [
+            "Item5",
+            "65",
+            "",
+            "",
+            ""
+          ],
+          [
+            "Item6",
+            "",
+            "76",
+            "",
+            ""
+          ]
+        ],
+        "style": "sparse",
+        "has_header": true,
+        "complex": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_19_cmplx_wide.pdf": {
+    "tables": [
+      {
+        "rows": 7,
+        "cols": 9,
+        "cells": [
+          [
+            "C0",
+            "C1",
+            "C2",
+            "C3",
+            "C4",
+            "C5",
+            "C6",
+            "C7",
+            "C8"
+          ],
+          [
+            "47",
+            "56",
+            "9",
+            "86",
+            "43",
+            "80",
+            "41",
+            "85",
+            "16"
+          ],
+          [
+            "93",
+            "39",
+            "65",
+            "40",
+            "86",
+            "53",
+            "42",
+            "52",
+            "90"
+          ],
+          [
+            "38",
+            "71",
+            "17",
+            "25",
+            "54",
+            "86",
+            "49",
+            "87",
+            "96"
+          ],
+          [
+            "23",
+            "79",
+            "73",
+            "39",
+            "52",
+            "71",
+            "1",
+            "39",
+            "37"
+          ],
+          [
+            "27",
+            "56",
+            "75",
+            "78",
+            "84",
+            "42",
+            "60",
+            "57",
+            "57"
+          ],
+          [
+            "87",
+            "28",
+            "66",
+            "61",
+            "95",
+            "22",
+            "85",
+            "11",
+            "37"
+          ]
+        ],
+        "style": "wide9",
+        "has_header": true,
+        "complex": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_20_cmplx_borderless_merged.pdf": {
+    "tables": [
+      {
+        "rows": 8,
+        "cols": 3,
+        "cells": [
+          [
+            "Results Summary",
+            "",
+            ""
+          ],
+          [
+            "Sample",
+            "Mean",
+            "StdDev"
+          ],
+          [
+            "X1",
+            "1.2",
+            "0.1"
+          ],
+          [
+            "X2",
+            "2.2",
+            "0.2"
+          ],
+          [
+            "X3",
+            "3.2",
+            "0.3"
+          ],
+          [
+            "X4",
+            "4.2",
+            "0.4"
+          ],
+          [
+            "X5",
+            "5.2",
+            "0.5"
+          ],
+          [
+            "X6",
+            "6.2",
+            "0.6"
+          ]
+        ],
+        "style": "borderless_merged",
+        "has_header": true,
+        "complex": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_21_cmplx_in_twocol.pdf": {
+    "tables": [
+      {
+        "rows": 7,
+        "cols": 3,
+        "cells": [
+          [
+            "Name",
+            "Region",
+            "Samples"
+          ],
+          [
+            "Zone1",
+            "680.9",
+            "344.1"
+          ],
+          [
+            "North2",
+            "689.4",
+            "231.3"
+          ],
+          [
+            "Basalt3",
+            "26.0",
+            "251.7"
+          ],
+          [
+            "Gamma4",
+            "467.6",
+            "908.9"
+          ],
+          [
+            "Shale5",
+            "736.6",
+            "507.6"
+          ],
+          [
+            "North6",
+            "152.0",
+            "915.1"
+          ]
+        ],
+        "style": "in_twocol",
+        "has_header": true,
+        "complex": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_22_neg_prose.pdf": {
     "tables": [],
     "is_negative": true
   },
-  "tbl_15_neg_list.pdf": {
+  "tbl_23_neg_list.pdf": {
     "tables": [],
     "is_negative": true
   },
-  "tbl_16_neg_headings.pdf": {
+  "tbl_24_neg_headings.pdf": {
     "tables": [],
     "is_negative": true
   },
-  "tbl_17_neg_twocol_prose.pdf": {
+  "tbl_25_neg_twocol_prose.pdf": {
     "tables": [],
     "is_negative": true
   },
-  "tbl_18_neg_labelvalue.pdf": {
+  "tbl_26_neg_labelvalue.pdf": {
     "tables": [],
     "is_negative": true
   }
