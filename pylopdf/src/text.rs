@@ -14,6 +14,9 @@ struct FontInfo {
     /// Glyph advance widths in 1000-em units, keyed by code/CID.
     widths: HashMap<u32, f32>,
     default_width: f32,
+    bold: bool,
+    italic: bool,
+    mono: bool,
 }
 
 fn obj_i64(o: &Object) -> Option<i64> {
@@ -123,7 +126,41 @@ fn build_fonts(doc: &Document, page_id: ObjectId, raw: &[u8]) -> HashMap<Vec<u8>
             }
         }
 
-        out.insert(name, FontInfo { two_byte, to_unicode, widths, default_width });
+        // Style flags from BaseFont name + FontDescriptor /Flags.
+        let basefont = dict
+            .get(b"BaseFont")
+            .and_then(|o| o.as_name())
+            .map(|n| String::from_utf8_lossy(n).to_lowercase())
+            .unwrap_or_default();
+        let descriptor = dict
+            .get(b"FontDescriptor")
+            .ok()
+            .and_then(|o| deref(doc, o))
+            .or_else(|| {
+                dict.get(b"DescendantFonts")
+                    .ok()
+                    .and_then(|o| deref(doc, o))
+                    .and_then(|o| o.as_array().ok())
+                    .and_then(|a| a.first())
+                    .and_then(|o| deref(doc, o))
+                    .and_then(|o| o.as_dict().ok())
+                    .and_then(|dd| dd.get(b"FontDescriptor").ok())
+                    .and_then(|o| deref(doc, o))
+            })
+            .and_then(|o| o.as_dict().ok());
+        let flags = descriptor.and_then(|d| d.get(b"Flags").ok()).and_then(obj_i64).unwrap_or(0);
+        let bold = basefont.contains("bold") || (flags & 0x40000) != 0;
+        let italic =
+            basefont.contains("italic") || basefont.contains("oblique") || (flags & 0x40) != 0;
+        let mono = basefont.contains("mono")
+            || basefont.contains("courier")
+            || basefont.contains("consol")
+            || (flags & 0x1) != 0;
+
+        out.insert(
+            name,
+            FontInfo { two_byte, to_unicode, widths, default_width, bold, italic, mono },
+        );
     }
     out
 }
@@ -392,6 +429,9 @@ pub struct Span {
     pub size: f32,
     pub width: f32,
     pub text: String,
+    pub bold: bool,
+    pub italic: bool,
+    pub mono: bool,
 }
 
 fn num(o: &Object) -> f32 {
@@ -418,7 +458,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
     let mut tw = 0.0f32; // word spacing
     let mut cur: Option<&FontInfo> = None;
 
-    let mut emit = |tm: &Mat, size: f32, width: f32, s: String| {
+    let mut emit = |tm: &Mat, size: f32, width: f32, style: (bool, bool, bool), s: String| {
         if !s.is_empty() {
             spans.push(Span {
                 x: tm.e,
@@ -426,6 +466,9 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
                 size: size.abs().max(1.0),
                 width: width.abs(),
                 text: s,
+                bold: style.0,
+                italic: style.1,
+                mono: style.2,
             });
         }
     };
@@ -476,7 +519,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
                 if let Some(Object::String(s, _)) = o.first() {
                     let mut t = String::new();
                     let w = decode_string(s, cur, size, tc, tw, &mut t);
-                    emit(&tm, size * tm.d, w, t);
+                    emit(&tm, size * tm.d, w, cur.map(|f| (f.bold, f.italic, f.mono)).unwrap_or((false, false, false)), t);
                 }
             }
             "'" | "\"" => {
@@ -485,7 +528,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
                 if let Some(Object::String(s, _)) = o.last() {
                     let mut t = String::new();
                     let w = decode_string(s, cur, size, tc, tw, &mut t);
-                    emit(&tm, size * tm.d, w, t);
+                    emit(&tm, size * tm.d, w, cur.map(|f| (f.bold, f.italic, f.mono)).unwrap_or((false, false, false)), t);
                 }
             }
             "TJ" => {
@@ -511,7 +554,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
                             _ => {}
                         }
                     }
-                    emit(&tm, size * tm.d, w, t);
+                    emit(&tm, size * tm.d, w, cur.map(|f| (f.bold, f.italic, f.mono)).unwrap_or((false, false, false)), t);
                 }
             }
             _ => {}
