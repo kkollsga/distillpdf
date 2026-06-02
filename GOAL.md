@@ -1,5 +1,12 @@
 # 🎯 Project Goal — `pylopdf` (working name)
 
+> **v1 STATUS (2026-06-02): SHIPPED & accepted.** All 4 pillars (text/images/fonts/tables)
+> working; CID fonts solved; mean recall 0.982 / median 0.993 vs PyMuPDF; ~1.8× faster than
+> pdf_oxide; small MIT wheel. Per user decision, the residual diacritics gap (embedded
+> font-program glyphs like ț/ș) is **accepted for now, deferred** — revisit with an embedded
+> Type1/CFF font-program decoder later. See `PROGRESS.md` and `bench/REPORT.md`.
+
+
 > A feature-complete, pure-Rust **PyMuPDF competitor** for Python, built on **lopdf** as
 > the parsing backend, exposed via **PyO3 + maturin**. Clean-room ("greenroom") build that
 > uses **pdf-inspector** and **pdf_oxide** as *architectural inspiration*, not copied code.

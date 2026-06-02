@@ -153,3 +153,8 @@ feature (the thing estimated as person-months at project start). Options: (a) bu
 ## Notes
 - lopdf 0.36 lacks `get_page_images` (added later upstream) — bump when doing #3.
 - lopdf parsed romanian where oxidize-pdf's own parser failed — backend choice validated.
+
+## v1 SHIPPED (accepted 2026-06-02)
+All 4 pillars working; mean recall 0.982 / median 0.993 vs PyMuPDF; ~1.8x faster than
+pdf_oxide; small MIT wheel. Diacritics font-program gap accepted/deferred (needs embedded
+Type1/CFF decoder). Final comparison in bench/REPORT.md; usage in pylopdf/README.md.
