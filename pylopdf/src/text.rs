@@ -307,8 +307,15 @@ fn push_norm(out: &mut String, ch: char) {
 }
 
 /// Decode a show-string into `out` and return the horizontal advance in points
-/// (font widths applied at `size`).
-fn decode_string(bytes: &[u8], font: Option<&FontInfo>, size: f32, out: &mut String) -> f32 {
+/// (font widths + char-spacing `tc` + word-spacing `tw`, applied at `size`).
+fn decode_string(
+    bytes: &[u8],
+    font: Option<&FontInfo>,
+    size: f32,
+    tc: f32,
+    tw: f32,
+    out: &mut String,
+) -> f32 {
     let mut adv = 0.0f32;
     match font {
         Some(fi) => {
@@ -333,14 +340,18 @@ fn decode_string(bytes: &[u8], font: Option<&FontInfo>, size: f32, out: &mut Str
                     }
                 }
                 let w = fi.widths.get(&code).copied().unwrap_or(fi.default_width);
-                adv += w / 1000.0 * size;
+                adv += w / 1000.0 * size + tc;
+                // PDF word spacing applies to single-byte code 32 only.
+                if !fi.two_byte && code == 32 {
+                    adv += tw;
+                }
                 i += step;
             }
         }
         None => {
             for &b in bytes {
                 push_norm(out, b as char);
-                adv += 0.5 * size;
+                adv += 0.5 * size + tc + if b == 32 { tw } else { 0.0 };
             }
         }
     }
@@ -403,6 +414,8 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
     let mut tlm = Mat::ID;
     let mut leading = 0.0f32;
     let mut size = 0.0f32;
+    let mut tc = 0.0f32; // char spacing
+    let mut tw = 0.0f32; // word spacing
     let mut cur: Option<&FontInfo> = None;
 
     let mut emit = |tm: &Mat, size: f32, width: f32, s: String| {
@@ -453,6 +466,8 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
                 tm = tlm;
             }
             "TL" if !o.is_empty() => leading = num(&o[0]),
+            "Tc" if !o.is_empty() => tc = num(&o[0]),
+            "Tw" if !o.is_empty() => tw = num(&o[0]),
             "T*" => {
                 tlm = Mat::translate(0.0, -leading).mul(tlm);
                 tm = tlm;
@@ -460,7 +475,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
             "Tj" => {
                 if let Some(Object::String(s, _)) = o.first() {
                     let mut t = String::new();
-                    let w = decode_string(s, cur, size, &mut t);
+                    let w = decode_string(s, cur, size, tc, tw, &mut t);
                     emit(&tm, size * tm.d, w, t);
                 }
             }
@@ -469,7 +484,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
                 tm = tlm;
                 if let Some(Object::String(s, _)) = o.last() {
                     let mut t = String::new();
-                    let w = decode_string(s, cur, size, &mut t);
+                    let w = decode_string(s, cur, size, tc, tw, &mut t);
                     emit(&tm, size * tm.d, w, t);
                 }
             }
@@ -479,7 +494,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
                     let mut w = 0.0f32;
                     for el in arr {
                         match el {
-                            Object::String(s, _) => w += decode_string(s, cur, size, &mut t),
+                            Object::String(s, _) => w += decode_string(s, cur, size, tc, tw, &mut t),
                             // numeric kern: subtract advance (units/1000 * size).
                             Object::Integer(n) => {
                                 w -= *n as f32 / 1000.0 * size;
