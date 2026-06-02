@@ -1,0 +1,799 @@
+{
+  "tbl_00_grid_3x6.pdf": {
+    "tables": [
+      {
+        "rows": 6,
+        "cols": 3,
+        "cells": [
+          [
+            "Name",
+            "Region",
+            "Samples"
+          ],
+          [
+            "Delta1",
+            "Alpha1",
+            "760.4"
+          ],
+          [
+            "North2",
+            "North2",
+            "143.1"
+          ],
+          [
+            "Unit3",
+            "Gamma3",
+            "605.6"
+          ],
+          [
+            "Beta4",
+            "Alpha4",
+            "96.3"
+          ],
+          [
+            "North5",
+            "Zone5",
+            "617.0"
+          ]
+        ],
+        "style": "grid",
+        "has_header": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_01_box_3x6.pdf": {
+    "tables": [
+      {
+        "rows": 6,
+        "cols": 3,
+        "cells": [
+          [
+            "Name",
+            "Region",
+            "Samples"
+          ],
+          [
+            "Unit1",
+            "Shale1",
+            "734.8"
+          ],
+          [
+            "Feldspar2",
+            "North2",
+            "460.9"
+          ],
+          [
+            "South3",
+            "Alpha3",
+            "778.2"
+          ],
+          [
+            "Feldspar4",
+            "West4",
+            "285.2"
+          ],
+          [
+            "Shale5",
+            "West5",
+            "105.1"
+          ]
+        ],
+        "style": "box",
+        "has_header": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_02_hrules_3x6.pdf": {
+    "tables": [
+      {
+        "rows": 6,
+        "cols": 3,
+        "cells": [
+          [
+            "Name",
+            "Region",
+            "Samples"
+          ],
+          [
+            "Olivine1",
+            "Delta1",
+            "368.5"
+          ],
+          [
+            "South2",
+            "Beta2",
+            "748.7"
+          ],
+          [
+            "Unit3",
+            "Delta3",
+            "997.6"
+          ],
+          [
+            "Gamma4",
+            "Unit4",
+            "301.9"
+          ],
+          [
+            "Quartz5",
+            "Layer5",
+            "197.1"
+          ]
+        ],
+        "style": "hrules",
+        "has_header": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_03_header_shaded_3x6.pdf": {
+    "tables": [
+      {
+        "rows": 6,
+        "cols": 3,
+        "cells": [
+          [
+            "Name",
+            "Region",
+            "Samples"
+          ],
+          [
+            "Beta1",
+            "North1",
+            "792.4"
+          ],
+          [
+            "Gamma2",
+            "North2",
+            "888.1"
+          ],
+          [
+            "Olivine3",
+            "South3",
+            "465.5"
+          ],
+          [
+            "Granite4",
+            "Quartz4",
+            "364.3"
+          ],
+          [
+            "South5",
+            "Gamma5",
+            "624.2"
+          ]
+        ],
+        "style": "header_shaded",
+        "has_header": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_04_borderless_3x6.pdf": {
+    "tables": [
+      {
+        "rows": 6,
+        "cols": 3,
+        "cells": [
+          [
+            "Name",
+            "Region",
+            "Samples"
+          ],
+          [
+            "Unit1",
+            "North1",
+            "168.7"
+          ],
+          [
+            "Olivine2",
+            "South2",
+            "948.8"
+          ],
+          [
+            "North3",
+            "West3",
+            "864.0"
+          ],
+          [
+            "North4",
+            "Beta4",
+            "825.5"
+          ],
+          [
+            "Olivine5",
+            "South5",
+            "68.3"
+          ]
+        ],
+        "style": "borderless",
+        "has_header": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_05_grid_2col.pdf": {
+    "tables": [
+      {
+        "rows": 8,
+        "cols": 2,
+        "cells": [
+          [
+            "Name",
+            "Region"
+          ],
+          [
+            "Layer1",
+            "West1"
+          ],
+          [
+            "Shale2",
+            "Calcite2"
+          ],
+          [
+            "Olivine3",
+            "Pyrite3"
+          ],
+          [
+            "Basalt4",
+            "South4"
+          ],
+          [
+            "Basalt5",
+            "North5"
+          ],
+          [
+            "Unit6",
+            "Unit6"
+          ],
+          [
+            "South7",
+            "Layer7"
+          ]
+        ],
+        "style": "grid",
+        "has_header": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_06_grid_5col.pdf": {
+    "tables": [
+      {
+        "rows": 8,
+        "cols": 5,
+        "cells": [
+          [
+            "Name",
+            "Region",
+            "Samples",
+            "Depth m",
+            "Grade %"
+          ],
+          [
+            "Feldspar1",
+            "Layer1",
+            "409.5",
+            "225.2",
+            "522.7"
+          ],
+          [
+            "Gamma2",
+            "Beta2",
+            "882.1",
+            "157.2",
+            "812.6"
+          ],
+          [
+            "Gamma3",
+            "Olivine3",
+            "391.9",
+            "480.8",
+            "258.8"
+          ],
+          [
+            "Alpha4",
+            "Delta4",
+            "699.8",
+            "769.4",
+            "788.5"
+          ],
+          [
+            "Delta5",
+            "East5",
+            "446.2",
+            "465.0",
+            "977.4"
+          ],
+          [
+            "Zone6",
+            "Granite6",
+            "520.1",
+            "892.4",
+            "862.8"
+          ],
+          [
+            "Shale7",
+            "Basalt7",
+            "383.2",
+            "553.8",
+            "941.0"
+          ]
+        ],
+        "style": "grid",
+        "has_header": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_07_borderless_2col.pdf": {
+    "tables": [
+      {
+        "rows": 8,
+        "cols": 2,
+        "cells": [
+          [
+            "Name",
+            "Region"
+          ],
+          [
+            "West1",
+            "Calcite1"
+          ],
+          [
+            "Alpha2",
+            "Delta2"
+          ],
+          [
+            "Quartz3",
+            "East3"
+          ],
+          [
+            "North4",
+            "Beta4"
+          ],
+          [
+            "North5",
+            "Layer5"
+          ],
+          [
+            "Gamma6",
+            "Gamma6"
+          ],
+          [
+            "Calcite7",
+            "Gamma7"
+          ]
+        ],
+        "style": "borderless",
+        "has_header": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_08_borderless_5col.pdf": {
+    "tables": [
+      {
+        "rows": 8,
+        "cols": 5,
+        "cells": [
+          [
+            "Name",
+            "Region",
+            "Samples",
+            "Depth m",
+            "Grade %"
+          ],
+          [
+            "Unit1",
+            "Basalt1",
+            "132.7",
+            "970.8",
+            "170.4"
+          ],
+          [
+            "Zone2",
+            "Feldspar2",
+            "988.3",
+            "952.8",
+            "774.3"
+          ],
+          [
+            "East3",
+            "Olivine3",
+            "688.5",
+            "449.8",
+            "463.1"
+          ],
+          [
+            "North4",
+            "North4",
+            "66.5",
+            "22.9",
+            "568.3"
+          ],
+          [
+            "Layer5",
+            "North5",
+            "8.1",
+            "725.0",
+            "235.1"
+          ],
+          [
+            "Beta6",
+            "West6",
+            "73.8",
+            "244.4",
+            "686.7"
+          ],
+          [
+            "Shale7",
+            "Unit7",
+            "136.9",
+            "591.7",
+            "249.7"
+          ]
+        ],
+        "style": "borderless",
+        "has_header": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_09_grid_large.pdf": {
+    "tables": [
+      {
+        "rows": 20,
+        "cols": 4,
+        "cells": [
+          [
+            "Name",
+            "Region",
+            "Samples",
+            "Depth m"
+          ],
+          [
+            "Feldspar1",
+            "Shale1",
+            "97.1",
+            "675.6"
+          ],
+          [
+            "Quartz2",
+            "Feldspar2",
+            "421.7",
+            "885.0"
+          ],
+          [
+            "Delta3",
+            "Beta3",
+            "413.5",
+            "820.1"
+          ],
+          [
+            "North4",
+            "Shale4",
+            "195.8",
+            "460.2"
+          ],
+          [
+            "Feldspar5",
+            "Granite5",
+            "286.7",
+            "256.1"
+          ],
+          [
+            "Pyrite6",
+            "Unit6",
+            "101.0",
+            "668.8"
+          ],
+          [
+            "Alpha7",
+            "Gamma7",
+            "949.3",
+            "171.6"
+          ],
+          [
+            "Calcite8",
+            "Calcite8",
+            "219.6",
+            "925.0"
+          ],
+          [
+            "Granite9",
+            "Olivine9",
+            "3.6",
+            "272.7"
+          ],
+          [
+            "East10",
+            "Feldspar10",
+            "714.8",
+            "678.7"
+          ],
+          [
+            "Basalt11",
+            "Shale11",
+            "304.3",
+            "992.0"
+          ],
+          [
+            "Layer12",
+            "Unit12",
+            "63.5",
+            "59.0"
+          ],
+          [
+            "Layer13",
+            "Calcite13",
+            "515.8",
+            "162.0"
+          ],
+          [
+            "Zone14",
+            "Gamma14",
+            "872.2",
+            "71.9"
+          ],
+          [
+            "Gamma15",
+            "North15",
+            "414.1",
+            "965.9"
+          ],
+          [
+            "North16",
+            "Layer16",
+            "609.0",
+            "635.1"
+          ],
+          [
+            "Feldspar17",
+            "Layer17",
+            "579.8",
+            "324.4"
+          ],
+          [
+            "Shale18",
+            "West18",
+            "245.4",
+            "406.2"
+          ],
+          [
+            "East19",
+            "Pyrite19",
+            "324.1",
+            "10.7"
+          ]
+        ],
+        "style": "grid",
+        "has_header": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_10_grid_in_prose.pdf": {
+    "tables": [
+      {
+        "rows": 6,
+        "cols": 3,
+        "cells": [
+          [
+            "Name",
+            "Region",
+            "Samples"
+          ],
+          [
+            "Layer1",
+            "Delta1",
+            "76.8"
+          ],
+          [
+            "Shale2",
+            "Zone2",
+            "272.2"
+          ],
+          [
+            "Quartz3",
+            "Gamma3",
+            "901.3"
+          ],
+          [
+            "Quartz4",
+            "East4",
+            "162.7"
+          ],
+          [
+            "Unit5",
+            "East5",
+            "627.8"
+          ]
+        ],
+        "style": "grid",
+        "has_header": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_11_borderless_in_prose.pdf": {
+    "tables": [
+      {
+        "rows": 6,
+        "cols": 3,
+        "cells": [
+          [
+            "Name",
+            "Region",
+            "Samples"
+          ],
+          [
+            "Alpha1",
+            "Unit1",
+            "307.1"
+          ],
+          [
+            "Basalt2",
+            "South2",
+            "119.1"
+          ],
+          [
+            "Unit3",
+            "Basalt3",
+            "279.4"
+          ],
+          [
+            "Shale4",
+            "West4",
+            "209.4"
+          ],
+          [
+            "Zone5",
+            "Calcite5",
+            "258.0"
+          ]
+        ],
+        "style": "borderless",
+        "has_header": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_12_two_tables.pdf": {
+    "tables": [
+      {
+        "rows": 5,
+        "cols": 3,
+        "cells": [
+          [
+            "Name",
+            "Region",
+            "Samples"
+          ],
+          [
+            "Gamma1",
+            "Feldspar1",
+            "850.4"
+          ],
+          [
+            "Beta2",
+            "Alpha2",
+            "342.2"
+          ],
+          [
+            "South3",
+            "Granite3",
+            "760.7"
+          ],
+          [
+            "Unit4",
+            "Feldspar4",
+            "575.0"
+          ]
+        ],
+        "style": "grid",
+        "has_header": true
+      },
+      {
+        "rows": 5,
+        "cols": 2,
+        "cells": [
+          [
+            "Name",
+            "Region"
+          ],
+          [
+            "Delta1",
+            "Gamma1"
+          ],
+          [
+            "Basalt2",
+            "Unit2"
+          ],
+          [
+            "Beta3",
+            "Quartz3"
+          ],
+          [
+            "Layer4",
+            "Unit4"
+          ]
+        ],
+        "style": "header_shaded",
+        "has_header": true
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_13_grid_noheader.pdf": {
+    "tables": [
+      {
+        "rows": 6,
+        "cols": 4,
+        "cells": [
+          [
+            "Basalt1",
+            "Feldspar1",
+            "131.0",
+            "316.5"
+          ],
+          [
+            "Beta2",
+            "Quartz2",
+            "216.3",
+            "683.1"
+          ],
+          [
+            "Quartz3",
+            "Unit3",
+            "906.6",
+            "998.9"
+          ],
+          [
+            "Basalt4",
+            "North4",
+            "886.2",
+            "820.2"
+          ],
+          [
+            "Feldspar5",
+            "Alpha5",
+            "184.5",
+            "802.6"
+          ],
+          [
+            "North6",
+            "South6",
+            "164.1",
+            "392.0"
+          ]
+        ],
+        "style": "grid",
+        "has_header": false
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_14_neg_prose.pdf": {
+    "tables": [],
+    "is_negative": true
+  },
+  "tbl_15_neg_list.pdf": {
+    "tables": [],
+    "is_negative": true
+  },
+  "tbl_16_neg_headings.pdf": {
+    "tables": [],
+    "is_negative": true
+  },
+  "tbl_17_neg_twocol_prose.pdf": {
+    "tables": [],
+    "is_negative": true
+  },
+  "tbl_18_neg_labelvalue.pdf": {
+    "tables": [],
+    "is_negative": true
+  }
+}
