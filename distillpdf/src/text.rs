@@ -808,6 +808,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
     let mut size = 0.0f32;
     let mut tc = 0.0f32; // char spacing
     let mut tw = 0.0f32; // word spacing
+    let mut ts = 0.0f32; // text rise (Ts): baseline shift in text space — sub/superscripts
     let mut cur: Option<&FontInfo> = None;
     let mut ctm = Mat::ID; // graphics CTM (q/Q/cm) — needed for rotated/transformed text
     let mut cstack: Vec<Mat> = Vec::new();
@@ -906,6 +907,11 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
             "TL" if !o.is_empty() => leading = num(&o[0]),
             "Tc" if !o.is_empty() => tc = num(&o[0]),
             "Tw" if !o.is_empty() => tw = num(&o[0]),
+            // Text rise (Ts): baseline shift in text space for sub/superscripts. It
+            // persists across BT/ET like the other text-state params and is carried into
+            // each word matrix above as a y-offset, so a raised/lowered glyph lands off
+            // the line baseline where the HTML layer recognises it as <sup>/<sub>.
+            "Ts" if !o.is_empty() => ts = num(&o[0]),
             "T*" => {
                 tlm = Mat::translate(0.0, -leading).mul(tlm);
                 tm = tlm;
@@ -915,7 +921,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
                     let style = cur.map(|f| (f.bold, f.italic, f.mono)).unwrap_or((false, false, false));
                     let (words, total) = decode_words(&[Show::Str(s)], cur, size, tc, tw);
                     for wd in words {
-                        let wtm = Mat::translate(wd.x_off, 0.0).mul(tm);
+                        let wtm = Mat::translate(wd.x_off, ts).mul(tm);
                         emit(&wtm, &ctm, size, wd.width, style, wd.text);
                     }
                     tm = Mat::translate(total, 0.0).mul(tm);
@@ -928,7 +934,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
                     let style = cur.map(|f| (f.bold, f.italic, f.mono)).unwrap_or((false, false, false));
                     let (words, total) = decode_words(&[Show::Str(s)], cur, size, tc, tw);
                     for wd in words {
-                        let wtm = Mat::translate(wd.x_off, 0.0).mul(tm);
+                        let wtm = Mat::translate(wd.x_off, ts).mul(tm);
                         emit(&wtm, &ctm, size, wd.width, style, wd.text);
                     }
                     tm = Mat::translate(total, 0.0).mul(tm);
@@ -948,7 +954,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
                     let style = cur.map(|f| (f.bold, f.italic, f.mono)).unwrap_or((false, false, false));
                     let (words, total) = decode_words(&elems, cur, size, tc, tw);
                     for wd in words {
-                        let wtm = Mat::translate(wd.x_off, 0.0).mul(tm);
+                        let wtm = Mat::translate(wd.x_off, ts).mul(tm);
                         emit(&wtm, &ctm, size, wd.width, style, wd.text);
                     }
                     tm = Mat::translate(total, 0.0).mul(tm);

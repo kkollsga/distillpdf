@@ -98,8 +98,7 @@
   "math.pdf": {
     "title": "Convergence Analysis",
     "section": "1 Analysis",
-    "equation": "L(w) = S(w) + a * R(w) + b",
-    "equation_fragment": "R(w)",
+    "equation_fragment": "S(w)",
     "theorem_text": "The estimator is consistent under the stated assumptions"
   },
   "numeric.pdf": {

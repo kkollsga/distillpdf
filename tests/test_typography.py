@@ -1,10 +1,6 @@
 """Typography on an owned fixture (typography.pdf): accented Latin characters survive
 intact, hyphenation across a line break is rejoined, no control characters leak, and
-sub/superscripts are surfaced (currently xfail — distillpdf doesn't yet recover scripts
-positioned via the PDF text-rise operator that reportlab emits; real-document sub/sup is
-covered by the local corpus math gate)."""
-import pytest
-
+sub/superscripts (positioned via the PDF text-rise operator) are surfaced as <sup>/<sub>."""
 from _fixtures import GT, html, text
 
 NAME = "typography.pdf"
@@ -29,10 +25,6 @@ def test_no_control_characters():
     assert not ctrl, f"control characters leaked: {[hex(ord(c)) for c in ctrl[:5]]}"
 
 
-@pytest.mark.xfail(reason="distillpdf does not yet surface sub/superscripts positioned "
-                          "via the PDF Ts text-rise operator (reportlab's mechanism); "
-                          "real-document sub/sup is covered by the corpus math_no_subsup gate",
-                   strict=False)
 def test_superscript_and_subscript():
     h = html(NAME)
     assert "<sup>" in h, "superscript not surfaced"

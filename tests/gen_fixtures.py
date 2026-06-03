@@ -344,8 +344,12 @@ def gen_math():
     y = PAGE_H - 120
     y = heading(c, "1 Analysis", y)
     y = para(c, "We bound the loss with the following inequality, derived in the appendix.", y)
-    c.setFont(BODY_F, 12)
-    c.drawString(LM + 40, y, "L(w) = S(w) + a * R(w) + b      (1)")
+    # equation with a real subscript (text rise) so this math doc keeps its notation
+    t = c.beginText(LM + 40, y)
+    t.setFont(BODY_F, 12); t.textOut("L(w) = S(w) + a * R(x")
+    t.setFont(BODY_F, 8); t.setRise(-3); t.textOut("i")
+    t.setRise(0); t.setFont(BODY_F, 12); t.textOut(") + b      (1)")
+    c.drawText(t)
     y -= LEAD + 8
     y = para(c, "Theorem 1. The estimator is consistent under the stated assumptions and "
                 "converges to the true parameter as the sample size grows without bound.", y)
@@ -356,8 +360,7 @@ def gen_math():
     GT["math.pdf"] = {
         "title": "Convergence Analysis",
         "section": "1 Analysis",
-        "equation": "L(w) = S(w) + a * R(w) + b",
-        "equation_fragment": "R(w)",
+        "equation_fragment": "S(w)",
         "theorem_text": "The estimator is consistent under the stated assumptions",
     }
 

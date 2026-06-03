@@ -96,12 +96,58 @@ fn lines_of(mut spans: Vec<Span>, links: &[LinkBox]) -> Vec<Line> {
     }
     let avg = spans.iter().map(|s| s.size).sum::<f32>() / spans.len() as f32;
     let band = (avg * 0.6).max(2.0);
+    // A sub/superscript glyph sits a few points off the baseline; left as-is its raised
+    // box floats into the row ABOVE and xy_cut reads it out of order (orphaning a lone
+    // "2" at the start of the next line). For ORDERING only, snap each small offset
+    // glyph onto the baseline of the adjacent base-size glyph it scripts, so it stays
+    // in its own row right beside that glyph. Its sup/sub polarity is still classified
+    // from the ORIGINAL y in the assembly loop below.
+    let base_sz = avg * 0.85;
+    let order_y: Vec<f32> = (0..spans.len())
+        .map(|i| {
+            let s = &spans[i];
+            if s.size >= base_sz {
+                return s.y;
+            }
+            // Only re-base an ISOLATED script (a lone footnote marker / exponent among
+            // base-size text). A small glyph sitting among OTHER small glyphs is part of
+            // a dense math run (stacked sub/superscripts, an inline formula); leaving its
+            // order alone avoids reshuffling equation fragments into spurious lines/lists.
+            let in_cluster = spans.iter().enumerate().any(|(j, t)| {
+                j != i && t.size < base_sz && (t.x - s.x).abs() < avg * 3.0 && (t.y - s.y).abs() < band * 1.5
+            });
+            if in_cluster {
+                return s.y;
+            }
+            let mut best: Option<(f32, f32)> = None; // (|dx|, base baseline y)
+            for (j, t) in spans.iter().enumerate() {
+                if i == j || t.size < base_sz {
+                    continue;
+                }
+                let dy = (s.y - t.y).abs();
+                if dy <= t.size * 0.05 || dy >= t.size * 0.9 {
+                    continue; // not in the sub/superscript offset window
+                }
+                let (s_end, t_end) = (s.x + span_width(s), t.x + span_width(t));
+                let dx = if s.x >= t.x { s.x - t_end } else { t.x - s_end }; // gap to base
+                if dx > t.size * 1.2 {
+                    continue; // not horizontally adjacent to this base glyph
+                }
+                let adx = dx.abs();
+                if best.map_or(true, |(bd, _)| adx < bd) {
+                    best = Some((adx, t.y));
+                }
+            }
+            best.map_or(s.y, |(_, by)| by)
+        })
+        .collect();
     // Order spans column-aware (same XY-cut as the text path) so a visual line is
     // never assembled across a column gutter — left and right columns become
     // separate lines, splitting only between words, never within one.
     let boxes: Vec<text::BBox> = spans
         .iter()
-        .map(|s| (s.x, s.x + span_width(s), s.y, s.y + s.size.max(1.0)))
+        .enumerate()
+        .map(|(i, s)| (s.x, s.x + span_width(s), order_y[i], order_y[i] + s.size.max(1.0)))
         .collect();
     let order = text::xy_cut_order(&boxes, avg.max(1.0));
     let mut lines: Vec<Line> = Vec::new();
