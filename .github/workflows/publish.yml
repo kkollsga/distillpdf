@@ -6,17 +6,17 @@ name: Publish to PyPI
 # wheels + sdist and upload them. An unchanged version is skipped, so the workflow is
 # idempotent — bump the version in Cargo.toml + pyproject.toml to cut a release.
 #
-# Auth: uses the PYPI_API_TOKEN repository secret (a PyPI API token; username is the
-# implicit __token__). To use PyPI Trusted Publishing instead, delete the `password:`
-# line in the publish job, add `permissions: { id-token: write }` and `environment: pypi`
-# to that job, and register this repo + workflow as a trusted publisher on PyPI.
+# Auth: PyPI Trusted Publishing (OIDC) — no secret. The publish job carries
+# `permissions: id-token: write`; register this repo + the `publish.yml` workflow as a
+# trusted publisher on PyPI (https://pypi.org/manage/account/publishing/). If you
+# configured an Environment name there, add a matching `environment:` to the publish job.
 
 on:
   push:
     branches: [main]
     paths-ignore:
       - '**.md'
-      - 'LICENSE'
+      - 'LICENSE*'
   workflow_dispatch:
 
 jobs:
@@ -126,6 +126,11 @@ jobs:
     needs: [check, wheels]
     if: needs.check.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
+    # PyPI Trusted Publishing (OIDC): no secret. id-token: write lets the action mint the
+    # short-lived OIDC token PyPI exchanges for an upload token. If the trusted publisher
+    # on PyPI is configured with an Environment name, add a matching `environment:` here.
+    permissions:
+      id-token: write
     steps:
       - name: Download all wheels
         uses: actions/download-artifact@v4
@@ -140,4 +145,3 @@ jobs:
         with:
           packages-dir: dist
           skip-existing: true
-          password: ${{ secrets.PYPI_API_TOKEN }}
