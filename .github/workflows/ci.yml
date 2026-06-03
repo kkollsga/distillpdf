@@ -23,13 +23,13 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            distillpdf/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('distillpdf/Cargo.toml') }}
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.toml') }}
 
       - name: Build & install distillpdf
         run: |
           python -m pip install --upgrade pip maturin pytest
-          maturin build --release --manifest-path distillpdf/Cargo.toml --out dist
+          maturin build --release --out dist
           pip install dist/*.whl
 
       - name: Run tests

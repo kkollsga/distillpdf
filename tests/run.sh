@@ -18,9 +18,9 @@ if [ "${1:-}" != "--no-build" ]; then
   # leave a stale .so loaded so source edits silently don't take effect). Wheel path is
   # reproducible via the latest-mtime glob.
   "$VENV/bin/pip" -q install maturin pytest >/dev/null 2>&1 || true
-  ( cd "$ROOT/distillpdf" \
+  ( cd "$ROOT" \
     && VIRTUAL_ENV="$VENV" "$VENV/bin/maturin" build --release 2>&1 | grep -iE "error|Built wheel" )
-  WHEEL="$(ls -t "$ROOT/distillpdf/target/wheels/"*.whl | head -1)"
+  WHEEL="$(ls -t "$ROOT/target/wheels/"*.whl | head -1)"
   "$VENV/bin/pip" install -q --force-reinstall --no-deps "$WHEEL" >/dev/null
   "$PY" -c "import distillpdf" || { echo "distillpdf import failed after build"; exit 1; }
 fi

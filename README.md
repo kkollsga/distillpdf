@@ -27,7 +27,7 @@ Not yet on PyPI. Build from source with [maturin](https://www.maturin.rs):
 
 ```bash
 git clone https://github.com/kkollsga/distillpdf
-cd distillpdf/distillpdf
+cd distillpdf
 maturin build --release
 pip install target/wheels/distillpdf-*.whl
 ```
