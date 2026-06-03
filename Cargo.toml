@@ -1,9 +1,13 @@
 [package]
 name = "distillpdf"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 license = "MIT"
 description = "Pure-Rust PDF extraction (text/tables/figures/fonts) that distills documents into clean, LLM-ready HTML — on lopdf, for Python"
+repository = "https://github.com/kkollsga/distillpdf"
+homepage = "https://github.com/kkollsga/distillpdf"
+keywords = ["pdf", "extraction", "llm", "rag", "lopdf"]
+categories = ["text-processing", "parser-implementations"]
 
 [lib]
 name = "distillpdf"

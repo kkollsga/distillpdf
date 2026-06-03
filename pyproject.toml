@@ -4,14 +4,54 @@ build-backend = "maturin"
 
 [project]
 name = "distillpdf"
-version = "0.0.1"
-description = "Pure-Rust PDF extraction that distills documents into clean, LLM-ready HTML, on lopdf"
+version = "0.0.2"
+description = "Pure-Rust PDF extraction that distills documents into clean, LLM-ready HTML — for LLMs and RAG, built on lopdf"
+readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
-classifiers = [
-    "Programming Language :: Rust",
-    "Programming Language :: Python :: Implementation :: CPython",
+authors = [{ name = "kkollsga", email = "kkollsga@gmail.com" }]
+keywords = [
+    "pdf",
+    "pdf-extraction",
+    "pdf-to-html",
+    "pdf-to-text",
+    "pdf-parser",
+    "text-extraction",
+    "table-extraction",
+    "document-parsing",
+    "llm",
+    "rag",
+    "ai",
+    "nlp",
+    "rust",
+    "lopdf",
 ]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Text Processing :: Markup :: HTML",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/kkollsga/distillpdf"
+Repository = "https://github.com/kkollsga/distillpdf"
+Issues = "https://github.com/kkollsga/distillpdf/issues"
+Source = "https://github.com/kkollsga/distillpdf"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
