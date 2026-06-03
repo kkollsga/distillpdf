@@ -1,0 +1,145 @@
+{
+  "headings.pdf": {
+    "title": "Structural Heading Showcase",
+    "headings": [
+      {
+        "text": "Abstract",
+        "tag": "h2"
+      },
+      {
+        "text": "1 Introduction",
+        "tag": "h2"
+      },
+      {
+        "text": "1.1 Background",
+        "tag": "h3"
+      },
+      {
+        "text": "1.1.1 Prior Work",
+        "tag": "h4"
+      },
+      {
+        "text": "2 Methods",
+        "tag": "h2"
+      },
+      {
+        "text": "References",
+        "tag": "h2"
+      }
+    ],
+    "not_headings": [
+      "Smith et al. (2019) demonstrated the approach on several datasets in detail.",
+      "This is an ordinary declarative sentence of body prose that ends with a period.",
+      "We thank J. K. Lee and M. R. Patel for helpful discussions and feedback here."
+    ]
+  },
+  "lists.pdf": {
+    "numbered": [
+      "First ordered step in the procedure.",
+      "Second ordered step in the procedure.",
+      "Third ordered step in the procedure."
+    ],
+    "colon": [
+      "Question one introduced after a colon line.",
+      "Question two introduced after a colon line."
+    ],
+    "wrapped_snippet": "folded back into the same list item",
+    "unordered_items": [
+      "Star-marked alpha is the first unordered item.",
+      "Star-marked beta is the second unordered item.",
+      "Star-marked gamma is the third unordered item.",
+      "Star-marked delta wraps onto a second line so its continuation is folded back into the same list item rather than splitting off as a paragraph."
+    ],
+    "ordered_items": [
+      "First ordered step in the procedure.",
+      "Second ordered step in the procedure.",
+      "Third ordered step in the procedure.",
+      "Question one introduced after a colon line.",
+      "Question two introduced after a colon line."
+    ]
+  },
+  "figures.pdf": {
+    "fig1_caption": "Figure 1: A raster bar chart comparing two measured groups.",
+    "fig2_caption": "Figure 2: A vector line chart with a rotated axis title.",
+    "rotated_label": "Amplitude",
+    "inline_xref": "As shown in Figure 1 the bars differ",
+    "n_figures": 2
+  },
+  "links.pdf": {
+    "uri": "https://example.com/distillpdf",
+    "dest_name": "cite.smith2020",
+    "dest_page": 2,
+    "uri_text": "Visit our project homepage",
+    "internal_text": "Methods section"
+  },
+  "typography.pdf": {
+    "accents": [
+      "caf\u00e9",
+      "r\u00e9sum\u00e9",
+      "na\u00efve",
+      "P\u00e9rez",
+      "fjord"
+    ],
+    "dehyphenated": "automatic",
+    "not_present": "auto- matic",
+    "superscript_base": "mc",
+    "subscript_base": "H"
+  },
+  "twocol.pdf": {
+    "order": [
+      "LEFTONE",
+      "LEFTTWO",
+      "LEFTTHREE",
+      "RIGHTONE",
+      "RIGHTTWO",
+      "RIGHTTHREE"
+    ]
+  },
+  "math.pdf": {
+    "title": "Convergence Analysis",
+    "section": "1 Analysis",
+    "equation": "L(w) = S(w) + a * R(w) + b",
+    "equation_fragment": "R(w)",
+    "theorem_text": "The estimator is consistent under the stated assumptions"
+  },
+  "numeric.pdf": {
+    "header": [
+      "System",
+      "Acc",
+      "F1",
+      "Loss"
+    ],
+    "rows": [
+      [
+        "BaseNet",
+        "84.6",
+        "83.4",
+        "0.21"
+      ],
+      [
+        "WideNet",
+        "88.2",
+        "87.9",
+        "0.18"
+      ],
+      [
+        "DeepNet",
+        "91.5",
+        "90.7",
+        "0.15"
+      ],
+      [
+        "MegaNet",
+        "92.3",
+        "91.8",
+        "0.12"
+      ]
+    ],
+    "decimals": [
+      "84.6",
+      "0.21",
+      "92.3",
+      "0.12"
+    ]
+  }
+}

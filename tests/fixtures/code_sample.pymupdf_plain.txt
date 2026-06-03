@@ -1,9 +1,0 @@
-API Usage
-Install the library and call the parser as shown.
-Example
-import pylopdf
-doc = pylopdf.Pdf.open("file.pdf")
-text = doc.extract_text()
-for t in doc.extract_tables():
-    print(t["n_rows"], t["n_cols"])
-The snippet prints table dimensions for each detected table in the document.

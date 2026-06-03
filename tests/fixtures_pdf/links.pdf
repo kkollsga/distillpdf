@@ -1,0 +1,56 @@
+%PDF-1.5
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /Names << /Dests 8 0 R >> >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 4 0 R /Annots [9 0 R 10 0 R] >>
+endobj
+4 0 obj
+<< /Length 155 >>
+stream
+BT /F1 12 Tf 72 700 Td (Visit our project homepage for downloads and docs.) Tj 0 -22 Td (See the Smith 2020 reference and the Methods section below.) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>
+endobj
+6 0 obj
+<< /Length 142 >>
+stream
+BT /F1 14 Tf 72 720 Td (Methods) Tj /F1 12 Tf 72 690 Td (This destination section is where the cite anchor resolves, not a page number.) Tj ET
+endstream
+endobj
+7 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+8 0 obj
+<< /Names [ (cite.smith2020) [5 0 R /XYZ 72 730 0] ] >>
+endobj
+9 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 696 420 714] /Border [0 0 0] /A << /S /URI /URI (https://example.com/distillpdf) >> >>
+endobj
+10 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 674 420 692] /Border [0 0 0] /A << /S /GoTo /D (cite.smith2020) >> >>
+endobj
+xref
+0 11
+0000000000 65535 f 
+0000000015 00000 n 
+0000000090 00000 n 
+0000000153 00000 n 
+0000000302 00000 n 
+0000000508 00000 n 
+0000000634 00000 n 
+0000000827 00000 n 
+0000000897 00000 n 
+0000000968 00000 n 
+0000001111 00000 n 
+trailer
+<< /Size 11 /Root 1 0 R >>
+startxref
+1238
+%%EOF
