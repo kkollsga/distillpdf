@@ -37,7 +37,7 @@ pip install target/wheels/distillpdf-*.whl
 ```python
 import distillpdf
 
-doc = distillpdf.Pdf.open("paper.pdf")
+doc = distillpdf.open("paper.pdf")   # or distillpdf.from_bytes(data)
 html = doc.to_html()            # clean, semantic HTML for an LLM
 toc  = doc.toc()                # [(level, title, page, id), ...]
 abstract = doc.section("abstract")   # targeted section extraction

@@ -183,9 +183,25 @@ impl Pdf {
     }
 }
 
+/// Open a PDF from a filesystem path — `distillpdf.open("file.pdf")`. A module-level
+/// shorthand for `Pdf.open(...)`.
+#[pyfunction]
+fn open(path: &str) -> PyResult<Pdf> {
+    Pdf::open(path)
+}
+
+/// Open a PDF from raw bytes — `distillpdf.from_bytes(data)`. Shorthand for
+/// `Pdf.from_bytes(...)`.
+#[pyfunction]
+fn from_bytes(data: &[u8]) -> PyResult<Pdf> {
+    Pdf::from_bytes(data)
+}
+
 #[pymodule]
 fn _distillpdf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Pdf>()?;
+    m.add_function(wrap_pyfunction!(open, m)?)?;
+    m.add_function(wrap_pyfunction!(from_bytes, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

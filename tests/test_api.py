@@ -20,6 +20,18 @@ def test_open_and_page_count():
     assert distillpdf.Pdf.open(LINKS).page_count() == 2
 
 
+def test_module_level_open():
+    """The top-level distillpdf.open()/from_bytes() shorthands return a Pdf and match
+    the Pdf.open()/Pdf.from_bytes() classmethods."""
+    doc = distillpdf.open(HEADINGS)
+    assert isinstance(doc, distillpdf.Pdf)
+    assert doc.page_count() == 1
+    assert doc.to_html() == distillpdf.Pdf.open(HEADINGS).to_html()
+    with open(HEADINGS, "rb") as f:
+        data = f.read()
+    assert distillpdf.from_bytes(data).to_html() == distillpdf.Pdf.from_bytes(data).to_html()
+
+
 def test_from_bytes_matches_open():
     with open(HEADINGS, "rb") as f:
         data = f.read()
