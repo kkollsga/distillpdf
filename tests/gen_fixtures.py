@@ -167,6 +167,43 @@ def gen_runin():
     }
 
 
+def gen_footnotes():
+    """Body text followed by a block of footnotes in smaller type at the page bottom —
+    must be gathered into one <aside>, each footnote split on its leading marker, not
+    left as loose body <p>s."""
+    pdf = os.path.join(OUT, "footnotes.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    title(c, "Footnotes Demo")
+    y = PAGE_H - 120
+    bodies = [
+        "This document ends with a block of footnotes set in smaller type at the bottom of "
+        "the page, the way academic papers present them, well clear of the body text above.",
+        "The body text is set at the normal body size, so the smaller footnote block below "
+        "is clearly distinguishable both by its font size and by its position on the page.",
+        "A reader scanning the page sees the main argument first and the supporting "
+        "footnotes, each with its reference marker, gathered together at the very bottom.",
+    ]
+    for b in bodies:
+        y = para(c, b, y, gap=10)
+    foots = [
+        "1  First footnote explains a referenced detail in smaller type.",
+        "2  Second footnote points readers to a related resource for context.",
+        "3  Third footnote adds a final clarifying remark about the method.",
+    ]
+    fy = 120
+    c.setFont("Helvetica", 8)
+    for f in foots:
+        c.drawString(LM, fy, f)
+        fy -= 11
+    c.showPage()
+    c.save()
+    GT["footnotes.pdf"] = {
+        "foot_snippets": ["First footnote explains a referenced detail",
+                          "Second footnote points readers to a related",
+                          "Third footnote adds a final clarifying remark"],
+    }
+
+
 def gen_twolists():
     """Two numbered lists with a real paragraph between them. Regression guard: the
     intervening paragraph must stay its own <p> (not be swallowed into the first list's
@@ -500,6 +537,7 @@ def main():
     gen_headings()
     gen_lists()
     gen_runin()
+    gen_footnotes()
     gen_twolists()
     gen_figures()
     gen_figures_onepage()

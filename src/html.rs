@@ -1015,6 +1015,79 @@ fn table_html(t: &PosTable, cap: Option<(&str, &str, bool)>) -> String {
     }
 }
 
+/// Mark which lines belong to a page-bottom footnote block (see emit_lines). A run of
+/// >=2 consecutive footnote-sized lines (`size < body*0.86`) confined to the bottom ~45%
+/// of the content, capped at 12 lines so a small-font reference list isn't swallowed.
+fn footnote_region_mask(lines: &[&Line], body: f32) -> Vec<bool> {
+    let mut mark = vec![false; lines.len()];
+    if lines.len() < 2 {
+        return mark;
+    }
+    let (lo, hi) = lines.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), l| (a.min(l.y), b.max(l.y)));
+    let bottom_cut = lo + (hi - lo) * 0.45; // footnotes sit below this y
+    let small = |l: &Line| !l.text().trim().is_empty() && l.size < body * 0.86;
+    let mut i = 0;
+    while i < lines.len() {
+        if !small(lines[i]) {
+            i += 1;
+            continue;
+        }
+        let a = i;
+        while i < lines.len() && small(lines[i]) {
+            i += 1;
+        }
+        // lines[a] is the run's first (highest-y) line; require the whole run low on page
+        if (2..=12).contains(&(i - a)) && lines[a].y < bottom_cut {
+            mark[a..i].iter_mut().for_each(|m| *m = true);
+        }
+    }
+    mark
+}
+
+/// Render a footnote block's lines as `<p>` items inside the caller's `<aside>`: a lone
+/// marker number ("1") begins a new footnote and is joined to the definition that
+/// follows ("1." + "https://…"); wrapped continuation lines fold in (de-hyphenated).
+fn emit_footnotes(lines: &[&Line], out: &mut String) {
+    // A footnote begins with its marker number: either a lone "1" line, or a number
+    // glued to the start of the definition ("3In all cases…"). Split the marker off and
+    // begin a new <p>; a line with no leading marker (a wrapped definition line, or a URL
+    // on its own line) continues the current footnote.
+    let lead_marker = |t: &str| -> Option<(String, String)> {
+        let t = t.trim_start();
+        let n: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if n.is_empty() || n.len() > 2 {
+            return None;
+        }
+        let rest = t[n.len()..].trim_start();
+        // lone marker, or a marker glued to text that starts a word/quote (a real
+        // footnote), not a numeric continuation like "4H, i.e., …"
+        if rest.is_empty() || rest.chars().next().is_some_and(|c| c.is_alphabetic() || "“\"'".contains(c)) {
+            Some((n, rest.to_string()))
+        } else {
+            None
+        }
+    };
+    let mut cur = String::new();
+    let flush = |cur: &mut String, out: &mut String| {
+        if !cur.trim().is_empty() {
+            out.push_str(&format!("<p>{}</p>", cur.trim()));
+            cur.clear();
+        }
+    };
+    for l in lines {
+        match lead_marker(&l.text()) {
+            Some((num, rest)) => {
+                flush(&mut cur, out);
+                cur.push_str(&num);
+                cur.push_str(". ");
+                cur.push_str(&rest);
+            }
+            None => append_piece(&mut cur, render_runs(&l.runs).trim()),
+        }
+    }
+    flush(&mut cur, out);
+}
+
 /// Emit a run of consecutive text lines as headings / paragraphs / lists / code.
 fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, out: &mut String) {
     let mut i = 0;
@@ -1038,6 +1111,14 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, out: &mut String) {
     // un-advanced loop here also appends to `out` each turn, so a stall is not a benign
     // CPU spin but unbounded memory growth → OOM. This degrades that whole bug class to
     // at worst one skipped line (which the tests catch), never a machine crash.
+    // Footnote regions: a run of >=2 consecutive footnote-sized lines (visibly smaller
+    // than the body) confined to the BOTTOM of the page is the footnote block. Marked
+    // here and emitted as one <aside> below, instead of loose, fragmented <p>s. Guards:
+    // the run sits in the bottom ~45% (so page-1 affiliations at the top don't qualify),
+    // and is short (<=12 lines, so a small-font reference list — which fills the page —
+    // is not swallowed). An inline subscript doesn't count: its LINE is body-sized.
+    let foot = footnote_region_mask(lines, body);
+
     let mut watchdog = usize::MAX;
     while i < lines.len() {
         if i == watchdog {
@@ -1045,6 +1126,17 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, out: &mut String) {
             continue;
         }
         watchdog = i;
+        if foot[i] {
+            flush_para!();
+            let a = i;
+            while i < lines.len() && foot[i] {
+                i += 1;
+            }
+            out.push_str("<aside>");
+            emit_footnotes(&lines[a..i], out);
+            out.push_str("</aside>");
+            continue;
+        }
         let ln = lines[i];
         let txt = ln.text();
         // header (paragraph-aware: standalone line or bold run-in lead). Checked
@@ -1146,7 +1238,9 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, out: &mut String) {
         i += 1;
         while i < lines.len() {
             let l = lines[i];
-            if l.mono || list_kind(&l.text()).is_some() || detect_header(l, body).is_some() {
+            // Stop the body block at the footnote region so it is emitted as its own
+            // <aside> (handled at the loop top) rather than swallowed into this paragraph.
+            if foot[i] || l.mono || list_kind(&l.text()).is_some() || detect_header(l, body).is_some() {
                 break;
             }
             // Column wrap: reading order goes top-to-bottom within a column, so y

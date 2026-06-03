@@ -63,6 +63,13 @@
     "rejoined": "modular architecture that lets downstream",
     "not_present": "architec- ture"
   },
+  "footnotes.pdf": {
+    "foot_snippets": [
+      "First footnote explains a referenced detail",
+      "Second footnote points readers to a related",
+      "Third footnote adds a final clarifying remark"
+    ]
+  },
   "twolists.pdf": {
     "first": [
       "Initialize the system before starting the run.",
