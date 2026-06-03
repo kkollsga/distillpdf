@@ -58,6 +58,11 @@
       "Question two introduced after a colon line."
     ]
   },
+  "runin.pdf": {
+    "head": "Model Architecture",
+    "rejoined": "modular architecture that lets downstream",
+    "not_present": "architec- ture"
+  },
   "twolists.pdf": {
     "first": [
       "Initialize the system before starting the run.",

@@ -67,6 +67,19 @@ def test_toc_lists_headings():
         assert any(spec["text"] in t for t in titles), f"TOC missing: {spec['text']!r}"
 
 
+def test_runin_head_body_flows_and_dehyphenates():
+    """A bold run-in head becomes its own heading, and the body it introduces flows as
+    ONE paragraph with the line-break hyphen rejoined — not split into the head's
+    leftover fragment plus an orphaned continuation."""
+    g = GT["runin.pdf"]
+    h = html("runin.pdf")
+    heads = [re.sub(r"<[^>]+>", "", m) for m in re.findall(r"<h[1-6]\b[^>]*>.*?</h[1-6]>", h, re.DOTALL)]
+    assert any(g["head"] in t for t in heads), f"run-in head not emitted: {g['head']!r}"
+    t = text(h)
+    assert g["rejoined"] in t, f"run-in body not flowed/dehyphenated: {g['rejoined']!r}"
+    assert g["not_present"] not in t, "line-break hyphen survived in run-in body"
+
+
 def test_section_extraction():
     sec = distillpdf.Pdf.open(os.path.join(FIX, NAME)).section("introduction")
     assert sec, "section('introduction') returned nothing"

@@ -1069,11 +1069,15 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, out: &mut String) {
             };
             out.push_str(&format!("<h{tag}>{}</h{tag}>", render_runs(&ln.runs[..k])));
             if k < ln.runs.len() {
-                // Run-in lead ("Encoder: The encoder …"): the rest of THIS line
-                // begins the body; emit it as a (single) paragraph.
+                // Run-in lead ("Model Architecture BERT's model architec-"): the rest
+                // of THIS line begins the body. Seed the paragraph accumulator with it
+                // (don't close it as its own <p>) so the wrapped continuation on the
+                // next line flows in and a line-break hyphen rejoins ("architec-" +
+                // "ture" → "architecture"). A real paragraph break after it still
+                // flushes via the usual indent/gap rules in the paragraph branch.
                 let rest = render_runs(&ln.runs[k..]);
                 if !rest.trim().is_empty() {
-                    out.push_str(&format!("<p>{}</p>", rest.trim()));
+                    append_piece(&mut para, rest.trim());
                 }
             }
             // Standalone header: consume just the heading line and let the body

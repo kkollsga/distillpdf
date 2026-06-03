@@ -139,6 +139,34 @@ def gen_lists():
     }
 
 
+def gen_runin():
+    """A bold run-in head inline with the body it introduces, where that body wraps with
+    a line-break hyphen. The head must become its own <hN>, and the body must flow as ONE
+    paragraph with the hyphenated word rejoined (not split into the head's leftover <p>
+    plus an orphaned continuation)."""
+    pdf = os.path.join(OUT, "runin.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    title(c, "Run-in Heads")
+    y = PAGE_H - 120
+    y = para(c, "The section below opens with a bold run-in head on the same line as its "
+                "body text, a common style in academic papers.", y)
+    # run-in head (bold) + body on the SAME line, body wraps with a hyphen
+    t = c.beginText(LM, y)
+    t.setFont("Helvetica-Bold", 11); t.textOut("Model Architecture ")
+    t.setFont(BODY_F, BODY_S); t.textOut("the framework uses a modular architec-")
+    c.drawText(t)
+    y -= LEAD
+    c.setFont(BODY_F, BODY_S)
+    c.drawString(LM, y, "ture that lets downstream components be extended and maintained freely.")
+    c.showPage()
+    c.save()
+    GT["runin.pdf"] = {
+        "head": "Model Architecture",
+        "rejoined": "modular architecture that lets downstream",
+        "not_present": "architec- ture",
+    }
+
+
 def gen_twolists():
     """Two numbered lists with a real paragraph between them. Regression guard: the
     intervening paragraph must stay its own <p> (not be swallowed into the first list's
@@ -471,6 +499,7 @@ def gen_numeric():
 def main():
     gen_headings()
     gen_lists()
+    gen_runin()
     gen_twolists()
     gen_figures()
     gen_figures_onepage()
