@@ -18,7 +18,7 @@ ARXIV = [p for p in (glob.glob(os.path.join(HERE, "corpus", "arxiv_*.pdf"))
                      + glob.glob(os.path.join(HERE, "corpus", "attention_*.pdf")))]
 CAP = re.compile(r"(?:^|\n)\s*Table\s+\d+", re.IGNORECASE)
 
-MIN_PRESENCE_RECALL = 0.70
+MIN_PRESENCE_RECALL = 0.95
 
 
 def run():

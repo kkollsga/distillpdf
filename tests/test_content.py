@@ -51,12 +51,12 @@ TARGETS = {
     "figure_render": 0.85,  # each ground-truth figure is actually rendered (img/svg)
 }
 FLOORS = {
-    "table_cells": 0.60,
-    "references": 0.50,
-    "paragraphs": 0.17,
-    "figure_caps": 0.57,
-    "figure_text": 0.40,
-    "figure_render": 0.40,
+    "table_cells": 0.65,
+    "references": 0.57,
+    "paragraphs": 0.50,
+    "figure_caps": 0.70,
+    "figure_text": 0.85,
+    "figure_render": 0.90,
 }
 MAX_TABLE_BLEED = 3      # Phase B: cs_CV 2-col-prose bleed fixed; 3 residual are
                          # fw9 (a dense gov form) — headings absorbed into tables. Target 0.

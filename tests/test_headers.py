@@ -29,9 +29,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Each entry: (label, gt_path, pdf_subdir, {per_file_recall|None, recall, level, precision}).
 GT_SETS = [
     ("tuned", os.path.join(HERE, "header_groundtruth.json"), "corpus",
-     {"per_file_recall": 0.80, "recall": 0.95, "level": 0.85, "precision": 0.55}),
+     {"per_file_recall": 0.80, "recall": 0.97, "level": 0.92, "precision": 0.70}),
     ("held-out", os.path.join(HERE, "header_groundtruth_heldout.json"), "corpus_headers",
-     {"per_file_recall": None, "recall": 0.80, "level": 0.75, "precision": 0.50}),
+     {"per_file_recall": None, "recall": 0.80, "level": 0.77, "precision": 0.70}),
 ]
 
 HTAG = re.compile(r"<h([1-6])\b[^>]*>(.*?)</h\1>", re.DOTALL)  # headings now carry an id= anchor

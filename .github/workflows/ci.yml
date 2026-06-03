@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            distillpdf/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('distillpdf/Cargo.toml') }}
+
+      - name: Build & install distillpdf
+        run: |
+          python -m pip install --upgrade pip maturin pytest
+          maturin build --release --manifest-path distillpdf/Cargo.toml --out dist
+          pip install dist/*.whl
+
+      - name: Run tests
+        # The PDF corpora are gitignored, so corpus-backed tests self-skip on a fresh
+        # clone (see tests/conftest.py); the synthetic-table tests run for real.
+        run: pytest tests/ -q

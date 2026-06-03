@@ -15,7 +15,7 @@ import glob, os, re, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 CORPUS = sorted(glob.glob(os.path.join(HERE, "corpus", "*.pdf"))
                 + glob.glob(os.path.join(HERE, "corpus_headers", "*.pdf")))
-MAX_NUMERIC_TOKENS_PER_SPAN = 3  # a span with more is an un-split table row
+MAX_NUMERIC_TOKENS_PER_SPAN = 1  # a span with more is an un-split table row
 
 NUMERIC = re.compile(r"^[-+]?\d[\d.,/%]*$")
 

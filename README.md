@@ -50,11 +50,14 @@ RAG. Out of scope (for now): page rendering, PDF generation, OCR.
 
 ## Development
 
-The regression and structural-fidelity gates live in [`bench/`](bench/) and need only
-`distillpdf` installed (they read frozen fixtures + a local PDF corpus):
+The test suite lives in [`tests/`](tests/) (pytest) and runs on CI. It needs only
+`distillpdf` installed. The third-party PDF corpora (`tests/corpus*/`) are gitignored, so
+on a fresh clone the corpus-backed tests self-skip and the synthetic-table tests run; with
+the corpora present locally the whole suite runs:
 
 ```bash
-bash bench/gates.sh          # regression gates (must stay green) + goal gates (report)
+bash tests/run.sh        # build distillpdf + run pytest
+pytest tests/ -q         # or just run the tests against an installed build
 ```
 
 ## License

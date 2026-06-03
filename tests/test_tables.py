@@ -17,13 +17,13 @@ GTDIR = os.path.join(HERE, "corpus_tables")
 WORD = re.compile(r"\w+", re.UNICODE)
 
 # Thresholds — set after measuring baseline (see report). Tune in the goal.
-MIN_DETECTION_RECALL = 0.80
+MIN_DETECTION_RECALL = 0.95
 MAX_FALSE_POSITIVES = 0          # tables on negative PDFs
-MIN_COL_ACCURACY = 0.70
-MIN_CELL_RECALL = 0.85
-MIN_COUNT_ACCURACY = 0.70        # PDFs where detected table count == GT count
-MIN_COMPLEX_RECALL = 0.75        # detection recall on COMPLEX/messy tables
-MIN_COMPLEX_CELL = 0.70          # cell-content recall on complex tables
+MIN_COL_ACCURACY = 0.90
+MIN_CELL_RECALL = 0.92
+MIN_COUNT_ACCURACY = 0.90        # PDFs where detected table count == GT count
+MIN_COMPLEX_RECALL = 0.95        # detection recall on COMPLEX/messy tables
+MIN_COMPLEX_CELL = 0.85          # cell-content recall on complex tables
 
 
 def toks(grid):

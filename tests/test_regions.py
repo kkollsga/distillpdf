@@ -18,8 +18,8 @@ CORPUS = sorted(glob.glob(os.path.join(HERE, "corpus", "*.pdf"))
                 + glob.glob(os.path.join(HERE, "corpus_headers", "*.pdf")))
 FIX = os.path.join(HERE, "fixtures")
 
-MIN_FIGURE_COVERAGE = 0.90   # embedded <img> that sit inside a <figure>
-MIN_CAPTION_ATTACH = 0.50    # of corpus Figure N / Table N captions
+MIN_FIGURE_COVERAGE = 0.98   # embedded <img> that sit inside a <figure>
+MIN_CAPTION_ATTACH = 0.70    # of corpus Figure N / Table N captions
 
 CAPTION = re.compile(r"(?:^|\n)\s*(?:Figure|Fig\.|Table)\s+\d+", re.IGNORECASE)
 
