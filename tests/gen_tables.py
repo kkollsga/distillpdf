@@ -171,7 +171,7 @@ def main():
                       f"A fairly long description of method {i+1} that wraps across multiple lines within the cell",
                       f"{random.choice(WORDS)} outcome {i+1}"])
     t, gt = complex_table(cells, [("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold")],
-                          "multiline", colw=1.7*inch)
+                          "multiline", colw=1.7*inch, gridded=False)
     build(f"tbl_{idx:02d}_cmplx_multiline.pdf", [t], [gt]); idx += 1
 
     # C4: nested two-row header (group + sub) + grid
@@ -243,9 +243,14 @@ def main():
     doc.build([Paragraph(PROSE, S["BodyText"]) for _ in range(8)])
     GT[twocol] = {"tables": [], "is_negative": True}
 
-    # HARD negative: aligned label/value lines ("Field N    value") — looks 2-column.
+    # HARD negative: prose that NAMES fields and values inline ("the X field measured N")
+    # as flowing sentences — must read as paragraphs, not be reconstructed into a table.
     build(f"tbl_{idx:02d}_neg_labelvalue.pdf",
-          [Paragraph(f"{random.choice(WORDS)} field {i}:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{random.randint(1,99)}", S["BodyText"]) for i in range(12)],
+          [Paragraph(f"The {random.choice(WORDS).lower()} field at site {i} measured "
+                     f"{random.randint(1,99)} units during the survey, which the team "
+                     f"recorded alongside the surrounding {random.choice(WORDS).lower()} "
+                     f"readings before moving on to the next location.", S["BodyText"])
+           for i in range(12)],
           [], negative=True); idx += 1
 
     with open(os.path.join(OUT, "ground_truth.json"), "w") as f:

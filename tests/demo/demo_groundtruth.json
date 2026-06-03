@@ -35,5 +35,21 @@
     "reconstructs the logical structure of a PDF",
     "fixed layout so its extracted structure is"
   ],
-  "section_probe": "introduction"
+  "section_probe": "introduction",
+  "platypus": {
+    "headings": [
+      "Overview",
+      "Background",
+      "Approach",
+      "Results",
+      "Conclusion"
+    ],
+    "ordered": [
+      "The overview section introduces the platypus layout pipeline and sets the stage.",
+      "Background material explains how each flowable is positioned by a translate transform.",
+      "Our approach reconstructs the reading order directly from the graphics transform.",
+      "Results confirm the blocks are extracted from top to bottom with no content loss.",
+      "In conclusion the cm positioned document reads in exactly the correct order."
+    ]
+  }
 }

@@ -813,18 +813,33 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
     let mut cstack: Vec<Mat> = Vec::new();
 
     let mut emit = |wtm: &Mat, ctm: &Mat, base_size: f32, width: f32, style: (bool, bool, bool), s: String| {
-        // UPRIGHT text keeps its prior computation — position from the text matrix,
-        // height = size × vertical scale — which is correct for the corpus (text is
-        // positioned by Tm/Td; applying the CTM here regressed several docs that carry a
-        // non-identity CTM at text-draw time). Only ROTATED text uses the combined
-        // device matrix: its true position, a magnitude-based height (so a 90° title
-        // isn't dropped by a near-zero `d`), and the baseline angle. Rotation is the
-        // BASELINE angle (atan2(b,a)) — ~0 for italic SKEW, so skewed text stays upright.
+        // Resolve the device position from the text matrix and the graphics CTM.
+        //  - ROTATED text (non-horizontal baseline) uses the full combined matrix: its
+        //    true position, a magnitude-based height (so a 90° title isn't dropped by a
+        //    near-zero `d`), and the baseline angle. (Baseline ~0 for italic SKEW, so
+        //    skewed text stays upright and isn't pulled out of the body/tables.)
+        //  - A PURE-TRANSLATE CTM (a≈d≈1, b≈c≈0) means the text is laid out in a LOCAL
+        //    frame and only moved into place — reportlab/platypus and similar generators
+        //    emit `q [1 0 0 1 tx ty] cm BT … ET Q` per block. Ignoring it collapses every
+        //    block to local coords → scrambled reading order + lost text, so apply the
+        //    translate. (CTM identity is the trivial sub-case: dm == wtm, no change — so
+        //    the common Tm/Td-positioned corpus is byte-identical.)
+        //  - Any OTHER CTM (scale / Y-flip / shear) transforms the whole coordinate
+        //    system; such docs are internally consistent under the text matrix alone and
+        //    re-tuning the whole pipeline to their device coords is a separate effort, so
+        //    they keep the text-matrix position.
         let dm = wtm.mul(*ctm);
         let baseline = dm.b.atan2(dm.a);
         let rotated = baseline.abs() > 0.1;
+        let pure_translate = !rotated
+            && (ctm.a - 1.0).abs() < 1e-3
+            && (ctm.d - 1.0).abs() < 1e-3
+            && ctm.b.abs() < 1e-3
+            && ctm.c.abs() < 1e-3;
         let (x, y, height, angle) = if rotated {
             (dm.e, dm.f, base_size * (dm.c * dm.c + dm.d * dm.d).sqrt(), baseline)
+        } else if pure_translate {
+            (dm.e, dm.f, base_size * wtm.d, 0.0)
         } else {
             (wtm.e, wtm.f, base_size * wtm.d, 0.0)
         };

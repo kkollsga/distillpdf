@@ -15,8 +15,10 @@ import os
 
 from PIL import Image, ImageDraw
 from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.utils import simpleSplit
 from reportlab.pdfgen import canvas
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 OUT = os.path.join(os.path.dirname(__file__), "demo")
 os.makedirs(OUT, exist_ok=True)
@@ -71,6 +73,39 @@ def make_chart_png(path):
     d.rectangle([60, 120, 130, 180], fill=(70, 110, 200))
     d.rectangle([190, 60, 260, 180], fill=(200, 90, 70))
     img.save(path)
+
+
+# A second fixture built with the HIGH-LEVEL platypus API (SimpleDocTemplate). Unlike
+# the canvas above, platypus positions every flowable through a per-block graphics
+# transform (`q [1 0 0 1 tx ty] cm BT … ET Q`) — text laid out in a LOCAL frame and only
+# translated into place. If the extractor ignores that translate, every block collapses
+# to local coordinates and the document scrambles. This fixture pins the cm-positioning
+# regression: the sections must come out top-to-bottom, intact, in order.
+PLATYPUS_SECTIONS = [
+    ("Overview", "The overview section introduces the platypus layout pipeline and sets the stage."),
+    ("Background", "Background material explains how each flowable is positioned by a translate transform."),
+    ("Approach", "Our approach reconstructs the reading order directly from the graphics transform."),
+    ("Results", "Results confirm the blocks are extracted from top to bottom with no content loss."),
+    ("Conclusion", "In conclusion the cm positioned document reads in exactly the correct order."),
+]
+PLATYPUS_GT = {
+    "headings": [h for h, _ in PLATYPUS_SECTIONS],
+    # the ordered body sentences that must appear verbatim (no loss / no scramble) and
+    # in this exact reading order:
+    "ordered": [b for _, b in PLATYPUS_SECTIONS],
+}
+
+
+def build_platypus():
+    pdf = os.path.join(OUT, "demo_platypus.pdf")
+    styles = getSampleStyleSheet()
+    story = []
+    for head, body in PLATYPUS_SECTIONS:
+        story.append(Paragraph(head, styles["Heading2"]))
+        story.append(Paragraph(body, styles["BodyText"]))
+        story.append(Spacer(1, 10))
+    SimpleDocTemplate(pdf, pagesize=letter, topMargin=72, bottomMargin=72).build(story)
+    print("wrote", pdf)
 
 
 def build():
@@ -133,9 +168,10 @@ def build():
     c.save()
     os.remove(png)
     with open(os.path.join(OUT, "demo_groundtruth.json"), "w") as f:
-        json.dump(GROUND_TRUTH, f, indent=2)
+        json.dump({**GROUND_TRUTH, "platypus": PLATYPUS_GT}, f, indent=2)
     print("wrote", pdf, "+ demo_groundtruth.json")
 
 
 if __name__ == "__main__":
     build()
+    build_platypus()

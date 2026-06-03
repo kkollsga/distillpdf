@@ -17,6 +17,7 @@ import distillpdf
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEMO = os.path.join(HERE, "demo", "demo.pdf")
+PLATYPUS = os.path.join(HERE, "demo", "demo_platypus.pdf")
 with open(os.path.join(HERE, "demo", "demo_groundtruth.json")) as _f:
     GT = json.load(_f)
 
@@ -88,6 +89,22 @@ def test_section_extraction():
     sec = distillpdf.Pdf.open(DEMO).section(GT["section_probe"])
     assert sec, "section() returned nothing for the Introduction"
     assert "reconstructs the logical structure" in _text(sec), "section() body is wrong"
+
+
+def test_platypus_reading_order():
+    """A cm-positioned (reportlab platypus / SimpleDocTemplate) document: every flowable
+    is placed via a per-block graphics translate. Ignoring that transform collapses the
+    blocks to local coordinates and scrambles the page. Assert the sections come out
+    intact and in top-to-bottom reading order."""
+    gt = GT["platypus"]
+    t = _text(distillpdf.Pdf.open(PLATYPUS).to_html())
+    pos = []
+    for sentence in gt["ordered"]:
+        assert sentence in t, f"platypus block lost or scrambled: {sentence!r}"
+        pos.append(t.find(sentence))
+    assert pos == sorted(pos), f"platypus blocks out of reading order: {pos}"
+    for head in gt["headings"]:
+        assert head in t, f"platypus heading missing: {head!r}"
 
 
 if __name__ == "__main__":

@@ -153,6 +153,28 @@ fn columns(rows: &[Vec<Cell>], tol: f32) -> Vec<f32> {
     cols
 }
 
+/// Column index for a span at `x` by left-anchored RANGES: column `k` owns
+/// `[cols[k], cols[k+1])`, so a word in a wide cell that drifts past the midpoint
+/// toward the next anchor still stays in its own column (a small leftward `tol`
+/// margin keeps right-aligned values from spilling left). Falls back to column 0
+/// for anything left of the first anchor. Used to fill the grid, where a span's true
+/// column is the range it lies in — not merely the nearest anchor.
+fn col_band(cols: &[f32], x: f32, tol: f32) -> Option<usize> {
+    if cols.is_empty() {
+        return None;
+    }
+    let margin = tol * 0.5;
+    let mut k = 0;
+    for (i, &c) in cols.iter().enumerate() {
+        if c <= x + margin {
+            k = i;
+        } else {
+            break;
+        }
+    }
+    Some(k)
+}
+
 /// Index of the column anchor nearest to `x`.
 fn nearest_col(cols: &[f32], x: f32) -> Option<usize> {
     cols.iter()
@@ -330,10 +352,81 @@ fn detect_tables_region(spans: &[Span]) -> Vec<PosTable> {
     };
     let tol = (avg_size * 1.5).max(6.0);
     let rows = rows_of(spans.iter().map(clone_span).collect());
-    let celled: Vec<(f32, Vec<Cell>, Vec<Span>)> = rows
+    let mut celled: Vec<(f32, Vec<Cell>, Vec<Span>)> = rows
         .iter()
         .map(|r| (r.first().map(|s| s.y).unwrap_or(0.0), row_cells(r), r.iter().map(clone_span).collect()))
         .collect();
+
+    // Coalesce wrapped multi-line cells. A borderless table with a long column (e.g.
+    // a "Description" that wraps) emits its overflow lines as rows holding only that
+    // one interior cell. Those 1-cell rows would otherwise break the multi-cell row
+    // run and the table would be missed (and its bare ruling leak out as a figure).
+    // Fold each such overflow line into the nearest multi-cell row whose columns
+    // include it, so the wrapped cell stays a single cell and the run is contiguous.
+    {
+        let anchors: Vec<usize> = (0..celled.len()).filter(|&i| celled[i].1.len() >= 2).collect();
+        if anchors.len() >= 2 {
+            // Left edge of the table body: a genuine row label starts here; an overflow
+            // line of a wrapped *interior* cell does not, which is how we tell them apart.
+            let region_min_x = anchors
+                .iter()
+                .map(|&i| celled[i].1.iter().map(|c| c.x).fold(f32::INFINITY, f32::min))
+                .fold(f32::INFINITY, f32::min);
+            let mut absorb: Vec<(usize, usize)> = Vec::new(); // (anchor, overflow-row)
+            for ti in 0..celled.len() {
+                if celled[ti].1.len() != 1 {
+                    continue;
+                }
+                let cx = celled[ti].1[0].x;
+                if cx <= region_min_x + tol {
+                    continue; // sits at the left edge -> a row label / prose line, not overflow
+                }
+                let mut best: Option<(usize, f32)> = None;
+                for &ai in &anchors {
+                    let dy = (celled[ai].0 - celled[ti].0).abs();
+                    if dy > avg_size * 1.8 {
+                        continue; // not vertically adjacent -> not the same wrapped cell
+                    }
+                    if !celled[ai].1.iter().any(|c| (c.x - cx).abs() <= tol) {
+                        continue; // overflow x must line up with one of the anchor's columns
+                    }
+                    if best.map_or(true, |(_, bd)| dy < bd) {
+                        best = Some((ai, dy));
+                    }
+                }
+                if let Some((ai, _)) = best {
+                    absorb.push((ai, ti));
+                }
+            }
+            let mut drop = vec![false; celled.len()];
+            for (ai, ti) in absorb {
+                let mut moved = std::mem::take(&mut celled[ti].2);
+                drop[ti] = true;
+                celled[ai].2.append(&mut moved);
+            }
+            if drop.iter().any(|&d| d) {
+                let mut kept: Vec<(f32, Vec<Cell>, Vec<Span>)> = Vec::new();
+                for (i, mut row) in celled.into_iter().enumerate() {
+                    if drop[i] {
+                        continue;
+                    }
+                    // Reading order within a merged cell is top-to-bottom: sort the row's
+                    // spans by descending y (then x) so bin_row accumulates the wrapped
+                    // lines in order. The anchor's cell list (row.1) is left untouched —
+                    // the overflow lands in an existing column, so the column structure
+                    // and x-extent are unchanged.
+                    row.2.sort_by(|a, b| {
+                        b.y.partial_cmp(&a.y)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+                    });
+                    kept.push(row);
+                }
+                celled = kept;
+            }
+        }
+    }
+
     let mut tables = Vec::new();
 
     let flush = |run: &Vec<&(f32, Vec<Cell>, Vec<Span>)>, headers: &[&(f32, Vec<Cell>, Vec<Span>)], tables: &mut Vec<PosTable>| {
@@ -384,7 +477,7 @@ fn detect_tables_region(spans: &[Span]) -> Vec<PosTable> {
                 if txt.is_empty() {
                     continue;
                 }
-                if let Some(ci) = nearest_col(&cols, s.x) {
+                if let Some(ci) = col_band(&cols, s.x, tol) {
                     let k = col_to_keep[ci];
                     if !cells[k].is_empty() && join_space(&cells[k], txt) {
                         cells[k].push(' ');
