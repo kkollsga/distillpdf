@@ -15,8 +15,10 @@ import pytest
 HERE = os.path.dirname(os.path.abspath(__file__))
 CORPUS_PRESENT = bool(glob.glob(os.path.join(HERE, "corpus", "*.pdf")))
 
-# Tests that only need tracked data and must always run (incl. on CI).
-TRACKED_DATA_ONLY = {"test_tables.py"}
+# Tests that only need tracked data and must always run (incl. on CI):
+#   test_demo.py    — the self-contained demo PDF we own (tests/demo/demo.pdf)
+#   test_tables.py  — the synthetic table corpus (tests/corpus_tables/)
+TRACKED_DATA_ONLY = {"test_demo.py", "test_tables.py"}
 
 
 def pytest_collection_modifyitems(config, items):

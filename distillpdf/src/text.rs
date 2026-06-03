@@ -813,16 +813,14 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
     let mut cstack: Vec<Mat> = Vec::new();
 
     let mut emit = |wtm: &Mat, ctm: &Mat, base_size: f32, width: f32, style: (bool, bool, bool), s: String| {
-        // Combine the text matrix with the graphics CTM. UPRIGHT text (the body, where
-        // the combined matrix has no rotation/skew) keeps its exact prior computation —
-        // position from the text matrix, height = size × vertical scale — so the body
-        // pipeline is byte-identical and the CTM change can't shift it. Only ROTATED
-        // text takes the new branch: its true device position, a magnitude-based height
-        // (so a 90° title isn't dropped by a near-zero `d`), and the baseline angle.
+        // UPRIGHT text keeps its prior computation — position from the text matrix,
+        // height = size × vertical scale — which is correct for the corpus (text is
+        // positioned by Tm/Td; applying the CTM here regressed several docs that carry a
+        // non-identity CTM at text-draw time). Only ROTATED text uses the combined
+        // device matrix: its true position, a magnitude-based height (so a 90° title
+        // isn't dropped by a near-zero `d`), and the baseline angle. Rotation is the
+        // BASELINE angle (atan2(b,a)) — ~0 for italic SKEW, so skewed text stays upright.
         let dm = wtm.mul(*ctm);
-        // Rotation = a non-horizontal BASELINE (atan2(b,a)); this is ~0 for italic SKEW
-        // (which shears glyphs but keeps the baseline horizontal), so skewed/italic text
-        // stays on the upright path and isn't wrongly pulled out of the body/tables.
         let baseline = dm.b.atan2(dm.a);
         let rotated = baseline.abs() > 0.1;
         let (x, y, height, angle) = if rotated {

@@ -51,9 +51,11 @@ RAG. Out of scope (for now): page rendering, PDF generation, OCR.
 ## Development
 
 The test suite lives in [`tests/`](tests/) (pytest) and runs on CI. It needs only
-`distillpdf` installed. The third-party PDF corpora (`tests/corpus*/`) are gitignored, so
-on a fresh clone the corpus-backed tests self-skip and the synthetic-table tests run; with
-the corpora present locally the whole suite runs:
+`distillpdf` installed. CI runs entirely on data we own — a self-contained demo PDF
+(`tests/demo/`, end-to-end structure check) and a synthetic table corpus
+(`tests/corpus_tables/`). The third-party PDF corpora (`tests/corpus*/`) are gitignored,
+so their tests self-skip on a fresh clone and run only when the corpora are present
+locally for deeper coverage:
 
 ```bash
 bash tests/run.sh        # build distillpdf + run pytest

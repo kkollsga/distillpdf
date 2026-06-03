@@ -1,0 +1,39 @@
+{
+  "title": "DistillPDF Demo Document",
+  "headings": [
+    "Abstract",
+    "1 Introduction",
+    "2 Methods"
+  ],
+  "list_items": [
+    "Headings are recovered from font size and weight.",
+    "Tables are reconstructed into rows and cells.",
+    "Figures are wrapped together with their captions."
+  ],
+  "table": {
+    "header": [
+      "Metric",
+      "Value",
+      "Unit"
+    ],
+    "rows": [
+      [
+        "Recall",
+        "0.98",
+        "ratio"
+      ],
+      [
+        "Latency",
+        "12",
+        "ms"
+      ]
+    ]
+  },
+  "figure_caption_prefix": "Figure 1",
+  "paragraph_snippets": [
+    "self-contained demo used by the distillpdf",
+    "reconstructs the logical structure of a PDF",
+    "fixed layout so its extracted structure is"
+  ],
+  "section_probe": "introduction"
+}
