@@ -16,3 +16,5 @@ bench/corpus/
 bench/corpus_headers/
 # Private competitor benchmarking (head-to-head vs pymupdf4llm/pdf_oxide/etc.).
 benchmarking/
+# macOS
+.DS_Store
