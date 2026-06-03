@@ -1595,13 +1595,20 @@ pub fn to_html(doc: &Document, raw: &[u8]) -> String {
                 // a figure regardless of how it's drawn). This merges the caption and
                 // its graphic into one <figure> instead of leaving a caption-less SVG
                 // plus a graphic-less standalone caption.
+                // Distance from the caption to a figure is the gap to its NEAREST edge
+                // (the figure's [y_bottom, y_top] interval), not to its top: a caption
+                // sits just below its figure, so for a tall raster the top edge is far
+                // away while a lower figure's top is deceptively near — measuring to the
+                // top swaps the two captions. Edge distance binds each caption to the
+                // figure it actually abuts (0 when the caption is inside the figure box).
+                let edge = |yb: f32, yt: f32| if cy < yb { yb - cy } else if cy > yt { cy - yt } else { 0.0 };
                 let img_best = images.iter().enumerate()
                     .filter(|(j, _)| img_cap[*j].is_none())
-                    .map(|(j, im)| (j, (im.y_top - cy).abs()))
+                    .map(|(j, im)| (j, edge(im.y_bottom, im.y_top)))
                     .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                 let svg_best = vectors.iter().enumerate()
                     .filter(|(j, _)| svg_cap[*j].is_none())
-                    .map(|(j, v)| (j, (v.y_top - cy).abs()))
+                    .map(|(j, v)| (j, edge(v.y_bottom, v.y_top)))
                     .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                 match (img_best, svg_best) {
                     (Some((j, di)), Some((k, ds))) => {

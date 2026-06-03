@@ -242,6 +242,7 @@ fn png_bytes(img: image::DynamicImage) -> Option<Vec<u8>> {
 /// not retained — the rendered `<img>` is sized by CSS, not intrinsic dimensions.)
 pub struct Placed {
     pub y_top: f32,
+    pub y_bottom: f32,
     pub uri: String,
 }
 
@@ -327,7 +328,7 @@ fn walk(
                     }
                     let uri = cache.entry(id).or_insert_with(|| data_uri(doc, id)).clone();
                     if let Some(u) = uri {
-                        out.push(Placed { y_top: y1, uri: u });
+                        out.push(Placed { y_top: y1, y_bottom: y0, uri: u });
                     }
                 } else if subtype == b"Form" {
                     // Form: descend with its /Matrix and own resources.

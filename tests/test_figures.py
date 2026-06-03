@@ -50,6 +50,23 @@ def test_all_images_inside_a_figure():
     assert len(bare) == len(in_fig), "an <img> is not wrapped in a <figure>"
 
 
+def test_two_figures_one_page_captions_not_swapped():
+    """Regression: with a raster figure above a vector figure on the SAME page, each
+    caption binds to the figure it sits under (caption→figure anchoring by nearest
+    edge, not by top edge which swapped them)."""
+    g = GT["figures_onepage.pdf"]
+    h = html("figures_onepage.pdf")
+    figs = re.findall(r"<figure\b.*?</figure>", h, re.DOTALL)
+    img_fig = next((f for f in figs if "<img" in f), "")
+    svg_fig = next((f for f in figs if "<svg" in f), "")
+    img_cap = re.search(r"<figcaption>(.*?)</figcaption>", img_fig, re.DOTALL)
+    svg_cap = re.search(r"<figcaption>(.*?)</figcaption>", svg_fig, re.DOTALL)
+    assert img_cap and g["fig1_caption"][:30] in re.sub(r"\s+", " ", img_cap.group(1)), \
+        "raster figure did not get Figure 1's caption"
+    assert svg_cap and g["fig2_caption"][:30] in re.sub(r"\s+", " ", svg_cap.group(1)), \
+        "vector figure did not get Figure 2's caption"
+
+
 def test_inline_xref_not_a_caption():
     h = html(NAME)
     caps = [re.sub(r"\s+", " ", c) for c in re.findall(r"<figcaption>(.*?)</figcaption>", h, re.DOTALL)]

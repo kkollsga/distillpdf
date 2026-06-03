@@ -65,6 +65,10 @@
     "inline_xref": "As shown in Figure 1 the bars differ",
     "n_figures": 2
   },
+  "figures_onepage.pdf": {
+    "fig1_caption": "Figure 1: A raster bar chart comparing two measured groups.",
+    "fig2_caption": "Figure 2: A vector line chart of the same measurements."
+  },
   "links.pdf": {
     "uri": "https://example.com/distillpdf",
     "dest_name": "cite.smith2020",

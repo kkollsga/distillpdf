@@ -204,6 +204,47 @@ def gen_figures():
     }
 
 
+def _vector_chart(c, ox, oy, vw, vh):
+    c.setLineWidth(1)
+    c.line(ox, oy, ox + vw, oy)
+    c.line(ox, oy, ox, oy + vh)
+    for i in range(1, 4):
+        c.line(ox, oy + vh * i / 4, ox + vw, oy + vh * i / 4)
+    c.setFillColorRGB(0.25, 0.45, 0.8)
+    for i, bh in enumerate((40, 95, 65, 110)):
+        c.rect(ox + 20 + i * 48, oy, 28, min(bh, vh - 4), fill=1, stroke=1)
+    c.setFillColorRGB(0, 0, 0)
+
+
+def gen_figures_onepage():
+    """Both figures (raster ABOVE, vector BELOW), each with its own caption directly
+    beneath it, on ONE page. Regression guard for caption→figure anchoring: the captions
+    must bind to the figure each sits under, not get swapped by a top-edge distance."""
+    pdf = os.path.join(OUT, "figures_onepage.pdf")
+    png = os.path.join(OUT, "_bar2.png")
+    _bar_png(png)
+    c = canvas.Canvas(pdf, pagesize=letter)
+    title(c, "Two Figures On One Page")
+    y = PAGE_H - 120
+    img_w, img_h = 220, 140
+    c.drawImage(png, LM, y - img_h, width=img_w, height=img_h)
+    y -= img_h + 14
+    c.setFont("Helvetica", 9.5)
+    c.drawString(LM, y, "Figure 1: A raster bar chart comparing two measured groups.")
+    y -= 34
+    _vector_chart(c, LM + 50, y - 120, 210, 110)
+    y -= 120 + 8
+    c.setFont("Helvetica", 9.5)
+    c.drawString(LM, y, "Figure 2: A vector line chart of the same measurements.")
+    c.showPage()
+    c.save()
+    os.remove(png)
+    GT["figures_onepage.pdf"] = {
+        "fig1_caption": "Figure 1: A raster bar chart comparing two measured groups.",
+        "fig2_caption": "Figure 2: A vector line chart of the same measurements.",
+    }
+
+
 # ------------------------------------------------------------------------------ links
 def _assemble_pdf(objs, path):
     """Write a minimal PDF from {objnum: bytes} (numbers contiguous from 1)."""
@@ -400,6 +441,7 @@ def main():
     gen_headings()
     gen_lists()
     gen_figures()
+    gen_figures_onepage()
     gen_links()
     gen_typography()
     gen_twocol()
