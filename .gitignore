@@ -7,7 +7,12 @@ __pycache__/
 *.pyc
 .venv/
 *.so
-# bench artifacts — out/ is a regenerated cache (our HTML + competitor outputs).
-# Committed ground truth lives in bench/fixtures/, bench/*.json, bench/corpus*/.
+# bench artifacts — out/ is a regenerated cache of distillpdf's own HTML.
 bench/out/
-bench/rust_extra/target/
+# PDF corpora: kept locally for the gates, NOT published (third-party PDFs).
+# Committed ground truth (bench/fixtures/, bench/*.json) + the synthetic
+# bench/corpus_tables/ stay tracked so the gate logic is reproducible.
+bench/corpus/
+bench/corpus_headers/
+# Private competitor benchmarking (head-to-head vs pymupdf4llm/pdf_oxide/etc.).
+benchmarking/

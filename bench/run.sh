@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Dev loop: build distillpdf into the local venv and run the goallines.
 # Needs ONLY distillpdf — goallines read frozen fixtures (header_groundtruth*.json,
-# corpus_tables/ground_truth.json, out/*.pymupdf_plain.txt, out/ref_meta.json).
-# pymupdf / pdfoxide are NOT required here; they're only for refreshing fixtures
-# (freeze_refs.py) or the competitor comparison (compare_headers.py / score_quality.py).
+# corpus_tables/ground_truth.json, fixtures/*.pymupdf_plain.txt) plus the local PDF
+# corpora (bench/corpus*/, gitignored). No competitor tools required; head-to-head
+# comparison lives in the gitignored ../benchmarking/ folder.
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VENV="$ROOT/.venv"
