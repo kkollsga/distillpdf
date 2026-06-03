@@ -1,8 +1,8 @@
-# distillpdf
+# distillPDF
 
 **Pure-Rust PDF extraction that distills documents into clean, LLM-ready output.**
 
-`distillpdf` reads a PDF and reconstructs its *structure* — reading order, headings,
+distillPDF reads a PDF and reconstructs its *structure* — reading order, headings,
 paragraphs, lists, tables, and figures — then emits compact, semantic **HTML** (or plain
 text) suitable for feeding to language models or building RAG pipelines. It is built on
 [`lopdf`](https://github.com/J-F-Liu/lopdf) and shipped to Python via
