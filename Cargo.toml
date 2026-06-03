@@ -2,7 +2,7 @@
 name = "distillpdf"
 version = "0.0.1"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 description = "Pure-Rust PDF extraction (text/tables/figures/fonts) that distills documents into clean, LLM-ready HTML — on lopdf, for Python"
 
 [lib]

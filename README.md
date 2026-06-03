@@ -7,7 +7,7 @@ paragraphs, lists, tables, and figures — then emits compact, semantic **HTML**
 text) suitable for feeding to language models or building RAG pipelines. It is built on
 [`lopdf`](https://github.com/J-F-Liu/lopdf) and shipped to Python via
 [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs) as a small, permissively
-licensed wheel — a lightweight, MIT/Apache alternative to AGPL/heavyweight extractors.
+licensed wheel — a lightweight, MIT-licensed alternative to AGPL/heavyweight extractors.
 
 > Status: early (`0.0.1`), pre-PyPI. The API surface is small and may still change.
 
@@ -19,7 +19,7 @@ licensed wheel — a lightweight, MIT/Apache alternative to AGPL/heavyweight ext
   extraction (`Pdf.section("abstract")`).
 - **LLM-ready.** Lean, class-free HTML with a centered max-width layout — semantic
   markup an LLM can read directly, no styling noise.
-- **Small & permissive.** Pure Rust on `lopdf`, no system dependencies, MIT OR Apache-2.0.
+- **Small & permissive.** Pure Rust on `lopdf`, no system dependencies, MIT-licensed.
 
 ## Install
 
@@ -64,4 +64,4 @@ pytest tests/ -q         # or just run the tests against an installed build
 
 ## License
 
-MIT OR Apache-2.0, at your option.
+MIT — see [LICENSE](LICENSE).
