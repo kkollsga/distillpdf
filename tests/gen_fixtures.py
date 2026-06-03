@@ -139,6 +139,37 @@ def gen_lists():
     }
 
 
+def gen_twolists():
+    """Two numbered lists with a real paragraph between them. Regression guard: the
+    intervening paragraph must stay its own <p> (not be swallowed into the first list's
+    last <li>) and the two lists must remain separate, intact lists."""
+    pdf = os.path.join(OUT, "twolists.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    title(c, "Two Lists Separated By Prose")
+    y = PAGE_H - 120
+    first = ["Initialize the system before starting the run.",
+             "Run the main computation loop to completion."]
+    middle = ("Between the two lists sits this ordinary paragraph of body prose, which "
+              "must remain its own paragraph and never be swallowed into the list above.")
+    second = ["Validate the computed results for correctness.",
+              "Report the final summary output to the user."]
+    y = para(c, "The first procedure has the following steps:", y, gap=4)
+    for i, n in enumerate(first, 1):
+        y = para(c, f"{i}. {n}", y, indent=18, gap=3)
+    y -= 8
+    y = para(c, middle, y)
+    y -= 4
+    y = para(c, "A second, unrelated procedure has its own steps:", y, gap=4)
+    for i, n in enumerate(second, 1):
+        y = para(c, f"{i}. {n}", y, indent=18, gap=3)
+    c.showPage()
+    c.save()
+    GT["twolists.pdf"] = {
+        "first": first, "second": second,
+        "middle_snippet": "must remain its own paragraph and never be swallowed",
+    }
+
+
 # ---------------------------------------------------------------------------- figures
 def _bar_png(path):
     img = Image.new("RGB", (300, 190), "white")
@@ -440,6 +471,7 @@ def gen_numeric():
 def main():
     gen_headings()
     gen_lists()
+    gen_twolists()
     gen_figures()
     gen_figures_onepage()
     gen_links()

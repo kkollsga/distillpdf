@@ -2079,10 +2079,31 @@ fn merge_math_fragments(html: &str) -> String {
     out
 }
 
+/// Whether a `<p>` between two same-type lists INTRODUCES the following list (its text
+/// ends with ':', e.g. "The second procedure has these steps:"). Such a line is a real
+/// separator — the next list is its own list, not a fragment of the previous one — so
+/// the two must not be fused. A genuine wrapped continuation of the last item never ends
+/// with a colon.
+fn introduces_list(inner: &str) -> bool {
+    let mut t = String::new();
+    let mut depth = 0i32;
+    for ch in inner.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = (depth - 1).max(0),
+            _ if depth == 0 => t.push(ch),
+            _ => {}
+        }
+    }
+    t.trim_end().ends_with(':')
+}
+
 /// Rejoin a list fragmented into single-item lists: `…A</li></ul> <p>cont</p>… <ul><li>B…`
 /// becomes `…A cont…</li><li>B…`. The intervening `<p>`s are the wrapped continuation
 /// of item A that the line loop couldn't attach (flush-left wrap, column break). Only
-/// fires for same-type adjacent lists with a few short continuation paragraphs between.
+/// fires for same-type adjacent lists with a few short continuation paragraphs between,
+/// and never across a `<p>` that introduces the next list (ends with ':') — so two real
+/// lists, the second introduced by a lead-in line, are left separate.
 fn merge_fragmented_lists(html: &str) -> String {
     let mut s = html.to_string();
     for tag in ["ul", "ol"] {
@@ -2107,7 +2128,9 @@ fn merge_fragmented_lists(html: &str) -> String {
                     if conts.len() < 3 {
                         if let Some(body) = s[k..].strip_prefix("<p>") {
                             if let Some(rel) = body.find("</p>") {
-                                if rel < 400 {
+                                // A lead-in line ("… steps:") separates two real lists;
+                                // never fold across it.
+                                if rel < 400 && !introduces_list(&body[..rel]) {
                                     conts.push(&body[..rel]);
                                     k += 3 + rel + 4;
                                     continue;

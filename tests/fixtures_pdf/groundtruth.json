@@ -58,6 +58,17 @@
       "Question two introduced after a colon line."
     ]
   },
+  "twolists.pdf": {
+    "first": [
+      "Initialize the system before starting the run.",
+      "Run the main computation loop to completion."
+    ],
+    "second": [
+      "Validate the computed results for correctness.",
+      "Report the final summary output to the user."
+    ],
+    "middle_snippet": "must remain its own paragraph and never be swallowed"
+  },
   "figures.pdf": {
     "fig1_caption": "Figure 1: A raster bar chart comparing two measured groups.",
     "fig2_caption": "Figure 2: A vector line chart with a rotated axis title.",

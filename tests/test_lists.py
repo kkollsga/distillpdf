@@ -3,7 +3,7 @@ numbered and colon-introduced items become <ol><li>, a wrapped item stays one <l
 markers are stripped, and no list is fragmented into single-item lists."""
 import re
 
-from _fixtures import GT, html, cells
+from _fixtures import GT, html, cells, text
 
 NAME = "lists.pdf"
 G = GT[NAME]
@@ -47,3 +47,17 @@ def test_wrapped_item_merged():
     # and the wrapped item lives in the (multi-item) unordered list
     ul_items = [c for ul in _lists(html(NAME), "ul") for c in cells(ul, "li")]
     assert any(G["wrapped_snippet"] in c for c in ul_items), "wrapped item not in the <ul>"
+
+
+def test_two_lists_separated_by_paragraph():
+    """Regression: a real paragraph between two numbered lists stays its own <p> and is
+    NOT absorbed into the first list's last <li>; both lists remain separate and intact."""
+    g = GT["twolists.pdf"]
+    h = html("twolists.pdf")
+    li = cells(h, "li")
+    assert not any(g["middle_snippet"] in c for c in li), \
+        "intervening paragraph swallowed into a <li>"
+    assert g["middle_snippet"] in text(h), "intervening paragraph lost"
+    for item in g["first"] + g["second"]:
+        assert any(item in c for c in li), f"list item lost: {item!r}"
+    assert len(_lists(h, "ol")) >= 2, "the two lists were merged into one"
