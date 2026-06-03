@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Score pylopdf table detection against synthetic ground truth (gen_tables.py).
+"""Score distillpdf table detection against synthetic ground truth (gen_tables.py).
 
 Metrics:
   detection recall   — fraction of ground-truth tables found (content overlap >=0.5)
@@ -36,9 +36,9 @@ def toks(grid):
 
 
 def detected_tables(path):
-    import pylopdf
+    import distillpdf
     res = []
-    for t in pylopdf.Pdf.open(path).extract_tables():
+    for t in distillpdf.Pdf.open(path).extract_tables():
         res.append({"n_cols": t["n_cols"], "n_rows": t["n_rows"], "cells": t["cells"]})
     return res
 

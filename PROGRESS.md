@@ -1,14 +1,98 @@
-# pylopdf — progress log
+# distillpdf — progress log
 
 Goal: see `GOAL.md`. Active loop building toward feature-complete PyMuPDF competitor.
+Dev loop & gates: `bash bench/gates.sh` (regression gates must stay green; goal
+gates turn green as phases land). Goal/gate definitions: `bench/GOALS.md`.
+
+## Layout-analysis roadmap — DONE (2026-06-02), all gates green
+Phase 1 ✅ region typing + opportunistic `<figure>`/`<figcaption>` linking (figure
+coverage 1.00, caption attach 0.93). Phase 3 ✅ word-level span extraction
+(`decode_words` splits Tj/TJ at spaces+kern gaps; empty-but-advancing glyph = a
+space; join threshold dropped to 0.2em for word spans). Phase 2 ✅ borderless
+tables now detected from word alignment (bert Table 1 / GLUE results parsed;
+presence recall 0.93) — `detect_tables_pos` grid keeps majority columns but MERGES
+stray cells into the nearest kept column (dense grid, no content loss, no markup
+bloat; synthetic detection 23/23, cell recall 0.94). Run `bash bench/gates.sh`.
+
+## Layout-analysis roadmap (region-first, ABBYY-style) — tasks #1–#3
+Region-first DLA: localize regions (figure/table/header-footer/text), then split
+cells only inside table regions → no artifacts in prose. Captions/IDs are an
+opportunistic overlay (a caption-less figure is still a figure), not a gate.
+Prior art (open-source MCP): pdfplumber text strategy — columns = word x-clusters
+with ≥3 aligned words (the alignment-count is the anti-FP guard); rows = shared
+top-y. Phases & gates in `bench/GOALS.md`:
+- Phase 1 (`test_regions.py`): region typing + `<figure>`/`<figcaption>` linking. Low risk.
+- Phase 3 (`test_word_spans.py`): word-level span extraction (foundational; full re-verify).
+- Phase 2 (`test_tables_real.py`): borderless table detection on word alignment. Blocked by Phase 3.
+
+## 2026-06-02 — header generalization (15 held-out papers)
+Fetched 15 fresh arXiv PDFs across 15 fields (`bench/corpus_headers/`); Sonnet
+subagents extracted ground truth → `header_groundtruth_heldout.json`. First held-out
+run exposed real gaps the tuned-4 hid: `1.`-period sections eaten as list items
+(math_PR 0.00), Roman numerals (`I./II.`) unhandled, reference lists & running heads
+as false headers. Fixes (all general): check header before list (capitalised `N.`
+title = section; lowercase/sentence = list); `roman_section` (level-1 Roman);
+canonical names detected at body size; `Appendix A` prefix; `.`-terminated run-in
+leads; guards for publication-year + author-initial citations, arXiv id, expanded
+theorem/figure/table/algorithm/assumption labels; and a **doc-level dedup** that
+demotes any heading repeated 3+ times (running page heads) from `<hN>` to `<p>`.
+Held-out: recall 0.665→**0.854**, precision 0.41→**0.57**, level 0.70→**0.83**;
+tuned set held (recall 0.98). `test_headers.py` now scores both sets (tuned = strict
+per-file; held-out = aggregate). vs competitors on held-out: distillpdf recall **0.85**
+/ level **0.83** beats pymupdf4llm (0.70 / 0.38); pdf-inspector & pdf_oxide collapse
+on unseen papers (0.16 / 0.04). html + tables goallines still GREEN.
+
+## 2026-06-02 — header (heading) extraction goalline
+**Problem:** `to_html` heading detection was size-ratio only, so it missed nearly
+all arXiv headers — section faces (Nimbus "Medi", CM "CMBX") are only ~1.1× body
+or body-size **bold**, and subsections are body-size. bert header recall was 0.03.
+**Ground truth:** 4 Sonnet subagents (one per paper) extracted the ordered
+section/subsection headers by font analysis (size+bold+numbering) → committed as
+`bench/header_groundtruth.json` (bert/attention/nerf/math). `bench/test_headers.py`
+is the goalline: header **recall**, **level accuracy** (numbering depth → h1/h2/h3),
+and **precision** (spurious headings).
+**Detector rewrite (`detect_header`, paragraph-aware per user spec — "bold at the
+top of a paragraph is a header; size + number give the level"):**
+(1) numbered "N[.N…] Title" with a capitalised real-word title → level = numbering
+depth; (2) canonical names (Abstract/References/…); (3) standalone bold/larger
+short line; (4) **bold run-in lead** ("Encoder:", "Task #1: Masked LM") → splits the
+line, lead becomes the heading, rest stays the paragraph. Guards: theorem-env
+labels (Theorem/Lemma/Definition…), "et al." running heads, pure-number rows,
+single-token leads. Bold detection in `text.rs` now recognises heading weights
+("Medi"/medium/semibold/black/**cmbx**), and `list_kind` no longer eats "N.N Title"
+as a list item (the key bug).
+**Result:** header recall 0.03→**1.00** (bert), mean **0.975**; level accuracy
+**0.953**; precision **0.61**. All other goallines held (html 0.96, tables 0 FP).
+
+## 2026-06-02 — 2-column reading order (arXiv/geology)
+**Problem:** global y-band sort interleaved 2-column pages line-by-line
+(`left-line right-line …`), unreadable for arXiv. Recall hid it (set-based); the
+honest metric is token-level order fidelity `O` (autojunk OFF — the old `seqratio`
+used autojunk ON, which discarded the anchor words and scored good order as 0.2).
+**Fix:** recursive **XY-cut** column/block segmenter (`text::xy_cut_order`), shared
+by the text extractor *and* HTML layer. Vertical gutters split columns (left before
+right), horizontal gutters peel full-width title/abstract/figures; a `vertical_valid`
+guard (both sides substantial + y-overlapping) rejects false gutters from sparse/
+centered pages and map labels. Gutter threshold = 1.2×median font (a single column
+has *no* interior x-gap, so this is safe). Companion fix in `extract.rs`: 2-column
+prose >4 words/cell is no longer misdetected as a table (phantom table boxes
+straddled the gutter and re-forced interleaving — and were false positives).
+**Result (order fidelity O, vs PyMuPDF):** BERT 0.53→0.88, NeRF 0.94 (beats all
+peers), math 0.85, attention 0.95; HTML BERT 0.52→0.84. Recall unchanged (0.95–0.97);
+XY-cut overhead ~3–6% (single-digit ms); table goalline still GREEN (0 false
+positives); html goalline GREEN (mean 0.96).
+Benchmark improved to capture it: `score_quality.py` reports `O`; `test_html.py`
+recall de-hyphenates both sides; corpus grew to 11 (4 two-column arXiv + geology).
+**Known follow-up (out of scope):** Cold_Email ebook scrambles order every page
+(O0.16, recall 1.0) — content streams aren't in reading order; pre-existing.
 
 ## Done
 - **Phase 0** (commit c806443): maturin/PyO3 abi3 wheel on lopdf. `Pdf.open/from_bytes`,
   `page_count`, `extract_text`, `extract_page_text`. Smoke test passes. 6/6 PDFs open.
-- **Bench integration**: `bench/bench_pylopdf.py` + added to `score_quality.py`.
+- **Bench integration**: `bench/bench_distillpdf.py` + added to `score_quality.py`.
 
 ## Current quality baseline (word recall vs PyMuPDF, bench corpus)
-| PDF | pylopdf | best peer | gap |
+| PDF | distillpdf | best peer | gap |
 |---|---|---|---|
 | Cold_Email | **R1.00 S1.00** | pdf-inspector .99 | ahead |
 | attention | R0.96 S0.98 | pdf-extract .99 | small |
@@ -103,7 +187,7 @@ faster than pymupdf4llm. (Synthetic-CID slower due to per-font raw rescan → ca
   missing glyph-name decode, not reconstruction.
 
 ## FINAL diagnosis of the recall gap (evidence-backed)
-- romanian R0.91: **all 59 missing words** are ones where pylopdf DROPPED a glyph and
+- romanian R0.91: **all 59 missing words** are ones where distillpdf DROPPED a glyph and
   pymupdf kept a base letter. The pymupdf reference has **0** comma-below chars
   (ț/ș/ţ/ş all 0) — i.e. pymupdf itself folds ț→t, ș→s for this font.
 - The simple fonts DO carry `/Encoding /Differences` with standard **AGL glyph names**
@@ -157,4 +241,4 @@ feature (the thing estimated as person-months at project start). Options: (a) bu
 ## v1 SHIPPED (accepted 2026-06-02)
 All 4 pillars working; mean recall 0.982 / median 0.993 vs PyMuPDF; ~1.8x faster than
 pdf_oxide; small MIT wheel. Diacritics font-program gap accepted/deferred (needs embedded
-Type1/CFF decoder). Final comparison in bench/REPORT.md; usage in pylopdf/README.md.
+Type1/CFF decoder). Final comparison in bench/REPORT.md; usage in distillpdf/README.md.

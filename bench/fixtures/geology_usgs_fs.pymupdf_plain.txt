@@ -1,0 +1,477 @@
+Clear
+Lake
+§¨¦
+80
+£
+101
+£
+101
+U
+128
+U
+1
+U
+128
+U
+29
+Napa
+Sonoma
+Petaluma
+Calistoga
+Sebastopol
+Sebastopol
+Santa
+Rosa
+Healdsburg
+Cloverdale
+Cloverdale
+Guerneville
+123°
+38°
+45'
+38°
+30'
+38°
+15'
+PACIFIC
+OCEAN
+San Pablo
+Bay
+38°
+U
+29
+Lake
+Berryessa
+122°15'
+Rohnert
+Park
+0
+10 MILES
+5
+0
+10 KILOMETERS
+5
+Base modified from U.S. Geological Survey and other Federal and State 
+digital data, various scales; Albers Equal-Area Conic projection, standard 
+parallels are 29°30' N. and 45°30' N.; North American Datum of 1983
+North San Francisco Bay Shallow Aquifer study unit boundary
+North San Francisco Bay Public-Supply Aquifer study unit 
+   boundary (Kulongoski and others, 2006)
+EXPLANATION
+Valleys and Plains study area
+Highlands study area
+U.S. Department of the Interior
+U.S. Geological Survey
+Fact Sheet 2018–3007
+February 2018
+U.S. Geological Survey and the California State Water Resources Control Board
+Groundwater Quality in the North San Francisco Bay Shallow 
+Aquifer, California 
+
+Groundwater provides more than 40 percent of California’s drinking water. To protect this vital resource, 
+the State of California created the Groundwater Ambient Monitoring and Assessment (GAMA) Program. 
+The Priority Basin Project of the GAMA Program provides a comprehensive assessment of the State’s ground­
+water quality and increases public access to groundwater-quality information. The North San Francisco Bay 
+Shallow Aquifer constitutes one of the study units being evaluated. 
+Overview of Water Quality
+The North San Francisco Bay Shallow Aquifer 
+Study Unit
+The North San Francisco Bay Shallow Aquifer study unit covers over 1,800 square 
+miles near the coast in Central California. The study unit consists of 6 groundwater basins, 
+some of which have multiple subbasins (California Department of Water Resources, 2003), 
+as well as the surrounding highland terranes and is split into two study areas (Bennett and 
+Fram, 2014). Alluvial-filled valleys in the study unit were combined to form the Valleys and 
+Plains study area. Volcanic, metamorphic, and ultramafic hardrock highlands surrounding the 
+Valleys and Plains form the Highlands study area. 
+deep. Water quality in the shallow aquifer system can differ from that in the deeper public-
+supply aquifer system.
+The study unit has warm, dry summers and cool, moist winters. Average annual rainfall 
+is about 30 inches. The study unit is drained by several rivers and streams along with 
+their principal tributaries. Land use in the study unit is approximately 73 percent natural 
+(forest, grasslands, and bare rock), 16 percent urban, and 11 percent agricultural. Primary 
+agricultural uses include pasture, vineyards, flower nurseries, and orchards (Bennett, 2018). 
+The largest urban areas are the cities of Santa Rosa, Petaluma, Rohnert Park, and Napa.
+Recharge to the groundwater system is primarily by stream-channel infiltration from 
+the major rivers and their tributaries and by infiltration of precipitation. The primary sources 
+of discharge are water pumped for municipal supply, evaporation, and discharge to streams.
+GAMA’s Priority Basin Project 
+evaluates the quality of untreated 
+groundwater. For context, however, 
+benchmarks established for drinking- 
+water quality are used for comparison. 
+Benchmarks and definitions of high, 
+moderate, and low concentrations are 
+discussed in the inset box “Benchmarks 
+for Evaluating Groundwater Quality” on 
+page 3.
+Many inorganic constituents 
+are naturally in groundwater. The 
+concentrations of the inorganic 
+constituents can be affected by natural 
+processes as well as by human activities. 
+In the North San Francisco Bay Shallow 
+Aquifer study unit, one or more inorganic 
+constituents were present at high 
+concentrations in about 27 percent of 
+the shallow aquifers and at moderate 
+concentrations in about 21 percent.
+Man-made organic constituents 
+are found in products used in the home, 
+business, industry, and agriculture. 
+Organic constituents can enter the 
+environment through normal usage, spills, 
+or improper disposal. In this study unit, 
+organic constituents were present at high 
+concentrations in about 1 percent of the 
+shallow aquifer system, but were not 
+present at moderate concentrations.
+ISSN 2327-6916 (print)
+ISSN 2327-6932 (online)
+https://doi.org/10.3133/fs20183007
+High
+Moderate
+CONSTITUENT CONCENTRATIONS
+Low or not detected 
+Values are a percentage of the area of the groundwater 
+resources used for domestic drinking water with 
+concentrations in the three specified categories.
+Organic
+constituents
+Inorganic
+constituents
+99
+1
+52
+21
+27
+The shallow aquifer system 
+in the study unit is defined as 
+those parts of the aquifer system 
+shallower than the perforation 
+intervals for public-supply wells 
+used in the deeper public-supply 
+aquifer system (Bennett, 2018). An 
+assessment of the deeper public-
+supply aquifer system was done 
+by Kulongoski and others (2010). 
+Sampled wells in the shallow 
+aquifer system ranged from 22 to 
+755 feet deep and were typically 
+constructed using solid casings 
+that extended below land surface 
+to open or perforated intervals that 
+ranged between 8 and 550 feet 
+                     
+     
+INORGANIC CONSTITUENTS
+RESULTS: Groundwater Quality in the North San Francisco Bay Shallow Aquifer Study Unit
+Inorganic Constituents with Human-Health Benchmarks
+Trace and minor elements are naturally present in the minerals in rocks and 
+soils and in the water that comes into contact with those materials. In the North 
+San Francisco Bay Shallow Aquifer study unit, trace elements were present at high 
+concentrations in about 25 percent of the shallow aquifer system and at moderate 
+concentrations in about 21 percent. Arsenic, boron, fluoride, and manganese were the 
+trace elements detected at high concentrations.
+Radioactivity is the release of energy or energetic particles during spontaneous 
+decay of unstable atoms. Most of the radioactivity in groundwater comes from 
+the decay of naturally present isotopes of uranium and thorium in minerals in the 
+sediments of the aquifer. Radon-222, which primarily poses a threat to indoor air 
+quality as a gas, was the only radioactive constituent present at high concentrations 
+(2 samples). Because the danger posed by radon-222 is based on its concentrations in 
+air, it is not represented in the pie chart for radioactive constituents. 
+Nutrients, such as nitrogen, are naturally present at low concentrations in 
+groundwater. High and moderate concentrations generally are a result of human 
+activities, such as applying fertilizer to crops and landscaping, seepage from septic 
+systems, and human and animal waste. In the North San Francisco Bay Shallow 
+Aquifer study unit, nutrients were detected at high concentrations in about 2 percent 
+of the shallow aquifer system and were present at moderate concentrations in about 
+3 percent.
+Perchlorate
+Perchlorate is an inorganic constituent that has been regulated in California 
+drinking water since 2007. It is used in solid rocket fuel, fireworks, safety flares, and 
+is present in some fertilizers.  Perchlorate exists naturally at low concentrations in 
+groundwater and was detected at moderate concentrations in about 3 percent of the 
+shallow aquifer system.
+Inorganic Constituents with Non-Health Benchmarks
+(Not included in water-quality overview charts shown on the front page)
+Some constituents affect the aesthetic properties of water, such as taste, color, 
+and odor, or can create nuisance problems, such as staining and scaling. The State 
+of California has a recommended and an upper limit for total dissolved solids (TDS) 
+in drinking water. All water naturally contains TDS as a result of the weathering 
+and dissolution of minerals in soils. Individual major ions that contribute to TDS 
+concentrations include sulfate and chloride. The trace element iron exists naturally 
+in minerals in rocks and soils. Anoxic conditions (very low amounts of dissolved 
+oxygen) in groundwater can result in release of iron from minerals into groundwater 
+(Hem, 1985).
+In the North San Francisco Bay Shallow Aquifer study unit, TDS or the major 
+ions chloride and sulfate were present at high concentrations (greater than the upper 
+limit) in about 6 percent of the shallow aquifer system and at moderate concentra­
+tions (between the recommended and upper limit) in about 16 percent. Iron was 
+present at high concentrations in about 20 percent of the shallow aquifer system and 
+at moderate concentrations in about 5 percent.
+54
+21
+25
+95
+3
+2
+Nutrients
+75
+5
+20
+Iron
+78
+16
+6
+Major ions and TDS
+100
+Radioactive constituents
+Trace elements
+97
+3
+Perchlorate
+ORGANIC CONSTITUENTS
+RESULTS: Groundwater Quality in the North San Francisco Bay Shallow Aquifer Study Unit
+Organic Constituents
+The GAMA Priority Basin Project uses laboratory methods that can detect low con­
+centrations of volatile organic compounds (VOCs) and pesticides, far below human-health 
+benchmarks. VOCs and pesticides detected at these very low concentrations can be used to 
+help trace water from the landscape into the aquifer system.
+Volatile Organic Compounds with Human-Health Benchmarks
+VOCs are in many household, commercial, industrial, and agricultural products and 
+are characterized by a tendency to volatilize (evaporate) into the air. VOCs include solvents, 
+trihalomethanes, refrigerants, and organic synthesis reagents. In the North San Francisco 
+Bay Shallow Aquifer study unit, VOCs were at low concentrations when detected and were 
+not present at high or moderate concentrations in the shallow aquifer system.   
+Pesticides with Human-Health Benchmarks
+Pesticides, including herbicides, insecticides, fungicides, and fumigants, are applied to 
+crops, gardens, lawns, around buildings, and along roads to help control unwanted veg­
+etation (weeds), insects, fungi, and other pests. In the North San Francisco Bay Shallow 
+Aquifer study unit, pesticides were detected at high concentrations in about 1 percent of the 
+shallow aquifer system, but none were detected at moderate concentrations. The insecticide 
+dieldrin was the only pesticide detected at a high concentration. 
+BENCHMARKS FOR EVALUATING GROUNDWATER QUALITY
+GAMA’s Priority Basin Project uses benchmarks established 
+for drinking water to provide context for evaluating the quality of 
+groundwater. The quality of drinking water can differ from the quality 
+of groundwater because of contact with household plumbing, exposure 
+to the atmosphere, or water treatment. Federal and California regulatory 
+benchmarks for protecting human health (maximum contaminant level, 
+MCL) were used when available. Otherwise, non-regulatory benchmarks 
+for protecting human health (lifetime health advisory level, HAL, and 
+notification level, NL) and nonregulatory benchmarks for protecting 
+aesthetic properties, such as taste and odor (secondary maximum 
+contaminant level, SMCL) were used.
+Benchmark type and value for selected constituents.
+[Constituents are listed in the order in which they are discussed in this fact sheet. Benchmark types: California, State Water Resources Control Board Division 
+of Drinking Water; Federal, U.S. Environmental Protection Agency; HAL, lifetime health advisory level; MCL, maximum contaminant level; RSD5, risk-specific 
+dose at a risk factor of 10-5; SMCL, secondary maximum contaminant level. Abbreviations: ppb, parts per billion or micrograms per liter; ppm, parts per million or 
+milligrams per liter; pCi/L, picocuries per liter]
+Constituent
+Benchmark
+Constituent
+Benchmark
+Type
+Value
+Type
+Value
+Arsenic
+Federal MCL
+10 ppb
+Perchlorate
+California MCL
+6 ppb
+Boron
+Federal HAL
+6,000 ppb
+Total dissolved solids (TDS)
+California SMCL
+1,000 ppm
+Fluoride
+California MCL
+2 ppm
+Chloride
+California SMCL
+500 ppm
+Manganese
+Federal HAL
+300 ppb
+Sulfate
+California SMCL
+500 ppm
+Radon-222
+Proposed Federal MCL
+4,000 pCi/L
+Iron
+California SMCL
+300 ppb
+Nitrate
+Federal MCL
+10 ppm
+Dieldrin
+Federal RSD5
+0.02 ppb
+High, moderate, and low concentrations are defined relative to benchmarks
+Concentrations are considered high if they are greater than a benchmark. For inorganic constituents, concentrations are moderate 
+if they are greater than one-half of a benchmark. For organic and special-interest constituents, concentrations are moderate if they 
+are greater than one-tenth of a benchmark. Low concentrations include non-detections and values less than moderate concentrations. 
+Methods for evaluating water quality are discussed by Bennett and Fram (2014).
+High: Concentrations are greater than the
+   benchmark
+Moderate: Concentrations are less than
+   the benchmark, but greater than one-half 
+   (for inorganic constituents) or one-tenth 
+   (for organic constituents) of the benchmark
+Low: Concentrations are less than moderate 
+   or the constituent was not detected
+Pie diagrams are used to summarize groundwater-quality
+results. The pie slices represent the percentages of the  
+groundwater resources with high, moderate, and low 
+concentrations of a constituent.  Methods for calculating 
+these percentages are discussed by Bennett (2018).
+100
+Pesticides
+Volatile organic
+compounds
+100
+99
+1
+ISSN 2327-6916 (print)
+ISSN 2327-6932 (online)
+http://dx.doi.org/10.3133/fsxxxxxxxx
+Priority Basin Assessments 
+GAMA’s Priority Basin Project 
+(GAMA-PBP) assesses water quality in 
+two distinct parts of the aquifer system 
+used for drinking water: the public-
+supply aquifer system and the shallow 
+aquifer system. The public-supply 
+aquifer system is defined by the depths 
+of public-supply wells. The shallow 
+aquifer system is defined as that portion 
+of the aquifer system shallower than the 
+public-supply wells. Domestic wells 
+are often in the shallow aquifer system. 
+Assessments are ongoing in more than 
+120 basins throughout California. 
+The GAMA-PBP assessments are 
+based on a comparison of constituent 
+concentrations in untreated groundwater 
+with benchmarks established for the 
+protection of human health and for 
+aesthetic concerns. The GAMA-PBP 
+does not evaluate the quality of drinking 
+water delivered to consumers. 
+The GAMA-PBP uses two scientific 
+approaches for assessing groundwater 
+quality. The first approach uses a 
+network of wells to statistically assess 
+the status of groundwater quality. The 
+second approach combines water-quality, 
+hydrologic, geographic, and other data to 
+help assess the factors that affect water 
+quality. In the North San Francisco Bay 
+Shallow Aquifer study unit, data were 
+collected by the GAMA-PBP in 2012. 
+The GAMA-PBP includes chemical 
+analyses not generally available 
+as part of regulatory compliance 
+monitoring, including measurements at 
+concentrations much lower than human-
+health benchmarks and measurement of 
+constituents that can be used to trace the 
+sources and movement of groundwater.
+For more information
+Technical reports and hydrologic data 
+collected for the GAMA Program may be 
+obtained from: 
+GAMA Project Chief
+U.S. Geological Survey
+California Water Science Center
+6000 J Street, Placer Hall
+Sacramento, CA 95819
+Telephone number: (916) 278-3000
+WEB: http://ca.water.usgs.gov/gama
+GAMA Program Unit Chief
+State Water Resources Control Board
+Division of Water Quality 
+PO Box 2231, Sacramento, CA 95812
+Telephone number: (916) 341-5779
+WEB: 
+http://www.waterboards.ca.gov/gama
+By George L. Bennett V and Miranda Fram
+REFERENCES CITED
+Bennett, G.L., V, 2018, Status and understanding of groundwater quality in the North San Francisco Bay Shallow 
+Aquifer study unit, 2012; California GAMA Priority Basin Project (ver. 1.1, February 2018): U.S. Geological 
+Survey Scientific Investigations Report 2017–5051, 74 p., https://doi.org/10.3133/sir20175051.
+Bennett, G.L., V, and Fram, M.S., 2014, Groundwater-quality data in the North San Francisco Bay Shallow 
+Aquifer study unit, 2012—Results from the California GAMA Program: U.S. Geological Survey Data Series 
+865, 94 p., https://doi.org/10.3133/ds865.
+California Department of Water Resources, 2003, California’s groundwater: California Department of Water 
+Resources Bulletin 118, 246 p., https://www.water.ca.gov/Programs/Groundwater-Management/Bulletin-118.
+Forrest, M.J., Kulongoski, J.T., Edwards, M.S., Farrar, C.D., Belitz, K., and Norris, R.D., 2013, Hydrothermal 
+contamination of public supply wells in Napa and Sonoma Valleys, California: Applied Geochemistry, v. 33, 
+p. 25–40, https://doi.org/10.1016/j.apgeochem.2013.01.012.
+Hem, J.D., 1985, Study and interpretation of the chemical characteristics of natural water (3d ed.): U.S. Geologi­
+cal Survey Water Supply Paper 2254, 263 p., http://pubs.er.usgs.gov/publication/wsp2254.
+Kulongoski, J.T., Belitz, Kenneth, and Dawson, B.J., 2006, Ground-water quality data in the North San Fran­
+cisco Bay hydrologic provinces, California, 2004—Results from the Ground-Water Ambient Monitoring and 
+Assessment (GAMA) Program: U.S. Geological Survey Data Series Report 167, 100 p., http://pubs.usgs.gov/
+ds/ds167/. 
+Kulongoski, J.T., Belitz, Kenneth, Landon, M.K., and Farrar, Christopher, 2010, Status and understanding of 
+groundwater quality in the North San Francisco Bay groundwater basins, 2004—California GAMA Priority 
+Basin Project: U.S. Geological Survey Scientific Investigations Report 2010–5089, 88 p., http://pubs.usgs.
+gov/sir/2010/5089/.
+Smedley, P.L., and Kinniburgh, D.G., 2002, A review of the source, behaviour and distribution of arsenic in natu­
+ral waters: Applied Geochemistry, v. 17, no. 5, p. 517–568, https://doi.org/10.1016/S0883-2927(02)00018-5.
+Factors that Affect Groundwater Quality
+In the North San Francisco Bay Shallow Aquifer study unit, trace elements such 
+as arsenic, boron, fluoride and manganese were detected at high concentrations in about 
+one-quarter of the aquifer system. Groundwater age and geochemical conditions in the aquifer 
+are often related to trace-element concentrations. Arsenic concentration in the study unit, for 
+example, exhibited relationships both to groundwater age and dissolved oxygen concetrations.
+The highest concentrations of arsenic were in samples with low dissolved oxygen and 
+premodern or mixed age groundwater. Arsenic can be released from iron or manganese 
+oxyhydroxides under anoxic conditions (low dissolved oxygen), and the longer groundwater 
+is in contact with aquifer materials that contain arsenic, the more time there is for chemicals to 
+react (Smedley and Kinniburgh, 2002). Hydrothermal water, water heated by the Earth’s inter­
+nal heat, is present in some areas of the study unit (Forrest and others, 2013). These waters can 
+ascend along faults or the fracture zone and mix with groundwater, and because mineral solu­
+bilities tend to increase with temperature, trace elements like arsenic, boron, and floride can 
+become elevated (Forrest and others, 2013). Sites with the highest concentrations of arsenic 
+in the North San Francisco Bay shallow aquifer study unit had slightly elevated groundwater 
+temperatures, potentially indicating mixing with hydrothermal water (Bennett, 2018).
+High
+High
+Moderate 
+Moderate 
+Low
+Low
+0
+2
+4
+6
+8
+Dissolved oxygen concentration, milligrams per liter
+0
+10
+20
+30
+40
+50
+Arsenic concentration, micrograms per liter
+60
+10
+1
+3
+5
+7
+9
+Highland
+Modern
+Mixed
+Premodern
+Valleys
+and Plains
+EXPLANATION
+Anoxic Oxic

@@ -1,4 +1,4 @@
-# 🎯 Project Goal — `pylopdf` (working name)
+# 🎯 Project Goal — `distillpdf` (working name)
 
 > **v1 STATUS (2026-06-02): SHIPPED & accepted.** All 4 pillars (text/images/fonts/tables)
 > working; CID fonts solved; mean recall 0.982 / median 0.993 vs PyMuPDF; ~1.8× faster than
@@ -58,7 +58,7 @@ PyO3 + maturin  →  abi3 wheel  →  pip install (zero runtime deps from user's
 ## Benchmark harness (already built, in `bench/`)
 Baselines: pymupdf4llm + plain PyMuPDF. Competitors: oxidize-pdf, pdf-extract,
 pdf-inspector, pdf_oxide. Scripts: `bench_*.py`, `score_quality.py`, corpus in `bench/corpus/`,
-results + `REPORT.md` in `bench/out/`. Add `pylopdf` here once it builds.
+results + `REPORT.md` in `bench/out/`. Add `distillpdf` here once it builds.
 
 ## Reference findings (from this repo's investigation)
 - MuPDF ≈ 580k LOC C (+ ~1M thirdparty), AGPL → the reason we avoid it.
@@ -67,5 +67,5 @@ results + `REPORT.md` in `bench/out/`. Add `pylopdf` here once it builds.
 - lopdf gives objects + Flate/LZW/ASCII85 + `get_page_images` (raw bytes, no codec decode).
 
 ## Open question
-**Name** — `pylopdf` is clear but couples the brand to lopdf (a swappable internal). Consider a
+**Name** — `distillpdf` is clear but couples the brand to lopdf (a swappable internal). Consider a
 backend-agnostic name before publishing. Tracked, not blocking.

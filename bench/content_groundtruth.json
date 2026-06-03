@@ -1,0 +1,2945 @@
+{
+ "_note": "Content ground truth per corpus PDF, extracted independently by Sonnet reading each PDF (no extractor involved). Facets: tables (with must_cells / must_not_cells to catch prose bleed), references (count + verbatim entry starts), paragraphs (verbatim contiguous snippets to test reading-order/paragraph integrity), figures (caption + in-figure text). Consumed by test_content.py.",
+ "Cold_Email_Hacks.pdf": {
+  "tables": [],
+  "references": {
+   "count": 0,
+   "samples": []
+  },
+  "paragraphs": [
+   {
+    "note": "italic sentence mid-paragraph, must be preserved as distinct italic run",
+    "text_snippet": "Taking a template, filling in the blanks and hitting send is easy. It even feels like you accomplished something important. But that's not how you grow your business."
+   },
+   {
+    "note": "bold lead-in list item: bold phrase followed by non-bold body on same bullet — extractor must not split or drop bold",
+    "text_snippet": "If you're the appropriate person to speak with, what does your calendar look like? If not, who do you recommend I talk to? (This particular sentence is from Brian Kreuzberger,"
+   },
+   {
+    "note": "inline statistics with % signs and specific numbers — easy to garble",
+    "text_snippet": "I've seen cases where response rates went from 7% to 39%. That's a 457% increase)!"
+   },
+   {
+    "note": "paragraph containing em-dash, specific named researchers, and inline colon list intro",
+    "text_snippet": "Break-up emails utilize the principle of loss aversion, that behavioral economists Kahneman & Tversky succinctly expressed in five words: losses loom larger than gains."
+   },
+   {
+    "note": "paragraph with specific date/time schedule list — bullet-like plain-text list could be misread as table",
+    "text_snippet": "As a general guideline, start off by following up with high frequency, then decrease the frequency over time. Here's a general schedule for timing your follow-ups:"
+   }
+  ],
+  "figures": [
+   {
+    "label": "Figure 1",
+    "caption_snippet": "Look at this example of an average email signature:",
+    "in_figure_text": [
+     "John Doe",
+     "Vice President of Sales",
+     "Generic Company",
+     "T: (555) 555-2121",
+     "F: (555) 555-3232",
+     "Nice talking to you — paulj7395@gmail.com"
+    ]
+   },
+   {
+    "label": "Figure 2",
+    "caption_snippet": "Here's what my signature looks like:",
+    "in_figure_text": [
+     "Steli Efti, CEO Close.io",
+     "We're hiring! Join the most badass team in SaaS!",
+     "Buy my book: Startup Sales Guide",
+     "Watch my keynote: Hustle Hard!",
+     "Subscribe to my podcast: The Startup Chat with Steli & Hiten",
+     "Hustle Hard - Get..."
+    ]
+   },
+   {
+    "label": "Figure 3",
+    "caption_snippet": "You can see the result below, along with Jeff's own notes on why it worked.",
+    "in_figure_text": [
+     "Jeff Deutsch | Marketing Director",
+     "professional branding, link to the company",
+     "answers the question, \"What is Ptengine?\"",
+     "website, in case they missed it before",
+     "Our YouTube video shows up as an attachment, grabs the eye and increases awareness of the benefits of Ptengine",
+     "Spy on an e-Com"
+    ]
+   },
+   {
+    "label": "Figure 4",
+    "caption_snippet": "For example, try reading these two versions of the same promotional email from a pizzeria:",
+    "in_figure_text": [
+     "Have some pizza this holiday season!",
+     "Our customers",
+     "Hey there,",
+     "plain",
+     "pepperoni",
+     "veggie"
+    ]
+   },
+   {
+    "label": "Figure 5",
+    "caption_snippet": "Here's an example:",
+    "in_figure_text": [
+     "Hey Elon,",
+     "You don't have enough leads.",
+     "You don't have good quality leads",
+     "You lack predictability for your funnel",
+     "Remind me to follow up if no reply",
+     "in 1 week"
+    ]
+   },
+   {
+    "label": "Figure 6",
+    "caption_snippet": "Here's what to send them instead:",
+    "in_figure_text": [
+     "Hey Phil,",
+     "You've chosen a different scenario. :(",
+     "This is not a priority for you right now. (That's cool.)",
+     "You are on a sandy Hawaiian beach. :)",
+     "Remind me to follow up if no reply",
+     "in 1 week"
+    ]
+   }
+  ]
+ },
+ "arxiv_bert.pdf": {
+  "tables": [
+   {
+    "label": "Table 1",
+    "caption_snippet": "GLUE Test results, scored by the evaluation server (https://glue",
+    "n_rows": 6,
+    "n_cols": 9,
+    "must_cells": [
+     "86.7/85.9",
+     "72.1",
+     "92.7",
+     "94.9",
+     "60.5",
+     "89.3",
+     "70.1",
+     "82.1"
+    ],
+    "must_not_cells": [
+     "Results are presented in Table 1.",
+     "4.5% and 7.0% respective average accuracy improvement"
+    ]
+   },
+   {
+    "label": "Table 2",
+    "caption_snippet": "SQuAD 1.1 results. The BERT ensemble is 7x systems which use",
+    "n_rows": 9,
+    "n_cols": 4,
+    "must_cells": [
+     "82.3",
+     "91.2",
+     "86.0",
+     "91.7",
+     "84.5",
+     "90.5",
+     "86.2",
+     "93.2"
+    ],
+    "must_not_cells": [
+     "Table 2 shows top leaderboard entries as well as results from top published systems"
+    ]
+   },
+   {
+    "label": "Table 3",
+    "caption_snippet": "SQuAD 2.0 results. We exclude entries that use BERT as one of",
+    "n_rows": 6,
+    "n_cols": 4,
+    "must_cells": [
+     "86.3",
+     "89.0",
+     "89.5",
+     "74.8",
+     "78.0",
+     "78.7"
+    ],
+    "must_not_cells": [
+     "We observe a +5.1 F1 improvement over the previous best system."
+    ]
+   },
+   {
+    "label": "Table 4",
+    "caption_snippet": "SWAG Dev and Test accuracies. †Human performance is measured w",
+    "n_rows": 7,
+    "n_cols": 3,
+    "must_cells": [
+     "51.9",
+     "52.7",
+     "59.1",
+     "59.2",
+     "86.6",
+     "86.3",
+     "85.0",
+     "88.0"
+    ],
+    "must_not_cells": [
+     "BERTLARGE outperforms the authors' baseline ESIM+ELMo system by +27.1%"
+    ]
+   },
+   {
+    "label": "Table 5",
+    "caption_snippet": "Ablation over the pre-training tasks using the BERTBASE archite",
+    "n_rows": 4,
+    "n_cols": 6,
+    "must_cells": [
+     "84.4",
+     "88.4",
+     "86.7",
+     "92.7",
+     "83.9",
+     "84.9",
+     "86.5",
+     "87.9"
+    ],
+    "must_not_cells": [
+     "We first examine the impact brought by the NSP task."
+    ]
+   },
+   {
+    "label": "Table 6",
+    "caption_snippet": "Ablation over BERT model size. #L = the number of layers; #H =",
+    "n_rows": 6,
+    "n_cols": 6,
+    "must_cells": [
+     "5.84",
+     "4.68",
+     "3.99",
+     "3.54",
+     "3.23",
+     "86.6",
+     "87.8",
+     "93.7"
+    ],
+    "must_not_cells": [
+     "Results on selected GLUE tasks are shown in Table 6."
+    ]
+   }
+  ],
+  "references": {
+   "count": 40,
+   "samples": [
+    "Alan Akbik, Duncan Blythe, and Roland Vollgraf. 2018. Contextual string embeddings for sequence labeling.",
+    "Rami Al-Rfou, Dokook Choe, Noah Constant, Mandy Guo, and Llion Jones. 2018. Character-level lan-",
+    "Peter F Brown, Peter V Desouza, Robert L Mercer, Vincent J Della Pietra, and Jenifer C Lai. 1992. Class-based n-gram models of natural language.",
+    "Ciprian Chelba, Tomas Mikolov, Mike Schuster, Qi Ge, Thorsten Brants, Phillipp Koehn, and Tony Robinson. 2013. One billion word benchmark for measur-",
+    "Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Lukasz Kaiser, and Illia Polosukhin. 2017. Attention is all you need."
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "Abstract paragraph split across two columns, contains key metrics that could be mangled",
+    "text_snippet": "BERT is conceptually simple and empirically powerful. It obtains new state-of-the-art results on eleven natural language processing tasks, including pushing the GLUE score to"
+   },
+   {
+    "note": "Two-column paragraph near Figure 1, wraps across column boundary",
+    "text_snippet": "A distinctive feature of BERT is its unified architecture across different tasks. There is minimal difference between the pre-trained architecture and the final downstream architecture."
+   },
+   {
+    "note": "Paragraph near bottom of column 1 page 5, wraps into column 2 near figure",
+    "text_snippet": "The NSP task is closely related to representation-learning objectives used in Jernite et al. (2017) and Logeswaran and Lee (2018). However, in prior work, only sentence embeddings are transferred to"
+   },
+   {
+    "note": "Column-wrap paragraph in Section 3.2 Fine-tuning BERT, crosses column boundary mid-sentence",
+    "text_snippet": "Fine-tuning is straightforward since the self-attention mechanism in the Transformer allows BERT to model many downstream tasks—whether they involve single text or text pairs—by swapping out the appropriate inputs and outputs."
+   }
+  ],
+  "figures": [
+   {
+    "label": "Figure 1",
+    "caption_snippet": "Overall pre-training and fine-tuning procedures for BERT. Apart f",
+    "in_figure_text": [
+     "NSP",
+     "Mask LM",
+     "BERT",
+     "Pre-training",
+     "Fine-Tuning",
+     "MNLI",
+     "NER",
+     "SQuAD",
+     "Start/End Span",
+     "Masked Sentence A",
+     "Masked Sentence B",
+     "Unlabeled Sentence A and B Pair",
+     "Question Answer Pair"
+    ]
+   },
+   {
+    "label": "Figure 2",
+    "caption_snippet": "BERT input representation. The input embeddings are the sum of t",
+    "in_figure_text": [
+     "Input",
+     "Token Embeddings",
+     "Segment Embeddings",
+     "Position Embeddings",
+     "[CLS]",
+     "my",
+     "dog",
+     "is",
+     "cute",
+     "[SEP]",
+     "he",
+     "likes",
+     "play",
+     "##ing"
+    ]
+   },
+   {
+    "label": "Figure 3",
+    "caption_snippet": "Differences in pre-training model architectures. BERT uses a bid",
+    "in_figure_text": [
+     "BERT (Ours)",
+     "OpenAI GPT",
+     "ELMo",
+     "Trm",
+     "Lstm",
+     "E1",
+     "E2",
+     "En"
+    ]
+   },
+   {
+    "label": "Figure 4",
+    "caption_snippet": "Illustrations of Fine-tuning BERT on Different Tasks.",
+    "in_figure_text": [
+     "Class Label",
+     "BERT",
+     "Sentence 1",
+     "Sentence 2",
+     "(a) Sentence Pair Classification Tasks: MNLI, QQP, QNLI, STS-B, MRPC, RTE, SWAG",
+     "(b) Single Sentence Classification Tasks: SST-2, CoLA",
+     "(c) Question Answering Tasks: SQuAD v1.1",
+     "(d) Single Sentence Tagging Tasks: CoNLL-2003 NER",
+     "Start/End Span",
+     "O",
+     "B-PER",
+     "Question",
+     "Paragraph",
+     "Single Sentence"
+    ]
+   },
+   {
+    "label": "Figure 5",
+    "caption_snippet": "Ablation over number of training steps. This shows the MNLI accu",
+    "in_figure_text": [
+     "BERTBASE (Masked LM)",
+     "BERTBASE (Left-to-Right)",
+     "Pre-training Steps (Thousands)",
+     "MNLI Dev Accuracy"
+    ]
+   }
+  ]
+ },
+ "arxiv_math.pdf": {
+  "tables": [
+   {
+    "label": "unnamed table page 24",
+    "caption_snippet": "The following chart shows the required case analysis.",
+    "n_rows": 3,
+    "n_cols": 5,
+    "must_cells": [
+     "PZ",
+     "(Q − P)Z",
+     "column totals: QZ",
+     "|P|p",
+     "max(δ1, δ2)|P|q",
+     "|G| + Δ",
+     "max(δ1, δ2)|G|"
+    ],
+    "must_not_cells": [
+     "The following chart shows the required case analysis.",
+     "Here max(δ1, δ2) = max(δ′1, δ′2) and ? denotes an indeterminate"
+    ]
+   },
+   {
+    "label": "unnamed table page 26",
+    "caption_snippet": "The cases are summarized in the following chart",
+    "n_rows": 5,
+    "n_cols": 5,
+    "must_cells": [
+     "(P ∩ Qx)Z",
+     "(P − Qx)Z",
+     "(Qx − P)Z",
+     "(G − (P ∪ Qx))Z",
+     "column totals: GZ",
+     "|P ∩ Qx|p",
+     "|P|p = |G|"
+    ],
+    "must_not_cells": [
+     "Notation 8.9. The disjoint regions in Figure 3 are",
+     "With this notation, we are reduced to proving (2)"
+    ]
+   }
+  ],
+  "references": {
+   "count": 33,
+   "samples": [
+    "[AFV08] Heather Armstrong, Bradley Forrest, and Karen Vogtmann, A presentation for Aut(Fn),",
+    "[BBM07] Mladen Bestvina, Kai-Uwe Bux, and Dan Margalit, Dimension of the Torelli group for Out(Fn),",
+    "[CV86] Marc Culler and Karen Vogtmann, Moduli of graphs and automorphisms of free groups,",
+    "[KV93] Sava Krstic and Karen Vogtmann, Equivariant outer space and automorphisms of free-by-finite groups,",
+    "[Vog17] Karen Vogtmann, Contractibility of outer space: reprise, Hyperbolic geometry and geometric group"
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "abstract list items embedded in paragraph flow — extractor may drop enumerated items or merge them",
+    "text_snippet": "YES or NO depending on whether or not there is an element θ ∈ Out(Fn) such that θ(K⃗) = K⃗′ together with one such θ if it exists and"
+   },
+   {
+    "note": "paragraph wraps around footnote marker mid-sentence near bottom of page 8",
+    "text_snippet": "if there is cellular isomorphism1 h : G → G′ such that h ◦ g and g′ are homotopy equivalent. We write [(G, g)] for the equivalence class"
+   },
+   {
+    "note": "paragraph spanning page 3 to page 4, split across pages; extractor may duplicate or drop the cross-page sentence",
+    "text_snippet": "graph τ. We replace this with the volume ∥τ∥K of the Stallings graph determined by K ∈ K and a marked graph τ; see Section 5."
+   },
+   {
+    "note": "inline display math followed immediately by prose continuation — extractor may absorb formula into paragraph or skip it",
+    "text_snippet": "It is clear that if a ∈ Fn, K is the conjugacy class of the cyclic subgroup ⟨a⟩, and w is the conjugacy class of a then the modified star graph for ρ and K is the same as the star graph for ρ and w."
+   }
+  ],
+  "figures": [
+   {
+    "label": "Figure 1",
+    "caption_snippet": "The right side illustrates a rose ρ = (R, r), a Stallings graph K",
+    "in_figure_text": [
+     "Ỹ",
+     "Y",
+     "Kg",
+     "Kρ",
+     "G",
+     "R"
+    ]
+   },
+   {
+    "label": "Figure 2",
+    "caption_snippet": "Figure 2:",
+    "in_figure_text": [
+     "Qα",
+     "α",
+     "A",
+     "γ",
+     "γ′",
+     "B"
+    ]
+   },
+   {
+    "label": "Figure 3",
+    "caption_snippet": "The left ellipse represents α and the right xβ. The union of the pink",
+    "in_figure_text": [
+     "A",
+     "γ",
+     "xγ′",
+     "xB",
+     "α",
+     "xβ"
+    ]
+   }
+  ]
+ },
+ "arxiv_nerf.pdf": {
+  "tables": [
+   {
+    "label": "Table 1",
+    "caption_snippet": "Our method quantitatively outperforms prior work on datasets of",
+    "n_rows": 5,
+    "n_cols": 7,
+    "must_cells": [
+     "33.20",
+     "0.963",
+     "0.073",
+     "40.15",
+     "0.991",
+     "0.023",
+     "26.50",
+     "0.212"
+    ],
+    "must_not_cells": [
+     "The DeepVoxels [41] dataset consists of 4 diffuse objects with simple geometry.",
+     "we urge readers to view our supplementary video"
+    ]
+   },
+   {
+    "label": "Table 2",
+    "caption_snippet": "An ablation study of our model. Metrics are averaged over the 8",
+    "n_rows": 10,
+    "n_cols": 8,
+    "must_cells": [
+     "No PE, VD, H",
+     "26.67",
+     "0.906",
+     "0.136",
+     "31.01",
+     "0.947",
+     "0.081",
+     "Complete Model"
+    ],
+    "must_not_cells": [
+     "L used in our positional encoding for x (the maximum frequency used for d is",
+     "See Sec. 6.4 for detailed descriptions."
+    ]
+   }
+  ],
+  "references": {
+   "count": 52,
+   "samples": [
+    "Abadi, M., Agarwal, A., Barham, P., Brevdo, E., Chen, Z., Citro, C., Corrado, G.S., Davis, A., Dean,",
+    "Buehler, C., Bosse, M., McMillan, L., Gortler, S., Cohen, M.: Unstructured lumigraph rendering. In: SIGGRAPH (2001)",
+    "Kajiya, J.T., Herzen, B.P.V.: Ray tracing volume densities. Computer Graphics (SIGGRAPH) (1984)",
+    "Mildenhall, B., Srinivasan, P.P., Ortiz-Cayon, R., Kalantari, N.K., Ramamoorthi, R., Ng, R., Kar, A.: Local light field fusion: Practical view synthesis with prescriptive sampling guidelines.",
+    "Sitzmann, V., Zollhoefer, M., Wetzstein, G.: Scene representation networks: Continuous 3D-structure-aware neural scene representations. In: NeurIPS (2019)"
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "Abstract paragraph wrapping near the column margin with complex math notation inline",
+    "text_snippet": "synthesizing novel views of complex scenes by optimizing an underlying continuous volumetric scene function using a sparse set of input views. Our algorithm represents a scene using a fully-connected (non-convolutional) deep network, whose input is a single continuous 5D coor"
+   },
+   {
+    "note": "Paragraph split across equation boundary (Eq. 1), easy to mis-merge with equation text",
+    "text_snippet": "The function T(t) denotes the accumulated transmittance along the ray from tn to t, i.e., the probability that the ray travels from tn to t without hitting any other particle. Rendering a view from our continuous neural radiance field"
+   },
+   {
+    "note": "Paragraph near ablation table caption that could be absorbed into table",
+    "text_snippet": "L used in our positional encoding for x (the maximum frequency used for d is scaled proportionally). Only using 5 frequencies reduces performance, but increasing the number of frequencies from 10 to 15 does not improve performance."
+   },
+   {
+    "note": "Implementation details paragraph with specific numerical hyperparameters, near equations",
+    "text_snippet": "In our experiments, we use a batch size of 4096 rays, each sampled at Nc = 64 coordinates in the coarse volume and Nf = 128 additional coordinates in the fine volume. We use the Adam optimizer [18] with a learning rate that begins at"
+   }
+  ],
+  "figures": [
+   {
+    "label": "Figure 1",
+    "caption_snippet": "We present a method that optimizes a continuous 5D neural radiance",
+    "in_figure_text": [
+     "Input Images",
+     "Optimize NeRF",
+     "Render new views"
+    ]
+   },
+   {
+    "label": "Figure 2",
+    "caption_snippet": "An overview of our neural radiance field scene representation and",
+    "in_figure_text": [
+     "5D Input Position + Direction",
+     "Output Color + Density",
+     "Volume Rendering",
+     "Rendering Loss",
+     "(x,y,z,θ,φ)",
+     "(RGBσ)",
+     "Ray Distance",
+     "g.t."
+    ]
+   },
+   {
+    "label": "Figure 4",
+    "caption_snippet": "Here we visualize how our full model benefits from representing view-",
+    "in_figure_text": [
+     "Ground Truth",
+     "Complete Model",
+     "No View Dependence",
+     "No Positional Encoding"
+    ]
+   },
+   {
+    "label": "Figure 5",
+    "caption_snippet": "Comparisons on test-set views for scenes from our new synthetic dataset",
+    "in_figure_text": [
+     "Ground Truth",
+     "NeRF (ours)",
+     "LLFF",
+     "SRN",
+     "NV"
+    ]
+   },
+   {
+    "label": "Figure 7",
+    "caption_snippet": "A visualization of our fully-connected network architecture. Input vectors",
+    "in_figure_text": [
+     "256",
+     "128",
+     "RGB",
+     "60",
+     "24"
+    ]
+   }
+  ]
+ },
+ "astro-ph_GA_2606_02566.pdf": {
+  "tables": [
+   {
+    "label": "Table 1",
+    "caption_snippet": "Summary of simulations generated in this work and their various param",
+    "n_rows": 13,
+    "n_cols": 6,
+    "must_cells": [
+     "m10q-CDM",
+     "m10b-s30",
+     "1.25",
+     "2.02",
+     "22.30",
+     "6.90",
+     "10.4",
+     "5.2"
+    ],
+    "must_not_cells": [
+     "Halo initial condition (IC)",
+     "DM model",
+     "NFW scale density",
+     "Bound mass within the virial radius"
+    ]
+   },
+   {
+    "label": "Table 2",
+    "caption_snippet": "Merger properties in each SIDM host halo. The first two columns corr",
+    "n_rows": 10,
+    "n_cols": 5,
+    "must_cells": [
+     "m10q-s70",
+     "m10b-s70",
+     "0.37",
+     "0.059",
+     "7.7",
+     "0.187",
+     "m10f-s70",
+     "0.136"
+    ],
+    "must_not_cells": [
+     "we define radial mergers as those below the median",
+     "proxy for the pericenter distance"
+    ]
+   },
+   {
+    "label": "Table 3",
+    "caption_snippet": "Simulated and predicted gravothermal-collapse time intervals.",
+    "n_rows": 7,
+    "n_cols": 4,
+    "must_cells": [
+     "m10q-s70",
+     "7.7",
+     "6.4",
+     "13.0",
+     "m10i-s70",
+     "3.0",
+     "47.7",
+     "26.7"
+    ],
+    "must_not_cells": [
+     "the best-fit logarithmic slopes",
+     "self-similar nature of the fluid model"
+    ]
+   }
+  ],
+  "references": {
+   "count": 95,
+   "samples": [
+    "Ade, P. A. R., Aghanim, N., Armitage-Caplan, C., et al. 2014, Astronomy &; Astrophysics, 571, A16,",
+    "Balberg, S., & Shapiro, S. L. 2002, Physical Review Letters, 88, doi: 10.1103/physrevlett.88.101301",
+    "Behroozi, P. S., Wechsler, R. H., Wu, H.-Y. 2013a, ApJ, 762, 109, doi: 10.1088/0004-637X/762/2/109",
+    "Fitts, A., Boylan-Kolchin, M., Bozek, B., et al. 2019, Monthly Notices of the Royal Astronomical Society, 490, 962–977,",
+    "Zel'dovich, Y. B., & Podurets, M. A. 1966, Soviet Ast., 9, 742"
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "two-column wrap near equation/figure, cross-section notation with special chars",
+    "text_snippet": "using both CDM and SIDM with a constant cross section of σ/m = 70 cm2 g−1. We analyze, for the first time, the density evolution of"
+   },
+   {
+    "note": "column wrap mid-sentence near Table 1 reference, halo naming convention",
+    "text_snippet": "ies (Mhost ∼ 1010 M⊙, hereafter \"m10s\"), which are run with the GIZMO code using the Tree+PM gravity solver (P. F. Hopkins 2015; P. F. Hopkins et al. 2018)."
+   },
+   {
+    "note": "column wrap in conclusions section, bullet point continuation across columns",
+    "text_snippet": "time based on the fluid model (N. J. Outmezguine et al. 2023), only half of them (m10q,d,i) reach deep into the gravothermal-collapse regime (i.e.,"
+   },
+   {
+    "note": "near footnote boundary and cross-column wrap, specific numerical values",
+    "text_snippet": "we adopt η = 5×10−4 and κ = 5×10−4, both smaller than typical values in previous works (V. H. Robles et al. 2017; P. F. Hopkins et al. 2018; C. A. Correa et al. 2022; I. Palub-"
+   }
+  ],
+  "figures": [
+   {
+    "label": "Figure 1",
+    "caption_snippet": "Time evolution of the central halo's core density. Arrows along the",
+    "in_figure_text": [
+     "m10q-s70",
+     "m10d-s70",
+     "m10i-s70",
+     "m10b-s70",
+     "m10f-s70",
+     "m10j-s70"
+    ]
+   },
+   {
+    "label": "Figure 2",
+    "caption_snippet": "Fractional change in average temperature between inner and outer regi",
+    "in_figure_text": [
+     "m10q-s70",
+     "m10d-s70",
+     "m10i-s70",
+     "m10b-s70",
+     "m10f-s70",
+     "m10j-s70"
+    ]
+   },
+   {
+    "label": "Figure 3",
+    "caption_snippet": "Evolution of core density and core radius for simulated halos compare",
+    "in_figure_text": [
+     "m10q-s70",
+     "m10d-s70",
+     "m10i-s70",
+     "m10b-s70",
+     "m10f-s70",
+     "m10j-s70"
+    ]
+   },
+   {
+    "label": "Figure A.1",
+    "caption_snippet": "Evolution of m10q-s70 core densities with time-stepping parameters, κ",
+    "in_figure_text": [
+     "κ = 0.01; η = 0.01",
+     "κ = 0.002; η = 0.0005",
+     "κ = 0.0005; η = 0.0005",
+     "m10q-s70",
+     "(Fiducial)"
+    ]
+   },
+   {
+    "label": "Figure B.1",
+    "caption_snippet": "Density profiles of halos m10i-s70 (top) and m10b-s70 (bottom) at th",
+    "in_figure_text": [
+     "L13 (Fiducial)",
+     "L12",
+     "L11",
+     "m10i-s70",
+     "m10b-s70"
+    ]
+   },
+   {
+    "label": "Figure C.1",
+    "caption_snippet": "(Left) Core radius of each host halo (m10q,d,i,b,f,j) with σ/m = 70",
+    "in_figure_text": [
+     "m10q-s70",
+     "m10d-s70",
+     "m10i-s70",
+     "m10b-s70",
+     "m10f-s70",
+     "m10b-s30"
+    ]
+   }
+  ]
+ },
+ "attention_1706.03762.pdf": {
+  "tables": [
+   {
+    "label": "Table 1",
+    "caption_snippet": "Maximum path lengths, per-layer complexity and minimum number of",
+    "n_rows": 5,
+    "n_cols": 4,
+    "must_cells": [
+     "Self-Attention",
+     "Recurrent",
+     "Convolutional",
+     "Self-Attention (restricted)",
+     "O(n^2 · d)",
+     "O(n · d^2)",
+     "O(log_k(n))",
+     "O(n/r)"
+    ],
+    "must_not_cells": [
+     "Since our model contains no recurrence and no convolution",
+     "we must inject some information about the relative or absolute position"
+    ]
+   },
+   {
+    "label": "Table 2",
+    "caption_snippet": "The Transformer achieves better BLEU scores than previous state-of-the-art",
+    "n_rows": 11,
+    "n_cols": 5,
+    "must_cells": [
+     "ByteNet [18]",
+     "ConvS2S [9]",
+     "MoE [32]",
+     "Transformer (base model)",
+     "Transformer (big)",
+     "28.4",
+     "41.8",
+     "3.3 · 10^18"
+    ],
+    "must_not_cells": [
+     "Residual Dropout",
+     "We apply dropout [33] to the output of each sub-layer",
+     "Label Smoothing"
+    ]
+   },
+   {
+    "label": "Table 3",
+    "caption_snippet": "Variations on the Transformer architecture. Unlisted values are identical",
+    "n_rows": 17,
+    "n_cols": 12,
+    "must_cells": [
+     "base",
+     "big",
+     "4.92",
+     "4.33",
+     "26.4",
+     "25.8",
+     "213",
+     "positional embedding instead of sinusoids"
+    ],
+    "must_not_cells": [
+     "development set, newstest2013. We used beam search as described",
+     "In Table 3 rows (A), we vary the number of attention heads"
+    ]
+   },
+   {
+    "label": "Table 4",
+    "caption_snippet": "The Transformer generalizes well to English constituency parsing (Results",
+    "n_rows": 13,
+    "n_cols": 3,
+    "must_cells": [
+     "Vinyals & Kaiser et al. (2014) [37]",
+     "Transformer (4 layers)",
+     "Luong et al. (2015) [23]",
+     "Dyer et al. (2016) [8]",
+     "88.3",
+     "92.7",
+     "93.0",
+     "93.3"
+    ],
+    "must_not_cells": [
+     "increased the maximum output length to input length + 300",
+     "Our results in Table 4 show that despite the lack of task-specific tuning"
+    ]
+   }
+  ],
+  "references": {
+   "count": 40,
+   "samples": [
+    "[1] Jimmy Lei Ba, Jamie Ryan Kiros, and Geoffrey E Hinton. Layer normalization. arXiv preprint",
+    "[2] Dzmitry Bahdanau, Kyunghyun Cho, and Yoshua Bengio. Neural machine translation by jointly",
+    "[9] Jonas Gehring, Michael Auli, David Grangier, Denis Yarats, and Yann N. Dauphin. Convolutional",
+    "[32] Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis, Quoc Le, Geoffrey Hinton,",
+    "[38] Yonghui Wu, Mike Schuster, Zhifeng Chen, Quoc V Le, Mohammad Norouzi, Wolfgang"
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "column-spanning abstract paragraph with long BLEU score sentence that wraps across lines",
+    "text_snippet": "achieves 28.4 BLEU on the WMT 2014 English-to-German translation task, improving over the existing best results, including ensembles, by over 2 BLEU. On the WMT 2014 English-to-French translation task,"
+   },
+   {
+    "note": "two-column body wrap near equation, section 3.2.1; additive vs dot-product comparison",
+    "text_snippet": "much faster and more space-efficient in practice, since it can be implemented using highly optimized matrix multiplication code."
+   },
+   {
+    "note": "section 4 paragraph spanning column break, comparing self-attention and recurrent layers",
+    "text_snippet": "dependencies is a key challenge in many sequence transduction tasks. One key factor affecting the ability to learn such dependencies is the length of the paths forward and backward signals have to traverse in the network."
+   },
+   {
+    "note": "section 5.2 paragraph with inline reference to table 3 bottom line; number-heavy, easy to corrupt",
+    "text_snippet": "the hyperparameters described throughout the paper, each training step took about 0.4 seconds. We trained the base models for a total of 100,000 steps or 12 hours."
+   }
+  ],
+  "figures": [
+   {
+    "label": "Figure 1",
+    "caption_snippet": "The Transformer - model architecture.",
+    "in_figure_text": [
+     "Output Probabilities",
+     "Softmax",
+     "Linear",
+     "Add & Norm",
+     "Feed Forward",
+     "Multi-Head Attention",
+     "Masked Multi-Head Attention",
+     "Positional Encoding",
+     "Input Embedding",
+     "Output Embedding",
+     "Inputs",
+     "Outputs (shifted right)"
+    ]
+   },
+   {
+    "label": "Figure 2",
+    "caption_snippet": "(left) Scaled Dot-Product Attention. (right) Multi-Head Attention consists",
+    "in_figure_text": [
+     "MatMul",
+     "SoftMax",
+     "Mask (opt.)",
+     "Scale",
+     "Q",
+     "K",
+     "V",
+     "Scaled Dot-Product Attention",
+     "Linear",
+     "Concat",
+     "Multi-Head Attention"
+    ]
+   },
+   {
+    "label": "Figure 3",
+    "caption_snippet": "An example of the attention mechanism following long-distance dependencies",
+    "in_figure_text": [
+     "making",
+     "the",
+     "registration",
+     "voting",
+     "process",
+     "more",
+     "difficult",
+     "<EOS>",
+     "<pad>"
+    ]
+   },
+   {
+    "label": "Figure 4",
+    "caption_snippet": "Two attention heads, also in layer 5 of 6, apparently involved in anaphora",
+    "in_figure_text": [
+     "The",
+     "Law",
+     "its",
+     "application",
+     "<EOS>",
+     "<pad>"
+    ]
+   },
+   {
+    "label": "Figure 5",
+    "caption_snippet": "Many of the attention heads exhibit behaviour that seems related to the",
+    "in_figure_text": [
+     "The",
+     "Law",
+     "application",
+     "missing",
+     "<EOS>",
+     "<pad>"
+    ]
+   }
+  ]
+ },
+ "code_sample.pdf": {
+  "tables": [],
+  "references": {
+   "count": 0,
+   "samples": []
+  },
+  "paragraphs": [
+   {
+    "note": "opening prose sentence — easy to drop or merge with heading",
+    "text_snippet": "Install the library and call the parser as shown."
+   },
+   {
+    "note": "code block line 1 — monospaced, must survive verbatim",
+    "text_snippet": "import pylopdf"
+   },
+   {
+    "note": "code block lines 2-3 — must preserve exact spacing and quotes",
+    "text_snippet": "doc = pylopdf.Pdf.open(\"file.pdf\")\ntext = doc.extract_text()"
+   },
+   {
+    "note": "code block lines 4-5 — indentation and bracket syntax must survive",
+    "text_snippet": "for t in doc.extract_tables():\n    print(t[\"n_rows\"], t[\"n_cols\"])"
+   },
+   {
+    "note": "closing prose sentence — easy to absorb into code block or drop",
+    "text_snippet": "The snippet prints table dimensions for each detected table in the document."
+   }
+  ],
+  "figures": []
+ },
+ "cond-mat_soft_2606_02439.pdf": {
+  "tables": [],
+  "references": {
+   "count": 38,
+   "samples": [
+    "[1] S. F. Edwards and P. W. Anderson, Theory of spin glasses, J. Phys. F: Met. Phys. 5, 965 (1975).",
+    "[3] J. Zimmerman and F. Hoare, Low-temperature specific heat of dilute Cu-Mn alloys, Journal of Physics and Chemistry of Solids 17, 52 (1960).",
+    "[13] J. Snyder, J. S. Slusky, R. J. Cava, and P. Schiffer, How 'spin ice' freezes, Nature 413, 48 (2001).",
+    "[18] R. F. Wang, C. Nisoli, R. S. Freitas, J. Li, W. McConville, B. J. Cooley, M. S. Lund, N. Samarth, C. Leighton, V. H. Crespi, and P. Schiffer, Artificial 'spin ice' in a geometri-",
+    "[38] A. Del Campo and W. H. Zurek, Universality of phase transition dynamics: Topological defects from symmetry breaking, Int. J. Mod. Phys. A 29, 1430018 (2014)."
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "Column wrap mid-sentence at page 1/2 boundary — sentence starts right column p1 and continues left column p2",
+    "text_snippet": "using both theory and simulations. Our model suggest that when the magnetic field points in the direction of a lattice vector, the system has a ground state that locally maximizes the topological charge"
+   },
+   {
+    "note": "Two-column wrap near Figure 1 caption — abstract ends and introduction begins across columns",
+    "text_snippet": "magnetic enhancement of the potential barrier that the particles need to cross to find a lower energy state."
+   },
+   {
+    "note": "Equation inline with prose, column wrap risk around Eq. (3) on page 2",
+    "text_snippet": "where m is the magnetic moment of the colloids, given by m = VχB/µ0, and φ is the angle between the magnetic field vector, B and the vector joining both particles"
+   },
+   {
+    "note": "Column-wrap paragraph in Results section across pages 3–4, near Figure 3 caption",
+    "text_snippet": "The slow quench is more ordered, with defects scattered on a field of ground state vertices."
+   }
+  ],
+  "figures": [
+   {
+    "label": "Figure 1",
+    "caption_snippet": "Schematic of the system. a) Colloidal particles are placed in double-well traps with induced magnetic moments",
+    "in_figure_text": [
+     "m",
+     "m",
+     "z",
+     "y",
+     "x",
+     "B",
+     "z",
+     "x"
+    ]
+   },
+   {
+    "label": "Figure 2",
+    "caption_snippet": "Color-coded vertex types with their corresponding geometric vertex energy E(v)/B2 with an in-plane field",
+    "in_figure_text": [
+     "I",
+     "IIa",
+     "IIb",
+     "IIIa",
+     "IIIb",
+     "IV",
+     "Va",
+     "Vb",
+     "VI",
+     "E/B2",
+     "P(v)",
+     "B [mT]",
+     "θ [deg]"
+    ]
+   },
+   {
+    "label": "Figure 3",
+    "caption_snippet": "Vertex Maps of the last frame of simulations in quenched anisotropic colloidal ice for fast (a,b) and slow (c,d)",
+    "in_figure_text": [
+     "a)",
+     "b)",
+     "c)",
+     "d)"
+    ]
+   },
+   {
+    "label": "Figure 4",
+    "caption_snippet": "(a) Logarithmic plot of spin-spin spatial correlation functions for the slow quench and (b) Edwards-Anderson pa",
+    "in_figure_text": [
+     "B[mT]",
+     "slow",
+     "fast",
+     "B [mT]",
+     "lc/a",
+     "Δr/a",
+     "Δt[s]"
+    ]
+   },
+   {
+    "label": "Figure 5",
+    "caption_snippet": "Modified Potentials for a single vertex (left) and two coupled vertices (right) with increasing magnetic field",
+    "in_figure_text": [
+     "B [mT]",
+     "U/kBT",
+     "r∥/d",
+     "h̃",
+     "B2 [mT2]"
+    ]
+   }
+  ]
+ },
+ "cs_CL_2606_02569.pdf": {
+  "tables": [
+   {
+    "label": "Table 1",
+    "caption_snippet": "Core redesigns from a playback-oriented codec to AdaCodec's MLLM-oriented predictive code.",
+    "n_rows": 5,
+    "n_cols": 3,
+    "must_cells": [
+     "Block partition",
+     "GOP scheduling",
+     "Heterogeneous block sizes chosen for bitrate.",
+     "Reuses the predictive cost from motion search to trigger adaptive I-frame insertion.",
+     "Tuned to high-FPS playback.",
+     "Reference pictures selected under codec syntax."
+    ],
+    "must_not_cells": [
+     "AdaCodec adapts this predictive-coding paradigm to a video-MLLM inter-face.",
+     "the core redesign choices that distinguish this code from a playback-oriented codec"
+    ]
+   },
+   {
+    "label": "Table 2",
+    "caption_snippet": "Main benchmark results across long-video, temporal, and general video-understanding tasks.",
+    "n_rows": 20,
+    "n_cols": 12,
+    "must_cells": [
+     "62.2",
+     "75.8±1.8",
+     "65.3±3.1",
+     "Qwen3-VL-8B",
+     "CoPE-VideoLM-7B",
+     "AdaCodec (1/7 token budget)",
+     "AdaCodec (comparable token budget)",
+     "GPT-5 [58]"
+    ],
+    "must_not_cells": [
+     "This setting asks how performant AdaCodec is while using a significantly lower token budget",
+     "At a matched token budget, AdaCodec improves over the baseline on every benchmark"
+    ]
+   },
+   {
+    "label": "Table 3",
+    "caption_snippet": "Token efficiency at the theoretical cap and over all evaluation videos. GOP length counts the I-frame and P-frames.",
+    "n_rows": 5,
+    "n_cols": 3,
+    "must_cells": [
+     "GOP length↑",
+     "17.00",
+     "10.21",
+     "P-frames/GOP↑",
+     "Token ratio↓",
+     "11.8%",
+     "84.6%",
+     "88.2%"
+    ],
+    "must_not_cells": [
+     "The maximum GOP length in AdaCodec is 17 frames (1 I-frame + 16 P-frames)."
+    ]
+   },
+   {
+    "label": "Table 4",
+    "caption_snippet": "Latency and peak-memory comparison. Score is the five-benchmark mean.",
+    "n_rows": 3,
+    "n_cols": 6,
+    "must_cells": [
+     "RGB base.",
+     "AdaCodec",
+     "55,893.2",
+     "8,550.4",
+     "9.26s",
+     "1.62s",
+     "34.6 GB",
+     "75.7"
+    ],
+    "must_not_cells": [
+     "AdaCodec aims to improve both benchmark accuracy and system efficiency."
+    ]
+   },
+   {
+    "label": "Table 5",
+    "caption_snippet": "Representation ablation under matched GOP coverage. All settings use full-RGB I-frames; only the P-frame input changes.",
+    "n_rows": 6,
+    "n_cols": 4,
+    "must_cells": [
+     "I-only",
+     "Per-frame RGB",
+     "Thumbnail P (untrained)",
+     "AdaCodec",
+     "52.7",
+     "63.8",
+     "58.2",
+     "75.7"
+    ],
+    "must_not_cells": [
+     "We test the necessity of predictive coding at the representation level."
+    ]
+   },
+   {
+    "label": "Table 6",
+    "caption_snippet": "Core design ablations for AdaCodec. The default uses 16×16 macroblocks and adaptive GOP construction; deltas are relative to default.",
+    "n_rows": 5,
+    "n_cols": 4,
+    "must_cells": [
+     "AdaCodec",
+     "Dynamic Macroblocks",
+     "Fixed GOP, nP=8",
+     "Fixed GOP, nP=16",
+     "60.3",
+     "56.2",
+     "74.1",
+     "58.4 -1.9"
+    ],
+    "must_not_cells": [
+     "Section 4.6 tests the necessity of the predictive coding interface itself"
+    ]
+   }
+  ],
+  "references": {
+   "count": 95,
+   "samples": [
+    "[1] KunChang Li, Yinan He, Yi Wang, Yizhuo Li, Wenhai Wang, Ping Luo, Yali Wang, Limin Wang, and Yu Qiao. VideoChat: Chat-Centric Video Understanding.",
+    "[8] Chaoyou Fu, Yuhan Dai, Yongdong Luo, Lei Li, Shuhuai Ren, Renrui Zhang, Zihan Wang, Chenyu Zhou, Yunhang Shen, Mengdan Zhang, Peixian Chen, Yanwei Li, Shaohui Lin, Sirui Zhao, Ke Li,",
+    "[32] Rajesh P. N. Rao and Dana H. Ballard. Predictive coding in the visual cortex: a functional interpretation of some extra-classical receptive-field effects. Nature Neuroscience, 2(1):79–87, 1999.",
+    "[46] Shuai Bai, Yuxuan Cai, Ruizhe Chen, Keqin Chen, Xionghui Chen, Zesen Cheng, Lianghao Deng, Wei Ding, Chang Gao, Chunjiang Ge, Wenbin Ge, Zhifang Guo, Qidong Huang, Jie Huang, Fei Huang, Binyuan",
+    "[57] Christopher Clark, Jieyu Zhang, Zixian Ma, Jae Sung Park, Mohammadreza Salehi, Rohun Tripathi, Sangho Lee, Zhongzeng Ren, Chris Dongjoo Kim, Yinuo Yang, Vincent Shao, Yue Yang, Weikai Huang,"
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "abstract flows across two columns, wraps around figure captions; easy to merge with caption text",
+    "text_snippet": "tokens on a reference frame only when its conditional predictive cost is high; other-wise, it encodes inter-frame changes, including motion and prediction residuals, as compact P-tokens."
+   },
+   {
+    "note": "introduction column wrap near numbered list items; list item prose may bleed into next paragraph",
+    "text_snippet": "evidence is still derived from independent RGB frames. A related line has used codec-aware signals for efficient video understanding [27–31]. These works show that codec structure can carry"
+   },
+   {
+    "note": "method section wraps mid-sentence with equation numbering nearby; cross-column wrap risk",
+    "text_snippet": "copies the RGB kernels, and zero-initializes the two motion-vector channels. It then appends learnable tokens after the patch sequence and uses their output states as EP(ut). This architecture adapts to"
+   },
+   {
+    "note": "section 4.5 text wraps alongside Figure 4 inset; right-column float absorption risk",
+    "text_snippet": "tive token curve therefore grows much more slowly than per-frame RGB. The policy thus saves tokens in predictable intervals and spends full visual tokens when prediction becomes difficult."
+   }
+  ],
+  "figures": [
+   {
+    "label": "Figure 1",
+    "caption_snippet": "AdaCodec treats the video MLLM visual interface as a predictive code:",
+    "in_figure_text": [
+     "MLLM-Oriented Predictive Visual Code",
+     "Adaptive GOP Construction",
+     "Results Across 11 Benchmarks",
+     "Latency Comparison",
+     "I-frame",
+     "P-frame",
+     "256 tokens",
+     "16 tokens",
+     "TTFT",
+     "E2EL",
+     "Long-Video Average Accuracy"
+    ]
+   },
+   {
+    "label": "Figure 2",
+    "caption_snippet": "AdaCodec method overview. Left: Motion-and-residual encoding for a P-frame.",
+    "in_figure_text": [
+     "Motion and Residual Encoding",
+     "Current Frame (t)",
+     "Reference Frame (t-1)",
+     "Deployable Model",
+     "GOP 1",
+     "I Frame",
+     "P Frame 1",
+     "P Frame 2",
+     "ViT",
+     "P-Tokenizer",
+     "LLM",
+     "Motion Vector",
+     "Residual"
+    ]
+   },
+   {
+    "label": "Figure 3",
+    "caption_snippet": "Long-video accuracy under visual-token budget sweeps.",
+    "in_figure_text": [
+     "MLVU",
+     "LongVideoBench",
+     "LVBench",
+     "Ours",
+     "Qwen3-VL-8B",
+     "32k",
+     "64k",
+     "128k",
+     "224k"
+    ]
+   },
+   {
+    "label": "Figure 4",
+    "caption_snippet": "Dynamic-case behavior under adaptive GOP construction. Spikes in pcost trigger I-frame insertions,",
+    "in_figure_text": [
+     "Dynamic Video Case",
+     "AdaCodec tokens",
+     "Threshold",
+     "Per-frame RGB",
+     "pcost",
+     "I-frame insertion",
+     "Video Timeline",
+     "Cumulative Visual Tokens"
+    ]
+   }
+  ]
+ },
+ "cs_CV_2606_02580.pdf": {
+  "tables": [
+   {
+    "label": "Table 1",
+    "caption_snippet": "Quantitative comparison on NeRF synthetic scenes. PSNR,",
+    "n_rows": 4,
+    "n_cols": 7,
+    "must_cells": [
+     "VIGAᵜᴸᴹ⁻ᵒⁿˡʸ",
+     "13.58",
+     "0.6881",
+     "0.3493",
+     "0.3021",
+     "0.7188",
+     "0.8830",
+     "11.18"
+    ],
+    "must_not_cells": [
+     "Tab. 1 and Tab. 2 report the quantitative comparison on the NeRF",
+     "spheres is excluded from our evaluation."
+    ]
+   },
+   {
+    "label": "Table 2",
+    "caption_snippet": "Quantitative comparison on Edit3D. We report the same metrics",
+    "n_rows": 4,
+    "n_cols": 7,
+    "must_cells": [
+     "12.65",
+     "0.6737",
+     "0.3823",
+     "0.3433",
+     "0.6293",
+     "0.8446",
+     "12.48"
+    ],
+    "must_not_cells": [
+     "SEIG achieves the best score on five out of",
+     "object-centric scenes from [Li et al. 2026]."
+    ]
+   }
+  ],
+  "references": {
+   "count": 54,
+   "samples": [
+    "Anthropic. 2025. Claude Opus 4.7. https://www.anthropic.com/news/claude-opus-4-7.",
+    "Harry Barrow, J Tenenbaum, A Hanson, and E Riseman. 1978. Recovering intrinsic scene characteristics.",
+    "Sagie Benaim, Frederik Warburg, Peter Ebert Christensen, and Serge Belongie. 2024. Volumetric disentanglement for 3d scene manipulation. In IEEE/CVF Winter Conference",
+    "Ben Mildenhall, Pratul P. Srinivasan, Matthew Tancik, Jonathan T. Barron, Ravi Ramamoorthi, and Ren Ng. 2020. NeRF: Representing Scenes as Neural Radiance Fields",
+    "Yunzhi Zhang, Zizhang Li, Matt Zhou, Shangzhe Wu, and Jiajun Wu. 2024. The Scene Language: Representing Scenes with Programs, Words, and Embeddings. arXiv preprint arXiv:2410.16770 (2024)."
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "Abstract paragraph split across two columns near figure 1, easily mis-wrapped",
+    "text_snippet": "constructs a 3D scene from a single image by progressively refining scene factors including geometry, materials, composition, and lighting directly in executable Blender code space. We evaluate our framework across diverse"
+   },
+   {
+    "note": "Method section body crossing column boundary near section header",
+    "text_snippet": "However, directly prompting a VLM to generate or refine a complete Blender scene places a heavy burden on the model, requiring it to jointly infer geometry, materials, composition, and lighting parameters while producing executable code."
+   },
+   {
+    "note": "Paragraph in experiments section straddling column break near table",
+    "text_snippet": "For quantitative evaluation, we curate a set of images from the NeRF synthetic dataset [Mildenhall et al. 2020] and VoxHammer [Li et al. 2026]. Five images are rendered from 7 of the 8 NeRF scenes; the materials scene containing specular reflections from metallic"
+   },
+   {
+    "note": "Conclusion paragraph — single dense block easy to mis-segment",
+    "text_snippet": "By decomposing reconstruction into a sequence of individually verifiable subproblems, each closed by its own generator-verifier stage, our framework enables the model to progressively recover geometry, materials, composition and lighting, while avoiding the entangled-output bottleneck that limits monolithic reconstruction pipelines."
+   }
+  ],
+  "figures": [
+   {
+    "label": "Figure 1",
+    "caption_snippet": "From a single reference image (leftmost inset), SEIG reconstruct",
+    "in_figure_text": [
+     "Image to Blender Code",
+     "Reference Image",
+     "Novel Views",
+     "Editing",
+     "Relighting"
+    ]
+   },
+   {
+    "label": "Figure 2",
+    "caption_snippet": "Method overview. Our agentic reconstruction pipeline decomposes",
+    "in_figure_text": [
+     "Reference",
+     "Initializer",
+     "Rollout 1",
+     "Scene Rollouts",
+     "Rollout Selector",
+     "Scene Graph",
+     "Geometry Refinement",
+     "Geometry Verifier",
+     "Material Refinement",
+     "Material Verifier",
+     "Composition Refinement",
+     "Composition Verifier",
+     "Lighting Refinement",
+     "Lighting Verifier",
+     "Final Prediction"
+    ]
+   },
+   {
+    "label": "Figure 3",
+    "caption_snippet": "Qualitative comparison across methods. Each block shows a dif",
+    "in_figure_text": [
+     "Reference",
+     "VIGA (VLM-Only)",
+     "VIGA (full)",
+     "Ours",
+     "Input view",
+     "Novel views"
+    ]
+   },
+   {
+    "label": "Figure 7",
+    "caption_snippet": "Intermediate outputs across pipeline stages. Two examples show",
+    "in_figure_text": [
+     "Reference image",
+     "Initialization",
+     "Geometry",
+     "Material",
+     "Composition",
+     "Lighting",
+     "Novel views",
+     "Rearrangement",
+     "Relighting"
+    ]
+   },
+   {
+    "label": "Figure 8",
+    "caption_snippet": "Gallery of Blender scenes created by SEIG from in-the-wild and sy",
+    "in_figure_text": [
+     "Reference image",
+     "Input view",
+     "Novel views",
+     "Novel view 1",
+     "Novel view 2"
+    ]
+   }
+  ]
+ },
+ "cs_DS_2606_02492.pdf": {
+  "tables": [
+   {
+    "label": "Table 1",
+    "caption_snippet": "problems, parameters and methods we use below",
+    "n_rows": 10,
+    "n_cols": 3,
+    "must_cells": [
+     "Vertex Cover",
+     "Dominating Set",
+     "Min–Max Matching",
+     "Diverse Pair of Matchings",
+     "(n − k)-Coloring",
+     "size of the vertex cover",
+     "incidence treedepth",
+     "BFS-width",
+     "Theorem 18 (also [10])",
+     "Theorem 52"
+    ],
+    "must_not_cells": [
+     "is not prohibitively restrictive",
+     "but a robust and attainable algorithmic goal"
+    ]
+   }
+  ],
+  "references": {
+   "count": 37,
+   "samples": [
+    "René van Bevern. Fixed-Parameter Linear-Time Algorithms for NP-hard Graph and Hypergraph Problems Arising in Industrial Applications.",
+    "Hans L. Bodlaender. A Linear-Time Algorithm for Finding Tree-Decompositions of Small Treewidth. SIAM Journal on Computing, 25(6):1305–1317, December 1996.",
+    "Stephen A. Cook and Robert A. Reckhow. Time bounded random access machines. Journal of Computer and System Sciences, 7(4):354–375, 1973.",
+    "Marek Cygan, Fedor V. Fomin, Lukasz Kowalik, Daniel Lokshtanov, Dániel Marx, Marcin Pilipczuk, Michal Pilipczuk, and Saket Saurabh. Parameterized Algorithms. Springer, 2015.",
+    "Mihalis Yannakakis and Fanica Gavril. Edge dominating sets in graphs. SIAM journal on applied mathematics, 38(3):364–372, 1980."
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "Definition of TLFPT — core technical definition with formal runtime notation",
+    "text_snippet": "An algorithm is Truly Linear Fixed Parameter Tractable (TLFPT) if, on input (I, k) with |I| = n, it runs in time O(n) + f(k). TLFPT denotes the class of all parameterized problems admitting a TLFPT algorithm."
+   },
+   {
+    "note": "Diagonalization hierarchy — tricky inline math hierarchy with subset symbols",
+    "text_snippet": "TLFPT ⊂ LFPT ⊂ FPT ⊆ W[1] ⊆ W[2] ⊆ . . ."
+   },
+   {
+    "note": "Word-RAM architecture paragraph — tricky technical prose mixing model theory and algorithm claims",
+    "text_snippet": "word size – is log n, where n is length of the input. Thus word-RAM prohibits unbounded parallelism wherein constant-time operations are applied to words of length polynomial in the size of the input."
+   },
+   {
+    "note": "Corollary 10 equivalence list — tricky because numbered list items contain inline math",
+    "text_snippet": "a kernel for Π is computable in time O(|x| + k), i.e. Π admits a linear-time kernelization, 2. a kernel for Π is computable in time O(|x| + f(k)) for some function f, i.e. Π admits a TLFPT time kernelization,"
+   }
+  ],
+  "figures": [
+   {
+    "label": "Figure 1",
+    "caption_snippet": "A graphical summary of our results. Containment of the properties we will use to categorize problems within in this paper.",
+    "in_figure_text": [
+     "ℓ-bounded depth",
+     "twin subgraph reducible",
+     "m-matching bounded",
+     "τ-twin reducible",
+     "d-degree reducible",
+     "BFS-nice"
+    ]
+   },
+   {
+    "label": "Figure 2",
+    "caption_snippet": "An 9-vertex graph H (left), and a DFS tree T of H (right).",
+    "in_figure_text": [
+     "r",
+     "s",
+     "t",
+     "u",
+     "v",
+     "w",
+     "x",
+     "y",
+     "z"
+    ]
+   },
+   {
+    "label": "Figure 3",
+    "caption_snippet": "Illustration of punch graphs and the lookup table kPunch when k = 3.",
+    "in_figure_text": [
+     "kPunch[0,1] = 100",
+     "kPunch[0,2] = 010",
+     "kPunch[1,2] = 001",
+     "A(P_{0,1})",
+     "A(P_{0,2})",
+     "A(P_{1,2})"
+    ]
+   },
+   {
+    "label": "Figure 4",
+    "caption_snippet": "Illustrating the ideas used in Algorithm 7 for k = 3.",
+    "in_figure_text": [
+     "|L_{i-1}| = 2",
+     "|L_i| = 3"
+    ]
+   },
+   {
+    "label": "Figure 5",
+    "caption_snippet": "Illustrating how the two graphs and the bicolored bigraph from Figure 4 can be encoded are encoded binary strings.",
+    "in_figure_text": [
+     "x_{i-1} = 100",
+     "y_i = 101010000",
+     "x_i = 011"
+    ]
+   }
+  ]
+ },
+ "cs_LG_2606_02576.pdf": {
+  "tables": [
+   {
+    "label": "Table 1",
+    "caption_snippet": "Performance on TriGap. The best and second-best results are highlighted in",
+    "n_rows": 11,
+    "n_cols": 12,
+    "must_cells": [
+     "42.87",
+     "47.23",
+     "93.50",
+     "66.03",
+     "36.51",
+     "PROTOADA (Ours)",
+     "SAME (Xie et al., 2026)",
+     "57.87"
+    ],
+    "must_not_cells": [
+     "we compare PROTOADA with representative continual instruction",
+     "On the more challenging TriGap benchmark"
+    ]
+   },
+   {
+    "label": "Table 2",
+    "caption_snippet": "Average performance of different methods on the UCIT benchmark. The best and second-best results are",
+    "n_rows": 11,
+    "n_cols": 7,
+    "must_cells": [
+     "74.66",
+     "89.83",
+     "93.20",
+     "61.49",
+     "81.37",
+     "66.40",
+     "55.64",
+     "PROTOADA (Ours)"
+    ],
+    "must_not_cells": [
+     "Consistent gains on UCIT further validate the effectiveness",
+     "which enables compatible LoRA sharing while preserving"
+    ]
+   },
+   {
+    "label": "Table 3",
+    "caption_snippet": "Ablation study of PROTOADA, all experiments are conducted under UCIT.",
+    "n_rows": 5,
+    "n_cols": 2,
+    "must_cells": [
+     "60.79",
+     "68.13",
+     "72.35",
+     "74.66",
+     "w/ Format + Adaptive + Geometry (Ours)",
+     "Baseline"
+    ],
+    "must_not_cells": [
+     "Format-aware prototypes improve the average accuracy",
+     "Adaptive assignment further increases accuracy"
+    ]
+   },
+   {
+    "label": "Table 4",
+    "caption_snippet": "Task-order robustness of PROTOADA on UCIT. We report average accuracy (%) under three task sequences.",
+    "n_rows": 3,
+    "n_cols": 4,
+    "must_cells": [
+     "74.66",
+     "70.83",
+     "71.17",
+     "PROTOADA (Ours)",
+     "Original",
+     "Reverse"
+    ],
+    "must_not_cells": [
+     "PROTOADA maintains stable performance under different task orders",
+     "Although reversing or shuffling the task order introduces"
+    ]
+   }
+  ],
+  "references": {
+   "count": 42,
+   "samples": [
+    "Jinze Bai, Shuai Bai, Shusheng Yang, Shijie Wang, Sinan Tan, Peng Wang, Junyang Lin, Chang Zhou,",
+    "Meng Cao, Yuyang Liu, Yingfei Liu, Tiancai Wang, Jiahua Dong, Henghui Ding, Xiangyu Zhang, Ian",
+    "Robert M French. 1999. Catastrophic forgetting in connectionist networks. Trends in cognitive sciences,",
+    "Runwei Guan, Rongsheng Hu, Shangshu Chen, Ningyuan Xiao, Xue Xia, Jiayang Liu, Beibei Chen,",
+    "Virginia Klema and Alan Laub. 1980. The singular value decomposition: Its computation and some ap-"
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "two-column body text wrapping near figure caption (Fig. 1), easy to merge with caption",
+    "text_snippet": "tasks with distinct response structures could share highly similar visual-linguistic semantics and thus be wrongly routed to the same expert;"
+   },
+   {
+    "note": "two-column body text near footnote marker and equation, risk of absorbing footnote text",
+    "text_snippet": "calculate the mean, variance of response length, token uncertainty, and template consistency 2 from target responses and derive a format code:"
+   },
+   {
+    "note": "column-spanning paragraph transition near equations, risk of line-wrap merge",
+    "text_snippet": "where each group stores shared parameters for tasks that are compatible in both image-text semantics and response protocols. To avoid entangling"
+   },
+   {
+    "note": "cross-column paragraph near Fig. 4 and Fig. 5 captions, susceptible to caption absorption",
+    "text_snippet": "cause severe degradation when it remains consistent. In contrast, the format-varied stream leads to a large drop for FineTune, whose Last accuracy"
+   }
+  ],
+  "figures": [
+   {
+    "label": "Figure 1",
+    "caption_snippet": "Accuracy of sequential finetuning under format-varied (FmtGap) and semantic-varied (VisGap)",
+    "in_figure_text": [
+     "VisGap",
+     "FmtGap",
+     "Phase-0",
+     "Phase-2",
+     "Phase-4",
+     "Continual Instruction Tuning Tasks"
+    ]
+   },
+   {
+    "label": "Figure 2",
+    "caption_snippet": "t-SNE visualization of task representations under semantic-only and format-aware prototypes.",
+    "in_figure_text": [
+     "(a) Semantic-Only.",
+     "(b) Format-Aware."
+    ]
+   },
+   {
+    "label": "Figure 3",
+    "caption_snippet": "PROTOADA groups tasks with compatible response formats into shared experts, while separating",
+    "in_figure_text": [
+     "MCIT Task 1",
+     "Task 2",
+     "Task k",
+     "Group 1 Short-Answer Expert",
+     "Group 2 Option-Letter Expert",
+     "Prototype Embedding Space"
+    ]
+   },
+   {
+    "label": "Figure 4",
+    "caption_snippet": "Performance gap between handling streams with the same format and streams with varied formats.",
+    "in_figure_text": [
+     "FineTune",
+     "MoELoRA",
+     "HiDe-LLaVA",
+     "ProtoAda (sem.)",
+     "ProtoAda (full)",
+     "Same-format stream"
+    ]
+   },
+   {
+    "label": "Figure 5",
+    "caption_snippet": "Separability index among task prototypes on UCIT as more tasks are learned, with the line tracking",
+    "in_figure_text": [
+     "Task0",
+     "Task1",
+     "Task2",
+     "Task3",
+     "Task4",
+     "Task5"
+    ]
+   },
+   {
+    "label": "Figure 6",
+    "caption_snippet": "Parameter budget of PROTOADAover the TriGap task stream.",
+    "in_figure_text": [
+     "ProtoAda w/o consolidation",
+     "ProtoAda w/ consolidation",
+     "Typical MoE methods",
+     "Parameter Reuse",
+     "Global Consolidation"
+    ]
+   }
+  ]
+ },
+ "econ_EM_2606_02234.pdf": {
+  "tables": [
+   {
+    "label": "Table 1",
+    "caption_snippet": "Conditions required and ruled out under Models A and B (see Propositions 1 and 2)",
+    "n_rows": 5,
+    "n_cols": 3,
+    "must_cells": [
+     "Additive separability of U in treatment equation",
+     "Random-walk structure of treatment shocks",
+     "No dynamic treatment effects",
+     "No direct effect of past treatments on later covariates",
+     "Not required",
+     "Required"
+    ],
+    "must_not_cells": [
+     "Proposition 3",
+     "CIA-∇D is generally not nested with CIA-D or CIA-∇Y"
+    ]
+   },
+   {
+    "label": "Table 2",
+    "caption_snippet": "First simulation study (independent W_0, W_1).",
+    "n_rows": 15,
+    "n_cols": 9,
+    "must_cells": [
+     "−0.00",
+     "0.33",
+     "0.83",
+     "0.50",
+     "1.17",
+     "Sim1a CIA-∇D only (α = 1, γ = 2)",
+     "Sim1d CIA-∇Y only (α = 2, γ = 1)",
+     "Sim1f All invalid (α = 2, γ = 2)"
+    ],
+    "must_not_cells": [
+     "Table 3 confirms Proposition 4",
+     "The second simulation study uses a random-walk DGP"
+    ]
+   },
+   {
+    "label": "Table 3",
+    "caption_snippet": "Second simulation study (random walk of W_T).",
+    "n_rows": 7,
+    "n_cols": 9,
+    "must_cells": [
+     "Sim2a No dynamic effect (γ = 1, φ = 0)",
+     "Sim2b Dynamic effect (γ = 2, φ = 0.5)",
+     "−0.00",
+     "0.11",
+     "0.17",
+     "0.09"
+    ],
+    "must_not_cells": [
+     "Table 4 reports the full set of estimates",
+     "To illustrate the four identification strategies"
+    ]
+   },
+   {
+    "label": "Table 4",
+    "caption_snippet": "Cigarette Demand: Price Elasticity under Four Identification Strategies. Baltagi & Levin (1986) panel, 46 US states × 29 years (1964–1992), n = 1,334.",
+    "n_rows": 12,
+    "n_cols": 5,
+    "must_cells": [
+     "−0.395***",
+     "−0.402***",
+     "−0.380***",
+     "−0.684***",
+     "(0.038)",
+     "(0.078)",
+     "p < 0.001***",
+     "−0.519***"
+    ],
+    "must_not_cells": [
+     "Table 4 reports bias and root mean squared error",
+     "The second simulation study"
+    ]
+   }
+  ],
+  "references": {
+   "count": 36,
+   "samples": [
+    "Abadie, A. (2005). Semiparametric difference-in-differences estimators. Review of Economic",
+    "Angrist, J. D., & Pischke, J.-S. (2009). Mostly harmless econometrics: An empiricist's",
+    "Baltagi, B. H., & Levin, D. (1986). Estimating dynamic demand for cigarettes using panel",
+    "Card, D., & Krueger, A. B. (1994). Minimum wages and employment: A case study of the",
+    "Hausman, J. A. (1978). Specification tests in econometrics. Econometrica, 46(6), 1251-1271."
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "Abstract — long dense paragraph with multiple technical claims, easy to mis-merge with keywords block",
+    "text_snippet": "demonstrate that the identifying assumptions relying on treatment changes are generally not nested with those of methods relying on treatment levels, such as selection-on-observables strategies that"
+   },
+   {
+    "note": "Introduction — inline citation list mid-paragraph, tricky link rendering",
+    "text_snippet": "the treatment level that are non-nested, as discussed in Weber, van der Laan, and Petersen (2015), Chabé-Ferret (2017), Xu (2023), and Huber and Oeß (2024)."
+   },
+   {
+    "note": "Empirical section — specific numeric details about dataset, prone to mis-extraction",
+    "text_snippet": "covering 46 US states over the period 1963–1992. The data set covers 1,380 state-year observations (or 1,334 after first-differencing) and is available in the plm package by Croissant and Millo (2008)"
+   },
+   {
+    "note": "Conclusion paragraph — dense policy language, no equations, easy to truncate",
+    "text_snippet": "equation, even though this does not substitute for careful examination of the underlying structural assumptions."
+   }
+  ],
+  "figures": [
+   {
+    "label": "Figure 1",
+    "caption_snippet": "Model A: DAG illustration of Proposition 1. Left: treatment levels. Right: treatment change. Solid nodes observed, dashed nodes unobserved.",
+    "in_figure_text": [
+     "W_0",
+     "W_1",
+     "D_0",
+     "D_1",
+     "Y_1",
+     "X_0",
+     "U",
+     "V_0",
+     "∇D_1",
+     "∇W_1"
+    ]
+   },
+   {
+    "label": "Figure 2",
+    "caption_snippet": "Model B: DAG illustration of Proposition 2. Left: treatment levels. Right: treatment change.",
+    "in_figure_text": [
+     "W_0",
+     "W_1",
+     "D_0",
+     "D_1",
+     "Y_1",
+     "X_0",
+     "U",
+     "ε_1",
+     "∇D_1"
+    ]
+   },
+   {
+    "label": "Figure 3",
+    "caption_snippet": "Model A: CIA-∇D holds, CIA-D fails. Left: treatment levels (U confounds D_1 and Y_1). Right: treatment change (U cancels from ∇D_1). Solid nodes observed, dashed nodes unobserved.",
+    "in_figure_text": [
+     "W_0",
+     "W_1",
+     "D_0",
+     "D_1",
+     "Y_1",
+     "U",
+     "∇W_1",
+     "∇D_1"
+    ]
+   },
+   {
+    "label": "Figure 4",
+    "caption_snippet": "Equation (18): CIA-D holds, CIA-∇D fails. Left: treatment levels (U absent from outcome, CIA-D holds). Right: treatment change (dynamic effect D_0 → Y_1 via W_0 introduces confounding, CIA-∇D fails).",
+    "in_figure_text": [
+     "W_0",
+     "W_1",
+     "D_0",
+     "D_1",
+     "Y_1",
+     "U",
+     "∇W_1",
+     "∇D_1"
+    ]
+   },
+   {
+    "label": "Figure 5",
+    "caption_snippet": "Equation (19): CIA-∇D holds, CIA-∇Y fails. Left: treatment change and outcome level (U absent from ∇D_1, CIA-∇D holds). Right: treatment level and outcome change (U does not cancel in ∇Y_1, CIA-∇Y fails).",
+    "in_figure_text": [
+     "W_0",
+     "∇W_1",
+     "D_0",
+     "∇D_1",
+     "Y_1",
+     "U",
+     "V_0",
+     "∇V_1"
+    ]
+   },
+   {
+    "label": "Figure 6",
+    "caption_snippet": "Equation (20): CIA-∇Y holds, CIA-∇D fails. Left: treatment change and outcome level (dynamic effect D_0 → Y_1 via W_0, CIA-∇D fails). Right: treatment level and outcome change (U cancels in ∇Y_1, CIA-∇Y holds).",
+    "in_figure_text": [
+     "W_0",
+     "∇W_1",
+     "D_0",
+     "∇D_1",
+     "Y_1",
+     "U",
+     "V_0",
+     "∇V_1"
+    ]
+   }
+  ]
+ },
+ "eess_SP_2606_02448.pdf": {
+  "tables": [
+   {
+    "label": "Table I",
+    "caption_snippet": "PCG SEGMENT COUNTS AND CLASS COMPOSITION AFTER PREPROCESSING (SPLIT PERFORMED AT THE RECORDING LEVEL).",
+    "n_rows": 5,
+    "n_cols": 4,
+    "must_cells": [
+     "11785",
+     "2791 (23.7)",
+     "1898 (76.3)",
+     "16749",
+     "12827 (76.6)",
+     "3922 (23.4)",
+     "1935 (78.2)",
+     "540 (21.8)"
+    ],
+    "must_not_cells": [
+     "quality-controlled 4 s PCG clip was converted to a log-mel",
+     "preprocessing yielded 16,749 usable 4 s clips in total"
+    ]
+   },
+   {
+    "label": "Table II",
+    "caption_snippet": "PLAUSIBILITY METRIC COMPARISON BETWEEN REAL AND DIFFUSION-GENERATED PCG CLIPS (4 S EACH; 10 PER CLASS). VALUES ARE REPORTED AS MEDIAN [Q1, Q3].",
+    "n_rows": 4,
+    "n_cols": 3,
+    "must_cells": [
+     "0.460 [0.449, 0.495]",
+     "0.368 [0.318, 0.413]",
+     "31.24 [26.61, 37.46]",
+     "39.00 [33.04, 45.04]",
+     "0.802 [0.774, 0.879]",
+     "0.845 [0.768, 0.897]"
+    ],
+    "must_not_cells": [
+     "Table II reports the three plausibility metrics defined in",
+     "Compared with real clips, generated clips show a lower rhythm score"
+    ]
+   },
+   {
+    "label": "Table III",
+    "caption_snippet": "EXPERT LISTENING SUMMARY. \"PLAUSIBLE PCG\" DENOTES CLIPS JUDGED AS HEART-SOUND-LIKE WITHOUT OBVIOUS NON-PHYSIOLOGICAL ARTEFACTS. LABEL-DISCRIMINATION METRICS ARE COMPUTED AGAINST THE DATASET LABEL (y ∈ {0, 1}).",
+    "n_rows": 7,
+    "n_cols": 4,
+    "must_cells": [
+     "38/40 (95%)",
+     "17/20 (85%)",
+     "16/20 (80%)",
+     "24/40 (60%)",
+     "12/20 (60%)",
+     "5/20 (25%)",
+     "2/10 (20%)",
+     "10/10 (100%)"
+    ],
+    "must_not_cells": [
+     "Two clinicians independently evaluated 60 de-identified 4 s clips",
+     "Plausibility ratings were high for both sources."
+    ]
+   }
+  ],
+  "references": {
+   "count": 20,
+   "samples": [
+    "[1] World Health Organization, \"Cardiovascular diseases (CVDs),\" Fact sheet, 31 Jul. 2025. [Online]. Available: https://www.who.int/news-",
+    "[2] A. H. Davidsen, K. Diederichsen, J. L. B. Andersen, H. Schirmer, E. Reierth, and H. Melbye, \"Diagnostic accuracy of heart auscultation for",
+    "[5] G. D. Clifford, C. Liu, B. Moody, D. Springer, I. Silva, Q. Li, et al., \"Classification of normal/abnormal heart sound recordings: the PhysioNet/Computing in Cardiology Challenge 2016,\" in",
+    "[13] J. Song, C. Meng, and S. Ermon, \"Denoising diffusion implicit models,\" arXiv:2010.02502, 2020, doi: 10.48550/arXiv.2010.02502.",
+    "[20] M. A. Reyna, S. K. Sadr, A. W. B. Silva, et al., \"Heart murmur detection from phonocardiogram recordings: the George B. Moody PhysioNet Challenge 2022,\" PLOS Digital Health, vol. 2, no. 9, e0000324, 2023,"
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "Two-column wrap near Table I; numbers and abbreviations easy to mis-parse",
+    "text_snippet": "preprocessing yielded 16,749 usable 4 s clips in total (12,827 normal; 3,922 abnormal; 23.4% abnormal). These clips and their labels were used as the sole inputs for both diffusion"
+   },
+   {
+    "note": "Dense math/symbol paragraph spanning columns; cross-line hyphenation risk",
+    "text_snippet": "The noise schedule is specified by βt ∈ (0, 1), with βt linearly increasing from 10−4 to 2×10−2 across t = 1, . . . , T. Define αt = 1 − βt and ᾱt = ∏t"
+   },
+   {
+    "note": "Column wrap in Results; numeric values with brackets easy to absorb wrongly",
+    "text_snippet": "generated clips show a lower rhythm score (0.368 vs. 0.460), indicating weaker envelope periodicity within the physiological heart-cycle range. In contrast, the explosion score is higher for generated clips (39.00 vs. 31.24)"
+   },
+   {
+    "note": "Near Fig. 3 confusion matrix; column break mid-sentence",
+    "text_snippet": "sifier achieved an accuracy of 92.24% (2283/2475), with class-wise recall of 93.6% for y=0 (1811/1935) and 87.4% for y=1 (472/540), indicating strong segment-level normal-versus-abnormal discrimination under the fixed split."
+   }
+  ],
+  "figures": [
+   {
+    "label": "Fig. 1",
+    "caption_snippet": "Overview of the proposed pipeline. (a) Preprocessing and log-mel feature extraction. (b) Compact 2D U-Net denoiser for reverse diffusion with skip connections.",
+    "in_figure_text": [
+     "Raw PCG @ 2k Hz",
+     "Band-Pass Filter",
+     "Segmentation",
+     "Log-mel extraction",
+     "Global Norm",
+     "Forward diffusion",
+     "ResBlock",
+     "Bottleneck",
+     "SiLU",
+     "GN(64)",
+     "Signal-level metrics",
+     "Expert listening",
+     "Downstream classifier"
+    ]
+   },
+   {
+    "label": "Fig. 2",
+    "caption_snippet": "Qualitative examples of real and generated PCG segments (4 s). Top row: waveforms. Bottom row: log-mel representations using 128 mel bands spanning 20–500 Hz (mel-frequency bins shown on the vertical axis).",
+    "in_figure_text": [
+     "REAL(y=0)",
+     "REAL(y=1)",
+     "GEN(y=0)",
+     "GEN(y=1)",
+     "Hz",
+     "Time (s)"
+    ]
+   },
+   {
+    "label": "Fig. 3",
+    "caption_snippet": "Confusion matrices of the ResNet-50 classifier on (a) real test segments and (b) 1000 unfiltered synthetic segments (500 per class).",
+    "in_figure_text": [
+     "REAL",
+     "GEN",
+     "True Label",
+     "Predicated Label",
+     "1811",
+     "124",
+     "68",
+     "472",
+     "476",
+     "24",
+     "148",
+     "352"
+    ]
+   }
+  ]
+ },
+ "fw9_form.pdf": {
+  "tables": [
+   {
+    "label": "Tax classification table",
+    "caption_snippet": "IF the entity/individual on line 1 is a(n) . . .",
+    "n_rows": 6,
+    "n_cols": 2,
+    "must_cells": [
+     "IF the entity/individual on line 1 is a(n) . . .",
+     "THEN check the box for . . .",
+     "Corporation.",
+     "Individual/sole proprietor.",
+     "Limited liability company and enter the appropriate tax classification:",
+     "P = Partnership,",
+     "C = C corporation, or",
+     "S = S corporation.",
+     "Partnership.",
+     "Trust/estate."
+    ],
+    "must_not_cells": [
+     "Check the appropriate box on line 3a for the U.S. federal tax classification of the person whose name is entered on line 1. Check only one box on line 3a.",
+     "Failure to furnish TIN."
+    ]
+   },
+   {
+    "label": "Backup withholding exemption payments chart",
+    "caption_snippet": "IF the payment is for . . .",
+    "n_rows": 6,
+    "n_cols": 2,
+    "must_cells": [
+     "IF the payment is for . . .",
+     "THEN the payment is exempt for . . .",
+     "Interest and dividend payments",
+     "All exempt payees except for 7.",
+     "Broker transactions",
+     "Exempt payees 1 through 4 and 6 through 11 and all C corporations.",
+     "Barter exchange transactions and patronage dividends",
+     "Exempt payees 1 through 4.",
+     "Payments over $600 required to be reported and direct sales over $5,0001",
+     "Generally, exempt payees 1 through 5.2",
+     "Payments made in settlement of payment card or third-party network transactions"
+    ],
+    "must_not_cells": [
+     "The following chart shows types of payments that may be exempt from backup withholding. The chart applies to the exempt payees listed above, 1 through 13.",
+     "Exemption from FATCA reporting code."
+    ]
+   },
+   {
+    "label": "What Name and Number To Give the Requester",
+    "caption_snippet": "What Name and Number To Give the Requester",
+    "n_rows": 8,
+    "n_cols": 2,
+    "must_cells": [
+     "For this type of account:",
+     "Give name and SSN of:",
+     "1. Individual",
+     "The individual",
+     "2. Two or more individuals (joint account) other than an account maintained by an FFI",
+     "The actual owner of the account or, if combined funds, the first individual on the account1",
+     "3. Two or more U.S. persons (joint account maintained by an FFI)",
+     "Each holder of the account",
+     "4. Custodial account of a minor (Uniform Gift to Minors Act)",
+     "The minor2",
+     "6. Sole proprietorship or disregarded entity owned by an individual",
+     "The owner3",
+     "7. Grantor trust filing under Optional Filing Method 1 (see Regulations section 1.671-4(b)(2)(i)(A))**",
+     "The grantor*"
+    ],
+    "must_not_cells": [
+     "To establish to the withholding agent that you are a U.S. person, or resident alien, sign Form W-9.",
+     "Secure Your Tax Records From Identity Theft"
+    ]
+   },
+   {
+    "label": "What Name and Number To Give the Requester (continued)",
+    "caption_snippet": "For this type of account:",
+    "n_rows": 9,
+    "n_cols": 2,
+    "must_cells": [
+     "Give name and EIN of:",
+     "8. Disregarded entity not owned by an individual",
+     "The owner",
+     "9. A valid trust, estate, or pension trust",
+     "Legal entity4",
+     "10. Corporation or LLC electing corporate status on Form 8832 or Form 2553",
+     "The corporation",
+     "11. Association, club, religious, educational, or other tax-exempt organization",
+     "The organization",
+     "12. Partnership or multi-member LLC",
+     "The partnership",
+     "13. A broker or registered nominee",
+     "The broker or nominee",
+     "15. Grantor trust filing Form 1041 or under the Optional Filing Method 2, requiring Form 1099 (see Regulations section 1.671-4(b)(2)(i)(B))**",
+     "The trust"
+    ],
+    "must_not_cells": [
+     "1 List first and circle the name of the person whose number you furnish.",
+     "Signature requirements."
+    ]
+   }
+  ],
+  "references": {
+   "count": 0,
+   "samples": []
+  },
+  "paragraphs": [
+   {
+    "note": "Part II Certification dense run-on list; item 2 spans multiple clauses across lines",
+    "text_snippet": "I am not subject to backup withholding because (a) I am exempt from backup withholding, or (b) I have not been notified by the Internal Revenue Service (IRS) that I am subject to backup withholding as a result of a failure to report all interest or dividends, or (c) the IRS has notified me that I am no longer subject to backup withholding; and"
+   },
+   {
+    "note": "Certification instructions paragraph — dense single block with multiple comma-separated conditions, easy to fragment",
+    "text_snippet": "You must cross out item 2 above if you have been notified by the IRS that you are currently subject to backup withholding because you have failed to report all interest and dividends on your tax return. For real estate transactions, item 2 does not apply."
+   },
+   {
+    "note": "Backup withholding definition sentence listing payment types — often mis-split across columns",
+    "text_snippet": "Payments that may be subject to backup withholding include, but are not limited to, interest, tax-exempt interest, dividends, broker and barter exchange transactions, rents, royalties, nonemployee pay, payments made in settlement of payment card and third-party network transactions, and certain payments from fishing boat operators."
+   },
+   {
+    "note": "Privacy Act Notice — long dense paragraph, liable to be split or merged with adjacent column text",
+    "text_snippet": "Section 6109 of the Internal Revenue Code requires you to provide your correct TIN to persons (including federal agencies) who are required to file information returns with the IRS to report interest, dividends, or certain other income paid to you; mortgage interest you paid; the acquisition or abandonment of secured property; the cancellation of debt; or contributions you made to an IRA, Archer MSA, or HSA."
+   }
+  ],
+  "figures": []
+ },
+ "geology_usgs_fs.pdf": {
+  "tables": [
+   {
+    "label": "Table (Benchmark type and value for selected constituents)",
+    "caption_snippet": "Benchmark type and value for selected constituents.",
+    "n_rows": 7,
+    "n_cols": 6,
+    "must_cells": [
+     "10 ppb",
+     "6,000 ppb",
+     "2 ppm",
+     "300 ppb",
+     "4,000 pCi/L",
+     "Proposed Federal MCL",
+     "Federal RSD5",
+     "0.02 ppb",
+     "1,000 ppm",
+     "500 ppm",
+     "Total dissolved solids (TDS)",
+     "Radon-222"
+    ],
+    "must_not_cells": [
+     "Concentrations are considered high if they are greater than a benchmark.",
+     "Methods for evaluating water quality are discussed by Bennett and Fram (2014)."
+    ]
+   }
+  ],
+  "references": {
+   "count": 8,
+   "samples": [
+    "Bennett, G.L., V, 2018, Status and understanding of groundwater quality in the North San Francisco Bay Shallow",
+    "Bennett, G.L., V, and Fram, M.S., 2014, Groundwater-quality data in the North San Francisco Bay Shallow",
+    "California Department of Water Resources, 2003, California's groundwater: California Department of Water",
+    "Forrest, M.J., Kulongoski, J.T., Edwards, M.S., Farrar, C.D., Belitz, K., and Norris, R.D., 2013, Hydrothermal",
+    "Hem, J.D., 1985, Study and interpretation of the chemical characteristics of natural water (3d ed.): U.S. Geologi-",
+    "Kulongoski, J.T., Belitz, Kenneth, and Dawson, B.J., 2006, Ground-water quality data in the North San Fran-",
+    "Kulongoski, J.T., Belitz, Kenneth, Landon, M.K., and Farrar, Christopher, 2010, Status and understanding of",
+    "Smedley, P.L., and Kinniburgh, D.G., 2002, A review of the source, behaviour and distribution of arsenic in natu-"
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "Two-column layout page 1: text flows from narrow right column back to wide left column bottom; extractor may merge caption text into paragraph",
+    "text_snippet": "ranged between 8 and 550 feet deep. Water quality in the shallow aquifer system can differ from that in the deeper public-supply aquifer system."
+   },
+   {
+    "note": "Column-wrap near map figure page 1: sentence spans the column boundary between the map caption and the main body text",
+    "text_snippet": "The study unit has warm, dry summers and cool, moist winters. Average annual rainfall is about 30 inches. The study unit is drained by several rivers and streams along with their principal tributaries."
+   },
+   {
+    "note": "Page 2 left-column pie chart labels adjacent to prose; extractor may absorb numbers (25, 21, 54, 100, 2, 3, 95, 3, 97) into the paragraph text",
+    "text_snippet": "Trace and minor elements are naturally present in the minerals in rocks and soils and in the water that comes into contact with those materials. In the North San Francisco Bay Shallow Aquifer study unit, trace elements were present at high"
+   },
+   {
+    "note": "Page 4 paragraph spans two columns near the arsenic scatter plot figure; cross-column wrap is likely to be corrupted",
+    "text_snippet": "oxyhydroxides under anoxic conditions (low dissolved oxygen), and the longer groundwater is in contact with aquifer materials that contain arsenic, the more time there is for chemicals to react (Smedley and Kinniburgh, 2002)."
+   }
+  ],
+  "figures": [
+   {
+    "label": "Figure (North San Francisco Bay Shallow Aquifer study unit map)",
+    "caption_snippet": "Base modified from U.S. Geological Survey and other Federal and State digital data",
+    "in_figure_text": [
+     "EXPLANATION",
+     "North San Francisco Bay Shallow Aquifer study unit boundary",
+     "Highlands study area",
+     "Valleys and Plains study area",
+     "North San Francisco Bay Public-Supply Aquifer study unit boundary (Kulongoski and others, 2006)",
+     "PACIFIC OCEAN",
+     "123°",
+     "122°15'",
+     "38°45'",
+     "38°30'",
+     "38°15'",
+     "38°",
+     "Cloverdale",
+     "Healdsburg",
+     "Guerneville",
+     "Sebastopol",
+     "Santa Rosa",
+     "Rohnert Park",
+     "Petaluma",
+     "San Pablo Bay",
+     "Clear Lake",
+     "Lake Berryessa",
+     "0  5  10 MILES",
+     "0  5  10 KILOMETERS"
+    ]
+   },
+   {
+    "label": "Figure (Arsenic vs. dissolved oxygen scatter plot)",
+    "caption_snippet": "Arsenic concentration, micrograms per liter versus Dissolved oxygen concentration, milligrams per liter",
+    "in_figure_text": [
+     "EXPLANATION",
+     "Highland",
+     "Valleys and Plains",
+     "Modern",
+     "Mixed",
+     "Premodern",
+     "Anoxic",
+     "Oxic",
+     "High",
+     "Moderate",
+     "Low",
+     "60",
+     "50",
+     "40",
+     "30",
+     "20",
+     "10",
+     "0",
+     "1",
+     "2",
+     "3",
+     "4",
+     "5",
+     "6",
+     "7",
+     "8",
+     "9",
+     "10"
+    ]
+   }
+  ]
+ },
+ "issue-93-romanian.pdf": {
+  "tables": [],
+  "references": {
+   "count": 0,
+   "samples": []
+  },
+  "paragraphs": [
+   {
+    "note": "Opening body paragraph with ă/â/î — personal details of mandant",
+    "text_snippet": "cetățean român, născut la data de 12.04.1992 în Iași, domiciliat în Str. Lalelelor 10, Bl. C, Sc. 1, Ap. 6, Iași, posesor al documentului de identitate"
+   },
+   {
+    "note": "Declarația de scop — dense diacritics ă/â/î/ș/ț throughout",
+    "text_snippet": "apartamentului aparținând Mandantului, cu toate accesoriile, dotările și bunurile mobile aferente, în numele și pe seama Mandantului, inclusiv, dar fără a se limita la, efectuarea tuturor actelor"
+   },
+   {
+    "note": "Clauză generală privind exercitarea atribuțiilor — ă/â/î/ș/ț",
+    "text_snippet": "limitele prezentului înscris, cu putere și autoritate deplină, în numele și pe seama Mandantului, având dreptul, după caz, să formuleze și să depună cereri, să primească și să predea documente"
+   },
+   {
+    "note": "Limitări bullet — ă/â/î diacritics, financial threshold text",
+    "text_snippet": "aparținând Mandantului, nici să îl greveze de sarcini, fără acordul prealabil, expres și în scris al Mandantului. Interdicția vizează, cu titlu exemplificativ, dar fără a se limita la: vânzare, schimb,"
+   },
+   {
+    "note": "Dispoziții finale — bună-credință, obligația, socoteală diacritics",
+    "text_snippet": "actiona cu bună-credință, cu prudența și diligența unui bun proprietar și de a da socoteală Mandantului pentru actele de administrare îndeplinite și sumele gestionate, remitând documentele justificative aferente."
+   }
+  ],
+  "figures": []
+ },
+ "math_AG_2606_02429.pdf": {
+  "tables": [],
+  "figures": [
+   {
+    "label": "Figure (Remark 3.2 diagram)",
+    "caption_snippet": "Remark 3.2. Let Y be a curve with function field L. The proof of Lemma 3.1 constructs the following diagram:",
+    "in_figure_text": [
+     "Y",
+     "X",
+     "D",
+     "E",
+     "A4",
+     "S4",
+     "Stab(1)",
+     "{1}",
+     "2",
+     "3",
+     "4",
+     "12",
+     "2",
+     "3",
+     "2",
+     "4",
+     "2",
+     "3"
+    ]
+   }
+  ],
+  "references": {
+   "count": 25,
+   "samples": [
+    "[1] Roberto M. Avanzi and Umberto Zannier. The equation f(X) = f(Y) in rational functions X =",
+    "[2] Nils Bruin. The arithmetic of Prym varieties in genus 3. Compos. Math., 144(2):317–338, 2008.",
+    "[5] Gerhard Frey and Ernst Kani. Curves of genus 2 covering elliptic curves and an arithmetical appli-",
+    "[10] Abhinav Kumar Kuhn. Curves of genus 2 with split Jacobian. Trans. Amer. Math. Soc., 307(1):41–49,",
+    "[16] David W. Masser and Gisbert Wüstholz. Isogeny estimates for abelian varieties, and finiteness"
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "Abstract — single-column, plain prose, verbatim opening",
+    "text_snippet": "given a genus 2 curve X together with a nonconstant map π : X → E to an elliptic curve, determine an elliptic curve E′ and a map π′ : X → E′ independent of π."
+   },
+   {
+    "note": "Problem 1.1 bold statement — theorem-style with math notation",
+    "text_snippet": "Given a curve X of genus 2 with a rational nonconstant map π : X → E to an elliptic curve E, find an independent map π′ : X → E′ to an elliptic curve E′."
+   },
+   {
+    "note": "Remark 2.3 — hyperelliptic involution, inline math, multi-sentence",
+    "text_snippet": "Let i denote the hyperelliptic involution on X, given in affine coordinates by i(x, y) = (x, −y). Then the map π + π ◦ i factors through the quotient X/i ∼= P1."
+   },
+   {
+    "note": "Proposition 2.7 italic statement — defines complementary curve",
+    "text_snippet": "the curve Φc in X(2) defined by the equation π(p1) + π(p2) = c, where p1, p2 ∈ X. The complementary curve E′ may be obtained as a smooth model of the unique irreducible component with positive genus."
+   },
+   {
+    "note": "Section 5.3 Generalizations — plain prose with isogeny/Prym notation",
+    "text_snippet": "we may birationally identify J with X(g), and describe birationally the Prym variety of X → E (that is, Prym(X/E) := (ker π∗ : J → E)0) as an irreducible component of π(p1) + · · · + π(pg) = c for sufficiently general c ∈ E."
+   }
+  ]
+ },
+ "math_GT_2606_02396.pdf": {
+  "tables": [],
+  "references": {
+   "count": 39,
+   "samples": [
+    "Frederick Justin Almgren Jr., The homotopy groups of the integral cycle groups, Topology 1 (1962), 257–299. MR0146835",
+    "Lucas Ambrozio, Alessandro Carlotto, and Ben Sharp, Compactness analysis for free boundary minimal hypersurfaces, Calc. Var. Partial Differential Equations 57 (2018), no. 1, Paper No. 22, 39. MR3740402",
+    "Robert Haslhofer and Daniel Ketover, Minimal 2-spheres in 3-spheres, Duke Math. J. 168 (2019), no. 10, 1929–1975. MR3983295",
+    "Francis R. Smith, On the existence of embedded minimal 2-spheres in the 3-sphere, endowed with an arbitrary Riemannian metric, Ph.D. Thesis, 1982.",
+    "Zhichao Wang and Xin Zhou, Existence of four minimal spheres in S3 with a bumpy metric (2023), available at arXiv:math/2305.08755."
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "Main theorem with two-part conclusion — italic theorem prose with math notation",
+    "text_snippet": "ary such that there are no degenerate-and-stable minimal spheres or degenerate-and-stable free boundary minimal disks. Then there exist at least three distinct embedded submanifolds which are either minimal spheres or free boundary minimal disks."
+   },
+   {
+    "note": "Theorem 1.3 multiplicity-one statement — complex hypothesis with sweepout class and inequality",
+    "text_snippet": "Suppose that Π is a homotopy class of (X, Z)-sweepouts by Σ0 with\n\nL(Π) > sup\nx∈Z\nH2(Φ0(x)) = 0.\n\nThen there exists a pairwise disjoint collection of connected, almost properly embedded, minimal surfaces {Γj}N\nj=1 with (possibly empty) free boundary, and positive integers {mj}N\nj=1 so that"
+   },
+   {
+    "note": "Proof prose describing mean curvature flow strategy — dense technical paragraph",
+    "text_snippet": "curvature flow starting from ∂M. By a result of White [36], we find a compact subset Ω ⊂ M containing ∂M whose interior admits a (possibly singular) foliation by strictly mean convex hypersurfaces, and so that ∂Ω ∩ Int(M) is either empty or consists of stable embedded minimal spheres with contracting neighborhoods."
+   },
+   {
+    "note": "Proposition 3.1 hypothesis — long run-on theorem statement with functional-analytic conditions",
+    "text_snippet": "Let h ∈ C∞(M) so that h ≡ 0 in a neighborhood of ∂M and h changes sign along Σ \\ ∂M. Let {(Σk, Ωk)}k∈N be a sequence of strongly Aεkh-stationary, C1,1, free εkh-boundaries in (M, g)"
+   },
+   {
+    "note": "Definition 2.1 — outer almost minimizing condition, tricky multi-line quantified definition",
+    "text_snippet": "Given ε, δ > 0, an open set U ⊂ M̃, and an embedded separating surface (Σ, Ω) ∈ E, we say that (Σ, Ω) is (Ah, ε, δ)-outer almost minimizing in U if there does not exist any isotopy ψ ∈ Jsout(U), such that\n\nAh(ψ(t, Σ, Ω)) ≤ Ah(Σ, Ω) + δ    for all t ∈ [0, 1];"
+   }
+  ],
+  "figures": []
+ },
+ "math_PR_2606_02570.pdf": {
+  "tables": [],
+  "references": {
+   "count": 18,
+   "samples": [
+    "[1] Milton Abramowitz and Irene A. Stegun. Handbook of Mathematical Functions with Formulas, Graphs, and",
+    "[2] Martin Bauer, Martins Bruveris, and Peter W. Michor. Overview of the geometries of shape spaces and diffeo-",
+    "[6] Alexander Grigor'yan. Stochastically complete manifolds. Doklady Akademii Nauk SSSR, 290(3):534–537, 1986.",
+    "[8] Karen Habermann, Philipp Harms, and Stefan Sommer. Long-time existence of Brownian motion on configu-",
+    "[12] Mario Micheli, Peter W. Michor, and David Mumford. Sectional curvature in terms of the cometric, with"
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "Theorem 1.1 statement — main stochastic completeness criterion",
+    "text_snippet": "it possesses a positive continuous Fourier transform k̂: Rd → R. In addition, assume that there exist ε > 0 and constants b, c > 0 as well as p ≥ 1 such that, for all r ∈ (0, ε),"
+   },
+   {
+    "note": "Lemma 3.4 statement — lower bound for separation distance on geodesic balls",
+    "text_snippet": "there exist ε > 0 as well as a constant c > 0 such that k(0) − k(r) ≤ −cr2 log(r) for all r ∈ (0, ε). Fix z ∈ Landn. For sufficiently large R > 0, we then have, for all x ∈ B(z, R),"
+   },
+   {
+    "note": "Remark 3.3 — geodesic completeness equivalence condition, plain prose",
+    "text_snippet": "We note that in Lemma 3.2, it is not necessary to assume geodesic completeness of the landmark manifold (Landn, g). According to [10], under translational and rotational invariance, geodesic completeness is equivalent to, for a > 0,"
+   },
+   {
+    "note": "Paper outline paragraph — plain prose overview of sections",
+    "text_snippet": "In Section 2, we first present an overview of cometric kernels and their Fourier transforms, with a focus on Matérn kernels arising from Sobolev differential operators. We then proceed in Section 3 to derive the required controls for Euclidean norms and pairwise distances on"
+   }
+  ],
+  "figures": []
+ },
+ "physics_optics_2606_02571.pdf": {
+  "tables": [
+   {
+    "label": "Table S1",
+    "caption_snippet": "Passive multilayer optical response parameters: transmission, polarization rotation and FOMs at extrema.",
+    "n_rows": 38,
+    "n_cols": 5,
+    "must_cells": [
+     "Pattern-I linear",
+     "Pattern-II linear",
+     "Pattern-I elliptical",
+     "Pattern-II elliptical",
+     "320.87",
+     "317.29",
+     "-24.67",
+     "29.60",
+     "0.446",
+     "1.420"
+    ],
+    "must_not_cells": [
+     "The co-polarized (Tco), cross-polarized (Tcross) and total (Tfull) transmissions"
+    ]
+   }
+  ],
+  "references": {
+   "count": 72,
+   "samples": [
+    "1. X. Ni, S. Yves, A. Krasnok, and A. Alù, \"Topological metamaterials,\" Chemical Reviews,",
+    "2. D. D. Smith, H. Chang, K. A. Fuller, A. T. Rosenberger, and R. W. Boyd, \"Coupled-resonator-induced transparency,\"",
+    "16. C. W. Hsu, B. Zhen, A. D. Stone, J. D. Joannopoulos, and M. Soljačić, \"Bound states in the continuum,\"",
+    "61. E. Tóth, B. Bánhelyi, O. Fekete, and M. Csete, \"Metamaterial properties of Babinet complementary complex structures,\"",
+    "72. B. Assouline, and A. Capua, \"Faraday effects emerging from the optical magnetic field,\""
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "Abstract — long justified block spanning full column width, dense technical terminology, easy to merge with keywords line",
+    "text_snippet": "spectrally overlapping regions due to the reach physics involving (i) symmetry breaking via coupled localized modes, (ii) Brillouin zone-folding stemmed from constituent sub-lattices"
+   },
+   {
+    "note": "Two-column wrap near optimization formula section — sentence crosses column boundary with subscript-heavy notation",
+    "text_snippet": "the polarization-selective readout of the COMSOL Multiphysics RF module was used, and the co-polarized and cross-polarized transmitted signals were extracted, while the dissipative loss was"
+   },
+   {
+    "note": "Near Figure 1 caption — paragraph continues after figure; easy to lose or merge with caption text",
+    "text_snippet": "revealing capability for propagation direction dependent transmission, when the GFR condition is met (Fig. 1b). In Pattern-II a global maximum develops in the balanced asymmetrical"
+   },
+   {
+    "note": "Section 3.4 — dense acronym-heavy sentence with forward-slash separated values; hyphenated subscripts risk split",
+    "text_snippet": "The dispersion maps of the concave monolayer taken in γ=90° azimuthal orientation (Γ-Y direction of the centred rectangular unitcell) indicate complementary localized modes as well as"
+   }
+  ],
+  "figures": [
+   {
+    "label": "Figure 1",
+    "caption_snippet": "Optical responses of Pattern-I, transmission side. (a, d) Co-polarized transmission and polarization rotation",
+    "in_figure_text": [
+     "(a)",
+     "(b)",
+     "(c)",
+     "(d)",
+     "(e)",
+     "(f)"
+    ]
+   },
+   {
+    "label": "Figure 2",
+    "caption_snippet": "Optical responses of Pattern-II, transmission side. (a, d) Co-polarized transmission and polarization rotation",
+    "in_figure_text": [
+     "(a)",
+     "(b)",
+     "(c)",
+     "(d)",
+     "(e)",
+     "(f)"
+    ]
+   },
+   {
+    "label": "Figure 3",
+    "caption_snippet": "Dispersion characteristic of classical co-polarized asymmetric transmission and non-reciprocal rotations of Pattern-I.",
+    "in_figure_text": [
+     "(a)",
+     "(b)",
+     "(c)",
+     "(d)",
+     "(e)",
+     "(f)"
+    ]
+   },
+   {
+    "label": "Figure 4",
+    "caption_snippet": "Dispersion characteristic of classical co-polarized asymmetric transmission and non-reciprocal rotations of Pattern-II.",
+    "in_figure_text": [
+     "(a)",
+     "(b)",
+     "(c)",
+     "(d)",
+     "(e)",
+     "(f)"
+    ]
+   },
+   {
+    "label": "Figure 5",
+    "caption_snippet": "Dispersion characteristic of co-polarized asymmetric transmissions and cumulative rotation and FOMs qualifying both propagation directions in GFR configuration",
+    "in_figure_text": [
+     "(a)",
+     "(b)",
+     "(c)",
+     "(d)",
+     "(e)",
+     "(f)"
+    ]
+   },
+   {
+    "label": "Figure 7",
+    "caption_snippet": "Near-field phenomena of Pattern-I. (a, d) Charge distribution on consecutive layer surfaces (Video 1, 2),",
+    "in_figure_text": [
+     "(a)",
+     "(b)",
+     "(c)",
+     "(k)",
+     "(l)",
+     "(m)"
+    ]
+   }
+  ]
+ },
+ "q-bio_NC_2606_02392.pdf": {
+  "tables": [
+   {
+    "label": "Table 1",
+    "caption_snippet": "Seven-substrate evidence base with exact pre-registered metrics.  All experiments pre-registered before analysis.",
+    "n_rows": 8,
+    "n_cols": 6,
+    "must_cells": [
+     "H_LOGIC_DIGITAL_v1",
+     "H_LOGIC_F3_ISCAS85_v1",
+     "H_LOGIC_EXTRACTION mathlib4",
+     "H_LOGIC_COQ_STDLIB_v1",
+     "X9 v2 CatReNet",
+     "r(cat., prod.)    =\n0.826 vs r(react.) =\n0.496",
+     "2026-05-29; hash eaf485b3...",
+     "hub_persistence_r= 0.214, betweenness r = 0.341 (exploratory)."
+    ],
+    "must_not_cells": [
+     "Table 1 summarizes the seven pre-registered experiments constituting the evidence base.",
+     "Three structural cautions apply."
+    ]
+   }
+  ],
+  "references": {
+   "count": 9,
+   "samples": [
+    "Ivanov, V. (2026). Evidence for a Functional Proximity Law in Multilayer Networks. arXiv:2604.23639 [cs.SI].",
+    "Varshney, L. R., Chen, B. L., Paniagua, E., Hall, D. H., & Chklovskii, D. B. (2011). Structural properties of the Caenorhabditis elegans neuronal network.",
+    "Winding, M., Pedigo, B. D., Barnes, C. L., Patsolic, H. G., Park, Y., Kazimiers, T., . . . Bhatt, D. L. (2023). The connectome of an insect brain.",
+    "The mathlib Community. (2020). The Lean Mathematical Library. In Proceedings of CPP 2020 (pp. 367–381). ACM.",
+    "Brglez, F., Bryan, D., & Kozminski, K. (1989). Combinational profiles of sequential benchmark circuits. In IEEE International Symposium on Circuits and Systems (pp. 1929–1934)."
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "two-column-like table caption merging into body text near Table 1",
+    "text_snippet": "Table 1 summarizes the seven pre-registered experiments constituting the evidence base. Each row is an independent substrate; all statistical claims are from pre-registered runs."
+   },
+   {
+    "note": "inline math and subscript notation near FPL definition, easy to mangle",
+    "text_snippet": "Formally, let k(1) and k(2) be the degree vectors of all nodes in layers d1 and d2 respectively. The FPL predicts r(k(1), k(2)) > 0 when d1 and d2 are functionally proximate."
+   },
+   {
+    "note": "abstract stat-dense passage with parenthetical r/p/n values",
+    "text_snippet": "was CONFIRMED (r = 0.426, p = 0.002, Spearman r = 0.551). The Coq Corelib result provides the first cross-proof-assistant directional replication of the formal-mathematics"
+   },
+   {
+    "note": "paragraph crossing page boundary near conclusion, degree-metric contrast",
+    "text_snippet": "across layers is the correct metric for detecting the load-bearing logic structure, while degree-based hub persistence measures connection-density topology that can be misleading."
+   }
+  ],
+  "figures": []
+ },
+ "quant-ph_2606_02574.pdf": {
+  "tables": [
+   {
+    "label": "Table I",
+    "caption_snippet": "Hardware resources and postselection yields for the two datasets.",
+    "n_rows": 3,
+    "n_cols": 7,
+    "must_cells": [
+     "0.10",
+     "0.03",
+     "366",
+     "0.502 (0.191–0.789)",
+     "0.319 (0.047–0.790)",
+     "1.20 × 10⁶ / 3.83 × 10⁵",
+     "0.483 (0.219–0.750)",
+     "0.285 (0.053–0.713)"
+    ],
+    "must_not_cells": [
+     "that prepares |0⟩ on each ancilla and measures it repeatedly",
+     "confusion probabilities P(0|0)"
+    ]
+   },
+   {
+    "label": "Table (inline, page 9)",
+    "caption_snippet": "finite-volume partner agreement for three field values",
+    "n_rows": 4,
+    "n_cols": 4,
+    "must_cells": [
+     "0.002",
+     "0.005",
+     "0.01",
+     "800/1200",
+     "400/800",
+     "200/400",
+     "13.7–20.6",
+     "0.05%"
+    ],
+    "must_not_cells": [
+     "The finite-volume error decreases rapidly with L/ξ",
+     "the partner agreement is well below the inter-field spread"
+    ]
+   }
+  ],
+  "references": {
+   "count": 53,
+   "samples": [
+    "[1] C. B. Dover, T. Gutsche, M. Maruyama, and A. Faessler, The Physics of nucleon - anti-nucleon annihilation,",
+    "[6] G. 't Hooft, A Two-Dimensional Model for Mesons, Nucl. Phys. B 75, 461 (1974).",
+    "[11] S. R. Coleman, The Quantum Sine-Gordon Equation as the Massive Thirring Model, Phys. Rev. D 11, 2088 (1975).",
+    "[50] S. R. White, Density matrix formulation for quantum renormalization groups, Phys. Rev. Lett. 69, 2863 (1992).",
+    "[53] M. C. Bañuls et al., Simulating Lattice Gauge Theories within Quantum Technologies, Eur. Phys. J. D 74, 165 (2020),"
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "two-column wrap near equation, abstract text with subscripts and hyphenated technical terms",
+    "text_snippet": "the nucleon–antinucleon interaction probes some of the key properties of quantum chromodynamics (QCD): confinement, chiral symmetry breaking, and topology. In particular, the interplay between attraction, repulsion, and annihila-"
+   },
+   {
+    "note": "column wrap mid-sentence, technical parameter list easy to mis-join",
+    "text_snippet": "Throughout we use (Jx, Jy, Jz) = (0.8, 0.8, 0.79). The scaling analysis below uses data with four different values of the magnetization hs. Three are each paired with a finite-volume check at a smaller system size; the fourth (|hs| ="
+   },
+   {
+    "note": "column wrap, inline config-name code strings adjacent to prose",
+    "text_snippet": "four configurations: offset0_kfirst, offset1_kfirst, offset0_afirst, and offset1_afirst. For a given r, we average over the subset of configurations that realize that separation without pushing either insertion point outside of the chain."
+   },
+   {
+    "note": "acknowledgments paragraph spanning columns, many proper names and grant numbers",
+    "text_snippet": "ported in part by the U.S. Department of Energy, Office of Science, Office of Nuclear Physics, Incubator for Quantum Simulation (IQuS) under Award Number DOE (NP) Award DE-SC0020970 (S.G.)."
+   }
+  ],
+  "figures": [
+   {
+    "label": "FIG. 1",
+    "caption_snippet": "Kink-antikink interaction potential V(r) extracted on quantum hardware (HW) compared with exact diagonalization (ED) for a L = 14 chain",
+    "in_figure_text": [
+     "SV (ideal circuits)",
+     "ED (lattice)",
+     "HW (4-config avg)",
+     "|hs|=0.10",
+     "|hs|=0.03",
+     "channel: K↓,A↑"
+    ]
+   },
+   {
+    "label": "FIG. 2",
+    "caption_snippet": "Scaling collapse of the four primary large-L DMRG datasets.",
+    "in_figure_text": [
+     "hs = 0.0020, N = 1200",
+     "hs = 0.0050, N = 800",
+     "hs = 0.0100, N = 400",
+     "hs = 0.0010, N = 2400",
+     "μh → 0"
+    ]
+   },
+   {
+    "label": "FIG. 3",
+    "caption_snippet": "Rescaled kink–antikink potential V(r)/μh versus x = (r+1)μh for the four primary large-L DMRG datasets",
+    "in_figure_text": [
+     "N = 1200, hs = 0.002",
+     "N = 800, hs = 0.005",
+     "N = 400, hs = 0.01",
+     "N = 2400, hs = 0.001",
+     "N = 14, hs = 0.03",
+     "N = 14, hs = 0.1"
+    ]
+   },
+   {
+    "label": "FIG. 4",
+    "caption_snippet": "Rescaled potential Ṽ(x0) at fixed scaled distances x0, plotted against μh for the four field values.",
+    "in_figure_text": [
+     "x = 0.25",
+     "x = 0.30",
+     "x = 0.35",
+     "x = 0.40",
+     "x = 0.45",
+     "x = 0.50"
+    ]
+   },
+   {
+    "label": "FIG. 5",
+    "caption_snippet": "A summary of the quantum-centric workflow used in this work.",
+    "in_figure_text": [
+     "GS ansatz",
+     "Operator insertions",
+     "Measurement",
+     "Conditional energies",
+     "Interaction potential"
+    ]
+   },
+   {
+    "label": "FIG. 6",
+    "caption_snippet": "Fully symmetrized kink–antikink interaction potential V(r) on hardware (HW) compared with exact diagonalization (ED)",
+    "in_figure_text": [
+     "SV (ideal circuits)",
+     "ED (lattice)",
+     "HW (8-config avg)",
+     "|hs|=0.10",
+     "|hs|=0.03"
+    ]
+   }
+  ]
+ },
+ "stat_ML_2606_02363.pdf": {
+  "tables": [],
+  "references": {
+   "count": 44,
+   "samples": [
+    "Arora, R., Dekel, O., and Tewari, A. Online bandit learning against an adaptive adversary: from regret to policy regret.",
+    "Auer, P., Cesa-Bianchi, N., Freund, Y., and Schapire, R. E. The nonstochastic multiarmed bandit problem. SIAM",
+    "Bertsekas, D. P. Dynamic programming and optimal control, volume 1. Athena scientific Belmont, MA, 1995.",
+    "Russo, D. and Van Roy, B. Eluder dimension and the sample complexity of optimistic exploration. In Advances in",
+    "Zhu, Q. and Basar, T. Game-theoretic approach to feedback-driven multi-stage moving target defense. In International"
+   ]
+  },
+  "paragraphs": [
+   {
+    "note": "abstract column, math expression mid-paragraph with sqrt symbol and cross-column wrap",
+    "text_snippet": "gorithm achieves O(√T) policy regret for fixed problem parameters, with explicit dependence on the horizon, adversary memory, confidence ra-"
+   },
+   {
+    "note": "introduction column wrap near citation list, easy to merge with adjacent footnote",
+    "text_snippet": "applications of practical importance involve multiple agents whose interests may conflict. A self-driving car navigates among human drivers who adapt their behavior in response"
+   },
+   {
+    "note": "section 2 column wrap, technical definition sentence spanning both columns",
+    "text_snippet": "the learner observes signals from OA and the adversary from OB. The dynamics are governed by transition kernels Th : S × A × B → ∆(S) and emission kernels"
+   },
+   {
+    "note": "conclusion paragraph, near end of main body before acknowledgements, risk of merging with Impact Statement",
+    "text_snippet": "show that √dET policy regret is both achievable and unavoidable, up to problem-dependent and logarithmic factors. Several directions remain open, including efficient algo-"
+   }
+  ],
+  "figures": []
+ },
+ "unicode_professional_demo.pdf": {
+  "tables": [],
+  "references": {
+   "count": 0,
+   "samples": []
+  },
+  "paragraphs": [
+   {
+    "note": "Currency symbols: dollar, euro, pound, yen, rupee",
+    "text_snippet": "USD: $1,234.56  EUR: €987.65  GBP: £456.78"
+   },
+   {
+    "note": "Currency symbols continued: yen (JPY/CNY) and rupee sign ₹",
+    "text_snippet": "JPY: ¥12,345  CNY: ¥876.54  INR: ₹5,432"
+   },
+   {
+    "note": "Legal/copyright symbols: copyright ©, registered ®, trademark ™, section §, pilcrow ¶, dagger †",
+    "text_snippet": "Copyright © 2024 • Registered ® • Trademark™"
+   },
+   {
+    "note": "Section sign, pilcrow, dagger symbols",
+    "text_snippet": "Section § 3.2 • Paragraph ¶ • Reference †"
+   },
+   {
+    "note": "Status indicator boxes and checkmarks: □ ☑ ☒ ✓ ✗",
+    "text_snippet": "□ Pending  ☑ Completed  ☒ Cancelled"
+   },
+   {
+    "note": "Checkmark ✓ and cross ✗ status indicators",
+    "text_snippet": "✓ Approved  ✗ Rejected  □Warning"
+   },
+   {
+    "note": "Mathematical operators: minus −, times ×, divide ÷",
+    "text_snippet": "Basic: 2 + 2 = 4, 10 − 5 = 5, 3 × 4 = 12, 8 ÷ 2 = 4"
+   },
+   {
+    "note": "Math: summation ∑ with arrow →",
+    "text_snippet": "Advanced: x + y = r , ∑(i=1→n) = n(n+1)/2"
+   },
+   {
+    "note": "Comparison operators: ≤ ≥ ≈ ≠",
+    "text_snippet": "Comparisons: a ≤ b, x ≥ y, p ≈ 3.14, A ≠ B"
+   },
+   {
+    "note": "Arrow symbols: ← → ↑ ↓",
+    "text_snippet": "Directions: ← Left → Right ↑ Up ↓ Down"
+   },
+   {
+    "note": "Arrow right → used in process flow",
+    "text_snippet": "Process: Step 1 → Step 2 → Step 3 → Complete"
+   },
+   {
+    "note": "Vulgar fractions: ½ ¼ ¾",
+    "text_snippet": "Fractions: ½ cup, ¼ teaspoon, ¾ complete"
+   },
+   {
+    "note": "Degree sign °, Celsius/Fahrenheit",
+    "text_snippet": "Temperature: 20°C = 68°F, Water boils at 100°C"
+   },
+   {
+    "note": "Footer/tagline of the document",
+    "text_snippet": "✓ Full Unicode support with automatic encoding detection"
+   }
+  ],
+  "figures": []
+ },
+ "unicode_showcase.pdf": {
+  "tables": [],
+  "references": {
+   "count": 0,
+   "samples": []
+  },
+  "paragraphs": [
+   {
+    "note": "European Latin with accented characters: Spanish, French, German, Portuguese, Polish, Czech",
+    "text_snippet": "Español: El veloz murciélago hindú comía feliz cardillo y kiwi\n  Français: Portez ce vieux whisky au juge blond qui fume\n  Deutsch: Victor jagt zwölf Boxkämpfer quer über den Sylter Deich"
+   },
+   {
+    "note": "Portuguese and Polish pangrams with accents, Polish ą ę ł ó ś ź ń, Czech ž ľ ť ú ě ď ó",
+    "text_snippet": "Português: Luís argüia à Júlia que «brações, fé, chá, óxido, pôr, zângão»\n  Polski: Pchnąć w tę łódź jeża lub ośm skrzyń fig\n  Český: Příliš žluťoučký kůň úpěl ďábelské ódy"
+   },
+   {
+    "note": "Cyrillic Russian and Ukrainian scripts",
+    "text_snippet": "Русский: Съешь же ещё этих мягких французских булок да выпей чаю\n  Українська: Чуєш їх, доцю, га? Кумедна ж ти, прощайся без ґольфів!"
+   },
+   {
+    "note": "Greek script with polytonic diacritics (combining accent τὴν)",
+    "text_snippet": "Ελληνικά: Ξεσκεπάζω τὴν ψυχοφθόρα βδελυγμία"
+   },
+   {
+    "note": "Asian scripts: Japanese hiragana/kanji, Korean Hangul, Chinese CJK, Thai",
+    "text_snippet": "Japanese: 日本語 こんにちは (Konnichiwa)\n  Korean: 한국어 안녕하세요 (Annyeonghaseyo)\n  Chinese: 中文 你好 (Nǐ hǎo)\n  Thai: ภาษาไทย สวัสดี (S̄wạs̄dī)"
+   },
+   {
+    "note": "Mathematical symbols: basic operations, calculus, set theory, logic operators",
+    "text_snippet": "Basic Operations: + − × ÷ ± ∓ ≈ ≠ ≡ ≤ ≥ ≪ ≫\nCalculus: ∫ ∬ ∭ ∮ ∇ ∂ ∆ ∑ ∏ ∐\nSet Theory: ∈ ∉ ⊂ ⊃ ⊆ ⊇ ∩ ∪ ∅ ℵ ℘\nLogic: ∧ ∨ ¬ ⊕ → ← ↔ ⇒ ⇐ ⇔ ∀ ∃"
+   },
+   {
+    "note": "Greek math letters uppercase+lowercase, geometry, physics with ℏ Å ° ′ ″, chemistry equilibrium arrows",
+    "text_snippet": "Greek: Α Β Γ Δ Ε Ζ Η Θ α β γ δ ε ζ η θ π φ ψ ω Σ Ω\nGeometry: ∠ ∟ ⊥ ∥ △ □ ○ ⬟ ⬢ ⬡\nPhysics: ℏ ℃ ℉ Å ° ′ ″ Ω µ ∞\nChemistry: ⇌ ⇄ ↑ ↓ ⟶ ⟵ ⟷"
+   },
+   {
+    "note": "Math formulas with subscript/superscript unicode: ² ₀ ₀ √ ² ²",
+    "text_snippet": "E = mc²\n  ∫₀^∞ e^(-x²) dx = √π/2\n  ∑(n=1 to ∞) 1/n² = π²/6\n  ∇ × B = µ₀(J + ε₀ ∂E/∂t)"
+   },
+   {
+    "note": "Currency symbols including rare: ₹ ₽ ₿ ₩ ₪ ₨ ₱ ₦ ₡",
+    "text_snippet": "Currency: $ € £ ¥ ¢ ₹ ₽ ₿ ¤ ƒ ₩ ₪ ₨ ₱ ₦ ₡"
+   },
+   {
+    "note": "Legal symbols, typographic quotes including CJK brackets 「」『』 and low-9 quotes ‚„",
+    "text_snippet": "Legal: © ® ™ ℗ § ¶ † ‡ ※\nQuotes: « » ‚ „ ‹ › 「 」 『 』 〝 〞 〟"
+   },
+   {
+    "note": "Fractions vulgar ½ ⅓ ⅔ ¼ ¾ ⅕ ⅖ ⅗ ⅘ ⅙ ⅚ ⅛ ⅜ ⅝ ⅞; weather and technical dingbats",
+    "text_snippet": "Fractions: ½ ⅓ ⅔ ¼ ¾ ⅕ ⅖ ⅗ ⅘ ⅙ ⅚ ⅛ ⅜ ⅝ ⅞\nCommunication: ☎ ☏ ✉ ✆ @ # ℡\nWeather: ☀ ☁ ☂ ☃ ☄ ⛅ ⛈ ☔ ❄ ❅ ❆"
+   },
+   {
+    "note": "Emoji page: hearts ❤️ ❣️ and hand gestures ✋ ✌️ ☝️ ✊ survive as proper codepoints; most emoji render as U+FFFD in PDF",
+    "text_snippet": "Hearts: ❤️ � � � � � � � � � ❣️ � � �\nTime: ⏰ ⏱ ⏲ ⏳ ⌛️ ⌚️ � � � � � � � �"
+   },
+   {
+    "note": "Box-drawing characters (U+2500 block): single-line box with ┌ ┬ ┐ │ ├ ┼ ┤ └ ┴ ┘",
+    "text_snippet": "┌─────────┬─────────┐\n│ Cell 1  │ Cell 2  │\n├─────────┼─────────┤\n│ Cell 3  │ Cell 4  │\n└─────────┴─────────┘"
+   },
+   {
+    "note": "Double-line box drawing ╔ ╦ ╗ ║ ╠ ╬ ╣ ╚ ╩ ╝ and rounded corners ╭ ╮ ╰ ╯",
+    "text_snippet": "╔═════════╦═════════╗\n║ Header1 ║ Header2 ║\n╠═════════╬═════════╣\n║ Data 1  ║ Data 2  ║\n╚═════════╩═════════╝\nRounded Corners:\n╭─────────────────────╮\n│  Rounded Box Style  │\n╰─────────────────────╯"
+   },
+   {
+    "note": "Block elements progress bar ▁▂▃▄▅▆▇█, braille loading ⣾⣽⣻⢿⡿⣟⣯⣷, half/full blocks ▀▄█▌▐░▒▓",
+    "text_snippet": "Progress bars: ▁▂▃▄▅▆▇█\nLoading: ⣾⣽⣻⢿⡿⣟⣯⣷\nBlocks: ▀▄█▌▐░▒▓"
+   },
+   {
+    "note": "Geometric shapes: triangles, diamonds, circles with fill variants; music notes; chess pieces ♔♕♖♗♘♙♚♛♜♝♞♟; card suits ♠♣♥♦",
+    "text_snippet": "▲ ▼ ◀ ▶ ◢ ◣ ◤ ◥ ◆ ◇ ◈ ◊ ○ ● ◐ ◑ ◒ ◓\n■ □ ▢ ▣ ▤ ▥ ▦ ▧ ▨ ▩ ▪ ▫ ▬ ▭ ▮ ▯\nMusic: ♩ ♪ ♫ ♬ ♭ ♮ ♯\nChess: ♔ ♕ ♖ ♗ ♘ ♙ ♚ ♛ ♜ ♝ ♞ ♟\n♠♣♥♦"
+   }
+  ],
+  "figures": []
+ }
+}

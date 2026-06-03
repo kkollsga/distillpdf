@@ -1,0 +1,1609 @@
+When Do Treatment Changes Identify Causal Effects?
+Martin Huber
+University of Fribourg, Department of Economics
+June 2, 2026
+Abstract: This paper clarifies the identifying assumptions underlying causal inference based on
+treatment changes rather than treatment levels, and their relationship to conventional identification
+strategies. We characterize two distinct structural models, with non-nested identifying assump-
+tions, under which treatment-change identification is valid conditional on observed covariates. We
+demonstrate that the identifying assumptions relying on treatment changes are generally not nested
+with those of methods relying on treatment levels, such as selection-on-observables strategies that
+control for past outcomes, treatments, and covariates, or difference-in-differences approaches that
+difference outcomes rather than treatments over time. We show, however, that under a random-walk
+restriction on the treatment process, conditioning on treatment changes is equivalent to conditioning
+on treatment levels given lagged treatment. This and other equivalence results motivate overidentifi-
+cation tests by jointly considering methods based on treatment levels and changes. Beyond these
+tests, the non-nesting results carry a structural double robustness implication: an estimator that
+differences both the outcome and the treatment over time, such as two-way fixed effects regression,
+remains consistent if either the treatment-change assumption or the parallel-trends assumption
+holds, without requiring both simultaneously. We characterize the causal models consistent with
+each method, investigate finite-sample behavior in a simulation study, and present an empirical
+application to cigarette demand.
+Keywords: treatment effects, treatment changes, conditional independence, overidentification.
+JEL Classification: C12, C14, C21, C23.
+Address for correspondence: Martin Huber, University of Fribourg, Bd. de Pérolles 90, 1700 Fribourg,
+Switzerland; martin.huber@unifr.ch.
+Acknowledgements: The author used the AI assistant Claude (developed by Anthropic) as an aid for
+scientific writing and coding. Specifically, it was used to rephrase and improve the clarity of author-written
+text and to optimize code.
+arXiv:2606.02234v1  [econ.EM]  1 Jun 2026
+1
+Introduction
+Identifying causal effects in observational data remains a central challenge in empirical
+research. In the absence of random assignment, applied work frequently relies either on
+selection-on-observables assumptions, which require treatment assignment (such as a medical
+treatment dose or participation in a training program) to be independent of potential outcomes
+conditional on observed covariates, or on difference-in-differences (DiD) designs, which exploit
+repeated observations over time and assume parallel trends in potential outcomes, possibly
+conditional on covariates. Both approaches impose identifying assumptions with respect to
+the treatment level that are non-nested, as discussed in Weber, van der Laan, and Petersen
+(2015), Chabé-Ferret (2017), Xu (2023), and Huber and Oeß (2024).
+There exists a third practice that is not uncommon in applied work but rarely made
+theoretically explicit: assessing the effect of changes in a dynamically evolving treatment
+rather than of specific treatment levels. Examples include studies of tax reforms that change
+marginal rates over time, labor market regulations that adjust minimum wages, education
+policies that shift compulsory schooling ages, and medical dosage protocols that modify
+treatment intensity. In such settings, researchers often implicitly assume that treatment
+changes rather than levels are quasi-randomly assigned conditional on observed covariates,
+without articulating precisely what structural conditions this requires or how it relates to
+conventional identification strategies. A common example is recoding the treatment as one
+in the case of a treatment increase and as zero if the treatment remains constant over time.
+Card and Krueger (1994), for instance, apparently a classical DiD study, define the treatment
+group as observations experiencing an increase in the minimum wage (in the US state of New
+Jersey) and the control group as those where the minimum wage remains constant but is
+nonzero (in Pennsylvania).
+This paper provides a systematic analysis of identification based on treatment changes,
+addressing the following issues. We clarify the conditions under which variation in treatment
+changes (rather than levels) identifies causal effects and what must be ruled out for this
+identification strategy to be valid. We then discuss scenarios in which these conditions are
+distinct from those underlying identification based on treatment levels via DiD or selection-
+on-observables strategies. Finally, we investigate causal models in which treatment-change
+and level-based strategies are jointly valid and how this joint validity can be exploited to
+construct overidentification tests or to obtain doubly robust identification, implying consistent
+estimation when one but not another set of identifying assumptions holds.
+As a main contribution of this paper, we characterize two structural models under which
+treatment-change identification is valid, even though the two models are not nested in terms of
+1
+assumptions. Both models require that, conditional on covariates, any unobserved confounder
+in the treatment equation that also affects the outcome is an additively separable time-
+invariant fixed effect, so that first-differencing removes the fixed effect from the treatment
+change. In this case, treatment changes may add identifying power relative to level-based
+approaches, since unobserved fixed effects that jointly determine treatment levels and outcomes
+do not contaminate the treatment change. The first model (Model A) additionally rules
+out dynamic treatment effects of earlier treatments on later outcomes and, in general, on
+later covariates, conditional on earlier covariates. The second model (Model B) imposes a
+stronger restriction on the treatment process, requiring that the time-varying unobserved
+shocks driving treatment changes are serially uncorrelated conditional on covariates, so that
+the treatment follows a random walk. In return for this stronger assumption on the treatment
+side, the second model accommodates dynamic treatment effects.
+We formally show that the identifying assumptions relying on treatment changes are
+generally not nested with those of methods relying on treatment levels, such as selection-on-
+observables strategies that control for past outcomes, treatments, and covariates, or DiD
+approaches that difference outcomes rather than treatments over time while also controlling
+for past treatments and covariates. We establish, however, that if the treatment follows a
+random walk as in Model B, conditioning on treatment changes is equivalent to conditioning
+on treatment levels given the lagged treatment, so that differencing the treatment adds
+no identifying power beyond what is already achieved by conditioning on levels. Similarly,
+when both treatment-change and DiD assumptions hold simultaneously (namely when fixed
+effects are additively separable in both the treatment and outcome equations and there are
+no time-varying unobserved confounders) the resulting causal parameters coincide. Such
+equivalence results also permit the construction of Hausman (1978)-type overidentification
+tests by jointly exploiting methods based on treatment levels and changes, which we discuss
+in both parametric and nonparametric settings.
+Beyond the overidentification tests, the non-nesting results carry a double robustness (DR)
+implication, see Robins, Rotnitzky, and Zhao (1994), for estimators that rely on multiple
+identification strategies simultaneously. Consider, for instance, DiD and treatment-change-
+based identification, which aim to difference out fixed effects in the outcome and treatment
+equations, respectively. An estimator that differences both the outcome and the treatment,
+as the classical two-way fixed effects (TWFE) estimator does in a linear setting, remains
+consistent if either identifying assumption holds, that is, if confounding is due to additive
+fixed effects in the treatment equation or in the outcome equation, without requiring both
+simultaneously. This result is related to the findings on doubly robust identification in
+Arkhangelsky and Imbens (2022) and Arkhangelsky, Imbens, Lei, and Luo (2021), who
+2
+consider different structural models and estimation approaches than we do.
+We investigate the finite-sample behavior of the different identification strategies in a
+simulation study, which confirms the non-nesting results: each strategy can fail while the
+others remain valid, and no single set of assumptions dominates the others. As a further
+result, the simulations also confirm that TWFE satisfies a DR property in the sense that it
+remains consistent whenever either the treatment-change assumption or the parallel-trends
+assumption holds, even when the other fails. As an empirical illustration, we estimate the
+price elasticity of cigarette consumption using the state-level panel of Baltagi and Levin (1986)
+covering 46 US states over the period 1963-1992. Applying different identification strategies
+and the associated Hausman overidentification tests, we find that the treatment-change
+strategy yields a substantially larger price elasticity in absolute value than the DiD, treatment
+level-based selection-on-observables, and TWFE strategies, which are more similar to each
+other. Correspondingly, the overidentification tests reject the treatment-change strategy
+against these alternatives, refuting the joint validity of treatment-change- and treatment-
+level-based approaches. When estimating the models nonparametrically using the causal
+forest approach of Wager and Athey (2018) and Athey, Tibshirani, and Wager (2019) in
+addition to OLS, the estimates broadly confirm this picture, providing evidence against the
+treatment change-based strategy when taking the DR property of TWFE into account.
+The remainder of the paper is organized as follows. Section 2 introduces the causal
+framework, effect of interest, and the assumptions for identification based on treatment
+changes. Section 3 presents two non-nested structural models satisfying these assumptions,
+with illustrations using causal graphs.
+Section 4 compares the identifying assumptions
+based on treatment changes to those underlying DiD and selection-on-observables strategies,
+including proofs of non-nesting in general and equivalence results for specific models. Section 5
+discusses overidentification tests and DR identification results. Section 6 presents a simulation
+study and Section 7 an empirical application to the price elasticity of cigarette demand.
+Section 8 concludes.
+2
+Causal Framework and Identifying Assumptions
+Many empirical studies analyzing panel data are based on identification strategies that rely on
+differencing outcomes over time to remove unobserved time-constant confounders, also known
+as fixed effects; see e.g. the extensive difference-in-differences (DiD) literature (Ashenfelter,
+1978; Snow, 1855). This paper considers an alternative identification strategy based on
+treatment changes over time. Let YT and DT denote the outcome and the treatment in period
+T, respectively. The treatment DT is presumably assigned at the beginning of period T, while
+3
+the outcome YT is measured at the end of that period. Let XT denote a vector of covariates
+observed in period T, also measured later in that period after treatment assignment DT,
+which may contain both time-invariant and time-varying variables. For any variable A, let
+¯AT = {A1, . . . , AT} denote its history up to period T ≥2. Throughout, capital letters denote
+random variables, while lowercase letters denote their realizations.
+To define our causal effect of interest (or estimand), we employ the potential outcomes
+framework (Neyman, 1923; Rubin, 1974). Standard potential outcomes are defined with
+respect to treatment levels: YT(dT) denotes the potential outcome at time T under treatment
+level dT in that period. In contrast, we are interested in the causal effect of a change in
+treatment. For a treatment change value ∇d, we consider the potential outcome YT(DT−1 +
+∇dT), where ∇dT is a specific value of the treatment increment ∇DT = DT −DT−1. For
+notational convenience, we henceforth drop the time index and write the treatment increment
+as ∇d. We focus on the average effect of a treatment change of size ∇d relative to no change
+in period T = t, denoted by ∆t(∇d) and defined as
+∆t(∇d) = E [Yt(Dt−1 + ∇d) −Yt(Dt−1)] ,
+(1)
+and more generally, on the average effect of two arbitrary treatment changes ∇d and ∇d′ in
+period T = t, denoted by ∆t(∇d, ∇d′) and defined as
+∆t(∇d, ∇d′) = E [Yt(Dt−1 + ∇d) −Yt(Dt−1 + ∇d′)] .
+(2)
+It is worth noting that the same treatment increment may be realized under different
+baseline treatment levels across units, so treatment effects indexed by increments do not
+generally correspond to the effects of uniquely defined treatment levels. Such effects of
+treatment changes are nonetheless of direct policy relevance in settings where the treatment
+is dynamically adjusted, such as changes in tax rates, adjustments in public expenditures, or
+gradual modifications of medical dosages. Throughout we impose SUTVA (Cox, 1958; Rubin,
+1980) and rule out anticipation effects as is commonly assumed in DiD studies (Lechner,
+2011).
+We next outline the identifying assumptions underlying causal effect identification. The
+first is a conditional independence assumption, which requires treatment changes to be
+independent of potential outcomes conditional on past covariates.
+Assumption 1. (CIA-∇D)
+YT(DT−1 + ∇d) ⊥∇DT | ¯XT−1 for all ∇d in the support of ∇DT.
+Assumption 1 states that, after conditioning on the history of covariates observed prior to
+4
+the treatment change, the treatment change ∇DT is as good as randomly assigned. While the
+level of the treatment DT may be endogenous, identification hinges solely on the exogeneity of
+the treatment increment ∇DT. We condition on ¯XT−1 rather than contemporaneous covariates
+XT because the latter may include variables influenced by the treatment assignment in period
+T; conditioning on post-treatment variables generally invalidates identification by introducing
+selection on outcomes, as e.g. discussed in Angrist and Pischke (2009).
+As a further remark, note that if the lagged treatment DT−1 is constant across units, then
+Assumption 1 coincides with the conventional selection-on-observables (or unconfoundedness)
+assumption for treatment evaluation formulated in terms of treatment levels, YT(d) ⊥DT |
+¯XT−1, see, for example, Imbens (2004). A leading case is one in which no unit is treated
+in the earlier period, so that DT−1 = 0 for all units and ∇DT = DT −0 = DT. In this
+case, treatment changes and treatment levels coincide. Therefore, formulating identifying
+assumptions in terms of treatment changes rather than levels is conceptually meaningful only
+when there is variation in DT−1 across units.
+In addition to Assumption 1, identification requires a common support condition, ensuring
+sufficient overlap in treatment changes across covariate histories.
+Assumption 2. (Common Support)
+Pr(∇DT = ∇d | ¯XT−1) > 0 for all ∇d in the support of ∇DT.
+Assumption 2 guarantees that each treatment change of interest occurs with positive
+probability for all relevant values of the conditioning variables, ensuring that the causal effects
+of treatment increments are empirically identifiable. While this condition is stated for discrete
+treatment changes, in the case of continuously distributed treatment changes it should be
+interpreted in terms of the conditional density: the density of ∇DT given ¯XT−1 must be
+bounded away from zero on its support, rather than requiring strictly positive probability
+mass at a point.
+Under Assumptions 1 and 2, both the average treatment effect (ATE) of a treatment
+change and the conditional average treatment effect (CATE) given ¯XT−1 are identified:
+∆T(∇d, ∇d′) = E
+
+E[YT(DT−1 + ∇d) | ¯XT−1] −E[YT(DT−1 + ∇d′) | ¯XT−1]
+
+(3)
+= E
+
+E[YT | ∇DT = ∇d, ¯XT−1] −E[YT | ∇DT = ∇d′, ¯XT−1]
+
+,
+where the first equality follows from the law of iterated expectations, and the second follows
+from Assumption 1. Assumption 2 ensures that subpopulations with ∇d and ∇d′ exist
+conditional on ¯XT−1, so that the conditional expectations are well-defined.
+Analogous
+arguments can establish identification of distributional effects, such as quantile treatment
+5
+effects, as considered for instance in Firpo (2007).
+3
+Structural Models and Causal Graphs
+Assumption 1 of the previous section is stated at a high level, and its intuition may not
+be immediately obvious, as it refers to treatment changes rather than treatment levels. To
+understand the types of structural models in which this assumption is satisfied or violated,
+consider the following general equations for the outcome and treatment:
+YT = FY
+
+T, ¯DT, ¯XT−1, ¯VT, U
+
+,
+DT = FD
+
+T, ¯DT−1, ¯XT−1, ¯WT, U
+
+,
+(4)
+where VT and WT are time-varying unobservables and U is a time-invariant unobservable or
+fixed effect. In general, Assumption 1 will not hold in model (4) without further constraints.
+To see this, note that
+∇DT = FD(T, ¯DT−1, ¯XT−1, ¯WT, U) −FD(T −1, ¯DT−2, ¯XT−2, ¯WT−1, U).
+(5)
+In nonlinear models, the fixed effect U will typically not cancel, as its effect may interact
+with time. Consequently, U remains a potential confounder that jointly affects ∇DT and
+YT. Further violations of Assumption 1 can arise in several ways. First, if the time-varying
+unobservables VT and WT are statistically dependent, then ∇DT and YT may be statistically
+associated even after conditioning on past covariates. Second, if past treatments directly
+affect future outcomes - i.e., there are dynamic treatment effects as e.g. considered in Robins
+(1986) and Robins, Hernan, and Brumback (2000) - and also influence future treatments,
+then past treatments themselves become confounders of treatment changes and outcomes. In
+this case, conditioning on covariates alone may be insufficient for identification.
+Satisfying Assumption 1 requires departing from the general model (5) and imposing
+certain restrictions. In particular, we restrict the treatment model to feature additive, time-
+invariant unobservables (or fixed effects), so that such components cancel when considering
+treatment changes rather than treatment levels. Specifically, we assume
+DT = FD
+
+T, ¯XT−1, ¯WT
+
++ U
+(6)
+where U is a scalar, time-constant unobservable or fixed effect. More generally, U may
+be interpreted as an index aggregating multiple unobserved factors that affect treatment
+assignment persistently over time. We also note that the model assumes that the treatment
+6
+in a specific period may be associated with past treatment levels through the levels of
+time-constant and -varying unobservables U, ¯WT and covariate histories ¯XT−1, but that past
+treatments do not directly affect current treatment beyond these variables.
+Maintaining the additive fixed effects restriction in the treatment model, we now charac-
+terize two distinct, non-nested structural models in terms of further constraints, each leading
+to valid identification via treatment changes. The first model, which we call Model A, rules
+out dynamic treatment effects of earlier treatments on later outcomes. Formally, we assume
+that the outcome in period T, YT, is not directly affected by treatments in earlier periods,
+¯DT−1. Moreover, we assume that only the contemporaneous time-varying unobservable VT
+directly affects YT, which is consistent with outcomes being subject to transitory shocks
+rather than persistent unobserved dynamics; past realizations ¯VT−1 do not directly enter the
+outcome equation. The resulting outcome model corresponds to
+YT = FY
+
+T, DT, ¯XT−1, VT, U
+
+.
+(7)
+In addition to the restrictions imposed on the treatment and outcome models (6) and (7),
+identification requires conditional independence assumptions relating the unobservables in
+the treatment and outcome equations. Specifically, we assume
+{U, VT} ⊥¯WT | ¯XT−1.
+(8)
+That is, the time-invariant unobservable U and the contemporaneous time-varying unobserv-
+able VT are jointly conditionally independent of the history of time-varying unobservables
+affecting treatment assignment, given past observed covariates ¯XT−1.
+To see why this condition in combination with the restricted treatment and outcome
+equations yields identification, note that under (6) the treatment change satisfies
+∇DT =FD
+
+T, ¯XT−1, ¯WT
+
+−FD
+
+T −1, ¯XT−2, ¯WT−1
+
+,
+(9)
+due to the cancellation of the fixed effect U. Thus, apart from the deterministic time index,
+∇DT depends only on { ¯XT−1, ¯WT}. Imposing (8) therefore implies
+{U, VT} ⊥∇DT| ¯XT−1.
+(10)
+Next, consider the potential outcome based on outcome model 7 under a treatment change
+∇d:
+YT(∇d) = FY
+
+T, DT−1 + ∇d, ¯XT−1, VT, U
+
+.
+(11)
+7
+Conditional on ¯XT−1, the only remaining stochastic elements in YT(∇d) are unobservables
+VT and U, which are independent of ∇DT given ¯XT−1 by (10). It therefore follows that, for
+all ∇d, YT(∇d) ⊥∇DT | ¯XT−1, which is Assumption 1. Proposition 1 formally states this
+result that our model conditions satisfy Assumption 1.
+Proposition 1. (Identification under Model A).
+Under the treatment equation (6), the outcome equation (7), and condition (8), Assumption 1
+holds.
+However, concerning the practical implications of Proposition 1, a crucial question is
+whether condition (8), which is again a relatively high-level condition, can be satisfied in
+empirically plausible causal models. This holds only under specific restrictions on the causal
+structure, for instance, a scenario that rules out direct effects of past treatments ¯DT−1 on past
+covariates ¯XT−1. Figure 1 provides a graphical illustration of such a causal framework using
+a directed acyclic graph (DAG); see, for instance, Pearl (2000) for background discussion.
+Solid nodes represent observed variables, dashed nodes represent unobserved variables, and
+arrows denote causal effects between variables. The causal effect of interest is the effect of
+the treatment (change) on the outcome Y1. The graph on the left depicts the causal model in
+terms of the original treatment levels D0 and D1, whereas the graph on the right represents
+the model when considering the treatment change ∇D1 = D1 −D0. Considering first the left
+graph, treatment D1 and outcome Y1 are confounded by the time-invariant unobservable U,
+even after conditioning on X0. In contrast, under the maintained model assumptions, U does
+(due to its additive separability) not affect the treatment change ∇D1 in the right graph.
+One notable property of our framework is the exclusion of a direct effect of D0 on X0,
+ensuring that X0 is not affected by W0 through D0. Otherwise, X0 would act as a collider on
+the path U →X0 ←D0 ←W0 according to the d-separation theorem for causal inference
+(Pearl, 1988). For this reason, conditioning on X0 would induce a spurious association between
+U and W0, and thus between ∇W1 = W1 −W0, the change in time-varying unobservables
+affecting the treatment, and ∇D1, violating condition (8). Importantly, this restriction
+implies that earlier treatments do not affect post-treatment covariates that are used as control
+variables for later treatment assignment, which may be restrictive in practice. One reason is
+that covariates may include earlier outcomes that are plausibly affected by past treatments.
+Next, we consider a second, alternative structural model, which we call Model B. It also
+satisfies Assumption 1 and places a stronger restriction on the treatment process (in contrast to
+classical fixed-effects panel models, see e.g. Wooldridge (2002), where restrictions are typically
+imposed on the outcome equation) but leaves the outcome equation in (4) unrestricted,
+permitting dynamic treatment effects. To this end, we now consider a treatment model in
+8
+Figure 1:
+Model A: DAG illustration of Proposition 1. Left: treatment levels. Right: treatment
+change. Solid nodes observed, dashed nodes unobserved.
+D0
+D1
+Y1
+W0
+W1
+V1
+U
+X0
+V0
+X−1
+D0
+∇D1
+Y1
+W0
+∇W1
+V1
+U
+X0
+V0
+X−1
+which both the time-constant and time-varying unobservables are additively separable:
+DT = FD
+
+T, ¯XT−1
+
++ U + WT,
+(12)
+where WT is the time-varying unobservable specific to period T, while its previous history
+does not, in contrast to treatment model (6), directly affect the treatment. Furthermore, we
+assume that time-varying unobservable WT driving treatment levels follows a random walk,
+implying that the treatment level in some period T corresponds to the treatment level in the
+previous period T −1 plus a quasi-random shock that fully explains the change over time:
+WT = WT−1 + εT,
+εT ⊥WT−1 | ¯XT−1,
+(13)
+where εT is the period-T shock to treatment, which is independent of past treatments
+conditional on ¯XT−1.
+Under the treatment model restrictions in equations (12) and (13), Assumption 1 holds if
+the time-specific shock εT in the treatment equation is independent of the outcome-relevant
+unobservables conditional on past covariates:
+{U, ¯VT} ⊥εT | ¯XT−1.
+(14)
+To see this, note that under (12) the treatment change satisfies
+∇DT =FD(T, ¯XT−1) + WT −FD(T −1, ¯XT−2) −WT−1,
+=FD(T, ¯XT−1) + εT −FD(T −1, ¯XT−2)
+(15)
+9
+where the first equality follows from cancellation of the fixed effect U, and the second from
+the random-walk specification (13). Since T is deterministic, the only stochastic element
+in treatment change (15) conditional on ¯XT−1 is the shock εT. Therefore, imposing (14)
+immediately gives
+{¯VT, U} ⊥∇DT| ¯XT−1,
+(16)
+establishing that the treatment change is conditionally independent of unobservables affecting
+the outcome.
+Next, consider the potential outcome based on the unrestricted outcome model in (4)
+under a treatment change ∇d:
+YT(∇d) = FY
+
+T, ¯DT−1, DT−1 + ∇d, ¯XT−1, ¯VT, U
+
+.
+(17)
+Conditional on ¯XT−1, the remaining stochastic elements in YT(∇d) are ¯DT−1, ¯VT, and U. By
+(16), ¯VT, U are independent of ∇DT conditional on ¯XT−1. Moreover, each past treatment Dt
+for t ≤T −1 depends on past time-varying unobservables Wt, which are independent of εT
+by the random-walk assumption (13). Hence, ¯DT−1 is also independent of ∇DT conditional
+on ¯XT−1. It follows that, for all ∇d, YT(∇d) ⊥∇DT| ¯XT−1, which is Assumption 1. This
+result is formalized in Proposition 2.
+Proposition 2. (Identification under Model B).
+Under the treatment equation (12), the random walk (13), the unrestricted outcome equation
+in (4), and condition (14), Assumption 1 holds.
+Figure 2 illustrates the causal structure underlying our analysis. The left panel shows the
+model formulated in terms of treatment levels D0 and D1, whereas the right panel depicts the
+corresponding model for the treatment change ∇D1 = D1 −D0. Both panels include a direct
+arrow from D0 to Y1, reflecting that dynamic treatment effects are permitted. Conditional
+on ¯X0 = {X−1, X0}, there are no variables that jointly affect ∇D1 and Y1. In particular, the
+confounding paths through V0 and V1 are blocked. However, it is noteworthy that conditioning
+on X0 (which may include the earlier outcome Y0) introduces spurious associations between
+U and W0 as well as between V0 and W0. In the DAG, this arises because X0 is a collider on
+the paths U →X0 ←D0 ←W0 and V0 →X0 ←D0 ←W0. Importantly, this collider bias
+does, however, not jeopardize identification of the treatment-change effect, because W0 is not
+associated with the treatment shock ε1 under the random-walk assumption, and hence does
+not induce dependence between ∇D1 and Y1.
+Based on the previous discussion, it is clear that Models A and B are not nested, as they
+10
+Figure 2:
+Model B: DAG illustration of Proposition 2. Left: treatment levels. Right: treatment
+change.
+D0
+D1
+Y1
+W0
+W1
+V1
+U
+X0
+V0
+X−1
+D0
+∇D1
+Y1
+W0
+ε1
+V1
+U
+X0
+V0
+X−1
+rely on distinct identifying conditions, as formally stated in the previous two propositions.
+For instance, the absence of dynamic treatment effects in outcome equation (7) under Model
+A neither implies nor is implied by the random walk condition (13) in Model B. Table 1
+summarizes the key differences between the conditions that must be satisfied under Models
+A and B.
+Table 1: Conditions required and ruled out under Models A and B (see Propositions 1 and 2)
+Condition
+Model A
+Model B
+Additive separability of U in treatment equation
+Required
+Required
+Random-walk structure of treatment shocks
+Not required
+Required
+No dynamic treatment effects
+Required
+Not required
+No direct effect of past treatments on later covariates
+Required
+Not required
+4
+Comparison with Treatment Level-Based Strategies
+We now compare the conditions derived in the previous sections to those underlying two
+conventional identification strategies that operate on treatment levels rather than changes:
+classical selection-on-observables, which treats treatment levels as exogenous conditional on
+observed variables when considering outcome levels, and DiD, which treats treatment levels
+as exogenous conditional on observed variables when considering outcome trends. Formally,
+selection on observables relies on the following conditional independence assumption (CIA),
+see e.g. Imbens (2004):
+11
+Assumption 3. (CIA-D).
+YT(d) ⊥DT | ¯DT−1, ¯XT−1, ¯YT−1
+for all d in the support of DT.
+The parallel trends assumption underlying DiD can be formalized as follows:
+Assumption 4. (CIA-∇Y ).
+∇YT(d) ⊥DT | ¯DT−1, ¯XT−1
+for all d in the support of DT.
+Our approach based on treatment changes and the two approaches based on treatment
+levels all impose specific conditional independence assumptions, but differ in which source of
+variation is deemed exogenous for causal analysis and in the set of control variables. CIA-∇D
+(Assumption 1) treats the treatment change ∇DT as exogenous conditional on ¯XT−1. CIA-D
+(Assumption 3) treats the treatment level DT as exogenous conditional on ¯DT−1, ¯XT−1, and
+¯YT−1. CIA-∇Y (Assumption 4) imposes treatment exogeneity with respect to potential
+outcome changes, conditional on ¯DT−1 and ¯XT−1. It is worth emphasizing that for DiD
+identification based on CIA-∇Y , the conditioning set ¯XT−1 must not include lagged outcomes
+¯YT−1. If lagged outcomes are added to the conditioning set, the parallel trends assumption in
+Assumption 4 collapses to CIA-D, i.e. selection-on-observables formulated in terms of levels
+rather than differences of potential outcomes.1
+We note that in the DiD literature, typically weaker versions of parallel trends than
+Assumption 4 are imposed. Most commonly, parallel trends are required to hold only on
+average and only for the potential outcome difference under nontreatment, ∇YT(0), conditional
+on not having been treated in earlier periods, ¯DT−1 = 0. Together with suitable common
+support conditions, this is sufficient for identifying the average treatment effect on the treated
+(ATET) among units switching from nontreatment in earlier periods to treatment in period T;
+see, for example, Abadie (2005) for semiparametric ATET identification and the literature on
+staggered treatment adoption, including Borusyak, Jaravel, and Spiess (2024), Callaway and
+Sant’Anna (2021), Goodman-Bacon (2021), de Chaisemartin and D’Haultfeuille (2020), and
+Sun and Abraham (2021). For conceptual clarity, we focus here on the stronger Assumption 4,
+which is imposed on the entire distribution of potential outcomes rather than only on means,
+1To see this, write ¯YT −1 explicitly in the conditioning set as a slight abuse of our previous notation:
+∇YT (d) ⊥DT | ¯DT −1, ¯XT −1, ¯YT −1
+⇐⇒YT (d) −YT −1(d) ⊥DT | ¯DT −1, ¯XT −1, ¯YT −1
+⇐⇒YT (d) −YT −1 ⊥DT | ¯DT −1, ¯XT −1, ¯YT −1
+⇐⇒YT (d) ⊥DT | ¯DT −1, ¯XT −1, ¯YT −1,
+where the second equivalence follows from the absence of anticipation effects, so that YT −1(d) = YT −1 for all
+d, and the third from the fact that YT −1 is measurable with respect to the conditioning set and therefore
+fixed conditional on it, so that subtracting it does not affect conditional independence.
+12
+and for all treatment levels d rather than only for d = 0, as also discussed in Fricke (2017),
+de Chaisemartin, Ciccia, d’Haultfoeuille, and Knau (2022), and Haddad, Huber, and Zhang
+(2024). This stronger assumption also allows identification of effects in the total population,
+such as the ATE, rather than only the ATET. For the sake of brevity, we also omit an explicit
+discussion of common support conditions.
+CIA-∇D is generally not nested with CIA-D or CIA-∇Y . We demonstrate this through
+a series of examples showing that each assumption can hold while the others fail, in both
+directions. We first show that CIA-∇D does not imply CIA-D. Suppose Model A holds, so
+that CIA-∇D is satisfied. Under the treatment equation (6), the fixed effect U is additively
+separable and therefore cancels in the treatment change ∇DT. However, U continues to affect
+the outcome via equation (7), so U remains a confounder of DT and YT, and CIA-D fails.
+Figure 3 illustrates both configurations side by side: in the left panel, the paths U →D1 and
+U →Y1 create confounding; in the right panel, U is absent from ∇D1 due to cancellation
+while the path U →Y1 remains.
+The converse direction also fails. To see that CIA-D does not imply CIA-∇D, suppose
+the outcome equation of Model A is modified so that U no longer affects the outcome directly,
+but earlier treatments ¯DT−1 may have dynamic effects on YT:
+YT = FY
+
+T, ¯DT, ¯XT−1, VT
+
+.
+(18)
+With U absent from the outcome equation, it is no longer a confounder of DT and YT, so CIA-
+D holds. However, the dynamic effect of DT−1 on YT introduces confounding for CIA-∇D:
+the time-varying unobservable WT−1 in the treatment equation affects both DT−1 (which in
+turn affects YT) and the change in unobservables ∇WT (which drives ∇DT), rendering ∇DT
+and YT dependent conditional on ¯XT−1. CIA-∇D therefore fails. Figure 4 illustrates both
+configurations side by side.
+Turning to the relationship between CIA-∇D and CIA-∇Y , we again show that neither
+implies the other. To see that CIA-∇D does not imply CIA-∇Y , suppose again that Model
+A holds, so CIA-∇D is satisfied, but suppose additionally that the fixed effect U interacts
+with time in the outcome equation, for instance:
+YT = FY
+ ¯DT, ¯XT−1, VT
+
++ U · T.
+(19)
+Differencing the outcome yields ∇YT = FY
+ ¯DT, ¯XT−1, VT
+
++ U, so U remains in ∇YT
+and jointly determines DT and ∇YT. CIA-∇Y therefore fails. Figure 5 illustrates both
+configurations. The left panel shows treatment changes with outcome levels, where U is
+absent from ∇D1 but present in Y1. The right panel shows treatment levels and the differenced
+13
+Figure 3:
+Model A: CIA-∇D holds, CIA-D fails. Left: treatment levels (U confounds D1 and Y1).
+Right: treatment change (U cancels from ∇D1). Solid nodes observed, dashed nodes unobserved.
+D0
+D1
+Y1
+W0
+W1
+V1
+U
+X0
+V0
+X−1
+D0
+∇D1
+Y1
+W0
+∇W1
+V1
+U
+X0
+V0
+X−1
+Figure 4:
+Equation (18): CIA-D holds, CIA-∇D fails. Left: treatment levels (U absent from
+outcome, CIA-D holds). Right: treatment change (dynamic effect D0 →Y1 via W0 introduces
+confounding, CIA-∇D fails).
+D0
+D1
+Y1
+W0
+W1
+V1
+U
+X0
+V0
+X−1
+D0
+∇D1
+Y1
+W0
+∇W1
+V1
+U
+X0
+V0
+X−1
+14
+outcome ∇Y1, where U acts as a confounder because it affects both D1 and ∇Y1, as it does
+not (fully) cancel out when differencing the outcomes.
+In the other direction, CIA-∇Y does not imply CIA-∇D. Suppose the outcome equation
+features an additively separable fixed effect U and dynamic treatment effects, with ¯XT−1 not
+including past outcomes ¯YT−1:
+YT = FY
+
+T, ¯DT, ¯XT−1, VT
+
++ U.
+(20)
+Since U is additively separable, it cancels in ∇YT, so CIA-∇Y holds. However, the dynamic
+effect of DT−1 on YT introduces confounding for CIA-∇D through the same mechanism
+as before: WT−1 jointly affects DT−1 (which affects YT) and ∇WT (which drives ∇DT), so
+CIA-∇D fails. Figure 6 illustrates both configurations. The left panel shows the treatment
+change with outcome levels, where the dynamic path D0 →Y1 via W0 creates confounding.
+The right panel shows treatment levels against ∇Y1, where U cancels in the differenced
+outcome but confounds the level regression.
+Figure 5:
+Equation (19): CIA-∇D holds, CIA-∇Y fails. Left: treatment change and outcome
+level (U absent from ∇D1, CIA-∇D holds). Right: treatment level and outcome change (U does not
+cancel in ∇Y1, CIA-∇Y fails).
+D0
+∇D1
+Y1
+W0
+∇W1
+V1
+U
+X0
+V0
+X−1
+D0
+D1
+∇Y1
+W0
+W1
+∇V1
+U
+X0
+V0
+X−1
+Proposition 3. (Non-nesting of identification strategies).
+CIA-∇D (Assumption 1), CIA-D (Assumption 3), and CIA-∇Y (Assumption 4) are pairwise
+non-nested: none implies any of the others in general.
+Our previous examples establish that CIA-∇D, CIA-D, and CIA-∇Y are pairwise non-
+nested in general, as formally stated in Proposition 3. Despite this general non-nesting, there
+exist special cases in which multiple assumptions are satisfied simultaneously. In particular,
+15
+Figure 6:
+Equation (20): CIA-∇Y holds, CIA-∇D fails. Left: treatment change and outcome
+level (dynamic effect D0 →Y1 via W0, CIA-∇D fails). Right: treatment level and outcome change
+(U cancels in ∇Y1, CIA-∇Y holds).
+D0
+∇D1
+Y1
+W0
+∇W1
+V1
+U
+X0
+V0
+X−1
+D0
+D1
+∇Y1
+W0
+W1
+∇V1
+U
+X0
+V0
+X−1
+under Model B all three conditions hold jointly. To see why CIA-D holds in addition to
+CIA-∇D under Model B, recall from equation (15) that
+DT = DT−1 + FD(T, ¯XT−1) −FD(T −1, ¯XT−2) + εT.
+(21)
+Conditional on ¯XT−1 and DT−1, the only stochastic variation in DT is driven by εT, which is
+also the only stochastic element in ∇DT conditional on ¯XT−1. Therefore,
+σ(DT | ¯XT−1, DT−1) = σ(∇DT | ¯XT−1) = σ(εT),
+(22)
+where σ(·) denotes the generated σ-algebra. Conditional independence between {U, ¯VT} and
+DT given ¯XT−1 and DT−1 holds if and only if {U, ¯VT} is independent of εT given ¯XT−1, which
+is precisely condition (14) and is in turn equivalent to CIA-∇D by Proposition 2. Hence
+CIA-∇D and CIA-D are simultaneously satisfied under Model B.
+We now turn to CIA-∇Y . Since conditioning on DT−1 and ¯XT−1 renders DT independent
+of {U, ¯VT}, the fixed effect U is not a confounder of the treatment and the outcome under
+Model B, regardless of whether U cancels in ∇YT or not. Even if U remains in ∇YT, it does
+not jointly determine DT given the conditioning set and therefore does not violate CIA-∇Y .
+This equivalence result is stated in Proposition 4.
+Proposition 4. (All three identification strategies valid under Model B).
+Under the conditions of Model B,
+{U, ¯VT} ⊥DT | ¯XT−1, DT−1
+⇐⇒
+{U, ¯VT} ⊥∇DT | ¯XT−1.
+(23)
+16
+Consequently, Assumptions 1, 4, and 3 all hold simultaneously.
+Proposition 4 shows that under Model B, all three strategies achieve identification by
+exploiting the same source of variation, namely the conditionally random treatment shock
+εT that follows a random walk and is independent of the fixed effect U. In contrast, under
+the treatment process of Model A, the change in time-varying unobservables affecting the
+treatment does not generally follow a random walk (for example when WT−1 and WT are
+independently distributed), so conditioning on DT−1 does not fully remove the U-variation
+from DT, and the three identification strategies are not equivalent.
+5
+Overidentification Tests and Double Robustness
+The non-nesting results of the previous section imply that when more than one identification
+strategy is simultaneously valid, the resulting causal parameters coincide in the population
+and a Hausman-style comparison of estimates constitutes an overidentification test. Before
+developing these tests, we establish that all three identification strategies — CIA-∇D, CIA-D,
+and CIA-∇Y — can in principle be used to identify the same treatment-change-based causal
+parameters, as defined in equations (1) and (2), which puts them on a common footing for
+comparison.
+Under CIA-∇D (Assumption 1) and common support (Assumption 2), the average
+potential outcome under a treatment change ∇d is identified as
+E[Yt(Dt−1 + ∇d) | ¯Xt−1] = E
+h
+E[Yt | ∇Dt = ∇d, ¯Xt−1] | ¯Xt−1
+i
+,
+(24)
+where identification follows from the conditional independence in Assumption 1 by the same
+argument as in Section 2. Note that ¯Xt−1 may include lagged outcomes as control variables
+under CIA-∇D.
+Under CIA-D (Assumption 3), setting d = Dt−1 + ∇d and applying the conditional
+independence directly gives
+E[Yt(Dt−1 + ∇d) | ¯Dt−1, ¯Xt−1] = E
+h
+Yt | Dt = Dt−1 + ∇d, ¯Dt−1, ¯Xt−1
+i
+,
+(25)
+where ¯Xt−1 under CIA-D may include lagged outcomes ¯Yt−1. Averaging over the distribution
+of ¯Dt−1 conditional on ¯Xt−1 then identifies E[Yt(Dt−1 + ∇d) | ¯Xt−1].
+Under CIA-∇Y (Assumption 4), the parallel trends assumption identifies the average
+17
+potential outcome change under treatment level d = Dt−1 + ∇d as
+E[∇Yt(Dt−1 + ∇d) | ¯Dt−1, ¯Xt−1] = E[∇Yt | Dt = Dt−1 + ∇d, ¯Dt−1, ¯Xt−1].
+(26)
+Adding back the observed lagged outcome E[Yt−1 | ¯Dt−1, ¯Xt−1] and averaging over the
+distribution of ¯Dt−1 conditional on ¯Xt−1 identifies E[Yt(Dt−1 + ∇d) | ¯Xt−1]. As discussed in
+Section 4, the conditioning set ¯Xt−1 must not include lagged outcomes ¯Yt−1 under CIA-∇Y ,
+since their inclusion collapses this assumption to CIA-D.
+Since all three strategies identify E[Yt(Dt−1 + ∇d) | ¯Xt−1] under their respective assump-
+tions, the average treatment effects ∆t(∇d) and ∆t(∇d, ∇d′) are also identified under each
+strategy, and the resulting estimates should agree whenever more than one assumption holds
+simultaneously. This motivates Hausman-type overidentification tests: under joint validity
+of any two strategies j and k, their estimates of ∆t(∇d, ∇d′), denoted by ˆ∆t,j and ˆ∆t,k, are
+asymptotically equivalent. Furthermore, the test statistic
+Ht,jk = ( ˆ∆t,j −ˆ∆t,k)2
+ˆσ2
+t,j + ˆσ2
+t,k
+H0
+−→χ2(1).
+(27)
+with ˆσ2
+t,j and ˆσ2
+t,k denoting the standard errors of ˆ∆t,j and ˆ∆t,k, is asymptotically valid under
+standard regularity conditions. Rejection of Ht,jk establishes that at least one assumption
+fails, but cannot identify which one without additional prior restrictions; non-rejection is
+consistent with joint validity but also with violations that bias both strategies exactly in the
+same way, a case that may be ruled out by imposing a causal faithfulness assumption, see e.g.
+Pearl (2000).
+The non-nesting of CIA-∇D and CIA-∇Y carries a further implication that complements
+the overidentification tests, that concerns the popular two-way fixed effects (TWFE) approach,
+which simultaneously relies on differenced outcomes ∇Y and treatment changes ∇D. Under
+specific modeling assumptions, TWFE bears a double robustness (DR) property: it remains
+consistent if U is additively separable in either the treatment equation or the outcome
+equation, without requiring both simultaneously. When invoking the DR property, the
+conditioning set ¯XT−1 must not include lagged outcomes ¯YT−1, since CIA-∇Y requires their
+exclusion to avoid collapsing to CIA-D, as discussed in Section 4.
+To formalize the DR result, consider two distinct structural models. The first corresponds
+to Model A, under which U is additively separable in the treatment equation (6), the outcome
+equation (7) holds with only contemporaneous VT entering YT and no dynamic effects of
+earlier treatments on later outcomes, and condition (8) ensures {U, VT} ⊥¯WT | ¯XT−1. By
+Proposition 1, these conditions imply CIA-∇D. The second model departs from Model A by
+18
+relaxing additive separability of U in the treatment equation, while instead imposing it in the
+outcome equation. Specifically, consider a treatment equation that excludes past treatments
+¯DT−1 as in (6) but does not require U to be additively separable:
+DT = FD
+
+T, ¯XT−1, ¯WT, U
+
+,
+(28)
+and an outcome equation with additively separable U:
+YT = FY
+
+T, DT, ¯XT−1, VT
+
++ U,
+(29)
+which modifies (7) by splitting U out additively from FY , while maintaining the absence of
+dynamic effects. Under (29), U cancels in ∇YT(d) = YT(d) −YT−1(d), so that CIA-∇Y is
+satisfied under condition (8) together with the following additional condition:
+VT−1 ⊥¯WT | ¯XT−1,
+(30)
+which, together with (8), implies strict exogeneity of the treatment from time-varying
+unobservables affecting the outcome conditional on ¯XT−1 for periods T and T −1, as
+typically assumed in panel models.
+While condition (8) covers {U, VT} ⊥¯WT | ¯XT−1,
+condition (30) adds VT−1 ⊥¯WT | ¯XT−1, required because TWFE considers the differenced
+outcome ∇YT = YT −YT−1 as dependent variable, thus including YT−1 which depends on
+VT−1. Proposition 5 formally states the DR result.
+Proposition 5. (Double robustness of TWFE approaches based on ∇YT(∇d), ∇DT).
+Under condition (30), ∇YT(∇d) ⊥∇DT | ¯XT−1 holds if either of the following two sets of
+conditions is satisfied:
+(i) Treatment equation (6) with U additively separable, outcome equation (7), and condi-
+tion (8), so that Assumption 1 holds.
+(ii) Treatment equation (28), outcome equation (29) with U additively separable, and VT ⊥
+¯WT−1 | ¯XT−1 (implied by but weaker than condition (8)), so that Assumption 4 holds.
+To prove Proposition 5, note that YT−1(d) = YT−1 for all d, so ∇YT(∇d) = YT(DT−1 +
+∇d) −YT−1 under absence of anticipation effects of future treatments on past outcomes
+(as implicitly assumed throughout our discussion). Under route (i), U cancels from ∇DT
+by additive separability in (6), so ∇DT depends only on ¯WT and ¯XT−1. Independence
+of YT(DT−1 + ∇d) from ∇DT requires {VT, U} ⊥
+¯WT |
+¯XT−1, given by condition (8).
+Independence of YT−1 from ∇DT requires {VT−1, U} ⊥¯WT | ¯XT−1: the U part again follows
+19
+from (8), the VT−1 part from condition (30). Since both YT(DT−1 + ∇d) and YT−1 are
+independently distributed of ∇DT given ¯XT−1, so is their difference, giving ∇YT(∇d) ⊥
+∇DT | ¯XT−1.
+Under route (ii), U cancels in ∇YT(∇d) = FY (T, DT−1 + ∇d, ¯XT−1, VT) −FY (T −
+1, DT−1, ¯XT−2, VT−1) by additive separability in (29), leaving the time-varying unobservables
+VT and VT−1 as the only stochastic elements conditional on covariates. Since U is cancelled
+from ∇YT(∇d), any effect of U on ∇DT through (28) does not induce confounding. Indepen-
+dence of ∇YT(∇d) from ∇DT therefore requires only {VT, VT−1} ⊥¯WT | ¯XT−1: the condi-
+tional independence of VT follows from condition (8), where only the weaker VT ⊥¯WT | ¯XT−1
+is required rather than the full joint independence {U, VT} ⊥¯WT | ¯XT−1, and the conditional
+independence of VT−1 follows from condition (30). Therefore, ∇YT(∇d) ⊥∇DT | ¯XT−1.
+The two routes in Proposition 5 are non-nested, which constitutes the DR property of
+TWFE: additive separability of U in the treatment equation (6) neither implies nor is implied
+by its additive separability in the outcome equation (29). Under route (ii), U need not cancel
+from ∇DT, so CIA-∇D need not hold; under route (i), U need not cancel from ∇YT, so
+CIA-∇Y need not hold. This structural DR property is related to, but distinct from, the
+findings of Arkhangelsky and Imbens (2022) and Arkhangelsky et al. (2021). Those papers
+distinguish a model-based path restricting the outcome equation and a design-based path
+restricting the treatment equation, and construct estimators that are consistent if either
+restriction holds. Our result differs in that our framework accommodates continuously varying
+rather than binary treatments, and that both routes concern the estimation of the outcome
+equation, rather than the treatment equation.
+As a final point on overidentification and DR, we note that for continuous treatments,
+the causal effect of interest is often the conditional average marginal effect of a unit increase
+in the treatment level,
+δt(¯x) =
+Z ∂Yt(d)
+∂d
+f(d | ¯Xt−1 = ¯x) dd,
+(31)
+or its average δt = E[δt( ¯Xt−1)]. In the subsequent discussion, we consider the identification
+of δt(¯x) and δt under two levels of model generality. To this end, let λt(¯x) = Cov(∇Dt, Dt |
+¯Xt−1 = ¯x)/Var(∇Dt | ¯Xt−1 = ¯x) denote the persistence factor of the treatment process
+conditional on covariates, measuring the degree to which the conditional treatment level
+co-moves with its change. Under a random walk, λt(¯x) = 1; under mean-reverting processes,
+λt(¯x) ∈(0, 1). The first causal framework considered is a semiparametric partially linear
+outcome model Yt = δt( ¯Xt−1)Dt + f(U, ¯Xt−1, Vt) with effects that are heterogeneous in
+covariates but linear in the treatment conditional on covariates, δt(¯x), and persistence λt(¯x).
+20
+The second is a homogeneous partially linear model Yt = δDt + f(U, ¯Xt−1, Vt), in which both
+the treatment effect and the persistence factor are homogeneous across covariates and time,
+i.e. δt(¯x) = δ and λt(¯x) = λ for all ¯x and t. In the homogeneous case, the rescaling under
+CIA-∇D simplifies to a single scalar λ, and linear TWFE recovers δ directly without rescaling
+due to linear cancellation.
+Under each strategy, the population regression coefficient is defined as the best linear
+projection coefficient of the outcome variable B on the treatment variable A after partialling
+out the conditioning set C:
+β(C) = Cov(A, B | C)
+Var(A | C)
+,
+(32)
+where for CIA-∇Y : A = Dt, B = ∇Yt, C = { ¯Dt−1, ¯Xt−1}; for CIA-D: A = Dt, B = Yt,
+C = { ¯Dt−1, ¯Xt−1}; for CIA-∇D: A = ∇Dt, B = Yt, C = ¯Xt−1; and for TWFE: A = ∇Dt,
+B = ∇Yt, C = ¯Xt−1. Partialling out C from both A and B yields residuals eA and eB, and
+(32) equals Cov( eA, eB)/Var( eA) by the Frisch–Waugh theorem. Proposition 6 formalizes the
+probability limits of these coefficients; proofs are provided in Appendix A.
+Proposition 6. (Estimands across strategies).
+Let Assumptions 1, 4, and 3 hold simultaneously, as well as ∇YT(∇d) ⊥∇DT | ¯XT−1 (as
+satisfied under the conditions of Proposition 5).
+(i) Heterogeneous partially linear model. Under Yt = δt( ¯Xt−1)Dt + f(U, ¯Xt−1, Vt), the
+conditional population regression coefficients satisfy
+βCIA-∇Y (¯x, ¯dt−1) = βCIA-D(¯x, ¯dt−1) = βTWFE(¯x) = δt(¯x),
+βCIA-∇D(¯x) = δt(¯x) · λt(¯x),
+(33)
+Furthermore, under condition (14), λt(¯x) = 1 for all ¯x, and all four strategies recover
+δt(¯x) directly.
+(ii) Homogeneous partially linear model. Under Yt = δDt + f(U, ¯Xt−1, Vt) with δt(¯x) = δ
+and λt(¯x) = λ for all ¯x and t,
+βCIA-∇Y (¯x, ¯dt−1) = βCIA-D(¯x, ¯dt−1) = βTWFE(¯x) = δ,
+βCIA-∇D(¯x) = δ · λ.
+(34)
+Furthermore, under condition (14), λ = 1 and all four strategies recover δ directly.
+21
+Proposition 6 demonstrates that under case (i), CIA-∇D identifies δt(¯x)·λt(¯x) conditionally
+on ¯Xt−1 = ¯x, implying that δt(¯x) is recovered by dividing by λt(¯x) at the conditional level
+before averaging to obtain δt:
+δt = E
+"βCIA-∇D( ¯Xt−1)
+λt( ¯Xt−1)
+#
+.
+(35)
+Under case (ii), rescaling under CIA-∇D simplifies to the single scalar 1/λ. In either case,
+the variance of the scaling factor must be propagated into the standard error of the rescaled
+estimate, for instance via the delta method. The non-equivalence between CIA-∇D and the
+other strategies arises because they exploit different sources of treatment variation. CIA-∇Y
+and CIA-D exploit variation in Dt and identify E[Yt(d) | ¯Xt−1] as a function of the treatment
+level d. Their population regression coefficients are weighted averages of δt(¯x) with weights
+proportional to Var(Dt | ¯Xt−1 = ¯x). CIA-∇D instead exploits variation in ∇Dt against the
+outcome level Yt, so its regression coefficient involves δt(¯x) · λt(¯x) with weights proportional
+to Var(∇Dt | ¯Xt−1 = ¯x). The persistence factor λt(¯x) enters because a unit change in ∇Dt
+corresponds to only a λt(¯x)-sized change in Dt on average. TWFE also exploits variation in
+∇Dt but differences the outcome as well, so the relevant slope is that of E[∇Yt(∇d) | ¯Xt−1]
+with respect to ∇d, which equals δt(¯x) directly since a unit increase in ∇d shifts Yt(Dt−1+∇d)
+by exactly δt(¯x) while leaving Yt−1 unaffected under no anticipation. The persistence factor
+therefore does not enter. If the conditional treatment process follows a random walk, then
+λt(¯x) = 1 and all population regression coefficients coincide. The non-equivalence of estimands
+under CIA-∇D and the other strategies otherwise makes it necessary to rescale CIA-∇D
+estimates before comparing them via Hausman overidentification tests, as implemented in
+the empirical application of Section 7.
+It is worth noting that the CIA-∇D estimand has a natural instrumental variables (IV)
+interpretation, see e.g. Wright (1928) and Imbens and Angrist (1994). The treatment change
+∇Dt serves as an instrument for the treatment level Dt, with the persistence factor λt(¯x)
+playing the role of the first-stage coefficient conditional on ¯Xt−1 = ¯x. In the homogeneous case
+(ii), the reduced-form coefficient from regressing Yt on ∇Dt estimates δ · λ, and dividing by
+the first-stage estimate of λ recovers δ by the standard IV ratio formula. In the heterogeneous
+case (i), the raw CIA-∇D estimand upweights units with higher λt(¯x), since these units
+respond more strongly in their treatment levels to treatment changes and thus contribute
+more to the first-stage variation. The rescaling in equation (35) corrects for this reweighting
+by dividing each unit-level estimand by λt(¯x) before averaging, recovering the unweighted
+average marginal effect δt.
+The IV structure of our framework connects naturally to the shift-share or Bartik in-
+22
+strument literature, see for instance Bartik (1991) and Borusyak, Hull, and Jaravel (2024),
+in which the treatment change ∇Dt is constructed as the product of an aggregate shock
+(shift) and an initial treatment exposure (share). One example is Autor, Dorn, and Hanson
+(2013), who assess the effect of rising Chinese import competition on regional employment
+in the US. They construct a shift-share instrument by multiplying industry-level import
+growth in non-US countries by regional industry employment shares reflecting each region’s
+initial exposure to those shocks, and use this instrument to predict US regional import
+exposure (the treatment). In such settings, ∇Dt plays the role of the shift-share instrument,
+Dt is the endogenous treatment, and ˆλ is the first-stage coefficient. The exogeneity of ∇Dt
+under CIA-∇D then corresponds to the conditions discussed in Borusyak, Hull, and Jaravel
+(2021) and Goldsmith-Pinkham, Sorkin, and Swift (2020), who show that instrument validity
+requires either the shifts or the shares to be exogenous.
+6
+Simulation Study
+This section presents two simulation studies illustrating the non-nesting results of Section 4,
+the attenuation and rescaling results of Section 5, and the DR of TWFE established in
+Proposition 5. The first simulation study is based on the following data generating process
+(DGP) with independent period-specific unobservables:
+U, V0, V1, W0, W1, X0 ∼N(0, 1) mutually independent,
+D0 = X0 + W0 + U,
+Y0 = D0 + U + V0,
+D1 = X0 + W1 + αU,
+Y1 = D1 + γU + X0 + V1.
+We report results for four linear estimators: CIA-∇D (OLS of Y1 on ∇D1 and X0), CIA-∇Y
+(OLS of ∇Y1 on D1, D0, and X0), CIA-D (OLS of Y1 on D1, D0, X0, and Y0), and TWFE
+(OLS of ∇Y1 on ∇D1 and X0).
+CIA-∇D requires the treatment change to be unconfounded: ∇D1 = W1 −W0 + (α −1)U
+contains U whenever α ̸= 1, but this only induces confounding if U also affects Y1, i.e. if γ ̸= 0.
+CIA-∇D therefore holds iff α = 1 or γ = 0. CIA-∇Y requires the treatment level to be
+unconfounded with potential outcome changes: ∇Y1(d) = d−D0 +(γ −1)U +V1 −V0 contains
+U whenever γ ̸= 1, but this only induces confounding if U also affects D1, i.e. if α ̸= 0.
+CIA-∇Y therefore holds iff γ = 1 or α = 0. CIA-D requires no residual confounding after
+conditioning on Y0, D0, and X0: when γ = 0, U does not enter Y1 so there is no confounding
+regardless of α; when α = 0, U does not enter D1 so D1 is exogenous regardless of γ. CIA-D
+therefore holds iff α = 0 or γ = 0. TWFE is DR and holds whenever CIA-∇D or CIA-∇Y
+23
+holds. We consider six scenarios: Sim1a (α = 1, γ = 2), in which CIA-∇D holds (α = 1)
+but CIA-∇Y fails (γ ̸= 1, α ̸= 0) and CIA-D fails (α ̸= 0, γ ̸= 0); Sim1b (α = 1, γ = 0), in
+which CIA-∇D and CIA-D hold since α = 1 and γ = 0 respectively, but CIA-∇Y fails since
+γ ̸= 1 and α ̸= 0; Sim1c (α = 1, γ = 1), in which CIA-∇D and CIA-∇Y hold simultaneously;
+Sim1d (α = 2, γ = 1), in which CIA-∇Y holds (γ = 1) but CIA-∇D fails (α ̸= 1, γ ̸= 0) and
+CIA-D fails; Sim1e (α = 2, γ = 0), in which CIA-∇D and CIA-D hold since γ = 0 eliminates
+U from Y1, but CIA-∇Y fails since γ ̸= 1 and α ̸= 0; and Sim1f (α = 2, γ = 2), in which all
+strategies are invalid.
+Table 2: First simulation study (independent W0, W1).
+CIA-∇D
+CIA-∇Y
+CIA-D
+TWFE
+Scenario
+Bias
+RMSE
+Bias
+RMSE
+Bias
+RMSE
+Bias
+RMSE
+n = 500
+Sim1a CIA-∇D only (α = 1, γ = 2)
+−0.00
+0.10
+0.33
+0.34
+0.50
+0.50
+−0.00
+0.06
+Sim1b CIA-∇D & CIA-D (α = 1, γ = 0)
+−0.00
+0.05
+−0.33
+0.34
+−0.00
+0.04
+0.00
+0.06
+Sim1c CIA-∇D & CIA-∇Y (α = 1, γ = 1) −0.00
+0.08
+−0.00
+0.05
+0.25
+0.25
+−0.00
+0.05
+Sim1d CIA-∇Y only (α = 2, γ = 1)
+0.83
+0.84
+−0.00
+0.04
+0.28
+0.29
+−0.00
+0.04
+Sim1e CIA-D only (α = 2, γ = 0)
+0.50
+0.50
+−0.33
+0.34
+−0.00
+0.03
+−0.33
+0.34
+Sim1f All invalid (α = 2, γ = 2)
+1.17
+1.17
+0.33
+0.33
+0.57
+0.57
+0.33
+0.34
+n = 2,000
+Sim1a CIA-∇D only (α = 1, γ = 2)
+−0.00
+0.05
+0.33
+0.33
+0.50
+0.50
+−0.00
+0.03
+Sim1b CIA-∇D & CIA-D (α = 1, γ = 0)
+−0.00
+0.02
+−0.33
+0.34
+−0.00
+0.02
+−0.00
+0.03
+Sim1c CIA-∇D & CIA-∇Y (α = 1, γ = 1) −0.00
+0.04
+−0.00
+0.03
+0.25
+0.25
+−0.00
+0.02
+Sim1d CIA-∇Y only (α = 2, γ = 1)
+0.83
+0.83
+−0.00
+0.02
+0.29
+0.29
+−0.00
+0.02
+Sim1e CIA-D only (α = 2, γ = 0)
+0.50
+0.50
+−0.33
+0.33
+−0.00
+0.01
+−0.33
+0.33
+Sim1f All invalid (α = 2, γ = 2)
+1.17
+1.17
+0.33
+0.33
+0.57
+0.57
+0.33
+0.33
+Notes: DGP: D0 = X0 + W0 + U, D1 = X0 + W1 + αU, Y1 = D1 + γU + X0 + V1. CIA-∇D valid
+iff α = 1 or γ = 0; CIA-∇Y valid iff γ = 1 or α = 0; CIA-D valid iff α = 0 or γ = 0. TWFE is DR
+(Proposition 5): consistent whenever CIA-∇D or CIA-∇Y holds. Bias and root mean squared error
+(RMSE) relative to each estimator’s own probability limit: CIA-∇D is compared against δ/2 = 0.5;
+CIA-∇Y , CIA-D, and TWFE are compared against δ = 1.
+Proposition 6 establishes that CIA-∇Y , CIA-D, and TWFE all estimate δ = 1 directly,
+while CIA-∇D estimates δ · E[λ1(X0)]. In this DGP, ∇D1 = W1 −W0 with W0 and W1
+independent and equal variance, so λ1 is constant across X0 with λ1 = Var(W1)/(Var(W1) +
+Var(W0)) = 1/2, giving plim ˆβCIA-∇D = δ/2 = 0.5. Only W1 has a direct causal path to Y1
+via D1, while −W0 in ∇D1 carries no such path; OLS weights by total variance, attenuating
+the coefficient toward δ/2. CIA-∇D bias is therefore reported against 0.5. TWFE avoids this
+attenuation because differencing both outcome and treatment yields ∇Y1 = δ ∇D1 + ∇V1,
+24
+whose numerator and denominator cancel exactly to recover δ = 1; TWFE bias, as well as
+CIA-∇Y and CIA-D biases, are reported against δ = 1.
+Table 2 reports bias and root mean squared error (RMSE) based on 1,000 simulations and
+two sample sizes, n = 500 and n = 2,000. For all valid estimators, the RMSE approximately
+halves when the sample size quadruples, consistent with the expected √n convergence rate,
+while the bias remains negligible across both sample sizes. Sim1a shows that CIA-∇D does
+not imply CIA-∇Y or CIA-D: CIA-∇D has a bias of ≈0 against δ/2 = 0.5, while CIA-∇Y
+has a persistent bias of 0.33 and CIA-D has a bias of 0.50. TWFE also has a bias of ≈0
+against δ = 1, confirming DR: CIA-∇D holds so TWFE is consistent even though CIA-∇Y
+fails. Sim1d is the complementary demonstration: CIA-∇D has a bias of 0.83 but TWFE
+is unbiased because outcome differencing cancels U from ∇Y1 regardless of α. Sim1e is the
+critical failure case: neither CIA-∇D nor CIA-∇Y holds, so TWFE has a bias of −0.33 even
+though CIA-D is valid, confirming that CIA-D alone does not confer DR on TWFE. Sim1b
+and Sim1c confirm the remaining non-nesting directions, and Sim1f confirms that all four
+estimators are biased when all assumptions fail simultaneously.
+The second simulation study uses a random-walk DGP with a dynamic treatment effect:
+U, V0, V1, W0, ε1, X0 ∼N(0, 1) mutually independent,
+D0 = X0 + U + W0,
+W1 = W0 + ε1,
+D1 = X0 + U + W1,
+Y0 = D0 + U + V0,
+Y1 = D1 + ϕD0 + γU + X0 + V1,
+where ϕ ≥0 controls the dynamic effect of D0 on Y1. Under the random-walk structure,
+∇D1 = ε1 is always free of U, so by Proposition 4 all three identification assumptions hold
+simultaneously regardless of γ or ϕ, and TWFE inherits consistency. Since λ1 = 1, CIA-∇D is
+not attenuated and all four estimators are reported against δ = 1. We consider two scenarios:
+Sim2a (γ = 1, ϕ = 0), a baseline without dynamic effects and moderate confounding, in which
+all strategies are straightforwardly valid; and Sim2b (γ = 2, ϕ = 0.5), which combines strong
+fixed-effect confounding with a dynamic treatment effect that would invalidate strategies
+under the first simulation study’s DGP, but does not do so here because ∇D1 = ε1 is a
+random shock independent of U.
+Table 3 confirms Proposition 4: all four estimators are unbiased in both scenarios, with
+RMSE again approximately halving when going from n = 500 to n = 2,000, consistent
+with √n convergence. Sim2b is the key illustration: despite strong fixed-effect confounding
+and a dynamic treatment effect, all four methods remain consistent under the random-walk
+structure. The larger RMSE of CIA-∇D and TWFE relative to CIA-∇Y and CIA-D in
+Sim2b reflects that CIA-∇Y and CIA-D include D0 as a regressor, directly controlling for
+25
+Table 3: Second simulation study (random walk of WT ).
+CIA-∇D
+CIA-∇Y
+CIA-D
+TWFE
+Scenario
+Bias
+RMSE
+Bias
+RMSE
+Bias
+RMSE
+Bias
+RMSE
+n = 500
+Sim2a No dynamic effect (γ = 1, ϕ = 0) −0.00
+0.11
+−0.00
+0.07
+−0.00
+0.05
+−0.00
+0.07
+Sim2b Dynamic effect (γ = 2, ϕ = 0.5)
+−0.00
+0.17
+−0.00
+0.07
+−0.00
+0.07
+−0.00
+0.09
+n = 2,000
+Sim2a No dynamic effect (γ = 1, ϕ = 0) −0.00
+0.05
+−0.00
+0.03
+−0.00
+0.03
+−0.00
+0.03
+Sim2b Dynamic effect (γ = 2, ϕ = 0.5)
+−0.00
+0.09
+−0.00
+0.04
+−0.00
+0.03
+−0.00
+0.05
+Notes: DGP: D0 = X0 +U +W0, W1 = W0 +ε1, D1 = X0 +U +W1, Y1 = D1 +ϕD0 +γU +X0 +V1.
+CIA-∇D, CIA-∇Y , and CIA-D all hold simultaneously regardless of γ or ϕ, and TWFE inherits
+consistency. Bias and root mean squared error (RMSE) compared against each estimator’s probability
+limit, δ = 1.
+the dynamic effect ϕD0 on Y1 and thereby reducing residual variance, whereas CIA-∇D and
+TWFE do not include D0 separately so this variation remains in the residual.
+7
+Empirical Application: Cigarette Demand
+To illustrate the four identification strategies and the overidentification tests developed in
+Sections 2–5, we estimate the price elasticity of cigarette demand using the panel data
+previously analyzed by Baltagi and Levin (1986) covering 46 US states over the period
+1963–1992. The data set covers 1,380 state-year observations (or 1,334 after first-differencing)
+and is available in the plm package by Croissant and Millo (2008) for the statistical software
+R. The outcome Yit is log per-capita cigarette sales (packs per year), the treatment Dit is
+log real cigarette price (nominal price deflated by the CPI), and the covariates Xit consist
+of log real per-capita disposable income and log population aged 16 and over. Cigarette
+demand is an interesting testing ground, as real prices vary substantially across states and
+over time owing to differences in state excise taxes, and the literature offers a well-established
+benchmark price elasticity of approximately −0.3 to −0.5, as discussed in Chaloupka and
+Warner (2000).
+We implement four empirical strategies, namely CIA-∇D, CIA-∇Y , CIA-D, and TWFE.
+In line with our previous discussion, for any strategy in which Dit enters in levels, Di,t−1 is
+added as an additional control variable, and whenever Yit enters in levels, Yi,t−1 is added
+as an additional control variable. The continuous controls Xit enter at both the current
+26
+level Xit and the lagged level Xi,t−1 as separate regressors. Year fixed effects are included in
+all four specifications. State fixed effects are never included explicitly, but are eliminated
+by outcome differencing when relying on CIA-∇Y and TWFE, while Yi,t−1 is controlled for
+instead when relying on CIA-∇D and CIA-D. Assuming linear outcome models, the four
+regression specifications are:
+• CIA-∇Y : ∇Yit ∼Dit + Di,t−1 + Xit + Xi,t−1 + year FE
+• CIA-∇D: Yit ∼∇Dit + Yi,t−1 + Xit + Xi,t−1 + year FE
+• CIA-D: Yit ∼Dit + Yi,t−1 + Di,t−1 + Xit + Xi,t−1 + year FE
+• TWFE: ∇Yit ∼∇Dit + Xit + Xi,t−1 + year FE
+As established in Proposition 6(ii) under the homogeneous partially linear model, CIA-∇Y ,
+CIA-D, and TWFE all estimate δ directly, while the CIA-∇D-based estimate converges to δ·λ
+and must be rescaled by the inverse of an estimate of λ, denoted by ˆλ, before overidentification
+tests can be run. For TWFE, δ is identified directly because differencing both outcome and
+treatment means the relevant slope is that of E[∇Yt(∇d) | ¯Xt−1] with respect to ∇d, which
+equals δt(¯x) directly under the DR assumptions of Proposition 5, without the persistence
+factor entering. We maintain the homogeneity and time-stationarity assumption for CIA-∇D,
+so that the pooled estimate ˆλ averages over both covariate values and time periods. We
+estimate ˆλ as the pooled OLS coefficient from a regression of Dit on ∇Dit after partialling
+out Yi,t−1, Xi,t−1, and year fixed effects. The contemporaneous controls Xit are excluded
+since they are measured after treatment assignment, but including them leaves ˆλ unchanged
+at three decimal places. The standard error of ˆλ is computed by block-bootstrapping states
+with 500 bootstrap samples, and the resulting uncertainty is propagated into the standard
+error of the rescaled CIA-∇D estimate via the delta method.
+In addition to OLS, we estimate treatment effects using the causal forest of Wager and
+Athey (2018) and Athey et al. (2019), which allows for heterogeneous treatment effects
+and flexible nonparametric estimation of δt(¯x) as defined in equation (31). For CIA-∇Y ,
+CIA-D, and TWFE, the causal forest directly estimates δt(¯x) without rescaling. For CIA-∇D,
+rescaling is required according to Proposition 6(i): we first train a causal forest with Yit
+as the outcome and ∇Dit as the treatment, conditional on pre-determined covariates ¯Xt−1
+including year dummies, yielding unit-level estimates of ˆβCIA-∇D(¯xi) = δt(¯xi) · λt(¯xi). We
+then estimate λt(¯x) nonparametrically by training a separate causal forest with Dit as the
+outcome and ∇Dit as the treatment, conditional on the same covariates, yielding unit-level
+estimates ˆλt(¯xi). The rescaled ATE is then obtained by dividing each unit-level estimate
+ˆβCIA-∇D(¯xi) by ˆλt(¯xi) before averaging, as in equation (35), with standard errors propagated
+27
+via the delta method. We use the grf package of Tibshirani, Athey, and Wager (2020) with
+2,000 honest trees and tuned hyperparameters throughout.
+Table 4: Cigarette Demand: Price Elasticity under Four Identification Strategies. Baltagi & Levin
+(1986) panel, 46 US states × 29 years (1964–1992), n = 1,334.
+OLS
+Causal Forest
+Strategy
+ATE estimate
+Standard error
+ATE estimate
+Standard error
+CIA-∇Y
+−0.395∗∗∗
+(0.038)
+−0.326∗∗∗
+(0.030)
+CIA-D
+−0.402∗∗∗
+(0.039)
+−0.386∗∗∗
+(0.037)
+TWFE
+−0.380∗∗∗
+(0.039)
+−0.365∗∗∗
+(0.036)
+CIA-∇D
+−0.684∗∗∗
+(0.078)
+−0.519∗∗∗
+(0.075)
+Hausman overidentification tests (OLS p-value | Causal Forest p-value)
+CIA-∇Y vs CIA-∇D
+p < 0.001∗∗∗
+p = 0.018∗
+CIA-∇Y vs CIA-D
+p = 0.896
+p = 0.206
+CIA-∇Y vs TWFE
+p = 0.793
+p = 0.408
+CIA-∇D vs CIA-D
+p = 0.001∗∗
+p = 0.115
+CIA-∇D vs TWFE
+p < 0.001∗∗∗
+p = 0.067
+CIA-D vs TWFE
+p = 0.695
+p = 0.684
+Notes: Yit = log per-capita cigarette sales; Dit = log real cigarette price; Xit = log real disposable
+income, log population aged 16+. Controls enter at levels in both periods t and t −1. All
+specifications include year fixed effects; state fixed effects are absorbed by outcome differencing
+for CIA-∇Y and TWFE. Standard errors clustered by state in parentheses. All OLS and causal
+forest coefficients estimate δ directly except CIA-∇D, where the raw OLS coefficient (−0.378)
+and causal forest ATE (−0.387) correspond to ˆδ · ˆλ and are rescaled by 1/ˆλ = 1.81 and 1/ˆλt(¯xi)
+respectively (Proposition 6). Hausman p-values from a two-sided z-test. ∗p < 0.05, ∗∗p < 0.01,
+∗∗∗p < 0.001.
+Table 4 reports the full set of estimates on the common effect scale (after rescaling
+for CIA-∇D). The linear estimate of the scaling factor ˆλ = 0.552 with a standard error
+(SE) of 0.021 based on the block bootstrap, strongly rejecting the random-walk hypothesis
+λ = 1 (p < 0.001) and marginally rejecting λ = 0.5 (p = 0.013), indicating that the price
+process is intermediate between a pure AR(1) and a random walk. The linear rescaling
+factor is 1/ˆλ = 1.81. The OLS estimates reveal that those based on CIA-∇Y (ˆδ = −0.395,
+SE = 0.038), CIA-D (ˆδ = −0.402, SE = 0.039), and TWFE (ˆδ = −0.380, SE = 0.039)
+are tightly grouped and within the literature benchmark. The rescaled CIA-∇D estimate
+(ˆδ = −0.684, SE = 0.075) lies approximately 0.29 log-points above this cluster. The Hausman
+overidentification tests reflect this finding: all three comparisons involving CIA-∇D reject
+(p < 0.001 against CIA-∇Y , p = 0.001 against CIA-D, p < 0.001 against TWFE), while the
+comparisons CIA-∇Y vs. CIA-D (p = 0.896), CIA-∇Y vs. TWFE (p = 0.793), and CIA-D
+28
+vs. TWFE (p = 0.695) all fail to reject, confirming that the level-based strategies and TWFE
+agree closely.
+The causal forest estimates present a more nuanced picture. The estimates based on CIA-
+∇Y (ˆδ = −0.326, SE = 0.030), CIA-D (ˆδ = −0.386, SE = 0.037), and TWFE (ˆδ = −0.365,
+SE = 0.036) remain in the same cluster, with all pairwise Hausman tests failing to reject (CIA-
+∇Y vs. CIA-D: p = 0.206; CIA-∇Y vs. TWFE: p = 0.408; CIA-D vs. TWFE: p = 0.684).
+The rescaled forest estimate based on CIA-∇D (ˆδ = −0.519, SE = 0.075) shifts somewhat
+toward the level-based strategies relative to OLS, though CIA-∇Y vs. CIA-∇D continues
+to reject (p = 0.018) and CIA-∇D vs. TWFE is borderline (p = 0.067), while CIA-∇D vs.
+CIA-D no longer rejects (p = 0.115), suggesting that part of the OLS discrepancy reflected
+nonlinearity in the treatment-outcome relationship.
+Taken together, these results refute the joint validity of the treatment-change and
+treatment-level identification strategies: across both OLS and the causal forest, Hausman tests
+consistently find that the CIA-∇D estimate is distinct from those based on CIA-∇Y , CIA-D,
+and TWFE, which agree closely under both estimators. In the light of the DR property of
+TWFE, this provides evidence against the treatment change-based strategy. A potential
+reason for a violation of CIA-∇D might be that states experiencing large year-to-year price
+increases may differ systematically in ways that past outcomes and covariates do not fully
+capture, plausibly because tax-driven price changes reflect state-level political and fiscal
+conditions that can also be associated with cigarette consumption.
+8
+Conclusion
+This paper has clarified when conditioning on treatment changes rather than levels identifies
+causal effects, how these conditions compare to those underlying conventional identifica-
+tion strategies based on treatment levels such as selection-on-observables and difference-in-
+differences, and under which circumstances the different strategies are jointly valid so that
+overidentification tests can be constructed.
+Treatment-change identification is valid under at least two distinct structural models with
+non-nested identifying assumptions: one that requires the absence of dynamic treatment
+effects and one that imposes a random-walk restriction on the treatment process. In the latter
+case, all three identification strategies - based on treatment changes, treatment levels, and
+outcome differences - coincide and can be exploited jointly in overidentification tests. When
+the strategies are not jointly valid, the non-nesting results carry a structural double robustness
+implication: under specific structural assumptions, the TWFE estimator, which differences
+both the outcome and the treatment, remains consistent if either the treatment-change
+29
+assumption or the parallel-trends assumption holds, without requiring both simultaneously.
+These results have practical implications for empirical work. Researchers exploiting
+treatment changes should be explicit about it and also about which structural conditions they
+rely on — in particular, whether dynamic treatment effects are permitted or treatment shocks
+are assumed to follow a random walk. The overidentification tests considered here provide a
+valuable diagnostic for whether data are consistent with more than one strategy in terms
+of identifying assumptions, and are best combined with falsification tests on pre-treatment
+periods. When the estimates based on different strategies disagree, the double robustness of
+TWFE offers a degree of protection against misspecification of either the treatment or outcome
+equation, even though this does not substitute for careful examination of the underlying
+structural assumptions.
+30
+References
+Abadie, A. (2005). Semiparametric difference-in-differences estimators. Review of Economic
+Studies, 72, 1-19.
+Angrist, J. D., & Pischke, J.-S. (2009). Mostly harmless econometrics: An empiricist’s
+companion. Princeton university press.
+Arkhangelsky, D., & Imbens, G. W. (2022). Doubly robust identification for causal panel
+data models. The Econometrics Journal, 25(3), 649–674.
+Arkhangelsky, D., Imbens, G. W., Lei, L., & Luo, X. (2021). Double-robust two-way-fixed-
+effects regression for panel data. arXiv preprint 2107.13737, 2, 12.
+Ashenfelter, O. (1978). Estimating the effect of training programms on earnings. The Review
+of Economics and Statistics, 6, 47-57.
+Athey, S., Tibshirani, J., & Wager, S. (2019). Generalized random forests. Annals of
+Statistics, 47(2), 1148–1178. doi: 10.1214/18-AOS1709
+Autor, D. H., Dorn, D., & Hanson, G. H. (2013). The china syndrome: Local labor market
+effects of import competition in the united states. American economic review, 103,
+2121-2168.
+Baltagi, B. H., & Levin, D. (1986). Estimating dynamic demand for cigarettes using panel
+data: The effects of bootlegging, taxation and advertising reconsidered. Review of
+Economics and Statistics, 68(1), 148–155.
+Bartik, T. J. (1991). Who benefits from state and local economic development policies?
+Kalamazoo, Michigan: W.E. Upjohn Institute for Employment Research.
+Borusyak, K., Hull, P., & Jaravel, X. (2021). Quasi-Experimental Shift-Share Research
+Designs. The Review of Economic Studies, 89, 181-213.
+Borusyak, K., Hull, P., & Jaravel, X. (2024). A practical guide to shift-share instruments.
+Borusyak, K., Jaravel, X., & Spiess, J. (2024). Revisiting Event-Study Designs: Robust and
+Efficient Estimation. The Review of Economic Studies, rdae007.
+Callaway, B., & Sant’Anna, P. H. (2021). Difference-in-differences with multiple time periods.
+Journal of Econometrics, 225, 200-230.
+Card, D., & Krueger, A. B. (1994). Minimum wages and employment: A case study of the
+fast-food industry in new jersey and pennsylvania. The American Economic Review,
+84, 772-793.
+Chabé-Ferret, S. (2017). Should we combine difference in differences with conditioning on
+pre-treatment outcomes. working paper, Toulouse School of Economics.
+Chaloupka, F. J., & Warner, K. E. (2000). The economics of smoking. In A. J. Culyer &
+J. P. Newhouse (Eds.), Handbook of health economics (Vol. 1, pp. 1539–1627). Elsevier.
+31
+Cox, D. (1958). Planning of experiments. New York: Wiley.
+Croissant, Y., & Millo, G. (2008). Panel data econometrics in r: The plm package. Journal of
+Statistical Software, 27(2), 1–43. Retrieved from https://doi.org/10.18637/jss.v027.i02
+doi: 10.18637/jss.v027.i02
+de Chaisemartin, C., Ciccia, D., d’Haultfoeuille, X., & Knau, F. (2022). Difference-in-
+differences estimators when no unit remains untreated. SSRN Electronic Journal.
+de Chaisemartin, C., & D’Haultfeuille, X. (2020). Two-way fixed effects estimators with
+heterogeneous treatment effects. American Economic Review, 110, 2964-2996.
+Firpo, S. (2007). Efficient semiparametric estimation of quantile treatment effects. Econo-
+metrica, 75, 259-276.
+Fricke, H. (2017). Identification based on difference-in-differences approaches with multiple
+treatments. Oxford Bulletin of Economics and Statistics, 79, 426-433.
+Goldsmith-Pinkham, P., Sorkin, I., & Swift, H. (2020). Bartik instruments: What, when,
+why, and how. American Economic Review, 110.
+Goodman-Bacon, A. (2021). Difference-in-differences with variation in treatment timing.
+Journal of Econometrics, 225, 254-277.
+Haddad, M. F., Huber, M., & Zhang, L. Z. (2024). Difference-in-differences with time-
+varying continuous treatments using double/debiased machine learning. arXiv preprint
+2410.21105.
+Hausman, J. A. (1978). Specification tests in econometrics. Econometrica, 46(6), 1251-1271.
+Huber, M., & Oeß, E.-M. (2024). A joint test of unconfoundedness and common trends.
+arXiv preprint 2404.16961.
+Imbens, G. W. (2004, Feb.). Nonparametric estimation of average treatment effects under
+exogeneity: a review. The Review of Economics and Statistics, 86, 4-29.
+Imbens, G. W., & Angrist, J. (1994). Identification and estimation of local average treatment
+effects. Econometrica, 62, 467-475.
+Lechner, M. (2011). The estimation of causal effects by difference-in-difference methods.
+Foundations and Trends in Econometrics, 4, 165-224.
+Neyman, J. (1923). On the application of probability theory to agricultural experiments.
+essay on principles. Statistical Science, Reprint, 5, 463-480.
+Pearl, J. (1988). Probabilistic reasoning in intelligent systems: networks of plausible inference.
+San Mateo: Morgan Kaufmann.
+Pearl, J. (2000). Causality: Models, reasoning, and inference. Cambridge: Cambridge
+University Press.
+Robins, J. M.
+(1986).
+A new approach to causal inference in mortality studies with
+sustained exposure periods - application to control of the healthy worker survivor effect.
+32
+Mathematical Modelling, 7, 1393-1512.
+Robins, J. M., Hernan, M. A., & Brumback, B. (2000). Marginal structural models and
+causal inference in epidemiology. Epidemiology, 11, 550-560.
+Robins, J. M., Rotnitzky, A., & Zhao, L. (1994). Estimation of regression coefficients
+when some regressors are not always observed. Journal of the American Statistical
+Association, 90, 846-866.
+Rubin, D. B. (1974). Estimating causal effects of treatments in randomized and nonrandomized
+studies. Journal of Educational Psychology, 66, 688-701.
+Rubin, D. B. (1980). Comment on ’randomization analysis of experimental data: The
+fisher randomization test’ by d. basu. Journal of American Statistical Association, 75,
+591-593.
+Snow, J. (1855). On the mode of communication of cholera (J. Churchill, Ed.).
+Sun, L., & Abraham, S. (2021). Estimating dynamic treatment effects in event studies with
+heterogeneous treatment effects. Journal of Econometrics, 225, 175-199.
+Tibshirani, J., Athey, S., & Wager, S. (2020). grf: Generalized random forests. R package.
+Wager, S., & Athey, S. (2018). Estimation and inference of heterogeneous treatment effects
+using random forests. Journal of the American Statistical Association, 113, 1228-1242.
+Weber, A. M., van der Laan, M. J., & Petersen, M. L. (2015). Assumption trade-offs
+when choosing identification strategies for pre-post treatment effect estimation: An
+illustration of a community-based intervention in madagascar.
+Journal of Causal
+Inference, 3, 109–130.
+Wooldridge, J. (2002). Econometric analysis of cross section and panel data. Cambridge:
+MIT Press.
+Wright, P. G. (1928). The tariff on animal and vegetable oils. The Macmillan Company.
+Xu, Y. (2023). Causal inference with time-series cross-sectional data: a reflection. SSRN
+3979613.
+33
+A
+Proof of Proposition 6
+Throughout we maintain Assumptions 1, 4, and 3 jointly, together with either conditions (8)
+and (30) under Model A, or condition (14) under Model B. The population regression
+coefficient for each strategy is defined as in equation (32).
+Part (i): Heterogeneous partially linear model
+CIA-D: For CIA-D, A = Dt, B = Yt, C = { ¯Dt−1, ¯Xt−1}. Under CIA-D, Yt(d) ⊥Dt |
+¯Dt−1, ¯Xt−1 for all d, so by equation (25),
+E[Yt | Dt = d, ¯Dt−1, ¯Xt−1] = E[Yt(d) | ¯Dt−1, ¯Xt−1].
+(A1)
+Under the heterogeneous partially linear model, Yt(d) = δt( ¯Xt−1) · d + f(U, ¯Xt−1, Vt), so
+E[Yt(d) | ¯Dt−1, ¯Xt−1] = δt( ¯Xt−1) · d + g( ¯Dt−1, ¯Xt−1),
+(A2)
+for some function g collecting E[f(U, ¯Xt−1, Vt) | ¯Dt−1, ¯Xt−1]. Since δt( ¯Xt−1) is measurable
+with respect to ¯Xt−1 and g absorbs into the projection intercept,
+Cov(Dt, Yt | ¯Dt−1, ¯Xt−1) = Cov(Dt, E[Yt | Dt, ¯Dt−1, ¯Xt−1] | ¯Dt−1, ¯Xt−1)
+= Cov(Dt, δt( ¯Xt−1) · Dt + g( ¯Dt−1, ¯Xt−1) | ¯Dt−1, ¯Xt−1)
+= δt( ¯Xt−1) · Var(Dt | ¯Dt−1, ¯Xt−1),
+(A3)
+where the first equality applies the law of total covariance, using that Cov(Dt, Yt | ¯Dt−1, ¯Xt−1) =
+Cov(Dt, E[Yt | Dt, ¯Dt−1, ¯Xt−1] | ¯Dt−1, ¯Xt−1) since the residual Yt −E[Yt | Dt, ¯Dt−1, ¯Xt−1] is
+uncorrelated with any function of Dt by the properties of conditional expectation; the second
+substitutes the conditional expectation derived above; and the third uses that g( ¯Dt−1, ¯Xt−1)
+is measurable with respect to the conditioning set and thus has zero covariance with Dt
+conditional on ¯Dt−1, ¯Xt−1, and that δt( ¯Xt−1) is measurable with respect to ¯Xt−1 and can
+therefore be factored out of the covariance. This gives βCIA-D(¯x, ¯dt−1) = δt(¯x), where the
+conditional effect does not depend on ¯dt−1 since under the heterogeneous partially linear
+model Yt(d) = δt( ¯Xt−1) · d + f(U, ¯Xt−1, Vt), the treatment effect δt(¯x) depends only on ¯Xt−1
+and not on past treatment levels. Averaging over ¯Xt−1 gives δt.
+□
+CIA-∇Y : For CIA-∇Y , A = Dt, B = ∇Yt, C = { ¯Dt−1, ¯Xt−1}. Under CIA-∇Y and
+no anticipation, ∇Yt(d) = Yt(d) −Yt−1, so ∇Yt(d) ⊥Dt | ¯Dt−1, ¯Xt−1 for all d, and by
+34
+equation (26),
+E[∇Yt | Dt = d, ¯Dt−1, ¯Xt−1] = E[∇Yt(d) | ¯Dt−1, ¯Xt−1].
+(A4)
+Under the heterogeneous partially linear model, Yt(d) = δt( ¯Xt−1) · d + f(U, ¯Xt−1, Vt), so
+E[∇Yt(d) | ¯Dt−1, ¯Xt−1] = δt( ¯Xt−1) · d + h( ¯Dt−1, ¯Xt−1),
+(A5)
+for some function h collecting E[f(U, ¯Xt−1, Vt) −Yt−1 | ¯Dt−1, ¯Xt−1]. Since δt( ¯Xt−1) is measur-
+able with respect to ¯Xt−1 and h absorbs into the projection intercept,
+Cov(Dt, ∇Yt | ¯Dt−1, ¯Xt−1) = δt( ¯Xt−1) · Var(Dt | ¯Dt−1, ¯Xt−1),
+(A6)
+giving βCIA-∇Y (¯x, ¯dt−1) = δt(¯x), where again the effect does not depend on ¯dt−1 since δt(¯x) is
+determined solely by ¯Xt−1 under the heterogeneous partially linear model. Averaging over
+¯Xt−1 gives δt.
+□
+CIA-∇D: For CIA-∇D, A = ∇Dt, B = Yt, C = ¯Xt−1. Under CIA-∇D, Yt(∇d) ⊥
+∇Dt | ¯Xt−1 for all ∇d, so Dt−1, while not fixed by conditioning on ¯Xt−1, does not act as a
+confounder. Therefore,
+Cov(∇Dt, Yt | ¯Xt−1) = Cov
+
+∇Dt, E[Yt | Dt, ¯Xt−1] | ¯Xt−1
+
+.
+(A7)
+Under the heterogeneous partially linear model, E[Yt | Dt, ¯Xt−1] = δt( ¯Xt−1) · Dt + g( ¯Xt−1), so
+Cov(∇Dt, E[Yt | Dt, ¯Xt−1] | ¯Xt−1) = δt( ¯Xt−1) · Cov(∇Dt, Dt | ¯Xt−1),
+(A8)
+since both δt( ¯Xt−1) and g( ¯Xt−1) are measurable with respect to ¯Xt−1, so g( ¯Xt−1) has zero
+covariance with ∇Dt conditional on ¯Xt−1 and δt( ¯Xt−1) can be factored out of the covariance.
+Substituting into equation (32),
+βCIA-∇D = δt( ¯Xt−1) · Cov(∇Dt, Dt | ¯Xt−1)
+Var(∇Dt | ¯Xt−1)
+= δt( ¯Xt−1) · λt( ¯Xt−1).
+(A9)
+Averaging over ¯Xt−1 yields E[δt( ¯Xt−1) · λt( ¯Xt−1)] as stated in (33). Under Model B, ∇Dt =
+εt ⊥Dt−1 | ¯Xt−1 by the random-walk assumption, so Cov(∇Dt, Dt−1 | ¯Xt−1) = 0, giving
+λt(¯x) = 1 for all ¯x, and the estimand equals δt directly without rescaling.
+□
+TWFE: For TWFE, A = ∇Dt, B = ∇Yt, C = ¯Xt−1. Under ∇Yt(∇d) ⊥∇Dt | ¯Xt−1 (as
+35
+discussed in Proposition 5) and no anticipation, ∇Yt(∇d) = Yt(Dt−1 + ∇d) −Yt−1, so
+E[∇Yt | ∇Dt = ∇d, ¯Xt−1] = E[∇Yt(∇d) | ¯Xt−1].
+(A10)
+Under the heterogeneous partially linear model, Yt(Dt−1 + ∇d) = δt( ¯Xt−1) · (Dt−1 + ∇d) +
+f(U, ¯Xt−1, Vt), so
+E[∇Yt(∇d) | ¯Xt−1] = δt( ¯Xt−1) · ∇d + k( ¯Xt−1),
+(A11)
+for some function k collecting δt( ¯Xt−1) · E[Dt−1 | ¯Xt−1] + E[f(U, ¯Xt−1, Vt) −Yt−1 | ¯Xt−1].
+Since δt( ¯Xt−1) is measurable with respect to ¯Xt−1 and k absorbs into the projection intercept,
+Cov(∇Dt, ∇Yt | ¯Xt−1) = δt( ¯Xt−1) · Var(∇Dt | ¯Xt−1),
+(A12)
+giving βTWFE(¯x) = δt(¯x) directly without rescaling. Under Model B, λt(¯x) = 1 for all ¯x, so
+this coincides with the CIA-∇D estimand.
+□
+Part (ii): Homogeneous partially linear model
+Under δt(¯x) = δ and λt(¯x) = λ for all ¯x and t, CIA-∇Y , CIA-D, and TWFE all recover
+δt(¯x) = δ directly from part (i), so
+βCIA-∇Y (¯x, ¯dt−1) = βCIA-D(¯x, ¯dt−1) = βTWFE(¯x) = δ.
+(A13)
+For CIA-∇D, the estimand from part (i) gives immediately
+βCIA-∇D(¯x) = δt(¯x) · λt(¯x) = δ · λ,
+(A14)
+so rescaling by 1/λ recovers δ. Under Model B, λ = 1 and all four strategies recover δ directly
+without rescaling.
+□
+36

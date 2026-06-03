@@ -5,7 +5,7 @@ Output:
   bench/corpus_tables/*.pdf
   bench/corpus_tables/ground_truth.json   { file: {tables:[{rows,cols,cells,style,has_header}], is_negative} }
 
-Used by test_tables.py to score pylopdf's table detection (precision/recall/structure/
+Used by test_tables.py to score distillpdf's table detection (precision/recall/structure/
 cell-content) against ground truth — the robust goalline for table extraction.
 """
 import json, os, random

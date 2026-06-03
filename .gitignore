@@ -7,6 +7,7 @@ __pycache__/
 *.pyc
 .venv/
 *.so
-# bench artifacts
-bench/out/imgs/
+# bench artifacts — out/ is a regenerated cache (our HTML + competitor outputs).
+# Committed ground truth lives in bench/fixtures/, bench/*.json, bench/corpus*/.
+bench/out/
 bench/rust_extra/target/

@@ -1,0 +1,691 @@
+Anisotropic interactions induce dynamical arrest in artificial colloidal ice.
+Leonardo G. Alanis-Cant´u and Antonio Ortiz-Ambriz∗
+Tecnologico de Monterrey, Escuela de Ingenier´ıa y Ciencias
+Ave.
+Eugenio Garza Sada 2501, Monterrey, 64849, M´exico.
+(Dated: June 2, 2026)
+Artificial Colloidal Ice is an ice-like system used to study the effects of frustration in controlled
+environments where all degrees of freedom can be accessed at a length-scale large enough for optical
+visualization and in real time. We modify this model system by inducing anisotropic interactions
+through an in-plane magnetic field.
+In this new regime, the system has a well-defined ground
+state consisting of a checkerboard pattern of fully charged vertices. However, Brownian Dynamics
+simulations are unable to reach this ground state and instead remain frozen in metastable disordered
+states, even in the absence of quenched disorder in the lattice. This arrest is caused by the local
+magnetic enhancement of the potential barrier that the particles need to cross to find a lower energy
+state.
+I.
+INTRODUCTION
+The spin glass model was introduced in 1975 [1] to ex-
+plain the unusual behavior of the specific heat in dilute
+magnetic alloys observed in the late 50s and early 60s
+[2, 3]. In this model, the Ising spins interact on a lattice
+through random coupling energies that produce a corru-
+gated potential landscape in phase space. The quenched
+disorder produces low-energy states that lack long-range
+order but have long relaxation times, effectively mak-
+ing them frozen in time.
+Quenched disorder typically
+plays a significant role in the freezing mechanism, as has
+been showed experimentally in materials like URh2Ge2
+where the exhibited spin freezing can be lifted when the
+source of disorder is removed [4]. However, macroscopic
+signatures of spin freezing have also been observed in
+very pure samples of bulk materials with no disorder,
+such as PrAu2Si2[5], Gadolinium Gallium Garnet (GGG)
+[6], various magnetic materials [7–9], and magnetic Py-
+rochlores [10–14]. The origins of this unconventional spin
+freezing appear to be multiple, from induced dynamical
+disorder [15] to lattice distortions induced by fluctuations
+[16, 17].
+Artificial Ice systems are engineered to study geometric
+frustration in a controlled environment. In Artificial Spin
+Ice (ASI), ferromagnetic elongated nanoislands are fabri-
+cated such that they are uniformly magnetized in one di-
+rection. These nanoislands can then be arranged in many
+different spatial configurations to obtain very diverse be-
+haviors [18–22], including glass transitions [23, 24], and
+ergodicity breaking [25]. Artificial Colloidal Ice (ACI),
+on the other hand, is composed of interacting colloidal
+particles confined to move inside bistable potentials [26].
+This system is similar to ASI, but the configuration is
+easier to observe experimentally as colloidal particles can
+usually be seen through an optical microscope, and their
+interactions are tunable [27]. An analogy between both
+systems can be made by considering the empty space in
+∗aortiza@tec.mx
+the bistable potential as a negative topological charge
+and then defining a dipole for each trap. It was shown
+in Refs.
+[28] that for infinite, single coordination lat-
+tices with isotropically repulsive particles, the topolog-
+ical dipoles in ACI are energetically equivalent to the
+magnetic dipoles in ASI.
+Experimentally, ACI is realized by placing superpara-
+magnetic colloids in lithographically etched grooves, and
+generating an external magnetic field that induces the in-
+teractions. When the magnetic field is perpendicular to
+the plane where particles sediment, the interactions are
+isotropic and repulsive. Most studies of colloidal ice have
+maintained this regime, either with such a magnetic field
+[27, 29, 30] or by considering electrically charged colloids
+[31]. For a review of particle ice systems, the reader is
+referred to Ref. [26].
+In this study we perform simulations that break this
+condition by applying an in-plane magnetic field, which
+causes the interaction between colloidal particles to be-
+come anisotropic and to have both attractive and repul-
+sive regions, as shown in Fig. 1. This causes the system
+to arrest, even in the absence of any quenched disorder;
+that is, even if the system has a definite ground state, it
+will fall into a metastable state, where due to the local re-
+pulsive force, the particles are unable to find a clear path
+to their lowest energy configuration.
+The system will
+then stop evolving and stay in this configuration for a
+very long time. We find that these long-lived metastable
+states appear due to the local increase in the potential
+barrier produced by the anisotropic interactions, even if
+the underlying lattice remains completely ordered, which
+makes this mechanism distinct from the one used to ex-
+plain spin freezing in Refs. [15, 16].
+II.
+METHODS
+For our simulations, we use Brownian Dynamics to
+compute the position ri of particle i at each timestep
+by integrating the overdamped equations of motion.
+γ dri
+dt = Fdd
+i
++ Ftrap
+i
++ η,
+(1)
+arXiv:2606.02439v1  [cond-mat.soft]  1 Jun 2026
+2
+θ
+Figure 1. Schematic of the system. a) Colloidal particles are
+placed in double-well traps with induced magnetic moments
+pointing along the x axis. b) The in-plane magnetic field pro-
+duces mixed attractive (blue) and repulsive (red) anisotropic
+interactions interactions at the single-vertex level.
+c) The
+system is arranged in a square lattice such that the magnetic
+field falls on one of the base vectors. The depicted arrange-
+ment corresponds to the ground-state configuration under the
+studied conditions.
+where γ = kBT/D is the drag coefficient with diffusion
+constant D = 0.14µ2m/s and η is a random variable
+representing the thermal noise, with zero mean ⟨η⟩= 0,
+and ⟨η(t)η(t′)⟩= 4kBTγδ(t−t′); in this case, T = 300K.
+The term Ftrap
+i
+arises from a bistable potential, like the
+one illustrated in Fig. 1a) with two components of the
+force vector: one parallel to the direction of the trap ˆe∥
+and one perpendicular to the direction of the trap ˆe⊥
+which prevents the colloids from jumping to other traps.
+The full expression is:
+Ftrap
+i
+= −ktrapr⊥ˆe⊥
+−ˆe∥
+(
+−khillr∥
+|r∥| ≤d/2,
+ktrap(|r∥| −d/2)sgn(r∥)
+|r∥| > d/2,(2)
+where d = 3µm is the trap separation, ktrap = 0.1pN/nm
+is the stiffness, and khill = 8h/d2 with h = 8pN·nm being
+the height of the central hill.
+The traps are arranged
+vertically and horizontally in a 2D square lattice with
+lattice constant a = 8.374µm as shown in Fig: 1c).
+The term Fdd
+i
+represents the magnetic dipole-dipole
+interactions, described by the potential
+Uij = −µ0m2
+4πr3
+ij
+
+3 cos2 ϕ −1
+
+,
+(3)
+where m is the magnetic moment of the colloids, given
+by m = V χB/µ0, and ϕ is the angle between the mag-
+netic field vector, B and the vector joining both particles
+rij = ri −rj. The angle θ is the polar angle between the
+magnetic field and the vertical direction, ˆz In the expres-
+sion for the magnetic moment, V is the colloid volume,
+and χ is the susceptibility. In our setup, colloidal parti-
+cles have a radius of r = 1.4µm and magnetic suscepti-
+bility χ = 0.4, in agreement with values measured with
+commercially available particles [32]. We neglect many
+body effects in our simulations, as particles are never
+close enough for these to be significant. All simulations
+were made with a timestep of 0.1ms and a sample size
+of n = 30 vertices per side, i.e. 1800 particles. These
+parameters were chosen to match what is experimentally
+available, except for the system size, the choice of peri-
+odic boundary conditions, and the variance of the central
+hill, which in our case is σh = 0.
+When the magnetic field is applied along one of the lat-
+tice basis vectors, it generates regions of attractive and
+repulsive interactions, separated by the so-called magic
+angle ϕ = 54.7◦, as illustrated in Fig. 1b). In a 4-in or 4-
+out vertex, all nearest-neighbor particles meet at an angle
+ϕ = 45 deg < ϕc, so their interactions are attractive. In
+consequence, particles in neighboring traps aligned with
+the magnetic field interact attractively, whereas particles
+in collinear traps perpendicular to the field experience re-
+pulsion. For traps oriented perpendicular to each other,
+the interaction can be either attractive or repulsive, de-
+pending on the relative positions of the particles.
+For
+example, as shown in Fig. 1b), when the particle in the
+horizontal trap is fixed close to the vertex, and the parti-
+cle in the vertical trap is in the nearest stable point, they
+interact attractively, while when the vertical particle is in
+the opposite end of the trap, the interaction is attractive.
+Although next-nearest-neighbor interactions across the
+vertex are mixed, they are weaker and won’t overcome
+the energetic gain associated with bringing all particles
+close to the vertex. As a result, vertices with all parti-
+cles pointing in or out are energetically favored, and we
+expect to observe predominantly charged vertices.
+III.
+RESULTS AND DISCUSSION
+With this relatively complicated interaction, we begin
+by estimating the energy hierarchy of all vertex types.
+This is non-trivial because the appearance of charged
+vertices (Types I, II, V, and VI, as defined in Fig. 2), nec-
+essarily produce vertices with the opposite charge. The
+values shown in Fig. 2 a) are calculated by a procedure
+similar to that of Refs. [28, 29]. For each vertex, the
+naive energy is given by the sum of all pair interactions
+between its components.
+The effective energy, Eeff, is
+calculated as the average between the naive energies of
+the vertex and its complement; that is, the vertex that
+appears from flipping all the particles.
+Using this procedure we reproduce the vertex hierar-
+chy known for a field orthogonal to the particle’s plane
+(θ = 0), as shown in Fig.
+2 b).
+Consequently, this
+model predicts that in our setup (θ = 90 deg), the ex-
+pected ground state is composed of highly charged ver-
+tices of types I and VI. Furthermore, we can plug the
+effective energy of vertex type v into the Boltzmann re-
+3
+Figure 2. a) Color-coded vertex types with their correspond-
+ing geometric vertex energy E(v)/B2 with an in-plane field
+direction on the x axis. b) Vertex energies with increasing
+tilting angle θ starting in the isotropic regime, i.e. orthogonal
+to the particle’s plane. c) Vertices fraction with increasing
+magnetic field grouped by topological charge, for the mean-
+field model (solid, —) line, fast simulations at ˙B = 33.3µT/s
+(-♦-), and slow simulations (-•-) at ˙B = 0.333µT/s.
+lation, P(v) ∼exp(−E(v)/kBT), to obtain the relative
+fraction of vertices of each type that are expected in a
+system in an equilibrium state. These expected vertex
+counts are shown as a solid line in Fig. 2 c), where it can
+be seen that at a field of B = 3mT, the equilibrium con-
+figuration should be composed purely of types I and VI.
+For the square lattice, this ground state is twofold degen-
+erate and can be realized by arranging q = ±4 topological
+charges antiferromagnetically in a checkerboard pattern,
+as illustrated in Fig. 1c).
+Here we should note that this process of adjusting the
+energy hierarchy by modifying the system symmetry has
+been proposed in Refs. [29, 33]. Specifically, Ref. [33]
+applies an external field that tilts the whole potential
+landscape and favors some vertices of type IV instead
+of type III. At high values of the external field, this re-
+sults in a new ferromagnetic ground state, where all spins
+point towards one corner, saturating the magnetization.
+We note here that our approach cannot be described as
+an external field, since the changes in the potential land-
+scape can’t be reduced to a force that depends only on
+a point in space. Instead, what we are modifying is the
+symmetry of the pair interactions in a way that breaks
+rotational symmetry but preserves inversion symmetry.
+To realize the simulations, the system was initialized
+in a random configuration, and then the field was in-
+creased at a constant quench rate ˙B. Two quench pro-
+tocols were realized at different rates: a fast protocol at
+˙B = 33.3µT/s and a slow protocol at ˙B = 0.333µT/s.
+Note that even in the case of the fast protocol, the time
+taken to reach 5mT is around 2.5 minutes, while for slow
+quench it’s more than 4 hours. After the quench both
+systems are allowed to relax for one hour at a constant
+a)
+b)
+c)
+d)
+Figure 3.
+Vertex Maps of the last frame of simulations in
+quenched anisitropic colloidal ice for fast (a,b) and slow (c,d)
+quenches. In panes a) and c), topological charges are directly
+colored corresponding to the colormap in Fig. 2. In b) and d)
+their color indicates to the value of their local antiferromag-
+netic order parameter, with negative vertices shown as green,
+and positive vertices as purple.
+Regions with deep purple
+or green color indicate domains of incompatible ground state
+configuration.
+field of Bf = 5mT.
+Figure 2 shows how both protocols deviate strongly
+from the model, even if they stop their evolution at
+around the same field value B ≈3mT. The fast quench
+produces slightly more vertices of types II and V than of
+the expected ground state, I and V, while the slow quench
+slightly increases the fraction of ground state vertices,
+but the final fraction is still around 0.6. The fact that
+slowing down the quench produces results closer to the
+model indicates that something in the dynamics prevents
+the system from reaching the ground state.
+It might
+be that there is a quench rate slow enough to allow the
+system to equilibrate; however, the modest improvement
+from 2.5 minutes to 4 hours suggests that the time re-
+quired to achieve the ground state is likely impracticable.
+We observe a typical spatial distribution of the final
+state in Fig. 3. In panels a) and c), we show the vertices
+according to the color scheme of Fig. 2. In this, the deep
+blue squares correspond to vertices of types I and VI and,
+therefore, to regions of local ground state configuration.
+All the pale blue and orange vertices are defects, with or-
+ange points being vertices of neutral charge. From these
+maps, we can conclude that the fast-quenched system is
+in a very disordered state, with domains of ground state
+vertices almost as large as defects. The slow quench is
+more ordered, with defects scattered on a field of ground
+state vertices.
+4
+5
+10
+∆r/a
+10−4
+10−2
+100
+Cij
+100
+101
+102
+∆t[s]
+10−1
+100
+Eij
+0
+5
+B
+103
+104
+τ[s]
+0
+1
+2
+3
+4
+5
+B[mT]
+0
+2
+4
+B [mT]
+0
+2
+4
+lc/a
+0
+1800
+3600
+∆t [s]
+slow
+fast
+a)
+b)
+c)
+Figure 4. (a) Logarithmic plot of spin-spin spatial correlation
+functions for the slow quench and (b) Edwards-Anderson pa-
+rameter at different magnetic fields. The translucent lines are
+calculated from the simulation, and solid lines are a fit to a
+stretched exponential function exp
+h
+−(∆t/τ)βi
+. (c) Correla-
+tion length obtained by fitting the spatial correlation func-
+tions with an exponential function, for both slow and fast
+simulations. The left panel shows how the correlation length
+remains steady at a constant field for an hour after the quench.
+The domain structure becomes more evident when we
+plot a local order parameter in panels b) and d). Spa-
+tially, the ground state of the system is composed of a
+checkerboard pattern of vertices of types I and VI. We
+define the local order parameter
+κx,y = (−1)x+yqxy,
+(4)
+where (x, y) are the components of the position vector
+in lattice units, and qxy is the charge of the vertex at
+position (x, y).
+This order parameter acquires a value
+of ±1 when the vertices are ordered according to the
+ground state and a value of 0 for defects.
+As before,
+we can observe that the fast quench produces a nearly
+completely disordered structure, while the slow quench
+almost reaches a structure composed of two interpen-
+etrated domains with scattered charged defects inside.
+The evolution of this order parameter for both quench
+rates can be seen in the videos S1 and S2.
+To characterize the size of the domains we compute
+the spin-spin correlation function as follows:
+C(rij) = |⟨σi · σj⟩| .
+(5)
+In Fig. 4a) we show the correlation functions for the slow
+quench simulations and see that these have generally de-
+caying exponential functional forms, although for very
+low fields these correlations show almost only noise. We
+fit these functions with an exponential exp (−rij/lc) to
+obtain the correlation length: that is, a measure of the
+average size of ordered regions in the lattice. By plotting
+lc in Fig. 4c), we can observe how, in both slow and fast
+quenches, the ordered domains start growing but satu-
+rate for fields greater than ∼2mT in agreement with the
+vertex counts from Fig: 2 c). The correlation length can
+grow up to three lattice sites for slow quenches, but stays
+lower than one lattice site for fast quenches, indicating
+the system does evolve from its random configuration,
+but maintains a strongly disordered state. This contrasts
+with the observations of Ref. [34], where the number of
+defects decreases due to the motion of the domain walls.
+After the quench, the correlation length remains constant
+for up to an hour at constant field. This can also be seen
+in the second half of videos S1 and S2.
+Figure 4b) shows the Edwards-Anderson parameter for
+several values of the field. This data required a different
+protocol, where the field was increased in discrete steps.
+This allowed the system to evolve for some time in a given
+field so that the time correlation could be calculated as:
+E(∆t) = ⟨ri(t)ri(t + ∆t)⟩,
+(6)
+where the average is taken over t and i. Surprisingly, par-
+ticles still exhibit some mobility even at high fields, where
+the vertex dynamics have effectively stopped evolving.
+However, this reflects the local jumping of specific par-
+ticles that have no consequence on the overall domain
+structure. The slowing down of the relaxation appears
+to be similar to that observed experimentally in strongly
+confined microgel particles [35]. However, in that sys-
+tem, spin-lattice distortions appear from the quasi-2D
+displacements, which are not present in our system. The
+inset in Fig. 4b) shows the relaxation times τ as the field
+increases.
+To calculate it, we fit the time correlation
+with a stretched exponential function, exp
+h
+−(∆t/τ)βi
+,
+shown in the figure as solid lines over the simulation
+data. The relaxation time clearly increases several or-
+ders of magnitude as the field increases, which indicates
+that the system’s dynamics become arrested. The precise
+functional form, and the point at which τ diverges is left
+for future work.
+The spin freezing we observe arises due to thermal fluc-
+tuations at zero and low fields. Under these conditions,
+particles can jump between two equilibrium positions as
+the central hill barrier is in the order of ∼2kBT. As
+the field increases, the potential landscape experienced
+by each particle changes significantly, making transitions
+between the two positions a rare event, even if the sys-
+tem’s energetics favor one position considerably over the
+other.
+To demonstrate this concept, Fig.
+5 illustrates the
+modified potential of a vertical trap inside a single-vertex
+(left) and two coupled vertices (right). The potential is
+calculated along the direction of the trap highlighted in
+magenta. In both cases, as the field increases, the poten-
+tial barrier between the two states increases, resulting
+5
+Figure 5. Modified Potentials for a single vertex (left) and two
+coupled vertices (right) with increasing magnetic field when
+the highlighted particle is moved across the trap. The inset
+shows the trap’s height ˜h = h/kBT with squared field B2.
+The left panel shows the large increase in the potential barrier
+necessary to cross to the minimum energy configuration.
+in a decrease in the transition probability, even though
+one of the stable positions is more energetic than the
+other. The inset on the single-vertex shows the height of
+the potential barrier ˜h = h/kBT measured at the cen-
+ter of the trap, which increases linearly with B2. In the
+single-vertex case, we observe that the potential going
+from +d/2 →−d/2 consists of a long and shallow hill
+and a sudden drop as we approach d/2.
+This implies
+that, as previously computed, q = +4 vertices are more
+stable, but q = +2 vertices remain metastable due to
+the energetic barrier preventing transitions to the ground
+state. When a second vertex is added, the ground state
+keeps being a combination of charges q = ±4, however,
+the metastable position d/2 is separated by a higher hill,
+making the ±2 vertex pair more stable.
+IV.
+CONCLUSIONS
+In this paper, we studied the anisotropic regime in Ar-
+tificial Colloidal Ice using both theory and simulations.
+Our model suggest that when the magnetic field points in
+the direction of a lattice vector, the system has a ground
+state that locally maximizes the topological charge, thus
+forming an antiferromagnetic configuration of ±4 charges
+arranged in a checkerboard pattern. However, Brownian
+Dynamics simulations show that instead, the system be-
+comes arrested in a metastable, disordered state, deviat-
+ing significantly from the equilibrium theoretical predic-
+tions. Slower quenching rates improved agreement with
+the models, indicating that the intrinsic dynamics of the
+system prevented it from reaching equilibrium.
+The temporal correlations show that, as the field in-
+creases, the timescale for the spin flips diverges, and the
+system falls to a frozen state that stops evolving.
+In
+disorder-free spin glass materials, it has been observed
+that freezing arises from small lattice distortions that in-
+duce enough disorder in the interactions for a glass state
+to appear, as observed in Y2Mo2O7 [16].
+In our sys-
+tem such fluctuations are not present, because the traps
+are fixed in space, and instead the frozen state arises
+from magnetic interactions themselves; as the system is
+cooled, the potential barrier between the two equilibrium
+positions increases, eventually becoming large enough
+to prevent particles from thermally exploring the phase
+space, revealing a different type of spin freezing with-
+out quenched disorder. This mechanism deviates signif-
+icantly from the one observed in other colloidal mod-
+els [35–37] where the glassiness is induced by very short
+range interactions between anisotropic particles, or by
+the interaction with a confinement, as well as from the
+mechanisms known to produce freezing in spin glass ma-
+terials [16, 17]. Our system produces a dynamical freez-
+ing in a system with only one degree of freedom per par-
+ticle. This reduced dimensionality allowed us to observe
+precisely the rise in the potential barrier that arrests the
+motion, while keeping the collective nature of the ob-
+served phenomena. We expect that our system can be
+used as model system for more complicated glassy sys-
+tems.
+Additionally, we note that the behavior we observe
+here is markedly different from that shown in isotropic
+colloidal ice [34], where slower quenches also produced
+larger domains, but these domains continued to coarsen
+over time. The fact that our system freezes and stops
+evolving could make it suitable to observe the scalings
+predicted by the Kibble-Zurek mechanism [38] by over-
+coming the difficulties observed in Ref. [34], where the
+coarsening of the domains after the transition meant that
+the characteristic lengthscale kept growing with time. We
+leave this research avenue for a future study.
+ACKNOWLEDGMENTS
+We thank Carolina Rodriguez-Gallo, Pietro Tierno,
+Yusheng Lei, and Xuan Feng for their fruitful discussions.
+LGAC acknowledges support from SECIHTI under its
+graduate scholarship program.
+[1] S. F. Edwards and P. W. Anderson, Theory of spin
+glasses, J. Phys. F: Met. Phys. 5, 965 (1975).
+[2] J. De Nobel and F. Du Chatenier, Specific heats of dilute
+alloys of manganese in silver and copper at low temper-
+6
+atures and in magnetic fields, Physica 25, 969 (1959).
+[3] J. Zimmerman and F. Hoare, Low-temperature specific
+heat of dilute Cu-Mn alloys, Journal of Physics and
+Chemistry of Solids 17, 52 (1960).
+[4] S. S¨ullow, G. J. Nieuwenhuys, A. A. Menovsky, J. A.
+Mydosh, S. A. M. Mentink, T. E. Mason, and W. J. L.
+Buyers, Spin Glass Behavior in URh 2 Ge 2, Phys. Rev.
+Lett. 78, 354 (1997).
+[5] A. Krimmel, J. Hemberger, M. Nicklas, G. Knebel,
+W. Trinkl,
+M. Brando,
+V. Fritsch,
+A. Loidl, and
+E. Ressouche, Spin-glass behavior in PrAu 2 Si 2, Phys.
+Rev. B 59, R6604 (1999).
+[6] P. Schiffer, A. P. Ramirez, D. A. Huse, P. L. Gammel,
+U. Yaron, D. J. Bishop, and A. J. Valentino, Frustra-
+tion Induced Spin Freezing in a Site-Ordered Magnet:
+Gadolinium Gallium Garnet, Phys. Rev. Lett. 74, 2379
+(1995).
+[7] E. A. Goremychkin, R. Osborn, B. D. Rainford, R. T.
+Macaluso, D. T. Adroja, and M. Koza, Spin-glass or-
+der induced by dynamic frustration, Nature Phys 4, 766
+(2008).
+[8] M. Hadouchi, A. Assani, M. Saadi, Y. Kopelevich, R. R.
+Da Silva, A. Lahmar, H. Bouyanfif, M. El Marssi, and
+L. El Ammari, Unconventional spin-glass-like state in
+AgCo2V3O10, the novel magnetically frustrated mate-
+rial, Journal of Magnetism and Magnetic Materials 491,
+165623 (2019).
+[9] X.-M. Zhang, C.-R. Li, X.-H. Zhang, W.-X. Zhang, and
+X.-M. Chen, Unusual Slow Magnetic Relaxation in He-
+lical Co3 (OH)2 Ferrimagnetic Chain Based Cobalt Hy-
+droxysulfates, Chem. Mater. 20, 2298 (2008).
+[10] B. D. Gaulin, J. N. Reimers, T. E. Mason, J. E. Greedan,
+and Z. Tun, Spin freezing in the geometrically frustrated
+pyrochlore antiferromagnet Tb 2 Mo 2 O 7, Phys. Rev.
+Lett. 69, 3244 (1992).
+[11] N. P. Raju, E. Gmelin, and R. K. Kremer, Magnetic-
+susceptibility and specific-heat studies of spin-glass-like
+ordering in the pyrochlore compounds R 2 Mo 2 O 7 ( R
+=Y, Sm, or Gd), Phys. Rev. B 46, 5405 (1992).
+[12] J. N. Reimers, J. E. Greedan, R. K. Kremer, E. Gmelin,
+and M. A. Subramanian, Short-range magnetic ordering
+in the highly frustrated pyrochlore Y 2 Mn 2 O 7, Phys.
+Rev. B 43, 3387 (1991).
+[13] J. Snyder, J. S. Slusky, R. J. Cava, and P. Schiffer, How
+‘spin ice’ freezes, Nature 413, 48 (2001).
+[14] J. Snyder, B. G. Ueland, J. S. Slusky, H. Karunadasa,
+R. J. Cava, and P. Schiffer, Low-temperature spin freez-
+ing in the Dy 2 Ti 2 O 7 spin ice, Phys. Rev. B 69, 064414
+(2004).
+[15] P. M. Thygesen, J. A. Paddison, R. Zhang, K. A. Beyer,
+K. W. Chapman, H. Y. Playford, M. G. Tucker, D. A.
+Keen, M. A. Hayward, and A. L. Goodwin, Orbital Dimer
+Model for the Spin-Glass State in Y 2 Mo 2 O 7, Phys.
+Rev. Lett. 118, 067201 (2017).
+[16] K. Mitsumoto, C. Hotta, and H. Yoshino, Spin-Orbital
+Glass Transition in a Model of a Frustrated Pyrochlore
+Magnet without Quenched Disorder, Phys. Rev. Lett.
+124, 087201 (2020).
+[17] K. Mitsumoto and H. Yoshino, Replica theory for
+disorder-free spin-lattice glass transition on a treelike
+simplex network, Phys. Rev. B 107, 054412 (2023).
+[18] R. F. Wang, C. Nisoli, R. S. Freitas, J. Li, W. McConville,
+B. J. Cooley, M. S. Lund, N. Samarth, C. Leighton, V. H.
+Crespi, and P. Schiffer, Artificial ‘spin ice’ in a geometri-
+cally frustrated lattice of nanoscale ferromagnetic islands,
+Nature 439, 303 (2006), tex.ids: wang artificial 2006.
+[19] Y. Lao, F. Caravelli, M. Sheikh, J. Sklenar, D. Gardeaza-
+bal, J. D. Watts, A. M. Albrecht, A. Scholl, K. Dahmen,
+C. Nisoli, and P. Schiffer, Classical topological order in
+the kinetics of artificial spin ice, Nature Phys 14, 723
+(2018).
+[20] N. Rougemaille, F. Montaigne, B. Canals, A. Dulu-
+ard, D. Lacour, M. Hehn, R. Belkhou, O. Fruchart,
+S. El Moussaoui, A. Bendounan, and F. Maccherozzi, Ar-
+tificial Kagome Arrays of Nanomagnets: A Frozen Dipo-
+lar Spin Ice, Phys. Rev. Lett. 106, 057209 (2011).
+[21] E. Mengotti, L. J. Heyderman, A. F. Rodr´ıguez, F. Nolt-
+ing, R. V. H¨ugli, and H.-B. Braun, Real-space obser-
+vation of emergent magnetic monopoles and associated
+Dirac strings in artificial kagome spin ice, Nature Phys
+7, 68 (2011), tex.ids: mengotti realspace 2011a.
+[22] M. S. Andersson, S. D. Pappas, H. Stopfel, E. ¨Ostman,
+A. Stein, P. Nordblad, R. Mathieu, B. Hj¨orvarsson, and
+V. Kapaklis, Thermally induced magnetic relaxation in
+square artificial spin ice, Sci Rep 6, 37097 (2016).
+[23] S. A. Morley, D. Alba Venero, J. M. Porro, S. T. Ri-
+ley, A. Stein, P. Steadman, R. L. Stamps, S. Langridge,
+and C. H. Marrows, Vogel-Fulcher-Tammann freezing of
+a thermally fluctuating artificial spin ice probed by x-
+ray photon correlation spectroscopy, Phys. Rev. B 95,
+104422 (2017).
+[24] M. Saccone, F. Caravelli, K. Hofhuis, S. Parchenko,
+Y. A. Birkh¨olzer, S. Dhuey, A. Kleibert, S. Van Dijken,
+C. Nisoli, and A. Farhan, Direct observation of a dynam-
+ical glass transition in a nanomagnetic artificial Hopfield
+network, Nat. Phys. 18, 517 (2022).
+[25] M. Saccone, F. Caravelli, K. Hofhuis, S. Dhuey, A. Scholl,
+C. Nisoli, and A. Farhan, Real-space observation of er-
+godicity transitions in artificial spin ice, Nat Commun
+14, 5674 (2023).
+[26] A. Ortiz-Ambriz, C. Nisoli, C. Reichhardt, C. J. Reich-
+hardt, and P. Tierno, Colloquium : Ice rule and emergent
+frustration in particle ice and beyond, Rev. Mod. Phys.
+91, 041003 (2019).
+[27] A. Ortiz-Ambriz and P. Tierno, Engineering of frustra-
+tion in colloidal artificial ices realized on microfeatured
+grooved lattices, Nat. Commun. 7, 10575 (2016).
+[28] C. Nisoli, Unexpected Phenomenology in Particle-Based
+Ice Absent in Magnetic Spin Ice, Phys. Rev. Lett. 120,
+167205 (2018).
+[29] E. C. O˘guz, A. Ortiz-Ambriz, H. Shem-Tov, E. Babi`a-
+Soler, P. Tierno, and Y. Shokef, Topology Restricts
+Quasidegeneracy in Sheared Square Colloidal Ice, Phys.
+Rev. Lett. 124, 238003 (2020).
+[30] C. Rodr´ıguez-Gallo, A. Ortiz-Ambriz, C. Nisoli, and
+P. Tierno, Geometrical control of topological charge
+transfer in Shakti-Cairo colloidal ice, Commun Phys 6,
+113 (2023).
+[31] A. Lib´al, C. Reichhardt, and C. J. O. Reichhardt, Real-
+izing Colloidal Artificial Ice on Arrays of Optical Traps,
+Phys. Rev. Lett. 97, 228302 (2006).
+[32] F. Martinez-Pedrero, A. Ortiz-Ambriz, I. Pagonabarraga,
+and P. Tierno, Colloidal Microworms Propelling via a
+Cooperative Hydrodynamic Conveyor Belt, Phys. Rev.
+Lett. 115, 138301 (2015).
+[33] M. Ostinato and P. Tierno, Tracking topological defects
+in a plasma state of a quenched colloidal ice, Phys. Rev.
+7
+B 111, 014414 (2025).
+[34] A. Libal, A. del Campo, C. Nisoli, C. Reichhardt, and
+C. J. O. Reichhardt, Quenched Dynamics of Artificial
+Spin Ice: Coarsening versus Kibble-Zurek, Phys. Rev.
+Research 2, 033433 (2020), arXiv: 1908.05328.
+[35] Y. Han, Y. Shokef, A. M. Alsayed, P. Yunker, T. C.
+Lubensky, and A. G. Yodh, Geometric frustration in
+buckled colloidal monolayers, Nature 456, 898 (2008).
+[36] J. Liang, X. Feng, N. Zheng, H. Wang, R. Ni, and
+Z. Zhang, Glass Transition in Monolayers of Rough Col-
+loidal Ellipsoids, Physical Review Letters 134, 038202
+(2025).
+[37] D. Zhou, F. Wang, B. Li, X. Lou, and Y. Han, Glassy
+Spin Dynamics in Geometrically Frustrated Buckled Col-
+loidal Crystals, Physical Review X 7, 021030 (2017).
+[38] A. Del Campo and W. H. Zurek, Universality of phase
+transition dynamics: Topological defects from symmetry
+breaking, Int. J. Mod. Phys. A 29, 1430018 (2014).

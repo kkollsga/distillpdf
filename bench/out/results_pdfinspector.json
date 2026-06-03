@@ -1,8 +1,0 @@
-{
-  "attention_1706.03762": {"ok": true, "t_s": 0.0287, "chars": 40118, "type": "TextBased", "enc_issues": false, "ocr_pages": 0, "layout": "LayoutComplexity { is_complex: true, pages_with_tables: [5, 8, 10, 13], pages_with_columns: [7, 8, 9, 10, 12] }"},
-  "Cold_Email_Hacks": {"ok": true, "t_s": 0.0789, "chars": 49271, "type": "Mixed", "enc_issues": false, "ocr_pages": 1, "layout": "LayoutComplexity { is_complex: true, pages_with_tables: [5, 19], pages_with_columns: [4, 5, 18, 24, 35, 36] }"},
-  "fw9_form": {"ok": true, "t_s": 0.0078, "chars": 38376, "type": "TextBased", "enc_issues": false, "ocr_pages": 0, "layout": "LayoutComplexity { is_complex: true, pages_with_tables: [5], pages_with_columns: [2, 3, 4, 5, 6] }"},
-  "issue-93-romanian": {"ok": true, "t_s": 0.0044, "chars": 10446, "type": "TextBased", "enc_issues": false, "ocr_pages": 0, "layout": "LayoutComplexity { is_complex: false, pages_with_tables: [], pages_with_columns: [] }"},
-  "unicode_professional_demo": {"ok": true, "t_s": 0.0007, "chars": 3482, "type": "TextBased", "enc_issues": true, "ocr_pages": 0, "layout": "LayoutComplexity { is_complex: false, pages_with_tables: [], pages_with_columns: [] }"},
-  "unicode_showcase": {"ok": true, "t_s": 0.0016, "chars": 0, "type": "TextBased", "enc_issues": true, "ocr_pages": 5, "layout": "LayoutComplexity { is_complex: false, pages_with_tables: [], pages_with_columns: [] }"}
-}

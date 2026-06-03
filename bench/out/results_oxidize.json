@@ -1,8 +1,0 @@
-{
-  "attention_1706.03762": {"ok": true, "t_text_s": 0.0119, "t_rag_s": 0.0121, "frags": 2353, "chunks": 50, "tables": 1, "images": 8, "chars": 37999, "sample_frag": "x=124.7 y=710.0 w=16.6 sz=12.0 bold=false font=Some(\"F84\") 'Pro'"},
-  "Cold_Email_Hacks": {"ok": true, "t_text_s": 0.0450, "t_rag_s": 0.0448, "frags": 39029, "chunks": 40, "tables": 0, "images": 8, "chars": 95331, "sample_frag": "x=71.6 y=60.7 w=5.5 sz=10.9 bold=false font=Some(\"F1\") ' '"},
-  "fw9_form": {"ok": true, "t_text_s": 0.0022, "t_rag_s": 0.0031, "frags": 781, "chunks": 40, "tables": 1, "images": 0, "chars": 37460, "sample_frag": "x=36.0 y=738.8 w=60.2 sz=7.0 bold=false font=Some(\"T1_0\") 'Form W-9'"},
-  "issue-93-romanian": {"ok": false, "t_text_s": 0.0000, "t_rag_s": 0.0000, "frags": 0, "chunks": 0, "tables": 0, "images": 0, "chars": 0, "sample_frag": ""},
-  "unicode_professional_demo": {"ok": true, "t_text_s": 0.0005, "t_rag_s": 0.0005, "frags": 76, "chunks": 1, "tables": 1, "images": 0, "chars": 4865, "sample_frag": "x=50.0 y=720.0 w=840.0 sz=28.0 bold=false font=Some(\"Arial\") ' O x i d i z e - P D'"},
-  "unicode_showcase": {"ok": true, "t_text_s": 0.0008, "t_rag_s": 0.0010, "frags": 170, "chunks": 18, "tables": 0, "images": 0, "chars": 11031, "sample_frag": "x=50.0 y=720.0 w=672.0 sz=24.0 bold=false font=Some(\"MainFont\") ' I n t e r n a t i o'"}
-}
