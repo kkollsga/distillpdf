@@ -126,9 +126,10 @@ jobs:
     needs: [check, wheels]
     if: needs.check.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
-    # PyPI Trusted Publishing (OIDC): no secret. id-token: write lets the action mint the
-    # short-lived OIDC token PyPI exchanges for an upload token. If the trusted publisher
-    # on PyPI is configured with an Environment name, add a matching `environment:` here.
+    # PyPI Trusted Publishing (OIDC): no secret. `environment: pypi` must match the
+    # Environment name configured on the PyPI trusted publisher; `id-token: write` lets
+    # the action mint the short-lived OIDC token PyPI exchanges for an upload token.
+    environment: pypi
     permissions:
       id-token: write
     steps:
