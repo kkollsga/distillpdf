@@ -1358,7 +1358,15 @@ fn append_piece(para: &mut String, piece: &str) {
     }
 }
 
-pub fn to_html(doc: &Document, raw: &[u8]) -> String {
+/// `inline_images`: when true, raster images are emitted as inline `<img src=…>`
+/// (base64 data URIs). When false, each is replaced by a lightweight `<image N>`
+/// placeholder (N a 1-based document-wide image counter) — the figure/caption
+/// wrapper and any `#fig-N` anchor are preserved, only the pixel payload is dropped.
+///
+/// `include_toc`: when true, an auto-generated `<nav>` table of contents is prepended
+/// to `<body>`. When false it is omitted — heading `id=` anchors are still assigned
+/// (so `#sec-…` links and `section()` keep working), only the visible TOC is dropped.
+pub fn to_html(doc: &Document, raw: &[u8], inline_images: bool, include_toc: bool) -> String {
     let pages = doc.get_pages();
 
     // Document-wide body font size = most common rounded span size.
@@ -1413,6 +1421,9 @@ pub fn to_html(doc: &Document, raw: &[u8]) -> String {
          <style>\nbody{max-width:48rem;margin:auto;padding:1rem}\n\
          img,svg{max-width:100%;height:auto}\n</style>\n</head>\n<body>\n",
     );
+    // 1-based, document-wide raster-image counter — only consulted to number the
+    // `<image N>` placeholders emitted when `inline_images` is false.
+    let mut img_n = 0usize;
     for (pidx, (pno, _pid, spans)) in page_spans.iter().enumerate() {
         out.push_str(&format!("<section data-page=\"{pno}\" id=\"page-{pno}\">\n"));
         // Anchor targets for this page's named destinations, so the semantic links
@@ -1809,12 +1820,19 @@ pub fn to_html(doc: &Document, raw: &[u8]) -> String {
                 }
                 Item::Img(j) => {
                     flush(&mut run, &mut out);
-                    let uri = &images[*j].uri;
+                    img_n += 1;
+                    // The graphic itself: the real inline image, or a `<image N>`
+                    // placeholder when the caller opened with images=False.
+                    let graphic = if inline_images {
+                        format!("<img src=\"{}\" />", images[*j].uri)
+                    } else {
+                        format!("<image {img_n}>")
+                    };
                     match &img_cap[*j] {
                         Some((num, cap)) => out.push_str(&format!(
-                            "<figure id=\"fig-{num}\"><img src=\"{uri}\" /><figcaption>{cap}</figcaption></figure>"
+                            "<figure id=\"fig-{num}\">{graphic}<figcaption>{cap}</figcaption></figure>"
                         )),
-                        None => out.push_str(&format!("<figure><img src=\"{uri}\" /></figure>")),
+                        None => out.push_str(&format!("<figure>{graphic}</figure>")),
                     }
                 }
                 Item::Svg(j) => {
@@ -1838,7 +1856,7 @@ pub fn to_html(doc: &Document, raw: &[u8]) -> String {
     }
     out.push_str("</body>\n</html>\n");
     let body = dedup_ids(&merge_adjacent_figures(&merge_math_fragments(&merge_fragmented_lists(&merge_adjacent_links(&demote_running_headings(out))))));
-    build_toc(body)
+    build_toc(body, include_toc)
 }
 
 /// The document outline parsed from the auto-TOC: `(level, title, page, anchor-id)`
@@ -1916,7 +1934,7 @@ fn strip_inline(html: &str) -> String {
 /// recorded as `data-level`, not nested sub-lists) keeps the outline queryable and
 /// avoids spurious single-item sub-lists. Runs last — after `dedup_ids` — so the ids
 /// it mints are deduped against the final id set.
-fn build_toc(html: String) -> String {
+fn build_toc(html: String, include_nav: bool) -> String {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     {
         let b = html.as_bytes();
@@ -1984,7 +2002,9 @@ fn build_toc(html: String) -> String {
         i += 1;
     }
     out.push_str(&html[copied..]);
-    if entries.is_empty() {
+    // The heading-id assignment above always runs (anchors/`section()` depend on it);
+    // only the visible `<nav>` is gated. `entries` empty ⇒ nothing to outline.
+    if entries.is_empty() || !include_nav {
         return out;
     }
     // Nested TOC: title (h1) and sections (h2) at the top level; subsections (h3)

@@ -18,7 +18,7 @@ It's built on [`lopdf`](https://github.com/J-F-Liu/lopdf) and shipped to Python 
 wheel — a lightweight, **permissively licensed alternative to AGPL/heavyweight extractors**
 (PyMuPDF, pdfminer, Unstructured), with no system dependencies and no Python runtime deps.
 
-> 🧪 **Early release (`0.0.2`) — testers wanted.** The API is small and may still change.
+> 🧪 **Early release (`0.0.3`) — testers wanted.** The API is small and may still change.
 > If you have PDFs that come out wrong, please
 > [open an issue](https://github.com/kkollsga/distillpdf/issues) with the file (or a
 > description) — real-world documents are exactly what this needs to get better.
@@ -29,7 +29,26 @@ wheel — a lightweight, **permissively licensed alternative to AGPL/heavyweight
 pip install distillpdf
 ```
 
-Prebuilt wheels; no compiler or system libraries required.
+Prebuilt wheels; no compiler or system libraries required. Installing also puts a
+`distillpdf` command on your PATH.
+
+## Command line
+
+Convert a PDF to clean HTML in one command:
+
+```bash
+distillpdf paper.pdf                  # HTML to stdout
+distillpdf paper.pdf -o paper.html    # ...or to a file
+distillpdf *.pdf -o out/              # batch: out/<name>.html per input
+
+distillpdf paper.pdf --no-images      # <image N> placeholders, no base64 bytes
+distillpdf paper.pdf --no-toc         # omit the table-of-contents nav
+distillpdf paper.pdf --text           # plain text instead of HTML
+distillpdf paper.pdf --toc            # print the table of contents
+distillpdf paper.pdf --section abstract
+```
+
+(Also available as `python -m distillpdf`.)
 
 ## Quickstart
 
@@ -44,7 +63,34 @@ toc      = doc.toc()                      # [(level, title, page, anchor_id), ..
 abstract = doc.section("abstract")        # targeted section extraction
 ```
 
-Need the raw pieces instead of HTML?
+Want compact, text-only output? Drop the inline image bytes — each embedded image
+becomes a lightweight `<image N>` placeholder (captions and figure anchors are kept):
+
+```python
+doc = distillpdf.open("paper.pdf", images=False)
+doc.to_html()    # <figure id="fig-1"><image 1><figcaption>…</figcaption></figure>
+```
+
+Pass `toc=False` to skip the auto table-of-contents `<nav>` (heading anchors are still
+emitted, so `#section` links and `doc.section(...)` keep working):
+
+```python
+distillpdf.open("paper.pdf", toc=False).to_html()
+```
+
+### `open()` / `from_bytes()` options
+
+| Option | Default | Effect on `to_html()` |
+|---|---|---|
+| `images=` | `True` | `False` swaps inline base64 images for `<image N>` placeholders (captions + `#fig-N` anchors kept) |
+| `toc=` | `True` | `False` omits the `<nav>` table of contents (heading anchors still emitted) |
+
+Both flags only change `to_html()` output — `toc()`, `section()`, and the raw extractors
+below are unaffected.
+
+### Raw pieces
+
+Need the structured data instead of HTML?
 
 ```python
 doc.extract_tables()   # cell grids (handles multi-level / colspan headers)

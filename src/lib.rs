@@ -22,26 +22,40 @@ struct Pdf {
     doc: Document,
     /// Raw PDF bytes, kept for lenient recovery of malformed streams.
     raw: Vec<u8>,
+    /// Whether `to_html()` inlines raster images as base64 `<img>` data URIs. When
+    /// false, each image becomes a lightweight `<image N>` placeholder instead.
+    inline_images: bool,
+    /// Whether `to_html()` prepends an auto `<nav>` table of contents. When false the
+    /// TOC is omitted (heading anchors are still emitted, so links/`section()` work).
+    include_toc: bool,
 }
 
 #[pymethods]
 impl Pdf {
     /// Open a PDF from a filesystem path.
+    ///
+    /// `images=False` replaces embedded raster images in `to_html()` with a
+    /// `<image N>` placeholder (keeping captions and figure anchors) instead of
+    /// inlining their base64 bytes — handy for compact, text-only LLM input.
+    /// `toc=False` omits the auto table-of-contents `<nav>` from `to_html()` (heading
+    /// anchors are still emitted, so links and `section()` keep working).
     #[staticmethod]
-    fn open(path: &str) -> PyResult<Self> {
+    #[pyo3(signature = (path, images = true, toc = true))]
+    fn open(path: &str, images: bool, toc: bool) -> PyResult<Self> {
         let raw = std::fs::read(path).map_err(|e| PyValueError::new_err(format!("read failed: {e}")))?;
         let doc =
             Document::load_mem(&raw).map_err(|e| PyValueError::new_err(format!("open failed: {e}")))?;
-        Ok(Pdf { doc, raw })
+        Ok(Pdf { doc, raw, inline_images: images, include_toc: toc })
     }
 
-    /// Open a PDF from raw bytes.
+    /// Open a PDF from raw bytes. See `open` for the `images`/`toc` flags.
     #[staticmethod]
-    fn from_bytes(data: &[u8]) -> PyResult<Self> {
+    #[pyo3(signature = (data, images = true, toc = true))]
+    fn from_bytes(data: &[u8], images: bool, toc: bool) -> PyResult<Self> {
         let raw = data.to_vec();
         let doc =
             Document::load_mem(&raw).map_err(|e| PyValueError::new_err(format!("parse failed: {e}")))?;
-        Ok(Pdf { doc, raw })
+        Ok(Pdf { doc, raw, inline_images: images, include_toc: toc })
     }
 
     /// Number of pages.
@@ -108,21 +122,25 @@ impl Pdf {
     /// Convert the PDF to thin, AI-ready HTML (per-page sections, headings,
     /// bold/italic, lists, tables, monospace; inline images added separately).
     fn to_html(&self) -> PyResult<String> {
-        Ok(html::to_html(&self.doc, &self.raw))
+        Ok(html::to_html(&self.doc, &self.raw, self.inline_images, self.include_toc))
     }
 
     /// Document outline: a list of `(level, title, page, anchor_id)` per heading, in
     /// reading order. `level` 1 is the title, 2 a section, 3 a subsection, … . The
     /// `anchor_id` matches an `id=` in `to_html()` (link with `#anchor_id`).
     fn toc(&self) -> PyResult<Vec<(u8, String, u32, String)>> {
-        Ok(html::toc(&html::to_html(&self.doc, &self.raw)))
+        // Force the TOC nav on regardless of `include_toc` — `html::toc` parses the
+        // outline back out of that <nav>, so it must be present here even when the
+        // user opted out of it in `to_html()`.
+        Ok(html::toc(&html::to_html(&self.doc, &self.raw, self.inline_images, true)))
     }
 
     /// HTML of a single section: the heading matching `name` (its `sec-…` slug, an id
     /// prefix, or a case-insensitive title substring) plus its content up to the next
     /// same-or-higher heading. E.g. `section("abstract")`. None if no match.
     fn section(&self, name: &str) -> PyResult<Option<String>> {
-        Ok(html::section(&html::to_html(&self.doc, &self.raw), name))
+        // `html::section` resolves via the TOC nav, so build with it present.
+        Ok(html::section(&html::to_html(&self.doc, &self.raw, self.inline_images, true), name))
     }
 
     /// Diagnostic: force our ToUnicode extractor for all pages (eval only).
@@ -184,17 +202,21 @@ impl Pdf {
 }
 
 /// Open a PDF from a filesystem path — `distillpdf.open("file.pdf")`. A module-level
-/// shorthand for `Pdf.open(...)`.
+/// shorthand for `Pdf.open(...)`. Pass `images=False` to emit `<image N>` placeholders
+/// instead of inline base64 images, and `toc=False` to omit the table-of-contents nav,
+/// in `to_html()`.
 #[pyfunction]
-fn open(path: &str) -> PyResult<Pdf> {
-    Pdf::open(path)
+#[pyo3(signature = (path, images = true, toc = true))]
+fn open(path: &str, images: bool, toc: bool) -> PyResult<Pdf> {
+    Pdf::open(path, images, toc)
 }
 
 /// Open a PDF from raw bytes — `distillpdf.from_bytes(data)`. Shorthand for
-/// `Pdf.from_bytes(...)`.
+/// `Pdf.from_bytes(...)`. See `open` for the `images`/`toc` flags.
 #[pyfunction]
-fn from_bytes(data: &[u8]) -> PyResult<Pdf> {
-    Pdf::from_bytes(data)
+#[pyo3(signature = (data, images = true, toc = true))]
+fn from_bytes(data: &[u8], images: bool, toc: bool) -> PyResult<Pdf> {
+    Pdf::from_bytes(data, images, toc)
 }
 
 #[pymodule]
