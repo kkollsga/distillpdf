@@ -165,6 +165,29 @@ fn decode_smask(doc: &Document, dict: &Dictionary) -> Option<image::GrayImage> {
     image::GrayImage::from_raw(w, h, raw[..total].to_vec())
 }
 
+/// Cheap (no-decode) test that an image XObject is a format we can render — used in
+/// placeholder mode so a `<image N>` stands in only for an image that inline mode would
+/// actually emit. Mirrors `data_uri`'s format gate without decoding pixels (so it can
+/// slightly over-count the rare SMask content-free overlay that inline mode drops).
+fn decodable(doc: &Document, id: ObjectId) -> bool {
+    let stream = match doc.get_object(id).ok().and_then(|o| o.as_stream().ok()) {
+        Some(s) => s,
+        None => return false,
+    };
+    let dict = &stream.dict;
+    let filters = filters_of(dict);
+    if filters.iter().any(|f| f == b"JPXDecode" || f == b"CCITTFaxDecode" || f == b"JBIG2Decode") {
+        return false;
+    }
+    if filters.iter().any(|f| f == b"DCTDecode") {
+        return true; // JPEG: always renderable
+    }
+    let w = dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0);
+    let h = dict.get(b"Height").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0);
+    let bpc = dict.get(b"BitsPerComponent").ok().and_then(|o| o.as_i64().ok()).unwrap_or(8);
+    w > 0 && h > 0 && bpc == 8
+}
+
 /// Build a base64 data URI for an image stream, or None if unsupported.
 ///
 /// Images with a soft mask (`/SMask`) are alpha-composited so transparency is
@@ -205,19 +228,37 @@ fn data_uri(doc: &Document, id: ObjectId) -> Option<String> {
         }
         None => None,
     };
+    // Composite over raw buffers (base RGB → RGBA + mask alpha) instead of per-pixel
+    // get_pixel/put_pixel, which bounds-check every access. Linear indexing over the
+    // contiguous samples is markedly faster on the large rasters this path handles.
     let mut max_a = 0u8;
     let (mut cmin, mut cmax) = ([255u8; 3], [0u8; 3]);
-    for (x, y, px) in rgba.enumerate_pixels_mut() {
-        let c = base.get_pixel(x, y).0;
-        let a = mask_ref.map(|m| m.get_pixel(x, y).0[0]).unwrap_or(255);
-        max_a = max_a.max(a);
+    let base_raw: &[u8] = &base;
+    let mask_raw: Option<&[u8]> = mask_ref.map(|m| -> &[u8] { m });
+    let out_raw: &mut [u8] = &mut rgba;
+    let n = (w as usize) * (h as usize);
+    for i in 0..n {
+        let (cr, cg, cb) = (base_raw[i * 3], base_raw[i * 3 + 1], base_raw[i * 3 + 2]);
+        let a = mask_raw.map(|m| m[i]).unwrap_or(255);
+        if a > max_a {
+            max_a = a;
+        }
         if a > 0 {
+            let c = [cr, cg, cb];
             for k in 0..3 {
-                cmin[k] = cmin[k].min(c[k]);
-                cmax[k] = cmax[k].max(c[k]);
+                if c[k] < cmin[k] {
+                    cmin[k] = c[k];
+                }
+                if c[k] > cmax[k] {
+                    cmax[k] = c[k];
+                }
             }
         }
-        *px = image::Rgba([c[0], c[1], c[2], a]);
+        let o = i * 4;
+        out_raw[o] = cr;
+        out_raw[o + 1] = cg;
+        out_raw[o + 2] = cb;
+        out_raw[o + 3] = a;
     }
     // Drop content-free overlays rather than emit them:
     //   * fully faint (max alpha < 40) — an invisible anti-alias / shadow layer;
@@ -254,7 +295,11 @@ const MIN_DIM: f32 = 24.0;
 /// Positioned images on a page, top-to-bottom. Recurses into Form XObjects
 /// (which carry their own content + resources + /Matrix). Tiny tiles are
 /// filtered out (see [`MIN_DIM`]).
-pub fn positioned_images(doc: &Document, page_id: ObjectId) -> Vec<Placed> {
+///
+/// `want_uris`: when false (placeholder mode), the image is located but NOT decoded
+/// or base64-encoded — `uri` is left empty. Decoding/encoding the raster is by far the
+/// dominant cost on image-heavy PDFs, so this makes `images=False` near-free.
+pub fn positioned_images(doc: &Document, page_id: ObjectId, want_uris: bool) -> Vec<Placed> {
     let resources = match page_resources(doc, page_id) {
         Some(r) => r,
         None => return Vec::new(),
@@ -266,7 +311,7 @@ pub fn positioned_images(doc: &Document, page_id: ObjectId) -> Vec<Placed> {
     let xmap = xobjects_of(doc, &resources);
     let mut out = Vec::new();
     let mut cache: HashMap<ObjectId, Option<String>> = HashMap::new();
-    walk(doc, &content.operations, &xmap, M::ID, &mut out, &mut cache, 0);
+    walk(doc, &content.operations, &xmap, M::ID, &mut out, &mut cache, 0, want_uris);
     out
 }
 
@@ -279,6 +324,7 @@ fn walk(
     out: &mut Vec<Placed>,
     cache: &mut HashMap<ObjectId, Option<String>>,
     depth: u32,
+    want_uris: bool,
 ) {
     if depth > 8 {
         return;
@@ -326,9 +372,18 @@ fn walk(
                     if w < MIN_DIM || h < MIN_DIM {
                         continue; // diagram tile / rule / icon — not a figure
                     }
-                    let uri = cache.entry(id).or_insert_with(|| data_uri(doc, id)).clone();
-                    if let Some(u) = uri {
-                        out.push(Placed { y_top: y1, y_bottom: y0, uri: u });
+                    if want_uris {
+                        let uri = cache.entry(id).or_insert_with(|| data_uri(doc, id)).clone();
+                        if let Some(u) = uri {
+                            out.push(Placed { y_top: y1, y_bottom: y0, uri: u });
+                        }
+                    } else {
+                        // Placeholder mode: keep the (decodable) image's slot without
+                        // paying to decode/encode it. Skip formats we can't render at all
+                        // so a `<image N>` placeholder only stands in for a real figure.
+                        if decodable(doc, id) {
+                            out.push(Placed { y_top: y1, y_bottom: y0, uri: String::new() });
+                        }
                     }
                 } else if subtype == b"Form" {
                     // Form: descend with its /Matrix and own resources.
@@ -355,7 +410,7 @@ fn walk(
                         }
                     }
                     if let Ok(content) = lopdf::content::Content::decode(&stream.decompressed_content().unwrap_or_default()) {
-                        walk(doc, &content.operations, &child, form_ctm, out, cache, depth + 1);
+                        walk(doc, &content.operations, &child, form_ctm, out, cache, depth + 1, want_uris);
                     }
                 }
             }

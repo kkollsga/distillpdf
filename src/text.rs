@@ -983,10 +983,6 @@ fn dedup_coincident(spans: &mut Vec<Span>) {
 /// form-internal text (page-level text is handled by `extract_spans`), in page
 /// user space — so this is purely additive and leaves the main pipeline alone.
 pub(crate) fn form_text_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span> {
-    let content = match doc.get_and_decode_page_content(page_id) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
     let resources = match doc.get_page_resources(page_id) {
         Ok((Some(d), _)) => d.clone(),
         Ok((None, ids)) => match ids.first().and_then(|id| doc.get_dictionary(*id).ok()).cloned() {
@@ -995,8 +991,26 @@ pub(crate) fn form_text_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> 
         },
         Err(_) => return Vec::new(),
     };
-    let fonts = build_fonts(doc, page_id, raw);
     let xmap = xobjects_of(doc, &resources);
+    // `decode_text_ctm` only emits spans INSIDE a Form XObject (depth ≥ 1). If the page
+    // references no form, there is nothing to collect — skip the page-content decode,
+    // font build, and op walk entirely (a large saving on form-free pages).
+    let has_form = xmap.values().any(|&id| {
+        doc.get_object(id)
+            .ok()
+            .and_then(|o| o.as_stream().ok())
+            .and_then(|s| s.dict.get(b"Subtype").ok())
+            .and_then(|o| o.as_name().ok())
+            == Some(b"Form")
+    });
+    if !has_form {
+        return Vec::new();
+    }
+    let content = match doc.get_and_decode_page_content(page_id) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let fonts = build_fonts(doc, page_id, raw);
     let mut out = Vec::new();
     decode_text_ctm(doc, &content.operations, &fonts, &xmap, Mat::ID, raw, 0, &mut out);
     out

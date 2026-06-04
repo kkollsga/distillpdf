@@ -41,6 +41,7 @@ distillpdf paper.pdf                  # HTML to stdout
 distillpdf paper.pdf -o paper.html    # ...or to a file
 distillpdf *.pdf -o out/              # batch: out/<name>.html per input
 
+distillpdf paper.pdf --mode page      # page-first HTML (default is section-first)
 distillpdf paper.pdf --no-images      # <image N> placeholders, no base64 bytes
 distillpdf paper.pdf --no-toc         # omit the table-of-contents nav
 distillpdf paper.pdf --text           # plain text instead of HTML
@@ -63,6 +64,26 @@ toc      = doc.toc()                      # [(level, title, page, anchor_id), ..
 abstract = doc.section("abstract")        # targeted section extraction
 ```
 
+### Output modes
+
+By default, **logical sections are first-order**: every heading becomes its own nested
+`<section id="sec-…">`, so you can pull a whole section as one block (great for RAG / LLM
+chunking), and page numbers are dropped.
+
+```python
+distillpdf.open("paper.pdf").to_html()
+# <section id="sec-abstract"><h2>Abstract</h2><p>…</p></section>
+
+distillpdf.open("paper.pdf").section("methods")   # → the <section id="sec-methods"> block
+```
+
+Pass `mode="page"` for the page-faithful structure instead — each page wrapped in
+`<section data-page="N" id="page-N">`, with page numbers in the TOC:
+
+```python
+distillpdf.open("paper.pdf", mode="page").to_html()
+```
+
 Want compact, text-only output? Drop the inline image bytes — each embedded image
 becomes a lightweight `<image N>` placeholder (captions and figure anchors are kept):
 
@@ -82,8 +103,9 @@ distillpdf.open("paper.pdf", toc=False).to_html()
 
 | Option | Default | Effect on `to_html()` |
 |---|---|---|
+| `mode=` | `"section"` | `"page"` wraps each page in `<section data-page="N">` and numbers TOC entries; the default groups content into nested `<section id="sec-…">` and drops page info |
 | `images=` | `True` | `False` swaps inline base64 images for `<image N>` placeholders (captions + `#fig-N` anchors kept) |
-| `toc=` | `True` | `False` omits the `<nav>` table of contents (heading anchors still emitted) |
+| `toc=` | `True` | `False` omits the `<nav>` table of contents (section/heading anchors still emitted) |
 
 Both flags only change `to_html()` output — `toc()`, `section()`, and the raw extractors
 below are unaffected.

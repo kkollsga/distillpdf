@@ -10,6 +10,7 @@ use crate::links;
 use crate::text::{self, Span};
 use crate::vector;
 use lopdf::{Document, ObjectId};
+use rayon::prelude::*;
 
 /// A link's rectangle (PDF user space) plus its resolved href, for hit-testing
 /// text spans during HTML emission. Internal links point at `#page-N`.
@@ -1358,30 +1359,61 @@ fn append_piece(para: &mut String, piece: &str) {
     }
 }
 
+/// Output structure for `to_html`.
+///
+/// - `Page` — pages are first-order: each page's content is wrapped in
+///   `<section data-page="N" id="page-N">` and the TOC carries a page per heading.
+/// - `Section` — logical sections are first-order: every heading opens its own nested
+///   `<section id="sec-…">` wrapper (id on the wrapper, inner heading/paragraphs bare),
+///   page identity is dropped, and the TOC has no page numbers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Page,
+    Section,
+}
+
+/// `mode`: see [`Mode`] — `Page` keeps per-page `<section data-page>` wrappers; `Section`
+/// regroups content into nested `<section id="sec-…">` blocks and drops page info.
+///
 /// `inline_images`: when true, raster images are emitted as inline `<img src=…>`
 /// (base64 data URIs). When false, each is replaced by a lightweight `<image N>`
 /// placeholder (N a 1-based document-wide image counter) — the figure/caption
 /// wrapper and any `#fig-N` anchor are preserved, only the pixel payload is dropped.
 ///
 /// `include_toc`: when true, an auto-generated `<nav>` table of contents is prepended
-/// to `<body>`. When false it is omitted — heading `id=` anchors are still assigned
-/// (so `#sec-…` links and `section()` keep working), only the visible TOC is dropped.
-pub fn to_html(doc: &Document, raw: &[u8], inline_images: bool, include_toc: bool) -> String {
+/// to `<body>`. When false it is omitted — heading/section `id=` anchors are still
+/// assigned (so `#sec-…` links and `section()` keep working), only the visible TOC drops.
+pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, include_toc: bool) -> String {
+    // Optional coarse phase profiler: set DPDF_PROFILE=1 to print per-phase WALL time to
+    // stderr. `prof_phase(label, ||…)` times a closure; zero cost when unset.
+    let prof = std::env::var_os("DPDF_PROFILE").is_some();
+    let prof_start = if prof { Some(std::time::Instant::now()) } else { None };
+    let phase = |label: &str, t: std::time::Instant| {
+        if prof {
+            eprintln!("  {label:<16} {:8.1}ms", t.elapsed().as_secs_f64() * 1e3);
+        }
+    };
+
     let pages = doc.get_pages();
 
-    // Document-wide body font size = most common rounded span size.
+    // Document-wide body font size = most common rounded span size. Spans are extracted
+    // per page in PARALLEL (each page is independent and read-only on the document); the
+    // histogram is folded sequentially afterwards (cheap).
+    let t = std::time::Instant::now();
+    let mut page_spans: Vec<(u32, ObjectId, Vec<Span>)> = pages
+        .par_iter()
+        .map(|(&pno, &pid)| (pno, pid, text::extract_spans(doc, pid, raw)))
+        .collect();
+    page_spans.sort_by_key(|(pno, _, _)| *pno);
+    phase("01_spans", t);
     let mut hist: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
-    let mut page_spans: Vec<(u32, ObjectId, Vec<Span>)> = Vec::new();
-    for (&pno, &pid) in &pages {
-        let spans = text::extract_spans(doc, pid, raw);
-        for s in &spans {
+    for (_, _, spans) in &page_spans {
+        for s in spans {
             if s.angle.abs() < 0.01 {
                 *hist.entry(s.size.round() as i32).or_insert(0) += 1; // body size ignores rotated labels
             }
         }
-        page_spans.push((pno, pid, spans));
     }
-    page_spans.sort_by_key(|(pno, _, _)| *pno);
     let body = hist.iter().max_by_key(|(_, c)| **c).map(|(s, _)| *s as f32).unwrap_or(10.0);
     // The document title is the largest text on the FIRST page; reserve <h1> for it.
     // (Scoped to page 1 — a large figure label or display equation on a later page
@@ -1414,18 +1446,26 @@ pub fn to_html(doc: &Document, raw: &[u8], inline_images: bool, include_toc: boo
         dests_by_page.entry(d.page).or_default().push((slug(&d.name), d.y));
     }
 
-    // Lean stylesheet: a centered reading column + images/figures that never overflow
-    // it. Deliberately minimal (no per-element slop) — the HTML is consumed by LLMs.
-    let mut out = String::from(
-        "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
-         <style>\nbody{max-width:48rem;margin:auto;padding:1rem}\n\
-         img,svg{max-width:100%;height:auto}\n</style>\n</head>\n<body>\n",
-    );
-    // 1-based, document-wide raster-image counter — only consulted to number the
-    // `<image N>` placeholders emitted when `inline_images` is false.
-    let mut img_n = 0usize;
-    for (pidx, (pno, _pid, spans)) in page_spans.iter().enumerate() {
-        out.push_str(&format!("<section data-page=\"{pno}\" id=\"page-{pno}\">\n"));
+    // Render every page IN PARALLEL into its own (html_fragment, image_uris). Each page
+    // is independent and reads the document immutably; image data URIs are deferred as
+    // page-LOCAL `\0<idx>\0` sentinels (so the string passes never touch the base64) and
+    // remapped to global indices during the sequential merge below.
+    let t = std::time::Instant::now();
+    let renders: Vec<(String, Vec<String>)> = page_spans
+        .par_iter()
+        .enumerate()
+        .map(|(pidx, (pno, _pid, spans))| {
+        let pno = pno;
+        let mut out = String::new();
+        // Per-page deferred inline-image data URIs (placeholder mode stores empty strings
+        // to keep the index aligned for `<image N>` numbering). The leading `\0<idx>\0`
+        // sentinel is rewritten to a global index at merge time.
+        let mut img_uris: Vec<String> = Vec::new();
+        // Page mode wraps each page in its own <section>; section mode emits the page's
+        // content bare into the stream and regroups it by heading afterwards.
+        if mode == Mode::Page {
+            out.push_str(&format!("<section data-page=\"{pno}\" id=\"page-{pno}\">\n"));
+        }
         // Anchor targets for this page's named destinations, so the semantic links
         // (#cite.x / #figure.n / #equation.n / #section.x) resolve. Empty <a id> at
         // the section head land the reader on the correct page + the exact target id.
@@ -1571,7 +1611,7 @@ pub fn to_html(doc: &Document, raw: &[u8], inline_images: bool, include_toc: boo
             Svg(usize), // vector figure transcoded to inline SVG
             Cap(usize), // standalone caption (e.g. a vector figure with no raster)
         }
-        let images = img::positioned_images(doc, *_pid);
+        let mut images = img::positioned_images(doc, *_pid, inline_images);
         // Vector figures (diagrams/plots drawn as paths). A figure's AREA is the
         // detected vector-ink cluster; we drop any that overlap a detected table
         // (tables own their region) so table rules aren't re-emitted as a figure.
@@ -1820,13 +1860,18 @@ pub fn to_html(doc: &Document, raw: &[u8], inline_images: bool, include_toc: boo
                 }
                 Item::Img(j) => {
                     flush(&mut run, &mut out);
-                    img_n += 1;
-                    // The graphic itself: the real inline image, or a `<image N>`
-                    // placeholder when the caller opened with images=False.
+                    // Both the inline data URI (often megabytes) and the `<image N>`
+                    // number are DEFERRED behind a tiny page-local `\0<idx>\0` sentinel:
+                    // the string post-processing passes never re-scan the payload, and the
+                    // global index/number is resolved once at the very end (after the
+                    // sequential merge fixes up page offsets). See substitute_images.
+                    let idx = img_uris.len();
                     let graphic = if inline_images {
-                        format!("<img src=\"{}\" />", images[*j].uri)
+                        img_uris.push(std::mem::take(&mut images[*j].uri));
+                        format!("<img src=\"\u{0}{idx}\u{0}\" />")
                     } else {
-                        format!("<image {img_n}>")
+                        img_uris.push(String::new()); // keep the index aligned for numbering
+                        format!("<image \u{0}{idx}\u{0}>")
                     };
                     match &img_cap[*j] {
                         Some((num, cap)) => out.push_str(&format!(
@@ -1852,11 +1897,46 @@ pub fn to_html(doc: &Document, raw: &[u8], inline_images: bool, include_toc: boo
             }
         }
         flush(&mut run, &mut out);
-        out.push_str("\n</section>\n");
+        if mode == Mode::Page {
+            out.push_str("\n</section>\n");
+        }
+        (out, img_uris)
+        })
+        .collect();
+    phase("02_render", t);
+
+    // Sequential merge (page order): concatenate the per-page fragments, rewriting each
+    // page's local `\0<idx>\0` image sentinels to global indices, and concatenating the
+    // per-page URI lists into one global list.
+    let t = std::time::Instant::now();
+    let mut out = String::from(
+        "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
+         <style>\nbody{max-width:48rem;margin:auto;padding:1rem}\n\
+         img,svg{max-width:100%;height:auto}\n</style>\n</head>\n<body>\n",
+    );
+    let mut img_uris: Vec<String> = Vec::new();
+    for (frag, uris) in renders {
+        append_with_img_offset(&mut out, &frag, img_uris.len());
+        img_uris.extend(uris);
     }
     out.push_str("</body>\n</html>\n");
+    phase("03_merge", t);
+
+    let t = std::time::Instant::now();
     let body = dedup_ids(&merge_adjacent_figures(&merge_math_fragments(&merge_fragmented_lists(&merge_adjacent_links(&demote_running_headings(out))))));
-    build_toc(body, include_toc)
+    // Page mode: id + TOC on headings, keyed by page. Section mode: regroup content into
+    // nested <section id="sec-…"> wrappers with a pageless TOC.
+    let result = match mode {
+        Mode::Page => build_toc(body, include_toc),
+        Mode::Section => build_sections(body, include_toc),
+    };
+    // Splice the deferred image URIs / `<image N>` numbers into their sentinels.
+    let result = substitute_images(result, &img_uris, inline_images);
+    phase("04_assemble", t);
+    if let Some(t0) = prof_start {
+        eprintln!("[DPDF_PROFILE] {} pages, total {:.1}ms", page_spans.len(), t0.elapsed().as_secs_f64() * 1e3);
+    }
+    result
 }
 
 /// The document outline parsed from the auto-TOC: `(level, title, page, anchor-id)`
@@ -1886,10 +1966,13 @@ pub fn toc(html: &str) -> Vec<(u8, String, u32, String)> {
     out
 }
 
-/// The HTML of one section: the heading whose id (or title) matches `name`, plus all
-/// content up to the next heading of the same or higher level. `name` matches the
-/// `sec-…` slug, an id prefix, or a case-insensitive title substring (so `section
-/// ("abstract")` works). Returns None if no heading matches.
+/// The HTML of one section. `name` matches the `sec-…` slug, an id prefix, or a
+/// case-insensitive title substring (so `section("abstract")` works); None if no match.
+///
+/// In **section mode** the id sits on a `<section>` wrapper, so the whole balanced
+/// `<section>…</section>` element (including any nested subsections) is returned. In
+/// **page mode** the id sits on the heading, so the heading plus content up to the next
+/// same-or-higher heading is returned.
 pub fn section(html: &str, name: &str) -> Option<String> {
     let entries = toc(html);
     let nl = name.to_lowercase();
@@ -1900,9 +1983,15 @@ pub fn section(html: &str, name: &str) -> Option<String> {
     let idx = entries
         .iter()
         .position(|(_, t, _, i)| *i == want || i.starts_with(&want) || t.to_lowercase().contains(&nl))?;
+    let id = &entries[idx].3;
+    // Section mode: the id is on a <section> wrapper — return that balanced element.
+    if let Some(open) = html.find(&format!("<section id=\"{id}\">")) {
+        return Some(balanced_section(html, open));
+    }
+    // Page mode: the id is on the heading — slice to the next same-or-higher heading.
     let level = entries[idx].0;
     let start = {
-        let p = html.find(&format!("id=\"{}\"", entries[idx].3))?;
+        let p = html.find(&format!("id=\"{id}\""))?;
         html[..p].rfind("<h")?
     };
     let end = entries[idx + 1..]
@@ -1911,6 +2000,29 @@ pub fn section(html: &str, name: &str) -> Option<String> {
         .and_then(|(_, _, _, nid)| html.find(&format!("id=\"{nid}\"")).map(|p| html[..p].rfind("<h").unwrap_or(p)))
         .unwrap_or_else(|| html.find("</body>").unwrap_or(html.len()));
     Some(html[start..end].trim().to_string())
+}
+
+/// From the byte offset of a `<section …>` open tag, return the full balanced
+/// `<section>…</section>` element, accounting for nested sections.
+fn balanced_section(html: &str, open: usize) -> String {
+    let b = html.as_bytes();
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < b.len() {
+        if b[i..].starts_with(b"<section") {
+            depth += 1;
+            i += "<section".len();
+        } else if b[i..].starts_with(b"</section>") {
+            depth -= 1;
+            i += "</section>".len();
+            if depth == 0 {
+                return html[open..i].trim().to_string();
+            }
+        } else {
+            i += 1;
+        }
+    }
+    html[open..].trim().to_string()
 }
 
 /// Plain text of a fragment of inline HTML (drop tags, unescape the basic entities).
@@ -2012,15 +2124,27 @@ fn build_toc(html: String, include_nav: bool) -> String {
     // outline). A `<ul>` (the outline order is positional, not enumerated). Each
     // <li> keeps data-level/data-page so the toc()/section() API still reads the
     // true heading level and page.
+    insert_nav(out, &build_nav(&entries, true))
+}
+
+/// Build the `<nav><ul>…</ul></nav>` outline from heading entries. Title (level 1) and
+/// sections (level 2) sit at the top level; subsections (level 3) nest under their
+/// section; deeper levels are omitted. Each `<li>` carries `data-level` (and `data-page`
+/// when `with_pages`) so the `toc()`/`section()` API still reads the true level/page.
+fn build_nav(entries: &[(u8, String, u32, String)], with_pages: bool) -> String {
     let mut nav = String::from("<nav><ul>");
     let mut li_open = false; // a top-level <li> awaiting its </li>
     let mut sub_open = false; // a nested <ul> (h3 children) is open
-    for (level, label, pg, id) in &entries {
+    for (level, label, pg, id) in entries {
         if *level > 3 {
             continue;
         }
         let a = format!("<a href=\"#{id}\">{}</a>", esc(label));
-        let li = format!("<li data-level=\"{level}\" data-page=\"{pg}\">{a}");
+        let li = if with_pages {
+            format!("<li data-level=\"{level}\" data-page=\"{pg}\">{a}")
+        } else {
+            format!("<li data-level=\"{level}\">{a}")
+        };
         if *level <= 2 {
             if sub_open {
                 nav.push_str("</ul>");
@@ -2052,17 +2176,182 @@ fn build_toc(html: String, include_nav: bool) -> String {
         nav.push_str("</li>");
     }
     nav.push_str("</ul></nav>\n");
-    match out.find("<body>\n") {
+    nav
+}
+
+/// Generic single pass over `\0<idx>\0` sentinels: each is replaced by `repl(idx)`'s
+/// output (the closure pushes directly into the buffer). Non-sentinel text is copied
+/// verbatim. NUL never occurs in real text/base64, so the markers are unambiguous.
+fn rewrite_sentinels(html: &str, extra: usize, mut repl: impl FnMut(usize, &mut String)) -> String {
+    let b = html.as_bytes();
+    let mut out = String::with_capacity(html.len() + extra);
+    let mut i = 0;
+    let mut last = 0;
+    while i < b.len() {
+        if b[i] == 0 {
+            let start = i;
+            let mut j = i + 1;
+            let mut idx = 0usize;
+            let mut any = false;
+            while j < b.len() && b[j].is_ascii_digit() {
+                idx = idx * 10 + (b[j] - b'0') as usize;
+                j += 1;
+                any = true;
+            }
+            if any && j < b.len() && b[j] == 0 {
+                out.push_str(&html[last..start]);
+                repl(idx, &mut out);
+                i = j + 1;
+                last = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&html[last..]);
+    out
+}
+
+/// Append one page's fragment to `out`, shifting its page-local `\0<idx>\0` image
+/// sentinels by `offset` so they index into the document-wide URI list built at merge.
+fn append_with_img_offset(out: &mut String, frag: &str, offset: usize) {
+    if offset == 0 || !frag.as_bytes().contains(&0) {
+        out.push_str(frag); // first page (local==global), or no image sentinels to shift
+        return;
+    }
+    out.push_str(&rewrite_sentinels(frag, frag.len() / 8, |idx, o| {
+        o.push('\u{0}');
+        o.push_str(&(idx + offset).to_string());
+        o.push('\u{0}');
+    }));
+}
+
+/// Resolve the deferred image sentinels: inline mode splices the base64 data URI back
+/// in; placeholder mode replaces the sentinel with the 1-based `<image N>` number.
+fn substitute_images(html: String, uris: &[String], inline: bool) -> String {
+    if uris.is_empty() {
+        return html;
+    }
+    let extra: usize = uris.iter().map(|u| u.len()).sum::<usize>().max(uris.len() * 4);
+    rewrite_sentinels(&html, extra, |idx, o| {
+        if inline {
+            if let Some(u) = uris.get(idx) {
+                o.push_str(u);
+            }
+        } else {
+            o.push_str(&(idx + 1).to_string());
+        }
+    })
+}
+
+/// Insert a `<nav>` block immediately after `<body>\n` (a no-op if there is no body tag).
+fn insert_nav(html: String, nav: &str) -> String {
+    match html.find("<body>\n") {
         Some(p) => {
             let at = p + "<body>\n".len();
-            let mut res = String::with_capacity(out.len() + nav.len());
-            res.push_str(&out[..at]);
-            res.push_str(&nav);
-            res.push_str(&out[at..]);
+            let mut res = String::with_capacity(html.len() + nav.len());
+            res.push_str(&html[..at]);
+            res.push_str(nav);
+            res.push_str(&html[at..]);
             res
         }
-        None => out,
+        None => html,
     }
+}
+
+/// Section-mode assembly: regroup the flat content stream into nested `<section
+/// id="sec-…">` wrappers — one per heading, with HTML-outline nesting (a heading at
+/// level L closes every open section of level ≥ L, then opens a new one). The `sec-…`
+/// id lives on the `<section>` wrapper; the inner `<hN>` is left bare. Optionally
+/// prepends a pageless `<nav>` outline. Page identity is not used here at all.
+fn build_sections(html: String, include_nav: bool) -> String {
+    // Existing ids (figures/tables/named-destination anchors) — section ids dedupe
+    // against them so a `sec-…` slug can never collide with one already in the document.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    {
+        let b = html.as_bytes();
+        let mut i = 0;
+        while i + 4 < b.len() {
+            if b[i..].starts_with(b"id=\"") {
+                let s = i + 4;
+                let mut e = s;
+                while e < b.len() && b[e] != b'"' {
+                    e += 1;
+                }
+                seen.insert(html[s..e].to_string());
+                i = e;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    // Walk the body, emitting `<section>` open/close around heading-delimited runs.
+    let b = html.as_bytes();
+    let mut out = String::with_capacity(html.len() + 512);
+    let mut entries: Vec<(u8, String, u32, String)> = Vec::new(); // level, label, 0, id
+    let mut open: Vec<u8> = Vec::new(); // stack of open section levels
+    let mut i = 0usize;
+    let mut copied = 0usize;
+    let body_start = html.find("<body>\n").map(|p| p + "<body>\n".len()).unwrap_or(0);
+    while i < b.len() {
+        // A heading open tag `<hL>` (L in 1..=6). Only headings within <body> matter.
+        if i >= body_start
+            && b[i] == b'<'
+            && i + 3 < b.len()
+            && b[i + 1] == b'h'
+            && (b'1'..=b'6').contains(&b[i + 2])
+            && b[i + 3] == b'>'
+        {
+            let level = b[i + 2] - b'0';
+            let close = format!("</h{level}>");
+            if let Some(rel) = html[i..].find(&close) {
+                let inner = &html[i + 4..i + rel];
+                let label = strip_inline(inner);
+                let label = label.trim();
+                if !label.is_empty() {
+                    // Flush content up to this heading, then close deeper/sibling sections.
+                    out.push_str(&html[copied..i]);
+                    while open.last().map_or(false, |&l| l >= level) {
+                        out.push_str("</section>");
+                        open.pop();
+                    }
+                    let base = {
+                        let s = format!("sec-{}", slug(&label.to_lowercase()));
+                        s.trim_matches('-').to_string()
+                    };
+                    let mut id = base.clone();
+                    let mut k = 2;
+                    while seen.contains(&id) {
+                        id = format!("{base}-{k}");
+                        k += 1;
+                    }
+                    seen.insert(id.clone());
+                    entries.push((level, label.to_string(), 0, id.clone()));
+                    out.push_str(&format!("<section id=\"{id}\">"));
+                    open.push(level);
+                    copied = i; // the bare heading itself is copied with the next run
+                    i += rel + close.len();
+                    continue;
+                }
+            }
+        }
+        // Close all open sections right before </body> so nothing leaks outside the body.
+        if b[i..].starts_with(b"</body>") {
+            out.push_str(&html[copied..i]);
+            while open.pop().is_some() {
+                out.push_str("</section>");
+            }
+            copied = i;
+            i += "</body>".len();
+            continue;
+        }
+        i += 1;
+    }
+    out.push_str(&html[copied..]);
+    if entries.is_empty() || !include_nav {
+        return out;
+    }
+    insert_nav(out, &build_nav(&entries, false))
 }
 
 /// Merge a graphic-only `<figure>` immediately adjacent to a caption-only `<figure>`

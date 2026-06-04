@@ -45,9 +45,12 @@ _HTML_CACHE = {}
 
 
 def html_for(path):
+    # These structural checks encode the PAGE-mode contract (one <section> per page,
+    # #page-N anchors, per-page reading order), so they pin mode="page" explicitly.
+    # Section-mode output is validated separately in test_section_mode.py.
     if path not in _HTML_CACHE:
         import distillpdf
-        _HTML_CACHE[path] = distillpdf.Pdf.open(path).to_html()
+        _HTML_CACHE[path] = distillpdf.Pdf.open(path, mode="page").to_html()
     return _HTML_CACHE[path]
 
 

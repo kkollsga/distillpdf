@@ -3,6 +3,7 @@
     distillpdf paper.pdf                  # HTML to stdout
     distillpdf paper.pdf -o paper.html    # HTML to a file
     distillpdf *.pdf -o out/              # batch: out/<name>.html per input
+    distillpdf paper.pdf --mode page      # page-first HTML (default is section-first)
     distillpdf paper.pdf --no-images      # <image N> placeholders, no base64
     distillpdf paper.pdf --no-toc         # omit the table-of-contents nav
     distillpdf paper.pdf --text           # plain text instead of HTML
@@ -19,8 +20,11 @@ from . import __version__, open as _open
 def _render(doc, args):
     """The chosen output for one opened document, as a string."""
     if args.toc:
+        # Section mode carries no page numbers (page == 0); show just the anchor there.
+        def loc(page, anchor):
+            return f"#{anchor}" if page == 0 else f"p{page}, #{anchor}"
         return "\n".join(
-            f"{'  ' * (lvl - 1)}{title}  (p{page}, #{anchor})"
+            f"{'  ' * (lvl - 1)}{title}  ({loc(page, anchor)})"
             for lvl, title, page, anchor in doc.toc()
         )
     if args.section is not None:
@@ -59,6 +63,10 @@ def main(argv=None):
         "default: stdout for one PDF, <name>.html beside each for many",
     )
     p.add_argument(
+        "--mode", choices=("section", "page"), default="section",
+        help="HTML structure: section-first (default) or page-first",
+    )
+    p.add_argument(
         "--no-images", dest="images", action="store_false",
         help="replace embedded images with <image N> placeholders (no base64)",
     )
@@ -76,7 +84,7 @@ def main(argv=None):
     rc = 0
     for src in args.pdf:
         try:
-            doc = _open(src, images=args.images, toc=args.include_toc)
+            doc = _open(src, mode=args.mode, images=args.images, toc=args.include_toc)
             content = _render(doc, args)
         except SystemExit:
             raise

@@ -43,7 +43,19 @@ def test_text_mode(capsys):
 def test_toc_mode(capsys):
     cli.main([HEADINGS, "--toc"])
     out = capsys.readouterr().out
-    assert "#sec-" in out and "(p1" in out
+    assert "#sec-" in out  # section mode (default): anchors, no page numbers
+
+
+def test_toc_mode_page(capsys):
+    cli.main([HEADINGS, "--toc", "--mode", "page"])
+    out = capsys.readouterr().out
+    assert "#sec-" in out and "p1" in out  # page mode carries page numbers
+
+
+def test_mode_page_restores_data_page(capsys):
+    cli.main([HEADINGS, "--mode", "page"])
+    out = capsys.readouterr().out
+    assert "data-page" in out and 'id="page-' in out
 
 
 def test_output_file(tmp_path, capsys):
