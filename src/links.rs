@@ -42,6 +42,37 @@ fn pdf_string(o: &Object) -> Option<String> {
     }
 }
 
+/// A single PDFDocEncoding high byte (0x80–0xFF) → char. This is the encoding PDF text
+/// strings use when they are not UTF-16BE (PDF spec Annex D.2). NOTE it is NOT cp1252:
+/// e.g. 0x85 is EN DASH here (ellipsis in cp1252), 0x84 EM DASH, 0x8D/0x8E curly double
+/// quotes. ASCII (<0x80) and Latin-1 (0xA1–0xFF) map to the same code point; 0xA0 = €.
+fn pdfdoc_char(c: u8) -> char {
+    match c {
+        0x80 => '\u{2022}', 0x81 => '\u{2020}', 0x82 => '\u{2021}', 0x83 => '\u{2026}',
+        0x84 => '\u{2014}', 0x85 => '\u{2013}', 0x86 => '\u{0192}', 0x87 => '\u{2044}',
+        0x88 => '\u{2039}', 0x89 => '\u{203A}', 0x8A => '\u{2212}', 0x8B => '\u{2030}',
+        0x8C => '\u{201E}', 0x8D => '\u{201C}', 0x8E => '\u{201D}', 0x8F => '\u{2018}',
+        0x90 => '\u{2019}', 0x91 => '\u{201A}', 0x92 => '\u{2122}', 0x93 => '\u{FB01}',
+        0x94 => '\u{FB02}', 0x95 => '\u{0141}', 0x96 => '\u{0152}', 0x97 => '\u{0160}',
+        0x98 => '\u{0178}', 0x99 => '\u{017D}', 0x9A => '\u{0131}', 0x9B => '\u{0142}',
+        0x9C => '\u{0153}', 0x9D => '\u{0161}', 0x9E => '\u{017E}', 0x9F => '\u{FFFD}',
+        0xA0 => '\u{20AC}',
+        _ => c as char, // ASCII (<0x80) and Latin-1 (0xA1–0xFF) map to the same code point
+    }
+}
+
+/// Decode a PDF text string (outline titles, etc.): UTF-16BE when it carries a BE BOM,
+/// otherwise PDFDocEncoding. `from_utf8_lossy` mangles both — UTF-16 (NUL bytes) and the
+/// PDFDocEncoding high range — so titles need this.
+fn decode_pdf_text(b: &[u8]) -> String {
+    if b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF {
+        let u16s: Vec<u16> = b[2..].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        String::from_utf16_lossy(&u16s)
+    } else {
+        b.iter().map(|&c| pdfdoc_char(c)).collect()
+    }
+}
+
 /// Resolve a destination value (explicit `[pageRef /XYZ …]` array, or a dict with
 /// a `/D` array) to a 1-indexed page number plus the target y (top) when present.
 /// `/XYZ left top zoom` → top is element 3; `/FitH top` / `/FitBH top` → element 2.
@@ -191,6 +222,107 @@ pub fn named_destinations(doc: &Document) -> Vec<NamedDest> {
         }
     }
     out
+}
+
+/// One entry of the PDF's own table of contents (the `/Outlines` bookmark tree).
+pub struct OutlineEntry {
+    pub level: u8, // 0-based nesting depth (top level = 0)
+    pub title: String,
+    pub page: u32, // 1-indexed target page; 0 if the destination didn't resolve
+}
+
+/// The PDF's author-supplied table of contents, read from the catalog `/Outlines`
+/// tree (titles + GoTo destinations), in reading order with nesting depth. Empty when
+/// the document has no outline. This is the document's OWN TOC — distinct from the one
+/// distillPDF synthesises from detected headings.
+pub fn outline(doc: &Document) -> Vec<OutlineEntry> {
+    let pages = doc.get_pages();
+    let page_no: HashMap<ObjectId, u32> = pages.iter().map(|(&n, &id)| (id, n)).collect();
+    let named = collect_named(doc, &page_no);
+    let cat = match doc.catalog() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let root = match cat.get(b"Outlines").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    let first = match root.get(b"First").ok().and_then(|o| o.as_reference().ok()) {
+        Some(r) => r,
+        None => return Vec::new(), // present but empty
+    };
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    walk_outline(doc, first, &page_no, &named, 0, &mut seen, &mut out);
+    out
+}
+
+/// Resolve an outline item's destination (`/Dest` array/name, or `/A` GoTo `/D`) to a
+/// page + optional y. Named destinations fall back to the names map (page only).
+fn outline_dest(doc: &Document, item: &Dictionary, page_no: &HashMap<ObjectId, u32>, named: &HashMap<Vec<u8>, u32>) -> (u32, Option<f32>) {
+    let resolve = |d: &Object| -> Option<(u32, Option<f32>)> {
+        match deref(doc, d)? {
+            Object::Array(_) => dest_to_pos(doc, d, page_no),
+            Object::Name(n) | Object::String(n, _) => named.get(n).map(|&p| (p, None)),
+            _ => None,
+        }
+    };
+    if let Ok(dest) = item.get(b"Dest") {
+        if let Some(r) = resolve(dest) {
+            return r;
+        }
+    }
+    if let Some(a) = item.get(b"A").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
+        if a.get(b"S").and_then(|o| o.as_name()).ok() == Some(&b"GoTo"[..]) {
+            if let Ok(d) = a.get(b"D") {
+                if let Some(r) = resolve(d) {
+                    return r;
+                }
+            }
+        }
+    }
+    (0, None)
+}
+
+/// Walk a sibling chain (`/Next`), recursing into children (`/First`). A visited set
+/// guards against cyclic `/Next` links in malformed outlines; depth is capped.
+fn walk_outline(
+    doc: &Document,
+    node: ObjectId,
+    page_no: &HashMap<ObjectId, u32>,
+    named: &HashMap<Vec<u8>, u32>,
+    depth: u8,
+    seen: &mut std::collections::HashSet<ObjectId>,
+    out: &mut Vec<OutlineEntry>,
+) {
+    if depth > 8 {
+        return;
+    }
+    let mut cur = node;
+    loop {
+        if !seen.insert(cur) {
+            break; // cycle
+        }
+        let item = match doc.get_dictionary(cur) {
+            Ok(d) => d.clone(),
+            Err(_) => break,
+        };
+        let title = match item.get(b"Title").ok() {
+            Some(Object::String(b, _)) => decode_pdf_text(b),
+            _ => String::new(),
+        };
+        let (page, _y) = outline_dest(doc, &item, page_no, named);
+        if !title.trim().is_empty() {
+            out.push(OutlineEntry { level: depth, title: title.trim().to_string(), page });
+        }
+        if let Some(first) = item.get(b"First").ok().and_then(|o| o.as_reference().ok()) {
+            walk_outline(doc, first, page_no, named, depth + 1, seen, out);
+        }
+        match item.get(b"Next").ok().and_then(|o| o.as_reference().ok()) {
+            Some(next) => cur = next,
+            None => break,
+        }
+    }
 }
 
 /// Extract every Link annotation across the document.

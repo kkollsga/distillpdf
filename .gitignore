@@ -13,3 +13,6 @@ __pycache__/
 benchmarking/
 # macOS
 .DS_Store
+
+# Local working notes (not shared)
+CLAUDE.md

@@ -323,7 +323,12 @@ fn finish(cur: &mut Vec<Seg>, fill: Option<[u8; 3]>, stroke: Option<([u8; 3], f3
             y1 = y1.max(y);
         }
     }
-    if x1 >= x0 {
+    // Drop paths whose extent is implausibly large. A real figure element never exceeds
+    // page size (~800 pt); a span of thousands+ means a coordinate was left in the wrong
+    // space (page coords leaking into a figure-local frame, a mis-applied matrix), which
+    // otherwise draws a line shooting off the figure or collapses its viewBox.
+    const MAX_EXTENT: f32 = 2000.0;
+    if x1 >= x0 && (x1 - x0).max(y1 - y0) <= MAX_EXTENT {
         out.push(Painted { segs: std::mem::take(cur), fill, stroke, fill_op, stroke_op, x0, y0, x1, y1, seq: 0 });
     } else {
         cur.clear();
@@ -612,9 +617,11 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
     let y0 = cluster.iter().map(|p| p.y0).fold(f32::INFINITY, f32::min);
     let y1 = cluster.iter().map(|p| p.y1).fold(f32::NEG_INFINITY, f32::max);
     let (w, h) = (x1 - x0, y1 - y0);
-    // page space (y up) -> local SVG space (y down): lx = x-x0, ly = y1-y.
-    let tx = |x: f32| fmt(x - x0);
-    let ty = |y: f32| fmt(y1 - y);
+    // page space (y up) -> local SVG space (y down): lx = x-x0, ly = y1-y. A stray point
+    // (one coordinate left in the wrong space, surviving the per-path extent gate) is
+    // clamped to within one figure-extent of the box, so it can never draw a huge line.
+    let tx = |x: f32| fmt((x - x0).clamp(-w, 2.0 * w));
+    let ty = |y: f32| fmt((y1 - y).clamp(-h, 2.0 * h));
 
     let mut paths = String::new();
     for p in cluster {

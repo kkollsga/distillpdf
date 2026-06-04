@@ -194,6 +194,21 @@ impl Pdf {
         Ok(py.allow_threads(|| html::toc(&html::to_html(&self.doc, &self.raw, mode, false, true))))
     }
 
+    /// The PDF's OWN table of contents — the author-supplied `/Outlines` bookmarks —
+    /// as `(level, title, page, anchor)` tuples in reading order. `level` is 1-based
+    /// nesting depth; `page` is the 1-indexed target page (0 if unresolved); `anchor` is
+    /// the `#page-N` fragment `to_html(mode="page")` exposes. Empty list when the PDF has
+    /// no outline. This is distinct from `toc()`, which is built from detected headings;
+    /// when an outline is present, `to_html()` also uses it for the rendered `<nav>`.
+    fn outline(&self, py: Python<'_>) -> PyResult<Vec<(u8, String, u32, String)>> {
+        Ok(py.allow_threads(|| {
+            links::outline(&self.doc)
+                .into_iter()
+                .map(|e| ((e.level + 1).min(255), e.title, e.page, format!("page-{}", e.page)))
+                .collect()
+        }))
+    }
+
     /// HTML of a single section: the heading matching `name` (its `sec-…` slug, an id
     /// prefix, or a case-insensitive title substring) plus its content up to the next
     /// same-or-higher heading. E.g. `section("abstract")`. None if no match. `mode` and

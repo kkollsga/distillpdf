@@ -278,19 +278,33 @@ fn png_bytes(img: image::DynamicImage) -> Option<Vec<u8>> {
     Some(out.into_inner())
 }
 
-/// A raster image placed on the page: its top edge (for reading-order placement)
-/// and data URI. (Width/height are used to filter tiny tiles at detection time but
-/// not retained — the rendered `<img>` is sized by CSS, not intrinsic dimensions.)
+/// A raster image placed on the page: its top edge (for reading-order placement) and
+/// data URI. A merged grid carries the union bbox's top/bottom and one stitched image.
 pub struct Placed {
     pub y_top: f32,
     pub y_bottom: f32,
     pub uri: String,
 }
 
+/// One placed image XObject before clustering: its object id, placed bbox (page points),
+/// and source pixel WIDTH (for the stitch resolution). Collected by `walk`, then grouped
+/// by `finalize`.
+struct RawTile {
+    id: ObjectId,
+    x0: f32,
+    x1: f32,
+    y0: f32,
+    y1: f32,
+    pw: u32,
+}
+
 /// Images smaller than this (rendered, points) are diagram tiles / rules /
 /// icons rather than figures — dropped so they don't flood the output with
 /// hundreds of fragments (a single figure is often a mosaic of tiny tiles).
 const MIN_DIM: f32 = 24.0;
+
+/// Minimum tiles in a cluster for it to be treated as a mergeable image grid.
+const MIN_GRID_TILES: usize = 4;
 
 /// Positioned images on a page, top-to-bottom. Recurses into Form XObjects
 /// (which carry their own content + resources + /Matrix). Tiny tiles are
@@ -309,22 +323,18 @@ pub fn positioned_images(doc: &Document, page_id: ObjectId, want_uris: bool) -> 
         Err(_) => return Vec::new(),
     };
     let xmap = xobjects_of(doc, &resources);
-    let mut out = Vec::new();
-    let mut cache: HashMap<ObjectId, Option<String>> = HashMap::new();
-    walk(doc, &content.operations, &xmap, M::ID, &mut out, &mut cache, 0, want_uris);
-    out
+    let mut raws: Vec<RawTile> = Vec::new();
+    walk(doc, &content.operations, &xmap, M::ID, &mut raws, 0);
+    finalize(doc, raws, want_uris)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn walk(
     doc: &Document,
     ops: &[lopdf::content::Operation],
     xmap: &HashMap<Vec<u8>, ObjectId>,
     base: M,
-    out: &mut Vec<Placed>,
-    cache: &mut HashMap<ObjectId, Option<String>>,
+    out: &mut Vec<RawTile>,
     depth: u32,
-    want_uris: bool,
 ) {
     if depth > 8 {
         return;
@@ -372,19 +382,10 @@ fn walk(
                     if w < MIN_DIM || h < MIN_DIM {
                         continue; // diagram tile / rule / icon — not a figure
                     }
-                    if want_uris {
-                        let uri = cache.entry(id).or_insert_with(|| data_uri(doc, id)).clone();
-                        if let Some(u) = uri {
-                            out.push(Placed { y_top: y1, y_bottom: y0, uri: u });
-                        }
-                    } else {
-                        // Placeholder mode: keep the (decodable) image's slot without
-                        // paying to decode/encode it. Skip formats we can't render at all
-                        // so a `<image N>` placeholder only stands in for a real figure.
-                        if decodable(doc, id) {
-                            out.push(Placed { y_top: y1, y_bottom: y0, uri: String::new() });
-                        }
-                    }
+                    // Record geometry + pixel dims; uri building / grid stitching happens
+                    // in finalize() once the whole page's tiles are known.
+                    let pw = stream.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0) as u32;
+                    out.push(RawTile { id, x0, x1, y0, y1, pw });
                 } else if subtype == b"Form" {
                     // Form: descend with its /Matrix and own resources.
                     let fm = stream
@@ -410,11 +411,196 @@ fn walk(
                         }
                     }
                     if let Ok(content) = lopdf::content::Content::decode(&stream.decompressed_content().unwrap_or_default()) {
-                        walk(doc, &content.operations, &child, form_ctm, out, cache, depth + 1, want_uris);
+                        walk(doc, &content.operations, &child, form_ctm, out, depth + 1);
                     }
                 }
             }
             _ => {}
         }
     }
+}
+
+/// Turn a page's raw tiles into placed images: detect mergeable image GRIDS (clusters
+/// of ≥4 spatially-adjacent tiles spanning ≥2 columns and ≥2 rows — maps/diagrams that
+/// authoring software exports as a tile mosaic) and stitch each into ONE image; every
+/// other image is emitted on its own. In placeholder mode (`!want_uris`) the same
+/// grouping applies with no pixel decode — a grid becomes one empty-uri slot.
+fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool) -> Vec<Placed> {
+    let mut out = Vec::new();
+    for g in cluster(&raws) {
+        let tiles: Vec<&RawTile> = g.iter().map(|&i| &raws[i]).collect();
+        let (x0, x1, y0, y1) = union_bbox(&tiles);
+        if tiles.len() >= MIN_GRID_TILES && is_grid(&tiles) {
+            if want_uris {
+                if let Some(uri) = stitch_grid(doc, &tiles, (x0, x1, y0, y1)) {
+                    out.push(Placed { y_top: y1, y_bottom: y0, uri });
+                    continue;
+                }
+                // stitch failed → fall through to per-tile emission
+            } else {
+                if tiles.iter().any(|t| decodable(doc, t.id)) {
+                    out.push(Placed { y_top: y1, y_bottom: y0, uri: String::new() });
+                }
+                continue;
+            }
+        }
+        // Not a grid (or stitch failed): emit each tile individually (prior behaviour).
+        for t in tiles {
+            if want_uris {
+                if let Some(uri) = data_uri(doc, t.id) {
+                    out.push(Placed { y_top: t.y1, y_bottom: t.y0, uri });
+                }
+            } else if decodable(doc, t.id) {
+                out.push(Placed { y_top: t.y1, y_bottom: t.y0, uri: String::new() });
+            }
+        }
+    }
+    out
+}
+
+/// Union-find grouping of tiles whose placed bounding boxes touch/overlap (within a
+/// small tolerance). Returns index groups; isolated images form singleton groups.
+fn cluster(tiles: &[RawTile]) -> Vec<Vec<usize>> {
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    const TOL: f32 = 2.0;
+    let n = tiles.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let (a, b) = (&tiles[i], &tiles[j]);
+            let xover = a.x0 < b.x1 + TOL && b.x0 < a.x1 + TOL;
+            let yover = a.y0 < b.y1 + TOL && b.y0 < a.y1 + TOL;
+            if xover && yover {
+                let (ra, rb) = (find(&mut parent, i), find(&mut parent, j));
+                if ra != rb {
+                    parent[ra] = rb;
+                }
+            }
+        }
+    }
+    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        groups.entry(r).or_default().push(i);
+    }
+    groups.into_values().collect()
+}
+
+fn union_bbox(tiles: &[&RawTile]) -> (f32, f32, f32, f32) {
+    let (mut x0, mut x1, mut y0, mut y1) = (f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY);
+    for t in tiles {
+        x0 = x0.min(t.x0);
+        x1 = x1.max(t.x1);
+        y0 = y0.min(t.y0);
+        y1 = y1.max(t.y1);
+    }
+    (x0, x1, y0, y1)
+}
+
+/// Count distinct cluster positions: sorted centers separated by more than `gap` start a
+/// new column/row. Used to require a real 2-D grid (≥2 columns AND ≥2 rows).
+fn distinct_positions(mut centers: Vec<f32>, gap: f32) -> usize {
+    centers.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut n = 0;
+    let mut last = f32::NEG_INFINITY;
+    for c in centers {
+        if c - last > gap.max(1.0) {
+            n += 1;
+            last = c;
+        }
+    }
+    n
+}
+
+/// A cluster is a mergeable grid when its tiles lay out in ≥2 columns and ≥2 rows (a
+/// single row/column stack is left as separate panels — it may be independent images).
+fn is_grid(tiles: &[&RawTile]) -> bool {
+    let mut ws: Vec<f32> = tiles.iter().map(|t| t.x1 - t.x0).collect();
+    let mut hs: Vec<f32> = tiles.iter().map(|t| t.y1 - t.y0).collect();
+    ws.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    hs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let (mw, mh) = (ws[ws.len() / 2], hs[hs.len() / 2]);
+    let cols = distinct_positions(tiles.iter().map(|t| (t.x0 + t.x1) * 0.5).collect(), mw * 0.5);
+    let rows = distinct_positions(tiles.iter().map(|t| (t.y0 + t.y1) * 0.5).collect(), mh * 0.5);
+    cols >= 2 && rows >= 2
+}
+
+/// Decode an image XObject to RGBA, compositing its soft mask (`/SMask`) into the alpha
+/// channel when present. Used by the grid stitcher.
+fn decode_rgba(doc: &Document, id: ObjectId) -> Option<image::RgbaImage> {
+    let base = decode_rgb(doc, id)?;
+    let (w, h) = (base.width(), base.height());
+    let dict = doc.get_object(id).ok()?.as_stream().ok()?.dict.clone();
+    match decode_smask(doc, &dict) {
+        Some(mask) => {
+            let resized;
+            let m = if mask.width() == w && mask.height() == h {
+                &mask
+            } else {
+                resized = image::imageops::resize(&mask, w, h, image::imageops::FilterType::Triangle);
+                &resized
+            };
+            let mut out = image::RgbaImage::new(w, h);
+            let base_raw: &[u8] = base.as_raw();
+            let m_raw: &[u8] = m.as_raw();
+            let o: &mut [u8] = &mut out;
+            for i in 0..(w as usize * h as usize) {
+                o[i * 4] = base_raw[i * 3];
+                o[i * 4 + 1] = base_raw[i * 3 + 1];
+                o[i * 4 + 2] = base_raw[i * 3 + 2];
+                o[i * 4 + 3] = m_raw[i];
+            }
+            Some(out)
+        }
+        None => Some(image::DynamicImage::ImageRgb8(base).to_rgba8()),
+    }
+}
+
+/// Composite a tile grid into a single PNG data URI. Each tile is decoded, resized to its
+/// placed size (in canvas pixels), and pasted at its grid position (PDF y-up → image
+/// y-down). Resolution = the tiles' median pixels-per-point. None if nothing decodes.
+fn stitch_grid(doc: &Document, tiles: &[&RawTile], bbox: (f32, f32, f32, f32)) -> Option<String> {
+    let (x0, x1, y0, y1) = bbox;
+    let (pw, ph) = (x1 - x0, y1 - y0);
+    if pw <= 0.0 || ph <= 0.0 {
+        return None;
+    }
+    let mut dpis: Vec<f32> = tiles
+        .iter()
+        .filter(|t| t.x1 - t.x0 > 0.1 && t.pw > 0)
+        .map(|t| t.pw as f32 / (t.x1 - t.x0))
+        .collect();
+    if dpis.is_empty() {
+        return None;
+    }
+    dpis.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let scale = dpis[dpis.len() / 2].clamp(0.5, 20.0);
+    let cw = ((pw * scale).round() as u32).clamp(1, 5000);
+    let ch = ((ph * scale).round() as u32).clamp(1, 5000);
+    let mut canvas = image::RgbaImage::new(cw, ch);
+    let mut placed_any = false;
+    for t in tiles {
+        let tile = match decode_rgba(doc, t.id) {
+            Some(im) => im,
+            None => continue,
+        };
+        let tw = (((t.x1 - t.x0) * scale).round() as u32).max(1);
+        let th = (((t.y1 - t.y0) * scale).round() as u32).max(1);
+        let resized = image::imageops::resize(&tile, tw, th, image::imageops::FilterType::Triangle);
+        let ox = ((t.x0 - x0) * scale).round() as i64;
+        let oy = ((y1 - t.y1) * scale).round() as i64; // top edge → canvas top
+        image::imageops::overlay(&mut canvas, &resized, ox, oy);
+        placed_any = true;
+    }
+    if !placed_any {
+        return None;
+    }
+    let png = png_bytes(image::DynamicImage::ImageRgba8(canvas))?;
+    Some(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&png)))
 }

@@ -1934,6 +1934,20 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
         Mode::Page => build_toc(body, include_toc),
         Mode::Section => build_sections(body, include_toc),
     };
+    // Prefer the PDF's OWN table of contents (the `/Outlines` bookmarks) for the nav when
+    // the document supplies one — it is the author's clean TOC, vs. our heading-detected
+    // approximation. Only the visible `<nav>` is swapped; heading/section anchors are
+    // unchanged (the outline links to them).
+    let result = if include_toc {
+        let ol = links::outline(doc);
+        if ol.is_empty() {
+            result
+        } else {
+            nav_from_outline(result, &ol, mode)
+        }
+    } else {
+        result
+    };
     // Splice the deferred image URIs / `<image N>` numbers into their sentinels.
     let result = substitute_images(result, &img_uris, inline_images);
     phase("04_assemble", t);
@@ -2143,7 +2157,13 @@ fn build_nav(entries: &[(u8, String, u32, String)], with_pages: bool) -> String 
         if *level > 3 {
             continue;
         }
-        let a = format!("<a href=\"#{id}\">{}</a>", esc(label));
+        // An empty id (an outline entry with no matching heading) renders as plain text
+        // rather than a dead `#` link.
+        let a = if id.is_empty() {
+            esc(label)
+        } else {
+            format!("<a href=\"#{id}\">{}</a>", esc(label))
+        };
         let li = if with_pages {
             format!("<li data-level=\"{level}\" data-page=\"{pg}\">{a}")
         } else {
@@ -2246,6 +2266,54 @@ fn substitute_images(html: String, uris: &[String], inline: bool) -> String {
             o.push_str(&(idx + 1).to_string());
         }
     })
+}
+
+/// Whitespace/punctuation-insensitive title key (lowercased alphanumerics only). Lets a
+/// PDF bookmark title match the detected heading even when the bookmark has cosmetic
+/// defects (missing spaces, smart quotes) — the structure comes from the outline, the
+/// clean title + working anchor from the matched heading.
+fn title_key(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+}
+
+/// Replace the generated `<nav>` with one built from the PDF's own outline (bookmarks).
+/// The outline supplies the TRUE TOC structure; each entry is matched to a detected
+/// heading (exact normalized title, else the heading title being a prefix of the
+/// bookmark's — handles a bookmark like "…on and around…" vs a heading wrapped to "…on")
+/// so it links to that heading's real `#sec-…` anchor. Unmatched entries appear as plain
+/// text (no dead link). No `#page-N` is used, so this works the same in both modes and
+/// doesn't re-introduce page identity. A no-op if there's no `<nav>` to replace.
+fn nav_from_outline(html: String, entries: &[links::OutlineEntry], _mode: Mode) -> String {
+    let detected = toc(&html);
+    let keyed: Vec<(String, String)> = detected.iter().map(|(_l, t, _p, id)| (title_key(t), id.clone())).collect();
+    let nav_entries: Vec<(u8, String, u32, String)> = entries
+        .iter()
+        .map(|e| {
+            let level = (e.level + 1).min(6);
+            let ek = title_key(&e.title);
+            // exact match first, then a heading key that is a (≥8-char) prefix of the
+            // bookmark key — a heading whose title wrapped and got truncated.
+            let id = keyed
+                .iter()
+                .find(|(k, _)| *k == ek)
+                .or_else(|| keyed.iter().find(|(k, _)| k.len() >= 8 && ek.starts_with(k.as_str())))
+                .map(|(_, id)| id.clone())
+                .unwrap_or_default();
+            (level, e.title.clone(), e.page, id)
+        })
+        .collect();
+    let nav = build_nav(&nav_entries, true); // outline entries always carry a page
+    match (html.find("<nav>"), html.find("</nav>")) {
+        (Some(a), Some(b)) if b > a => {
+            let end = b + "</nav>".len();
+            let mut out = String::with_capacity(html.len() + nav.len());
+            out.push_str(&html[..a]);
+            out.push_str(nav.trim_end_matches('\n'));
+            out.push_str(&html[end..]);
+            out
+        }
+        _ => html,
+    }
 }
 
 /// Insert a `<nav>` block immediately after `<body>\n` (a no-op if there is no body tag).
