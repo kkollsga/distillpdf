@@ -36,26 +36,14 @@ struct Pdf {
     /// Source path (`open`); `None` when constructed from bytes. Used by `export_html`
     /// to derive the default `<source>.html` output name.
     source: Option<std::path::PathBuf>,
-    /// Default `to_html()` output structure: section-first or page-first. Overridable
-    /// per call.
-    mode: html::Mode,
-    /// Default for inlining raster images as base64 `<img>` data URIs (else `<image N>`
-    /// placeholders). Overridable per call.
-    inline_images: bool,
-    /// Default for prepending the auto `<nav>` table of contents. Overridable per call.
-    include_toc: bool,
 }
 
 impl Pdf {
-    /// Resolve the rendering options (per-call override else the open-time default) and
-    /// render the HTML with the GIL released.
-    fn render(&self, py: Python<'_>, mode: Option<&str>, images: Option<bool>, toc: Option<bool>) -> PyResult<String> {
-        let mode = match mode {
-            Some(s) => parse_mode(s)?,
-            None => self.mode,
-        };
-        let images = images.unwrap_or(self.inline_images);
-        let toc = toc.unwrap_or(self.include_toc);
+    /// Render the HTML with the GIL released. Rendering options live on the render
+    /// methods (not `open`), since `open` only parses the container — the heavy
+    /// extraction happens here.
+    fn render(&self, py: Python<'_>, mode: &str, images: bool, toc: bool) -> PyResult<String> {
+        let mode = parse_mode(mode)?;
         Ok(py.allow_threads(|| html::to_html(&self.doc, &self.raw, mode, images, toc)))
     }
 
@@ -85,35 +73,24 @@ impl Pdf {
 
 #[pymethods]
 impl Pdf {
-    /// Open a PDF from a filesystem path.
-    ///
-    /// `mode` chooses the `to_html()` structure: `"section"` (default) makes logical
-    /// sections first-order — each heading becomes a nested `<section id="sec-…">` and
-    /// page info is dropped; `"page"` wraps each page in `<section data-page>`.
-    /// `images=False` replaces embedded raster images in `to_html()` with a
-    /// `<image N>` placeholder (keeping captions and figure anchors) instead of
-    /// inlining their base64 bytes — handy for compact, text-only LLM input.
-    /// `toc=False` omits the auto table-of-contents `<nav>` from `to_html()` (heading
-    /// anchors are still emitted, so links and `section()` keep working).
+    /// Open a PDF from a filesystem path. This only loads and parses the PDF container;
+    /// the actual extraction/render happens in `to_html()` / `export_html()`, which is
+    /// where the rendering options (`mode`/`images`/`toc`) live.
     #[staticmethod]
-    #[pyo3(signature = (path, mode = "section", images = true, toc = true))]
-    fn open(path: &str, mode: &str, images: bool, toc: bool) -> PyResult<Self> {
-        let mode = parse_mode(mode)?;
+    fn open(path: &str) -> PyResult<Self> {
         let raw = std::fs::read(path).map_err(|e| PyValueError::new_err(format!("read failed: {e}")))?;
         let doc =
             Document::load_mem(&raw).map_err(|e| PyValueError::new_err(format!("open failed: {e}")))?;
-        Ok(Pdf { doc, raw, source: Some(std::path::PathBuf::from(path)), mode, inline_images: images, include_toc: toc })
+        Ok(Pdf { doc, raw, source: Some(std::path::PathBuf::from(path)) })
     }
 
-    /// Open a PDF from raw bytes. See `open` for the `mode`/`images`/`toc` flags.
+    /// Open a PDF from raw bytes (no source path, so `export_html` needs an explicit path).
     #[staticmethod]
-    #[pyo3(signature = (data, mode = "section", images = true, toc = true))]
-    fn from_bytes(data: &[u8], mode: &str, images: bool, toc: bool) -> PyResult<Self> {
-        let mode = parse_mode(mode)?;
+    fn from_bytes(data: &[u8]) -> PyResult<Self> {
         let raw = data.to_vec();
         let doc =
             Document::load_mem(&raw).map_err(|e| PyValueError::new_err(format!("parse failed: {e}")))?;
-        Ok(Pdf { doc, raw, source: None, mode, inline_images: images, include_toc: toc })
+        Ok(Pdf { doc, raw, source: None })
     }
 
     /// Number of pages.
@@ -179,14 +156,14 @@ impl Pdf {
 
     /// Convert the PDF to thin, AI-ready HTML and return it as a string.
     ///
-    /// `mode` (`"section"`/`"page"`), `images`, and `toc` override the values set at
-    /// `open()` for this call only; omit them to use the open-time defaults. To write the
-    /// result straight to a file, use `export_html()` (same options).
+    /// `mode` (`"section"` default / `"page"`) chooses the structure; `images=False`
+    /// emits `<image N>` placeholders instead of inline base64; `toc=False` drops the
+    /// `<nav>` table of contents. To write straight to a file, use `export_html()`.
     ///
     /// The conversion (which internally renders pages in parallel) runs with the GIL
     /// released, so converting many PDFs across Python threads scales across cores.
-    #[pyo3(signature = (mode=None, images=None, toc=None))]
-    fn to_html(&self, py: Python<'_>, mode: Option<&str>, images: Option<bool>, toc: Option<bool>) -> PyResult<String> {
+    #[pyo3(signature = (mode="section", images=true, toc=true))]
+    fn to_html(&self, py: Python<'_>, mode: &str, images: bool, toc: bool) -> PyResult<String> {
         self.render(py, mode, images, toc)
     }
 
@@ -197,8 +174,8 @@ impl Pdf {
     /// `<source-stem>.html` inside it; otherwise `path` is used verbatim. `mode`/`images`/
     /// `toc` work exactly as in `to_html()`. A bytes-constructed `Pdf` (no source path)
     /// requires an explicit `path`.
-    #[pyo3(signature = (path=None, mode=None, images=None, toc=None))]
-    fn export_html(&self, py: Python<'_>, path: Option<&str>, mode: Option<&str>, images: Option<bool>, toc: Option<bool>) -> PyResult<String> {
+    #[pyo3(signature = (path=None, mode="section", images=true, toc=true))]
+    fn export_html(&self, py: Python<'_>, path: Option<&str>, mode: &str, images: bool, toc: bool) -> PyResult<String> {
         let dest = self.resolve_html_path(path)?;
         let html = self.render(py, mode, images, toc)?;
         std::fs::write(&dest, html).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
@@ -207,21 +184,25 @@ impl Pdf {
 
     /// Document outline: a list of `(level, title, page, anchor_id)` per heading, in
     /// reading order. `level` 1 is the title, 2 a section, 3 a subsection, … . The
-    /// `anchor_id` matches an `id=` in `to_html()` (link with `#anchor_id`).
-    fn toc(&self, py: Python<'_>) -> PyResult<Vec<(u8, String, u32, String)>> {
-        // Force the TOC nav on regardless of `include_toc` — `html::toc` parses the
-        // outline back out of that <nav>, so it must be present here even when the
-        // user opted out of it in `to_html()`. Mode is honoured, so section mode yields
-        // pageless entries.
-        Ok(py.allow_threads(|| html::toc(&html::to_html(&self.doc, &self.raw, self.mode, self.inline_images, true))))
+    /// `anchor_id` matches an `id=` in `to_html()` (link with `#anchor_id`). `mode`
+    /// matches `to_html()`: `"page"` carries real page numbers, `"section"` yields 0.
+    #[pyo3(signature = (mode="section"))]
+    fn toc(&self, py: Python<'_>, mode: &str) -> PyResult<Vec<(u8, String, u32, String)>> {
+        let mode = parse_mode(mode)?;
+        // Force the TOC nav on (and skip image encoding — irrelevant to the outline) —
+        // `html::toc` parses the outline back out of that <nav>.
+        Ok(py.allow_threads(|| html::toc(&html::to_html(&self.doc, &self.raw, mode, false, true))))
     }
 
     /// HTML of a single section: the heading matching `name` (its `sec-…` slug, an id
     /// prefix, or a case-insensitive title substring) plus its content up to the next
-    /// same-or-higher heading. E.g. `section("abstract")`. None if no match.
-    fn section(&self, py: Python<'_>, name: &str) -> PyResult<Option<String>> {
+    /// same-or-higher heading. E.g. `section("abstract")`. None if no match. `mode` and
+    /// `images` match `to_html()`.
+    #[pyo3(signature = (name, mode="section", images=true))]
+    fn section(&self, py: Python<'_>, name: &str, mode: &str, images: bool) -> PyResult<Option<String>> {
+        let mode = parse_mode(mode)?;
         // `html::section` resolves via the TOC nav, so build with it present.
-        Ok(py.allow_threads(|| html::section(&html::to_html(&self.doc, &self.raw, self.mode, self.inline_images, true), name)))
+        Ok(py.allow_threads(|| html::section(&html::to_html(&self.doc, &self.raw, mode, images, true), name)))
     }
 
     /// Diagnostic: force our ToUnicode extractor for all pages (eval only).
@@ -283,21 +264,17 @@ impl Pdf {
 }
 
 /// Open a PDF from a filesystem path — `distillpdf.open("file.pdf")`. A module-level
-/// shorthand for `Pdf.open(...)`. `mode` selects the `to_html()` structure
-/// (`"section"` default / `"page"`); `images=False` emits `<image N>` placeholders
-/// instead of inline base64 images; `toc=False` omits the table-of-contents nav.
+/// shorthand for `Pdf.open(...)`. Rendering options live on `to_html()`/`export_html()`.
 #[pyfunction]
-#[pyo3(signature = (path, mode = "section", images = true, toc = true))]
-fn open(path: &str, mode: &str, images: bool, toc: bool) -> PyResult<Pdf> {
-    Pdf::open(path, mode, images, toc)
+fn open(path: &str) -> PyResult<Pdf> {
+    Pdf::open(path)
 }
 
 /// Open a PDF from raw bytes — `distillpdf.from_bytes(data)`. Shorthand for
-/// `Pdf.from_bytes(...)`. See `open` for the `mode`/`images`/`toc` flags.
+/// `Pdf.from_bytes(...)`.
 #[pyfunction]
-#[pyo3(signature = (data, mode = "section", images = true, toc = true))]
-fn from_bytes(data: &[u8], mode: &str, images: bool, toc: bool) -> PyResult<Pdf> {
-    Pdf::from_bytes(data, mode, images, toc)
+fn from_bytes(data: &[u8]) -> PyResult<Pdf> {
+    Pdf::from_bytes(data)
 }
 
 #[pymodule]

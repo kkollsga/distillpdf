@@ -102,13 +102,20 @@ def test_dbg_spans():
     assert xy and all(len(s) == 5 for s in xy), "_dbg_spans_xy shape wrong"
 
 
-def test_to_html_options_override_open(tmp_path):
-    """to_html() returns the string and accepts per-call mode/images/toc overrides."""
-    d = distillpdf.Pdf.open(HEADINGS)  # default section mode
+def test_to_html_render_options():
+    """Rendering options live on to_html() (not open): mode/images/toc per call."""
+    d = distillpdf.Pdf.open(HEADINGS)
     assert d.to_html().startswith("<!doctype html>")
-    assert "data-page" not in d.to_html()              # section default
-    assert "data-page" in d.to_html(mode="page")        # per-call override
+    assert "data-page" not in d.to_html()          # section default
+    assert "data-page" in d.to_html(mode="page")    # page mode
     assert "<nav>" not in d.to_html(toc=False)
+    assert d.to_html(mode="page") == d.to_html(mode="page")  # deterministic
+
+
+def test_open_takes_no_render_options():
+    """open() no longer accepts rendering options — they belong on to_html()."""
+    with pytest.raises(TypeError):
+        distillpdf.Pdf.open(HEADINGS, mode="page")
 
 
 def test_export_html(tmp_path):
@@ -137,34 +144,30 @@ def test_export_html_from_bytes_needs_path(tmp_path):
 
 
 def test_images_false_emits_placeholder():
-    """open(images=False) drops inline base64 images from to_html() and replaces each
-    with a `<image N>` placeholder, while keeping the surrounding <figure>/caption."""
+    """to_html(images=False) drops inline base64 images and replaces each with a
+    `<image N>` placeholder, while keeping the surrounding <figure>/caption."""
     on = distillpdf.Pdf.open(FIGURES).to_html()
-    off = distillpdf.Pdf.open(FIGURES, images=False).to_html()
+    off = distillpdf.Pdf.open(FIGURES).to_html(images=False)
     assert "data:image" in on and "<img " in on, "fixture expected to inline an image"
     assert "data:image" not in off and "<img " not in off, "images=False still inlined an image"
     assert "<image 1>" in off, "expected a numbered <image N> placeholder"
     # the figure wrapper survives, only the pixel payload is swapped out
     assert "<figure" in off
-    # module-level shorthand honours the flag too
-    assert distillpdf.open(FIGURES, images=False).to_html() == off
 
 
 def test_toc_false_omits_nav_but_keeps_anchors():
-    """open(toc=False) drops the <nav> table of contents from to_html() while keeping
-    heading id anchors — so links and toc()/section() still resolve."""
-    on = distillpdf.Pdf.open(HEADINGS).to_html()
-    off = distillpdf.Pdf.open(HEADINGS, toc=False).to_html()
+    """to_html(toc=False) drops the <nav> table of contents while keeping heading id
+    anchors — so links and toc()/section() still resolve."""
+    d = distillpdf.Pdf.open(HEADINGS)
+    on = d.to_html()
+    off = d.to_html(toc=False)
     assert "<nav>" in on, "fixture expected to produce a TOC"
     assert "<nav>" not in off, "toc=False still emitted a <nav>"
     # heading anchors survive (so #sec-… links and section() keep working)
     assert 'id="sec-' in off
-    # the parsed-outline API is unaffected by the open-time flag
-    d = distillpdf.Pdf.open(HEADINGS, toc=False)
+    # the parsed-outline API is independent of the toc flag
     assert len(d.toc()) >= 1
     assert d.section("methods") is not None
-    # module-level shorthand honours the flag too
-    assert distillpdf.open(HEADINGS, toc=False).to_html() == off
 
 
 def test_toc_and_section_types():

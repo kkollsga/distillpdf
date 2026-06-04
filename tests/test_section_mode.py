@@ -25,7 +25,7 @@ def test_default_mode_is_section():
 
 
 def test_page_mode_opt_in():
-    h = distillpdf.open(HEADINGS, mode="page").to_html()
+    h = distillpdf.open(HEADINGS).to_html(mode="page")
     assert 'data-page="' in h and 'id="page-' in h
     assert '<section id="sec-' not in h  # page mode keeps the id on the heading
 
@@ -42,7 +42,7 @@ def test_toc_drops_pages_in_section_mode():
     entries = distillpdf.open(HEADINGS).toc()
     assert entries and all(pg == 0 for (_lvl, _t, pg, _id) in entries)
     # page mode still carries real page numbers
-    pentries = distillpdf.open(HEADINGS, mode="page").toc()
+    pentries = distillpdf.open(HEADINGS).toc(mode="page")
     assert any(pg >= 1 for (_lvl, _t, pg, _id) in pentries)
 
 
@@ -63,7 +63,7 @@ def test_nav_links_resolve_to_section_wrappers():
 
 
 def test_flags_compose_with_section_mode():
-    h = distillpdf.open(DEMO, images=False, toc=False).to_html()
+    h = distillpdf.open(DEMO).to_html(images=False, toc=False)
     assert "<nav>" not in h          # toc=False
     assert "data:image" not in h     # images=False
     assert '<section id="sec-' in h  # still section-structured
@@ -71,12 +71,12 @@ def test_flags_compose_with_section_mode():
 
 def test_invalid_mode_raises():
     with pytest.raises(ValueError):
-        distillpdf.open(HEADINGS, mode="bogus")
+        distillpdf.open(HEADINGS).to_html(mode="bogus")
 
 
 @pytest.mark.parametrize("path", OWNED, ids=IDS)
 def test_section_mode_well_formed(path):
-    h = distillpdf.Pdf.open(path, mode="section").to_html()
+    h = distillpdf.Pdf.open(path).to_html(mode="section")
     ok, errs = hc.well_formed(h)
     assert ok, f"{os.path.basename(path)}: malformed section-mode HTML: {errs[:4]}"
     assert h.count("<section") == h.count("</section>"), "unbalanced <section> nesting"

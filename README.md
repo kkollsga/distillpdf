@@ -86,34 +86,35 @@ Pass `mode="page"` for the page-faithful structure instead — each page wrapped
 `<section data-page="N" id="page-N">`, with page numbers in the TOC:
 
 ```python
-distillpdf.open("paper.pdf", mode="page").to_html()
+distillpdf.open("paper.pdf").to_html(mode="page")
 ```
 
 Want compact, text-only output? Drop the inline image bytes — each embedded image
 becomes a lightweight `<image N>` placeholder (captions and figure anchors are kept):
 
 ```python
-doc = distillpdf.open("paper.pdf", images=False)
-doc.to_html()    # <figure id="fig-1"><image 1><figcaption>…</figcaption></figure>
+distillpdf.open("paper.pdf").to_html(images=False)
+# <figure id="fig-1"><image 1><figcaption>…</figcaption></figure>
 ```
 
 Pass `toc=False` to skip the auto table-of-contents `<nav>` (heading anchors are still
 emitted, so `#section` links and `doc.section(...)` keep working):
 
 ```python
-distillpdf.open("paper.pdf", toc=False).to_html()
+distillpdf.open("paper.pdf").to_html(toc=False)
 ```
 
-### `open()` / `from_bytes()` options
+### Rendering options
 
-| Option | Default | Effect on `to_html()` |
+`open()` only loads the PDF; the rendering options live on `to_html()` and
+`export_html()` (and `mode` on `toc()`/`section()`), since that's where the content is
+actually extracted:
+
+| Option | Default | Effect |
 |---|---|---|
 | `mode=` | `"section"` | `"page"` wraps each page in `<section data-page="N">` and numbers TOC entries; the default groups content into nested `<section id="sec-…">` and drops page info |
 | `images=` | `True` | `False` swaps inline base64 images for `<image N>` placeholders (captions + `#fig-N` anchors kept) |
 | `toc=` | `True` | `False` omits the `<nav>` table of contents (section/heading anchors still emitted) |
-
-Both flags only change `to_html()` output — `toc()`, `section()`, and the raw extractors
-below are unaffected.
 
 ### Raw pieces
 

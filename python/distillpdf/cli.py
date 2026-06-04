@@ -25,16 +25,16 @@ def _render(doc, args):
             return f"#{anchor}" if page == 0 else f"p{page}, #{anchor}"
         return "\n".join(
             f"{'  ' * (lvl - 1)}{title}  ({loc(page, anchor)})"
-            for lvl, title, page, anchor in doc.toc()
+            for lvl, title, page, anchor in doc.toc(mode=args.mode)
         )
     if args.section is not None:
-        html = doc.section(args.section)
+        html = doc.section(args.section, mode=args.mode, images=args.images)
         if html is None:
             raise SystemExit(f"distillpdf: no section matching {args.section!r}")
         return html
     if args.text:
         return doc.extract_text()
-    return doc.to_html()
+    return doc.to_html(mode=args.mode, images=args.images, toc=args.include_toc)
 
 
 def _out_path(src, args, multiple):
@@ -84,7 +84,7 @@ def main(argv=None):
     rc = 0
     for src in args.pdf:
         try:
-            doc = _open(src, mode=args.mode, images=args.images, toc=args.include_toc)
+            doc = _open(src)
             content = _render(doc, args)
         except SystemExit:
             raise
