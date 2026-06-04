@@ -102,14 +102,38 @@ def test_dbg_spans():
     assert xy and all(len(s) == 5 for s in xy), "_dbg_spans_xy shape wrong"
 
 
-def test_to_html_writes_file(tmp_path):
-    """to_html() returns the HTML string; to_html(path) writes it (UTF-8) and returns None."""
+def test_to_html_options_override_open(tmp_path):
+    """to_html() returns the string and accepts per-call mode/images/toc overrides."""
+    d = distillpdf.Pdf.open(HEADINGS)  # default section mode
+    assert d.to_html().startswith("<!doctype html>")
+    assert "data-page" not in d.to_html()              # section default
+    assert "data-page" in d.to_html(mode="page")        # per-call override
+    assert "<nav>" not in d.to_html(toc=False)
+
+
+def test_export_html(tmp_path):
+    """export_html writes to a file: explicit path, directory, and source-derived name."""
     d = distillpdf.Pdf.open(HEADINGS)
     s = d.to_html()
-    assert isinstance(s, str) and s.startswith("<!doctype html>")
+    # explicit file path → returns the path written, contents match to_html()
     dest = tmp_path / "out.html"
-    assert d.to_html(str(dest)) is None
+    assert d.export_html(str(dest)) == str(dest)
     assert dest.read_text(encoding="utf-8") == s
+    # directory → <source-stem>.html inside it
+    written = d.export_html(str(tmp_path))
+    assert written.endswith("headings.html") and os.path.dirname(written) == str(tmp_path)
+    # options carry through
+    d.export_html(str(dest), mode="page")
+    assert "data-page" in dest.read_text(encoding="utf-8")
+
+
+def test_export_html_from_bytes_needs_path(tmp_path):
+    with open(HEADINGS, "rb") as f:
+        d = distillpdf.from_bytes(f.read())
+    with pytest.raises(Exception):
+        d.export_html()  # no source path to derive a name
+    dest = tmp_path / "b.html"
+    assert d.export_html(str(dest)) == str(dest)
 
 
 def test_images_false_emits_placeholder():

@@ -837,19 +837,24 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
             && (ctm.d - 1.0).abs() < 1e-3
             && ctm.b.abs() < 1e-3
             && ctm.c.abs() < 1e-3;
-        let (x, y, height, angle) = if rotated {
-            (dm.e, dm.f, base_size * (dm.c * dm.c + dm.d * dm.d).sqrt(), baseline)
+        // `width` arrives in text space (glyph advance × the Tf size). The font size can
+        // live in the text matrix instead of in Tf (size 1 in Tf, the real scale baked
+        // into Tm), in which case `height` already picks the scale up via `wtm.d`; the
+        // width must pick up the matching HORIZONTAL scale or it stays ~20× too small,
+        // collapsing every word's measured extent and tearing lines apart on fake gaps.
+        let (x, y, height, angle, sx) = if rotated {
+            (dm.e, dm.f, base_size * (dm.c * dm.c + dm.d * dm.d).sqrt(), baseline, (dm.a * dm.a + dm.b * dm.b).sqrt())
         } else if pure_translate {
-            (dm.e, dm.f, base_size * wtm.d, 0.0)
+            (dm.e, dm.f, base_size * wtm.d, 0.0, wtm.a)
         } else {
-            (wtm.e, wtm.f, base_size * wtm.d, 0.0)
+            (wtm.e, wtm.f, base_size * wtm.d, 0.0, wtm.a)
         };
         if !s.is_empty() && height.abs() >= 2.0 {
             spans.push(Span {
                 x,
                 y,
                 size: height.abs().max(1.0),
-                width: width.abs(),
+                width: (width * sx).abs(),
                 text: s,
                 bold: style.0,
                 italic: style.1,

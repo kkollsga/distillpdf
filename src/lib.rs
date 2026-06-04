@@ -33,14 +33,54 @@ struct Pdf {
     doc: Document,
     /// Raw PDF bytes, kept for lenient recovery of malformed streams.
     raw: Vec<u8>,
-    /// `to_html()` output structure: section-first (default) or page-first.
+    /// Source path (`open`); `None` when constructed from bytes. Used by `export_html`
+    /// to derive the default `<source>.html` output name.
+    source: Option<std::path::PathBuf>,
+    /// Default `to_html()` output structure: section-first or page-first. Overridable
+    /// per call.
     mode: html::Mode,
-    /// Whether `to_html()` inlines raster images as base64 `<img>` data URIs. When
-    /// false, each image becomes a lightweight `<image N>` placeholder instead.
+    /// Default for inlining raster images as base64 `<img>` data URIs (else `<image N>`
+    /// placeholders). Overridable per call.
     inline_images: bool,
-    /// Whether `to_html()` prepends an auto `<nav>` table of contents. When false the
-    /// TOC is omitted (heading anchors are still emitted, so links/`section()` work).
+    /// Default for prepending the auto `<nav>` table of contents. Overridable per call.
     include_toc: bool,
+}
+
+impl Pdf {
+    /// Resolve the rendering options (per-call override else the open-time default) and
+    /// render the HTML with the GIL released.
+    fn render(&self, py: Python<'_>, mode: Option<&str>, images: Option<bool>, toc: Option<bool>) -> PyResult<String> {
+        let mode = match mode {
+            Some(s) => parse_mode(s)?,
+            None => self.mode,
+        };
+        let images = images.unwrap_or(self.inline_images);
+        let toc = toc.unwrap_or(self.include_toc);
+        Ok(py.allow_threads(|| html::to_html(&self.doc, &self.raw, mode, images, toc)))
+    }
+
+    /// Resolve the output path for `export_html`: an explicit file, `<stem>.html` inside
+    /// an explicit directory, or `<source>.html` next to the opened PDF when omitted.
+    fn resolve_html_path(&self, path: Option<&str>) -> PyResult<std::path::PathBuf> {
+        match path {
+            // A directory → write <source-stem>.html inside it.
+            Some(p) if std::path::Path::new(p).is_dir() => {
+                let stem = self
+                    .source
+                    .as_ref()
+                    .and_then(|s| s.file_stem())
+                    .ok_or_else(|| PyValueError::new_err("export_html: a directory path needs a source filename to derive the name; pass a full file path"))?;
+                Ok(std::path::Path::new(p).join(stem).with_extension("html"))
+            }
+            Some(p) => Ok(std::path::PathBuf::from(p)),
+            // No path → <source>.html next to the opened PDF.
+            None => self
+                .source
+                .as_ref()
+                .map(|s| s.with_extension("html"))
+                .ok_or_else(|| PyValueError::new_err("export_html: no source path (opened from_bytes); pass an explicit path")),
+        }
+    }
 }
 
 #[pymethods]
@@ -62,7 +102,7 @@ impl Pdf {
         let raw = std::fs::read(path).map_err(|e| PyValueError::new_err(format!("read failed: {e}")))?;
         let doc =
             Document::load_mem(&raw).map_err(|e| PyValueError::new_err(format!("open failed: {e}")))?;
-        Ok(Pdf { doc, raw, mode, inline_images: images, include_toc: toc })
+        Ok(Pdf { doc, raw, source: Some(std::path::PathBuf::from(path)), mode, inline_images: images, include_toc: toc })
     }
 
     /// Open a PDF from raw bytes. See `open` for the `mode`/`images`/`toc` flags.
@@ -73,7 +113,7 @@ impl Pdf {
         let raw = data.to_vec();
         let doc =
             Document::load_mem(&raw).map_err(|e| PyValueError::new_err(format!("parse failed: {e}")))?;
-        Ok(Pdf { doc, raw, mode, inline_images: images, include_toc: toc })
+        Ok(Pdf { doc, raw, source: None, mode, inline_images: images, include_toc: toc })
     }
 
     /// Number of pages.
@@ -137,24 +177,32 @@ impl Pdf {
         Ok(list)
     }
 
-    /// Convert the PDF to thin, AI-ready HTML (per-page sections, headings,
-    /// bold/italic, lists, tables, monospace; inline images added separately).
+    /// Convert the PDF to thin, AI-ready HTML and return it as a string.
     ///
-    /// With no argument, returns the HTML string. Pass `path` to write the HTML to that
-    /// file (UTF-8) instead and return `None` — `doc.to_html("out.html")`.
+    /// `mode` (`"section"`/`"page"`), `images`, and `toc` override the values set at
+    /// `open()` for this call only; omit them to use the open-time defaults. To write the
+    /// result straight to a file, use `export_html()` (same options).
     ///
     /// The conversion (which internally renders pages in parallel) runs with the GIL
     /// released, so converting many PDFs across Python threads scales across cores.
-    #[pyo3(signature = (path=None))]
-    fn to_html(&self, py: Python<'_>, path: Option<&str>) -> PyResult<Option<String>> {
-        let html = py.allow_threads(|| html::to_html(&self.doc, &self.raw, self.mode, self.inline_images, self.include_toc));
-        match path {
-            Some(p) => {
-                std::fs::write(p, &html).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
-                Ok(None)
-            }
-            None => Ok(Some(html)),
-        }
+    #[pyo3(signature = (mode=None, images=None, toc=None))]
+    fn to_html(&self, py: Python<'_>, mode: Option<&str>, images: Option<bool>, toc: Option<bool>) -> PyResult<String> {
+        self.render(py, mode, images, toc)
+    }
+
+    /// Render the HTML and write it to a file, returning the path written.
+    ///
+    /// With no `path`, writes `<source>.html` next to the opened PDF
+    /// (`open("a/b.pdf").export_html()` → `a/b.html`). If `path` is a directory, writes
+    /// `<source-stem>.html` inside it; otherwise `path` is used verbatim. `mode`/`images`/
+    /// `toc` work exactly as in `to_html()`. A bytes-constructed `Pdf` (no source path)
+    /// requires an explicit `path`.
+    #[pyo3(signature = (path=None, mode=None, images=None, toc=None))]
+    fn export_html(&self, py: Python<'_>, path: Option<&str>, mode: Option<&str>, images: Option<bool>, toc: Option<bool>) -> PyResult<String> {
+        let dest = self.resolve_html_path(path)?;
+        let html = self.render(py, mode, images, toc)?;
+        std::fs::write(&dest, html).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
+        Ok(dest.to_string_lossy().into_owned())
     }
 
     /// Document outline: a list of `(level, title, page, anchor_id)` per heading, in

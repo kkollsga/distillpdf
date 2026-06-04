@@ -852,7 +852,11 @@ fn detect_header(line: &Line, body: f32) -> Option<(u8, usize)> {
         // of an inline bold phrase ("…de Evidență / a Procurilor și a Revocărilor…"),
         // not a heading.
         let cap_lead = lead.chars().next().is_some_and(|c| !c.is_lowercase());
+        // A lead ending in a comma is a continued enumeration — a bold author name at
+        // the head of an author list ("**Chris Dart,** Anne-Lise Lysholm, …"), not a
+        // section head. Headings never end in a comma.
         if cap_lead
+            && !lead.ends_with(',')
             && ((2..=8).contains(&lead_words)
                 || (labelled && lead.chars().filter(|c| c.is_alphabetic()).count() >= 2))
         {
