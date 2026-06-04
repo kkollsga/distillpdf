@@ -278,11 +278,14 @@ fn png_bytes(img: image::DynamicImage) -> Option<Vec<u8>> {
     Some(out.into_inner())
 }
 
-/// A raster image placed on the page: its top edge (for reading-order placement) and
-/// data URI. A merged grid carries the union bbox's top/bottom and one stitched image.
+/// A raster image placed on the page: its bounding box (top/bottom for reading order,
+/// left/right for detecting a vector overlay that annotates it) and data URI. A merged
+/// grid carries the union bbox and one stitched image.
 pub struct Placed {
     pub y_top: f32,
     pub y_bottom: f32,
+    pub x_left: f32,
+    pub x_right: f32,
     pub uri: String,
 }
 
@@ -433,13 +436,13 @@ fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool) -> Vec<Placed> 
         if tiles.len() >= MIN_GRID_TILES && is_grid(&tiles) {
             if want_uris {
                 if let Some(uri) = stitch_grid(doc, &tiles, (x0, x1, y0, y1)) {
-                    out.push(Placed { y_top: y1, y_bottom: y0, uri });
+                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri });
                     continue;
                 }
                 // stitch failed → fall through to per-tile emission
             } else {
                 if tiles.iter().any(|t| decodable(doc, t.id)) {
-                    out.push(Placed { y_top: y1, y_bottom: y0, uri: String::new() });
+                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri: String::new() });
                 }
                 continue;
             }
@@ -448,10 +451,10 @@ fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool) -> Vec<Placed> 
         for t in tiles {
             if want_uris {
                 if let Some(uri) = data_uri(doc, t.id) {
-                    out.push(Placed { y_top: t.y1, y_bottom: t.y0, uri });
+                    out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri });
                 }
             } else if decodable(doc, t.id) {
-                out.push(Placed { y_top: t.y1, y_bottom: t.y0, uri: String::new() });
+                out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri: String::new() });
             }
         }
     }

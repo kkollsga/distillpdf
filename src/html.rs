@@ -1094,7 +1094,7 @@ fn emit_footnotes(lines: &[&Line], out: &mut String) {
 }
 
 /// Emit a run of consecutive text lines as headings / paragraphs / lists / code.
-fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, out: &mut String) {
+fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], out: &mut String) {
     let mut i = 0;
     // The currently-open paragraph. It is NOT flushed at a column-wrap block
     // boundary — a paragraph that wraps from the bottom of one column to the top
@@ -1153,8 +1153,20 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, out: &mut String) {
         // a COLON-INTRODUCED numbered run (the prose announces it with a "…:" lead-in,
         // e.g. BERT C.1 "…the following questions:" → "1. Question: … / 2. Question: …"):
         // those colon-labelled items form a list, not a sequence of section headings.
+        // A line that exactly matches a PDF-outline title for this page is a section
+        // title by the author's own bookmark — promote it even when it carries no visual
+        // heading cue (some docs set abstract/section titles at body size). Page-scoped,
+        // so the contents page's TOC entries (different page) are never affected.
+        // A forced match is an author-declared SECTION title — emit it at section level
+        // (so it lands in the TOC and the outline link resolves), overriding any lower
+        // level `detect_header` would infer from its (often body-size) styling.
+        // Cap at 12 words: a longer match is a multi-line/sentence-like title — promoting
+        // it would read as a sentence heading. Those stay plain text in the outline nav.
+        let forced = !promote.is_empty()
+            && txt.split_whitespace().count() <= 12
+            && promote.iter().any(|k| *k == title_key(&txt));
         if !in_enumerated_run(lines, i) && !colon_introduced_list(lines, i) {
-        if let Some((lvl, k)) = detect_header(ln, body) {
+        if let Some((lvl, k)) = if forced { Some((1, ln.runs.len())) } else { detect_header(ln, body) } {
             // HTML heading tag: reserve <h1> for the document title (the largest
             // text). Sections (logical level 1) become <h2>, subsections <h3>,
             // etc., so the outline nests under a single <h1>.
@@ -1448,6 +1460,17 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
     let mut dests_by_page: std::collections::HashMap<u32, Vec<(String, Option<f32>)>> = std::collections::HashMap::new();
     for d in links::named_destinations(doc) {
         dests_by_page.entry(d.page).or_default().push((slug(&d.name), d.y));
+    }
+
+    // The PDF's own outline (bookmarks): used both to drive the nav and — per target
+    // page — to promote matching lines to headings (so body-size section titles the
+    // visual cues miss are still recognised, and the outline TOC links resolve).
+    let outline = links::outline(doc);
+    let mut promote_by_page: std::collections::HashMap<u32, Vec<String>> = std::collections::HashMap::new();
+    for e in &outline {
+        if e.page > 0 {
+            promote_by_page.entry(e.page).or_default().push(title_key(&e.title));
+        }
     }
 
     // Render every page IN PARALLEL into its own (html_fragment, image_uris). Each page
@@ -1829,11 +1852,33 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
             items.push(Item::T(j));
             boxes.push((t.x_left, t.x_right.max(t.x_left + 0.1), t.y_bottom, t.y_top));
         }
+        // A vector figure largely INSIDE a raster image is an overlay annotating it (a
+        // location map = a base raster with vector lines/labels on top). Pair them so the
+        // composite renders as ONE figure (the SVG positioned over the image) instead of
+        // two disconnected ones. Only in inline mode (the image must actually render).
+        let mut vec_owner: Vec<Option<usize>> = vec![None; vectors.len()];
+        let mut img_overlays: Vec<Vec<usize>> = vec![Vec::new(); images.len()];
+        if inline_images {
+            for (vi, v) in vectors.iter().enumerate() {
+                let varea = ((v.x_right - v.x_left) * (v.y_top - v.y_bottom)).max(1.0);
+                if let Some(ii) = images.iter().position(|im| {
+                    let ox = (v.x_right.min(im.x_right) - v.x_left.max(im.x_left)).max(0.0);
+                    let oy = (v.y_top.min(im.y_top) - v.y_bottom.max(im.y_bottom)).max(0.0);
+                    ox * oy / varea > 0.6 // ≥60% of the vector lies within the image
+                }) {
+                    vec_owner[vi] = Some(ii);
+                    img_overlays[ii].push(vi);
+                }
+            }
+        }
         for (j, im) in images.iter().enumerate() {
             items.push(Item::Img(j));
             boxes.push((px0, px1, im.y_top - 1.0, im.y_top + 1.0)); // full-width separator
         }
         for (j, v) in vectors.iter().enumerate() {
+            if vec_owner[j].is_some() {
+                continue; // overlaid onto its image, not emitted separately
+            }
             items.push(Item::Svg(j));
             boxes.push((v.x_left, v.x_right.max(v.x_left + 0.1), v.y_bottom, v.y_top));
         }
@@ -1844,11 +1889,14 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
         let order = text::xy_cut_order(&boxes, body);
         let items: Vec<&Item> = order.iter().map(|&i| &items[i]).collect();
 
-        // Emit, grouping consecutive lines into text blocks.
+        // Emit, grouping consecutive lines into text blocks. `page_promote` lists the
+        // PDF-outline titles whose target page is this one, so body-size section titles
+        // still become headings.
+        let page_promote: &[String] = promote_by_page.get(pno).map(|v| v.as_slice()).unwrap_or(&[]);
         let mut run: Vec<&Line> = Vec::new();
         let flush = |run: &mut Vec<&Line>, out: &mut String| {
             if !run.is_empty() {
-                emit_lines(run, body, title_sz, out);
+                emit_lines(run, body, title_sz, page_promote, out);
                 run.clear();
             }
         };
@@ -1877,11 +1925,23 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
                         img_uris.push(String::new()); // keep the index aligned for numbering
                         format!("<image \u{0}{idx}\u{0}>")
                     };
+                    // Vector overlays annotating this image, absolutely positioned over it.
+                    let overlays: String = img_overlays[*j]
+                        .iter()
+                        .map(|&vi| {
+                            vectors[vi].svg().replacen(
+                                "<svg ",
+                                "<svg style=\"position:absolute;left:0;top:0;width:100%;height:100%\" ",
+                                1,
+                            )
+                        })
+                        .collect();
+                    let rel = if overlays.is_empty() { "" } else { " style=\"position:relative\"" };
                     match &img_cap[*j] {
                         Some((num, cap)) => out.push_str(&format!(
-                            "<figure id=\"fig-{num}\">{graphic}<figcaption>{cap}</figcaption></figure>"
+                            "<figure{rel} id=\"fig-{num}\">{graphic}{overlays}<figcaption>{cap}</figcaption></figure>"
                         )),
-                        None => out.push_str(&format!("<figure>{graphic}</figure>")),
+                        None => out.push_str(&format!("<figure{rel}>{graphic}{overlays}</figure>")),
                     }
                 }
                 Item::Svg(j) => {
@@ -1938,13 +1998,8 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
     // the document supplies one — it is the author's clean TOC, vs. our heading-detected
     // approximation. Only the visible `<nav>` is swapped; heading/section anchors are
     // unchanged (the outline links to them).
-    let result = if include_toc {
-        let ol = links::outline(doc);
-        if ol.is_empty() {
-            result
-        } else {
-            nav_from_outline(result, &ol, mode)
-        }
+    let result = if include_toc && !outline.is_empty() {
+        nav_from_outline(result, &outline, mode)
     } else {
         result
     };
