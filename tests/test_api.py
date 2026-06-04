@@ -102,6 +102,16 @@ def test_dbg_spans():
     assert xy and all(len(s) == 5 for s in xy), "_dbg_spans_xy shape wrong"
 
 
+def test_to_html_writes_file(tmp_path):
+    """to_html() returns the HTML string; to_html(path) writes it (UTF-8) and returns None."""
+    d = distillpdf.Pdf.open(HEADINGS)
+    s = d.to_html()
+    assert isinstance(s, str) and s.startswith("<!doctype html>")
+    dest = tmp_path / "out.html"
+    assert d.to_html(str(dest)) is None
+    assert dest.read_text(encoding="utf-8") == s
+
+
 def test_images_false_emits_placeholder():
     """open(images=False) drops inline base64 images from to_html() and replaces each
     with a `<image N>` placeholder, while keeping the surrounding <figure>/caption."""

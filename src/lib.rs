@@ -140,10 +140,21 @@ impl Pdf {
     /// Convert the PDF to thin, AI-ready HTML (per-page sections, headings,
     /// bold/italic, lists, tables, monospace; inline images added separately).
     ///
+    /// With no argument, returns the HTML string. Pass `path` to write the HTML to that
+    /// file (UTF-8) instead and return `None` — `doc.to_html("out.html")`.
+    ///
     /// The conversion (which internally renders pages in parallel) runs with the GIL
     /// released, so converting many PDFs across Python threads scales across cores.
-    fn to_html(&self, py: Python<'_>) -> PyResult<String> {
-        Ok(py.allow_threads(|| html::to_html(&self.doc, &self.raw, self.mode, self.inline_images, self.include_toc)))
+    #[pyo3(signature = (path=None))]
+    fn to_html(&self, py: Python<'_>, path: Option<&str>) -> PyResult<Option<String>> {
+        let html = py.allow_threads(|| html::to_html(&self.doc, &self.raw, self.mode, self.inline_images, self.include_toc));
+        match path {
+            Some(p) => {
+                std::fs::write(p, &html).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
+                Ok(None)
+            }
+            None => Ok(Some(html)),
+        }
     }
 
     /// Document outline: a list of `(level, title, page, anchor_id)` per heading, in

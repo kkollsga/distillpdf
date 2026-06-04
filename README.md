@@ -59,6 +59,7 @@ import distillpdf
 doc = distillpdf.open("paper.pdf")        # or distillpdf.from_bytes(data)
 
 html     = doc.to_html()                  # clean, semantic HTML for an LLM
+doc.to_html("out.html")                   # ...or write it straight to a file
 text     = doc.extract_text()             # plain text, in reading order
 toc      = doc.toc()                      # [(level, title, page, anchor_id), ...]
 abstract = doc.section("abstract")        # targeted section extraction
