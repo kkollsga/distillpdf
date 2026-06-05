@@ -1,6 +1,6 @@
 # distillPDF
 
-**Turn any PDF into clean, LLM-ready HTML — structure-aware, pure-Rust, MIT-licensed.**
+**Turn any PDF into clean, LLM-ready HTML or Markdown — structure-aware, pure-Rust, MIT-licensed.**
 
 [![PyPI](https://img.shields.io/pypi/v/distillpdf.svg)](https://pypi.org/project/distillpdf/)
 [![Python versions](https://img.shields.io/pypi/pyversions/distillpdf.svg)](https://pypi.org/project/distillpdf/)
@@ -9,9 +9,10 @@
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org)
 
 `distillpdf` reads a PDF and reconstructs its *structure* — reading order, headings,
-paragraphs, lists, tables, and figures — then emits compact, semantic **HTML** (or plain
-text) ready to feed to an LLM or a RAG pipeline. No styling noise, no layout junk: just the
-content a model needs.
+paragraphs, lists, tables, and figures — then emits compact, semantic **HTML** or
+**Markdown** (or plain text) ready to feed to an LLM or a RAG pipeline. No styling noise, no
+layout junk: just the content a model needs. Markdown is produced from the same HTML, so
+both formats benefit from every extraction improvement.
 
 It's built on [`lopdf`](https://github.com/J-F-Liu/lopdf) and shipped to Python via
 [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs) as a small, self-contained
@@ -34,20 +35,19 @@ Prebuilt wheels; no compiler or system libraries required. Installing also puts 
 
 ## Command line
 
-Convert a PDF to clean HTML in one command:
+Convert a PDF to clean HTML or Markdown in one command:
 
 ```bash
 distillpdf paper.pdf                  # HTML to stdout
-distillpdf paper.pdf -o paper.html    # ...or to a file
+distillpdf paper.pdf -o paper.html    # ...or to an HTML file
+distillpdf paper.pdf -o paper.md      # ...or Markdown (inferred from the .md extension)
+distillpdf paper.pdf --markdown       # Markdown to stdout
 distillpdf *.pdf -o out/              # batch: out/<name>.html per input
 
-distillpdf paper.pdf --markdown       # Markdown instead of HTML
-distillpdf paper.pdf -o paper.md      # Markdown (inferred from the .md extension)
-distillpdf *.pdf --markdown -o out/   # batch Markdown; figures to out/img/
-distillpdf paper.pdf --embed-images   # Markdown with inline data: URIs (self-contained)
+distillpdf paper.pdf -o p.html --image-mode external  # lean HTML + an img/ folder
+distillpdf paper.pdf --image-mode drop           # replace images with placeholder text
 
 distillpdf paper.pdf --mode page      # page-first HTML (default is section-first)
-distillpdf paper.pdf --no-images      # placeholders, no base64 bytes
 distillpdf paper.pdf --no-toc         # omit the table-of-contents nav
 distillpdf paper.pdf --text           # plain text instead of HTML
 distillpdf paper.pdf --toc            # print the table of contents
@@ -63,13 +63,14 @@ import distillpdf
 
 doc = distillpdf.open("paper.pdf")        # or distillpdf.from_bytes(data)
 
-html     = doc.to_html()                  # clean, semantic HTML for an LLM
+html     = doc.to_html()                  # self-contained HTML string (inline images)
 md       = doc.to_markdown()              # ...or Markdown (built from the same HTML)
 
 # write straight to a file (like pandas .to_csv) — returns the path written:
-doc.to_html("out.html")                   # ...to a specific path
-doc.to_html(outputfile=True)              # ...or <source>.html next to the PDF
-doc.to_markdown("out.md")                 # .md + an img/ folder of extracted figures
+doc.to_html("out.html")                   # one self-contained file (images embedded)
+doc.to_html(outputfile=True)              # <source>.html next to the PDF
+doc.to_html("out.html", image_mode="external")  # ...or lean HTML + an img/ folder
+doc.to_markdown("out.md")                 # out.md + an img/ folder of extracted figures
 doc.to_markdown(outputfile=True)          # <source>.md (handy for bulk runs)
 
 # rendering options work the same on both:
@@ -86,15 +87,22 @@ processor improvement (clipping, heading detection, tables, front-matter) flows 
 Markdown automatically, with no second renderer to keep in sync.
 
 ```python
-doc.to_markdown()                         # string; images are caption-only placeholders
-doc.to_markdown("paper.md")               # writes paper.md + paper's img/fig_NN_slug.ext
-doc.to_markdown("paper.md", embed_images=True)   # self-contained: inline data: URIs
-doc.to_markdown(images=False)             # drop images entirely (placeholders)
+doc.to_markdown()                                  # string (images embedded inline)
+doc.to_markdown("paper.md")                        # writes paper.md
+doc.to_markdown("paper.md", image_mode="external") # paper.md + paper's img/fig_NN_slug.ext
+doc.to_markdown(image_mode="drop")                 # drop images (caption-only placeholders)
 ```
 
-When writing to a file, figures are extracted next to it as `img/fig_NN_<slug>.ext`
-(vector figures as self-contained `.svg`) and referenced relatively. Returning a string
-has no folder to write into, so images fall back to placeholders unless `embed_images=True`.
+`image_mode` controls figures — identically for `to_html()` and `to_markdown()`:
+
+| `image_mode` | result |
+|---|---|
+| `"embed"` (default) | inline base64 `data:` URIs — one self-contained string/file |
+| `"external"` | extract each figure to `img/fig_NN_slug.ext` (vectors as `.svg`) and reference it; only when writing to a file (a returned string falls back to `"embed"`) |
+| `"drop"` | replace images with placeholder text |
+
+Because both formats run through the same converter, `"external"` produces the **same**
+`img/` layout whether you write `.html` or `.md`.
 
 ### Output modes
 
@@ -116,11 +124,11 @@ Pass `mode="page"` for the page-faithful structure instead — each page wrapped
 distillpdf.open("paper.pdf").to_html(mode="page")
 ```
 
-Want compact, text-only output? Drop the inline image bytes — each embedded image
-becomes a lightweight `<image N>` placeholder (captions and figure anchors are kept):
+Want compact, text-only output? `image_mode="drop"` replaces each embedded image with a
+lightweight `<image N>` placeholder (captions and figure anchors are kept):
 
 ```python
-distillpdf.open("paper.pdf").to_html(images=False)
+distillpdf.open("paper.pdf").to_html(image_mode="drop")
 # <figure id="fig-1"><image 1><figcaption>…</figcaption></figure>
 ```
 
@@ -142,8 +150,7 @@ actually extracted:
 | `path=` | `None` | a file (or directory) to write to; `None` returns the string. Returns the path written |
 | `outputfile=` | `False` | `True` writes `<source>.html` / `<source>.md` next to the PDF (no `path` needed) — for bulk runs |
 | `mode=` | `"section"` | `"page"` wraps each page in `<section data-page="N">` and numbers TOC entries; the default groups content into nested `<section id="sec-…">` and drops page info |
-| `images=` | `True` | `False` swaps inline base64 images for `<image N>` placeholders (captions + `#fig-N` anchors kept) |
-| `embed_images=` | `False` | `to_markdown()` only: `True` inlines images as `data:` URIs instead of an `img/` folder |
+| `image_mode=` | `"embed"` | `"embed"` inline `data:` URIs (self-contained); `"external"` an `img/` folder (when writing to a file); `"drop"` placeholder text |
 | `toc=` | `True` | `False` omits the `<nav>` table of contents (section/heading anchors still emitted) |
 
 ### Raw pieces

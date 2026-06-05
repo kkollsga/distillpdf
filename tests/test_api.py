@@ -3,6 +3,7 @@ plain-text extraction (whole-doc + per-page), and the structured extractors
 (fonts/images/tables/links) plus the diagnostic span dumps — shapes, types, and basic
 invariants. Guards the API contract that downstream callers depend on."""
 import os
+import re
 
 import distillpdf
 import pytest
@@ -164,10 +165,10 @@ def test_to_markdown_string_placeholders():
 
 
 def test_to_markdown_to_file_extracts_images(tmp_path):
-    """to_markdown to a file writes the .md plus an img/ folder of figure files, referenced
-    relatively (default, images on, not embedded)."""
+    """to_markdown(image_mode="external") to a file writes the .md plus an img/ folder of
+    figure files, referenced relatively."""
     dest = tmp_path / "fig.md"
-    written = distillpdf.Pdf.open(FIGURES).to_markdown(str(dest))
+    written = distillpdf.Pdf.open(FIGURES).to_markdown(str(dest), image_mode="external")
     assert written == str(dest)
     md = dest.read_text(encoding="utf-8")
     imgdir = tmp_path / "img"
@@ -180,16 +181,9 @@ def test_to_markdown_to_file_extracts_images(tmp_path):
         assert (tmp_path / r).exists(), f"missing {r}"
 
 
-def test_to_markdown_embed_images_self_contained():
-    """embed_images=True inlines images as data: URIs (works for string output) and writes
-    no sidecar files."""
-    md = distillpdf.Pdf.open(FIGURES).to_markdown(embed_images=True)
-    assert "](data:image/" in md
-
-
-def test_to_markdown_images_false_overrides_embed():
-    md = distillpdf.Pdf.open(FIGURES).to_markdown(images=False, embed_images=True)
-    assert "](data:" not in md
+def test_to_markdown_drop_placeholders():
+    md = distillpdf.Pdf.open(FIGURES).to_markdown(image_mode="drop")
+    assert "](data:" not in md  # never any image bytes
 
 
 def test_export_html_removed():
@@ -197,13 +191,69 @@ def test_export_html_removed():
     assert not hasattr(distillpdf.Pdf.open(HEADINGS), "export_html")
 
 
-def test_images_false_emits_placeholder():
-    """to_html(images=False) drops inline base64 images and replaces each with a
+def test_to_html_external_images(tmp_path):
+    """to_html(image_mode="external") extracts figures to an img/ folder and references them,
+    instead of inlining base64 — a much smaller file."""
+    d = distillpdf.Pdf.open(FIGURES)
+    inline = d.to_html()  # default embed → self-contained / inline
+    assert "data:image" in inline
+
+    dest = tmp_path / "fig.html"
+    written = d.to_html(str(dest), image_mode="external")
+    assert written == str(dest)
+    h = dest.read_text(encoding="utf-8")
+    assert "data:image" not in h          # nothing inlined
+    assert "<svg" not in h                # vector figures externalised to .svg files
+    imgdir = tmp_path / "img"
+    assert imgdir.is_dir() and any(imgdir.iterdir())
+    refs = re.findall(r'src="(img/[^"]+)"', h)
+    assert refs and all((tmp_path / r).exists() for r in refs)
+    assert len(h) < len(inline)          # externalised HTML is smaller
+
+
+def test_to_html_string_is_self_contained(tmp_path):
+    """A returned string has no folder to write into, so it stays self-contained (inline)
+    and creates no img/ folder."""
+    d = distillpdf.Pdf.open(FIGURES)
+    h = d.to_html()  # no path → string
+    assert "data:image" in h
+    assert not (tmp_path / "img").exists()
+
+
+def test_to_html_default_embed_to_file(tmp_path):
+    """The default image_mode is embed: writing to a file gives one self-contained .html
+    (inline images, no img/ folder)."""
+    dest = tmp_path / "e.html"
+    distillpdf.Pdf.open(FIGURES).to_html(str(dest))
+    assert "data:image" in dest.read_text(encoding="utf-8")
+    assert not (tmp_path / "img").exists()
+
+
+def test_invalid_image_mode_raises():
+    with pytest.raises(Exception):
+        distillpdf.Pdf.open(FIGURES).to_html(image_mode="bogus")
+
+
+def test_to_html_and_markdown_share_img_layout(tmp_path):
+    """HTML and Markdown file output write the same img/ filenames for the same PDF."""
+    h_dir = tmp_path / "h"
+    m_dir = tmp_path / "m"
+    h_dir.mkdir()
+    m_dir.mkdir()
+    distillpdf.Pdf.open(FIGURES).to_html(str(h_dir / "a.html"), image_mode="external")
+    distillpdf.Pdf.open(FIGURES).to_markdown(str(m_dir / "a.md"), image_mode="external")
+    h_imgs = sorted(os.listdir(h_dir / "img"))
+    m_imgs = sorted(os.listdir(m_dir / "img"))
+    assert h_imgs == m_imgs and h_imgs
+
+
+def test_images_drop_emits_placeholder():
+    """image_mode="drop" drops inline base64 images and replaces each with a
     `<image N>` placeholder, while keeping the surrounding <figure>/caption."""
     on = distillpdf.Pdf.open(FIGURES).to_html()
-    off = distillpdf.Pdf.open(FIGURES).to_html(images=False)
+    off = distillpdf.Pdf.open(FIGURES).to_html(image_mode="drop")
     assert "data:image" in on and "<img " in on, "fixture expected to inline an image"
-    assert "data:image" not in off and "<img " not in off, "images=False still inlined an image"
+    assert "data:image" not in off and "<img " not in off, 'image_mode="drop" still inlined an image'
     assert "<image 1>" in off, "expected a numbered <image N> placeholder"
     # the figure wrapper survives, only the pixel payload is swapped out
     assert "<figure" in off

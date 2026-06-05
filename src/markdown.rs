@@ -17,13 +17,13 @@ use base64::Engine;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ImgMode {
     /// No bytes: a figure becomes `![caption](#fig-N)` — the caption is preserved, the
-    /// image is not. Used for string output and whenever `images=False`.
+    /// image is not (`image_mode="drop"`).
     Placeholder,
     /// Self-contained: rasters keep their `data:` URI, vector figures are inlined as
-    /// `data:image/svg+xml;base64,…`. Large, but the `.md` needs no sidecar files.
+    /// `data:image/svg+xml;base64,…` (`image_mode="embed"`).
     Embed,
-    /// Extract every figure to a file under `img/` and reference it relatively. The files
-    /// are returned to the caller (which writes them next to the `.md`).
+    /// Extract every figure to a file under `img/` and reference it relatively
+    /// (`image_mode="external"`). The files are returned to the caller.
     Files,
 }
 
@@ -567,14 +567,16 @@ fn emit_image(ctx: &mut Ctx, caption: &str, graphic: Graphic, fig_id: Option<&st
     }
 
     match (ctx.img_mode, graphic) {
+        // Embed: keep the bytes inline.
         (ImgMode::Embed, Graphic::Raster { uri }) => format!("![{alt}]({uri})"),
         (ImgMode::Embed, Graphic::Svg(raw)) => {
             let b64 = base64::engine::general_purpose::STANDARD.encode(raw.as_bytes());
             format!("![{alt}](data:image/svg+xml;base64,{b64})")
         }
+        // Files: extract the graphic to img/ and reference it.
         (ImgMode::Files, Graphic::Raster { uri }) => match decode_data_uri(&uri) {
             Some((bytes, ext)) => {
-                let path = self::fig_path(n, alt, &ext);
+                let path = fig_path(n, alt, &ext);
                 ctx.files.push(ImageFile { path: path.clone(), bytes });
                 format!("![{alt}]({path})")
             }
@@ -585,7 +587,7 @@ fn emit_image(ctx: &mut Ctx, caption: &str, graphic: Graphic, fig_id: Option<&st
             ctx.files.push(ImageFile { path: path.clone(), bytes: raw.into_bytes() });
             format!("![{alt}]({path})")
         }
-        // Unreachable combinations (Placeholder/None handled above).
+        // None/Placeholder handled above.
         _ => format!("![{alt}](#{anchor})"),
     }
 }
@@ -648,6 +650,126 @@ fn decode_data_uri(uri: &str) -> Option<(Vec<u8>, String)> {
     };
     let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).ok()?;
     Some((bytes, ext.to_string()))
+}
+
+// ------------------------------------------------------------- HTML image externalisation
+
+/// Rewrite a finished HTML document so figure images live in an `img/` folder instead of
+/// inline `data:` URIs (the HTML analogue of Markdown's file mode). Returns the rewritten
+/// HTML plus the files to write. A raster `<img src="data:…">` keeps its tag with `src`
+/// repointed to `img/fig_NN_slug.ext`; an inline figure `<svg>…</svg>` is written out as
+/// `img/fig_NN_slug.svg` and replaced by an `<img>` referencing it. Naming matches
+/// [`html_to_markdown`] so the two formats produce the same `img/` filenames.
+pub fn externalize_images(html: &str) -> (String, Vec<ImageFile>) {
+    let nodes = parse(html);
+    let mut ctx = ExtCtx { fig_n: 0, files: Vec::new(), repls: Vec::new() };
+    ext_walk(&nodes, &mut ctx);
+    // Apply replacements in document order (each `from` — a unique data URI or the exact
+    // raw `<svg>` — is replaced once; the `to` never reintroduces a `from`).
+    let mut out = html.to_string();
+    for (from, to) in &ctx.repls {
+        out = out.replacen(from, to, 1);
+    }
+    (out, ctx.files)
+}
+
+struct ExtCtx {
+    fig_n: usize,
+    files: Vec<ImageFile>,
+    repls: Vec<(String, String)>,
+}
+
+fn ext_walk(nodes: &[Node], ctx: &mut ExtCtx) {
+    for n in nodes {
+        if let Node::Elem { tag, attrs, children, svg } = n {
+            match tag.as_str() {
+                "figure" => {
+                    ctx.fig_n += 1;
+                    let num = ctx.fig_n;
+                    let caption = figcaption_text(children);
+                    ext_graphic(children, &caption, num, ctx);
+                }
+                "img" => {
+                    ctx.fig_n += 1;
+                    let num = ctx.fig_n;
+                    if let Some(src) = attr(attrs, "src") {
+                        ext_raster(src, "", num, ctx);
+                    }
+                }
+                "svg" => {
+                    ctx.fig_n += 1;
+                    let num = ctx.fig_n;
+                    ext_svg(svg.as_deref().unwrap_or(""), "", num, ctx);
+                }
+                _ => ext_walk(children, ctx),
+            }
+        }
+    }
+}
+
+/// Externalise the first raster/svg graphic in a figure's children (its `<figcaption>` is
+/// skipped). Returns once a graphic is handled.
+fn ext_graphic(nodes: &[Node], caption: &str, num: usize, ctx: &mut ExtCtx) -> bool {
+    for n in nodes {
+        if let Node::Elem { tag, attrs, children, svg } = n {
+            match tag.as_str() {
+                "figcaption" => {}
+                "img" => {
+                    if let Some(src) = attr(attrs, "src") {
+                        ext_raster(src, caption, num, ctx);
+                        return true;
+                    }
+                }
+                "svg" => {
+                    ext_svg(svg.as_deref().unwrap_or(""), caption, num, ctx);
+                    return true;
+                }
+                _ => {
+                    if ext_graphic(children, caption, num, ctx) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn ext_raster(src: &str, caption: &str, num: usize, ctx: &mut ExtCtx) {
+    if let Some((bytes, ext)) = decode_data_uri(src) {
+        let path = fig_path(num, caption, &ext);
+        ctx.files.push(ImageFile { path: path.clone(), bytes });
+        // Repoint just the src value; the rest of the <img> tag is untouched.
+        ctx.repls.push((src.to_string(), path));
+    }
+}
+
+fn ext_svg(raw: &str, caption: &str, num: usize, ctx: &mut ExtCtx) {
+    if raw.is_empty() {
+        return;
+    }
+    let path = fig_path(num, caption, "svg");
+    ctx.files.push(ImageFile { path: path.clone(), bytes: raw.as_bytes().to_vec() });
+    ctx.repls.push((raw.to_string(), format!("<img src=\"{}\" alt=\"{}\" />", path, esc_attr(caption))));
+}
+
+fn figcaption_text(nodes: &[Node]) -> String {
+    for n in nodes {
+        if let Node::Elem { tag, children, .. } = n {
+            if tag == "figcaption" {
+                return plain_text(children).trim().to_string();
+            }
+            let t = figcaption_text(children);
+            if !t.is_empty() {
+                return t;
+            }
+        }
+    }
+    String::new()
+}
+
+fn esc_attr(s: &str) -> String {
+    s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;")
 }
 
 // -------------------------------------------------------------------------------- utils

@@ -1,5 +1,5 @@
 """The `distillpdf` command-line interface (distillpdf.cli): HTML/text/toc/section
-rendering, the --no-images placeholder, stdout vs -o file vs batch directory output,
+rendering, the --image-mode placeholder, stdout vs -o file vs batch directory output,
 and non-zero exit on bad input. Drives cli.main() in-process (no subprocess)."""
 import os
 
@@ -19,8 +19,8 @@ def test_html_to_stdout(capsys):
     assert out.startswith("<!doctype html>") and "</html>" in out
 
 
-def test_no_images_placeholder(capsys):
-    cli.main([FIGURES, "--no-images"])
+def test_image_mode_drop_placeholder(capsys):
+    cli.main([FIGURES, "--image-mode", "drop"])
     out = capsys.readouterr().out
     assert "data:image" not in out and "<img " not in out
     assert "<image 1>" in out

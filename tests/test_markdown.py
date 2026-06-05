@@ -68,20 +68,14 @@ def test_emphasis_converted():
 
 
 def test_figure_caption_is_alt_text():
-    """A figure's caption survives as the image alt text (placeholder mode by default)."""
+    """A figure's caption survives as the image alt text."""
     md = _md(FIGURES)
-    assert re.search(r"!\[[^\]]*\]\(#?[^)]*\)", md)  # an image with (possibly empty) alt
-
-
-def test_embed_svg_data_uri():
-    md = _md(FIGURES, embed_images=True)
-    # figures.pdf has vector figures → inlined as svg data URIs (or raster data URIs)
-    assert "](data:image/" in md
+    assert re.search(r"!\[[^\]]*\]\([^)]*\)", md)  # an image with (possibly empty) alt
 
 
 def test_file_extraction_paths_resolve(tmp_path):
     dest = tmp_path / "f.md"
-    distillpdf.Pdf.open(FIGURES).to_markdown(str(dest))
+    distillpdf.Pdf.open(FIGURES).to_markdown(str(dest), image_mode="external")
     md = dest.read_text(encoding="utf-8")
     refs = re.findall(r"\]\((img/[^)]+)\)", md)
     assert refs

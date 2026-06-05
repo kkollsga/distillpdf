@@ -30,6 +30,23 @@ fn parse_mode(mode: &str) -> PyResult<html::Mode> {
     }
 }
 
+/// Parse the `image_mode` string into a render strategy:
+/// * `"embed"` → inline base64 `data:` URIs (self-contained).
+/// * `"external"` → extract figures to an `img/` folder; only possible when writing to a
+///   file, so a returned string falls back to `string_fallback` (HTML uses `Embed` to stay
+///   self-contained; Markdown uses `Placeholder`, since inline data URIs are impractical).
+/// * `"drop"` → replace images with placeholder text.
+fn parse_image_mode(s: &str, writing: bool, string_fallback: markdown::ImgMode) -> PyResult<markdown::ImgMode> {
+    match s {
+        "embed" => Ok(markdown::ImgMode::Embed),
+        "drop" => Ok(markdown::ImgMode::Placeholder),
+        "external" => Ok(if writing { markdown::ImgMode::Files } else { string_fallback }),
+        other => Err(PyValueError::new_err(format!(
+            "invalid image_mode {other:?}: expected \"embed\", \"external\", or \"drop\""
+        ))),
+    }
+}
+
 /// A loaded PDF document.
 #[pyclass]
 struct Pdf {
@@ -73,6 +90,27 @@ impl Pdf {
                 .map(|s| s.with_extension(ext))
                 .ok_or_else(|| PyValueError::new_err("no source path (opened from_bytes); pass an explicit path")),
         }
+    }
+
+    /// Write the document `content` to `dest` plus any extracted figure files (relative
+    /// paths, e.g. `img/fig_01_x.png`) under `dest`'s directory. Returns the dest path.
+    fn write_doc(&self, dest: std::path::PathBuf, content: &str, files: &[markdown::ImageFile]) -> PyResult<String> {
+        // Create the destination directory if the caller pointed at a not-yet-existing folder.
+        if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|e| PyValueError::new_err(format!("mkdir failed: {e}")))?;
+        }
+        std::fs::write(&dest, content).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
+        if !files.is_empty() {
+            let dir = dest.parent().unwrap_or_else(|| std::path::Path::new("."));
+            for f in files {
+                let fp = dir.join(&f.path);
+                if let Some(parent) = fp.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| PyValueError::new_err(format!("mkdir failed: {e}")))?;
+                }
+                std::fs::write(&fp, &f.bytes).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
+            }
+        }
+        Ok(dest.to_string_lossy().into_owned())
     }
 }
 
@@ -167,21 +205,37 @@ impl Pdf {
     /// `.to_csv`. `outputfile=True` with no `path` derives the name from the PDF
     /// (`text.pdf` → `text.html`), which keeps bulk conversion to one line per file.
     ///
-    /// `mode` (`"section"` default / `"page"`) chooses the structure; `images=False`
-    /// emits `<image N>` placeholders instead of inline base64; `toc=False` drops the
+    /// `mode` (`"section"` default / `"page"`) chooses the structure; `toc=False` drops the
     /// `<nav>` table of contents.
+    ///
+    /// `image_mode` controls figures:
+    /// * `"embed"` (default) → inline base64 `data:` URIs — a single self-contained string
+    ///   or file.
+    /// * `"external"` → extract figures to an `img/` folder next to the HTML
+    ///   (`img/fig_NN_slug.ext`, vector figures as `.svg`) and reference them — small HTML,
+    ///   same `img/` layout as `to_markdown()`. (A returned string has no folder to write
+    ///   into, so it falls back to `"embed"`.)
+    /// * `"drop"` → `<image N>` placeholders, no image bytes.
     ///
     /// The conversion (which internally renders pages in parallel) runs with the GIL
     /// released, so converting many PDFs across Python threads scales across cores.
-    #[pyo3(signature = (path=None, outputfile=false, mode="section", images=true, toc=true))]
-    fn to_html(&self, py: Python<'_>, path: Option<&str>, outputfile: bool, mode: &str, images: bool, toc: bool) -> PyResult<String> {
-        let html = self.render(py, mode, images, toc)?;
-        if !(outputfile || path.is_some()) {
-            return Ok(html);
+    #[pyo3(signature = (path=None, outputfile=false, mode="section", toc=true, image_mode="embed"))]
+    fn to_html(&self, py: Python<'_>, path: Option<&str>, outputfile: bool, mode: &str, toc: bool, image_mode: &str) -> PyResult<String> {
+        let writing = outputfile || path.is_some();
+        // HTML string output stays self-contained, so `external` falls back to embedding.
+        let im = parse_image_mode(image_mode, writing, markdown::ImgMode::Embed)?;
+        // Placeholder renders `<image N>`; embed/external need the real image bytes.
+        let html = self.render(py, mode, !matches!(im, markdown::ImgMode::Placeholder), toc)?;
+        if !writing {
+            return Ok(html); // self-contained (embed) or placeholders (drop)
         }
         let dest = self.resolve_out_path(path, "html")?;
-        std::fs::write(&dest, html).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
-        Ok(dest.to_string_lossy().into_owned())
+        if matches!(im, markdown::ImgMode::Files) {
+            // Extract figures to img/ next to the file.
+            let (html, files) = py.allow_threads(|| markdown::externalize_images(&html));
+            return self.write_doc(dest, &html, &files);
+        }
+        self.write_doc(dest, &html, &[])
     }
 
     /// Convert the PDF to clean Markdown.
@@ -194,47 +248,28 @@ impl Pdf {
     /// (`text.pdf` → `text.md`) and return the path; otherwise the Markdown string is
     /// returned. `mode`/`toc` match `to_html()`.
     ///
-    /// Image handling:
-    /// * `images=False` → caption-only placeholders.
-    /// * `embed_images=True` → self-contained `data:` URIs (works for string output too).
-    /// * otherwise, when writing to a file, figures are extracted to an `img/` folder next
-    ///   to the `.md` (`img/fig_NN_slug.ext`) and referenced relatively; when returning a
-    ///   string they fall back to placeholders (there is no folder to write into).
-    #[pyo3(signature = (path=None, outputfile=false, mode="section", images=true, toc=true, embed_images=false))]
-    fn to_markdown(&self, py: Python<'_>, path: Option<&str>, outputfile: bool, mode: &str, images: bool, toc: bool, embed_images: bool) -> PyResult<String> {
+    /// `image_mode` controls figures (same values as `to_html()`, but defaulting to
+    /// `"external"` — inline `data:` URIs are impractical in Markdown):
+    /// * `"external"` (default) → extract figures to an `img/` folder next to the `.md`
+    ///   (`img/fig_NN_slug.ext`) and reference them; a returned string (no folder) falls
+    ///   back to caption-only placeholders.
+    /// * `"embed"` → inline `data:` URIs.
+    /// * `"drop"` → caption-only placeholders.
+    #[pyo3(signature = (path=None, outputfile=false, mode="section", toc=true, image_mode="external"))]
+    fn to_markdown(&self, py: Python<'_>, path: Option<&str>, outputfile: bool, mode: &str, toc: bool, image_mode: &str) -> PyResult<String> {
         let writing = outputfile || path.is_some();
-        // Pick the image strategy, and render the HTML accordingly (placeholder/embed only
-        // need the cheap `<image N>` HTML; file extraction needs the inline data URIs).
-        let img_mode = if !images {
-            markdown::ImgMode::Placeholder
-        } else if embed_images {
-            markdown::ImgMode::Embed
-        } else if writing {
-            markdown::ImgMode::Files
-        } else {
-            markdown::ImgMode::Placeholder
-        };
-        let need_bytes = matches!(img_mode, markdown::ImgMode::Embed | markdown::ImgMode::Files);
+        // Markdown string output can't externalise and shouldn't inline, so it drops to
+        // placeholders.
+        let im = parse_image_mode(image_mode, writing, markdown::ImgMode::Placeholder)?;
+        let need_bytes = matches!(im, markdown::ImgMode::Embed | markdown::ImgMode::Files);
         let html = self.render(py, mode, need_bytes, toc)?;
-        let (md, files) = py.allow_threads(|| markdown::html_to_markdown(&html, toc, img_mode));
+        let (md, files) = py.allow_threads(|| markdown::html_to_markdown(&html, toc, im));
 
         if !writing {
             return Ok(md);
         }
         let dest = self.resolve_out_path(path, "md")?;
-        std::fs::write(&dest, &md).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
-        // Write any extracted figure files under <dest-dir>/img/.
-        if !files.is_empty() {
-            let dir = dest.parent().unwrap_or_else(|| std::path::Path::new("."));
-            for f in &files {
-                let fp = dir.join(&f.path);
-                if let Some(parent) = fp.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| PyValueError::new_err(format!("mkdir failed: {e}")))?;
-                }
-                std::fs::write(&fp, &f.bytes).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
-            }
-        }
-        Ok(dest.to_string_lossy().into_owned())
+        self.write_doc(dest, &md, &files)
     }
 
     /// Document outline: a list of `(level, title, page, anchor_id)` per heading, in
@@ -267,10 +302,12 @@ impl Pdf {
     /// HTML of a single section: the heading matching `name` (its `sec-…` slug, an id
     /// prefix, or a case-insensitive title substring) plus its content up to the next
     /// same-or-higher heading. E.g. `section("abstract")`. None if no match. `mode` and
-    /// `images` match `to_html()`.
-    #[pyo3(signature = (name, mode="section", images=true))]
-    fn section(&self, py: Python<'_>, name: &str, mode: &str, images: bool) -> PyResult<Option<String>> {
+    /// `image_mode` match `to_html()` (the result is a string, so `"external"` behaves like
+    /// `"embed"`).
+    #[pyo3(signature = (name, mode="section", image_mode="embed"))]
+    fn section(&self, py: Python<'_>, name: &str, mode: &str, image_mode: &str) -> PyResult<Option<String>> {
         let mode = parse_mode(mode)?;
+        let images = !matches!(parse_image_mode(image_mode, false, markdown::ImgMode::Embed)?, markdown::ImgMode::Placeholder);
         // `html::section` resolves via the TOC nav, so build with it present.
         Ok(py.allow_threads(|| html::section(&html::to_html(&self.doc, &self.raw, mode, images, true), name)))
     }

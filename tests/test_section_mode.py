@@ -63,9 +63,9 @@ def test_nav_links_resolve_to_section_wrappers():
 
 
 def test_flags_compose_with_section_mode():
-    h = distillpdf.open(DEMO).to_html(images=False, toc=False)
+    h = distillpdf.open(DEMO).to_html(image_mode="drop", toc=False)
     assert "<nav>" not in h          # toc=False
-    assert "data:image" not in h     # images=False
+    assert "data:image" not in h     # image_mode="drop"
     assert '<section id="sec-' in h  # still section-structured
 
 
