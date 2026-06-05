@@ -50,7 +50,7 @@ def html_for(path):
     # Section-mode output is validated separately in test_section_mode.py.
     if path not in _HTML_CACHE:
         import distillpdf
-        _HTML_CACHE[path] = distillpdf.Pdf.open(path).to_html(mode="page")
+        _HTML_CACHE[path] = distillpdf.Pdf.open(path).to_html(mode="page", return_string=True)
     return _HTML_CACHE[path]
 
 

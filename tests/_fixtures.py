@@ -14,7 +14,7 @@ with open(os.path.join(FIX, "groundtruth.json")) as _f:
 def html(name):
     # Page mode: these fixture checks predate the section-mode default and assert the
     # per-page structure. Section mode has its own coverage in test_section_mode.py.
-    return distillpdf.Pdf.open(os.path.join(FIX, name)).to_html(mode="page")
+    return distillpdf.Pdf.open(os.path.join(FIX, name)).to_html(mode="page", return_string=True)
 
 
 def doc(name):

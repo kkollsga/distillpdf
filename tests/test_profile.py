@@ -25,7 +25,7 @@ def _heads(html):
 
 
 def test_distinct_font_heads_become_h2():
-    heads = _heads(distillpdf.Pdf.open(PDF).to_html(mode="section"))
+    heads = _heads(distillpdf.Pdf.open(PDF).to_html(mode="section", return_string=True))
     texts = {t for _, t in heads}
     for want in GT["section_heads"]:
         assert want in texts, f"{want!r} not detected as a heading; got {heads}"
@@ -36,13 +36,13 @@ def test_distinct_font_heads_become_h2():
 
 
 def test_title_is_single_h1():
-    html = distillpdf.Pdf.open(PDF).to_html(mode="section")
+    html = distillpdf.Pdf.open(PDF).to_html(mode="section", return_string=True)
     h1 = [t for tag, t in _heads(html) if tag == "h1"]
     assert h1 == [GT["title"]], h1
 
 
 def test_section_bodies_stay_paragraphs():
-    html = distillpdf.Pdf.open(PDF).to_html(mode="section")
+    html = distillpdf.Pdf.open(PDF).to_html(mode="section", return_string=True)
     assert GT["body_snippet"] in hc.plain(html)
     # the heading text must not be swallowed into a paragraph
     assert GT["section_heads"][0] not in [
@@ -52,5 +52,5 @@ def test_section_bodies_stay_paragraphs():
 
 def test_profile_heads_well_formed():
     for mode in ("section", "page"):
-        ok, errs = hc.well_formed(distillpdf.Pdf.open(PDF).to_html(mode=mode))
+        ok, errs = hc.well_formed(distillpdf.Pdf.open(PDF).to_html(mode=mode, return_string=True))
         assert ok, errs

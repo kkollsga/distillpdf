@@ -103,10 +103,11 @@ def main(argv=None):
                 dest = _out_path(src, args, multiple, _fmt(args, args.output))
                 fmt = _fmt(args, dest)
                 if dest is None:
+                    # stdout: get the rendered string (no file to write).
                     content = (
-                        doc.to_markdown(mode=args.mode, toc=args.include_toc, **img_kw)
+                        doc.to_markdown(mode=args.mode, toc=args.include_toc, return_string=True, **img_kw)
                         if fmt == "markdown"
-                        else doc.to_html(mode=args.mode, toc=args.include_toc, **img_kw)
+                        else doc.to_html(mode=args.mode, toc=args.include_toc, return_string=True, **img_kw)
                     )
                 else:
                     # Write directly through the library so img/ is extracted next to the file.

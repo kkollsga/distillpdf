@@ -20,6 +20,7 @@ FIGURES = os.path.join(FIX, "figures.pdf")
 
 
 def _md(path, **kw):
+    kw.setdefault("return_string", True)
     return distillpdf.Pdf.open(path).to_markdown(**kw)
 
 
@@ -88,7 +89,7 @@ def test_string_and_file_body_match(tmp_path):
     """Writing to a file and returning a string differ only in image handling — the prose
     (headings/paragraphs) is identical."""
     d = distillpdf.Pdf.open(HEADINGS)
-    s = d.to_markdown()
+    s = d.to_markdown(return_string=True)
     dest = tmp_path / "h.md"
     d.to_markdown(str(dest))
     # strip image lines from both, compare the rest

@@ -25,7 +25,7 @@ def _meta():
 
 
 def _header(mode="section"):
-    html = distillpdf.Pdf.open(PDF).to_html(mode=mode)
+    html = distillpdf.Pdf.open(PDF).to_html(mode=mode, return_string=True)
     m = re.search(r"<header>.*?</header>", html, re.DOTALL)
     return html, (m.group(0) if m else None)
 

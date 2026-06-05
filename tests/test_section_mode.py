@@ -19,19 +19,19 @@ IDS = [os.path.basename(p) for p in OWNED]
 
 
 def test_default_mode_is_section():
-    h = distillpdf.open(HEADINGS).to_html()  # no mode arg → section
+    h = distillpdf.open(HEADINGS).to_html(return_string=True)  # no mode arg → section
     assert '<section id="sec-' in h
     assert "data-page" not in h and 'id="page-' not in h
 
 
 def test_page_mode_opt_in():
-    h = distillpdf.open(HEADINGS).to_html(mode="page")
+    h = distillpdf.open(HEADINGS).to_html(mode="page", return_string=True)
     assert 'data-page="' in h and 'id="page-' in h
     assert '<section id="sec-' not in h  # page mode keeps the id on the heading
 
 
 def test_section_wrapper_carries_id_inner_bare():
-    h = distillpdf.open(DEMO).to_html()
+    h = distillpdf.open(DEMO).to_html(return_string=True)
     # the sec-… id sits on the <section>; the heading it wraps is bare
     m = re.search(r'<section id="sec-[^"]+">\s*<h\d\b([^>]*)>', h)
     assert m, "expected a <section id=…> directly wrapping its heading"
@@ -55,7 +55,7 @@ def test_section_returns_balanced_block():
 
 
 def test_nav_links_resolve_to_section_wrappers():
-    h = distillpdf.open(HEADINGS).to_html()
+    h = distillpdf.open(HEADINGS).to_html(return_string=True)
     hrefs = re.findall(r'<a href="#(sec-[^"]+)"', h)
     assert hrefs, "expected a section TOC with sec-… links"
     for href in hrefs:
@@ -63,7 +63,7 @@ def test_nav_links_resolve_to_section_wrappers():
 
 
 def test_flags_compose_with_section_mode():
-    h = distillpdf.open(DEMO).to_html(image_mode="drop", toc=False)
+    h = distillpdf.open(DEMO).to_html(image_mode="drop", toc=False, return_string=True)
     assert "<nav>" not in h          # toc=False
     assert "data:image" not in h     # image_mode="drop"
     assert '<section id="sec-' in h  # still section-structured
@@ -76,7 +76,7 @@ def test_invalid_mode_raises():
 
 @pytest.mark.parametrize("path", OWNED, ids=IDS)
 def test_section_mode_well_formed(path):
-    h = distillpdf.Pdf.open(path).to_html(mode="section")
+    h = distillpdf.Pdf.open(path).to_html(mode="section", return_string=True)
     ok, errs = hc.well_formed(h)
     assert ok, f"{os.path.basename(path)}: malformed section-mode HTML: {errs[:4]}"
     assert h.count("<section") == h.count("</section>"), "unbalanced <section> nesting"

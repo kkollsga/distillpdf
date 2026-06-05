@@ -23,7 +23,7 @@ with open(os.path.join(HERE, "demo", "demo_groundtruth.json")) as _f:
 
 
 def _html():
-    return distillpdf.Pdf.open(DEMO).to_html()
+    return distillpdf.Pdf.open(DEMO).to_html(return_string=True)
 
 
 def _text(html):
@@ -97,7 +97,7 @@ def test_platypus_reading_order():
     blocks to local coordinates and scrambles the page. Assert the sections come out
     intact and in top-to-bottom reading order."""
     gt = GT["platypus"]
-    t = _text(distillpdf.Pdf.open(PLATYPUS).to_html())
+    t = _text(distillpdf.Pdf.open(PLATYPUS).to_html(return_string=True))
     pos = []
     for sentence in gt["ordered"]:
         assert sentence in t, f"platypus block lost or scrambled: {sentence!r}"

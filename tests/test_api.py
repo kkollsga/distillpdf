@@ -27,17 +27,17 @@ def test_module_level_open():
     doc = distillpdf.open(HEADINGS)
     assert isinstance(doc, distillpdf.Pdf)
     assert doc.page_count() == 1
-    assert doc.to_html() == distillpdf.Pdf.open(HEADINGS).to_html()
+    assert doc.to_html(return_string=True) == distillpdf.Pdf.open(HEADINGS).to_html(return_string=True)
     with open(HEADINGS, "rb") as f:
         data = f.read()
-    assert distillpdf.from_bytes(data).to_html() == distillpdf.Pdf.from_bytes(data).to_html()
+    assert distillpdf.from_bytes(data).to_html(return_string=True) == distillpdf.Pdf.from_bytes(data).to_html(return_string=True)
 
 
 def test_from_bytes_matches_open():
     with open(HEADINGS, "rb") as f:
         data = f.read()
-    a = distillpdf.Pdf.from_bytes(data).to_html()
-    b = distillpdf.Pdf.open(HEADINGS).to_html()
+    a = distillpdf.Pdf.from_bytes(data).to_html(return_string=True)
+    b = distillpdf.Pdf.open(HEADINGS).to_html(return_string=True)
     assert a == b, "from_bytes() and open() produced different HTML"
 
 
@@ -104,13 +104,14 @@ def test_dbg_spans():
 
 
 def test_to_html_render_options():
-    """Rendering options live on to_html() (not open): mode/images/toc per call."""
+    """Rendering options live on to_html() (not open): mode/toc per call.
+    `return_string=True` returns the HTML instead of writing a file."""
     d = distillpdf.Pdf.open(HEADINGS)
-    assert d.to_html().startswith("<!doctype html>")
-    assert "data-page" not in d.to_html()          # section default
-    assert "data-page" in d.to_html(mode="page")    # page mode
-    assert "<nav>" not in d.to_html(toc=False)
-    assert d.to_html(mode="page") == d.to_html(mode="page")  # deterministic
+    assert d.to_html(return_string=True).startswith("<!doctype html>")
+    assert "data-page" not in d.to_html(return_string=True)          # section default
+    assert "data-page" in d.to_html(mode="page", return_string=True)  # page mode
+    assert "<nav>" not in d.to_html(toc=False, return_string=True)
+    assert d.to_html(mode="page", return_string=True) == d.to_html(mode="page", return_string=True)
 
 
 def test_open_takes_no_render_options():
@@ -120,29 +121,28 @@ def test_open_takes_no_render_options():
 
 
 def test_to_html_to_file(tmp_path):
-    """to_html(path=...) writes to a file: explicit path, directory, contents match the
-    string form; the no-write default still returns the HTML string."""
+    """to_html() writes a file by default and returns 1; an explicit path or directory
+    chooses the location, and the written content matches return_string=True."""
     d = distillpdf.Pdf.open(HEADINGS)
-    s = d.to_html()
-    assert s.startswith("<!doctype html>")  # no path → string
-    # explicit file path → returns the path written, contents match to_html()
+    s = d.to_html(return_string=True)
+    assert s.startswith("<!doctype html>")
+    # explicit file path → writes there, returns 1, content matches the string form
     dest = tmp_path / "out.html"
-    assert d.to_html(str(dest)) == str(dest)
+    assert d.to_html(str(dest)) == 1
     assert dest.read_text(encoding="utf-8") == s
     # directory → <source-stem>.html inside it
-    written = d.to_html(str(tmp_path))
-    assert written.endswith("headings.html") and os.path.dirname(written) == str(tmp_path)
+    assert d.to_html(str(tmp_path)) == 1
+    assert (tmp_path / "headings.html").exists()
     # options carry through
     d.to_html(str(dest), mode="page")
     assert "data-page" in dest.read_text(encoding="utf-8")
 
 
-def test_to_html_outputfile_derives_name(tmp_path):
-    """outputfile=True with no path writes <source>.html next to the PDF (bulk convenience)."""
+def test_to_html_default_writes_next_to_source(tmp_path):
+    """With no path, to_html() writes <source>.html next to the opened PDF and returns 1."""
     src = tmp_path / "doc.pdf"
     src.write_bytes(open(HEADINGS, "rb").read())
-    written = distillpdf.Pdf.open(str(src)).to_html(outputfile=True)
-    assert written == str(tmp_path / "doc.html")
+    assert distillpdf.Pdf.open(str(src)).to_html() == 1
     assert (tmp_path / "doc.html").read_text(encoding="utf-8").startswith("<!doctype html>")
 
 
@@ -150,26 +150,26 @@ def test_to_html_from_bytes_needs_path(tmp_path):
     with open(HEADINGS, "rb") as f:
         d = distillpdf.from_bytes(f.read())
     with pytest.raises(Exception):
-        d.to_html(outputfile=True)  # no source path to derive a name
+        d.to_html()  # no source path to derive a name, and not return_string
+    assert d.to_html(return_string=True).startswith("<!doctype html>")  # string is fine
     dest = tmp_path / "b.html"
-    assert d.to_html(str(dest)) == str(dest)
+    assert d.to_html(str(dest)) == 1
 
 
 def test_to_markdown_string_placeholders():
-    """to_markdown() with no path returns a string; images are caption-only placeholders
-    (no data: URIs), headings/tables become Markdown."""
-    md = distillpdf.Pdf.open(HEADINGS).to_markdown()
+    """to_markdown(return_string=True) returns a string; images are caption-only
+    placeholders (no data: URIs), headings/tables become Markdown."""
+    md = distillpdf.Pdf.open(HEADINGS).to_markdown(return_string=True)
     assert isinstance(md, str) and md.strip()
     assert "](data:" not in md          # no inline bytes for string output
     assert md.lstrip().startswith(("#", "-"))  # heading or TOC list, not HTML
 
 
 def test_to_markdown_to_file_extracts_images(tmp_path):
-    """to_markdown(image_mode="external") to a file writes the .md plus an img/ folder of
-    figure files, referenced relatively."""
+    """to_markdown() to a file (external by default) writes the .md plus an img/ folder of
+    figure files, referenced relatively, and returns 1."""
     dest = tmp_path / "fig.md"
-    written = distillpdf.Pdf.open(FIGURES).to_markdown(str(dest), image_mode="external")
-    assert written == str(dest)
+    assert distillpdf.Pdf.open(FIGURES).to_markdown(str(dest)) == 1
     md = dest.read_text(encoding="utf-8")
     imgdir = tmp_path / "img"
     assert imgdir.is_dir() and any(imgdir.iterdir()), "no img/ files written"
@@ -182,7 +182,7 @@ def test_to_markdown_to_file_extracts_images(tmp_path):
 
 
 def test_to_markdown_drop_placeholders():
-    md = distillpdf.Pdf.open(FIGURES).to_markdown(image_mode="drop")
+    md = distillpdf.Pdf.open(FIGURES).to_markdown(image_mode="drop", return_string=True)
     assert "](data:" not in md  # never any image bytes
 
 
@@ -195,12 +195,11 @@ def test_to_html_external_images(tmp_path):
     """to_html(image_mode="external") extracts figures to an img/ folder and references them,
     instead of inlining base64 — a much smaller file."""
     d = distillpdf.Pdf.open(FIGURES)
-    inline = d.to_html()  # default embed → self-contained / inline
+    inline = d.to_html(return_string=True)  # default embed → self-contained / inline
     assert "data:image" in inline
 
     dest = tmp_path / "fig.html"
-    written = d.to_html(str(dest), image_mode="external")
-    assert written == str(dest)
+    assert d.to_html(str(dest), image_mode="external") == 1
     h = dest.read_text(encoding="utf-8")
     assert "data:image" not in h          # nothing inlined
     assert "<svg" not in h                # vector figures externalised to .svg files
@@ -215,7 +214,7 @@ def test_to_html_string_is_self_contained(tmp_path):
     """A returned string has no folder to write into, so it stays self-contained (inline)
     and creates no img/ folder."""
     d = distillpdf.Pdf.open(FIGURES)
-    h = d.to_html()  # no path → string
+    h = d.to_html(return_string=True)
     assert "data:image" in h
     assert not (tmp_path / "img").exists()
 
@@ -224,7 +223,7 @@ def test_to_html_default_embed_to_file(tmp_path):
     """The default image_mode is embed: writing to a file gives one self-contained .html
     (inline images, no img/ folder)."""
     dest = tmp_path / "e.html"
-    distillpdf.Pdf.open(FIGURES).to_html(str(dest))
+    assert distillpdf.Pdf.open(FIGURES).to_html(str(dest)) == 1
     assert "data:image" in dest.read_text(encoding="utf-8")
     assert not (tmp_path / "img").exists()
 
@@ -250,8 +249,8 @@ def test_to_html_and_markdown_share_img_layout(tmp_path):
 def test_images_drop_emits_placeholder():
     """image_mode="drop" drops inline base64 images and replaces each with a
     `<image N>` placeholder, while keeping the surrounding <figure>/caption."""
-    on = distillpdf.Pdf.open(FIGURES).to_html()
-    off = distillpdf.Pdf.open(FIGURES).to_html(image_mode="drop")
+    on = distillpdf.Pdf.open(FIGURES).to_html(return_string=True)
+    off = distillpdf.Pdf.open(FIGURES).to_html(image_mode="drop", return_string=True)
     assert "data:image" in on and "<img " in on, "fixture expected to inline an image"
     assert "data:image" not in off and "<img " not in off, 'image_mode="drop" still inlined an image'
     assert "<image 1>" in off, "expected a numbered <image N> placeholder"
@@ -263,8 +262,8 @@ def test_toc_false_omits_nav_but_keeps_anchors():
     """to_html(toc=False) drops the <nav> table of contents while keeping heading id
     anchors — so links and toc()/section() still resolve."""
     d = distillpdf.Pdf.open(HEADINGS)
-    on = d.to_html()
-    off = d.to_html(toc=False)
+    on = d.to_html(return_string=True)
+    off = d.to_html(toc=False, return_string=True)
     assert "<nav>" in on, "fixture expected to produce a TOC"
     assert "<nav>" not in off, "toc=False still emitted a <nav>"
     # heading anchors survive (so #sec-… links and section() keep working)

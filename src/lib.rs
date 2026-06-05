@@ -36,6 +36,12 @@ fn parse_mode(mode: &str) -> PyResult<html::Mode> {
 ///   file, so a returned string falls back to `string_fallback` (HTML uses `Embed` to stay
 ///   self-contained; Markdown uses `Placeholder`, since inline data URIs are impractical).
 /// * `"drop"` → replace images with placeholder text.
+/// The success sentinel returned by the file-writing methods: Python `int` 1.
+fn ok_one(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    use pyo3::IntoPyObject;
+    Ok(1i64.into_pyobject(py).unwrap().into_any().unbind())
+}
+
 fn parse_image_mode(s: &str, writing: bool, string_fallback: markdown::ImgMode) -> PyResult<markdown::ImgMode> {
     match s {
         "embed" => Ok(markdown::ImgMode::Embed),
@@ -200,17 +206,17 @@ impl Pdf {
 
     /// Convert the PDF to thin, AI-ready HTML.
     ///
-    /// By default returns the HTML as a string. Pass `path` (a file or a directory) or set
-    /// `outputfile=True` to write to disk instead and return the path written — like pandas'
-    /// `.to_csv`. `outputfile=True` with no `path` derives the name from the PDF
-    /// (`text.pdf` → `text.html`), which keeps bulk conversion to one line per file.
+    /// By default this **writes a file and returns `1`** on success — `path` if given
+    /// (a file, or a directory to place `<source-stem>.html` in), otherwise `<source>.html`
+    /// next to the opened PDF (`text.pdf` → `text.html`). Set `return_string=True` to get
+    /// the HTML back as a string instead (and write nothing).
     ///
     /// `mode` (`"section"` default / `"page"`) chooses the structure; `toc=False` drops the
     /// `<nav>` table of contents.
     ///
     /// `image_mode` controls figures:
-    /// * `"embed"` (default) → inline base64 `data:` URIs — a single self-contained string
-    ///   or file.
+    /// * `"embed"` (default) → inline base64 `data:` URIs — a single self-contained file (or
+    ///   string).
     /// * `"external"` → extract figures to an `img/` folder next to the HTML
     ///   (`img/fig_NN_slug.ext`, vector figures as `.svg`) and reference them — small HTML,
     ///   same `img/` layout as `to_markdown()`. (A returned string has no folder to write
@@ -219,23 +225,24 @@ impl Pdf {
     ///
     /// The conversion (which internally renders pages in parallel) runs with the GIL
     /// released, so converting many PDFs across Python threads scales across cores.
-    #[pyo3(signature = (path=None, outputfile=false, mode="section", toc=true, image_mode="embed"))]
-    fn to_html(&self, py: Python<'_>, path: Option<&str>, outputfile: bool, mode: &str, toc: bool, image_mode: &str) -> PyResult<String> {
-        let writing = outputfile || path.is_some();
-        // HTML string output stays self-contained, so `external` falls back to embedding.
-        let im = parse_image_mode(image_mode, writing, markdown::ImgMode::Embed)?;
+    #[pyo3(signature = (path=None, return_string=false, mode="section", toc=true, image_mode="embed"))]
+    fn to_html(&self, py: Python<'_>, path: Option<&str>, return_string: bool, mode: &str, toc: bool, image_mode: &str) -> PyResult<Py<PyAny>> {
+        // Writing to disk is the default; `return_string=True` returns the HTML instead.
+        let im = parse_image_mode(image_mode, !return_string, markdown::ImgMode::Embed)?;
         // Placeholder renders `<image N>`; embed/external need the real image bytes.
         let html = self.render(py, mode, !matches!(im, markdown::ImgMode::Placeholder), toc)?;
-        if !writing {
-            return Ok(html); // self-contained (embed) or placeholders (drop)
+        if return_string {
+            return Ok(pyo3::types::PyString::new(py, &html).into_any().unbind());
         }
         let dest = self.resolve_out_path(path, "html")?;
         if matches!(im, markdown::ImgMode::Files) {
             // Extract figures to img/ next to the file.
             let (html, files) = py.allow_threads(|| markdown::externalize_images(&html));
-            return self.write_doc(dest, &html, &files);
+            self.write_doc(dest, &html, &files)?;
+        } else {
+            self.write_doc(dest, &html, &[])?;
         }
-        self.write_doc(dest, &html, &[])
+        ok_one(py)
     }
 
     /// Convert the PDF to clean Markdown.
@@ -244,9 +251,9 @@ impl Pdf {
     /// processor improvement flows in automatically — there is no separate Markdown
     /// renderer to maintain.
     ///
-    /// File output works exactly like `to_html()`: `path` / `outputfile=True` write to disk
-    /// (`text.pdf` → `text.md`) and return the path; otherwise the Markdown string is
-    /// returned. `mode`/`toc` match `to_html()`.
+    /// File output works exactly like `to_html()`: by default it **writes** `<source>.md`
+    /// (or `path`) and returns `1`; `return_string=True` returns the Markdown string.
+    /// `mode`/`toc` match `to_html()`.
     ///
     /// `image_mode` controls figures (same values as `to_html()`, but defaulting to
     /// `"external"` — inline `data:` URIs are impractical in Markdown):
@@ -255,21 +262,21 @@ impl Pdf {
     ///   back to caption-only placeholders.
     /// * `"embed"` → inline `data:` URIs.
     /// * `"drop"` → caption-only placeholders.
-    #[pyo3(signature = (path=None, outputfile=false, mode="section", toc=true, image_mode="external"))]
-    fn to_markdown(&self, py: Python<'_>, path: Option<&str>, outputfile: bool, mode: &str, toc: bool, image_mode: &str) -> PyResult<String> {
-        let writing = outputfile || path.is_some();
+    #[pyo3(signature = (path=None, return_string=false, mode="section", toc=true, image_mode="external"))]
+    fn to_markdown(&self, py: Python<'_>, path: Option<&str>, return_string: bool, mode: &str, toc: bool, image_mode: &str) -> PyResult<Py<PyAny>> {
         // Markdown string output can't externalise and shouldn't inline, so it drops to
         // placeholders.
-        let im = parse_image_mode(image_mode, writing, markdown::ImgMode::Placeholder)?;
+        let im = parse_image_mode(image_mode, !return_string, markdown::ImgMode::Placeholder)?;
         let need_bytes = matches!(im, markdown::ImgMode::Embed | markdown::ImgMode::Files);
         let html = self.render(py, mode, need_bytes, toc)?;
         let (md, files) = py.allow_threads(|| markdown::html_to_markdown(&html, toc, im));
 
-        if !writing {
-            return Ok(md);
+        if return_string {
+            return Ok(pyo3::types::PyString::new(py, &md).into_any().unbind());
         }
         let dest = self.resolve_out_path(path, "md")?;
-        self.write_doc(dest, &md, &files)
+        self.write_doc(dest, &md, &files)?;
+        ok_one(py)
     }
 
     /// Document outline: a list of `(level, title, page, anchor_id)` per heading, in

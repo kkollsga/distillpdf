@@ -63,21 +63,21 @@ import distillpdf
 
 doc = distillpdf.open("paper.pdf")        # or distillpdf.from_bytes(data)
 
-html     = doc.to_html()                  # self-contained HTML string (inline images)
-md       = doc.to_markdown()              # ...or Markdown (built from the same HTML)
+# By default, these WRITE a file and return 1 (deriving the name from the PDF):
+doc.to_html()                             # → paper.html  (one self-contained file)
+doc.to_markdown()                         # → paper.md  + an img/ folder of figures
+doc.to_html("out.html")                   # ...or to a specific path / directory
+doc.to_html("out.html", image_mode="external")  # ...lean HTML + an img/ folder
 
-# write straight to a file (like pandas .to_csv) — returns the path written:
-doc.to_html("out.html")                   # one self-contained file (images embedded)
-doc.to_html(outputfile=True)              # <source>.html next to the PDF
-doc.to_html("out.html", image_mode="external")  # ...or lean HTML + an img/ folder
-doc.to_markdown("out.md")                 # out.md + an img/ folder of extracted figures
-doc.to_markdown(outputfile=True)          # <source>.md (handy for bulk runs)
+# Pass return_string=True to get the rendered text back instead of writing:
+html = doc.to_html(return_string=True)    # self-contained HTML string (inline images)
+md   = doc.to_markdown(return_string=True) # ...or Markdown (built from the same HTML)
 
 # rendering options work the same on both:
 doc.to_html(mode="page", toc=False)
 text     = doc.extract_text()             # plain text, in reading order
 toc      = doc.toc()                      # [(level, title, page, anchor_id), ...]
-abstract = doc.section("abstract")        # targeted section extraction
+abstract = doc.section("abstract")        # targeted section extraction (returns a string)
 ```
 
 ### Markdown
@@ -111,7 +111,7 @@ By default, **logical sections are first-order**: every heading becomes its own 
 chunking), and page numbers are dropped.
 
 ```python
-distillpdf.open("paper.pdf").to_html()
+distillpdf.open("paper.pdf").to_html(return_string=True)
 # <section id="sec-abstract"><h2>Abstract</h2><p>…</p></section>
 
 distillpdf.open("paper.pdf").section("methods")   # → the <section id="sec-methods"> block
@@ -121,14 +121,14 @@ Pass `mode="page"` for the page-faithful structure instead — each page wrapped
 `<section data-page="N" id="page-N">`, with page numbers in the TOC:
 
 ```python
-distillpdf.open("paper.pdf").to_html(mode="page")
+distillpdf.open("paper.pdf").to_html(mode="page", return_string=True)
 ```
 
 Want compact, text-only output? `image_mode="drop"` replaces each embedded image with a
 lightweight `<image N>` placeholder (captions and figure anchors are kept):
 
 ```python
-distillpdf.open("paper.pdf").to_html(image_mode="drop")
+distillpdf.open("paper.pdf").to_html(image_mode="drop", return_string=True)
 # <figure id="fig-1"><image 1><figcaption>…</figcaption></figure>
 ```
 
@@ -136,7 +136,7 @@ Pass `toc=False` to skip the auto table-of-contents `<nav>` (heading anchors are
 emitted, so `#section` links and `doc.section(...)` keep working):
 
 ```python
-distillpdf.open("paper.pdf").to_html(toc=False)
+distillpdf.open("paper.pdf").to_html(toc=False, return_string=True)
 ```
 
 ### Rendering options
@@ -147,8 +147,8 @@ actually extracted:
 
 | Option | Default | Effect |
 |---|---|---|
-| `path=` | `None` | a file (or directory) to write to; `None` returns the string. Returns the path written |
-| `outputfile=` | `False` | `True` writes `<source>.html` / `<source>.md` next to the PDF (no `path` needed) — for bulk runs |
+| `path=` | `None` | where to write: a file, or a directory to place `<source-stem>.html`/`.md` in. `None` writes `<source>.html`/`.md` next to the PDF. (Ignored when `return_string=True`.) |
+| `return_string=` | `False` | `True` returns the rendered string and writes nothing; the default writes a file and returns `1` |
 | `mode=` | `"section"` | `"page"` wraps each page in `<section data-page="N">` and numbers TOC entries; the default groups content into nested `<section id="sec-…">` and drops page info |
 | `image_mode=` | `"embed"` | `"embed"` inline `data:` URIs (self-contained); `"external"` an `img/` folder (when writing to a file); `"drop"` placeholder text |
 | `toc=` | `True` | `False` omits the `<nav>` table of contents (section/heading anchors still emitted) |
