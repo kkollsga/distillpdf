@@ -834,22 +834,26 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
     let area = (w * h).max(1.0);
     let mut plot: Option<(f32, f32, f32, f32)> = None;
     // SVG <clipPath> definitions for paths drawn under a PDF clip (a plot's reference curves
-    // clipped to the axes box). Deduped per distinct rect; ids are namespaced by the figure
-    // origin so they stay unique across every figure in the page's HTML.
-    let id_prefix = format!("{}_{}", x0 as i32, y1 as i32);
+    // clipped to the axes box). The id is derived from the clip's own figure-LOCAL geometry
+    // so that `same id ⟺ same <rect>`. This is what keeps clipping correct once the whole
+    // document is assembled: ids must be globally unique, but every figure shares the same
+    // page content origin, so an origin- or index-based id collides across figures — and the
+    // doc-wide `dedup_ids` pass then renames the colliding `id=` WITHOUT touching the
+    // `clip-path="url(#…)"` reference, silently breaking the clip. A geometry-keyed id avoids
+    // that: distinct clips get distinct ids (no rename), and any genuinely identical clip
+    // that does get renamed still resolves to a clipPath with an identical rect.
     let mut clip_defs = String::new();
-    let mut clip_ids: Vec<((i32, i32, i32, i32), String)> = Vec::new();
+    let mut clip_ids: Vec<(i32, i32, i32, i32)> = Vec::new();
     let mut clip_id_for = |c: (f32, f32, f32, f32), defs: &mut String| -> String {
         // page space -> figure-local (y flipped): a clip rect (cx0,cy0,cx1,cy1).
         let (lx, lw_) = (c.0 - x0, (c.2 - c.0).max(0.0));
         let (ly, lh_) = (y1 - c.3, (c.3 - c.1).max(0.0));
         let key = ((lx * 4.0) as i32, (ly * 4.0) as i32, (lw_ * 4.0) as i32, (lh_ * 4.0) as i32);
-        if let Some((_, id)) = clip_ids.iter().find(|(k, _)| *k == key) {
-            return id.clone();
+        let id = format!("clip_{}_{}_{}_{}", key.0, key.1, key.2, key.3);
+        if !clip_ids.contains(&key) {
+            defs.push_str(&format!("<clipPath id=\"{}\"><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/></clipPath>", id, fmt(lx), fmt(ly), fmt(lw_), fmt(lh_)));
+            clip_ids.push(key);
         }
-        let id = format!("c{}_{}", id_prefix, clip_ids.len());
-        defs.push_str(&format!("<clipPath id=\"{}\"><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/></clipPath>", id, fmt(lx), fmt(ly), fmt(lw_), fmt(lh_)));
-        clip_ids.push((key, id.clone()));
         id
     };
     let mut paths = String::new();

@@ -2446,6 +2446,19 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
         let in_prose = |x: f32, y: f32| {
             prose_rows.iter().any(|&(x0, x1, y0, y1)| x >= x0 - 2.0 && x <= x1 + 2.0 && y >= y0 && y <= y1)
         };
+        // A figure caption ("Figure N …", "Table N …") sits just outside the figure ink,
+        // within `near_fig_label`'s margin. Its numeric fragments (the "5.6"/"-" in
+        // "Figure 5.6: …") otherwise read as axis ticks and get scooped INTO the SVG — and
+        // duplicated, since the caption is also emitted normally. Exclude any span on a
+        // caption line from figure-label capture.
+        let caption_bands: Vec<(f32, f32, f32, f32)> = lines
+            .iter()
+            .filter(|l| caption_label(&l.text()).is_some())
+            .map(|l| (l.x0, l.x1, l.y - 1.0, l.y + l.size + 1.0))
+            .collect();
+        let in_caption = |x: f32, y: f32| {
+            caption_bands.iter().any(|&(x0, x1, y0, y1)| x >= x0 - 2.0 && x <= x1 + 2.0 && y >= y0 && y <= y1)
+        };
         // Render the figures' text as SVG <text>: a figure's labels are drawn either
         // inside its Form XObject (form_text_spans) OR directly in the page content
         // within the figure's bbox (DAG node labels, plot axis ticks) — both are
@@ -2455,12 +2468,15 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
             let mk = |s: text::Span| vector::LabelSpan { x: s.x, y: s.y, size: s.size, width: s.width, text: s.text, bold: s.bold, italic: s.italic, angle: s.angle };
             let mut labels: Vec<vector::LabelSpan> = text::form_text_spans(doc, *_pid, raw)
                 .into_iter()
-                .filter(|s| !in_prose(s.x + s.width * 0.5, s.y + s.size * 0.5))
+                .filter(|s| {
+                    let (cx, cy) = (s.x + s.width * 0.5, s.y + s.size * 0.5);
+                    !in_prose(cx, cy) && !in_caption(cx, cy)
+                })
                 .map(mk)
                 .collect();
             for s in spans {
                 let (cx, cy) = (s.x + s.width * 0.5, s.y + s.size * 0.5);
-                if (in_figure(cx, cy) || near_fig_label(cx, cy, s.size, &s.text)) && !in_prose(cx, cy) {
+                if (in_figure(cx, cy) || near_fig_label(cx, cy, s.size, &s.text)) && !in_prose(cx, cy) && !in_caption(cx, cy) {
                     labels.push(mk(clone_span(s)));
                 }
             }
