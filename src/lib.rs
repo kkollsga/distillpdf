@@ -9,9 +9,11 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 mod extract;
+mod frontmatter;
 mod html;
 mod img;
 mod links;
+mod profile;
 mod text;
 mod vector;
 use pyo3::types::{PyDict, PyList};
@@ -218,6 +220,28 @@ impl Pdf {
         let mode = parse_mode(mode)?;
         // `html::section` resolves via the TOC nav, so build with it present.
         Ok(py.allow_threads(|| html::section(&html::to_html(&self.doc, &self.raw, mode, images, true), name)))
+    }
+
+    /// Structured front-matter of an academic paper, parsed from page 1:
+    /// `{title:str, authors:[{name:str, affiliation:str|None}], abstract:str|None,
+    /// keywords:[str]}`. Fields are empty/None when not detected. Authors are linked to
+    /// their organisation via the affiliation superscript markers.
+    fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let fm = py.allow_threads(|| html::extract_front_matter(&self.doc, &self.raw));
+        let d = PyDict::new(py);
+        d.set_item("title", fm.title)?;
+        let authors = PyList::empty(py);
+        for a in fm.authors {
+            let ad = PyDict::new(py);
+            ad.set_item("name", a.name)?;
+            ad.set_item("affiliation", a.affiliation)?;
+            authors.append(ad)?;
+        }
+        d.set_item("authors", authors)?;
+        d.set_item("affiliations", fm.affiliations)?;
+        d.set_item("abstract", fm.abstract_text)?;
+        d.set_item("keywords", fm.keywords)?;
+        Ok(d)
     }
 
     /// Diagnostic: force our ToUnicode extractor for all pages (eval only).

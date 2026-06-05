@@ -95,7 +95,7 @@ def row_cells(table, tag):
 class _Balance(HTMLParser):
     BLOCK = {"html", "body", "section", "table", "tr", "td", "th", "ul", "ol", "li",
              "h1", "h2", "h3", "h4", "h5", "h6", "p", "b", "i", "pre", "code",
-             "figure", "figcaption", "nav", "a", "sub", "sup", "aside"}
+             "figure", "figcaption", "nav", "a", "sub", "sup", "aside", "header", "span"}
     VOID = {"img", "br", "hr", "meta"}
 
     def __init__(self):

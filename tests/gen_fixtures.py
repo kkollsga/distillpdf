@@ -502,6 +502,95 @@ def gen_math():
     }
 
 
+# -------------------------------------------------------------------------- frontmatter
+def gen_frontmatter():
+    """An academic-paper first page: a large title, an author line with SUPERSCRIPT
+    affiliation markers, NUMBERED affiliation lines (plus an interleaved e-mail), an
+    ``Abstract:`` block and a ``Keywords:`` line, then a numbered body section. Exercises
+    the front-matter <header> + metadata() path: title/authors+orgs/abstract/keywords are
+    pulled into <header> (authors linked to their organisation), the e-mail is dropped,
+    and the numbered section stays in the body."""
+    pdf = os.path.join(OUT, "frontmatter.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    c.setFont("Helvetica-Bold", 17)
+    c.drawCentredString(PAGE_W / 2, PAGE_H - 80, "A Study of Example Phenomena in Test Documents")
+    y = PAGE_H - 112
+    # author line with superscript affiliation markers (text rise keeps them on the line)
+    def author(t, name, mark):
+        t.setFont("Helvetica", 11)
+        t.textOut(name)
+        t.setRise(4)
+        t.setFont("Helvetica", 7)
+        t.textOut(mark)
+        t.setRise(0)
+    t = c.beginText(LM, y)
+    author(t, "A. B. First", "1")
+    t.setFont("Helvetica", 11); t.textOut(", ")
+    author(t, "C. D. Second", "2")
+    t.setFont("Helvetica", 11); t.textOut(", ")
+    author(t, "E. F. Third", "1")
+    c.drawText(t)
+    y -= LEAD + 6
+    c.setFont("Helvetica", 10)
+    c.drawString(LM, y, "1 University of Example, Example City, Exampleland"); y -= 12
+    c.drawString(LM, y, "2 Institute of Testing, Test Town, Testland"); y -= 12
+    c.drawString(LM, y, "(e-mail: first@example.edu)"); y -= 20
+    abstract = ("Abstract: This paper presents a self-contained academic-style fixture used to "
+                "verify front-matter extraction. It states a goal, summarises a method, and "
+                "reports a result in ordinary prose so the abstract is captured as a single "
+                "block separate from the body that follows it.")
+    y = para(c, abstract, y, size=9.5, gap=6)
+    y = para(c, "Keywords: testing, extraction, metadata, fixtures", y, size=9.5, gap=12)
+    y = heading(c, "1 Introduction", y)
+    y = para(c, "The introduction is ordinary body prose under a numbered section heading and "
+                "must remain in the body, not the header.", y)
+    c.showPage()
+    c.save()
+    GT["frontmatter.pdf"] = {
+        "title": "A Study of Example Phenomena in Test Documents",
+        "authors": [
+            {"name": "A. B. First", "affiliation_contains": "University of Example"},
+            {"name": "C. D. Second", "affiliation_contains": "Institute of Testing"},
+            {"name": "E. F. Third", "affiliation_contains": "University of Example"},
+        ],
+        "abstract_contains": "verify front-matter extraction",
+        "keywords": ["testing", "extraction", "metadata", "fixtures"],
+        "body_contains": "ordinary body prose under a numbered section",
+        "email_fragment": "first@example.edu",
+    }
+
+
+# ----------------------------------------------------------------- profile-driven heads
+def gen_profile_heads():
+    """Section headers set in a DISTINCT, non-bold font only slightly larger than body
+    (≈1.14× — below the old fixed 1.18× ratio gate) and NOT flagged bold. The fixed-
+    threshold detector misses these; the document style profile recognises the heading
+    face from the size·font cluster and promotes them to <h2>. Body is Helvetica; the
+    title is large bold Helvetica; section heads are Times-Roman 12 over a 10.5 body."""
+    pdf = os.path.join(OUT, "profile_heads.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    c.setFont("Helvetica-Bold", 18)
+    c.drawCentredString(PAGE_W / 2, PAGE_H - 80, "Profile Driven Heading Detection")
+    y = PAGE_H - 120
+    heads = ["Background and Motivation", "Method and Materials", "Results and Discussion"]
+    for hd in heads:
+        # heading: Times-Roman 12 (distinct font, non-bold, 1.14x of the 10.5 body)
+        c.setFont("Times-Roman", 12)
+        c.drawString(LM, y, hd)
+        y -= 18
+        y = para(c, "This section body is ordinary Helvetica prose at the body size, set "
+                    "below a heading whose only cue is a distinct font slightly larger than "
+                    "body — no bold, no numbering — which the style profile must catch.", y)
+        y -= 6
+    c.showPage()
+    c.save()
+    GT["profile_heads.pdf"] = {
+        "title": "Profile Driven Heading Detection",
+        "section_heads": heads,
+        "body_snippet": "ordinary Helvetica prose at the body size",
+    }
+
+
 # ---------------------------------------------------------------------------- numeric
 def gen_numeric():
     """A borderless numeric table for word-span granularity (no span may pack >1 numeric
@@ -546,6 +635,8 @@ def main():
     gen_twocol()
     gen_math()
     gen_numeric()
+    gen_frontmatter()
+    gen_profile_heads()
     with open(os.path.join(OUT, "groundtruth.json"), "w") as f:
         json.dump(GT, f, indent=2)
     print(f"generated {len(GT)} fixture PDFs + groundtruth.json -> {OUT}")

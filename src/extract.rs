@@ -214,6 +214,7 @@ fn clone_span(s: &Span) -> Span {
         italic: s.italic,
         mono: s.mono,
         angle: s.angle,
+        font: s.font,
     }
 }
 
@@ -226,7 +227,7 @@ fn clone_span(s: &Span) -> Span {
 /// caller can treat each side completely independently. A page where a wide
 /// element (a spanning figure/table) sits across the centre has no clean gutter,
 /// returns None, and is handled whole.
-fn central_gutter(spans: &[Span]) -> Option<f32> {
+pub(crate) fn central_gutter(spans: &[Span]) -> Option<f32> {
     let rows = rows_of(spans.iter().map(clone_span).collect());
     if rows.len() < 6 {
         return None;

@@ -167,5 +167,40 @@
       "92.3",
       "0.12"
     ]
+  },
+  "frontmatter.pdf": {
+    "title": "A Study of Example Phenomena in Test Documents",
+    "authors": [
+      {
+        "name": "A. B. First",
+        "affiliation_contains": "University of Example"
+      },
+      {
+        "name": "C. D. Second",
+        "affiliation_contains": "Institute of Testing"
+      },
+      {
+        "name": "E. F. Third",
+        "affiliation_contains": "University of Example"
+      }
+    ],
+    "abstract_contains": "verify front-matter extraction",
+    "keywords": [
+      "testing",
+      "extraction",
+      "metadata",
+      "fixtures"
+    ],
+    "body_contains": "ordinary body prose under a numbered section",
+    "email_fragment": "first@example.edu"
+  },
+  "profile_heads.pdf": {
+    "title": "Profile Driven Heading Detection",
+    "section_heads": [
+      "Background and Motivation",
+      "Method and Materials",
+      "Results and Discussion"
+    ],
+    "body_snippet": "ordinary Helvetica prose at the body size"
   }
 }

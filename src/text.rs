@@ -27,6 +27,30 @@ struct FontInfo {
     bold: bool,
     italic: bool,
     mono: bool,
+    /// Stable id of the font face (FNV-1a hash of the BaseFont name with its 6-char
+    /// subset prefix stripped). 0 = unknown. Lets the style profile tell a heading face
+    /// from the body face when they share a size but differ in font.
+    font_id: u32,
+}
+
+/// FNV-1a hash of a font's BaseFont name, ignoring any `ABCDEF+` subset prefix, so the
+/// same logical face subsetted differently across pages hashes the same. 0 = empty.
+fn font_id_of(basefont: &str) -> u32 {
+    let b = basefont.as_bytes();
+    let start = if b.len() >= 7 && b[6] == b'+' && b[..6].iter().all(|c| c.is_ascii_alphabetic()) {
+        7
+    } else {
+        0
+    };
+    let name = &b[start..];
+    if name.is_empty() {
+        return 0;
+    }
+    let mut h: u32 = 2166136261;
+    for &c in name {
+        h = h.wrapping_mul(16777619) ^ c as u32;
+    }
+    h
 }
 
 fn obj_i64(o: &Object) -> Option<i64> {
@@ -280,7 +304,8 @@ fn font_info(doc: &Document, dict: &Dictionary, raw: &[u8]) -> FontInfo {
                 .iter()
                 .any(|w| basefont.contains(w));
 
-        FontInfo { two_byte, to_unicode, differences, ot1_text, widths, default_width, bold, italic, mono }
+        let font_id = font_id_of(&basefont);
+        FontInfo { two_byte, to_unicode, differences, ot1_text, widths, default_width, bold, italic, mono, font_id }
     }
 }
 
@@ -784,6 +809,8 @@ pub struct Span {
     /// only for rotated text (e.g. a 90° y-axis title); kept out of the body flow and
     /// rendered as rotated SVG `<text>` when it's a figure label.
     pub angle: f32,
+    /// Stable font-face id (see [`font_id_of`]); 0 = unknown.
+    pub font: u32,
 }
 
 fn num(o: &Object) -> f32 {
@@ -813,7 +840,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
     let mut ctm = Mat::ID; // graphics CTM (q/Q/cm) — needed for rotated/transformed text
     let mut cstack: Vec<Mat> = Vec::new();
 
-    let mut emit = |wtm: &Mat, ctm: &Mat, base_size: f32, width: f32, style: (bool, bool, bool), s: String| {
+    let mut emit = |wtm: &Mat, ctm: &Mat, base_size: f32, width: f32, style: (bool, bool, bool, u32), s: String| {
         // Resolve the device position from the text matrix and the graphics CTM.
         //  - ROTATED text (non-horizontal baseline) uses the full combined matrix: its
         //    true position, a magnitude-based height (so a 90° title isn't dropped by a
@@ -860,6 +887,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
                 italic: style.1,
                 mono: style.2,
                 angle,
+                font: style.3,
             });
         }
     };
@@ -923,7 +951,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
             }
             "Tj" => {
                 if let Some(Object::String(s, _)) = o.first() {
-                    let style = cur.map(|f| (f.bold, f.italic, f.mono)).unwrap_or((false, false, false));
+                    let style = cur.map(|f| (f.bold, f.italic, f.mono, f.font_id)).unwrap_or((false, false, false, 0));
                     let (words, total) = decode_words(&[Show::Str(s)], cur, size, tc, tw);
                     for wd in words {
                         let wtm = Mat::translate(wd.x_off, ts).mul(tm);
@@ -936,7 +964,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
                 tlm = Mat::translate(0.0, -leading).mul(tlm);
                 tm = tlm;
                 if let Some(Object::String(s, _)) = o.last() {
-                    let style = cur.map(|f| (f.bold, f.italic, f.mono)).unwrap_or((false, false, false));
+                    let style = cur.map(|f| (f.bold, f.italic, f.mono, f.font_id)).unwrap_or((false, false, false, 0));
                     let (words, total) = decode_words(&[Show::Str(s)], cur, size, tc, tw);
                     for wd in words {
                         let wtm = Mat::translate(wd.x_off, ts).mul(tm);
@@ -956,7 +984,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
                             _ => None,
                         })
                         .collect();
-                    let style = cur.map(|f| (f.bold, f.italic, f.mono)).unwrap_or((false, false, false));
+                    let style = cur.map(|f| (f.bold, f.italic, f.mono, f.font_id)).unwrap_or((false, false, false, 0));
                     let (words, total) = decode_words(&elems, cur, size, tc, tw);
                     for wd in words {
                         let wtm = Mat::translate(wd.x_off, ts).mul(tm);
@@ -1052,7 +1080,7 @@ fn decode_text_ctm(doc: &Document, ops: &[lopdf::content::Operation], fonts: &Ha
     let mut cur: Option<&FontInfo> = None;
 
     let emit_show = |elems: &[Show], cur: Option<&FontInfo>, size: f32, tc: f32, tw: f32, tm: &mut Mat, g: Mat, out: &mut Vec<Span>| {
-        let style = cur.map(|f| (f.bold, f.italic, f.mono)).unwrap_or((false, false, false));
+        let style = cur.map(|f| (f.bold, f.italic, f.mono, f.font_id)).unwrap_or((false, false, false, 0));
         let (words, total) = decode_words(elems, cur, size, tc, tw);
         for wd in words {
             let posm = Mat::translate(wd.x_off, 0.0).mul(*tm).mul(g);
@@ -1079,6 +1107,7 @@ fn decode_text_ctm(doc: &Document, ops: &[lopdf::content::Operation], fonts: &Ha
                     italic: style.1,
                     mono: style.2,
                     angle,
+                    font: style.3,
                 });
             }
         }

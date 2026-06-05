@@ -243,6 +243,110 @@ impl PlacedSvg {
             texts
         )
     }
+
+    /// Render the `<text>` labels of this figure as SVG, in its local coords.
+    fn label_texts(&self) -> String {
+        let mut texts = String::new();
+        for l in &self.labels {
+            let weight = if l.bold { " font-weight=\"bold\"" } else { "" };
+            let style = if l.italic { " font-style=\"italic\"" } else { "" };
+            let transform = if l.angle.abs() > 0.01 {
+                format!(" transform=\"rotate({} {} {})\"", fmt(-l.angle * 180.0 / std::f32::consts::PI), fmt(l.lx), fmt(l.ly))
+            } else {
+                String::new()
+            };
+            texts.push_str(&format!(
+                "<text x=\"{}\" y=\"{}\" font-size=\"{}\"{weight}{style}{transform}>{}</text>",
+                fmt(l.lx),
+                fmt(l.ly),
+                fmt(l.size),
+                esc(&l.text)
+            ));
+        }
+        texts
+    }
+
+    /// Render an OVERLAY `<svg>` for compositing over a raster image: the viewBox is the
+    /// vector INK box (not expanded to include labels), so labels that fall outside it —
+    /// e.g. body prose the figure picked up below the map — are clipped by the SVG
+    /// viewport. `style` (caller-supplied) positions it over the image; `preserveAspect
+    /// Ratio="none"` makes the ink fill the positioned box exactly, so the polygons line
+    /// up with the raster (both are in page coordinates).
+    pub fn overlay_svg(&self, style: &str) -> String {
+        const PAD: f32 = 1.0;
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{} {} {} {}\" \
+             preserveAspectRatio=\"none\" style=\"{}\" font-family=\"sans-serif\" fill=\"#000\">{}{}</svg>",
+            fmt(-PAD),
+            fmt(-PAD),
+            fmt(self.w + 2.0 * PAD),
+            fmt(self.h + 2.0 * PAD),
+            style,
+            self.paths,
+            self.label_texts()
+        )
+    }
+
+    /// Render ONE self-contained `<svg>` that composites a raster `image` UNDER this
+    /// figure's vector ink and labels — all in the figure's local user space, so the
+    /// polygons register with the raster pixel-for-pixel. The viewBox is the union of the
+    /// raster rect, the vector ink, and every label, so nothing is clipped (axis labels in
+    /// the margins included — the overlay path's tight viewBox lost them). `href` is the
+    /// raster source (a data URI or deferred sentinel); `img` is the raster's
+    /// `(x_left, x_right, y_bottom, y_top)` in PDF page coords (y up).
+    pub fn composite_svg(&self, href: &str, img: (f32, f32, f32, f32)) -> String {
+        let (ix0, ix1, iy0, iy1) = img;
+        // Raster rect in local coords (origin (x_left, y_top), y DOWN).
+        let img_lx = ix0 - self.x_left;
+        let img_ly = self.y_top - iy1;
+        let img_lw = (ix1 - ix0).max(0.1);
+        let img_lh = (iy1 - iy0).max(0.1);
+        // viewBox union: ink [0,w]×[0,h], the raster rect, and every (rotation-aware) label.
+        let mut min_x = 0.0_f32.min(img_lx);
+        let mut min_y = 0.0_f32.min(img_ly);
+        let mut max_x = self.w.max(img_lx + img_lw);
+        let mut max_y = self.h.max(img_ly + img_lh);
+        for l in &self.labels {
+            let svg_rad = -l.angle;
+            let (sin, cos) = (svg_rad.sin(), svg_rad.cos());
+            for (px, py) in [(l.lx, l.ly - l.size), (l.lx + l.w, l.ly - l.size), (l.lx + l.w, l.ly + l.size * 0.25), (l.lx, l.ly + l.size * 0.25)] {
+                let (dx, dy) = (px - l.lx, py - l.ly);
+                let (rx, ry) = (l.lx + dx * cos - dy * sin, l.ly + dx * sin + dy * cos);
+                min_x = min_x.min(rx);
+                min_y = min_y.min(ry);
+                max_x = max_x.max(rx);
+                max_y = max_y.max(ry);
+            }
+        }
+        const PAD: f32 = 4.0;
+        min_x -= PAD;
+        min_y -= PAD;
+        max_x += PAD;
+        max_y += PAD;
+        let (vbw, vbh) = (max_x - min_x, max_y - min_y);
+        let pct = if self.page_w > 1.0 { (vbw / self.page_w * 150.0).clamp(10.0, 100.0) } else { 100.0 };
+        let image_el = format!(
+            "<image href=\"{}\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\"/>",
+            href,
+            fmt(img_lx),
+            fmt(img_ly),
+            fmt(img_lw),
+            fmt(img_lh)
+        );
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{} {} {} {}\" \
+             style=\"display:block;width:{}%;height:auto;margin:0 auto\" \
+             font-family=\"sans-serif\" fill=\"#000\">{}{}{}</svg>",
+            fmt(min_x),
+            fmt(min_y),
+            fmt(vbw),
+            fmt(vbh),
+            fmt(pct),
+            image_el,
+            self.paths,
+            self.label_texts()
+        )
+    }
 }
 
 // Figure filter: a real vector figure is a cluster of ink at least this big with

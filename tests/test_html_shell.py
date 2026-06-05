@@ -32,9 +32,11 @@ def test_well_formed(path):
 @pytest.mark.parametrize("path", OWNED, ids=IDS)
 def test_section_per_page(path):
     h = hc.html_for(path)
-    n_sec = len(re.findall(r"<section\b", h))
+    # Count PAGE sections only — the front-matter <header> may carry its own
+    # `<section id="abstract">`, which is not a page section.
+    n_sec = len(re.findall(r"<section data-page=", h))
     n_pg = distillpdf.Pdf.open(path).page_count()
-    assert n_sec == n_pg, f"{os.path.basename(path)}: {n_sec} <section> vs {n_pg} pages"
+    assert n_sec == n_pg, f"{os.path.basename(path)}: {n_sec} page <section> vs {n_pg} pages"
 
 
 @pytest.mark.parametrize("path", OWNED, ids=IDS)
