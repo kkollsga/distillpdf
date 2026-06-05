@@ -41,8 +41,13 @@ distillpdf paper.pdf                  # HTML to stdout
 distillpdf paper.pdf -o paper.html    # ...or to a file
 distillpdf *.pdf -o out/              # batch: out/<name>.html per input
 
+distillpdf paper.pdf --markdown       # Markdown instead of HTML
+distillpdf paper.pdf -o paper.md      # Markdown (inferred from the .md extension)
+distillpdf *.pdf --markdown -o out/   # batch Markdown; figures to out/img/
+distillpdf paper.pdf --embed-images   # Markdown with inline data: URIs (self-contained)
+
 distillpdf paper.pdf --mode page      # page-first HTML (default is section-first)
-distillpdf paper.pdf --no-images      # <image N> placeholders, no base64 bytes
+distillpdf paper.pdf --no-images      # placeholders, no base64 bytes
 distillpdf paper.pdf --no-toc         # omit the table-of-contents nav
 distillpdf paper.pdf --text           # plain text instead of HTML
 distillpdf paper.pdf --toc            # print the table of contents
@@ -59,15 +64,37 @@ import distillpdf
 doc = distillpdf.open("paper.pdf")        # or distillpdf.from_bytes(data)
 
 html     = doc.to_html()                  # clean, semantic HTML for an LLM
-doc.export_html()                         # ...or write <source>.html next to the PDF
-doc.export_html("out.html")               # ...or to a specific path
+md       = doc.to_markdown()              # ...or Markdown (built from the same HTML)
 
-# rendering options can be set at open() or overridden per call:
-doc.to_html(mode="page", toc=False)       # same options on export_html(...)
+# write straight to a file (like pandas .to_csv) — returns the path written:
+doc.to_html("out.html")                   # ...to a specific path
+doc.to_html(outputfile=True)              # ...or <source>.html next to the PDF
+doc.to_markdown("out.md")                 # .md + an img/ folder of extracted figures
+doc.to_markdown(outputfile=True)          # <source>.md (handy for bulk runs)
+
+# rendering options work the same on both:
+doc.to_html(mode="page", toc=False)
 text     = doc.extract_text()             # plain text, in reading order
 toc      = doc.toc()                      # [(level, title, page, anchor_id), ...]
 abstract = doc.section("abstract")        # targeted section extraction
 ```
+
+### Markdown
+
+`to_markdown()` is a transform of the very HTML `to_html()` produces — so every
+processor improvement (clipping, heading detection, tables, front-matter) flows into
+Markdown automatically, with no second renderer to keep in sync.
+
+```python
+doc.to_markdown()                         # string; images are caption-only placeholders
+doc.to_markdown("paper.md")               # writes paper.md + paper's img/fig_NN_slug.ext
+doc.to_markdown("paper.md", embed_images=True)   # self-contained: inline data: URIs
+doc.to_markdown(images=False)             # drop images entirely (placeholders)
+```
+
+When writing to a file, figures are extracted next to it as `img/fig_NN_<slug>.ext`
+(vector figures as self-contained `.svg`) and referenced relatively. Returning a string
+has no folder to write into, so images fall back to placeholders unless `embed_images=True`.
 
 ### Output modes
 
@@ -107,13 +134,16 @@ distillpdf.open("paper.pdf").to_html(toc=False)
 ### Rendering options
 
 `open()` only loads the PDF; the rendering options live on `to_html()` and
-`export_html()` (and `mode` on `toc()`/`section()`), since that's where the content is
+`to_markdown()` (and `mode` on `toc()`/`section()`), since that's where the content is
 actually extracted:
 
 | Option | Default | Effect |
 |---|---|---|
+| `path=` | `None` | a file (or directory) to write to; `None` returns the string. Returns the path written |
+| `outputfile=` | `False` | `True` writes `<source>.html` / `<source>.md` next to the PDF (no `path` needed) — for bulk runs |
 | `mode=` | `"section"` | `"page"` wraps each page in `<section data-page="N">` and numbers TOC entries; the default groups content into nested `<section id="sec-…">` and drops page info |
 | `images=` | `True` | `False` swaps inline base64 images for `<image N>` placeholders (captions + `#fig-N` anchors kept) |
+| `embed_images=` | `False` | `to_markdown()` only: `True` inlines images as `data:` URIs instead of an `img/` folder |
 | `toc=` | `True` | `False` omits the `<nav>` table of contents (section/heading anchors still emitted) |
 
 ### Raw pieces

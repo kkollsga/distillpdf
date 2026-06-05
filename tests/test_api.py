@@ -118,29 +118,83 @@ def test_open_takes_no_render_options():
         distillpdf.Pdf.open(HEADINGS, mode="page")
 
 
-def test_export_html(tmp_path):
-    """export_html writes to a file: explicit path, directory, and source-derived name."""
+def test_to_html_to_file(tmp_path):
+    """to_html(path=...) writes to a file: explicit path, directory, contents match the
+    string form; the no-write default still returns the HTML string."""
     d = distillpdf.Pdf.open(HEADINGS)
     s = d.to_html()
+    assert s.startswith("<!doctype html>")  # no path → string
     # explicit file path → returns the path written, contents match to_html()
     dest = tmp_path / "out.html"
-    assert d.export_html(str(dest)) == str(dest)
+    assert d.to_html(str(dest)) == str(dest)
     assert dest.read_text(encoding="utf-8") == s
     # directory → <source-stem>.html inside it
-    written = d.export_html(str(tmp_path))
+    written = d.to_html(str(tmp_path))
     assert written.endswith("headings.html") and os.path.dirname(written) == str(tmp_path)
     # options carry through
-    d.export_html(str(dest), mode="page")
+    d.to_html(str(dest), mode="page")
     assert "data-page" in dest.read_text(encoding="utf-8")
 
 
-def test_export_html_from_bytes_needs_path(tmp_path):
+def test_to_html_outputfile_derives_name(tmp_path):
+    """outputfile=True with no path writes <source>.html next to the PDF (bulk convenience)."""
+    src = tmp_path / "doc.pdf"
+    src.write_bytes(open(HEADINGS, "rb").read())
+    written = distillpdf.Pdf.open(str(src)).to_html(outputfile=True)
+    assert written == str(tmp_path / "doc.html")
+    assert (tmp_path / "doc.html").read_text(encoding="utf-8").startswith("<!doctype html>")
+
+
+def test_to_html_from_bytes_needs_path(tmp_path):
     with open(HEADINGS, "rb") as f:
         d = distillpdf.from_bytes(f.read())
     with pytest.raises(Exception):
-        d.export_html()  # no source path to derive a name
+        d.to_html(outputfile=True)  # no source path to derive a name
     dest = tmp_path / "b.html"
-    assert d.export_html(str(dest)) == str(dest)
+    assert d.to_html(str(dest)) == str(dest)
+
+
+def test_to_markdown_string_placeholders():
+    """to_markdown() with no path returns a string; images are caption-only placeholders
+    (no data: URIs), headings/tables become Markdown."""
+    md = distillpdf.Pdf.open(HEADINGS).to_markdown()
+    assert isinstance(md, str) and md.strip()
+    assert "](data:" not in md          # no inline bytes for string output
+    assert md.lstrip().startswith(("#", "-"))  # heading or TOC list, not HTML
+
+
+def test_to_markdown_to_file_extracts_images(tmp_path):
+    """to_markdown to a file writes the .md plus an img/ folder of figure files, referenced
+    relatively (default, images on, not embedded)."""
+    dest = tmp_path / "fig.md"
+    written = distillpdf.Pdf.open(FIGURES).to_markdown(str(dest))
+    assert written == str(dest)
+    md = dest.read_text(encoding="utf-8")
+    imgdir = tmp_path / "img"
+    assert imgdir.is_dir() and any(imgdir.iterdir()), "no img/ files written"
+    # every img/ reference resolves to a real file
+    import re
+    refs = re.findall(r"\]\((img/[^)]+)\)", md)
+    assert refs, "no img/ references in markdown"
+    for r in refs:
+        assert (tmp_path / r).exists(), f"missing {r}"
+
+
+def test_to_markdown_embed_images_self_contained():
+    """embed_images=True inlines images as data: URIs (works for string output) and writes
+    no sidecar files."""
+    md = distillpdf.Pdf.open(FIGURES).to_markdown(embed_images=True)
+    assert "](data:image/" in md
+
+
+def test_to_markdown_images_false_overrides_embed():
+    md = distillpdf.Pdf.open(FIGURES).to_markdown(images=False, embed_images=True)
+    assert "](data:" not in md
+
+
+def test_export_html_removed():
+    """The old export_html() method is gone — superseded by to_html(path=...)."""
+    assert not hasattr(distillpdf.Pdf.open(HEADINGS), "export_html")
 
 
 def test_images_false_emits_placeholder():

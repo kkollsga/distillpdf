@@ -13,6 +13,7 @@ mod frontmatter;
 mod html;
 mod img;
 mod links;
+mod markdown;
 mod profile;
 mod text;
 mod vector;
@@ -35,8 +36,8 @@ struct Pdf {
     doc: Document,
     /// Raw PDF bytes, kept for lenient recovery of malformed streams.
     raw: Vec<u8>,
-    /// Source path (`open`); `None` when constructed from bytes. Used by `export_html`
-    /// to derive the default `<source>.html` output name.
+    /// Source path (`open`); `None` when constructed from bytes. Used to derive the
+    /// default `<source>.html` / `<source>.md` output name when `outputfile=True`.
     source: Option<std::path::PathBuf>,
 }
 
@@ -49,26 +50,28 @@ impl Pdf {
         Ok(py.allow_threads(|| html::to_html(&self.doc, &self.raw, mode, images, toc)))
     }
 
-    /// Resolve the output path for `export_html`: an explicit file, `<stem>.html` inside
-    /// an explicit directory, or `<source>.html` next to the opened PDF when omitted.
-    fn resolve_html_path(&self, path: Option<&str>) -> PyResult<std::path::PathBuf> {
+    /// Resolve where rendered output is written, for the given default extension
+    /// (`"html"` / `"md"`): an explicit file path verbatim, `<source-stem>.<ext>` inside an
+    /// explicit directory, or `<source>.<ext>` next to the opened PDF when no path is given
+    /// (the `outputfile=True` convenience — `text.pdf` → `text.<ext>`).
+    fn resolve_out_path(&self, path: Option<&str>, ext: &str) -> PyResult<std::path::PathBuf> {
         match path {
-            // A directory → write <source-stem>.html inside it.
+            // A directory → write <source-stem>.<ext> inside it.
             Some(p) if std::path::Path::new(p).is_dir() => {
                 let stem = self
                     .source
                     .as_ref()
                     .and_then(|s| s.file_stem())
-                    .ok_or_else(|| PyValueError::new_err("export_html: a directory path needs a source filename to derive the name; pass a full file path"))?;
-                Ok(std::path::Path::new(p).join(stem).with_extension("html"))
+                    .ok_or_else(|| PyValueError::new_err("a directory path needs a source filename to derive the name; pass a full file path"))?;
+                Ok(std::path::Path::new(p).join(stem).with_extension(ext))
             }
             Some(p) => Ok(std::path::PathBuf::from(p)),
-            // No path → <source>.html next to the opened PDF.
+            // No path → <source>.<ext> next to the opened PDF.
             None => self
                 .source
                 .as_ref()
-                .map(|s| s.with_extension("html"))
-                .ok_or_else(|| PyValueError::new_err("export_html: no source path (opened from_bytes); pass an explicit path")),
+                .map(|s| s.with_extension(ext))
+                .ok_or_else(|| PyValueError::new_err("no source path (opened from_bytes); pass an explicit path")),
         }
     }
 }
@@ -76,7 +79,7 @@ impl Pdf {
 #[pymethods]
 impl Pdf {
     /// Open a PDF from a filesystem path. This only loads and parses the PDF container;
-    /// the actual extraction/render happens in `to_html()` / `export_html()`, which is
+    /// the actual extraction/render happens in `to_html()` / `to_markdown()`, which is
     /// where the rendering options (`mode`/`images`/`toc`) live.
     #[staticmethod]
     fn open(path: &str) -> PyResult<Self> {
@@ -86,7 +89,8 @@ impl Pdf {
         Ok(Pdf { doc, raw, source: Some(std::path::PathBuf::from(path)) })
     }
 
-    /// Open a PDF from raw bytes (no source path, so `export_html` needs an explicit path).
+    /// Open a PDF from raw bytes. There is no source path, so writing output with
+    /// `outputfile=True` (no `path`) is an error — pass an explicit `path` instead.
     #[staticmethod]
     fn from_bytes(data: &[u8]) -> PyResult<Self> {
         let raw = data.to_vec();
@@ -156,31 +160,80 @@ impl Pdf {
         Ok(list)
     }
 
-    /// Convert the PDF to thin, AI-ready HTML and return it as a string.
+    /// Convert the PDF to thin, AI-ready HTML.
+    ///
+    /// By default returns the HTML as a string. Pass `path` (a file or a directory) or set
+    /// `outputfile=True` to write to disk instead and return the path written — like pandas'
+    /// `.to_csv`. `outputfile=True` with no `path` derives the name from the PDF
+    /// (`text.pdf` → `text.html`), which keeps bulk conversion to one line per file.
     ///
     /// `mode` (`"section"` default / `"page"`) chooses the structure; `images=False`
     /// emits `<image N>` placeholders instead of inline base64; `toc=False` drops the
-    /// `<nav>` table of contents. To write straight to a file, use `export_html()`.
+    /// `<nav>` table of contents.
     ///
     /// The conversion (which internally renders pages in parallel) runs with the GIL
     /// released, so converting many PDFs across Python threads scales across cores.
-    #[pyo3(signature = (mode="section", images=true, toc=true))]
-    fn to_html(&self, py: Python<'_>, mode: &str, images: bool, toc: bool) -> PyResult<String> {
-        self.render(py, mode, images, toc)
+    #[pyo3(signature = (path=None, outputfile=false, mode="section", images=true, toc=true))]
+    fn to_html(&self, py: Python<'_>, path: Option<&str>, outputfile: bool, mode: &str, images: bool, toc: bool) -> PyResult<String> {
+        let html = self.render(py, mode, images, toc)?;
+        if !(outputfile || path.is_some()) {
+            return Ok(html);
+        }
+        let dest = self.resolve_out_path(path, "html")?;
+        std::fs::write(&dest, html).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
+        Ok(dest.to_string_lossy().into_owned())
     }
 
-    /// Render the HTML and write it to a file, returning the path written.
+    /// Convert the PDF to clean Markdown.
     ///
-    /// With no `path`, writes `<source>.html` next to the opened PDF
-    /// (`open("a/b.pdf").export_html()` → `a/b.html`). If `path` is a directory, writes
-    /// `<source-stem>.html` inside it; otherwise `path` is used verbatim. `mode`/`images`/
-    /// `toc` work exactly as in `to_html()`. A bytes-constructed `Pdf` (no source path)
-    /// requires an explicit `path`.
-    #[pyo3(signature = (path=None, mode="section", images=true, toc=true))]
-    fn export_html(&self, py: Python<'_>, path: Option<&str>, mode: &str, images: bool, toc: bool) -> PyResult<String> {
-        let dest = self.resolve_html_path(path)?;
-        let html = self.render(py, mode, images, toc)?;
-        std::fs::write(&dest, html).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
+    /// Markdown is produced by transforming the same HTML `to_html()` emits, so every
+    /// processor improvement flows in automatically — there is no separate Markdown
+    /// renderer to maintain.
+    ///
+    /// File output works exactly like `to_html()`: `path` / `outputfile=True` write to disk
+    /// (`text.pdf` → `text.md`) and return the path; otherwise the Markdown string is
+    /// returned. `mode`/`toc` match `to_html()`.
+    ///
+    /// Image handling:
+    /// * `images=False` → caption-only placeholders.
+    /// * `embed_images=True` → self-contained `data:` URIs (works for string output too).
+    /// * otherwise, when writing to a file, figures are extracted to an `img/` folder next
+    ///   to the `.md` (`img/fig_NN_slug.ext`) and referenced relatively; when returning a
+    ///   string they fall back to placeholders (there is no folder to write into).
+    #[pyo3(signature = (path=None, outputfile=false, mode="section", images=true, toc=true, embed_images=false))]
+    fn to_markdown(&self, py: Python<'_>, path: Option<&str>, outputfile: bool, mode: &str, images: bool, toc: bool, embed_images: bool) -> PyResult<String> {
+        let writing = outputfile || path.is_some();
+        // Pick the image strategy, and render the HTML accordingly (placeholder/embed only
+        // need the cheap `<image N>` HTML; file extraction needs the inline data URIs).
+        let img_mode = if !images {
+            markdown::ImgMode::Placeholder
+        } else if embed_images {
+            markdown::ImgMode::Embed
+        } else if writing {
+            markdown::ImgMode::Files
+        } else {
+            markdown::ImgMode::Placeholder
+        };
+        let need_bytes = matches!(img_mode, markdown::ImgMode::Embed | markdown::ImgMode::Files);
+        let html = self.render(py, mode, need_bytes, toc)?;
+        let (md, files) = py.allow_threads(|| markdown::html_to_markdown(&html, toc, img_mode));
+
+        if !writing {
+            return Ok(md);
+        }
+        let dest = self.resolve_out_path(path, "md")?;
+        std::fs::write(&dest, &md).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
+        // Write any extracted figure files under <dest-dir>/img/.
+        if !files.is_empty() {
+            let dir = dest.parent().unwrap_or_else(|| std::path::Path::new("."));
+            for f in &files {
+                let fp = dir.join(&f.path);
+                if let Some(parent) = fp.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| PyValueError::new_err(format!("mkdir failed: {e}")))?;
+                }
+                std::fs::write(&fp, &f.bytes).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
+            }
+        }
         Ok(dest.to_string_lossy().into_owned())
     }
 
@@ -303,7 +356,7 @@ impl Pdf {
 }
 
 /// Open a PDF from a filesystem path — `distillpdf.open("file.pdf")`. A module-level
-/// shorthand for `Pdf.open(...)`. Rendering options live on `to_html()`/`export_html()`.
+/// shorthand for `Pdf.open(...)`. Rendering options live on `to_html()`/`to_markdown()`.
 #[pyfunction]
 fn open(path: &str) -> PyResult<Pdf> {
     Pdf::open(path)
