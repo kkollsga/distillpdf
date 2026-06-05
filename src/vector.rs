@@ -83,6 +83,9 @@ struct Painted {
     x1: f32,
     y1: f32,
     seq: usize, // paint order in the content stream — preserved for correct z-order
+    // Active clip rect (page space) when this path was painted, if it actually crops it.
+    // Rendered as an SVG <clipPath> so the visible ink matches the PDF (no overshoot).
+    clip: Option<(f32, f32, f32, f32)>,
 }
 
 /// Graphics state carried through the walk and the q/Q stack.
@@ -94,10 +97,14 @@ struct GState {
     lw: f32,
     fill_a: f32,   // ExtGState `ca` — fill alpha
     stroke_a: f32, // ExtGState `CA` — stroke alpha
+    // Active clipping rectangle in PAGE space (x0, y0, x1, y1), the intersection of every
+    // `W`/`W*` clip seen so far on the q/Q stack. `None` = unclipped (page bounds). A plot
+    // clips its reference curves to the axes box; honouring it crops the curve overshoot.
+    clip: Option<(f32, f32, f32, f32)>,
 }
 impl GState {
     fn new(ctm: M, fill: [u8; 3], stroke: [u8; 3], lw: f32, fill_a: f32, stroke_a: f32) -> GState {
-        GState { ctm, fill, stroke, lw, fill_a, stroke_a }
+        GState { ctm, fill, stroke, lw, fill_a, stroke_a, clip: None }
     }
 }
 
@@ -436,7 +443,7 @@ fn extgstates_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, (Op
 /// A path with neither fill nor stroke (e.g. a fully transparent `ca 0` fill, or
 /// a clip-only path) carries no ink and is dropped — it must not inflate a
 /// figure cluster or paint a "hidden" black field.
-fn finish(cur: &mut Vec<Seg>, fill: Option<[u8; 3]>, stroke: Option<([u8; 3], f32)>, fill_op: f32, stroke_op: f32, out: &mut Vec<Painted>) {
+fn finish(cur: &mut Vec<Seg>, fill: Option<[u8; 3]>, stroke: Option<([u8; 3], f32)>, fill_op: f32, stroke_op: f32, clip: Option<(f32, f32, f32, f32)>, out: &mut Vec<Painted>) {
     if cur.is_empty() {
         return;
     }
@@ -463,10 +470,56 @@ fn finish(cur: &mut Vec<Seg>, fill: Option<[u8; 3]>, stroke: Option<([u8; 3], f3
     // space (page coords leaking into a figure-local frame, a mis-applied matrix), which
     // otherwise draws a line shooting off the figure or collapses its viewBox.
     const MAX_EXTENT: f32 = 2000.0;
-    if x1 >= x0 && (x1 - x0).max(y1 - y0) <= MAX_EXTENT {
-        out.push(Painted { segs: std::mem::take(cur), fill, stroke, fill_op, stroke_op, x0, y0, x1, y1, seq: 0 });
-    } else {
+    if x1 < x0 || (x1 - x0).max(y1 - y0) > MAX_EXTENT {
         cur.clear();
+        return;
+    }
+    // Honour the active clip: a path drawn under a tighter clip than its own extent (a
+    // plot's reference curve clipped to the axes box) only *shows* the clipped portion.
+    // Crop the stored bbox to that intersection so the figure's extent and viewBox exclude
+    // the overshoot; the full geometry stays in `segs` and is masked by an SVG <clipPath>
+    // at render time. Keep `clip` only when it actually crops (so we don't emit no-op masks
+    // for the ubiquitous full-page `re W n`).
+    let mut crop = None;
+    if let Some((cx0, cy0, cx1, cy1)) = clip {
+        let crops = cx0 > x0 + 0.5 || cy0 > y0 + 0.5 || cx1 < x1 - 0.5 || cy1 < y1 - 0.5;
+        if crops {
+            let (nx0, ny0, nx1, ny1) = (x0.max(cx0), y0.max(cy0), x1.min(cx1), y1.min(cy1));
+            if nx1 <= nx0 || ny1 <= ny0 {
+                cur.clear(); // path lies entirely outside its clip — invisible
+                return;
+            }
+            x0 = nx0;
+            y0 = ny0;
+            x1 = nx1;
+            y1 = ny1;
+            crop = clip;
+        }
+    }
+    out.push(Painted { segs: std::mem::take(cur), fill, stroke, fill_op, stroke_op, x0, y0, x1, y1, seq: 0, clip: crop });
+}
+
+/// Page-space bounding box of a path under construction (a clip path is just a path
+/// followed by `W`/`W*`); `None` if it has no points.
+fn path_bbox(cur: &[Seg]) -> Option<(f32, f32, f32, f32)> {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for s in cur {
+        let pts: &[(f32, f32)] = match s {
+            Seg::M(x, y) | Seg::L(x, y) => &[(*x, *y)],
+            Seg::C(a, b, c, d, e, f) => &[(*a, *b), (*c, *d), (*e, *f)],
+            Seg::Z => &[],
+        };
+        for &(x, y) in pts {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+    }
+    if x1 >= x0 {
+        Some((x0, y0, x1, y1))
+    } else {
+        None
     }
 }
 
@@ -542,6 +595,10 @@ fn walk(
     let mut g = base;
     let mut stack: Vec<GState> = Vec::new();
     let mut cur: Vec<Seg> = Vec::new();
+    // `W`/`W*` mark the current path as a clip, but it takes effect only after the path's
+    // painting operator. Defer it: set this flag on `W`/`W*`, fold it into `g.clip` when the
+    // path is painted/ended.
+    let mut pending_clip = false;
     // Effective fill/stroke for a paint op, after applying ExtGState alpha: a
     // ~zero alpha means the paint is invisible (so it is dropped, not blacked in).
     let eff_fill = |g: &GState| if g.fill_a >= ALPHA_HIDDEN { Some(g.fill) } else { None };
@@ -626,10 +683,26 @@ fn walk(
                 cur.push(Seg::Z);
             }
             "h" => cur.push(Seg::Z),
-            "f" | "F" | "f*" => finish(&mut cur, eff_fill(&g), None, g.fill_a, g.stroke_a, out),
-            "S" | "s" => finish(&mut cur, None, eff_stroke(&g), g.fill_a, g.stroke_a, out),
-            "B" | "B*" | "b" | "b*" => finish(&mut cur, eff_fill(&g), eff_stroke(&g), g.fill_a, g.stroke_a, out),
-            "n" => cur.clear(), // clip-only path → no ink
+            "W" | "W*" => pending_clip = true,
+            "f" | "F" | "f*" | "S" | "s" | "B" | "B*" | "b" | "b*" | "n" => {
+                // A pending `W`/`W*` clip applies after this paint op: intersect the current
+                // path's bbox into the graphics-state clip (q/Q scopes it via the GState copy).
+                if pending_clip {
+                    if let Some(bb) = path_bbox(&cur) {
+                        g.clip = Some(match g.clip {
+                            Some((x0, y0, x1, y1)) => (x0.max(bb.0), y0.max(bb.1), x1.min(bb.2), y1.min(bb.3)),
+                            None => bb,
+                        });
+                    }
+                    pending_clip = false;
+                }
+                match op.operator.as_str() {
+                    "f" | "F" | "f*" => finish(&mut cur, eff_fill(&g), None, g.fill_a, g.stroke_a, g.clip, out),
+                    "S" | "s" => finish(&mut cur, None, eff_stroke(&g), g.fill_a, g.stroke_a, g.clip, out),
+                    "B" | "B*" | "b" | "b*" => finish(&mut cur, eff_fill(&g), eff_stroke(&g), g.fill_a, g.stroke_a, g.clip, out),
+                    _ => cur.clear(), // "n": clip-only path → no ink
+                }
+            }
             "Do" => {
                 let id = match o.first().and_then(|x| x.as_name().ok()).and_then(|n| xmap.get(n)) {
                     Some(&id) => id,
@@ -760,6 +833,25 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
 
     let area = (w * h).max(1.0);
     let mut plot: Option<(f32, f32, f32, f32)> = None;
+    // SVG <clipPath> definitions for paths drawn under a PDF clip (a plot's reference curves
+    // clipped to the axes box). Deduped per distinct rect; ids are namespaced by the figure
+    // origin so they stay unique across every figure in the page's HTML.
+    let id_prefix = format!("{}_{}", x0 as i32, y1 as i32);
+    let mut clip_defs = String::new();
+    let mut clip_ids: Vec<((i32, i32, i32, i32), String)> = Vec::new();
+    let mut clip_id_for = |c: (f32, f32, f32, f32), defs: &mut String| -> String {
+        // page space -> figure-local (y flipped): a clip rect (cx0,cy0,cx1,cy1).
+        let (lx, lw_) = (c.0 - x0, (c.2 - c.0).max(0.0));
+        let (ly, lh_) = (y1 - c.3, (c.3 - c.1).max(0.0));
+        let key = ((lx * 4.0) as i32, (ly * 4.0) as i32, (lw_ * 4.0) as i32, (lh_ * 4.0) as i32);
+        if let Some((_, id)) = clip_ids.iter().find(|(k, _)| *k == key) {
+            return id.clone();
+        }
+        let id = format!("c{}_{}", id_prefix, clip_ids.len());
+        defs.push_str(&format!("<clipPath id=\"{}\"><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/></clipPath>", id, fmt(lx), fmt(ly), fmt(lw_), fmt(lh_)));
+        clip_ids.push((key, id.clone()));
+        id
+    };
     let mut paths = String::new();
     for p in cluster {
         // Skip a near-white background fill that covers a large part of the figure:
@@ -801,7 +893,12 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
             }
             None => String::new(),
         };
-        paths.push_str(&format!("<path d=\"{d}\" fill=\"{fill}\"{fop}{stroke}/>"));
+        let clip_attr = match p.clip {
+            Some(c) => format!(" clip-path=\"url(#{})\"", clip_id_for(c, &mut clip_defs)),
+            None => String::new(),
+        };
+        paths.push_str(&format!("<path d=\"{d}\" fill=\"{fill}\"{fop}{stroke}{clip_attr}/>"));
     }
+    let paths = if clip_defs.is_empty() { paths } else { format!("<defs>{clip_defs}</defs>{paths}") };
     PlacedSvg { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, paths, w, h, page_w, labels: Vec::new(), plot }
 }
