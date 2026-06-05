@@ -2568,22 +2568,38 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
             items.push(Item::T(j));
             boxes.push((t.x_left, t.x_right.max(t.x_left + 0.1), t.y_bottom, t.y_top));
         }
-        // A vector figure largely INSIDE a raster image is an overlay annotating it (a
-        // location map = a base raster with vector lines/labels on top). Pair them so the
-        // composite renders as ONE figure (the SVG positioned over the image) instead of
-        // two disconnected ones. Only in inline mode (the image must actually render).
-        let mut vec_owner: Vec<Option<usize>> = vec![None; vectors.len()];
-        let mut img_overlays: Vec<Vec<usize>> = vec![Vec::new(); images.len()];
+        // Pair an overlapping raster + vector into ONE composite figure (only inline, so
+        // the raster actually renders). The direction depends on which mostly contains the
+        // other — and BOTH are common:
+        //  - vector mostly inside raster (a location map: a base photo with vector lines/
+        //    labels on top) → the raster is the base, the vector overlays it.
+        //  - raster mostly inside vector (a plot whose data points are a raster within the
+        //    axes/legend frame, e.g. a Vp-depth crossplot) → the vector is the base, the
+        //    raster is embedded in its SVG.
+        // Either way the composite is one `<svg>` (raster `<image>` + vector ink + labels),
+        // registered pixel-for-pixel in the figure's own coordinate space.
+        let mut vec_owner: Vec<Option<usize>> = vec![None; vectors.len()]; // vector → base image
+        let mut img_overlays: Vec<Vec<usize>> = vec![Vec::new(); images.len()]; // image → overlay vectors
+        let mut img_owner: Vec<Option<usize>> = vec![None; images.len()]; // image → base vector
+        let mut svg_rasters: Vec<Vec<usize>> = vec![Vec::new(); vectors.len()]; // vector → embedded images
         if inline_images {
             for (vi, v) in vectors.iter().enumerate() {
                 let varea = ((v.x_right - v.x_left) * (v.y_top - v.y_bottom)).max(1.0);
-                if let Some(ii) = images.iter().position(|im| {
+                for (ii, im) in images.iter().enumerate() {
+                    if vec_owner[vi].is_some() || img_owner[ii].is_some() {
+                        continue;
+                    }
                     let ox = (v.x_right.min(im.x_right) - v.x_left.max(im.x_left)).max(0.0);
                     let oy = (v.y_top.min(im.y_top) - v.y_bottom.max(im.y_bottom)).max(0.0);
-                    ox * oy / varea > 0.6 // ≥60% of the vector lies within the image
-                }) {
-                    vec_owner[vi] = Some(ii);
-                    img_overlays[ii].push(vi);
+                    let overlap = ox * oy;
+                    let imarea = ((im.x_right - im.x_left) * (im.y_top - im.y_bottom)).max(1.0);
+                    if overlap / varea > 0.6 {
+                        vec_owner[vi] = Some(ii); // vector mostly inside image → raster base
+                        img_overlays[ii].push(vi);
+                    } else if overlap / imarea > 0.6 {
+                        img_owner[ii] = Some(vi); // image mostly inside vector → vector base
+                        svg_rasters[vi].push(ii);
+                    }
                 }
             }
         }
@@ -2628,6 +2644,12 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
                 }
                 Item::Img(j) => {
                     flush(&mut run, &mut out);
+                    // This raster is embedded inside a larger vector figure (a plot whose
+                    // data points are a raster within the axes) — emitted by that vector's
+                    // Item::Svg composite, not here.
+                    if img_owner[*j].is_some() {
+                        continue;
+                    }
                     // A raster overlaid by EXACTLY ONE vector figure (a location map: a base
                     // photo with vector lines/labels on top), in inline mode, is composited
                     // into ONE `<svg>` with the raster embedded as an `<image>` in the
@@ -2639,9 +2661,11 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
                         img_uris.push(std::mem::take(&mut images[*j].uri));
                         let href = format!("\u{0}{idx}\u{0}");
                         let im = &images[*j];
-                        let v = &vectors[img_overlays[*j][0]];
-                        let svg = v.composite_svg(&href, (im.x_left, im.x_right, im.y_bottom, im.y_top));
-                        match &img_cap[*j] {
+                        let vi = img_overlays[*j][0];
+                        let svg = vectors[vi].composite_svg(&[(&href, (im.x_left, im.x_right, im.y_bottom, im.y_top))]);
+                        // Caption may have attached to the image OR its overlay vector.
+                        let cap = img_cap[*j].as_ref().or(svg_cap[vi].as_ref());
+                        match cap {
                             Some((num, cap)) => out.push_str(&format!("<figure id=\"fig-{num}\">{svg}<figcaption>{cap}</figcaption></figure>")),
                             None => out.push_str(&format!("<figure>{svg}</figure>")),
                         }
@@ -2691,8 +2715,28 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
                 }
                 Item::Svg(j) => {
                     flush(&mut run, &mut out);
-                    let svg = vectors[*j].svg();
-                    match &svg_cap[*j] {
+                    // A vector frame containing raster image(s) (a plot whose data points
+                    // are a raster within the axes): composite into ONE `<svg>` with each
+                    // raster embedded as an `<image>` in the figure's coordinate space.
+                    let svg = if !svg_rasters[*j].is_empty() {
+                        let rasters: Vec<(String, (f32, f32, f32, f32))> = svg_rasters[*j]
+                            .iter()
+                            .map(|&ii| {
+                                let idx = img_uris.len();
+                                img_uris.push(std::mem::take(&mut images[ii].uri));
+                                let im = &images[ii];
+                                (format!("\u{0}{idx}\u{0}"), (im.x_left, im.x_right, im.y_bottom, im.y_top))
+                            })
+                            .collect();
+                        let refs: Vec<(&str, (f32, f32, f32, f32))> = rasters.iter().map(|(h, r)| (h.as_str(), *r)).collect();
+                        vectors[*j].composite_svg(&refs)
+                    } else {
+                        vectors[*j].svg()
+                    };
+                    // Caption may have attached to the vector OR to one of its embedded
+                    // rasters — use whichever has it so the composite keeps its caption.
+                    let cap = svg_cap[*j].as_ref().or_else(|| svg_rasters[*j].iter().find_map(|&ii| img_cap[ii].as_ref()));
+                    match cap {
                         Some((num, cap)) => out.push_str(&format!(
                             "<figure id=\"fig-{num}\">{svg}<figcaption>{cap}</figcaption></figure>"
                         )),

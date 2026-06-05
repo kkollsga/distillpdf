@@ -287,25 +287,43 @@ impl PlacedSvg {
         )
     }
 
-    /// Render ONE self-contained `<svg>` that composites a raster `image` UNDER this
-    /// figure's vector ink and labels — all in the figure's local user space, so the
-    /// polygons register with the raster pixel-for-pixel. The viewBox is the union of the
-    /// raster rect, the vector ink, and every label, so nothing is clipped (axis labels in
-    /// the margins included — the overlay path's tight viewBox lost them). `href` is the
-    /// raster source (a data URI or deferred sentinel); `img` is the raster's
-    /// `(x_left, x_right, y_bottom, y_top)` in PDF page coords (y up).
-    pub fn composite_svg(&self, href: &str, img: (f32, f32, f32, f32)) -> String {
-        let (ix0, ix1, iy0, iy1) = img;
-        // Raster rect in local coords (origin (x_left, y_top), y DOWN).
-        let img_lx = ix0 - self.x_left;
-        let img_ly = self.y_top - iy1;
-        let img_lw = (ix1 - ix0).max(0.1);
-        let img_lh = (iy1 - iy0).max(0.1);
-        // viewBox union: ink [0,w]×[0,h], the raster rect, and every (rotation-aware) label.
-        let mut min_x = 0.0_f32.min(img_lx);
-        let mut min_y = 0.0_f32.min(img_ly);
-        let mut max_x = self.w.max(img_lx + img_lw);
-        let mut max_y = self.h.max(img_ly + img_lh);
+    /// Render ONE self-contained `<svg>` that composites one or more raster images WITH
+    /// this figure's vector ink and labels — all in the figure's local user space, so they
+    /// register pixel-for-pixel. The viewBox is the union of every raster rect, the vector
+    /// ink, and every label, so nothing is clipped (axis labels in the margins included).
+    /// Works in BOTH directions: a vector OVER a base raster (a location map: vector lines/
+    /// labels over a base photo) and rasters INSIDE a larger vector frame (a plot whose
+    /// data points are a raster within the axes/legend). The raster sits behind the ink;
+    /// the vector's opaque plot-area background is dropped in `build_svg`, so the raster
+    /// shows and the grid/curves/axes overlay it. Each entry is
+    /// `(href, (x_left, x_right, y_bottom, y_top))`: the source and its PDF page rect (y up).
+    pub fn composite_svg(&self, rasters: &[(&str, (f32, f32, f32, f32))]) -> String {
+        // viewBox union: start from the vector ink [0,w]×[0,h].
+        let mut min_x = 0.0_f32;
+        let mut min_y = 0.0_f32;
+        let mut max_x = self.w;
+        let mut max_y = self.h;
+        // Raster rects in local coords (origin (x_left, y_top), y DOWN).
+        let mut images = String::new();
+        for (href, (ix0, ix1, iy0, iy1)) in rasters {
+            let img_lx = ix0 - self.x_left;
+            let img_ly = self.y_top - iy1;
+            let img_lw = (ix1 - ix0).max(0.1);
+            let img_lh = (iy1 - iy0).max(0.1);
+            min_x = min_x.min(img_lx);
+            min_y = min_y.min(img_ly);
+            max_x = max_x.max(img_lx + img_lw);
+            max_y = max_y.max(img_ly + img_lh);
+            images.push_str(&format!(
+                "<image href=\"{}\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\"/>",
+                href,
+                fmt(img_lx),
+                fmt(img_ly),
+                fmt(img_lw),
+                fmt(img_lh)
+            ));
+        }
+        // Grow to every (rotation-aware) label too.
         for l in &self.labels {
             let svg_rad = -l.angle;
             let (sin, cos) = (svg_rad.sin(), svg_rad.cos());
@@ -325,14 +343,7 @@ impl PlacedSvg {
         max_y += PAD;
         let (vbw, vbh) = (max_x - min_x, max_y - min_y);
         let pct = if self.page_w > 1.0 { (vbw / self.page_w * 150.0).clamp(10.0, 100.0) } else { 100.0 };
-        let image_el = format!(
-            "<image href=\"{}\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\"/>",
-            href,
-            fmt(img_lx),
-            fmt(img_ly),
-            fmt(img_lw),
-            fmt(img_lh)
-        );
+        // Rasters behind, then the vector ink, then the text labels on top.
         format!(
             "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{} {} {} {}\" \
              style=\"display:block;width:{}%;height:auto;margin:0 auto\" \
@@ -342,7 +353,7 @@ impl PlacedSvg {
             fmt(vbw),
             fmt(vbh),
             fmt(pct),
-            image_el,
+            images,
             self.paths,
             self.label_texts()
         )
@@ -727,8 +738,22 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
     let tx = |x: f32| fmt((x - x0).clamp(-w, 2.0 * w));
     let ty = |y: f32| fmt((y1 - y).clamp(-h, 2.0 * h));
 
+    let area = (w * h).max(1.0);
     let mut paths = String::new();
     for p in cluster {
+        // Skip a near-white background fill that covers a large part of the figure:
+        // invisible on the white page anyway, and in a raster+vector composite it would
+        // otherwise occlude the embedded raster (a plot's opaque white plot-area behind
+        // its data). The plot background covers the axes box but not the legend / overshoot
+        // curves, so a moderate area share (not near-100%) must qualify.
+        if p.stroke.is_none() {
+            if let Some([r, g, b]) = p.fill {
+                let pa = (p.x1 - p.x0).max(0.0) * (p.y1 - p.y0).max(0.0);
+                if r >= 248 && g >= 248 && b >= 248 && pa >= area * 0.3 {
+                    continue;
+                }
+            }
+        }
         let mut d = String::new();
         for s in &p.segs {
             match *s {
