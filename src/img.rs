@@ -737,16 +737,15 @@ fn stitch_grid(doc: &Document, tiles: &[&RawTile], bbox: (f32, f32, f32, f32)) -
     if pw <= 0.0 || ph <= 0.0 {
         return None;
     }
-    let mut dpis: Vec<f32> = tiles
+    // Canvas resolution = the DOMINANT tile's native DPI (pixels per point), i.e. the tile
+    // with the most pixels across its placed width. A median/min would let a cluster of
+    // small low-res satellites (axis strips, a colour bar) shrink the canvas and downsample
+    // the main high-res image (a scatter plot) — the figure must keep the source resolution.
+    let dominant = tiles
         .iter()
         .filter(|t| t.x1 - t.x0 > 0.1 && t.pw > 0)
-        .map(|t| t.pw as f32 / (t.x1 - t.x0))
-        .collect();
-    if dpis.is_empty() {
-        return None;
-    }
-    dpis.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let scale = dpis[dpis.len() / 2].clamp(0.5, 20.0);
+        .max_by_key(|t| t.pw)?;
+    let scale = (dominant.pw as f32 / (dominant.x1 - dominant.x0)).clamp(0.5, 20.0);
     let cw = ((pw * scale).round() as u32).clamp(1, 5000);
     let ch = ((ph * scale).round() as u32).clamp(1, 5000);
     let mut canvas = image::RgbaImage::from_pixel(cw, ch, image::Rgba([255, 255, 255, 255]));

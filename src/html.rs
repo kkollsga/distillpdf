@@ -682,6 +682,26 @@ fn looks_like_reference(s: &str) -> bool {
     false
 }
 
+/// True when a text run reads as a figure's axis label: numeric-DOMINATED (most
+/// whitespace tokens are short numeric ticks) — covering a lone tick (`"1000"`), a full
+/// tick row (`"1000 2000 … 7000"`), and an axis title fused to its ticks
+/// (`"Vp (m/s) 1000 … 7000"`) — or a lone unit-bearing axis title (`"Vp(m/s)"`, `"BSF(m)"`).
+/// Rejects the multi-word `"Figure N:"` caption and ordinary prose (mostly word tokens),
+/// so body-size axis labels can be pulled into a figure without swallowing prose.
+fn is_axis_label_text(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let toks: Vec<&str> = t.split_whitespace().collect();
+    let is_tick = |tok: &str| !tok.is_empty() && tok.len() <= 6 && tok.chars().all(|c| c.is_ascii_digit() || ".,-–%".contains(c));
+    let nnum = toks.iter().filter(|tok| is_tick(tok)).count();
+    let numeric_row = nnum >= 1 && nnum * 2 >= toks.len();
+    // A short unit-bearing axis title — "Vp(m/s)", "BSF(m)", or the spaced "Vp (m/s)".
+    let axis_title = toks.len() <= 2 && t.len() <= 14 && t.contains('(') && t.contains(')');
+    numeric_row || axis_title
+}
+
 /// Paragraph-aware header detection. A header is a numbered section line, a
 /// canonical top-level name, a standalone bold/larger line, or a **bold run-in
 /// lead** at the top of a paragraph. Returns `(level, n_leading_runs)`: when
@@ -2394,11 +2414,18 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
         // a wider margin of the figure as a figure label too. The font gate keeps body
         // prose and the body-size "Figure N:" caption (just below the plot) out.
         let axis_margin = body * 2.2;
-        let near_fig_label = |x: f32, y: f32, size: f32| {
-            size < body * 0.82
-                && fig_boxes.iter().any(|&(xl, xr, yb, yt)| {
-                    x >= xl - axis_margin && x <= xr + axis_margin && y >= yb - axis_margin && y <= yt + axis_margin
-                })
+        let near_fig_label = |x: f32, y: f32, size: f32, text: &str| {
+            let near = fig_boxes.iter().any(|&(xl, xr, yb, yt)| {
+                x >= xl - axis_margin && x <= xr + axis_margin && y >= yb - axis_margin && y <= yt + axis_margin
+            });
+            if !near {
+                return false;
+            }
+            // Small-font text just outside the ink is a tick/label (the common case); a
+            // BODY-size run is a label only when it is axis-shaped (a numeric tick row or a
+            // unit-bearing axis title — see `is_axis_label_text`), which excludes the
+            // multi-word "Figure N:" caption and ordinary prose.
+            size < body * 0.82 || is_axis_label_text(text)
         };
         // A body-size, multi-word line that merely OVERLAPS a figure's ink box (a
         // description paragraph the box happens to span — e.g. a location map with a
@@ -2409,6 +2436,7 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
         for l in &lines {
             if l.size >= body * 0.95
                 && l.text().split_whitespace().count() > 5
+                && !is_axis_label_text(&l.text()) // a body-size numeric tick row is a figure label, not prose
                 && detect_header(l, body, Some(&profile)).is_none()
                 && in_figure((l.x0 + l.x1) * 0.5, l.y)
             {
@@ -2432,7 +2460,7 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
                 .collect();
             for s in spans {
                 let (cx, cy) = (s.x + s.width * 0.5, s.y + s.size * 0.5);
-                if (in_figure(cx, cy) || near_fig_label(cx, cy, s.size)) && !in_prose(cx, cy) {
+                if (in_figure(cx, cy) || near_fig_label(cx, cy, s.size, &s.text)) && !in_prose(cx, cy) {
                     labels.push(mk(clone_span(s)));
                 }
             }
@@ -2597,7 +2625,13 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
             // (now rendered as SVG <text>) — keep it out of the prose flow. But never
             // swallow a section heading that merely overlaps a figure's bbox.
             let fig_cx = (l.x0 + l.x1) * 0.5;
-            let fig_label = (in_figure(fig_cx, l.y) || near_fig_label(fig_cx, l.y, l.size)) && detect_header(l, body, Some(&profile)).is_none() && !in_prose(fig_cx, l.y);
+            // An axis tick/title is part of the figure even when it's bold/short enough to
+            // look like a heading (a plot's "Vp (m/s)" title); a merely-contained line is a
+            // figure label only when it isn't a real section heading.
+            let axis_label = near_fig_label(fig_cx, l.y, l.size, &l.text());
+            let fig_label = (in_figure(fig_cx, l.y) || axis_label)
+                && !in_prose(fig_cx, l.y)
+                && (axis_label || detect_header(l, body, Some(&profile)).is_none());
             if !in_table(l.x0, l.x1, l.y) && !consumed_caption.contains(&idx) && !fig_label {
                 items.push(Item::L(l));
                 boxes.push((l.x0, l.x1.max(l.x0 + 0.1), l.y, l.y + l.size.max(1.0)));
