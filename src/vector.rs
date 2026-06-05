@@ -141,6 +141,11 @@ pub struct PlacedSvg {
     h: f32,
     page_w: f32, // page width — figure renders at its page-width share
     labels: Vec<Label>,
+    // Local bbox of the figure's opaque background rect (a plot's plot-area), if any. When
+    // present the viewBox is bounded to it (plus labels) so path ink overshooting the plot
+    // — reference curves the PDF clips to the axes box — is cropped by the SVG viewport
+    // instead of trailing far past the figure.
+    plot: Option<(f32, f32, f32, f32)>,
 }
 
 // A label whose centre is within this margin (pt) of the vector-ink bbox is taken
@@ -181,7 +186,9 @@ impl PlacedSvg {
         // viewBox: union of vector content [0,w]x[0,h] and label extents. A glyph
         // run occupies [lx, lx+w] horizontally and (allowing ascenders above the
         // baseline and descenders below it) [ly-size, ly+0.25*size] vertically.
-        let (mut min_x, mut min_y, mut max_x, mut max_y) = (0.0_f32, 0.0_f32, self.w, self.h);
+        // Base the viewBox on the plot area when one was detected (so reference curves the
+        // PDF clips to the axes box don't trail far past the figure); else the full ink.
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = self.plot.unwrap_or((0.0, 0.0, self.w, self.h));
         for l in &self.labels {
             // Text box in local coords (baseline at ly): [lx, lx+w] × [ly-size, ly+0.25size].
             // For a rotated label, rotate the four corners about the anchor (lx,ly) so the
@@ -298,11 +305,16 @@ impl PlacedSvg {
     /// shows and the grid/curves/axes overlay it. Each entry is
     /// `(href, (x_left, x_right, y_bottom, y_top))`: the source and its PDF page rect (y up).
     pub fn composite_svg(&self, rasters: &[(&str, (f32, f32, f32, f32))]) -> String {
-        // viewBox union: start from the vector ink [0,w]×[0,h].
-        let mut min_x = 0.0_f32;
-        let mut min_y = 0.0_f32;
-        let mut max_x = self.w;
-        let mut max_y = self.h;
+        // viewBox base: the plot area if detected (crops overshooting reference curves).
+        // When no plot box was found, start from an empty box and grow it from the rasters
+        // + labels only (NOT the full ink): that still bounds the figure to its real content
+        // — the data raster, axes ticks and legend text — so a curve that trails below the
+        // plot is clipped by the SVG viewport. We fall back to the full ink [0,w]×[0,h] only
+        // if there is nothing to anchor on (no raster, no label).
+        let have_plot = self.plot.is_some();
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = self
+            .plot
+            .unwrap_or((f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY));
         // Raster rects in local coords (origin (x_left, y_top), y DOWN).
         let mut images = String::new();
         for (href, (ix0, ix1, iy0, iy1)) in rasters {
@@ -335,6 +347,14 @@ impl PlacedSvg {
                 max_x = max_x.max(rx);
                 max_y = max_y.max(ry);
             }
+        }
+        // Nothing to anchor the viewBox on (no plot box, no raster, no label): fall back to
+        // the full vector ink so we never emit a degenerate/infinite viewBox.
+        if !have_plot && !min_x.is_finite() {
+            min_x = 0.0;
+            min_y = 0.0;
+            max_x = self.w;
+            max_y = self.h;
         }
         const PAD: f32 = 4.0;
         min_x -= PAD;
@@ -739,17 +759,24 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
     let ty = |y: f32| fmt((y1 - y).clamp(-h, 2.0 * h));
 
     let area = (w * h).max(1.0);
+    let mut plot: Option<(f32, f32, f32, f32)> = None;
     let mut paths = String::new();
     for p in cluster {
         // Skip a near-white background fill that covers a large part of the figure:
         // invisible on the white page anyway, and in a raster+vector composite it would
         // otherwise occlude the embedded raster (a plot's opaque white plot-area behind
         // its data). The plot background covers the axes box but not the legend / overshoot
-        // curves, so a moderate area share (not near-100%) must qualify.
+        // curves, so a moderate area share (not near-100%) must qualify. Remember its local
+        // bbox as the plot area, used to crop overshooting ink (uncliped reference curves).
         if p.stroke.is_none() {
             if let Some([r, g, b]) = p.fill {
                 let pa = (p.x1 - p.x0).max(0.0) * (p.y1 - p.y0).max(0.0);
                 if r >= 248 && g >= 248 && b >= 248 && pa >= area * 0.3 {
+                    let (bx0, bx1, by0, by1) = (p.x0 - x0, p.x1 - x0, y1 - p.y1, y1 - p.y0);
+                    plot = Some(match plot {
+                        Some((mx0, my0, mx1, my1)) => (mx0.min(bx0), my0.min(by0), mx1.max(bx1), my1.max(by1)),
+                        None => (bx0, by0, bx1, by1),
+                    });
                     continue;
                 }
             }
@@ -776,5 +803,5 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
         };
         paths.push_str(&format!("<path d=\"{d}\" fill=\"{fill}\"{fop}{stroke}/>"));
     }
-    PlacedSvg { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, paths, w, h, page_w, labels: Vec::new() }
+    PlacedSvg { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, paths, w, h, page_w, labels: Vec::new(), plot }
 }

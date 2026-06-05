@@ -2264,7 +2264,47 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
             }
             out.push('\n');
         }
-        let tables = extract::detect_tables_pos(spans);
+        let mut tables = extract::detect_tables_pos(spans);
+        let mut images = img::positioned_images(doc, *_pid, inline_images);
+        let raw_vectors = vector::positioned_vectors(doc, *_pid);
+        // Drop FALSE tables — a "table" that is really a figure's own structure, not a data
+        // table — BEFORE filtering vectors, so the real plot vector survives the vector
+        // filter below while a genuine ruled form table is preserved:
+        //   (a) a region largely covered by a raster image (a plot's data scatter/heatmap
+        //       reads as a grid), or
+        //   (b) a thin strip mostly inside a MUCH larger COMPOSITE-PLOT vector — a vector
+        //       that itself contains a substantial raster (the plot's data scatter/heatmap),
+        //       so the strip is the plot's axis-number row / legend. Requiring the vector to
+        //       contain a raster is what protects a ruled form (e.g. the IRS W-9): its cell
+        //       borders are a large vector with NO raster, so its real table is never dropped.
+        // Left in, such a false table both consumes the figure's labels as cells AND
+        // suppresses the overlapping vector, fragmenting a raster+vector plot (a Vp-depth
+        // crossplot) into a lone raster plus loose axis text.
+        tables.retain(|t| {
+            let ta = ((t.x_right - t.x_left) * (t.y_top - t.y_bottom)).max(1.0);
+            let raster_covered = images.iter().any(|im| {
+                let ia = ((im.x_right - im.x_left) * (im.y_top - im.y_bottom)).max(1.0);
+                let ox = (t.x_right.min(im.x_right) - t.x_left.max(im.x_left)).max(0.0);
+                let oy = (t.y_top.min(im.y_top) - t.y_bottom.max(im.y_bottom)).max(0.0);
+                ia >= ta * 0.15 && ox * oy >= ia * 0.5
+            });
+            let strip_in_plot = raw_vectors.iter().any(|v| {
+                let va = ((v.x_right - v.x_left) * (v.y_top - v.y_bottom)).max(1.0);
+                let ox = (v.x_right.min(t.x_right) - v.x_left.max(t.x_left)).max(0.0);
+                let oy = (v.y_top.min(t.y_top) - v.y_bottom.max(t.y_bottom)).max(0.0);
+                if !(ox * oy >= ta * 0.6 && ta < va * 0.5) {
+                    return false;
+                }
+                // …and the vector is a composite plot: it contains a substantial raster.
+                images.iter().any(|im| {
+                    let ia = ((im.x_right - im.x_left) * (im.y_top - im.y_bottom)).max(1.0);
+                    let iox = (v.x_right.min(im.x_right) - v.x_left.max(im.x_left)).max(0.0);
+                    let ioy = (v.y_top.min(im.y_top) - v.y_bottom.max(im.y_bottom)).max(0.0);
+                    iox * ioy >= ia * 0.5
+                })
+            });
+            !(raster_covered || strip_in_plot)
+        });
         let plinks = links_by_page.get(pno).unwrap_or(&no_links);
         let mut lines = lines_of(spans.iter().map(clone_span).collect(), plinks);
         // Drop running page numbers: a line that is just a 1–4 digit number sitting
@@ -2310,19 +2350,6 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
             }
         }
 
-        // Mark lines consumed by a table (within its y-range).
-        // A line belongs to a table only if it overlaps the table in BOTH axes. The
-        // x-overlap is essential on two-column pages: a table in one column must not
-        // swallow the OTHER column's prose at the same height (BERT p16: the right-
-        // column "Masking Rates" table was dropping the left-column Q&A text). A
-        // full-width single-column table still matches every line (x-overlap trivially
-        // holds), so its behaviour is unchanged.
-        let in_table = |x0: f32, x1: f32, y: f32| {
-            tables.iter().any(|t| {
-                y <= t.y_top + body && y >= t.y_bottom - body && x1 > t.x_left && x0 < t.x_right
-            })
-        };
-
         // Ordered items by y (top -> bottom). Img/T carry an index so a caption
         // can be attached opportunistically (see below).
         enum Item<'a> {
@@ -2332,11 +2359,14 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
             Svg(usize), // vector figure transcoded to inline SVG
             Cap(usize), // standalone caption (e.g. a vector figure with no raster)
         }
-        let mut images = img::positioned_images(doc, *_pid, inline_images);
         // Vector figures (diagrams/plots drawn as paths). A figure's AREA is the
         // detected vector-ink cluster; we drop any that overlap a detected table
         // (tables own their region) so table rules aren't re-emitted as a figure.
-        let mut vectors: Vec<vector::PlacedSvg> = vector::positioned_vectors(doc, *_pid)
+        // A figure overlapping a (remaining, real) table is dropped — a ruled table's
+        // borders read as vector ink and the table owns its region. The false tables that
+        // would wrongly suppress a real plot vector were already removed above, so this
+        // simple any-overlap test no longer fragments raster+vector crossplots.
+        let mut vectors: Vec<vector::PlacedSvg> = raw_vectors
             .into_iter()
             .filter(|v| {
                 !tables.iter().any(|t| {
@@ -2344,6 +2374,15 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
                 })
             })
             .collect();
+        // Mark lines consumed by a table (within its y-range). A line belongs to a table
+        // only if it overlaps in BOTH axes — the x-overlap is essential on two-column pages
+        // so a table in one column doesn't swallow the other column's prose. Defined after
+        // all table filtering so it sees the final table set.
+        let in_table = |x0: f32, x1: f32, y: f32| {
+            tables.iter().any(|t| {
+                y <= t.y_top + body && y >= t.y_bottom - body && x1 > t.x_left && x0 < t.x_right
+            })
+        };
         // A vector figure's bbox — used to attach its labels and to keep that text
         // out of the body flow (it belongs to the figure, not the prose).
         let fig_boxes: Vec<(f32, f32, f32, f32)> = vectors.iter().map(|v| (v.x_left, v.x_right, v.y_bottom, v.y_top)).collect();
