@@ -12,6 +12,7 @@ mod afm;
 mod captions;
 mod extract;
 mod frontmatter;
+mod headings;
 mod html;
 mod img;
 mod links;

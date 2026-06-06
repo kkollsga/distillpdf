@@ -2,7 +2,8 @@
 //! cross-reference, a "Continued" marker, or a List-of-Figures dot-leader entry; gather a
 //! multi-line caption block. Extracted from html.rs.
 
-use crate::html::{append_piece, detect_header, list_kind, render_runs, Line};
+use crate::headings::detect_header;
+use crate::html::{append_piece, list_kind, render_runs, Line};
 use crate::profile::DocProfile;
 
 /// "Figure 2 shows …", "Table 1 summarises …", "Fig. 3 plots …" — an in-text
