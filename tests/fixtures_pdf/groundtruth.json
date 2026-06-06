@@ -33,6 +33,47 @@
       "We thank J. K. Lee and M. R. Patel for helpful discussions and feedback here."
     ]
   },
+  "heading_traps.pdf": {
+    "headings": [
+      {
+        "text": "Introduction",
+        "tag": "h2"
+      }
+    ],
+    "not_headings": [
+      "x = y + z",
+      "a b c d e f",
+      "The ATLAS Collaboration",
+      "The result was set during the run"
+    ]
+  },
+  "sec_structure.pdf": {
+    "anchors": [
+      "PART I",
+      "Item 1. Business",
+      "Item 1A. Risk Factors"
+    ],
+    "genuine": [
+      "Financial Overview"
+    ],
+    "flood": [
+      "Net product sales",
+      "Cost of sales",
+      "Gross profit",
+      "Research and development",
+      "Selling and marketing",
+      "General and administrative",
+      "Operating loss",
+      "Interest income",
+      "Interest expense",
+      "Other income",
+      "Provision for taxes",
+      "Net loss",
+      "Total assets",
+      "Total liabilities",
+      "Cash and equivalents"
+    ]
+  },
   "lists.pdf": {
     "numbered": [
       "First ordered step in the procedure.",
@@ -92,6 +133,35 @@
     "fig1_caption": "Figure 1: A raster bar chart comparing two measured groups.",
     "fig2_caption": "Figure 2: A vector line chart of the same measurements."
   },
+  "figures_hier.pdf": {
+    "fig_id": "fig-2-3-1",
+    "tab_id": "tab-0-1-1",
+    "fig_caption": "Figure 2.3.1",
+    "tab_caption": "Table 0.1-1",
+    "linked_no_graphic": "Figure 6"
+  },
+  "figures_continued.pdf": {
+    "caption": "Figure 4",
+    "dup_id": "fig-4-2"
+  },
+  "figures_nodot.pdf": {
+    "nodot_id": "fig-5",
+    "nature_id": "fig-7",
+    "inline_xref": "As shown in Fig 5 the trend"
+  },
+  "lof_dotleader.pdf": {
+    "entry_text": "Overview of the study area",
+    "wrapped_text": "considerably longer descriptive title",
+    "n_figures": 0
+  },
+  "small_vector_fig.pdf": {
+    "caption": "Figure 1: A small diagram of the mapping between two objects.",
+    "n_figures": 1
+  },
+  "no_spurious_figs.pdf": {
+    "page1_figures": 0,
+    "total_figures": 1
+  },
   "links.pdf": {
     "uri": "https://example.com/distillpdf",
     "dest_name": "cite.smith2020",
@@ -122,11 +192,34 @@
       "RIGHTTHREE"
     ]
   },
+  "twocol_tight.pdf": {
+    "order": [
+      "LEFTSTART",
+      "LEFTEND",
+      "RIGHTSTART",
+      "RIGHTEND"
+    ]
+  },
+  "yflip.pdf": {
+    "order": [
+      "YFLIPONE",
+      "YFLIPTWO",
+      "YFLIPTHREE",
+      "YFLIPFOUR",
+      "YFLIPFIVE"
+    ]
+  },
   "math.pdf": {
     "title": "Convergence Analysis",
     "section": "1 Analysis",
     "equation_fragment": "S(w)",
     "theorem_text": "The estimator is consistent under the stated assumptions"
+  },
+  "mathfonts.pdf": {
+    "cmsy": "\u2264\u2265\u2192\u2208",
+    "cmmi": "\u03b1\u03bc\u03bb\u2202",
+    "diff_names": "\u2211\u222b\u03b1\u2264",
+    "c1": "\u2014\u2019"
   },
   "numeric.pdf": {
     "header": [

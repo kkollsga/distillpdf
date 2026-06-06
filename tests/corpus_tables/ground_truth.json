@@ -1307,5 +1307,206 @@
   "tbl_26_neg_labelvalue.pdf": {
     "tables": [],
     "is_negative": true
+  },
+  "tbl_lock_sparse_multicol.pdf": {
+    "tables": [
+      {
+        "rows": 10,
+        "cols": 10,
+        "cells": [
+          [
+            "Key",
+            "Q1",
+            "Q2",
+            "Q3",
+            "Q4",
+            "Q5",
+            "Q6",
+            "Q7",
+            "Q8",
+            "Q9"
+          ],
+          [
+            "Row1",
+            "7",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          [
+            "Row2",
+            "",
+            "22",
+            "",
+            "14",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          [
+            "Row3",
+            "",
+            "",
+            "33",
+            "",
+            "",
+            "",
+            "21",
+            "",
+            ""
+          ],
+          [
+            "Row4",
+            "28",
+            "",
+            "",
+            "44",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          [
+            "Row5",
+            "",
+            "",
+            "",
+            "35",
+            "55",
+            "",
+            "",
+            "",
+            ""
+          ],
+          [
+            "Row6",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "66",
+            "42",
+            "",
+            ""
+          ],
+          [
+            "Row7",
+            "49",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "77",
+            "",
+            ""
+          ],
+          [
+            "Row8",
+            "",
+            "",
+            "",
+            "56",
+            "",
+            "",
+            "",
+            "88",
+            ""
+          ],
+          [
+            "Row9",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "63",
+            "",
+            "99"
+          ]
+        ],
+        "style": "sparse_multicol",
+        "has_header": true,
+        "complex": false
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_lock_right_aligned.pdf": {
+    "tables": [
+      {
+        "rows": 9,
+        "cols": 3,
+        "cells": [
+          [
+            "Item",
+            "Count",
+            "Amount"
+          ],
+          [
+            "Item1",
+            "3",
+            "5"
+          ],
+          [
+            "Item2",
+            "6",
+            "1,234"
+          ],
+          [
+            "Item3",
+            "9",
+            "67"
+          ],
+          [
+            "Item4",
+            "12",
+            "890,123"
+          ],
+          [
+            "Item5",
+            "15",
+            "4"
+          ],
+          [
+            "Item6",
+            "18",
+            "56,789"
+          ],
+          [
+            "Item7",
+            "21",
+            "8"
+          ],
+          [
+            "Item8",
+            "24",
+            "12,000"
+          ]
+        ],
+        "style": "right_aligned_numeric",
+        "has_header": true,
+        "complex": false
+      }
+    ],
+    "is_negative": false
+  },
+  "tbl_lock_prose_not_table.pdf": {
+    "tables": [],
+    "is_negative": true
+  },
+  "tbl_lock_equation.pdf": {
+    "tables": [],
+    "is_negative": true
   }
 }

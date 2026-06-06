@@ -21,6 +21,11 @@ struct FontInfo {
     /// f-ligatures (0x0b-0x0f) and accents/specials (0x10-0x1f) aren't emitted as
     /// control chars. Math fonts (CMMI/CMSY/CMEX) are excluded — different encoding.
     ot1_text: bool,
+    /// CM math font family with no ToUnicode: 1 = CMMI/CMMIB/EUFM (Greek + math italic),
+    /// 2 = CMSY/CMBSY/MSAM/MSBM (relations/operators). 0 = not a (decodable) math font.
+    /// Low codes are decoded through the built-in TeX math encoding instead of being
+    /// dropped as control chars.
+    cm_math: u8,
     /// Glyph advance widths in 1000-em units, keyed by code/CID.
     widths: HashMap<u32, f32>,
     default_width: f32,
@@ -290,6 +295,25 @@ fn font_info(doc: &Document, dict: &Dictionary, raw: &[u8]) -> FontInfo {
             || basefont.contains("consol")
             || (flags & 0x1) != 0;
 
+        // A non-embedded standard base font (Times/Helvetica/Courier/Symbol/ZapfDingbats)
+        // with NO /Widths: use the Adobe Standard-14 AFM advances rather than a flat 0.5-em
+        // guess. The guess closes narrow two-column gutters (justified lines overshoot) and
+        // mis-sizes table columns; the real metrics fix both. Only fills when /Widths was
+        // absent (embedded subset fonts carry their own /Widths and keep it).
+        if !two_byte && widths.is_empty() {
+            if let Some(table) = crate::afm::standard_widths(&basefont, bold, italic) {
+                for (code, &w) in table.iter().enumerate() {
+                    if w != 0 {
+                        widths.insert(code as u32, w as f32);
+                    }
+                }
+            } else if let Some(mw) = descriptor.and_then(|d| d.get(b"MissingWidth").ok()).and_then(obj_i64) {
+                // Non-standard font without /Widths: the FontDescriptor's /MissingWidth is a
+                // better default than the flat 0.5-em fallback.
+                default_width = mw as f32;
+            }
+        }
+
         // CM *text* family (not the CMMI/CMSY/CMEX math fonts, which use a
         // different built-in encoding). Only used when there's no ToUnicode and
         // the code isn't covered by /Differences.
@@ -304,8 +328,21 @@ fn font_info(doc: &Document, dict: &Dictionary, raw: &[u8]) -> FontInfo {
                 .iter()
                 .any(|w| basefont.contains(w));
 
+        // CM math font whose low codes carry Greek / operators via the built-in TeX
+        // encoding (no ToUnicode) — decode them rather than dropping as control chars.
+        let cm_math: u8 = if !two_byte && to_unicode.is_none() {
+            if ["cmmi", "cmmib", "eufm", "eufb", "eurm", "eurb"].iter().any(|w| basefont.contains(w)) {
+                1
+            } else if ["cmsy", "cmbsy", "msam", "msbm"].iter().any(|w| basefont.contains(w)) {
+                2
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         let font_id = font_id_of(&basefont);
-        FontInfo { two_byte, to_unicode, differences, ot1_text, widths, default_width, bold, italic, mono, font_id }
+        FontInfo { two_byte, to_unicode, differences, ot1_text, cm_math, widths, default_width, bold, italic, mono, font_id }
     }
 }
 
@@ -421,6 +458,12 @@ fn utf16be(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Caps guarding a hostile/garbled ToUnicode CMap: a `beginbfrange` like
+/// `<0000> <FFFFFFFF> <0041>` would otherwise loop billions of times. The CID code space is
+/// 16-bit, so a single range over 65 536 codes — or a map past ~1M entries — is pathological.
+const MAX_CMAP_RANGE: u32 = 1 << 16;
+const MAX_CMAP_ENTRIES: usize = 1 << 20;
+
 fn parse_tounicode(data: &[u8]) -> HashMap<u32, String> {
     let text = String::from_utf8_lossy(data);
     let toks = tokenize_cmap(&text);
@@ -443,11 +486,16 @@ fn parse_tounicode(data: &[u8]) -> HashMap<u32, String> {
             while i < toks.len() && !is_word(&toks[i], "endbfrange") {
                 match (toks.get(i), toks.get(i + 1), toks.get(i + 2)) {
                     (Some(Tok::Hex(lo)), Some(Tok::Hex(hi)), Some(Tok::Hex(dst))) => {
-                        let (lo, hi) = (be_u32(lo), be_u32(hi));
+                        let lo = be_u32(lo);
+                        // Clamp a pathological range to the 16-bit CID space (no billion-iter loop).
+                        let hi = be_u32(hi).min(lo.saturating_add(MAX_CMAP_RANGE - 1));
                         let base = utf16be(dst);
                         // Common case: single-char dst incremented across the range.
                         let base_cp = base.chars().next().map(|c| c as u32);
                         for (k, code) in (lo..=hi).enumerate() {
+                            if map.len() >= MAX_CMAP_ENTRIES {
+                                break;
+                            }
                             if let Some(cp) = base_cp {
                                 if let Some(ch) = char::from_u32(cp + k as u32) {
                                     map.insert(code, ch.to_string());
@@ -569,6 +617,34 @@ fn glyph_to_str(name: &str) -> Option<String> {
         "zdotaccent" => "ż", "Zdotaccent" => "Ż",
         "germandbls" => "ß", "thorn" => "þ", "Thorn" => "Þ", "eth" => "ð", "Eth" => "Ð",
         "exclamdown" => "¡", "questiondown" => "¿", "ordfeminine" => "ª", "ordmasculine" => "º",
+        // Greek letters (Adobe Glyph List names) used by math fonts (PazoMath, Euler,
+        // MathTime) via /Differences with no ToUnicode.
+        "alpha" => "α", "beta" => "β", "gamma" => "γ", "delta" => "δ", "epsilon" => "ε",
+        "zeta" => "ζ", "eta" => "η", "theta" => "θ", "iota" => "ι", "kappa" => "κ",
+        "lambda" => "λ", "mu" => "μ", "nu" => "ν", "xi" => "ξ", "omicron" => "ο",
+        "pi" => "π", "rho" => "ρ", "sigma" => "σ", "sigma1" => "ς", "tau" => "τ",
+        "upsilon" => "υ", "phi" => "φ", "chi" => "χ", "psi" => "ψ", "omega" => "ω",
+        "varepsilon" => "ε", "vartheta" => "ϑ", "varpi" => "ϖ", "varrho" => "ϱ",
+        "varsigma" => "ς", "varphi" => "ϕ", "phi1" => "ϕ", "theta1" => "ϑ",
+        "Alpha" => "Α", "Beta" => "Β", "Gamma" => "Γ", "Delta" => "Δ", "Epsilon" => "Ε",
+        "Zeta" => "Ζ", "Eta" => "Η", "Theta" => "Θ", "Iota" => "Ι", "Kappa" => "Κ",
+        "Lambda" => "Λ", "Mu" => "Μ", "Nu" => "Ν", "Xi" => "Ξ", "Omicron" => "Ο",
+        "Pi" => "Π", "Rho" => "Ρ", "Sigma" => "Σ", "Tau" => "Τ", "Upsilon" => "Υ",
+        "Phi" => "Φ", "Chi" => "Χ", "Psi" => "Ψ", "Omega" => "Ω",
+        // Math operators / relations (AGL names).
+        "summation" => "∑", "product" => "∏", "integral" => "∫", "radical" => "√",
+        "partialdiff" => "∂", "gradient" => "∇", "nabla" => "∇", "infinity" => "∞",
+        "element" => "∈", "notelement" => "∉", "owner" => "∋", "emptyset" => "∅",
+        "intersection" => "∩", "union" => "∪", "logicaland" => "∧", "logicalor" => "∨",
+        "logicalnot" => "¬", "existential" => "∃", "universal" => "∀",
+        "lessequal" => "≤", "greaterequal" => "≥", "notequal" => "≠", "equivalence" => "≡",
+        "approxequal" => "≈", "similar" => "∼", "congruent" => "≅", "proportional" => "∝",
+        "propersubset" => "⊂", "propersuperset" => "⊃", "reflexsubset" => "⊆",
+        "reflexsuperset" => "⊇", "arrowright" => "→", "arrowleft" => "←", "arrowup" => "↑",
+        "arrowdown" => "↓", "arrowboth" => "↔", "arrowdblright" => "⇒", "arrowdblleft" => "⇐",
+        "arrowdblboth" => "⇔", "minute" => "′", "second" => "″", "aleph" => "ℵ",
+        "circlemultiply" => "⊗", "circleplus" => "⊕", "perpendicular" => "⊥", "angle" => "∠",
+        "asteriskmath" => "∗", "dotmath" => "⋅", "circlemath" => "∘",
         // Single-letter names (A..Z, a..z) and unknowns.
         _ => {
             if name.len() == 1 && name.as_bytes()[0].is_ascii_alphabetic() {
@@ -595,6 +671,62 @@ fn ot1_text_code(c: u8) -> Option<&'static str> {
         // text-encoding quote/dash positions (ASCII glyphs that CM text repurposes)
         0x22 => "”", 0x27 => "’", 0x5c => "“", 0x60 => "‘", 0x7b => "–", 0x7c => "—",
         0x7d => "˝", 0x7e => "˜", 0x7f => "¨",
+        _ => return None,
+    })
+}
+
+/// Windows-1252 C1 range (0x80-0x9F) — smart quotes, dashes, ellipsis, bullet. A font
+/// that declares no encoding and no ToUnicode emits these as raw bytes; mapped here
+/// before they fall through to `push_norm` (which would drop them as C1 control chars).
+fn c1_remap(b: u8) -> Option<&'static str> {
+    Some(match b {
+        0x82 => "‚", 0x84 => "„", 0x85 => "…", 0x86 => "†", 0x87 => "‡",
+        0x88 => "ˆ", 0x89 => "‰", 0x8b => "‹", 0x91 => "‘", 0x92 => "’",
+        0x93 => "“", 0x94 => "”", 0x95 => "•", 0x96 => "–", 0x97 => "—",
+        0x98 => "˜", 0x99 => "™", 0x9b => "›",
+        _ => return None,
+    })
+}
+
+/// Computer-Modern Math Italic (CMMI/CMMIB) built-in encoding for fonts with no
+/// ToUnicode: uppercase + lowercase Greek (incl. variants), `∂`, and the math-italic
+/// Latin letters (recovered as plain letters — they are variable names). Slots are the
+/// canonical TeX `cmmi` encoding.
+fn cmmi_code(c: u8) -> Option<&'static str> {
+    Some(match c {
+        0x00 => "Γ", 0x01 => "Δ", 0x02 => "Θ", 0x03 => "Λ", 0x04 => "Ξ", 0x05 => "Π",
+        0x06 => "Σ", 0x07 => "Υ", 0x08 => "Φ", 0x09 => "Ψ", 0x0a => "Ω",
+        0x0b => "α", 0x0c => "β", 0x0d => "γ", 0x0e => "δ", 0x0f => "ε", 0x10 => "ζ",
+        0x11 => "η", 0x12 => "θ", 0x13 => "ι", 0x14 => "κ", 0x15 => "λ", 0x16 => "μ",
+        0x17 => "ν", 0x18 => "ξ", 0x19 => "π", 0x1a => "ρ", 0x1b => "σ", 0x1c => "τ",
+        0x1d => "υ", 0x1e => "φ", 0x1f => "χ", 0x20 => "ψ", 0x21 => "ω",
+        0x22 => "ε", 0x23 => "ϑ", 0x24 => "ϖ", 0x25 => "ϱ", 0x26 => "ς", 0x27 => "ϕ",
+        0x40 => "∂", 0x60 => "ℓ", 0x7b => "ı", 0x7c => "ȷ", 0x7d => "℘",
+        // 0x41-0x5a (A-Z) and 0x61-0x7a (a-z) are math-italic Latin variables — already
+        // valid ASCII, so they pass through `push_norm` unchanged (return None here).
+        _ => return None,
+    })
+}
+
+/// Computer-Modern Symbol (CMSY/CMBSY) built-in encoding for fonts with no ToUnicode:
+/// the relations, operators and arrows of TeX math. Canonical TeX `cmsy` slots; only the
+/// well-established, high-frequency positions are mapped (uncertain slots fall through
+/// unchanged, exactly as today). Calligraphic caps are recovered as plain A-Z.
+fn cmsy_code(c: u8) -> Option<&'static str> {
+    Some(match c {
+        0x00 => "−", 0x01 => "·", 0x02 => "×", 0x03 => "∗", 0x04 => "÷", 0x05 => "⋄",
+        0x06 => "±", 0x07 => "∓", 0x08 => "⊕", 0x09 => "⊖", 0x0a => "⊗", 0x0b => "⊘",
+        0x0c => "⊙", 0x0f => "•",
+        0x11 => "≡", 0x12 => "⊆", 0x13 => "⊇", 0x14 => "≤", 0x15 => "≥",
+        0x18 => "∼", 0x19 => "≈", 0x1a => "⊂", 0x1b => "⊃", 0x1c => "≪", 0x1d => "≫",
+        0x20 => "←", 0x21 => "→", 0x22 => "↑", 0x23 => "↓", 0x24 => "↔",
+        0x27 => "≃", 0x28 => "⇐", 0x29 => "⇒", 0x2c => "⇔",
+        0x2f => "∝", 0x30 => "′", 0x31 => "∞", 0x32 => "∈", 0x33 => "∋",
+        0x38 => "∀", 0x39 => "∃", 0x3a => "¬", 0x3b => "∅", 0x3c => "ℜ", 0x3d => "ℑ",
+        0x3e => "⊤", 0x3f => "⊥", 0x40 => "ℵ",
+        // 0x41-0x5a are calligraphic caps — pass through as plain ASCII A-Z (None).
+        0x5b => "∪", 0x5c => "∩", 0x5e => "∧", 0x5f => "∨", 0x60 => "⊢", 0x61 => "⊣",
+        0x6a => "∥", 0x6e => "√", 0x72 => "∇",
         _ => return None,
     })
 }
@@ -734,7 +866,19 @@ fn decode_words(elems: &[Show], font: Option<&FontInfo>, size: f32, tc: f32, tw:
                         if !got && fi.to_unicode.is_none() {
                             if !fi.two_byte {
                                 let b = bytes[i];
-                                match fi.ot1_text.then(|| ot1_text_code(b)).flatten() {
+                                // CM text (OT1) → CM math (CMMI/CMSY) → Windows-1252 C1 →
+                                // raw byte. Each layer only fires for its font kind, so a
+                                // glyph that was being dropped is now recovered.
+                                let mapped = if fi.ot1_text {
+                                    ot1_text_code(b)
+                                } else {
+                                    match fi.cm_math {
+                                        1 => cmmi_code(b),
+                                        2 => cmsy_code(b),
+                                        _ => None,
+                                    }
+                                };
+                                match mapped.or_else(|| c1_remap(b)) {
                                     Some(t) => s.push_str(t),
                                     None => push_norm(&mut s, b as char),
                                 }
@@ -869,10 +1013,18 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
         // into Tm), in which case `height` already picks the scale up via `wtm.d`; the
         // width must pick up the matching HORIZONTAL scale or it stays ~20× too small,
         // collapsing every word's measured extent and tearing lines apart on fake gaps.
+        // Y-FLIP CTM (top-left origin): `[1 0 0 -1 0 H] cm` lays the page out with y growing
+        // DOWNWARD. It is axis-aligned (b≈c≈0) but the device y-axis is inverted (dm.d<0).
+        // Such a doc must use DEVICE coordinates (dm.f = H − text_y) so y is y-up like the
+        // rest of the pipeline; keeping the raw text-matrix y would make a top glyph sort
+        // below a bottom one and read the WHOLE document bottom-to-top (the SEC-filing bug).
+        let yflip = !rotated && dm.d < 0.0 && dm.b.abs() < 1e-3 && dm.c.abs() < 1e-3;
         let (x, y, height, angle, sx) = if rotated {
             (dm.e, dm.f, base_size * (dm.c * dm.c + dm.d * dm.d).sqrt(), baseline, (dm.a * dm.a + dm.b * dm.b).sqrt())
         } else if pure_translate {
             (dm.e, dm.f, base_size * wtm.d, 0.0, wtm.a)
+        } else if yflip {
+            (dm.e, dm.f, base_size * dm.d.abs(), 0.0, dm.a.abs())
         } else {
             (wtm.e, wtm.f, base_size * wtm.d, 0.0, wtm.a)
         };
@@ -1066,7 +1218,7 @@ fn xobjects_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, Objec
 /// spans only at depth >= 1 (inside a form), mapped to page space via the CTM.
 #[allow(clippy::too_many_arguments)]
 fn decode_text_ctm(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashMap<Vec<u8>, FontInfo>, xmap: &HashMap<Vec<u8>, ObjectId>, base: Mat, raw: &[u8], depth: u32, out: &mut Vec<Span>) {
-    if depth > 8 {
+    if depth > crate::MAX_FORM_DEPTH {
         return;
     }
     let mut g = base; // graphics CTM (form placement)
@@ -1269,6 +1421,44 @@ fn widest_gap(mut intervals: Vec<(f32, f32)>) -> Option<(f32, f32)> {
     best
 }
 
+/// Widest INTERIOR vertical lane crossed by at most `tol` intervals — a crossing-tolerant
+/// gutter detector. Unlike [`widest_gap`] (which needs a fully empty lane) this ignores a
+/// handful of stray boxes (a centered page number, a running header) that would otherwise
+/// veto an obvious two-column split. Returns `(lane_width, centre_x)`. The caller still
+/// validates the split with `vertical_valid`, so a false lane in sparse text is rejected.
+fn tolerant_vgap(intervals: &[(f32, f32)], tol: usize) -> Option<(f32, f32)> {
+    let xmin = intervals.iter().map(|v| v.0).fold(f32::INFINITY, f32::min);
+    let xmax = intervals.iter().map(|v| v.1).fold(f32::NEG_INFINITY, f32::max);
+    if !(xmax - xmin > 2.0) {
+        return None;
+    }
+    let crossings = |x: f32| intervals.iter().filter(|(lo, hi)| *lo < x && x < *hi).count();
+    // Sweep the interior at 1pt resolution, tracking the widest contiguous run of x whose
+    // crossing count stays within tolerance.
+    let step = 1.0f32;
+    let (mut best_w, mut best_c) = (0.0f32, 0.0f32);
+    let (mut run_start, mut in_run) = (0.0f32, false);
+    let mut x = xmin + step;
+    while x < xmax {
+        let clear = crossings(x) <= tol;
+        if clear && !in_run {
+            run_start = x;
+            in_run = true;
+        }
+        if in_run && (!clear || x + step >= xmax) {
+            let end = if clear { x } else { x - step };
+            let w = end - run_start;
+            if w > best_w {
+                best_w = w;
+                best_c = (run_start + end) * 0.5;
+            }
+            in_run = false;
+        }
+        x += step;
+    }
+    (best_w > 0.0).then_some((best_w, best_c))
+}
+
 /// A bounding box in PDF user space (y increases upward): `(left, right, bottom, top)`.
 pub type BBox = (f32, f32, f32, f32);
 
@@ -1280,8 +1470,16 @@ pub type BBox = (f32, f32, f32, f32);
 /// boxes, the HTML layer feeds it block boxes, so both segment columns the same
 /// way. See [`xy_cut`] for the algorithm.
 pub fn xy_cut_order(boxes: &[BBox], med: f32) -> Vec<usize> {
+    xy_cut_order_opt(boxes, med, false)
+}
+
+/// As [`xy_cut_order`], but `tolerant` enables the crossing-tolerant column-gutter detector
+/// (a stray centered page number / running header in the gutter no longer vetoes a real
+/// column split). Use it for SPAN-level prose ordering (where line interleaving hurts); keep
+/// it OFF for page-item ordering, where over-splitting would detach figures from captions.
+pub fn xy_cut_order_opt(boxes: &[BBox], med: f32, tolerant: bool) -> Vec<usize> {
     let mut order = Vec::with_capacity(boxes.len());
-    xy_cut(boxes, (0..boxes.len()).collect(), med.max(1.0), 0, &mut order);
+    xy_cut(boxes, (0..boxes.len()).collect(), med.max(1.0), 0, tolerant, &mut order);
     order
 }
 
@@ -1299,7 +1497,7 @@ pub fn xy_cut_order(boxes: &[BBox], med: f32) -> Vec<usize> {
 /// most. A full-width element (title/abstract/figure) fills the gutter and so
 /// has no vertical gap there — it gets peeled off by a horizontal cut first,
 /// after which the remaining body splits cleanly into columns.
-fn xy_cut(boxes: &[BBox], idx: Vec<usize>, med: f32, depth: u32, out: &mut Vec<usize>) {
+fn xy_cut(boxes: &[BBox], idx: Vec<usize>, med: f32, depth: u32, tolerant: bool, out: &mut Vec<usize>) {
     if idx.len() <= 1 || depth >= 40 {
         out.extend(sorted_lines(boxes, idx, med));
         return;
@@ -1319,24 +1517,19 @@ fn xy_cut(boxes: &[BBox], idx: Vec<usize>, med: f32, depth: u32, out: &mut Vec<u
     // lands as a page-wide horizontal box) that would otherwise smear across the
     // gutter and defeat every column cut. They still take part in the ordering.
     let min_h = (med * 0.4).max(2.0);
-    let gv = widest_gap(
-        idx.iter()
-            .filter(|&&i| boxes[i].3 - boxes[i].2 >= min_h)
-            .map(|&i| (boxes[i].0, boxes[i].1))
-            .collect(),
-    );
+    let vint: Vec<(f32, f32)> = idx
+        .iter()
+        .filter(|&&i| boxes[i].3 - boxes[i].2 >= min_h)
+        .map(|&i| (boxes[i].0, boxes[i].1))
+        .collect();
+    let gv = widest_gap(vint.clone()); // strictly-empty column gutter
     let gh = widest_gap(idx.iter().map(|&i| (boxes[i].2, boxes[i].3)).collect());
     let gvw = gv.map(|(g, _)| g).unwrap_or(0.0);
     let ghw = gh.map(|(g, _)| g).unwrap_or(0.0);
 
-    // Attempt a vertical (column) cut: split left|right and recurse, left first.
-    // Returns `Some(idx)` (the boxes handed back) when the gutter is not a real
-    // column boundary, so the caller can reconsider a horizontal cut instead.
-    let try_vertical = |out: &mut Vec<usize>, idx: Vec<usize>| -> Option<Vec<usize>> {
-        let cut = match gv {
-            Some((_, c)) => c,
-            None => return Some(idx),
-        };
+    // Attempt a vertical (column) cut at `cut`: split left|right and recurse, left first.
+    // Returns `Some(idx)` (the boxes handed back) when `cut` is not a real column boundary.
+    let try_vertical = |out: &mut Vec<usize>, idx: Vec<usize>, cut: f32| -> Option<Vec<usize>> {
         if !vertical_valid(boxes, &idx, cut) {
             return Some(idx);
         }
@@ -1345,8 +1538,8 @@ fn xy_cut(boxes: &[BBox], idx: Vec<usize>, med: f32, depth: u32, out: &mut Vec<u
             let b = boxes[i];
             if (b.0 + b.1) * 0.5 < cut { left.push(i) } else { right.push(i) }
         }
-        xy_cut(boxes, left, med, depth + 1, out);
-        xy_cut(boxes, right, med, depth + 1, out);
+        xy_cut(boxes, left, med, depth + 1, tolerant, out);
+        xy_cut(boxes, right, med, depth + 1, tolerant, out);
         None
     };
 
@@ -1354,13 +1547,16 @@ fn xy_cut(boxes: &[BBox], idx: Vec<usize>, med: f32, depth: u32, out: &mut Vec<u
     // Prefer a vertical cut when its gutter is at least as wide as the best
     // horizontal gap (columns dominate reading order).
     if gvw >= thr_v && gvw >= ghw {
-        match try_vertical(out, idx) {
-            None => return,
-            Some(back) => idx = back, // invalid gutter; reconsider below
+        if let Some((_, c)) = gv {
+            match try_vertical(out, idx, c) {
+                None => return,
+                Some(back) => idx = back, // invalid gutter; reconsider below
+            }
         }
     }
-    // Peel a full-width block (title/abstract/figure) horizontally, top first;
-    // the body underneath becomes cleanly two-column on recursion.
+    // Peel a full-width block (title/abstract/figure/caption) horizontally, top first; the
+    // body underneath becomes cleanly two-column on recursion. This runs BEFORE the tolerant
+    // gutter below, so a full-width caption is never split into columns.
     if ghw >= thr_h {
         let cut = gh.unwrap().1;
         let (mut top, mut bot) = (Vec::new(), Vec::new());
@@ -1372,19 +1568,56 @@ fn xy_cut(boxes: &[BBox], idx: Vec<usize>, med: f32, depth: u32, out: &mut Vec<u
                 bot.push(i)
             }
         }
-        xy_cut(boxes, top, med, depth + 1, out);
-        xy_cut(boxes, bot, med, depth + 1, out);
+        xy_cut(boxes, top, med, depth + 1, tolerant, out);
+        xy_cut(boxes, bot, med, depth + 1, tolerant, out);
         return;
     }
-    // No horizontal block break: a narrower-but-valid gutter still wins over
+    // No horizontal block break: a narrower-but-valid strictly-empty gutter still wins over
     // interleaving the columns line-by-line.
     if gvw >= thr_v {
-        match try_vertical(out, idx) {
-            None => return,
-            Some(back) => idx = back,
+        if let Some((_, c)) = gv {
+            match try_vertical(out, idx, c) {
+                None => return,
+                Some(back) => idx = back,
+            }
+        }
+    }
+    // LAST RESORT (span ordering only): a TALL two-column body whose gutter is split only by a
+    // stray centered page number / running header. Gated hard — tried only after the
+    // full-width horizontal peel (figures/captions already blocked off), tolerating very few
+    // crossings, requiring the lane to clear the column threshold AND both sides to span many
+    // lines, so a short multi-line caption is never mistaken for a pair of columns.
+    if tolerant && vint.len() >= 8 {
+        let tol = (vint.len() / 120).max(1);
+        if let Some((w, c)) = tolerant_vgap(&vint, tol) {
+            if w >= thr_v && tall_columns(boxes, &idx, c, med) {
+                match try_vertical(out, idx, c) {
+                    None => return,
+                    Some(back) => idx = back,
+                }
+            }
         }
     }
     out.extend(sorted_lines(boxes, idx, med));
+}
+
+/// Both sides of `cut` span a tall, overlapping y-range (≥ ~8 lines) — the signature of true
+/// page columns, not a short multi-line caption that merely has words on either side of a
+/// perceived lane. Used to gate the crossing-tolerant gutter.
+fn tall_columns(boxes: &[BBox], idx: &[usize], cut: f32, med: f32) -> bool {
+    let (mut lt, mut lb, mut rt, mut rb) = (f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY);
+    for &i in idx {
+        let b = boxes[i];
+        if (b.0 + b.1) * 0.5 < cut {
+            lt = lt.max(b.3);
+            lb = lb.min(b.2);
+        } else {
+            rt = rt.max(b.3);
+            rb = rb.min(b.2);
+        }
+    }
+    let overlap = (lt.min(rt) - lb.max(rb)).max(0.0);
+    overlap >= med * 8.0
 }
 
 /// Is a candidate vertical cut a real column boundary (not a sparse-layout or

@@ -176,6 +176,14 @@ fn jpeg_is_cmyk(content: &[u8]) -> bool {
 /// then map true CMYK → RGB.
 fn decode_jpeg_rgb(content: &[u8], decode_invert: bool) -> Option<image::RgbImage> {
     let mut dec = jpeg_decoder::Decoder::new(std::io::Cursor::new(content));
+    // Read the header first and reject absurd dimensions BEFORE decoding pixels (a hostile
+    // JPEG could declare a huge frame and force a giant allocation).
+    dec.read_info().ok()?;
+    if let Some(info) = dec.info() {
+        if !dims_sane(info.width as u32, info.height as u32) {
+            return None;
+        }
+    }
     let px = dec.decode().ok()?;
     let info = dec.info()?;
     let (w, h) = (info.width as u32, info.height as u32);
@@ -220,6 +228,16 @@ fn decode_inverts(dict: &Dictionary) -> bool {
 
 /// Decode an image stream to RGB8, handling JPEG (DCTDecode) and Flate/raw
 /// samples (gray/rgb). Returns None for formats we don't assemble.
+/// Per-dimension sanity cap and a total-pixel ceiling. A malformed/hostile stream can declare
+/// enormous `/Width`×`/Height`; refusing them before allocating the raw buffer prevents a
+/// decompression-bomb OOM.
+const MAX_IMAGE_DIM: u32 = 0x1FFFF; // 131071 px per side
+const MAX_IMAGE_PIXELS: usize = 64 << 20; // 64 M px
+
+fn dims_sane(w: u32, h: u32) -> bool {
+    w > 0 && h > 0 && w <= MAX_IMAGE_DIM && h <= MAX_IMAGE_DIM && (w as usize).saturating_mul(h as usize) <= MAX_IMAGE_PIXELS
+}
+
 fn decode_rgb(doc: &Document, id: ObjectId) -> Option<image::RgbImage> {
     let stream = doc.get_object(id).ok()?.as_stream().ok()?;
     let dict = &stream.dict;
@@ -233,7 +251,7 @@ fn decode_rgb(doc: &Document, id: ObjectId) -> Option<image::RgbImage> {
     let w = dict.get(b"Width").ok().and_then(|o| o.as_i64().ok())? as u32;
     let h = dict.get(b"Height").ok().and_then(|o| o.as_i64().ok())? as u32;
     let bpc = dict.get(b"BitsPerComponent").ok().and_then(|o| o.as_i64().ok()).unwrap_or(8);
-    if bpc != 8 || w == 0 || h == 0 {
+    if bpc != 8 || !dims_sane(w, h) {
         return None;
     }
     let raw = stream.decompressed_content().ok()?;
@@ -266,7 +284,7 @@ fn decode_smask(doc: &Document, dict: &Dictionary) -> Option<image::GrayImage> {
     let w = sd.get(b"Width").ok().and_then(|o| o.as_i64().ok())? as u32;
     let h = sd.get(b"Height").ok().and_then(|o| o.as_i64().ok())? as u32;
     let bpc = sd.get(b"BitsPerComponent").ok().and_then(|o| o.as_i64().ok()).unwrap_or(8);
-    if bpc != 8 || w == 0 || h == 0 {
+    if bpc != 8 || !dims_sane(w, h) {
         return None;
     }
     let raw = stream.decompressed_content().ok()?;
@@ -297,7 +315,7 @@ fn decodable(doc: &Document, id: ObjectId) -> bool {
     let w = dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0);
     let h = dict.get(b"Height").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0);
     let bpc = dict.get(b"BitsPerComponent").ok().and_then(|o| o.as_i64().ok()).unwrap_or(8);
-    w > 0 && h > 0 && bpc == 8
+    bpc == 8 && w > 0 && h > 0 && dims_sane(w as u32, h as u32)
 }
 
 /// Build a base64 data URI for an image stream, or None if unsupported.
@@ -500,7 +518,7 @@ fn walk(
     out: &mut Vec<RawTile>,
     depth: u32,
 ) {
-    if depth > 8 {
+    if depth > crate::MAX_FORM_DEPTH {
         return;
     }
     let mut ctm = base;

@@ -253,6 +253,79 @@ def main():
            for i in range(12)],
           [], negative=True); idx += 1
 
+    # ---- LOCKING fixtures for the two-pass column profile (extract.rs) ----
+    # Each pins one behaviour of the whitespace-lane column model so a future refactor
+    # can't silently re-break it. Re-seed so their content is independent of the count
+    # of fixtures generated above.
+    random.seed(202)
+
+    # L1 sparse_multicol — a WIDE table whose header names all 10 columns but whose body
+    # rows each fill only 1-2 cells (Transformer Table 3 / 10-K financial class). Locks
+    # header-named sparse-column SURVIVAL: the old ≥50%-occupancy filter collapsed this
+    # to ~2 columns; the band model + named-keep must keep ~10.
+    ncol = 10
+    cells = [["Key"] + [f"Q{c}" for c in range(1, ncol)]]
+    for r in range(9):
+        row = [f"Row{r+1}"] + [""] * (ncol - 1)
+        row[r + 1] = f"{(r + 1) * 11}"                    # diagonal → every column has ≥1 value
+        row[((r * 3) % (ncol - 1)) + 1] = f"{(r + 1) * 7}"  # a second sparse value
+        cells.append(row)
+    t = Table(cells, colWidths=[0.62 * inch] * ncol)
+    t.setStyle(TableStyle([("FONTSIZE", (0, 0), (-1, -1), 8),
+                           ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold")]))
+    build("tbl_lock_sparse_multicol.pdf", [t],
+          [{"rows": len(cells), "cols": ncol, "cells": cells,
+            "style": "sparse_multicol", "has_header": True, "complex": False}])
+
+    # L2 right_aligned_numeric — a right-aligned numeric column whose values span very
+    # different widths (1 to 7 digits). Their LEFT edges scatter row to row, which the
+    # old left-x clustering split into phantom columns; the band model (keyed on where
+    # text sits) must keep a STABLE 3-column structure with each value in its own cell.
+    amts = ["5", "1,234", "67", "890,123", "4", "56,789", "8", "12,000"]
+    cells = [["Item", "Count", "Amount"]]
+    for r, a in enumerate(amts):
+        cells.append([f"Item{r+1}", f"{(r+1)*3}", a])
+    t = Table(cells, colWidths=[1.3 * inch, 0.9 * inch, 1.2 * inch])
+    t.setStyle(TableStyle([("FONTSIZE", (0, 0), (-1, -1), 9),
+                           ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                           ("ALIGN", (1, 0), (2, -1), "RIGHT")]))
+    build("tbl_lock_right_aligned.pdf", [t],
+          [{"rows": len(cells), "cols": 3, "cells": cells,
+            "style": "right_aligned_numeric", "has_header": True, "complex": False}])
+
+    # L3 prose_not_table (NEGATIVE) — a two-column glossary: a short term beside a long
+    # wrapped definition. It forms ≥2-cell rows (so it reaches the column model), but the
+    # admission test (is_coherent_grid) must still reject it as prose. Locks the
+    # admission/column-keeping DECOUPLING against the relaxed (named) keep rule.
+    glossary = [
+        ["Basalt", "A dark fine-grained volcanic rock that forms from the rapid cooling of magnesium-rich lava exposed at the surface of the crust."],
+        ["Granite", "A coarse-grained intrusive igneous rock composed mainly of quartz and feldspar that crystallises slowly deep below the ground."],
+        ["Shale", "A fine-grained sedimentary rock formed from the compaction of silt and clay particles over very long geological periods of time."],
+        ["Quartz", "A hard crystalline mineral made of silicon dioxide that is found widely across many different rock types and mineral veins worldwide."],
+    ]
+    pdfrows = [[term, Paragraph(desc, CELL)] for term, desc in glossary]
+    t = Table(pdfrows, colWidths=[1.0 * inch, 4.4 * inch])
+    t.setStyle(TableStyle([("FONTSIZE", (0, 0), (-1, -1), 9), ("VALIGN", (0, 0), (-1, -1), "TOP")]))
+    build("tbl_lock_prose_not_table.pdf", [t], [], negative=True)
+
+    # L4 equation_not_table (NEGATIVE, canvas-positioned) — a display equation whose
+    # terms sit at fixed column x's, so it forms ≥2-cell rows and reaches the richer
+    # band column model (the case that could let an equation slip past the old guards).
+    # is_coherent_grid must still reject it via the relation (=) rule. (Base-14 fonts
+    # can't encode ≤/≥/−, so the inequality-specific path stays locked by the corpus
+    # math_as_table gate on the real math_PR PDF; this locks the general rule in CI.)
+    from reportlab.pdfgen import canvas as _canvas
+    c = _canvas.Canvas(os.path.join(OUT, "tbl_lock_equation.pdf"), pagesize=letter)
+    c.setFont("Helvetica", 11)
+    y = 640
+    for r in range(4):
+        c.drawString(90, y, f"(3.{r+1}) y")    # eq-number glued to a term (not standalone)
+        c.drawString(220, y, "= a x")          # = a x  (the relation)
+        c.drawString(330, y, f"+ b {r+1}")     # + b n
+        y -= 26
+    c.save()
+    GT["tbl_lock_equation.pdf"] = {"tables": [], "is_negative": True}
+
     with open(os.path.join(OUT, "ground_truth.json"), "w") as f:
         json.dump(GT, f, indent=2)
     n_tables = sum(len(v["tables"]) for v in GT.values())

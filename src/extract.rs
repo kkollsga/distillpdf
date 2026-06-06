@@ -140,7 +140,12 @@ fn row_cells(row: &[Span]) -> Vec<Cell> {
     cells
 }
 
-/// Cluster cell x-positions into column anchors (gap-based, tolerance `tol`).
+/// Cluster cell LEFT edges into column anchors (gap-based, tolerance `tol`). This is the
+/// pre-band-model detector, kept as a FALLBACK: the whitespace-lane `column_bands` is the
+/// primary, but on a wide-first-column table (e.g. the Transformer "Layer Type | …" Table 1)
+/// a long row label bridges the lane and merges columns, so the band model degenerates to
+/// <2 columns and the table is lost. Left-x clustering recovers those — it anchors on where
+/// each column STARTS, which a wide neighbour doesn't disturb.
 fn columns(rows: &[Vec<Cell>], tol: f32) -> Vec<f32> {
     let mut xs: Vec<f32> = rows.iter().flat_map(|r| r.iter().map(|c| c.x)).collect();
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -153,36 +158,207 @@ fn columns(rows: &[Vec<Cell>], tol: f32) -> Vec<f32> {
     cols
 }
 
-/// Column index for a span at `x` by left-anchored RANGES: column `k` owns
-/// `[cols[k], cols[k+1])`, so a word in a wide cell that drifts past the midpoint
-/// toward the next anchor still stays in its own column (a small leftward `tol`
-/// margin keeps right-aligned values from spilling left). Falls back to column 0
-/// for anything left of the first anchor. Used to fill the grid, where a span's true
-/// column is the range it lies in — not merely the nearest anchor.
-fn col_band(cols: &[f32], x: f32, tol: f32) -> Option<usize> {
-    if cols.is_empty() {
-        return None;
-    }
-    let margin = tol * 0.5;
-    let mut k = 0;
-    for (i, &c) in cols.iter().enumerate() {
-        if c <= x + margin {
-            k = i;
-        } else {
-            break;
-        }
-    }
-    Some(k)
-}
-
-/// Index of the column anchor nearest to `x`.
+/// Index of the column anchor nearest to `x` (left-x fallback occupancy counting).
 fn nearest_col(cols: &[f32], x: f32) -> Option<usize> {
     cols.iter()
         .enumerate()
-        .min_by(|(_, a), (_, b)| {
-            (x - **a).abs().partial_cmp(&(x - **b).abs()).unwrap_or(std::cmp::Ordering::Equal)
+        .min_by(|(_, a), (_, b)| (x - **a).abs().partial_cmp(&(x - **b).abs()).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+}
+
+/// Column bands via vertical whitespace lanes (PASS 1 of table parsing).
+///
+/// Project every cell's x-interval from the data rows AND any header rows, then read
+/// off the maximal x-ranges that some row covers; the clear gaps between them are the
+/// column separators. This keys on WHERE TEXT SITS, not where it starts, so a
+/// right-aligned numeric column (whose left edges scatter row to row) stays a single
+/// band, and because the header rows are projected too, a SPARSE column the body
+/// rarely fills is still a band (the header spans it). `bridge` is how many outlier
+/// rows may span a lane before it stops being a separator (0 = a lane must be fully
+/// clear). Cells within a row are disjoint, so interval coverage == row coverage.
+/// Returns each column band as (lo, hi), left→right; deterministic (event sweep).
+fn column_bands(rows: &[&[Cell]], bridge: usize) -> Vec<(f32, f32)> {
+    let mut ev: Vec<(f32, i32)> = Vec::new();
+    for r in rows {
+        for c in *r {
+            if c.end > c.x {
+                ev.push((c.x, 1));
+                ev.push((c.end, -1));
+            }
+        }
+    }
+    if ev.is_empty() {
+        return Vec::new();
+    }
+    ev.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(b.1.cmp(&a.1)));
+    let mut bands: Vec<(f32, f32)> = Vec::new();
+    let mut cov = 0i32;
+    let mut prev_x = ev[0].0;
+    let mut in_band = false;
+    let (mut lo, mut hi) = (0.0f32, 0.0f32);
+    for (x, d) in ev {
+        if x > prev_x {
+            // segment [prev_x, x) carried coverage `cov`
+            if cov as usize > bridge {
+                if !in_band {
+                    in_band = true;
+                    lo = prev_x;
+                }
+                hi = x;
+            } else if in_band {
+                bands.push((lo, hi));
+                in_band = false;
+            }
+        }
+        cov += d;
+        prev_x = x;
+    }
+    if in_band {
+        bands.push((lo, hi));
+    }
+    bands
+}
+
+/// Index of the band whose interval contains `x`, else the nearest band by distance
+/// to its interval. Used to assign a span to a column in PASS 2.
+fn band_of(bands: &[(f32, f32)], x: f32) -> Option<usize> {
+    if bands.is_empty() {
+        return None;
+    }
+    for (i, &(lo, hi)) in bands.iter().enumerate() {
+        if x >= lo && x <= hi {
+            return Some(i);
+        }
+    }
+    bands
+        .iter()
+        .enumerate()
+        .min_by(|(_, &(lo, hi)), (_, &(lo2, hi2))| {
+            let d = |l: f32, h: f32| if x < l { l - x } else { x - h };
+            d(lo, hi).partial_cmp(&d(lo2, hi2)).unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|(i, _)| i)
+}
+
+/// Structural ADMISSION test: is this region a genuine data table, or prose / an
+/// equation / a symbolic matrix that merely happens to have aligned tokens?
+///
+/// This is the single backstop that keeps false positives out. It is deliberately
+/// kept SEPARATE from column-keeping (how many columns survive) so that recovering a
+/// sparse column can never silently re-admit a prose/equation block: admission reads
+/// the region's content, column-keeping reads its geometry, and the two no longer
+/// interfere. Returns true to accept the region as a table.
+fn is_coherent_grid(grid: &[Vec<String>]) -> bool {
+    // Prose guard: real tabular cells are terse. A 2-column block averaging >4
+    // words/cell is running prose (wrapped body lines), not a table.
+    let (mut wc, mut nz, mut prose) = (0usize, 0usize, 0usize);
+    for row in grid {
+        for c in row {
+            let w = c.split_whitespace().count();
+            if w > 0 {
+                wc += w;
+                nz += 1;
+                if w > 8 {
+                    prose += 1;
+                }
+            }
+        }
+    }
+    let mean_words = if nz > 0 { wc as f32 / nz as f32 } else { 0.0 };
+    let ncols = grid.first().map(|r| r.len()).unwrap_or(0);
+    if ncols <= 2 && mean_words > 4.0 {
+        return false;
+    }
+    // 2-col body gridded into 3 cols (gutter-crossing title): tell is a phantom
+    // anchor column empty in nearly every row plus long cells. Real 3-col tables
+    // are populated, so they pass (e.g. the W-9 field tables).
+    let has_empty_col = ncols > 0
+        && !grid.is_empty()
+        && (0..ncols).any(|c| {
+            let empty = grid.iter().filter(|r| r.get(c).map_or(true, |s| s.trim().is_empty())).count();
+            empty * 5 >= grid.len() * 4
+        });
+    if ncols == 3 && mean_words > 4.5 && has_empty_col {
+        return false;
+    }
+    // Wider mis-grids: reject only when nearly every cell is a full sentence.
+    if nz >= 6 && prose * 3 >= nz * 2 && mean_words > 6.0 {
+        return false;
+    }
+    // Display EQUATION mis-detected as a table: cells are dominated by math
+    // operators / Greek (not numeric data) and the region carries an '=' or an
+    // equation-number "(N)". Reject so the equation stays in the text flow
+    // (where it is reassembled as one block) instead of a spurious <table>. A
+    // numeric data table has no operators and no '=', so it is unaffected.
+    let opcell = |t: &str| t.chars().any(|c| "=+−–×÷·≤≥≠≈∝∫∑∏√∈∉∂∇→←↔⇒⇐↦∼≜≡∥⟨⟩".contains(c) || "αβγδεζηθικλμνξπρςστυϕφχψωΓΔΘΛΞΠΣΦΨΩ".contains(c));
+    let op = grid.iter().flatten().filter(|c| opcell(c)).count();
+    // An equation is signalled by a RELATION — '=' or an inequality/equivalence
+    // (≤ ≥ ≠ ≈ ≜ ≡ ∝). These appear in display math/inequalities but almost never as
+    // the content of a data cell (a stats table's "p ≤ 0.05" carries real words too,
+    // which the alpha_words gate below preserves).
+    let has_rel = grid.iter().flatten().any(|c| c.chars().any(|ch| "=≤≥≠≈≜≡∝".contains(ch)));
+    let eqnum = grid.iter().flatten().any(|c| {
+        let t = c.trim();
+        let inner: String = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')).unwrap_or("").to_string();
+        !inner.is_empty() && inner.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+    });
+    // Real (alphabetic, ≥2-letter) words — an equation has almost none; its
+    // "words" are space-separated symbols. A data table has real words.
+    let alpha_words = grid.iter().flatten().flat_map(|c| c.split(|ch: char| !ch.is_alphabetic())).filter(|w| w.chars().count() >= 3).count();
+    // Reject an equation region: it carries a relation or eq-number, OR it is
+    // operator-dense (a relation/arrow chain), and it has almost no real words.
+    if nz > 0 && alpha_words <= nz && ((op >= 1 && (has_rel || eqnum)) || op * 2 >= nz) {
+        return false;
+    }
+    // Symbolic MATRIX/array mis-detected as a table (e.g. a block matrix of
+    // subscripted variables W₀, D₁Y₁, ∇W₁). Unlike the equation case above it
+    // carries no '=' / eq-number and is not operator-dense — its cells are plain
+    // variables. Signature: NO data values (a real data table has decimals or
+    // multi-digit numbers; a matrix has only single-digit sub/superscripts), NO
+    // real words, and a majority of cells are variable-like (start with a letter).
+    // A numeric data table fails this (its cells start with digits and it has data
+    // values), so it is unaffected.
+    let dataval = grid
+        .iter()
+        .flatten()
+        .filter(|c| {
+            let b = c.as_bytes();
+            (0..b.len()).any(|i| b[i].is_ascii_digit() && i + 2 < b.len() && b[i + 1] == b'.' && b[i + 2].is_ascii_digit())
+                || c.chars().filter(|ch| ch.is_ascii_digit()).count() >= 3
+        })
+        .count();
+    let letter_start = grid.iter().flatten().filter(|c| c.trim_start().chars().next().is_some_and(|ch| ch.is_alphabetic())).count();
+    if nz >= 4 && dataval == 0 && alpha_words == 0 && letter_start * 2 >= nz {
+        return false;
+    }
+    // Scattered symbolic DIAGRAM mis-detected as a table (e.g. a commutative
+    // diagram: nodes X, Y, D, E with arrow labels ⟨(234)⟩ flung across the page).
+    // Distinct from the matrix case above, which needs a letter-start majority —
+    // a diagram is half bare digits, half symbols, so no axis dominates. Its tells
+    // are instead: very LOW fill (nodes float in whitespace, unlike a real table
+    // whose occupied columns are densely populated), NO numeric data values, almost
+    // no real words, and either arrow/operator glyphs or short variable-like cells.
+    // Gated on dataval == 0 so no numeric data table can ever be hit.
+    // Commutative DIAGRAM mis-detected as a table (nodes X, Y, D, E with morphism
+    // labels ⟨(234)⟩ scattered across the page — or, once the left-x fallback merges
+    // them, a degenerate 2-column block). The tell is a category-theory
+    // arrow/morphism glyph (→ ↦ ⟨ ⟩ …), which essentially never appears in tabular
+    // DATA, in a grid that is NOT word-dominated. A word-heavy table (a state- or
+    // reaction-transition table whose cells are real labels — conv → relu → pool)
+    // survives via the alpha-word gate, so numeric/label tables are unaffected.
+    let diagram_glyph = grid.iter().flatten().any(|c| c.chars().any(|ch| "→←↔⇒⇐↦⟨⟩∘↪↩⟶⟵↠↣".contains(ch)));
+    // A real DATA table is full of decimal values (319.61, 0.446); a commutative
+    // diagram has none — its numbers are bare node indices. Require decimal-absence
+    // so a numeric table that merely uses an arrow in a header (input → output) is
+    // never mistaken for a diagram.
+    let has_decimal = grid.iter().flatten().any(|c| {
+        let b = c.as_bytes();
+        (0..b.len()).any(|i| b[i].is_ascii_digit() && i + 2 < b.len() && b[i + 1] == b'.' && b[i + 2].is_ascii_digit())
+    });
+    if nz >= 6 && diagram_glyph && alpha_words * 3 <= nz && !has_decimal {
+        return false;
+    }
+    true
 }
 
 /// Detect tables: runs of >=3 consecutive rows that each have >=2 gutter-separated
@@ -438,136 +614,7 @@ fn detect_tables_region(spans: &[Span]) -> Vec<PosTable> {
             .iter()
             .map(|(_, c, _)| c.iter().map(|x| Cell { x: x.x, end: x.end, text: x.text.clone() }).collect())
             .collect();
-        let cols = columns(&owned, tol);
-        if cols.len() < 2 {
-            return;
-        }
-        let mut occ = vec![0usize; cols.len()];
-        for row in &owned {
-            for c in row {
-                if let Some(ci) = nearest_col(&cols, c.x) {
-                    occ[ci] += 1;
-                }
-            }
-        }
-        // Columns occupied in a majority of rows are the table; stray minority cells
-        // merge into the nearest kept column (dense grid, no content drop, no bloat).
-        let keep: Vec<usize> = (0..cols.len()).filter(|&i| occ[i] * 2 >= owned.len()).collect();
-        if keep.len() < 2 {
-            return;
-        }
-        let col_to_keep: Vec<usize> = (0..cols.len())
-            .map(|ci| {
-                keep.iter()
-                    .enumerate()
-                    .min_by(|(_, &a), (_, &b)| {
-                        (cols[ci] - cols[a]).abs().partial_cmp(&(cols[ci] - cols[b]).abs()).unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .map(|(k, _)| k)
-                    .unwrap_or(0)
-            })
-            .collect();
-        // Fill the grid from the RAW SPANS, binning each to its nearest column. This
-        // splits a packed multi-column header ("MNLI-m QNLI MRPC SST-2" crammed into
-        // one cell) back into its columns, while data spans that share a column
-        // ("BERT" "BASE") still join — so cells track the real column structure.
-        let bin_row = |spans: &[Span]| {
-            let mut cells = vec![String::new(); keep.len()];
-            for s in spans {
-                let txt = s.text.trim();
-                if txt.is_empty() {
-                    continue;
-                }
-                if let Some(ci) = col_band(&cols, s.x, tol) {
-                    let k = col_to_keep[ci];
-                    if !cells[k].is_empty() && join_space(&cells[k], txt) {
-                        cells[k].push(' ');
-                    }
-                    cells[k].push_str(txt);
-                }
-            }
-            cells
-        };
-        let grid: Vec<Vec<String>> = run.iter().map(|(_, _, spans)| bin_row(spans)).collect();
-        // Prose guard: real tabular cells are terse. A 2-column block averaging >4
-        // words/cell is running prose (wrapped body lines), not a table.
-        let (mut wc, mut nz, mut prose) = (0usize, 0usize, 0usize);
-        for row in &grid {
-            for c in row {
-                let w = c.split_whitespace().count();
-                if w > 0 {
-                    wc += w;
-                    nz += 1;
-                    if w > 8 {
-                        prose += 1;
-                    }
-                }
-            }
-        }
-        let mean_words = if nz > 0 { wc as f32 / nz as f32 } else { 0.0 };
-        let ncols = grid.first().map(|r| r.len()).unwrap_or(0);
-        if ncols <= 2 && mean_words > 4.0 {
-            return;
-        }
-        // 2-col body gridded into 3 cols (gutter-crossing title): tell is a phantom
-        // anchor column empty in nearly every row plus long cells. Real 3-col tables
-        // are populated, so they pass (e.g. the W-9 field tables).
-        let has_empty_col = ncols > 0
-            && !grid.is_empty()
-            && (0..ncols).any(|c| {
-                let empty = grid.iter().filter(|r| r.get(c).map_or(true, |s| s.trim().is_empty())).count();
-                empty * 5 >= grid.len() * 4
-            });
-        if ncols == 3 && mean_words > 4.5 && has_empty_col {
-            return;
-        }
-        // Wider mis-grids: reject only when nearly every cell is a full sentence.
-        if nz >= 6 && prose * 3 >= nz * 2 && mean_words > 6.0 {
-            return;
-        }
-        // Display EQUATION mis-detected as a table: cells are dominated by math
-        // operators / Greek (not numeric data) and the region carries an '=' or an
-        // equation-number "(N)". Reject so the equation stays in the text flow
-        // (where it is reassembled as one block) instead of a spurious <table>. A
-        // numeric data table has no operators and no '=', so it is unaffected.
-        let opcell = |t: &str| t.chars().any(|c| "=+−–×÷·≤≥≠≈∝∫∑∏√∈∉∂∇→←↔⇒⇐↦∼≜≡∥⟨⟩".contains(c) || "αβγδεζηθικλμνξπρςστυϕφχψωΓΔΘΛΞΠΣΦΨΩ".contains(c));
-        let op = grid.iter().flatten().filter(|c| opcell(c)).count();
-        let has_eq = grid.iter().flatten().any(|c| c.contains('='));
-        let eqnum = grid.iter().flatten().any(|c| {
-            let t = c.trim();
-            let inner: String = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')).unwrap_or("").to_string();
-            !inner.is_empty() && inner.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
-        });
-        // Real (alphabetic, ≥2-letter) words — an equation has almost none; its
-        // "words" are space-separated symbols. A data table has real words.
-        let alpha_words = grid.iter().flatten().flat_map(|c| c.split(|ch: char| !ch.is_alphabetic())).filter(|w| w.chars().count() >= 3).count();
-        // Reject an equation region: it carries an '=' or eq-number, OR it is
-        // operator-dense (a relation/arrow chain), and it has almost no real words.
-        if nz > 0 && alpha_words <= nz && ((op >= 1 && (has_eq || eqnum)) || op * 2 >= nz) {
-            return;
-        }
-        // Symbolic MATRIX/array mis-detected as a table (e.g. a block matrix of
-        // subscripted variables W₀, D₁Y₁, ∇W₁). Unlike the equation case above it
-        // carries no '=' / eq-number and is not operator-dense — its cells are plain
-        // variables. Signature: NO data values (a real data table has decimals or
-        // multi-digit numbers; a matrix has only single-digit sub/superscripts), NO
-        // real words, and a majority of cells are variable-like (start with a letter).
-        // A numeric data table fails this (its cells start with digits and it has data
-        // values), so it is unaffected.
-        let dataval = grid
-            .iter()
-            .flatten()
-            .filter(|c| {
-                let b = c.as_bytes();
-                (0..b.len()).any(|i| b[i].is_ascii_digit() && i + 2 < b.len() && b[i + 1] == b'.' && b[i + 2].is_ascii_digit())
-                    || c.chars().filter(|ch| ch.is_ascii_digit()).count() >= 3
-            })
-            .count();
-        let letter_start = grid.iter().flatten().filter(|c| c.trim_start().chars().next().is_some_and(|ch| ch.is_alphabetic())).count();
-        if nz >= 4 && dataval == 0 && alpha_words == 0 && letter_start * 2 >= nz {
-            return;
-        }
-
+        // Region x-extent of the DATA.
         let (mut x_left, mut x_right) = (f32::INFINITY, f32::NEG_INFINITY);
         for row in &owned {
             for c in row {
@@ -575,6 +622,119 @@ fn detect_tables_region(spans: &[Span]) -> Vec<PosTable> {
                 x_right = x_right.max(c.end);
             }
         }
+        // Build a grid from the RAW SPANS for a candidate set of kept columns (expressed as
+        // x-bands) by assigning each span to the band containing its CENTRE, then ADMIT it
+        // (prose/equation/matrix reject). Returns (grid, kept left-x anchors) iff admitted.
+        // `min_fill` is the minimum fraction of non-empty grid cells required to ACCEPT —
+        // 0 for the band model (its header-named keep legitimately produces sparse wide
+        // tables), but raised for the left-x fallback so a sparse symbol SCATTER (a
+        // commutative diagram, a math array) isn't clustered into a spurious table.
+        let try_model = |kept: Vec<(f32, f32)>, min_fill: f32| -> Option<(Vec<Vec<String>>, Vec<f32>)> {
+            if kept.len() < 2 {
+                return None;
+            }
+            let grid: Vec<Vec<String>> = run
+                .iter()
+                .map(|(_, _, spans)| {
+                    let mut cells = vec![String::new(); kept.len()];
+                    for s in spans {
+                        let txt = s.text.trim();
+                        if txt.is_empty() {
+                            continue;
+                        }
+                        let w = if s.width > 0.1 { s.width } else { txt.chars().count() as f32 * s.size * 0.5 };
+                        if let Some(k) = band_of(&kept, s.x + w * 0.5) {
+                            if !cells[k].is_empty() && join_space(&cells[k], txt) {
+                                cells[k].push(' ');
+                            }
+                            cells[k].push_str(txt);
+                        }
+                    }
+                    cells
+                })
+                .collect();
+            if min_fill > 0.0 {
+                let total = grid.len() * kept.len();
+                let filled = grid.iter().flatten().filter(|c| !c.trim().is_empty()).count();
+                if total == 0 || (filled as f32) < min_fill * total as f32 {
+                    return None;
+                }
+            }
+            if is_coherent_grid(&grid) {
+                Some((grid, kept.iter().map(|b| b.0).collect()))
+            } else {
+                None
+            }
+        };
+        // PASS 1a (PRIMARY) — whitespace-lane band columns: keys on where text SITS, so
+        // right-aligned numerics stay distinct and a header-named sparse column survives.
+        let band_kept: Vec<(f32, f32)> = {
+            let owned_slices: Vec<&[Cell]> = owned.iter().map(|r| r.as_slice()).collect();
+            let bands = column_bands(&owned_slices, 0);
+            if bands.len() < 2 {
+                Vec::new()
+            } else {
+                let center = |c: &Cell| (c.x + c.end) * 0.5;
+                let mut occ = vec![0usize; bands.len()];
+                for row in &owned {
+                    let mut hit = vec![false; bands.len()];
+                    for c in row {
+                        if let Some(bi) = band_of(&bands, center(c)) {
+                            hit[bi] = true;
+                        }
+                    }
+                    for (i, &h) in hit.iter().enumerate() {
+                        if h {
+                            occ[i] += 1;
+                        }
+                    }
+                }
+                // A band is NAMED when a header cell (a stranded header row, or the run's own
+                // first row) overlaps it by ≥0.35 of its width — header-named bands survive
+                // even when the body rarely fills them (wide sparse tables).
+                let hdr_src: Vec<&Cell> = headers.iter().flat_map(|hr| hr.1.iter()).chain(owned.first().into_iter().flat_map(|r| r.iter())).collect();
+                let body_rows = owned.len();
+                (0..bands.len())
+                    .filter(|&i| {
+                        let (lo, hi) = bands[i];
+                        let w = hi - lo;
+                        let named = w > 0.0 && hdr_src.iter().any(|c| c.end.min(hi) - c.x.max(lo) > 0.35 * w);
+                        occ[i] * 2 >= body_rows || named
+                    })
+                    .map(|i| bands[i])
+                    .collect()
+            }
+        };
+        // PASS 1b (FALLBACK) — left-x clustering, as bands [anchor_k, anchor_{k+1}). Recovers
+        // wide-first-column tables the lane model over-merges (Transformer Table 1), where a
+        // long row label bridges a lane and collapses the band grid to <2 columns.
+        let leftx_kept = || -> Vec<(f32, f32)> {
+            let cols = columns(&owned, tol);
+            if cols.len() < 2 {
+                return Vec::new();
+            }
+            let mut occ = vec![0usize; cols.len()];
+            for row in &owned {
+                for c in row {
+                    if let Some(ci) = nearest_col(&cols, c.x) {
+                        occ[ci] += 1;
+                    }
+                }
+            }
+            let keep: Vec<usize> = (0..cols.len()).filter(|&i| occ[i] * 2 >= owned.len()).collect();
+            keep.iter()
+                .enumerate()
+                .map(|(j, &k)| (cols[k], keep.get(j + 1).map(|&nk| cols[nk]).unwrap_or(x_right + tol * 0.5)))
+                .collect()
+        };
+        // Band model first; on its failure (degenerate or rejected) fall back to left-x,
+        // which must clear a density bar (≥0.5 filled) so a sparse math scatter the band
+        // model correctly rejected isn't resurrected as a spurious table.
+        let (grid, kept_x) = match try_model(band_kept, 0.0).or_else(|| try_model(leftx_kept(), 0.5)) {
+            Some(gx) => gx,
+            None => return,
+        };
+
         // Now that the data table is ACCEPTED (past every prose/equation guard), attach
         // the grouped/multi-level HEADER rows the run-builder skipped — they don't form
         // uniform >=2-cell rows, so they were stranded above the data and leaked into the
@@ -582,7 +742,6 @@ fn detect_tables_region(spans: &[Span]) -> Vec<PosTable> {
         // its x-span covers become one cell with colspan = #covered (a label centred over
         // several columns merges); a cell over one column gets colspan 1; uncovered
         // columns become empty cells. Only rows horizontally overlapping the table count.
-        let kept_x: Vec<f32> = keep.iter().map(|&k| cols[k]).collect();
         let ncols = kept_x.len();
         let m = tol * 0.5;
         let mut y_top = run.first().map(|(y, _, _)| *y).unwrap_or(0.0);
@@ -594,7 +753,7 @@ fn detect_tables_region(spans: &[Span]) -> Vec<PosTable> {
             }
             let mut slots: Vec<Option<(String, usize)>> = vec![None; ncols];
             let mut owner: Vec<Option<usize>> = vec![None; ncols]; // column → slot holding its text
-            // Each data column k owns the x-region [anchor_k, anchor_{k+1}) (last → x_right).
+            // Each data column k owns the x-region [band_k.lo, band_{k+1}.lo) (last → x_right).
             // A header cell covers column k when its x-span overlaps that region by a
             // MEANINGFUL fraction of the column width — so a group label centred over
             // several columns spans them all, while a label that merely grazes a

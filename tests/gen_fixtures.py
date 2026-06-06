@@ -312,6 +312,167 @@ def _vector_chart(c, ox, oy, vw, vh):
     c.setFillColorRGB(0, 0, 0)
 
 
+def gen_figure_hier():
+    """Hierarchical figure/table numbers ("Figure 2.3.1", "Table 0.1-1") must be preserved
+    WHOLE in the id (fig-2-3-1 / tab-0-1-1) — not truncated to the leading integer (the NASA
+    databook bug). Plus a figure-less caption that must still emit inside <figure>, not as a
+    bare <p>."""
+    pdf = os.path.join(OUT, "figures_hier.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    title(c, "Hierarchical Figure Numbers")
+    y = PAGE_H - 130
+    _vector_chart(c, LM + 50, y - 120, 210, 110)
+    y -= 120 + 8
+    c.setFont("Helvetica", 9.5)
+    c.drawString(LM, y, "Figure 2.3.1: A hierarchical numbered figure.")
+    c.showPage()
+    c.setFont("Helvetica", 9.5)
+    c.drawString(LM, PAGE_H - 130, "Table 0.1-1: A hierarchical numbered table.")
+    c.drawString(LM, PAGE_H - 170, "Figure 6: A caption that is linked even with no graphic here.")
+    c.showPage()
+    c.save()
+    GT["figures_hier.pdf"] = {
+        "fig_id": "fig-2-3-1", "tab_id": "tab-0-1-1",
+        "fig_caption": "Figure 2.3.1", "tab_caption": "Table 0.1-1",
+        "linked_no_graphic": "Figure 6",
+    }
+
+
+def gen_figure_continued():
+    """A multi-page continuation: "Figure 4.—Continued" on a later page must NOT emit a new
+    (duplicate) caption/id — only the original "Figure 4" caption survives."""
+    pdf = os.path.join(OUT, "figures_continued.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    title(c, "Continued Figures")
+    y = PAGE_H - 130
+    _vector_chart(c, LM + 50, y - 120, 210, 110)
+    y -= 120 + 8
+    c.setFont("Helvetica", 9.5)
+    c.drawString(LM, y, "Figure 4: The original caption of the continued figure.")
+    c.showPage()
+    y = PAGE_H - 130
+    _vector_chart(c, LM + 50, y - 120, 210, 110)
+    y -= 120 + 8
+    c.setFont("Helvetica", 9.5)
+    c.drawString(LM, y, "Figure 4.—Continued")
+    c.showPage()
+    c.save()
+    GT["figures_continued.pdf"] = {"caption": "Figure 4", "dup_id": "fig-4-2"}
+
+
+def gen_figure_nodot():
+    """Broadened caption labels: "Fig 5" (no dot) and Nature "Figure 7 |" are captions; an
+    inline "As shown in Fig 5 …" body reference is NOT."""
+    pdf = os.path.join(OUT, "figures_nodot.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    title(c, "Caption Label Variants")
+    y = PAGE_H - 130
+    y = para(c, "As shown in Fig 5 the trend continues steadily across every measured "
+                "quarter of the study period.", y)
+    _vector_chart(c, LM + 50, y - 120, 210, 110)
+    y -= 120 + 8
+    c.setFont("Helvetica", 9.5)
+    c.drawString(LM, y, "Fig 5 A figure caption written without a dot after Fig.")
+    c.showPage()
+    y = PAGE_H - 130
+    _vector_chart(c, LM + 50, y - 120, 210, 110)
+    y -= 120 + 8
+    c.setFont("Helvetica", 9.5)
+    c.drawString(LM, y, "Figure 7 | A Nature-style separator caption.")
+    c.showPage()
+    c.save()
+    GT["figures_nodot.pdf"] = {
+        "nodot_id": "fig-5", "nature_id": "fig-7",
+        "inline_xref": "As shown in Fig 5 the trend",
+    }
+
+
+def gen_lof_dotleader():
+    """A 'List of Figures' page: each entry looks like a caption ('Figure N: title …') but
+    its tail is a DOT-LEADER run ending in a page number. These must NOT become <figure>
+    shells — they're a table of contents, not captions. The wrapped variant (title on line 1,
+    leaders on line 2) is the common real-world shape (the thesis case)."""
+    pdf = os.path.join(OUT, "lof_dotleader.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    title(c, "List of Figures")
+    y = PAGE_H - 130
+    c.setFont("Helvetica", 11)
+    # single-line entry
+    c.drawString(LM, y, "Figure 1.1: Overview of the study area . . . . . . . . . . . . . . . 3")
+    y -= LEAD
+    # wrapped entry — leaders on the continuation line just below
+    c.drawString(LM, y, "Figure 2.3: A considerably longer descriptive title that wraps onto")
+    y -= LEAD
+    c.drawString(LM + 18, y, "a second line before the leaders ................................ 17")
+    c.showPage()
+    c.save()
+    GT["lof_dotleader.pdf"] = {
+        "entry_text": "Overview of the study area",
+        "wrapped_text": "considerably longer descriptive title",
+        "n_figures": 0,
+    }
+
+
+def gen_small_vector_fig():
+    """A SMALL vector diagram (below the strong figure bar of 72x54pt: ~52x40pt, a few drawn
+    paths) WITH a 'Figure 1:' caption directly beneath. The caption-aware recovery must
+    promote it to a real <figure> containing <svg>/<path> — not drop it as a stray mark."""
+    pdf = os.path.join(OUT, "small_vector_fig.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    title(c, "Small Diagram")
+    y = PAGE_H - 140
+    y = para(c, "The mapping between the two objects is sketched in the small diagram below.", y)
+    ox, oy = LM + 40, y - 44
+    c.setLineWidth(1)
+    c.ellipse(ox, oy, ox + 22, oy + 16)            # node A
+    c.ellipse(ox + 30, oy + 22, ox + 52, oy + 38)  # node B
+    c.line(ox + 22, oy + 8, ox + 30, oy + 30)      # an arrow shaft between them
+    c.line(ox + 30, oy + 30, ox + 26, oy + 26)     # arrowhead
+    y = oy - 14
+    c.setFont("Helvetica", 9.5)
+    c.drawString(LM, y, "Figure 1: A small diagram of the mapping between two objects.")
+    c.showPage()
+    c.save()
+    GT["small_vector_fig.pdf"] = {
+        "caption": "Figure 1: A small diagram of the mapping between two objects.",
+        "n_figures": 1,
+    }
+
+
+def gen_no_spurious_figs():
+    """Precision gate: a prose page with incidental tiny marks (a short underline rule, a
+    small box) and NO figure caption anywhere. Weak vector candidates must NOT be promoted
+    without an adjacent caption — the page must emit ZERO <figure> elements. Page 2 is a
+    positive control (the same tiny diagram WITH a caption → exactly one figure), proving the
+    gate discriminates rather than blanket-rejecting."""
+    pdf = os.path.join(OUT, "no_spurious_figs.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    title(c, "Prose With Incidental Marks")
+    y = PAGE_H - 140
+    y = para(c, "This page is ordinary running prose. It contains a couple of incidental "
+                "vector marks that are not figures and have no caption near them.", y)
+    c.setLineWidth(1)
+    c.line(LM, y, LM + 60, y)             # a short underline rule
+    y -= 30
+    c.rect(LM, y - 18, 28, 18, stroke=1, fill=0)  # a small box
+    y -= 40
+    para(c, "The narrative continues afterwards without referring to any figure at all.", y)
+    c.showPage()
+    # page 2 — positive control: the same small diagram WITH a caption
+    y = PAGE_H - 140
+    ox, oy = LM + 40, y - 44
+    c.setLineWidth(1)
+    c.ellipse(ox, oy, ox + 22, oy + 16)
+    c.ellipse(ox + 30, oy + 22, ox + 52, oy + 38)
+    c.line(ox + 22, oy + 8, ox + 30, oy + 30)
+    y = oy - 14
+    c.setFont("Helvetica", 9.5)
+    c.drawString(LM, y, "Figure 1: The control diagram that does have a caption.")
+    c.showPage()
+    c.save()
+    GT["no_spurious_figs.pdf"] = {"page1_figures": 0, "total_figures": 1}
+
+
 def gen_figures_onepage():
     """Both figures (raster ABOVE, vector BELOW), each with its own caption directly
     beneath it, on ONE page. Regression guard for caption→figure anchoring: the captions
@@ -357,6 +518,37 @@ def _assemble_pdf(objs, path):
     body += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (n, xref_off)
     with open(path, "wb") as f:
         f.write(bytes(body))
+
+
+def gen_mathfonts():
+    """Hand-written PDF that exercises math glyph recovery (reportlab can't emit CM math
+    fonts). Four show-ops, each in a different path:
+      F1 CMSY10 (no encoding/ToUnicode) → bytes 0x14 0x15 0x21 0x32  → ≤ ≥ → ∈
+      F2 CMMI10 (no encoding/ToUnicode) → bytes 0x0b 0x16 0x15 0x40  → α μ λ ∂
+      F3 PazoMath /Differences → glyph NAMES summation/integral/alpha/lessequal → ∑ ∫ α ≤
+      F4 Helvetica raw C1 bytes 0x97 0x92 → — ’
+    """
+    pdf = os.path.join(OUT, "mathfonts.pdf")
+    content = (b"BT /F1 12 Tf 72 720 Td <14152132> Tj ET\n"
+               b"BT /F2 12 Tf 72 700 Td <0b161540> Tj ET\n"
+               b"BT /F3 12 Tf 72 680 Td <01020304> Tj ET\n"
+               b"BT /F4 12 Tf 72 660 Td <9792> Tj ET")
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << "
+            b"/F1 5 0 R /F2 6 0 R /F3 7 0 R /F4 8 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        5: b"<< /Type /Font /Subtype /Type1 /BaseFont /AAAAAA+CMSY10 >>",
+        6: b"<< /Type /Font /Subtype /Type1 /BaseFont /BBBBBB+CMMI10 >>",
+        7: (b"<< /Type /Font /Subtype /Type1 /BaseFont /CCCCCC+PazoMath /Encoding << "
+            b"/Type /Encoding /Differences [1 /summation /integral /alpha /lessequal] >> >>"),
+        8: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["mathfonts.pdf"] = {
+        "cmsy": "≤≥→∈", "cmmi": "αμλ∂", "diff_names": "∑∫α≤", "c1": "—’",
+    }
 
 
 def gen_links():
@@ -467,6 +659,60 @@ def gen_twocol():
     doc.build(story)
     GT["twocol.pdf"] = {
         "order": ["LEFTONE", "LEFTTWO", "LEFTTHREE", "RIGHTONE", "RIGHTTWO", "RIGHTTHREE"],
+    }
+
+
+def gen_twocol_tight():
+    """A TIGHT two-column page set in Times-Roman (a Standard-14 font with NO /Widths) with a
+    narrow gutter AND a centered page number sitting in that gutter — the SEC/PRL regime.
+    Two fixes must combine to read it column-by-column: (1) Standard-14 AFM widths (else the
+    flat 0.5-em guess overshoots and closes the gutter), and (2) the crossing-tolerant gutter
+    (else the centered page number splits the lane into sub-threshold halves). Pre-fix this
+    interleaves L/R line-by-line."""
+    pdf = os.path.join(OUT, "twocol_tight.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    c.setFont("Times-Roman", 11)
+    lx, rx = 72, 320          # two columns; gutter ≈ left-col-right-edge..rx
+    top = PAGE_H - 90
+    left = ("LEFTSTART the entire left column is read top to bottom before the right; "
+            "each line is ordinary justified body prose that reaches the column edge so a "
+            "naive width guess would overshoot the narrow central gutter and merge the "
+            "columns. we add many lines so the columns are tall enough to be real columns "
+            "and not a short caption that should stay on one line. LEFTEND closes the left.")
+    right = ("RIGHTSTART the right column must follow only after the whole left column, the "
+             "reading-order property under test here. it likewise wraps as justified prose "
+             "filling its measure to the right margin, line after line, so that the two "
+             "columns are comparable in height and the gutter between them stays clear "
+             "except for the page number. RIGHTEND closes the right column of the page.")
+    lines_l = simpleSplit(left, "Times-Roman", 11, 220)
+    lines_r = simpleSplit(right, "Times-Roman", 11, 225)
+    for i, ln in enumerate(lines_l):
+        c.drawString(lx, top - i * 14, ln)
+    for i, ln in enumerate(lines_r):
+        c.drawString(rx, top - i * 14, ln)
+    c.drawCentredString(PAGE_W / 2, 60, "7")  # centered page number in the gutter band
+    c.showPage()
+    c.save()
+    GT["twocol_tight.pdf"] = {"order": ["LEFTSTART", "LEFTEND", "RIGHTSTART", "RIGHTEND"]}
+
+
+def gen_yflip_page():
+    """A page laid out under a Y-FLIP CTM (`[1 0 0 -1 0 H]`, top-left origin) so y grows
+    DOWNWARD — the layout convention of many SEC/corporate PDF generators. The five marker
+    lines are drawn top-to-bottom; the extracted reading order must be ONE..FIVE. On the
+    pre-fix build this reads FIVE..ONE (the catastrophic global bottom-to-top reversal)."""
+    pdf = os.path.join(OUT, "yflip.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    c.saveState()
+    c.transform(1, 0, 0, -1, 0, PAGE_H)  # top-left origin; larger y = lower on the page
+    c.setFont("Helvetica", 12)
+    for i, word in enumerate(["YFLIPONE", "YFLIPTWO", "YFLIPTHREE", "YFLIPFOUR", "YFLIPFIVE"]):
+        c.drawString(72, 90 + i * 70, f"{word} marker paragraph of ordinary body text on the page.")
+    c.restoreState()
+    c.showPage()
+    c.save()
+    GT["yflip.pdf"] = {
+        "order": ["YFLIPONE", "YFLIPTWO", "YFLIPTHREE", "YFLIPFOUR", "YFLIPFIVE"],
     }
 
 
@@ -622,18 +868,98 @@ def gen_numeric():
     }
 
 
+def gen_heading_traps():
+    """Lines drawn in the HEADING face (bold, larger than body) that must NOT be promoted
+    to headings — the content-based rejection filters in detect_header. An equation
+    fragment, a single-letter symbol soup, an author/collaboration byline, and a clause
+    are each heading-styled but content-disqualified; a genuine canonical section
+    ("Introduction") in the same face must still be a heading, proving the filters
+    discriminate rather than blanket-reject heading-styled lines."""
+    pdf = os.path.join(OUT, "heading_traps.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    title(c, "Heading Trap Showcase")
+    y = PAGE_H - 120
+    y = heading(c, "Introduction", y)  # genuine canonical section → must stay a heading
+    y = para(c, "Ordinary body prose under the real section so it anchors a true heading.", y)
+    traps = [
+        "x = y + z",                       # equation fragment: relation, no real words
+        "a b c d e f",                     # symbol/letter soup: single-char tokens
+        "The ATLAS Collaboration",         # author/collaboration byline
+        "The result was set during the run",  # a clause, not a section name
+    ]
+    for t in traps:
+        y = heading(c, t, y)               # drawn in the heading face — must NOT promote
+        y = para(c, "Following body paragraph so the trap sits like a section head.", y)
+    c.showPage()
+    c.save()
+    GT["heading_traps.pdf"] = {
+        "headings": [{"text": "Introduction", "tag": "h2"}],
+        "not_headings": traps,
+    }
+
+
+def gen_sec_structure():
+    """A mini SEC-filing layout that locks the global pre-detection pass (plan_headings)
+    and the PART/Item anchors:
+      - "PART I" / "Item 1. Business" / "Item 1A. Risk Factors" must be headings (Reliable
+        SEC anchors), at section/subsection level;
+      - a genuine larger-style section ("Financial Overview") must stay a heading;
+      - a flood of >90 short bold line-item lines in ONE shared style must be DISTRUSTED
+        as an emphasis/label style → none of them is a heading.
+    Mirrors the real failure where a filing's bold line-item face is matched by hundreds of
+    financial rows and floods the output with spurious <h4>."""
+    pdf = os.path.join(OUT, "sec_structure.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    title(c, "Acme Corporation Annual Report")
+    y = PAGE_H - 120
+    y = heading(c, "PART I", y, size=15)
+    y = heading(c, "Item 1. Business", y, size=13)
+    y = para(c, "Body prose describing the business operations of the company in detail.", y)
+    y = heading(c, "Item 1A. Risk Factors", y, size=13)
+    y = para(c, "Risk factor discussion written as ordinary paragraph prose for the filing.", y)
+    y = heading(c, "Financial Overview", y, size=15)
+    y = para(c, "A short overview paragraph introducing the financial statements below.", y)
+    labels = ["Net product sales", "Cost of sales", "Gross profit", "Research and development",
+              "Selling and marketing", "General and administrative", "Operating loss",
+              "Interest income", "Interest expense", "Other income", "Provision for taxes",
+              "Net loss", "Total assets", "Total liabilities", "Cash and equivalents"]
+    for i in range(100):  # > the absolute distrust floor (90)
+        if y < 90:
+            c.showPage()
+            y = PAGE_H - 72
+        y = heading(c, labels[i % len(labels)], y, size=12, gap=3)
+    c.showPage()
+    c.save()
+    GT["sec_structure.pdf"] = {
+        "anchors": ["PART I", "Item 1. Business", "Item 1A. Risk Factors"],
+        "genuine": ["Financial Overview"],
+        "flood": labels,
+    }
+
+
 def main():
     gen_headings()
+    gen_heading_traps()
+    gen_sec_structure()
     gen_lists()
     gen_runin()
     gen_footnotes()
     gen_twolists()
     gen_figures()
     gen_figures_onepage()
+    gen_figure_hier()
+    gen_figure_continued()
+    gen_figure_nodot()
+    gen_lof_dotleader()
+    gen_small_vector_fig()
+    gen_no_spurious_figs()
     gen_links()
     gen_typography()
     gen_twocol()
+    gen_twocol_tight()
+    gen_yflip_page()
     gen_math()
+    gen_mathfonts()
     gen_numeric()
     gen_frontmatter()
     gen_profile_heads()

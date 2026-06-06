@@ -8,6 +8,7 @@ use lopdf::Document;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+mod afm;
 mod extract;
 mod frontmatter;
 mod html;
@@ -17,6 +18,11 @@ mod markdown;
 mod profile;
 mod text;
 mod vector;
+
+/// Maximum Form-XObject / content-stream recursion depth. Bounds runaway recursion and
+/// cyclic Form references while allowing legitimately deep nesting.
+pub(crate) const MAX_FORM_DEPTH: u32 = 40;
+
 use pyo3::types::{PyDict, PyList};
 
 /// Parse the `mode` string accepted by `open`/`from_bytes` into an `html::Mode`.

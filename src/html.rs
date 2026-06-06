@@ -32,6 +32,14 @@ fn slug(name: &str) -> String {
         .collect()
 }
 
+/// A caption number ("6.2.1", "0.1-1", "1A") slugged for use in an element id: separators
+/// become '-' and it is lowercased, so the displayed caption keeps the real "6.2.1" while
+/// the id is a clean `fig-6-2-1`. Distinct labels map to distinct ids (no truncation
+/// collisions); any residual collision is still handled by dedup_ids.
+fn num_id<S: AsRef<str>>(num: S) -> String {
+    num.as_ref().chars().map(|c| if c == '.' { '-' } else { c.to_ascii_lowercase() }).collect()
+}
+
 /// href of the link whose rectangle contains point `(x, y)`, if any.
 fn href_at(x: f32, y: f32, links: &[LinkBox]) -> Option<String> {
     links
@@ -116,17 +124,16 @@ fn lines_of(mut spans: Vec<Span>, links: &[LinkBox]) -> Vec<Line> {
             if s.size >= base_sz {
                 return s.y;
             }
-            // Only re-base an ISOLATED script (a lone footnote marker / exponent among
-            // base-size text). A small glyph sitting among OTHER small glyphs is part of
-            // a dense math run (stacked sub/superscripts, an inline formula); leaving its
-            // order alone avoids reshuffling equation fragments into spurious lines/lists.
+            // A small glyph sitting among OTHER small glyphs is part of a dense math run
+            // (stacked sub/superscripts, an inline/display formula); an ISOLATED script is
+            // a lone footnote marker / exponent among base-size text.
             let in_cluster = spans.iter().enumerate().any(|(j, t)| {
                 j != i && t.size < base_sz && (t.x - s.x).abs() < avg * 3.0 && (t.y - s.y).abs() < band * 1.5
             });
-            if in_cluster {
-                return s.y;
-            }
-            let mut best: Option<(f32, f32)> = None; // (|dx|, base baseline y)
+            // Find the base glyph this script attaches to (nearest horizontally-adjacent
+            // base-size glyph in the sub/superscript offset window), recording the host's
+            // size and weight (to keep cluster re-basing out of headings).
+            let mut best: Option<(f32, f32, f32, bool)> = None; // (|dx|, base y, base size, base bold)
             for (j, t) in spans.iter().enumerate() {
                 if i == j || t.size < base_sz {
                     continue;
@@ -141,11 +148,65 @@ fn lines_of(mut spans: Vec<Span>, links: &[LinkBox]) -> Vec<Line> {
                     continue; // not horizontally adjacent to this base glyph
                 }
                 let adx = dx.abs();
-                if best.map_or(true, |(bd, _)| adx < bd) {
-                    best = Some((adx, t.y));
+                if best.map_or(true, |(bd, _, _, _)| adx < bd) {
+                    best = Some((adx, t.y, t.size, t.bold));
                 }
             }
-            best.map_or(s.y, |(_, by)| by)
+            match best {
+                // No adjacent base — leave the offset glyph where it is.
+                None => s.y,
+                // In a dense math cluster, re-base onto the host ONLY when it lives in a
+                // FORMULA row (display/inline math: symbol-dominated), so the orphaned
+                // index fragments (i, j, K, ∂Σ …) rejoin their equation line instead of
+                // floating into a spurious <aside>. NEVER re-base a cluster whose host
+                // sits in a WORD-dominated row — that captures section headings the
+                // classifier finds structurally even though they are body-sized and
+                // unbolded ("H.2. … Suboptimal O(T^{3/4}) Regret from Biased Gradients",
+                // whose exponent was being pulled up into the title) as well as ordinary
+                // prose. Larger-font / bold hosts are excluded outright. An ISOLATED
+                // script keeps the prior, unconditional behaviour (footnote markers).
+                Some((_, by, bsz, bbold)) => {
+                    let rebase = if in_cluster {
+                        if bsz > avg * 1.25 || bbold {
+                            false
+                        } else {
+                            // Is the host's row a prose/heading line (mostly real words)
+                            // or a formula line (mostly symbols/digits)? A word is a span
+                            // carrying a 2+ letter run.
+                            let is_word = |t: &str| {
+                                let mut run = 0;
+                                t.chars().any(|c| {
+                                    if c.is_alphabetic() {
+                                        run += 1;
+                                        run >= 2
+                                    } else {
+                                        run = 0;
+                                        false
+                                    }
+                                })
+                            };
+                            let (mut row_base, mut row_words) = (0usize, 0usize);
+                            for t in spans.iter() {
+                                if t.size >= base_sz && !t.text.trim().is_empty() && (t.y - by).abs() < band {
+                                    row_base += 1;
+                                    if is_word(t.text.trim()) {
+                                        row_words += 1;
+                                    }
+                                }
+                            }
+                            let wordy_row = row_base >= 4 && row_words * 2 >= row_base;
+                            !wordy_row
+                        }
+                    } else {
+                        true
+                    };
+                    if rebase {
+                        by
+                    } else {
+                        s.y
+                    }
+                }
+            }
         })
         .collect();
     // Order spans column-aware (same XY-cut as the text path) so a visual line is
@@ -156,7 +217,10 @@ fn lines_of(mut spans: Vec<Span>, links: &[LinkBox]) -> Vec<Line> {
         .enumerate()
         .map(|(i, s)| (s.x, s.x + span_width(s), order_y[i], order_y[i] + s.size.max(1.0)))
         .collect();
-    let order = text::xy_cut_order(&boxes, avg.max(1.0));
+    // Span-level prose ordering: enable the crossing-tolerant column gutter so a centered
+    // page number / running header in a tight two-column gutter doesn't force the columns to
+    // interleave line-by-line.
+    let order = text::xy_cut_order_opt(&boxes, avg.max(1.0), true);
     let mut lines: Vec<Line> = Vec::new();
     let mut cur_band: Option<f32> = None;
     let mut prev_end = 0.0f32;
@@ -258,6 +322,29 @@ fn lines_of(mut spans: Vec<Span>, links: &[LinkBox]) -> Vec<Line> {
                 line.runs.push(Run { text: t, bold: s.bold, italic: s.italic, href, script });
             }
         }
+    }
+    // A line that is ONLY trailing punctuation (a lone "," / "." left behind when a
+    // display equation's glyphs reorder) is never a paragraph of its own — fold it onto
+    // the end of the preceding line so it doesn't surface as a stray <p>,</p>.
+    let line_text = |l: &Line| l.runs.iter().map(|r| r.text.as_str()).collect::<String>();
+    let punct_only = |t: &str| {
+        let t = t.trim();
+        !t.is_empty() && t.chars().all(|c| ",.;:".contains(c))
+    };
+    let mut i = 1;
+    while i < lines.len() {
+        if punct_only(&line_text(&lines[i])) {
+            let glued = line_text(&lines[i]).trim().to_string();
+            if let Some(r) = lines[i - 1].runs.last_mut() {
+                while r.text.ends_with(' ') {
+                    r.text.pop();
+                }
+                r.text.push_str(&glued);
+                lines.remove(i);
+                continue;
+            }
+        }
+        i += 1;
     }
     for l in &mut lines {
         l.mono = l.tot_w > 0 && l.mono_w * 2 >= l.tot_w;
@@ -708,7 +795,108 @@ fn is_axis_label_text(text: &str) -> bool {
 /// `n_leading_runs < line.runs.len()` the header is a run-in lead and the
 /// remaining runs continue as that paragraph's body. Level comes from the
 /// section number when present, else from font size.
-fn detect_header(line: &Line, body: f32, profile: Option<&DocProfile>) -> Option<(u8, usize)> {
+/// SEC filing structure anchor: "PART I"–"PART VIII" (→ level 1) or "Item 1"/"Item 1A"/
+/// "Item 10" (→ level 2), with or without a trailing title. Returns the heading level.
+/// These are the authoritative section markers in 10-K/S-1 filings (which ship no PDF
+/// outline), so they are recognised even though their styling matches non-heading lines.
+fn sec_anchor(trimmed: &str) -> Option<u8> {
+    let low = trimmed.to_lowercase();
+    // What follows the anchor token must be empty, a separator, or a capitalised title —
+    // never a lowercase sentence continuation ("Part I of Form W-9. If you are …"), which
+    // is prose that merely mentions the part, not the heading.
+    let title_ok = |rest: &str| {
+        let r = rest.trim_start();
+        r.is_empty() || r.starts_with([':', '.', '—', '-']) || r.chars().next().is_some_and(|c| !c.is_ascii_lowercase())
+    };
+    if low.starts_with("part ") {
+        let after = trimmed["part ".len()..].trim_start();
+        let tl = after.find(char::is_whitespace).unwrap_or(after.len());
+        let tok = after[..tl].trim_end_matches([':', '.', '—', '-', ',']);
+        if (1..=5).contains(&tok.len()) && tok.chars().all(|c| "IVXivx".contains(c)) && title_ok(&after[tl..]) {
+            return Some(1);
+        }
+    }
+    if low.starts_with("item ") {
+        let after = trimmed["item ".len()..].trim_start();
+        let tl = after.find(|c: char| c.is_whitespace() || c == '.' || c == ':').unwrap_or(after.len());
+        let tok = &after[..tl];
+        let digits = tok.chars().take_while(|c| c.is_ascii_digit()).count();
+        let suffix: String = tok.chars().skip_while(|c| c.is_ascii_digit()).collect();
+        if (1..=2).contains(&digits)
+            && (suffix.is_empty() || (suffix.len() <= 2 && suffix.chars().all(|c| c.is_ascii_alphabetic())))
+            && title_ok(&after[tl..])
+        {
+            return Some(2);
+        }
+    }
+    None
+}
+
+/// A line that reads as a CLAUSE or value phrase, not a heading — used to reject body
+/// fragments that happen to match a heading STYLE ("158 GeV at 95% confidence level have
+/// been set", "600 GeV), largely due to …"). Signals: a trailing comma, an internal
+/// sentence boundary (". " + capital/'('), a mid-line lowercase finite verb, or a leading
+/// number+unit followed by a lowercase continuation. Only applied to multi-word lines, so
+/// noun-phrase headings ("System Architecture", "Data Set") are untouched.
+fn looks_like_clause(trimmed: &str) -> bool {
+    if trimmed.ends_with(',') {
+        return true;
+    }
+    // Strip a leading section-number token ("1. ", "1.2 ", "II. ", "A. ") so its
+    // separator dot is not mistaken for an internal sentence boundary ("II. METHODS").
+    let core = {
+        let t = trimmed.trim_start();
+        match t.find(char::is_whitespace) {
+            Some(sp) if t[..sp].ends_with('.') => {
+                let head = t[..sp].trim_end_matches('.');
+                let numbery = !head.is_empty()
+                    && (head.chars().all(|c| c.is_ascii_digit() || c == '.')
+                        || head.chars().all(|c| "IVXLCDM".contains(c))
+                        || (head.len() == 1 && head.chars().all(|c| c.is_ascii_uppercase())));
+                if numbery { t[sp..].trim_start() } else { t }
+            }
+            _ => t,
+        }
+    };
+    let chars: Vec<char> = core.chars().collect();
+    for w in chars.windows(3) {
+        if w[0] == '.' && w[1] == ' ' && (w[2].is_uppercase() || w[2] == '(') {
+            return true; // internal sentence boundary
+        }
+    }
+    let toks: Vec<&str> = trimmed.split_whitespace().collect();
+    const VERBS: &[&str] = &["is", "are", "was", "were", "have", "has", "had", "been", "be", "set", "shows", "show", "due", "using", "based"];
+    if toks.iter().skip(1).any(|t| {
+        let w = t.trim_matches(|c: char| !c.is_alphabetic());
+        !w.is_empty() && w.chars().all(|c| c.is_lowercase()) && VERBS.contains(&w)
+    }) {
+        return true; // mid-line lowercase finite verb
+    }
+    const UNITS: &[&str] = &["gev", "tev", "mev", "kev", "ev", "kg", "mhz", "ghz", "khz", "hz", "nm", "mm", "cm", "km", "ms"];
+    if toks.first().is_some_and(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        && toks.get(1).is_some_and(|t| UNITS.contains(&t.trim_matches(|c: char| !c.is_alphabetic()).to_lowercase().as_str()))
+        && toks.iter().skip(2).any(|t| t.chars().next().is_some_and(|c| c.is_lowercase()))
+    {
+        return true; // leading value+unit with a lowercase continuation
+    }
+    false
+}
+
+/// How confidently a line was judged a heading, used to decide whether it must ALSO
+/// be positionally isolated before it is emitted. `Reliable` (numbered / canonical /
+/// Appendix) and `RunIn` (a bold in-line lead) are pattern-anchored and trustworthy on
+/// their own; `Style` (a profiled size/weight tier, or merely bold / larger than body)
+/// is the over-firing class — an address block, affiliation line, equation fragment or
+/// axis label can match a style without being a heading — so a `Style` verdict is only
+/// honoured when the line is positionally isolated (see `header_at`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeadingKind {
+    Reliable,
+    Style,
+    RunIn,
+}
+
+fn detect_header(line: &Line, body: f32, profile: Option<&DocProfile>) -> Option<(u8, usize, HeadingKind)> {
     let txt = line.text();
     let trimmed = txt.trim();
     if trimmed.is_empty() {
@@ -727,20 +915,58 @@ fn detect_header(line: &Line, body: f32, profile: Option<&DocProfile>) -> Option
     // Not headers: pure-number/symbol lines (bold table cells like "86.6 86.3"),
     // the arXiv sidebar id, running page heads / reference-list entries (author
     // initials "J. Cui, H. Yan", a publication year, or an "et al." author list).
+    // An author/collaboration byline ("The ATLAS Collaboration", "LIGO Scientific
+    // Consortium") is set like a heading but is not one: a ≥2-word line ending in a
+    // collaboration marker.
+    let collab_byline = (2..=6).contains(&words)
+        && matches!(
+            trimmed.split_whitespace().last().unwrap_or("").trim_end_matches(['.', ',', ':']).to_lowercase().as_str(),
+            "collaboration" | "collaborations" | "consortium"
+        );
     if trimmed.chars().filter(|c| c.is_alphabetic()).count() < 2
         || low.contains("et al")
         || low.starts_with("arxiv")
         || has_year(trimmed)
         || initials_count(trimmed) >= 2
+        || collab_byline
     {
         return None;
     }
 
-    // Display equations ("T ∆² ≤ Õ(H d (β+Γ)),", "V̄(R) ≡ Ē(R) − 2M,") are sometimes
-    // bold/large and get mistaken for headings. They carry a relational/assignment
-    // operator and almost no real words — a heading is words, not a relation.
+    // Mis-extracted display MATH promoted to a heading. A heading is real words; an
+    // equation fragment is symbols, single letters and digits. `real_words` = tokens
+    // with ≥2 ASCII letters.
+    //   • ONE real word: reject only on a relation ("T ∆² ≤ Õ(…)") — the original guard.
+    //   • NO real words: reject when dominated by math symbols, single-char tokens or
+    //     digits ("K ρ c", "∂ t ∂ z ∂ z", "⎢ ⎝350⎠ d ⎥ s"). Gated on real_words==0 so a
+    //     numbered heading ("5 Conclusions", real_words=1) is never caught here.
     let real_words = trimmed.split_whitespace().filter(|w| w.chars().filter(|c| c.is_ascii_alphabetic()).count() >= 2).count();
-    if real_words <= 1 && trimmed.chars().any(|c| matches!(c, '=' | '≤' | '≥' | '≡' | '≈' | '←' | '→' | '∝' | '≪' | '≫' | '∑' | '∈')) {
+    let relational = trimmed.chars().any(|c| matches!(c, '=' | '≤' | '≥' | '≡' | '≈' | '←' | '→' | '∝' | '≪' | '≫' | '∑' | '∈'));
+    // Math operators / fences / Greek (NOT the ascii hyphen, which is a word joiner).
+    let math = trimmed.chars().filter(|&c| {
+        "=≤≥≡≈≠<>+←→↔⇒↦∝≪≫∑∏∫∂∇√∈∉±×÷·∞⎢⎝⎠⎥⎜⎟|∆−".contains(c)
+            || "αβγδεζηθικλμνξπρςστυϕφχψωΓΔΘΛΞΠΣΦΨΩ".contains(c)
+    }).count();
+    if real_words == 0 {
+        // No real word: an equation fragment is symbols, single letters or digits
+        // ("K ρ c", "∂ t ∂ z ∂ z", "⎢ ⎝350⎠ d ⎥ s"). (A numbered heading "5 Conclusions"
+        // is real_words=1, never reaching here.)
+        let toks: Vec<&str> = trimmed.split_whitespace().collect();
+        let ntok = toks.len().max(1);
+        let single = toks.iter().filter(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).chars().count() <= 1).count();
+        let nonspace = trimmed.chars().filter(|c| !c.is_whitespace()).count().max(1);
+        let digits = trimmed.chars().filter(|c| c.is_ascii_digit()).count();
+        if relational || math >= 1 || single * 2 >= ntok || digits as f32 > nonspace as f32 * 0.4 {
+            return None;
+        }
+    } else if real_words == 1 && relational {
+        return None;
+    }
+    // Symbol-soup equation even WITH a few (often mis-extracted) word-like tokens
+    // ("K ρ zT ,ρ= ρ= K − ρρ −+ρ BTe"): math operators dominate over real words. The
+    // `>= 3` floor and `>= real_words + 2` margin spare genuine headings that carry a
+    // symbol or two ("H → ZZ → 4ℓ channel", "β-decay Measurements").
+    if math >= 3 && math >= real_words + 2 {
         return None;
     }
 
@@ -757,6 +983,16 @@ fn detect_header(line: &Line, body: f32, profile: Option<&DocProfile>) -> Option
         }
     }
 
+    // 0. SEC filing structure anchors ("PART I", "Item 1A. Risk Factors"). These carry
+    //    the real section structure of a 10-K/S-1 that has no PDF outline and whose tier
+    //    styling is shared with hundreds of non-heading lines (so the global distrust pass
+    //    would otherwise drop them). Recognising them as Reliable keeps them at the right
+    //    level and exempts them from the style-frequency distrust.
+    if words <= 16 {
+        if let Some(lvl) = sec_anchor(trimmed) {
+            return Some((lvl, line.runs.len(), HeadingKind::Reliable));
+        }
+    }
     // 1. Numbered section header — level from numbering depth. The "N.N Title"
     //    shape (number, space, capitalised title with a real word) is the signal;
     //    no bold needed (many heading faces aren't flagged bold). This also rejects
@@ -769,7 +1005,17 @@ fn detect_header(line: &Line, body: f32, profile: Option<&DocProfile>) -> Option
             // Footnotes ("2 We do not show halo … because …") carry a leading number
             // like a section, but are set SMALLER than body text; a real numbered
             // heading is body-size or larger. Reject sub-body-size numbered lines.
-            if title_upper && alpha >= 3 && ratio >= 0.92 {
+            // Also reject a measured VALUE mis-read as a section number ("158 GeV at 95%
+            // confidence level …", "7 TeV at the LHC …"): the leading "number" is a
+            // measurement whose next token is a unit, not a section title. (Such a line,
+            // if it is heading-styled at all, is then caught downstream by the style
+            // path's clause guard; otherwise it stays body text.)
+            let value_unit = {
+                let toks: Vec<&str> = trimmed.split_whitespace().collect();
+                const UNITS: &[&str] = &["gev", "tev", "mev", "kev", "ev", "kg", "mhz", "ghz", "khz", "hz", "nm", "mm", "cm", "km", "ms"];
+                toks.get(1).is_some_and(|t| UNITS.contains(&t.trim_matches(|c: char| !c.is_alphabetic()).to_lowercase().as_str()))
+            };
+            if title_upper && alpha >= 3 && ratio >= 0.92 && !value_unit {
                 // "N. **Bold lead.** body" (a labelled limitation/claim list item):
                 // keep only the bold run-in lead as the heading and let the body
                 // split off — the whole sentence is not the heading.
@@ -780,7 +1026,7 @@ fn detect_header(line: &Line, body: f32, profile: Option<&DocProfile>) -> Option
                     }
                     let lead: String = line.runs[..e].iter().map(|r| r.text.as_str()).collect();
                     if e < line.runs.len() && matches!(lead.trim_end().chars().next_back(), Some('.') | Some(':')) {
-                        return Some((lvl, e));
+                        return Some((lvl, e, HeadingKind::Reliable));
                     }
                 }
                 // A wrapped prose line that a DECIMAL VALUE merely opened is not a
@@ -794,7 +1040,7 @@ fn detect_header(line: &Line, body: f32, profile: Option<&DocProfile>) -> Option
                 if trimmed.starts_with('0') && internal_sentence {
                     return None;
                 }
-                return Some((lvl, line.runs.len()));
+                return Some((lvl, line.runs.len(), HeadingKind::Reliable));
             }
         }
     }
@@ -803,7 +1049,7 @@ fn detect_header(line: &Line, body: f32, profile: Option<&DocProfile>) -> Option
     //    a heading even at body size & non-bold (common in math/physics styles).
     let canon = low.trim_end_matches(['.', ':', '—', '-', ' ']);
     if trimmed.split_whitespace().count() <= 2 && TOP_HEADS.contains(&canon) {
-        return Some((1, line.runs.len()));
+        return Some((1, line.runs.len(), HeadingKind::Reliable));
     }
     // "Appendix A", "Appendix A. Title", "Appendix B: ..." → section level. But not
     // a sentence that merely opens with the word ("Appendix B shows that …") nor an
@@ -833,11 +1079,11 @@ fn detect_header(line: &Line, body: f32, profile: Option<&DocProfile>) -> Option
                 for (ri, r) in line.runs.iter().enumerate() {
                     acc += r.text.len();
                     if acc >= target {
-                        return Some((1, ri + 1));
+                        return Some((1, ri + 1, HeadingKind::Reliable));
                     }
                 }
             }
-            return Some((1, line.runs.len()));
+            return Some((1, line.runs.len(), HeadingKind::Reliable));
         }
     }
     // 2.5 Profiled heading tier: a short, capitalised line whose size·weight·font matches
@@ -849,10 +1095,11 @@ fn detect_header(line: &Line, body: f32, profile: Option<&DocProfile>) -> Option
         if words <= 16
             && !trimmed.ends_with(['.', ',', ';'])
             && !looks_like_reference(trimmed)
+            && !(real_words >= 2 && looks_like_clause(trimmed))
             && trimmed.chars().next().is_some_and(|c| !c.is_lowercase())
         {
             if let Some(level) = prof.heading_level(line.size, line.font, all_bold) {
-                return Some((level, line.runs.len()));
+                return Some((level, line.runs.len(), HeadingKind::Style));
             }
         }
     }
@@ -861,9 +1108,10 @@ fn detect_header(line: &Line, body: f32, profile: Option<&DocProfile>) -> Option
         && (all_bold || ratio >= 1.18)
         && !trimmed.ends_with(['.', ',', ';', ':'])
         && !looks_like_reference(trimmed)
+        && !(real_words >= 2 && looks_like_clause(trimmed))
         && trimmed.chars().next().is_some_and(|c| !c.is_lowercase())
     {
-        return Some((size_level(ratio), line.runs.len()));
+        return Some((size_level(ratio), line.runs.len(), HeadingKind::Style));
     }
     // 4. Bold run-in lead: short bold prefix, then non-bold body on the same line
     //    ("Encoder: The encoder …", "Task #1: Masked LM Before feeding …").
@@ -902,10 +1150,30 @@ fn detect_header(line: &Line, body: f32, profile: Option<&DocProfile>) -> Option
             && ((2..=8).contains(&lead_words)
                 || (labelled && lead.chars().filter(|c| c.is_alphabetic()).count() >= 2))
         {
-            return Some((3, k));
+            return Some((3, k, HeadingKind::RunIn));
         }
     }
     None
+}
+
+/// The gated heading decision used at the prose/list emission sites. A `Style` verdict
+/// from `detect_header` is dropped when its style signature was DISTRUSTED by the global
+/// pre-detection pass (an over-used emphasis/label style — see plan_headings).
+/// `Reliable` / `RunIn` verdicts (numbered, canonical, SEC `Item`/`PART`, run-ins) bypass
+/// the distrust, so real structure survives even in a filing whose headings share styling
+/// with hundreds of line items.
+fn header_at(lines: &[&Line], i: usize, body: f32, profile: &DocProfile, plan: &HeadingPlan) -> Option<(u8, usize)> {
+    let (lvl, k, kind) = detect_header(lines[i], body, Some(profile))?;
+    match kind {
+        HeadingKind::Reliable | HeadingKind::RunIn => Some((lvl, k)),
+        HeadingKind::Style => {
+            if plan.distrusted.contains(&style_sig(lines[i])) {
+                None
+            } else {
+                Some((lvl, k))
+            }
+        }
+    }
 }
 
 /// True when a whole line is set in a heading style the document profile identified.
@@ -962,7 +1230,7 @@ fn merge_heading_continuations(lines: &mut Vec<Line>, profile: &DocProfile) {
 /// figure's id).
 fn is_inline_xref(text: &str) -> bool {
     let low = text.trim_start().to_lowercase();
-    let rest = ["figure", "fig.", "fig", "table", "tab."]
+    let rest = ["figure", "fig.", "fig", "cuadro", "table", "tab.", "box"]
         .iter()
         .find_map(|p| low.strip_prefix(p));
     let rest = match rest {
@@ -996,24 +1264,120 @@ fn is_inline_xref(text: &str) -> bool {
 /// If a line is a figure/table caption ("Figure 3: …", "Fig. 2 …", "Table 1 …"),
 /// return (is_figure, number). Used to opportunistically anchor a caption to a
 /// figure/table region — never required for the region to be emitted.
-fn caption_label(text: &str) -> Option<(bool, String)> {
+/// Parse a caption label: its kind (figure vs table), its FULL number token, and the
+/// remainder of the line after the number. The number grammar is
+/// `DIGITS ( ('.'|'-') DIGITS )* LETTER?` — so a hierarchical "6.2.1"/"0.1-1" or a
+/// sub-label "1A" is captured whole (a separator only between two digit groups; a single
+/// trailing letter only when not followed by another letter, so "1 Plot" keeps just "1").
+/// Prefixes: "Figure"/"Fig."/"Fig "(no dot)/"Table"/"Cuadro"(Spanish)/"Box ".
+fn caption_parts(text: &str) -> Option<(bool, String, &str)> {
     let t = text.trim_start();
     let low = t.to_lowercase();
-    let (is_fig, rest) = if low.starts_with("figure") {
+    let (is_fig, after) = if low.starts_with("figure") {
         (true, &t[6..])
     } else if low.starts_with("fig.") {
         (true, &t[4..])
+    } else if low.starts_with("cuadro") {
+        (false, &t[6..])
     } else if low.starts_with("table") {
         (false, &t[5..])
+    } else if low.starts_with("fig ") || low.starts_with("fig\t") {
+        (true, &t[3..])
+    } else if low.starts_with("box ") || low.starts_with("box\t") {
+        (true, &t[3..])
     } else {
         return None;
     };
-    let rest = rest.trim_start();
-    let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if num.is_empty() {
+    let rest = after.trim_start();
+    let b = rest.as_bytes();
+    if b.is_empty() || !b[0].is_ascii_digit() {
         return None;
     }
-    Some((is_fig, num))
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    while i + 1 < b.len() && (b[i] == b'.' || b[i] == b'-') && b[i + 1].is_ascii_digit() {
+        i += 1;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    if i < b.len() && b[i].is_ascii_alphabetic() && (i + 1 >= b.len() || !b[i + 1].is_ascii_alphabetic()) {
+        i += 1;
+    }
+    Some((is_fig, rest[..i].to_string(), &rest[i..]))
+}
+
+/// If a line is a figure/table caption, return (is_figure, full number).
+fn caption_label(text: &str) -> Option<(bool, String)> {
+    caption_parts(text).map(|(f, n, _)| (f, n))
+}
+
+/// A multi-page CONTINUATION marker ("Figure 5.—Continued", "Table 2 (continued)"): the
+/// label's tail, after separators, is ONLY a "continued" token. It must not be emitted as a
+/// new caption (it would duplicate the original figure's number). A real caption that merely
+/// begins "Figure 5. Continuation of the survey …" is NOT matched (the tail has more words).
+fn caption_is_continued(text: &str) -> bool {
+    match caption_parts(text) {
+        // Strip ANY non-alphanumeric edge chars so the separator is irrelevant — a dash,
+        // colon, dot, paren, or a mojibake C1 byte (reportlab/WinAnsi em-dash 0x97).
+        Some((_, _, tail)) => {
+            let core = tail.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'');
+            matches!(core.to_lowercase().as_str(), "continued" | "cont" | "cont'd")
+        }
+        None => false,
+    }
+}
+
+/// Does `text` END in a DOT-LEADER run (≥4 leader dots, tolerating spaces between them and
+/// an optional trailing page number)? This is the signature of a List-of-Figures / Table-of-
+/// Contents entry: "Overview of the system … . . . . . 95". A real caption never carries a
+/// 4+ leader-dot run.
+fn dotleader_tail(text: &str) -> bool {
+    // Drop a trailing page-number token (and the whitespace before it), then count the
+    // consecutive leader dots at the new end.
+    let mut tail = text.trim_end();
+    let without_pageno = tail.trim_end_matches(|c: char| c.is_ascii_digit());
+    if without_pageno.len() < tail.len() {
+        tail = without_pageno.trim_end();
+    }
+    let mut dots = 0usize;
+    for c in tail.chars().rev() {
+        match c {
+            '.' | '…' | '·' => dots += if c == '…' { 3 } else { 1 },
+            ' ' | '\t' => continue,
+            _ => break,
+        }
+    }
+    dots >= 4
+}
+
+/// A List-of-Figures / Table-of-Contents entry that merely LOOKS like a caption
+/// ("Figure 3.1: Overview …"), so it would otherwise emit an empty `<figure>` shell. Its
+/// dot-leader tail may sit on the caption's first line OR, when the title wraps, on a
+/// following continuation line — so scan the caption line plus a few tight continuation
+/// lines below it. Per-line signal only (no "List of Figures" heading gate needed).
+fn is_dotleader_toc(lines: &[Line], idx: usize) -> bool {
+    if caption_parts(&lines[idx].text()).is_none() {
+        return false; // only relevant for caption-shaped lines
+    }
+    let base_sz = lines[idx].size.max(1.0);
+    let mut prev_y = lines[idx].y;
+    for k in idx..(idx + 4).min(lines.len()) {
+        if k > idx {
+            // stop if the next line isn't a tight continuation just below this one
+            let dy = prev_y - lines[k].y;
+            if dy < 0.0 || dy > base_sz * 2.0 {
+                break;
+            }
+        }
+        if dotleader_tail(&lines[k].text()) {
+            return true;
+        }
+        prev_y = lines[k].y;
+    }
+    false
 }
 
 /// Gather a (possibly multi-line) caption block starting at line `idx`: the
@@ -1060,9 +1424,20 @@ fn gather_caption(lines: &[Line], idx: usize, body: f32, profile: &DocProfile) -
 /// data, not a figure, so it is NOT wrapped in `<figure>`.
 fn table_html(t: &PosTable, cap: Option<(&str, &str, bool)>) -> String {
     let mut tbl = match cap {
-        Some((num, _, _)) => format!("<table id=\"tab-{num}\">"),
+        Some((num, _, _)) => format!("<table id=\"tab-{}\">", num_id(num)),
         None => String::from("<table>"),
     };
+    // Caption as the table's own `<caption>` (the required first child) so it is
+    // semantically LINKED to the table for an LLM reader — a sibling block can't be
+    // unambiguously associated. `caption-side:bottom` (inline style; no class — the HTML
+    // stays thin) preserves a caption that sits below the table in the source.
+    if let Some((_, caption, below)) = cap {
+        if below {
+            tbl.push_str(&format!("<caption style=\"caption-side:bottom\">{caption}</caption>"));
+        } else {
+            tbl.push_str(&format!("<caption>{caption}</caption>"));
+        }
+    }
     // Detached grouped/multi-level header rows (mapped onto the data column grid with
     // colspans) render first as <th>. When present, the data grid is ALL <td> (its row
     // 0 is data, not the header). When absent, fall back to treating grid row 0 as <th>.
@@ -1087,25 +1462,7 @@ fn table_html(t: &PosTable, cap: Option<(&str, &str, bool)>) -> String {
         tbl.push_str("</tr>");
     }
     tbl.push_str("</table>");
-    match cap {
-        // Pair the table with its caption as a sibling block `<div>`, not an HTML
-        // `<caption>`: a `<caption>` is locked to the (often narrow) table width,
-        // cramping the text, whereas a sibling block uses the full page reading-column
-        // width. No class (the HTML is kept thin/semantic) — a `<div>` is emitted ONLY
-        // here, so it unambiguously marks a table caption. Keep the side it sits on in
-        // the source (a caption often sits BELOW the table, e.g. BERT Table 1). Not a
-        // `<figure>`/`<figcaption>` — that would conflate data tables with image figures
-        // and trip the figure gates.
-        Some((_, caption, below)) => {
-            let capdiv = format!("<div>{caption}</div>");
-            if below {
-                format!("{tbl}{capdiv}")
-            } else {
-                format!("{capdiv}{tbl}")
-            }
-        }
-        None => tbl,
-    }
+    tbl
 }
 
 /// Mark which lines belong to a page-bottom footnote block (see emit_lines). A run of
@@ -1182,7 +1539,7 @@ fn emit_footnotes(lines: &[&Line], out: &mut String) {
 }
 
 /// Emit a run of consecutive text lines as headings / paragraphs / lists / code.
-fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], profile: &DocProfile, out: &mut String) {
+fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], profile: &DocProfile, plan: &HeadingPlan, out: &mut String) {
     let mut i = 0;
     // The currently-open paragraph. It is NOT flushed at a column-wrap block
     // boundary — a paragraph that wraps from the bottom of one column to the top
@@ -1254,7 +1611,7 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], pro
             && txt.split_whitespace().count() <= 12
             && promote.iter().any(|k| *k == title_key(&txt));
         if !in_enumerated_run(lines, i) && !colon_introduced_list(lines, i) {
-        if let Some((lvl, k)) = if forced { Some((1, ln.runs.len())) } else { detect_header(ln, body, Some(profile)) } {
+        if let Some((lvl, k)) = if forced { Some((1, ln.runs.len())) } else { header_at(lines, i, body, profile, plan) } {
             // HTML heading tag: reserve <h1> for the document title (the largest
             // text). Sections (logical level 1) become <h2>, subsections <h3>,
             // etc., so the outline nests under a single <h1>.
@@ -1296,7 +1653,7 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], pro
             // wrapped bullet from splitting into one-item-per-list + stray <p>s.
             while i < lines.len()
                 && list_kind(&lines[i].text()).is_some()
-                && (in_enumerated_run(lines, i) || colon_introduced_list(lines, i) || detect_header(lines[i], body, Some(profile)).is_none())
+                && (in_enumerated_run(lines, i) || colon_introduced_list(lines, i) || header_at(lines, i, body, profile, plan).is_none())
             {
                 let marker_x = lines[i].x0;
                 let mut item = strip_marker(&lines[i].text());
@@ -1306,7 +1663,7 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], pro
                     let l = lines[i];
                     let cont = list_kind(&l.text()).is_none()
                         && !l.mono
-                        && detect_header(l, body, Some(profile)).is_none()
+                        && header_at(lines, i, body, profile, plan).is_none()
                         && l.x0 >= marker_x - body * 0.3 // not dedented past the marker (flush or hanging-indent wrap)
                         && l.y <= prev_y + body * 0.5 // same column, flowing downward
                         && (prev_y - l.y) < body * 1.6; // tight line spacing — a paragraph gap ends the item
@@ -1345,7 +1702,7 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], pro
             let l = lines[i];
             // Stop the body block at the footnote region so it is emitted as its own
             // <aside> (handled at the loop top) rather than swallowed into this paragraph.
-            if foot[i] || l.mono || list_kind(&l.text()).is_some() || detect_header(l, body, Some(profile)).is_some() {
+            if foot[i] || l.mono || list_kind(&l.text()).is_some() || header_at(lines, i, body, profile, plan).is_some() {
                 break;
             }
             // Column wrap: reading order goes top-to-bottom within a column, so y
@@ -2040,6 +2397,71 @@ fn is_paper_front_matter(fm: &FrontMatter) -> bool {
     !fm.authors.is_empty()
 }
 
+/// The style signature of a line: rounded size, all-bold, font id — the key the heading
+/// tier and the distrust pass share.
+fn style_sig(line: &Line) -> (i32, bool, u32) {
+    let nonspace: Vec<&Run> = line.runs.iter().filter(|r| !r.text.trim().is_empty()).collect();
+    let all_bold = !nonspace.is_empty() && nonspace.iter().all(|r| r.bold);
+    (line.size.round() as i32, all_bold, line.font)
+}
+
+/// A document-global heading model built once before the parallel render. `distrusted`
+/// holds style signatures that produce so MANY heading candidates they are an emphasis /
+/// label style (e.g. an SEC filing's bold line-item face matched by hundreds of financial
+/// rows), not a heading style — `header_at` drops their `Style` verdicts. Pattern-anchored
+/// headings (`Reliable`/`RunIn`: numbered, canonical, SEC `Item`/`PART`, run-ins) bypass
+/// the distrust, so real structure survives. Read-only and integer-keyed → deterministic
+/// under the parallel render.
+#[derive(Default, Clone)]
+struct HeadingPlan {
+    distrusted: std::collections::HashSet<(i32, bool, u32)>,
+}
+
+/// PASS over the whole document's lines: count, per style signature, how many lines yield
+/// a surviving `Style` heading verdict, then distrust a signature whose count is far above
+/// what real section headings plausibly reach. A genuine document spreads headings across
+/// a few tiers with at most a few dozen of any one; an emphasis/label style fires on
+/// hundreds. The threshold is an ABSOLUTE floor (not a fraction of doc length — a long
+/// filing's flood is still only a few percent of its lines) raised mildly for very long
+/// docs. arXiv papers (≤~50 headings, mostly numbered=Reliable) never trip it → no-op.
+fn plan_headings(page_spans: &[(u32, ObjectId, Vec<Span>)], body: f32, profile: &DocProfile) -> HeadingPlan {
+    let mut counts: HashMap<(i32, bool, u32), usize> = HashMap::new();
+    let mut samples: HashMap<(i32, bool, u32), Vec<String>> = HashMap::new();
+    let debug = std::env::var("DPDF_HEAD_PROFILE").is_ok();
+    let mut doc_lines = 0usize;
+    let mut pages = 0usize;
+    for (_pno, _id, spans) in page_spans {
+        pages += 1;
+        let lines = lines_of(spans.iter().map(clone_span).collect(), &[]);
+        for ln in &lines {
+            doc_lines += 1;
+            if let Some((_, _, HeadingKind::Style)) = detect_header(ln, body, Some(profile)) {
+                let sig = style_sig(ln);
+                *counts.entry(sig).or_insert(0) += 1;
+                if debug {
+                    let s = samples.entry(sig).or_default();
+                    if s.len() < 4 {
+                        s.push(ln.text().trim().chars().take(40).collect());
+                    }
+                }
+            }
+        }
+    }
+    let thresh = 90usize.max(pages); // absolute floor 90; ~1 per page for very long docs
+    let distrusted: std::collections::HashSet<(i32, bool, u32)> =
+        counts.iter().filter(|(_, &c)| c > thresh).map(|(&k, _)| k).collect();
+    if debug {
+        let mut v: Vec<_> = counts.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        eprintln!("[head-profile] doc_lines={doc_lines} pages={pages} thresh={thresh} style-sigs:");
+        for (sig, c) in v.iter().take(10) {
+            let dis = if **c > thresh { " DISTRUST" } else { "" };
+            eprintln!("  {:?} x{}{}  e.g. {:?}", sig, c, dis, samples.get(*sig).map(|s| s.as_slice()).unwrap_or(&[]));
+        }
+    }
+    HeadingPlan { distrusted }
+}
+
 /// Analyse the whole document's typography once and build a [`DocProfile`]: the body
 /// size/weight/font, the heading size/weight/font tiers ranked to levels, whether sections
 /// are numbered, whether an outline exists, and the column layout. Operates on raw spans
@@ -2254,6 +2676,9 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
     // Document-wide style profile: the body/heading size·weight·font tiers, numbering,
     // outline presence and column layout — drives heading classification per-document.
     let profile = build_doc_profile(&page_spans, body, title_sz, !outline.is_empty());
+    // Global heading pre-detection: distrust over-used emphasis/label styles so a filing's
+    // line-item flood doesn't read as hundreds of headings (see plan_headings).
+    let head_plan = plan_headings(&page_spans, body, &profile);
 
     // Render every page IN PARALLEL into its own (html_fragment, image_uris). Each page
     // is independent and reads the document immutably; image data URIs are deferred as
@@ -2286,7 +2711,7 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
         }
         let mut tables = extract::detect_tables_pos(spans);
         let mut images = img::positioned_images(doc, *_pid, inline_images);
-        let raw_vectors = vector::positioned_vectors(doc, *_pid);
+        let (raw_vectors, weak_vectors) = vector::positioned_vectors(doc, *_pid);
         // Drop FALSE tables — a "table" that is really a figure's own structure, not a data
         // table — BEFORE filtering vectors, so the real plot vector survives the vector
         // filter below while a genuine ruled form table is preserved:
@@ -2386,14 +2811,60 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
         // borders read as vector ink and the table owns its region. The false tables that
         // would wrongly suppress a real plot vector were already removed above, so this
         // simple any-overlap test no longer fragments raster+vector crossplots.
-        let mut vectors: Vec<vector::PlacedSvg> = raw_vectors
-            .into_iter()
-            .filter(|v| {
-                !tables.iter().any(|t| {
-                    v.x_left < t.x_right && v.x_right > t.x_left && v.y_bottom < t.y_top && v.y_top > t.y_bottom
-                })
-            })
-            .collect();
+        let not_in_table = |v: &vector::PlacedSvg| {
+            !tables.iter().any(|t| v.x_left < t.x_right && v.x_right > t.x_left && v.y_bottom < t.y_top && v.y_top > t.y_bottom)
+        };
+        let mut vectors: Vec<vector::PlacedSvg> = raw_vectors.into_iter().filter(&not_in_table).collect();
+        // Caption-aware recovery: a small vector diagram below the figure filter's strong bar
+        // (a few ellipse curves, a TikZ sketch) is held aside as a WEAK candidate. Promote one
+        // into `vectors` only when a FIGURE CAPTION sits right next to it AND no strong figure
+        // already serves that caption — so a stray mark with no caption is never resurrected,
+        // and a caption with a real graphic isn't given a spurious second figure. Done here,
+        // before fig_boxes/labels/emit are built, so a promoted candidate flows through the
+        // identical machinery as a strong figure.
+        let mut weak: Vec<vector::PlacedSvg> = weak_vectors.into_iter().filter(&not_in_table).collect();
+        if !weak.is_empty() {
+            let gap = body * 6.0; // a caption sits within a few lines of its figure
+            let mut claimed = vec![false; weak.len()];
+            let mut promote: Vec<usize> = Vec::new();
+            for l in &lines {
+                let t = l.text();
+                let is_fig = matches!(caption_label(&t), Some((true, _)));
+                if !is_fig || is_inline_xref(&t) || caption_is_continued(&t) || dotleader_tail(&t) {
+                    continue;
+                }
+                let cy = l.y;
+                let edge = |yb: f32, yt: f32| if cy < yb { yb - cy } else if cy > yt { cy - yt } else { 0.0 };
+                let strong_near = images
+                    .iter()
+                    .map(|im| edge(im.y_bottom, im.y_top))
+                    .chain(vectors.iter().map(|v| edge(v.y_bottom, v.y_top)))
+                    .fold(f32::INFINITY, f32::min);
+                if strong_near <= gap {
+                    continue; // caption already has a (strong) graphic
+                }
+                let mut best: Option<(usize, f32)> = None;
+                for (j, v) in weak.iter().enumerate() {
+                    if claimed[j] {
+                        continue;
+                    }
+                    let e = edge(v.y_bottom, v.y_top);
+                    let x_overlap = v.x_right > l.x0 - body && v.x_left < l.x1 + body;
+                    if e <= gap && x_overlap && best.map_or(true, |(_, be)| e < be) {
+                        best = Some((j, e));
+                    }
+                }
+                if let Some((j, _)) = best {
+                    claimed[j] = true;
+                    promote.push(j);
+                }
+            }
+            promote.sort_unstable();
+            promote.dedup();
+            for &j in promote.iter().rev() {
+                vectors.push(weak.remove(j));
+            }
+        }
         // Mark lines consumed by a table (within its y-range). A line belongs to a table
         // only if it overlaps in BOTH axes — the x-overlap is essential on two-column pages
         // so a table in one column doesn't swallow the other column's prose. Defined after
@@ -2545,7 +3016,12 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
             .filter(|(_, l)| !in_table(l.x0, l.x1, l.y))
             .filter_map(|(idx, l)| {
                 let t = l.text();
-                caption_label(&t).and_then(|(f, n)| (!is_ref_continuation(idx) && !is_inline_xref(&t)).then(|| (idx, f, n)))
+                caption_label(&t).and_then(|(f, n)| {
+                    // Drop multi-page "Figure N—Continued" markers — re-emitting them would
+                    // duplicate the original figure's id and pollute the output with empty
+                    // continuation captions.
+                    (!is_ref_continuation(idx) && !is_inline_xref(&t) && !caption_is_continued(&t) && !is_dotleader_toc(&lines, idx)).then(|| (idx, f, n))
+                })
             })
             .collect();
         let mut consumed_caption = std::collections::HashSet::new();
@@ -2616,14 +3092,19 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
             };
             if !anchored {
                 // An unanchored FIGURE caption stays a `<figure>` (the figure exists;
-                // its graphic was dropped — an honest content-loss marker). An
-                // unanchored TABLE caption is NOT a figure: emit it as a caption `<div>`
-                // (the table itself was not detected nearby) — same element table
-                // captions use, keeping the `tab-N` id so cross-refs still resolve.
+                // its graphic was dropped — an honest content-loss marker, and it keeps the
+                // caption as a semantic `<figcaption>`). An unanchored TABLE caption is NOT a
+                // figure: emit it as a caption `<div>` (the table itself was not detected
+                // nearby) — same element table captions use, keeping the `tab-N` id so
+                // cross-refs still resolve. Spurious empties (List-of-Figures entries) and
+                // recoverable small vectors are already handled upstream (dot-leader
+                // suppression + caption-aware weak-vector promotion), so what remains here is
+                // a genuine figure whose graphic we could not extract.
+                let nid = num_id(&num);
                 let block = if is_fig {
-                    format!("<figure id=\"fig-{num}\"><figcaption>{html}</figcaption></figure>")
+                    format!("<figure id=\"fig-{nid}\"><figcaption>{html}</figcaption></figure>")
                 } else {
-                    format!("<div id=\"tab-{num}\">{html}</div>")
+                    format!("<div id=\"tab-{nid}\">{html}</div>")
                 };
                 standalone.push((lines[idx].x0, cy, block));
             }
@@ -2717,7 +3198,7 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
         let mut run: Vec<&Line> = Vec::new();
         let flush = |run: &mut Vec<&Line>, out: &mut String| {
             if !run.is_empty() {
-                emit_lines(run, body, title_sz, page_promote, &profile, out);
+                emit_lines(run, body, title_sz, page_promote, &profile, &head_plan, out);
                 run.clear();
             }
         };
@@ -2755,7 +3236,7 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
                         // Caption may have attached to the image OR its overlay vector.
                         let cap = img_cap[*j].as_ref().or(svg_cap[vi].as_ref());
                         match cap {
-                            Some((num, cap)) => out.push_str(&format!("<figure id=\"fig-{num}\">{svg}<figcaption>{cap}</figcaption></figure>")),
+                            Some((num, cap)) => out.push_str(&format!("<figure id=\"fig-{}\">{svg}<figcaption>{cap}</figcaption></figure>", num_id(num))),
                             None => out.push_str(&format!("<figure>{svg}</figure>")),
                         }
                         continue;
@@ -2797,7 +3278,8 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
                     let rel = if overlays.is_empty() { "" } else { " style=\"position:relative\"" };
                     match &img_cap[*j] {
                         Some((num, cap)) => out.push_str(&format!(
-                            "<figure{rel} id=\"fig-{num}\">{graphic}{overlays}<figcaption>{cap}</figcaption></figure>"
+                            "<figure{rel} id=\"fig-{nid}\">{graphic}{overlays}<figcaption>{cap}</figcaption></figure>",
+                            nid = num_id(num)
                         )),
                         None => out.push_str(&format!("<figure{rel}>{graphic}{overlays}</figure>")),
                     }
@@ -2827,7 +3309,8 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
                     let cap = svg_cap[*j].as_ref().or_else(|| svg_rasters[*j].iter().find_map(|&ii| img_cap[ii].as_ref()));
                     match cap {
                         Some((num, cap)) => out.push_str(&format!(
-                            "<figure id=\"fig-{num}\">{svg}<figcaption>{cap}</figcaption></figure>"
+                            "<figure id=\"fig-{nid}\">{svg}<figcaption>{cap}</figcaption></figure>",
+                            nid = num_id(num)
                         )),
                         None => out.push_str(&format!("<figure>{svg}</figure>")),
                     }

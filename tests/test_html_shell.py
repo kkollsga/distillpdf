@@ -48,7 +48,16 @@ def test_shell_and_no_bloat(path):
     assert len(re.findall(r"<style\b", h)) <= 1, "more than one <style> block"
 
 
-@pytest.mark.parametrize("path", OWNED, ids=IDS)
+# Markup-density is a DOCUMENT contract (body markup vs visible text). It is not
+# meaningful for the synthetic table corpus — a bare grid, and especially a SPARSE
+# grid (many empty <td> by design), is legitimately markup-heavy — so the ratio runs
+# over the document-like fixtures only. Table structure is covered by test_tables /
+# test_table_columns.
+DOCS = hc.doc_pdfs()
+DOC_IDS = [os.path.basename(p) for p in DOCS]
+
+
+@pytest.mark.parametrize("path", DOCS, ids=DOC_IDS)
 def test_markup_thinness(path):
     h = hc.html_for(path)
     pt = hc.plain_bytes(h)

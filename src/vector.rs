@@ -393,6 +393,13 @@ impl PlacedSvg {
 const MIN_W: f32 = 72.0;
 const MIN_H: f32 = 54.0;
 const MIN_PATHS: usize = 6;
+// A relaxed "weak" bar: a cluster that fails the strong bar but clears these is a CANDIDATE
+// figure, kept aside and only promoted in html.rs when a figure caption sits right next to it
+// (a small diagram — a few ellipse curves, a TikZ sketch — that the strong bar drops). The
+// weak bar still rejects a single rule / underline (needs ≥2 paths and a real 2-D extent).
+const WEAK_MIN_W: f32 = 36.0;
+const WEAK_MIN_H: f32 = 24.0;
+const WEAK_MIN_PATHS: usize = 2;
 const BAND_GAP: f32 = 24.0; // vertical gap that separates two figures
 const MAX_OPS: usize = 60_000; // bail on pathologically dense pages
 
@@ -524,17 +531,19 @@ fn path_bbox(cur: &[Seg]) -> Option<(f32, f32, f32, f32)> {
 }
 
 /// Vector figures on a page, top-to-bottom.
-pub fn positioned_vectors(doc: &Document, page_id: ObjectId) -> Vec<PlacedSvg> {
+/// Returns `(strong, weak)` placed vector figures. STRONG are emitted unconditionally; WEAK
+/// are sub-threshold candidates html.rs promotes only when a figure caption anchors to one.
+pub fn positioned_vectors(doc: &Document, page_id: ObjectId) -> (Vec<PlacedSvg>, Vec<PlacedSvg>) {
     let resources = match page_resources(doc, page_id) {
         Some(r) => r,
-        None => return Vec::new(),
+        None => return (Vec::new(), Vec::new()),
     };
     let content = match doc.get_and_decode_page_content(page_id) {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), Vec::new()),
     };
     if content.operations.len() > MAX_OPS {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let xmap = xobjects_of(doc, &resources);
     let egmap = extgstates_of(doc, &resources);
@@ -545,8 +554,9 @@ pub fn positioned_vectors(doc: &Document, page_id: ObjectId) -> Vec<PlacedSvg> {
         p.seq = i;
     }
     let page_w = page_width(doc, page_id);
-    let figures = cluster_figures(painted);
-    figures.iter().map(|c| build_svg(c, page_w)).collect()
+    let (strong, weak) = cluster_figures(painted);
+    let build = |cs: Vec<Vec<Painted>>| cs.iter().map(|c| build_svg(c, page_w)).collect();
+    (build(strong), build(weak))
 }
 
 /// Page width from the MediaBox (used to size each figure as a share of the page).
@@ -589,7 +599,7 @@ fn walk(
     out: &mut Vec<Painted>,
     depth: u32,
 ) {
-    if depth > 8 {
+    if depth > crate::MAX_FORM_DEPTH {
         return;
     }
     let mut g = base;
@@ -755,13 +765,16 @@ fn comps(o: &[Object]) -> Option<[u8; 3]> {
     }
 }
 
-/// Group painted paths into vertically-contiguous clusters, keep only the ones
-/// big enough and inky enough to be real figures.
-fn cluster_figures(mut paths: Vec<Painted>) -> Vec<Vec<Painted>> {
+/// Group painted paths into vertically-contiguous clusters and split them into
+/// `(strong, weak)`: STRONG clusters are real figures emitted unconditionally; WEAK
+/// clusters clear only the relaxed bar and are emitted by html.rs solely when a figure
+/// caption anchors to one (a small diagram the strong bar would drop). Clusters failing
+/// even the weak bar (single rules, stray marks) are discarded.
+fn cluster_figures(mut paths: Vec<Painted>) -> (Vec<Vec<Painted>>, Vec<Vec<Painted>>) {
     // Drop full-page background fills (a single huge rectangle) up front.
     paths.retain(|p| !(p.x1 - p.x0 > 400.0 && p.y1 - p.y0 > 600.0 && p.segs.len() <= 5));
     if paths.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     paths.sort_by(|a, b| b.y1.partial_cmp(&a.y1).unwrap_or(std::cmp::Ordering::Equal));
     let mut clusters: Vec<Vec<Painted>> = Vec::new();
@@ -777,19 +790,28 @@ fn cluster_figures(mut paths: Vec<Painted>) -> Vec<Vec<Painted>> {
         band_lo = p.y0;
         clusters.push(vec![p]);
     }
-    clusters.retain(|c| {
+    let extent = |c: &[Painted]| {
         let x0 = c.iter().map(|p| p.x0).fold(f32::INFINITY, f32::min);
         let x1 = c.iter().map(|p| p.x1).fold(f32::NEG_INFINITY, f32::max);
         let y0 = c.iter().map(|p| p.y0).fold(f32::INFINITY, f32::min);
         let y1 = c.iter().map(|p| p.y1).fold(f32::NEG_INFINITY, f32::max);
-        c.len() >= MIN_PATHS && x1 - x0 >= MIN_W && y1 - y0 >= MIN_H
-    });
+        (x1 - x0, y1 - y0)
+    };
+    let (mut strong, mut weak): (Vec<Vec<Painted>>, Vec<Vec<Painted>>) = (Vec::new(), Vec::new());
+    for c in clusters {
+        let (w, h) = extent(&c);
+        if c.len() >= MIN_PATHS && w >= MIN_W && h >= MIN_H {
+            strong.push(c);
+        } else if c.len() >= WEAK_MIN_PATHS && w >= WEAK_MIN_W && h >= WEAK_MIN_H {
+            weak.push(c);
+        }
+    }
     // Restore stream paint order within each cluster (banding sorted by y): a fill
     // drawn after an outline must paint on top of it, not be reordered by position.
-    for c in &mut clusters {
+    for c in strong.iter_mut().chain(weak.iter_mut()) {
         c.sort_by_key(|p| p.seq);
     }
-    clusters
+    (strong, weak)
 }
 
 fn fmt(v: f32) -> String {

@@ -26,6 +26,27 @@ def test_twocol_not_a_table():
     assert "<table" not in html("twocol.pdf"), "two-column prose mis-detected as a table"
 
 
+def test_twocol_tight_gutter_reads_in_order():
+    """A tight Times-Roman two-column page with a centered page number in the gutter must read
+    column-by-column. Locks the Standard-14 AFM widths + crossing-tolerant gutter together
+    (pre-fix the columns interleave L/R line-by-line)."""
+    t = text(html("twocol_tight.pdf"))
+    order = GT["twocol_tight.pdf"]["order"]
+    pos = [t.find(k) for k in order]
+    assert all(p >= 0 for p in pos), f"a column marker is missing: {list(zip(order, pos))}"
+    assert pos == sorted(pos), f"tight two-column reading order scrambled: {list(zip(order, pos))}"
+
+
+def test_yflip_reading_order_not_reversed():
+    """A page under a Y-flip CTM (top-left origin) must read top-to-bottom, not reversed.
+    Locks the SEC-filing global bottom-to-top reversal fix (extract_spans device coords)."""
+    t = text(html("yflip.pdf"))
+    order = GT["yflip.pdf"]["order"]
+    pos = [t.find(k) for k in order]
+    assert all(p >= 0 for p in pos), f"a Y-flip marker is missing: {list(zip(order, pos))}"
+    assert pos == sorted(pos), f"Y-flip page read bottom-to-top (reversed): {list(zip(order, pos))}"
+
+
 def test_twocol_paragraphs_intact():
     t = text(html("twocol.pdf"))
     # each column paragraph's distinctive opening must appear contiguously (no fusion)

@@ -295,7 +295,7 @@ fn walk_outline(
     seen: &mut std::collections::HashSet<ObjectId>,
     out: &mut Vec<OutlineEntry>,
 ) {
-    if depth > 8 {
+    if depth as u32 > crate::MAX_FORM_DEPTH {
         return;
     }
     let mut cur = node;
