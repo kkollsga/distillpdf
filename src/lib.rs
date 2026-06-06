@@ -333,7 +333,7 @@ impl Pdf {
     /// keywords:[str]}`. Fields are empty/None when not detected. Authors are linked to
     /// their organisation via the affiliation superscript markers.
     fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let fm = py.allow_threads(|| html::extract_front_matter(&self.doc, &self.raw));
+        let fm = py.allow_threads(|| frontmatter::extract_front_matter(&self.doc, &self.raw));
         let d = PyDict::new(py);
         d.set_item("title", fm.title)?;
         let authors = PyList::empty(py);
