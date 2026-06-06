@@ -662,6 +662,51 @@ def gen_twocol():
     }
 
 
+def gen_twocol_fullwidth_header():
+    """A full-width title + abstract spanning the WHOLE text measure, sitting ABOVE a
+    two-column body. The header crosses the central gutter, so it has no vertical gap
+    there: the layout MUST peel it off with a horizontal cut FIRST, then apply the
+    vertical column cut to the body only. Reading order must be header → entire left
+    column → right column. Pre-fix the full-width header defeats the gutter test and the
+    page falls to a single band, interleaving the columns L/R line-by-line."""
+    pdf = os.path.join(OUT, "twocol_fullwidth.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    top = PAGE_H - 72
+    # Full-width header: a title line + an abstract paragraph wrapped at the FULL text
+    # width (so each line crosses the page center / column gutter).
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(LM, top, "HEADERSTART A Full-Width Title Spanning Both Columns")
+    abstract = ("This abstract runs the full width of the text block, well across the central "
+                "gutter, so it cannot belong to either column and must be peeled off above the "
+                "two-column body before the columns are read. HEADEREND closes the header band.")
+    c.setFont("Helvetica", 10)
+    y = top - 24
+    for ln in simpleSplit(abstract, "Helvetica", 10, COL_W):
+        c.drawString(LM, y, ln)
+        y -= 13
+    # Two-column body below the header. Gutter straddles the page center (x ≈ 306).
+    body_top = y - 24
+    lx, rx = LM, 320
+    left = ("LEFTSTART the entire left column of the body is read top to bottom before the "
+            "right column, after the full-width header above it. each line is ordinary body "
+            "prose that fills its narrow measure so the column is clearly distinct from the "
+            "header that spans the whole page. we add several lines so the body columns are "
+            "tall and unmistakably real columns. LEFTEND closes the left column.")
+    right = ("RIGHTSTART the right column follows only after the whole left column, and only "
+             "after the full-width header has been emitted first of all. it likewise wraps as "
+             "body prose filling its measure, line after line, so the two columns are similar "
+             "in height and the gutter between them stays clear. RIGHTEND closes the right.")
+    for i, ln in enumerate(simpleSplit(left, "Helvetica", 10, 210)):
+        c.drawString(lx, body_top - i * 13, ln)
+    for i, ln in enumerate(simpleSplit(right, "Helvetica", 10, 210)):
+        c.drawString(rx, body_top - i * 13, ln)
+    c.showPage()
+    c.save()
+    GT["twocol_fullwidth.pdf"] = {
+        "order": ["HEADERSTART", "HEADEREND", "LEFTSTART", "LEFTEND", "RIGHTSTART", "RIGHTEND"],
+    }
+
+
 def gen_rotated_image_fig():
     """A vector chart with a small raster placed ROTATED 90° inside it (an axis label that the
     source flattened to a bitmap and set sideways — the Kaspersen 'Temp (Celsius)' case). The
@@ -986,6 +1031,7 @@ def main():
     gen_typography()
     gen_twocol()
     gen_twocol_tight()
+    gen_twocol_fullwidth_header()
     gen_rotated_image_fig()
     gen_yflip_page()
     gen_math()

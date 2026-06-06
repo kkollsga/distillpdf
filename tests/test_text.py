@@ -37,6 +37,18 @@ def test_twocol_tight_gutter_reads_in_order():
     assert pos == sorted(pos), f"tight two-column reading order scrambled: {list(zip(order, pos))}"
 
 
+def test_twocol_fullwidth_header_reads_header_then_columns():
+    """A full-width title/abstract above a two-column body must read header → entire left
+    column → right column. Locks the full-width horizontal peel: the header spans the gutter,
+    so it must be cut off above the body before the vertical column cut (pre-fix the page
+    falls to a single band and the columns interleave L/R line-by-line)."""
+    t = text(html("twocol_fullwidth.pdf"))
+    order = GT["twocol_fullwidth.pdf"]["order"]
+    pos = [t.find(k) for k in order]
+    assert all(p >= 0 for p in pos), f"a marker is missing: {list(zip(order, pos))}"
+    assert pos == sorted(pos), f"full-width-header reading order scrambled: {list(zip(order, pos))}"
+
+
 def test_yflip_reading_order_not_reversed():
     """A page under a Y-flip CTM (top-left origin) must read top-to-bottom, not reversed.
     Locks the SEC-filing global bottom-to-top reversal fix (extract_spans device coords)."""

@@ -200,6 +200,16 @@
       "RIGHTEND"
     ]
   },
+  "twocol_fullwidth.pdf": {
+    "order": [
+      "HEADERSTART",
+      "HEADEREND",
+      "LEFTSTART",
+      "LEFTEND",
+      "RIGHTSTART",
+      "RIGHTEND"
+    ]
+  },
   "rotated_image.pdf": {
     "caption": "Figure 1: A chart whose right-axis label is a rotated raster."
   },
