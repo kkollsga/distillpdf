@@ -2,7 +2,8 @@
 //! (size/number/roman/run-in cues), validate via the document style profile, plan the
 //! trusted heading styles globally, and merge wrapped heading lines. Extracted from html.rs.
 
-use crate::html::{clone_span, has_year, initials_count, lines_of, looks_like_reference, numbered_level, roman_section, Line, Run, THEOREM_ENV, TOP_HEADS};
+use crate::html::{clone_span, has_year, initials_count, looks_like_reference, numbered_level, roman_section, THEOREM_ENV, TOP_HEADS};
+use crate::layout::{lines_of, Line, Run};
 use crate::profile::DocProfile;
 use crate::text::Span;
 use lopdf::ObjectId;

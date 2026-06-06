@@ -24,7 +24,8 @@ pub struct Author {
     pub affiliation: Option<String>,
 }
 
-use crate::html::{esc, initials_count, lines_of, looks_like_reference, numbered_level, roman_section, Line, FOOTNOTE_MARKERS};
+use crate::html::{esc, initials_count, looks_like_reference, numbered_level, roman_section, FOOTNOTE_MARKERS};
+use crate::layout::{lines_of, Line};
 use crate::text;
 use lopdf::Document;
 use std::collections::HashSet;

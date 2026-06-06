@@ -3,7 +3,8 @@
 //! multi-line caption block. Extracted from html.rs.
 
 use crate::headings::detect_header;
-use crate::html::{append_piece, list_kind, render_runs, Line};
+use crate::html::{append_piece, list_kind};
+use crate::layout::{render_runs, Line};
 use crate::profile::DocProfile;
 
 /// "Figure 2 shows …", "Table 1 summarises …", "Fig. 3 plots …" — an in-text

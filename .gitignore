@@ -16,3 +16,4 @@ benchmarking/
 
 # Local working notes (not shared)
 CLAUDE.md
+.build-venv/

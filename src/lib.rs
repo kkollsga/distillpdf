@@ -15,6 +15,7 @@ mod frontmatter;
 mod headings;
 mod html;
 mod img;
+mod layout;
 mod links;
 mod markdown;
 mod nav;
