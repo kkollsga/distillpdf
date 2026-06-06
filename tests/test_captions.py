@@ -27,7 +27,8 @@ def _figcaps(h):
 def test_hierarchical_figure_id_and_display():
     h = html("figures_hier.pdf")
     g = GT["figures_hier.pdf"]
-    assert f'id="{g["fig_id"]}"' in h, f'missing {g["fig_id"]}; ids={re.findall(chr(39)+"id=.(fig-[^\"]*)"+chr(39), h)}'
+    ids = re.findall('id="(fig-[^"]*)"', h)
+    assert f'id="{g["fig_id"]}"' in h, f'missing {g["fig_id"]}; ids={ids}'
     assert f'id="{g["tab_id"]}"' in h, f'missing {g["tab_id"]}'
     # not truncated to the leading integer
     assert 'id="fig-2"' not in h and 'id="tab-0"' not in h, "number truncated to leading integer"
