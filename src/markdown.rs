@@ -610,7 +610,7 @@ fn caption_slug(caption: &str) -> String {
         let l = lower.to_ascii_lowercase();
         if l.starts_with("figure") || l.starts_with("fig.") || l.starts_with("fig ") {
             // skip the label up to the first ':' or '.' or '-' separator, then the number.
-            lower.splitn(2, |c| c == ':' || c == '–' || c == '-').nth(1).unwrap_or(lower)
+            lower.split_once([':', '–', '-']).map(|x| x.1).unwrap_or(lower)
         } else {
             lower
         }

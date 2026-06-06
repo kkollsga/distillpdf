@@ -1341,7 +1341,7 @@ fn decode_text_ctm(doc: &Document, ops: &[lopdf::content::Operation], fonts: &Ha
                     Some(&id) => id,
                     None => continue,
                 };
-                let stream = match doc.get_object(id).and_then(|x| x.as_stream().map(|s| s.clone())) {
+                let stream = match doc.get_object(id).and_then(|x| x.as_stream().cloned()) {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
@@ -1410,7 +1410,7 @@ fn widest_gap(mut intervals: Vec<(f32, f32)>) -> Option<(f32, f32)> {
     for &(lo, hi) in intervals.iter().skip(1) {
         if lo > max_hi {
             let g = lo - max_hi;
-            if best.map_or(true, |(bg, _)| g > bg) {
+            if best.is_none_or(|(bg, _)| g > bg) {
                 best = Some((g, (max_hi + lo) * 0.5));
             }
         }
@@ -1718,7 +1718,7 @@ pub fn debug_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> String {
     if let Ok(fonts) = doc.get_page_fonts(page_id) {
         for (name, dict) in fonts {
             if let Some(r) = dict.get(b"ToUnicode").ok().and_then(|o| o.as_reference().ok()) {
-                if let Ok(st) = doc.get_object(r).and_then(|o| o.as_stream().map(|s| s.clone())) {
+                if let Ok(st) = doc.get_object(r).and_then(|o| o.as_stream().cloned()) {
                     let dec = st.decompressed_content();
                     let raw_len = st.content.len();
                     let dec_len = dec.as_ref().map(|d| d.len() as i64).unwrap_or(-1);
@@ -1764,4 +1764,48 @@ pub fn debug_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> String {
 pub fn extract_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Option<String> {
     let spans = extract_spans(doc, page_id, raw);
     Some(text_from_spans(spans))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn widest_gap_finds_interior_lane() {
+        // two clusters of intervals with a clear gap 10..40 between them
+        let g = widest_gap(vec![(0.0, 10.0), (2.0, 8.0), (40.0, 50.0), (42.0, 48.0)]).unwrap();
+        assert!((g.0 - 30.0).abs() < 0.01, "gap width");
+        assert!((g.1 - 25.0).abs() < 0.01, "cut at midpoint");
+    }
+
+    #[test]
+    fn tolerant_vgap_ignores_a_stray_crosser() {
+        // a clean lane 20..40 except ONE interval (a centered page number) crosses x=30;
+        // strict widest_gap is split, but tolerant (tol=1) recovers the ~20pt lane.
+        let iv = vec![(0.0, 20.0), (0.0, 19.0), (40.0, 60.0), (41.0, 59.0), (29.0, 31.0)];
+        assert!(widest_gap(iv.clone()).map(|(w, _)| w).unwrap_or(0.0) < 12.0, "strict lane is split");
+        let (w, c) = tolerant_vgap(&iv, 1).unwrap();
+        assert!(w >= 15.0, "tolerant recovers the wide lane, got {w}");
+        assert!(c > 20.0 && c < 40.0, "cut inside the gutter");
+    }
+
+    #[test]
+    fn xy_cut_two_columns_then_single() {
+        // boxes: (left,right,bottom,top), y up. Two tall columns: L rows then R rows.
+        let body = 10.0;
+        let boxes: Vec<BBox> = vec![
+            (0.0, 40.0, 90.0, 100.0),  // L top
+            (0.0, 40.0, 60.0, 70.0),   // L mid
+            (0.0, 40.0, 30.0, 40.0),   // L bot
+            (60.0, 100.0, 90.0, 100.0),// R top
+            (60.0, 100.0, 60.0, 70.0), // R mid
+            (60.0, 100.0, 30.0, 40.0), // R bot
+        ];
+        let order = xy_cut_order(&boxes, body);
+        // entire left column (indices 0,1,2) before the right (3,4,5)
+        assert_eq!(order, vec![0, 1, 2, 3, 4, 5], "left column read fully before right");
+        // a single column reads top-to-bottom (higher y first)
+        let single: Vec<BBox> = vec![(0.0, 40.0, 30.0, 40.0), (0.0, 40.0, 90.0, 100.0), (0.0, 40.0, 60.0, 70.0)];
+        assert_eq!(xy_cut_order(&single, body), vec![1, 2, 0], "top-to-bottom");
+    }
 }

@@ -57,6 +57,6 @@ Issues = "https://github.com/kkollsga/distillpdf/issues"
 Source = "https://github.com/kkollsga/distillpdf"
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+features = ["extension-module"]
 module-name = "distillpdf._distillpdf"
 python-source = "python"

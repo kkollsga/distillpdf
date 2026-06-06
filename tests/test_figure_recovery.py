@@ -43,6 +43,19 @@ def test_small_vector_with_caption_recovered():
     assert "Figure 1" in fig, "caption not linked to the recovered figure"
 
 
+# ----- Rotated raster placement -----
+def test_rotated_raster_image_keeps_rotation():
+    """An image placed rotated 90° (a sideways axis label flattened to a bitmap) must be
+    emitted with a matrix transform so it renders rotated, not stretched into an axis-aligned
+    box. Locks the img.rs rotation-aware placement + composite_svg transform."""
+    h = html("rotated_image.pdf")
+    figs = _figures(h)
+    assert figs, "no figure emitted for the rotated-image chart"
+    blob = "".join(figs)
+    assert re.search(r'<image\b[^>]*transform="matrix\(', blob), \
+        "rotated raster emitted without a transform (would render stretched/mangled)"
+
+
 # ----- Precision gate: no spurious promotion without a caption -----
 def test_no_spurious_figures_without_caption():
     h = html("no_spurious_figs.pdf")

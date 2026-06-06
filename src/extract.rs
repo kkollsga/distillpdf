@@ -64,7 +64,7 @@ fn rows_of(mut spans: Vec<Span>) -> Vec<Vec<Span>> {
     let mut rows: Vec<Vec<Span>> = Vec::new();
     let mut ref_y: Option<f32> = None;
     for s in spans {
-        if ref_y.map_or(true, |ry| (ry - s.y).abs() > band) {
+        if ref_y.is_none_or(|ry| (ry - s.y).abs() > band) {
             rows.push(Vec::new());
             ref_y = Some(s.y);
         }
@@ -151,7 +151,7 @@ fn columns(rows: &[Vec<Cell>], tol: f32) -> Vec<f32> {
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mut cols: Vec<f32> = Vec::new();
     for x in xs {
-        if cols.last().map_or(true, |&c| x - c > tol) {
+        if cols.last().is_none_or(|&c| x - c > tol) {
             cols.push(x);
         }
     }
@@ -275,7 +275,7 @@ fn is_coherent_grid(grid: &[Vec<String>]) -> bool {
     let has_empty_col = ncols > 0
         && !grid.is_empty()
         && (0..ncols).any(|c| {
-            let empty = grid.iter().filter(|r| r.get(c).map_or(true, |s| s.trim().is_empty())).count();
+            let empty = grid.iter().filter(|r| r.get(c).is_none_or(|s| s.trim().is_empty())).count();
             empty * 5 >= grid.len() * 4
         });
     if ncols == 3 && mean_words > 4.5 && has_empty_col {
@@ -567,7 +567,7 @@ fn detect_tables_region(spans: &[Span]) -> Vec<PosTable> {
                     if !celled[ai].1.iter().any(|c| (c.x - cx).abs() <= tol) {
                         continue; // overflow x must line up with one of the anchor's columns
                     }
-                    if best.map_or(true, |(_, bd)| dy < bd) {
+                    if best.is_none_or(|(_, bd)| dy < bd) {
                         best = Some((ai, dy));
                     }
                 }
@@ -955,4 +955,46 @@ pub fn extract_fonts<'py>(py: Python<'py>, doc: &Document) -> PyResult<Bound<'py
         }
     }
     Ok(list)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grid(rows: &[&[&str]]) -> Vec<Vec<String>> {
+        rows.iter().map(|r| r.iter().map(|s| s.to_string()).collect()).collect()
+    }
+
+    #[test]
+    fn numeric_data_table_is_coherent() {
+        let g = grid(&[
+            &["Region", "Q1", "Q2", "Q3"],
+            &["North", "12.5", "13.1", "11.9"],
+            &["South", "9.4", "10.2", "8.8"],
+        ]);
+        assert!(is_coherent_grid(&g));
+    }
+
+    #[test]
+    fn prose_two_column_rejected() {
+        // a glossary: short term + long wrapped definition (mean words/cell > 4 in 2 cols)
+        let g = grid(&[
+            &["alpha", "the first letter of the Greek alphabet used widely in mathematics"],
+            &["beta", "the second letter often denoting a coefficient or a regression slope"],
+            &["gamma", "the third letter frequently used for the Lorentz factor in physics"],
+        ]);
+        assert!(!is_coherent_grid(&g));
+    }
+
+    #[test]
+    fn commutative_diagram_rejected() {
+        // morphism glyphs, no decimal data, not word-dominated → a diagram, not a table
+        let g = grid(&[
+            &["X", "", "⟨ (234) ⟩", "", "⟨ (34) ⟩"],
+            &["E", "1 P", "", "A 4", "Stab(1)"],
+            &["", "x", "3 12", "", ""],
+            &["2", "4", "", "", ""],
+        ]);
+        assert!(!is_coherent_grid(&g));
+    }
 }

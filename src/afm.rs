@@ -92,3 +92,26 @@ pub fn standard_widths(basefont: &str, bold: bool, italic: bool) -> Option<&'sta
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_widths() {
+        let t = standard_widths("Times-Roman", false, false).unwrap();
+        assert_eq!(t[b' ' as usize], 250); // space
+        assert_eq!(t[b'A' as usize], 722); // canonical AFM value
+        assert_eq!(standard_widths("Courier", false, false).unwrap()[b'A' as usize], 600); // monospace
+    }
+
+    #[test]
+    fn style_and_alias_and_subset_prefix() {
+        // family alias + bold/italic flags pick the right variant
+        assert!(std::ptr::eq(standard_widths("Arial,Bold", true, false).unwrap(), &HELVETICA_BOLD));
+        // a subset-prefixed name still resolves
+        assert!(std::ptr::eq(standard_widths("ABCDEF+Times-Italic", false, true).unwrap(), &TIMES_ITALIC));
+        // an embedded/unknown font is not a Standard-14 → None (keeps the /Widths path)
+        assert!(standard_widths("WRBHBJ+rtxmi", false, false).is_none());
+    }
+}

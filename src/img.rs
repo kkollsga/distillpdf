@@ -466,6 +466,12 @@ pub struct Placed {
     pub x_left: f32,
     pub x_right: f32,
     pub uri: String,
+    /// The image's full placement matrix `[a,b,c,d,e,f]` (PDF page space, y up) when it is
+    /// ROTATED (non-axis-aligned CTM) — e.g. a "Temp (Celsius)" axis label flattened to a
+    /// raster and placed sideways. `None` for the common axis-aligned case (then the bbox
+    /// alone places it). Used to emit a matching SVG transform instead of stretching the
+    /// pixels into the axis-aligned box.
+    pub ctm: Option<[f32; 6]>,
 }
 
 /// One placed image XObject before clustering: its object id, placed bbox (page points),
@@ -478,6 +484,7 @@ struct RawTile {
     y0: f32,
     y1: f32,
     pw: u32,
+    ctm: Option<[f32; 6]>, // placement matrix when rotated (see Placed::ctm)
 }
 
 /// Images smaller than this (rendered, points) are diagram tiles / rules /
@@ -545,7 +552,7 @@ fn walk(
                     Some(&id) => id,
                     None => continue,
                 };
-                let stream = match doc.get_object(id).and_then(|x| x.as_stream().map(|s| s.clone())) {
+                let stream = match doc.get_object(id).and_then(|x| x.as_stream().cloned()) {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
@@ -564,10 +571,19 @@ fn walk(
                     if w < MIN_DIM || h < MIN_DIM {
                         continue; // diagram tile / rule / icon — not a figure
                     }
+                    // A ROTATED placement (non-axis-aligned CTM) would render mangled if we
+                    // just stretched the pixels into this axis-aligned bbox — keep the matrix
+                    // so the emitter can rotate it. Axis-aligned (the common case) → None.
+                    let scale = ctm.a.abs().max(ctm.b.abs()).max(ctm.c.abs()).max(ctm.d.abs()).max(1e-6);
+                    let rot_ctm = if ctm.b.abs() > 0.01 * scale || ctm.c.abs() > 0.01 * scale {
+                        Some([ctm.a, ctm.b, ctm.c, ctm.d, ctm.e, ctm.f])
+                    } else {
+                        None
+                    };
                     // Record geometry + pixel dims; uri building / grid stitching happens
                     // in finalize() once the whole page's tiles are known.
                     let pw = stream.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0) as u32;
-                    out.push(RawTile { id, x0, x1, y0, y1, pw });
+                    out.push(RawTile { id, x0, x1, y0, y1, pw, ctm: rot_ctm });
                 } else if subtype == b"Form" {
                     // Form: descend with its /Matrix and own resources.
                     let fm = stream
@@ -613,27 +629,29 @@ fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool) -> Vec<Placed> 
         let tiles: Vec<&RawTile> = g.iter().map(|&i| &raws[i]).collect();
         let (x0, x1, y0, y1) = union_bbox(&tiles);
         if tiles.len() >= MIN_GRID_TILES && is_grid(&tiles) {
+            // A stitched grid is composed axis-aligned, so it carries no rotation.
             if want_uris {
                 if let Some(uri) = stitch_grid(doc, &tiles, (x0, x1, y0, y1)) {
-                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri });
+                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri, ctm: None });
                     continue;
                 }
                 // stitch failed → fall through to per-tile emission
             } else {
                 if tiles.iter().any(|t| decodable(doc, t.id)) {
-                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri: String::new() });
+                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri: String::new(), ctm: None });
                 }
                 continue;
             }
         }
-        // Not a grid (or stitch failed): emit each tile individually (prior behaviour).
+        // Not a grid (or stitch failed): emit each tile individually (prior behaviour),
+        // carrying its rotation matrix if any.
         for t in tiles {
             if want_uris {
                 if let Some(uri) = data_uri(doc, t.id) {
-                    out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri });
+                    out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri, ctm: t.ctm });
                 }
             } else if decodable(doc, t.id) {
-                out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri: String::new() });
+                out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri: String::new(), ctm: t.ctm });
             }
         }
     }

@@ -13,8 +13,15 @@ categories = ["text-processing", "parser-implementations"]
 name = "distillpdf"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# `extension-module` is REQUIRED for the Python wheel (maturin enables it via
+# pyproject's [tool.maturin] features), but it makes the test/bench binaries unlinkable
+# (it tells pyo3 not to link libpython, so `_PyExc_*` are undefined). Keeping it OPT-IN
+# means `cargo test` links normally and the pure-Rust logic gets real unit tests.
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
-pyo3 = { version = "0.25", features = ["extension-module", "abi3-py38"] }
+pyo3 = { version = "0.25", features = ["abi3-py38"] }
 lopdf = "0.40"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

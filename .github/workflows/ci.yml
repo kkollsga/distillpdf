@@ -26,6 +26,11 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.toml') }}
 
+      - name: Rust unit tests
+        # `extension-module` is opt-in (see Cargo.toml [features]); WITHOUT it the test
+        # binary links libpython normally, so cargo test runs the pure-logic unit tests.
+        run: cargo test --lib
+
       - name: Build & install distillpdf
         run: |
           python -m pip install --upgrade pip maturin pytest

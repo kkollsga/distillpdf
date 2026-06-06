@@ -200,6 +200,9 @@
       "RIGHTEND"
     ]
   },
+  "rotated_image.pdf": {
+    "caption": "Figure 1: A chart whose right-axis label is a rotated raster."
+  },
   "yflip.pdf": {
     "order": [
       "YFLIPONE",

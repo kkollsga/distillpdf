@@ -9,12 +9,15 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 mod afm;
+mod captions;
 mod extract;
 mod frontmatter;
 mod html;
 mod img;
 mod links;
 mod markdown;
+mod nav;
+mod postprocess;
 mod profile;
 mod text;
 mod vector;
@@ -293,8 +296,8 @@ impl Pdf {
     fn toc(&self, py: Python<'_>, mode: &str) -> PyResult<Vec<(u8, String, u32, String)>> {
         let mode = parse_mode(mode)?;
         // Force the TOC nav on (and skip image encoding — irrelevant to the outline) —
-        // `html::toc` parses the outline back out of that <nav>.
-        Ok(py.allow_threads(|| html::toc(&html::to_html(&self.doc, &self.raw, mode, false, true))))
+        // `nav::toc` parses the outline back out of that <nav>.
+        Ok(py.allow_threads(|| nav::toc(&html::to_html(&self.doc, &self.raw, mode, false, true))))
     }
 
     /// The PDF's OWN table of contents — the author-supplied `/Outlines` bookmarks —
@@ -307,7 +310,7 @@ impl Pdf {
         Ok(py.allow_threads(|| {
             links::outline(&self.doc)
                 .into_iter()
-                .map(|e| ((e.level + 1).min(255), e.title, e.page, format!("page-{}", e.page)))
+                .map(|e| ((e.level + 1), e.title, e.page, format!("page-{}", e.page)))
                 .collect()
         }))
     }
@@ -321,8 +324,8 @@ impl Pdf {
     fn section(&self, py: Python<'_>, name: &str, mode: &str, image_mode: &str) -> PyResult<Option<String>> {
         let mode = parse_mode(mode)?;
         let images = !matches!(parse_image_mode(image_mode, false, markdown::ImgMode::Embed)?, markdown::ImgMode::Placeholder);
-        // `html::section` resolves via the TOC nav, so build with it present.
-        Ok(py.allow_threads(|| html::section(&html::to_html(&self.doc, &self.raw, mode, images, true), name)))
+        // `nav::section` resolves via the TOC nav, so build with it present.
+        Ok(py.allow_threads(|| nav::section(&html::to_html(&self.doc, &self.raw, mode, images, true), name)))
     }
 
     /// Structured front-matter of an academic paper, parsed from page 1:
@@ -350,7 +353,7 @@ impl Pdf {
     /// Diagnostic: force our ToUnicode extractor for all pages (eval only).
     fn _mine_text(&self) -> PyResult<String> {
         let mut out = String::new();
-        for (_p, &page_id) in &self.doc.get_pages() {
+        for &page_id in self.doc.get_pages().values() {
             out.push_str(&text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default());
             out.push('\n');
         }

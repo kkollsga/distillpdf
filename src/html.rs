@@ -4,10 +4,13 @@
 //! lists, monospace/code, tables (positioned), inline embedded images. No CSS,
 //! no classes, no script — minimal tags for LLM consumption.
 
+use crate::captions::*;
 use crate::extract::{self, PosTable};
 use crate::frontmatter::{Author, FrontMatter};
 use crate::img;
 use crate::links;
+use crate::nav::*;
+use crate::postprocess::*;
 use crate::profile::{DocProfile, HeadingTier};
 use crate::text::{self, Span};
 use crate::vector;
@@ -26,7 +29,7 @@ struct LinkBox {
 /// stable HTML id/fragment: keep [A-Za-z0-9._-], map anything else to '-'. Used for
 /// both the in-text link href (`#slug`) and the anchor `id` at the target, so a
 /// citation resolves to its exact reference/figure/equation instead of a page.
-fn slug(name: &str) -> String {
+pub(crate) fn slug(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' })
         .collect()
@@ -48,7 +51,7 @@ fn href_at(x: f32, y: f32, links: &[LinkBox]) -> Option<String> {
         .map(|l| l.href.clone())
 }
 
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -62,30 +65,32 @@ fn esc(s: &str) -> String {
     o
 }
 
-struct Run {
-    text: String,
-    bold: bool,
-    italic: bool,
-    href: Option<String>,
-    script: i8, // 0 = baseline, 1 = superscript (<sup>), -1 = subscript (<sub>)
+// The line/run layout types are the shared currency between html.rs and the extracted
+// feature modules (captions, …), so they're pub(crate).
+pub(crate) struct Run {
+    pub(crate) text: String,
+    pub(crate) bold: bool,
+    pub(crate) italic: bool,
+    pub(crate) href: Option<String>,
+    pub(crate) script: i8, // 0 = baseline, 1 = superscript (<sup>), -1 = subscript (<sub>)
 }
 
-struct Line {
-    y: f32,
-    x0: f32,
-    x1: f32,
-    size: f32,
-    mono: bool,
-    mono_w: usize,
-    tot_w: usize,
-    runs: Vec<Run>,
+pub(crate) struct Line {
+    pub(crate) y: f32,
+    pub(crate) x0: f32,
+    pub(crate) x1: f32,
+    pub(crate) size: f32,
+    pub(crate) mono: bool,
+    pub(crate) mono_w: usize,
+    pub(crate) tot_w: usize,
+    pub(crate) runs: Vec<Run>,
     /// Dominant font-face id (the line's first non-space span); 0 = unknown. Lets the
     /// style profile recognise a heading face that differs from body at the same size.
-    font: u32,
+    pub(crate) font: u32,
 }
 
 impl Line {
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         self.runs.iter().map(|r| r.text.as_str()).collect()
     }
 }
@@ -148,7 +153,7 @@ fn lines_of(mut spans: Vec<Span>, links: &[LinkBox]) -> Vec<Line> {
                     continue; // not horizontally adjacent to this base glyph
                 }
                 let adx = dx.abs();
-                if best.map_or(true, |(bd, _, _, _)| adx < bd) {
+                if best.is_none_or(|(bd, _, _, _)| adx < bd) {
                     best = Some((adx, t.y, t.size, t.bold));
                 }
             }
@@ -259,7 +264,7 @@ fn lines_of(mut spans: Vec<Span>, links: &[LinkBox]) -> Vec<Line> {
             }
         }
         if !whitespace {
-            let band_changed = cur_band.map_or(true, |cb| (cb - b).abs() >= 0.5);
+            let band_changed = cur_band.is_none_or(|cb| (cb - b).abs() >= 0.5);
             // Break on a huge horizontal gap (a column gutter) so left/right
             // columns at the same y don't merge — split occurs between words,
             // never within one, so no fragmentation.
@@ -409,7 +414,7 @@ fn mark_to_combining(s: &str) -> Option<char> {
 // read on the next loop iteration in the unmatched-link path, but is (correctly) dead in
 // the expansions that immediately reopen a link or fall at end-of-fn — hence the allow.
 #[allow(unused_assignments)]
-fn render_runs(runs: &[Run]) -> String {
+pub(crate) fn render_runs(runs: &[Run]) -> String {
     let mut o = String::new();
     // Track the href of the currently-open <a> so consecutive runs that share a
     // link (a citation/URL split across styled glyph-runs, e.g. "Rad"+"ford") stay
@@ -468,7 +473,7 @@ const BULLETS: &[char] = &['•', '◦', '▪', '‣', '\u{95}', '\u{85}'];
 // becoming one-item lists.
 const WEAK_BULLETS: &[char] = &['·', '−', '–', '*', '\u{2013}'];
 
-fn list_kind(text: &str) -> Option<bool> {
+pub(crate) fn list_kind(text: &str) -> Option<bool> {
     let t = text.trim_start();
     if t.starts_with(|c| BULLETS.contains(&c)) {
         return Some(false); // unordered
@@ -690,7 +695,7 @@ fn roman_section(text: &str) -> Option<u8> {
     while j < b.len() && b[j] == b' ' {
         j += 1;
     }
-    if j == i + 1 || !b.get(j).map_or(false, |c| (*c as char).is_alphabetic()) {
+    if j == i + 1 || !b.get(j).is_some_and(|c| (*c as char).is_alphabetic()) {
         return None;
     }
     Some(1)
@@ -890,13 +895,13 @@ fn looks_like_clause(trimmed: &str) -> bool {
 /// axis label can match a style without being a heading — so a `Style` verdict is only
 /// honoured when the line is positionally isolated (see `header_at`).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum HeadingKind {
+pub(crate) enum HeadingKind {
     Reliable,
     Style,
     RunIn,
 }
 
-fn detect_header(line: &Line, body: f32, profile: Option<&DocProfile>) -> Option<(u8, usize, HeadingKind)> {
+pub(crate) fn detect_header(line: &Line, body: f32, profile: Option<&DocProfile>) -> Option<(u8, usize, HeadingKind)> {
     let txt = line.text();
     let trimmed = txt.trim();
     if trimmed.is_empty() {
@@ -999,8 +1004,8 @@ fn detect_header(line: &Line, body: f32, profile: Option<&DocProfile>) -> Option
     //    inline math like "1 N".
     if words <= 12 && !looks_like_reference(trimmed) {
         if let Some(lvl) = numbered_level(trimmed).or_else(|| roman_section(trimmed)) {
-            let title = trimmed.splitn(2, char::is_whitespace).nth(1).unwrap_or("");
-            let title_upper = title.chars().find(|c| c.is_alphabetic()).map_or(false, |c| c.is_uppercase());
+            let title = trimmed.split_once(char::is_whitespace).map(|x| x.1).unwrap_or("");
+            let title_upper = title.chars().find(|c| c.is_alphabetic()).is_some_and(|c| c.is_uppercase());
             let alpha = title.chars().filter(|c| c.is_alphabetic()).count();
             // Footnotes ("2 We do not show halo … because …") carry a leading number
             // like a section, but are set SMALLER than body text; a real numbered
@@ -1222,203 +1227,6 @@ fn merge_heading_continuations(lines: &mut Vec<Line>, profile: &DocProfile) {
     }
 }
 
-/// "Figure 2 shows …", "Table 1 summarises …", "Fig. 3 plots …" — an in-text
-/// cross-reference, NOT a caption. The figure/table number is followed by a verb
-/// or pronoun (the sentence's predicate), whereas a real caption is followed by a
-/// descriptive title or a ':' / '.' separator. Such a reference must stay body
-/// prose, not become a phantom `<figure id=fig-N>` (which also duplicates the real
-/// figure's id).
-fn is_inline_xref(text: &str) -> bool {
-    let low = text.trim_start().to_lowercase();
-    let rest = ["figure", "fig.", "fig", "cuadro", "table", "tab.", "box"]
-        .iter()
-        .find_map(|p| low.strip_prefix(p));
-    let rest = match rest {
-        Some(r) => r.trim_start(),
-        None => return false,
-    };
-    // Must be followed by a NUMBER ("Figure 2 …"). Consume the whole number token
-    // incl. a letter suffix / sub-label ("4b", "S12", "3.2") so the predicate test
-    // sees what really follows the reference number.
-    if !rest.starts_with(|c: char| c.is_ascii_digit()) {
-        return false;
-    }
-    let after_num = rest.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c.is_ascii_alphabetic());
-    // A real CAPTION is introduced by ':' or a descriptive Title; an in-text REFERENCE
-    // keeps the number inside a sentence — followed by a comma ("Figure 1, the arrows
-    // …"), or (after an optional ')') by a sentence predicate ("Fig 4b) shows …",
-    // "Table 3 confirms …").
-    if after_num.trim_start().starts_with(',') {
-        return true;
-    }
-    let after = after_num.trim_start_matches([')', ' ']);
-    const PREDICATE: &[&str] = &[
-        "show", "summari", "present", "plot", "compar", "illustrat", "depict", "report",
-        "list", "give", "provide", "denote", "display", "demonstrat", "describe", "confirm",
-        "indicat", "suggest", "impl", "exhibit", "contain", "yield", "mark", "reveal",
-        "we ", "it ", "is ", "are ", "can ", "highlight", "visuali", "plots",
-    ];
-    PREDICATE.iter().any(|v| after.starts_with(v))
-}
-
-/// If a line is a figure/table caption ("Figure 3: …", "Fig. 2 …", "Table 1 …"),
-/// return (is_figure, number). Used to opportunistically anchor a caption to a
-/// figure/table region — never required for the region to be emitted.
-/// Parse a caption label: its kind (figure vs table), its FULL number token, and the
-/// remainder of the line after the number. The number grammar is
-/// `DIGITS ( ('.'|'-') DIGITS )* LETTER?` — so a hierarchical "6.2.1"/"0.1-1" or a
-/// sub-label "1A" is captured whole (a separator only between two digit groups; a single
-/// trailing letter only when not followed by another letter, so "1 Plot" keeps just "1").
-/// Prefixes: "Figure"/"Fig."/"Fig "(no dot)/"Table"/"Cuadro"(Spanish)/"Box ".
-fn caption_parts(text: &str) -> Option<(bool, String, &str)> {
-    let t = text.trim_start();
-    let low = t.to_lowercase();
-    let (is_fig, after) = if low.starts_with("figure") {
-        (true, &t[6..])
-    } else if low.starts_with("fig.") {
-        (true, &t[4..])
-    } else if low.starts_with("cuadro") {
-        (false, &t[6..])
-    } else if low.starts_with("table") {
-        (false, &t[5..])
-    } else if low.starts_with("fig ") || low.starts_with("fig\t") {
-        (true, &t[3..])
-    } else if low.starts_with("box ") || low.starts_with("box\t") {
-        (true, &t[3..])
-    } else {
-        return None;
-    };
-    let rest = after.trim_start();
-    let b = rest.as_bytes();
-    if b.is_empty() || !b[0].is_ascii_digit() {
-        return None;
-    }
-    let mut i = 0;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    while i + 1 < b.len() && (b[i] == b'.' || b[i] == b'-') && b[i + 1].is_ascii_digit() {
-        i += 1;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
-    }
-    if i < b.len() && b[i].is_ascii_alphabetic() && (i + 1 >= b.len() || !b[i + 1].is_ascii_alphabetic()) {
-        i += 1;
-    }
-    Some((is_fig, rest[..i].to_string(), &rest[i..]))
-}
-
-/// If a line is a figure/table caption, return (is_figure, full number).
-fn caption_label(text: &str) -> Option<(bool, String)> {
-    caption_parts(text).map(|(f, n, _)| (f, n))
-}
-
-/// A multi-page CONTINUATION marker ("Figure 5.—Continued", "Table 2 (continued)"): the
-/// label's tail, after separators, is ONLY a "continued" token. It must not be emitted as a
-/// new caption (it would duplicate the original figure's number). A real caption that merely
-/// begins "Figure 5. Continuation of the survey …" is NOT matched (the tail has more words).
-fn caption_is_continued(text: &str) -> bool {
-    match caption_parts(text) {
-        // Strip ANY non-alphanumeric edge chars so the separator is irrelevant — a dash,
-        // colon, dot, paren, or a mojibake C1 byte (reportlab/WinAnsi em-dash 0x97).
-        Some((_, _, tail)) => {
-            let core = tail.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'');
-            matches!(core.to_lowercase().as_str(), "continued" | "cont" | "cont'd")
-        }
-        None => false,
-    }
-}
-
-/// Does `text` END in a DOT-LEADER run (≥4 leader dots, tolerating spaces between them and
-/// an optional trailing page number)? This is the signature of a List-of-Figures / Table-of-
-/// Contents entry: "Overview of the system … . . . . . 95". A real caption never carries a
-/// 4+ leader-dot run.
-fn dotleader_tail(text: &str) -> bool {
-    // Drop a trailing page-number token (and the whitespace before it), then count the
-    // consecutive leader dots at the new end.
-    let mut tail = text.trim_end();
-    let without_pageno = tail.trim_end_matches(|c: char| c.is_ascii_digit());
-    if without_pageno.len() < tail.len() {
-        tail = without_pageno.trim_end();
-    }
-    let mut dots = 0usize;
-    for c in tail.chars().rev() {
-        match c {
-            '.' | '…' | '·' => dots += if c == '…' { 3 } else { 1 },
-            ' ' | '\t' => continue,
-            _ => break,
-        }
-    }
-    dots >= 4
-}
-
-/// A List-of-Figures / Table-of-Contents entry that merely LOOKS like a caption
-/// ("Figure 3.1: Overview …"), so it would otherwise emit an empty `<figure>` shell. Its
-/// dot-leader tail may sit on the caption's first line OR, when the title wraps, on a
-/// following continuation line — so scan the caption line plus a few tight continuation
-/// lines below it. Per-line signal only (no "List of Figures" heading gate needed).
-fn is_dotleader_toc(lines: &[Line], idx: usize) -> bool {
-    if caption_parts(&lines[idx].text()).is_none() {
-        return false; // only relevant for caption-shaped lines
-    }
-    let base_sz = lines[idx].size.max(1.0);
-    let mut prev_y = lines[idx].y;
-    for k in idx..(idx + 4).min(lines.len()) {
-        if k > idx {
-            // stop if the next line isn't a tight continuation just below this one
-            let dy = prev_y - lines[k].y;
-            if dy < 0.0 || dy > base_sz * 2.0 {
-                break;
-            }
-        }
-        if dotleader_tail(&lines[k].text()) {
-            return true;
-        }
-        prev_y = lines[k].y;
-    }
-    false
-}
-
-/// Gather a (possibly multi-line) caption block starting at line `idx`: the
-/// caption sentence plus its continuation lines, stopping at an indented new
-/// paragraph, a vertical gap, a heading/list, or another caption. Tiny stray
-/// superscripts (footnote markers) are skipped, not treated as a break. Returns
-/// the rendered caption HTML and the line indices consumed.
-fn gather_caption(lines: &[Line], idx: usize, body: f32, profile: &DocProfile) -> (String, Vec<usize>) {
-    let base_x = lines[idx].x0;
-    let base_sz = lines[idx].size;
-    let mut html = render_runs(&lines[idx].runs);
-    let mut used = vec![idx];
-    let mut prev_y = lines[idx].y;
-    let mut k = idx + 1;
-    while k < lines.len() && used.len() < 14 {
-        let l = &lines[k];
-        // Skip a tiny stray superscript (e.g. a footnote marker) interleaved in
-        // the caption's y-range without ending the caption.
-        if l.size < base_sz * 0.75 && l.text().trim().chars().count() <= 3 {
-            used.push(k);
-            k += 1;
-            continue;
-        }
-        let dy = prev_y - l.y; // reading order is top->down: a small positive step
-        if dy < -l.size || dy > l.size * 1.8 {
-            break; // new column/region, or a paragraph-sized gap
-        }
-        if l.x0 - base_x > l.size * 0.6 {
-            break; // indented => a new paragraph, not caption continuation
-        }
-        if detect_header(l, body, Some(profile)).is_some() || list_kind(&l.text()).is_some() || caption_label(&l.text()).is_some() {
-            break;
-        }
-        append_piece(&mut html, &render_runs(&l.runs));
-        used.push(k);
-        prev_y = l.y;
-        k += 1;
-    }
-    (html, used)
-}
-
 /// Render a positioned table. A caption (when present) is emitted as the table's
 /// own `<caption>` and the anchor id goes on the `<table>` — a table is tabular
 /// data, not a figure, so it is NOT wrapped in `<figure>`.
@@ -1467,7 +1275,7 @@ fn table_html(t: &PosTable, cap: Option<(&str, &str, bool)>) -> String {
 
 /// Mark which lines belong to a page-bottom footnote block (see emit_lines). A run of
 /// >=2 consecutive footnote-sized lines (`size < body*0.86`) confined to the bottom ~45%
-/// of the content, capped at 12 lines so a small-font reference list isn't swallowed.
+/// > of the content, capped at 12 lines so a small-font reference list isn't swallowed.
 fn footnote_region_mask(lines: &[&Line], body: f32) -> Vec<bool> {
     let mut mark = vec![false; lines.len()];
     if lines.len() < 2 {
@@ -1773,7 +1581,7 @@ fn first_visible(s: &str) -> Option<char> {
     None
 }
 
-fn append_piece(para: &mut String, piece: &str) {
+pub(crate) fn append_piece(para: &mut String, piece: &str) {
     if para.is_empty() {
         *para = piece.to_string();
         return;
@@ -1863,7 +1671,7 @@ fn parse_affiliation(t: &str) -> Option<(String, String)> {
 fn is_lone_marker(t: &str) -> bool {
     let t = t.trim();
     let n = t.chars().count();
-    (n >= 1 && n <= 3 && t.chars().all(|c| c.is_ascii_digit()))
+    ((1..=3).contains(&n) && t.chars().all(|c| c.is_ascii_digit()))
         || (n == 1 && FOOTNOTE_MARKERS.contains(t.chars().next().unwrap()))
 }
 
@@ -2050,7 +1858,7 @@ fn detect_front_matter(lines: &[Line], body: f32) -> (FrontMatter, HashSet<usize
             if is_email(tt) {
                 continue;
             }
-            if tt.chars().next().map_or(false, |c| FOOTNOTE_MARKERS.contains(c)) {
+            if tt.chars().next().is_some_and(|c| FOOTNOTE_MARKERS.contains(c)) {
                 if let Some((key, org)) = parse_affiliation(tt) {
                     affs.push((key, org));
                     consumed.insert(i);
@@ -2237,7 +2045,7 @@ fn find_document_title(lines: &[Line], body: f32) -> Option<(String, HashSet<usi
     let title_ok = |l: &Line| title_core(l) && prominent(l);
     let mut order: Vec<usize> = (0..lines.len()).collect();
     order.sort_by(|&a, &b| lines[b].y.partial_cmp(&lines[a].y).unwrap_or(std::cmp::Ordering::Equal));
-    let cap_start = |l: &Line| l.text().trim().chars().next().map_or(false, |c| !c.is_lowercase());
+    let cap_start = |l: &Line| l.text().trim().chars().next().is_some_and(|c| !c.is_lowercase());
     let is_prose = |t: &str| {
         let words: Vec<&str> = t.split_whitespace().collect();
         if words.len() <= 12 {
@@ -2312,7 +2120,7 @@ fn find_title_sized(lines: &[Line], body: f32) -> Option<(String, HashSet<usize>
         if !(t.contains(',') || t.contains(" and ") || t.contains('&')) {
             return false;
         }
-        let words: Vec<&str> = t.split_whitespace().filter(|w| w.chars().next().map_or(false, |c| c.is_alphabetic())).collect();
+        let words: Vec<&str> = t.split_whitespace().filter(|w| w.chars().next().is_some_and(|c| c.is_alphabetic())).collect();
         if words.len() < 2 {
             return false;
         }
@@ -2850,7 +2658,7 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
                     }
                     let e = edge(v.y_bottom, v.y_top);
                     let x_overlap = v.x_right > l.x0 - body && v.x_left < l.x1 + body;
-                    if e <= gap && x_overlap && best.map_or(true, |(_, be)| e < be) {
+                    if e <= gap && x_overlap && best.is_none_or(|(_, be)| e < be) {
                         best = Some((j, e));
                     }
                 }
@@ -3020,7 +2828,7 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
                     // Drop multi-page "Figure N—Continued" markers — re-emitting them would
                     // duplicate the original figure's id and pollute the output with empty
                     // continuation captions.
-                    (!is_ref_continuation(idx) && !is_inline_xref(&t) && !caption_is_continued(&t) && !is_dotleader_toc(&lines, idx)).then(|| (idx, f, n))
+                    (!is_ref_continuation(idx) && !is_inline_xref(&t) && !caption_is_continued(&t) && !is_dotleader_toc(&lines, idx)).then_some((idx, f, n))
                 })
             })
             .collect();
@@ -3100,7 +2908,7 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
                 // recoverable small vectors are already handled upstream (dot-leader
                 // suppression + caption-aware weak-vector promotion), so what remains here is
                 // a genuine figure whose graphic we could not extract.
-                let nid = num_id(&num);
+                let nid = num_id(num);
                 let block = if is_fig {
                     format!("<figure id=\"fig-{nid}\"><figcaption>{html}</figcaption></figure>")
                 } else {
@@ -3232,7 +3040,7 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
                         let href = format!("\u{0}{idx}\u{0}");
                         let im = &images[*j];
                         let vi = img_overlays[*j][0];
-                        let svg = vectors[vi].composite_svg(&[(&href, (im.x_left, im.x_right, im.y_bottom, im.y_top))]);
+                        let svg = vectors[vi].composite_svg(&[(&href, (im.x_left, im.x_right, im.y_bottom, im.y_top), im.ctm)]);
                         // Caption may have attached to the image OR its overlay vector.
                         let cap = img_cap[*j].as_ref().or(svg_cap[vi].as_ref());
                         match cap {
@@ -3290,16 +3098,16 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
                     // are a raster within the axes): composite into ONE `<svg>` with each
                     // raster embedded as an `<image>` in the figure's coordinate space.
                     let svg = if !svg_rasters[*j].is_empty() {
-                        let rasters: Vec<(String, (f32, f32, f32, f32))> = svg_rasters[*j]
+                        let rasters: Vec<(String, (f32, f32, f32, f32), Option<[f32; 6]>)> = svg_rasters[*j]
                             .iter()
                             .map(|&ii| {
                                 let idx = img_uris.len();
                                 img_uris.push(std::mem::take(&mut images[ii].uri));
                                 let im = &images[ii];
-                                (format!("\u{0}{idx}\u{0}"), (im.x_left, im.x_right, im.y_bottom, im.y_top))
+                                (format!("\u{0}{idx}\u{0}"), (im.x_left, im.x_right, im.y_bottom, im.y_top), im.ctm)
                             })
                             .collect();
-                        let refs: Vec<(&str, (f32, f32, f32, f32))> = rasters.iter().map(|(h, r)| (h.as_str(), *r)).collect();
+                        let refs: Vec<(&str, (f32, f32, f32, f32), Option<[f32; 6]>)> = rasters.iter().map(|(h, r, m)| (h.as_str(), *r, *m)).collect();
                         vectors[*j].composite_svg(&refs)
                     } else {
                         vectors[*j].svg()
@@ -3371,846 +3179,6 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
         eprintln!("[DPDF_PROFILE] {} pages, total {:.1}ms", page_spans.len(), t0.elapsed().as_secs_f64() * 1e3);
     }
     result
-}
-
-/// The document outline parsed from the auto-TOC: `(level, title, page, anchor-id)`
-/// per heading, in document order. Drives section navigation/extraction.
-pub fn toc(html: &str) -> Vec<(u8, String, u32, String)> {
-    let mut out = Vec::new();
-    let nav = match (html.find("<nav>"), html.find("</nav>")) {
-        (Some(a), Some(b)) if b > a => &html[a..b],
-        _ => return out,
-    };
-    let field = |h: &str, key: &str| -> Option<String> {
-        let s = h.find(key)? + key.len();
-        let e = h[s..].find('"')?;
-        Some(h[s..s + e].to_string())
-    };
-    for li in nav.split("<li ").skip(1) {
-        let level = field(li, "data-level=\"").and_then(|s| s.parse().ok()).unwrap_or(0u8);
-        let page = field(li, "data-page=\"").and_then(|s| s.parse().ok()).unwrap_or(0u32);
-        let id = field(li, "href=\"#").unwrap_or_default();
-        let after_li = li.splitn(2, '>').nth(1).unwrap_or(""); // <a …>Label</a></li>
-        let after_a = after_li.splitn(2, '>').nth(1).unwrap_or(""); // Label</a>…
-        let label = strip_inline(after_a.split("</a>").next().unwrap_or(""));
-        if !id.is_empty() {
-            out.push((level, label.trim().to_string(), page, id));
-        }
-    }
-    out
-}
-
-/// The HTML of one section. `name` matches the `sec-…` slug, an id prefix, or a
-/// case-insensitive title substring (so `section("abstract")` works); None if no match.
-///
-/// In **section mode** the id sits on a `<section>` wrapper, so the whole balanced
-/// `<section>…</section>` element (including any nested subsections) is returned. In
-/// **page mode** the id sits on the heading, so the heading plus content up to the next
-/// same-or-higher heading is returned.
-pub fn section(html: &str, name: &str) -> Option<String> {
-    let entries = toc(html);
-    let nl = name.to_lowercase();
-    let want = {
-        let s = format!("sec-{}", slug(&nl));
-        s.trim_matches('-').to_string()
-    };
-    let idx = entries
-        .iter()
-        .position(|(_, t, _, i)| *i == want || i.starts_with(&want) || t.to_lowercase().contains(&nl))?;
-    let id = &entries[idx].3;
-    // Section mode: the id is on a <section> wrapper — return that balanced element.
-    if let Some(open) = html.find(&format!("<section id=\"{id}\">")) {
-        return Some(balanced_section(html, open));
-    }
-    // Page mode: the id is on the heading — slice to the next same-or-higher heading.
-    let level = entries[idx].0;
-    let start = {
-        let p = html.find(&format!("id=\"{id}\""))?;
-        html[..p].rfind("<h")?
-    };
-    let end = entries[idx + 1..]
-        .iter()
-        .find(|(l, _, _, _)| *l <= level)
-        .and_then(|(_, _, _, nid)| html.find(&format!("id=\"{nid}\"")).map(|p| html[..p].rfind("<h").unwrap_or(p)))
-        .unwrap_or_else(|| html.find("</body>").unwrap_or(html.len()));
-    Some(html[start..end].trim().to_string())
-}
-
-/// From the byte offset of a `<section …>` open tag, return the full balanced
-/// `<section>…</section>` element, accounting for nested sections.
-fn balanced_section(html: &str, open: usize) -> String {
-    let b = html.as_bytes();
-    let mut depth = 0i32;
-    let mut i = open;
-    while i < b.len() {
-        if b[i..].starts_with(b"<section") {
-            depth += 1;
-            i += "<section".len();
-        } else if b[i..].starts_with(b"</section>") {
-            depth -= 1;
-            i += "</section>".len();
-            if depth == 0 {
-                return html[open..i].trim().to_string();
-            }
-        } else {
-            i += 1;
-        }
-    }
-    html[open..].trim().to_string()
-}
-
-/// Plain text of a fragment of inline HTML (drop tags, unescape the basic entities).
-fn strip_inline(html: &str) -> String {
-    let mut s = String::with_capacity(html.len());
-    let mut intag = false;
-    for c in html.chars() {
-        match c {
-            '<' => intag = true,
-            '>' => intag = false,
-            _ if !intag => s.push(c),
-            _ => {}
-        }
-    }
-    s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'")
-}
-
-/// Give every heading a stable `sec-*` anchor id and prepend an auto table of
-/// contents. Page is the primary organiser (headings stay inside their
-/// `<section data-page>`), so each TOC entry carries its page. A FLAT `<ol>` (level
-/// recorded as `data-level`, not nested sub-lists) keeps the outline queryable and
-/// avoids spurious single-item sub-lists. Runs last — after `dedup_ids` — so the ids
-/// it mints are deduped against the final id set.
-fn build_toc(html: String, include_nav: bool) -> String {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    {
-        let b = html.as_bytes();
-        let mut i = 0;
-        while i + 4 < b.len() {
-            if b[i..].starts_with(b"id=\"") {
-                let s = i + 4;
-                let mut e = s;
-                while e < b.len() && b[e] != b'"' {
-                    e += 1;
-                }
-                seen.insert(html[s..e].to_string());
-                i = e;
-            } else {
-                i += 1;
-            }
-        }
-    }
-    let b = html.as_bytes();
-    let mut out = String::with_capacity(html.len() + 512);
-    let mut entries: Vec<(u8, String, u32, String)> = Vec::new(); // level, label, page, id
-    let mut page = 0u32;
-    let mut i = 0usize;
-    let mut copied = 0usize;
-    // Skip the leading front-matter <header>: the title <h1> inside it gets no sec- id.
-    let header_end = html
-        .find("<body>\n")
-        .and_then(|p| html[p..].find("</header>").map(|q| p + q + "</header>".len()))
-        .unwrap_or(0);
-    while i < b.len() {
-        if b[i..].starts_with(b"data-page=\"") {
-            let s = i + 11;
-            let mut e = s;
-            while e < b.len() && b[e] != b'"' {
-                e += 1;
-            }
-            page = html[s..e].parse().unwrap_or(page);
-            i = e;
-            continue;
-        }
-        // A heading open tag `<hL>` (L in 1..=6) — `b[i]=='<'` so `i` is a char boundary.
-        if i >= header_end && b[i] == b'<' && i + 3 < b.len() && b[i + 1] == b'h' && (b'1'..=b'6').contains(&b[i + 2]) && b[i + 3] == b'>' {
-            let level = b[i + 2] - b'0';
-            let close = format!("</h{level}>");
-            if let Some(rel) = html[i..].find(&close) {
-                let inner = &html[i + 4..i + rel];
-                let label = strip_inline(inner);
-                let label = label.trim();
-                if !label.is_empty() {
-                    out.push_str(&html[copied..i]);
-                    let base = {
-                        let s = format!("sec-{}", slug(&label.to_lowercase()));
-                        s.trim_matches('-').to_string()
-                    };
-                    let mut id = base.clone();
-                    let mut k = 2;
-                    while seen.contains(&id) {
-                        id = format!("{base}-{k}");
-                        k += 1;
-                    }
-                    seen.insert(id.clone());
-                    entries.push((level, label.to_string(), page, id.clone()));
-                    out.push_str(&format!("<h{level} id=\"{id}\">{inner}{close}"));
-                    i += rel + close.len();
-                    copied = i;
-                    continue;
-                }
-            }
-        }
-        i += 1;
-    }
-    out.push_str(&html[copied..]);
-    // The heading-id assignment above always runs (anchors/`section()` depend on it);
-    // only the visible `<nav>` is gated. `entries` empty ⇒ nothing to outline.
-    if entries.is_empty() || !include_nav {
-        return out;
-    }
-    // Nested TOC: title (h1) and sections (h2) at the top level; subsections (h3)
-    // indented under their section; deeper levels (h4+) omitted (too fine for an
-    // outline). A `<ul>` (the outline order is positional, not enumerated). Each
-    // <li> keeps data-level/data-page so the toc()/section() API still reads the
-    // true heading level and page.
-    insert_nav(out, &build_nav(&entries, true))
-}
-
-/// Build the `<nav><ul>…</ul></nav>` outline from heading entries. Title (level 1) and
-/// sections (level 2) sit at the top level; subsections (level 3) nest under their
-/// section; deeper levels are omitted. Each `<li>` carries `data-level` (and `data-page`
-/// when `with_pages`) so the `toc()`/`section()` API still reads the true level/page.
-fn build_nav(entries: &[(u8, String, u32, String)], with_pages: bool) -> String {
-    let mut nav = String::from("<nav><ul>");
-    let mut li_open = false; // a top-level <li> awaiting its </li>
-    let mut sub_open = false; // a nested <ul> (h3 children) is open
-    for (level, label, pg, id) in entries {
-        if *level > 3 {
-            continue;
-        }
-        // An empty id (an outline entry with no matching heading) renders as plain text
-        // rather than a dead `#` link.
-        let a = if id.is_empty() {
-            esc(label)
-        } else {
-            format!("<a href=\"#{id}\">{}</a>", esc(label))
-        };
-        let li = if with_pages {
-            format!("<li data-level=\"{level}\" data-page=\"{pg}\">{a}")
-        } else {
-            format!("<li data-level=\"{level}\">{a}")
-        };
-        if *level <= 2 {
-            if sub_open {
-                nav.push_str("</ul>");
-                sub_open = false;
-            }
-            if li_open {
-                nav.push_str("</li>");
-            }
-            nav.push_str(&li);
-            li_open = true;
-        } else if li_open {
-            // h3 → nest under the current section
-            if !sub_open {
-                nav.push_str("<ul>");
-                sub_open = true;
-            }
-            nav.push_str(&li);
-            nav.push_str("</li>");
-        } else {
-            // a stray h3 before any section: keep it at top level
-            nav.push_str(&li);
-            nav.push_str("</li>");
-        }
-    }
-    if sub_open {
-        nav.push_str("</ul>");
-    }
-    if li_open {
-        nav.push_str("</li>");
-    }
-    nav.push_str("</ul></nav>\n");
-    nav
-}
-
-/// Generic single pass over `\0<idx>\0` sentinels: each is replaced by `repl(idx)`'s
-/// output (the closure pushes directly into the buffer). Non-sentinel text is copied
-/// verbatim. NUL never occurs in real text/base64, so the markers are unambiguous.
-fn rewrite_sentinels(html: &str, extra: usize, mut repl: impl FnMut(usize, &mut String)) -> String {
-    let b = html.as_bytes();
-    let mut out = String::with_capacity(html.len() + extra);
-    let mut i = 0;
-    let mut last = 0;
-    while i < b.len() {
-        if b[i] == 0 {
-            let start = i;
-            let mut j = i + 1;
-            let mut idx = 0usize;
-            let mut any = false;
-            while j < b.len() && b[j].is_ascii_digit() {
-                idx = idx * 10 + (b[j] - b'0') as usize;
-                j += 1;
-                any = true;
-            }
-            if any && j < b.len() && b[j] == 0 {
-                out.push_str(&html[last..start]);
-                repl(idx, &mut out);
-                i = j + 1;
-                last = i;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out.push_str(&html[last..]);
-    out
-}
-
-/// Append one page's fragment to `out`, shifting its page-local `\0<idx>\0` image
-/// sentinels by `offset` so they index into the document-wide URI list built at merge.
-fn append_with_img_offset(out: &mut String, frag: &str, offset: usize) {
-    if offset == 0 || !frag.as_bytes().contains(&0) {
-        out.push_str(frag); // first page (local==global), or no image sentinels to shift
-        return;
-    }
-    out.push_str(&rewrite_sentinels(frag, frag.len() / 8, |idx, o| {
-        o.push('\u{0}');
-        o.push_str(&(idx + offset).to_string());
-        o.push('\u{0}');
-    }));
-}
-
-/// Resolve the deferred image sentinels: inline mode splices the base64 data URI back
-/// in; placeholder mode replaces the sentinel with the 1-based `<image N>` number.
-fn substitute_images(html: String, uris: &[String], inline: bool) -> String {
-    if uris.is_empty() {
-        return html;
-    }
-    let extra: usize = uris.iter().map(|u| u.len()).sum::<usize>().max(uris.len() * 4);
-    rewrite_sentinels(&html, extra, |idx, o| {
-        if inline {
-            if let Some(u) = uris.get(idx) {
-                o.push_str(u);
-            }
-        } else {
-            o.push_str(&(idx + 1).to_string());
-        }
-    })
-}
-
-/// Whitespace/punctuation-insensitive title key (lowercased alphanumerics only). Lets a
-/// PDF bookmark title match the detected heading even when the bookmark has cosmetic
-/// defects (missing spaces, smart quotes) — the structure comes from the outline, the
-/// clean title + working anchor from the matched heading.
-fn title_key(s: &str) -> String {
-    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
-}
-
-/// Replace the generated `<nav>` with one built from the PDF's own outline (bookmarks).
-/// The outline supplies the TRUE TOC structure; each entry is matched to a detected
-/// heading (exact normalized title, else the heading title being a prefix of the
-/// bookmark's — handles a bookmark like "…on and around…" vs a heading wrapped to "…on")
-/// so it links to that heading's real `#sec-…` anchor. Unmatched entries appear as plain
-/// text (no dead link). No `#page-N` is used, so this works the same in both modes and
-/// doesn't re-introduce page identity. A no-op if there's no `<nav>` to replace.
-fn nav_from_outline(html: String, entries: &[links::OutlineEntry], _mode: Mode) -> String {
-    let detected = toc(&html);
-    let keyed: Vec<(String, String)> = detected.iter().map(|(_l, t, _p, id)| (title_key(t), id.clone())).collect();
-    let nav_entries: Vec<(u8, String, u32, String)> = entries
-        .iter()
-        .map(|e| {
-            let level = (e.level + 1).min(6);
-            let ek = title_key(&e.title);
-            // exact match first, then a heading key that is a (≥8-char) prefix of the
-            // bookmark key — a heading whose title wrapped and got truncated.
-            let id = keyed
-                .iter()
-                .find(|(k, _)| *k == ek)
-                .or_else(|| keyed.iter().find(|(k, _)| k.len() >= 8 && ek.starts_with(k.as_str())))
-                .map(|(_, id)| id.clone())
-                .unwrap_or_default();
-            (level, e.title.clone(), e.page, id)
-        })
-        .collect();
-    let nav = build_nav(&nav_entries, true); // outline entries always carry a page
-    match (html.find("<nav>"), html.find("</nav>")) {
-        (Some(a), Some(b)) if b > a => {
-            let end = b + "</nav>".len();
-            let mut out = String::with_capacity(html.len() + nav.len());
-            out.push_str(&html[..a]);
-            out.push_str(nav.trim_end_matches('\n'));
-            out.push_str(&html[end..]);
-            out
-        }
-        _ => html,
-    }
-}
-
-/// Insert a `<nav>` block immediately after `<body>\n` (a no-op if there is no body tag).
-fn insert_nav(html: String, nav: &str) -> String {
-    match html.find("<body>\n") {
-        Some(p) => {
-            let at = p + "<body>\n".len();
-            let mut res = String::with_capacity(html.len() + nav.len());
-            res.push_str(&html[..at]);
-            res.push_str(nav);
-            res.push_str(&html[at..]);
-            res
-        }
-        None => html,
-    }
-}
-
-/// Section-mode assembly: regroup the flat content stream into nested `<section
-/// id="sec-…">` wrappers — one per heading, with HTML-outline nesting (a heading at
-/// level L closes every open section of level ≥ L, then opens a new one). The `sec-…`
-/// id lives on the `<section>` wrapper; the inner `<hN>` is left bare. Optionally
-/// prepends a pageless `<nav>` outline. Page identity is not used here at all.
-fn build_sections(html: String, include_nav: bool) -> String {
-    // Existing ids (figures/tables/named-destination anchors) — section ids dedupe
-    // against them so a `sec-…` slug can never collide with one already in the document.
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    {
-        let b = html.as_bytes();
-        let mut i = 0;
-        while i + 4 < b.len() {
-            if b[i..].starts_with(b"id=\"") {
-                let s = i + 4;
-                let mut e = s;
-                while e < b.len() && b[e] != b'"' {
-                    e += 1;
-                }
-                seen.insert(html[s..e].to_string());
-                i = e;
-            } else {
-                i += 1;
-            }
-        }
-    }
-    // Walk the body, emitting `<section>` open/close around heading-delimited runs.
-    let b = html.as_bytes();
-    let mut out = String::with_capacity(html.len() + 512);
-    let mut entries: Vec<(u8, String, u32, String)> = Vec::new(); // level, label, 0, id
-    let mut open: Vec<u8> = Vec::new(); // stack of open section levels
-    let mut i = 0usize;
-    let mut copied = 0usize;
-    let body_start = html.find("<body>\n").map(|p| p + "<body>\n".len()).unwrap_or(0);
-    // Skip the leading front-matter <header> so the title <h1> inside it is neither
-    // wrapped in a <section> nor minted a sec- id.
-    let header_end = html[body_start..]
-        .find("</header>")
-        .map(|p| body_start + p + "</header>".len())
-        .unwrap_or(body_start);
-    while i < b.len() {
-        // A heading open tag `<hL>` (L in 1..=6). Only headings within <body> matter.
-        if i >= header_end
-            && b[i] == b'<'
-            && i + 3 < b.len()
-            && b[i + 1] == b'h'
-            && (b'1'..=b'6').contains(&b[i + 2])
-            && b[i + 3] == b'>'
-        {
-            let level = b[i + 2] - b'0';
-            let close = format!("</h{level}>");
-            if let Some(rel) = html[i..].find(&close) {
-                let inner = &html[i + 4..i + rel];
-                let label = strip_inline(inner);
-                let label = label.trim();
-                if !label.is_empty() {
-                    // Flush content up to this heading, then close deeper/sibling sections.
-                    out.push_str(&html[copied..i]);
-                    while open.last().map_or(false, |&l| l >= level) {
-                        out.push_str("</section>");
-                        open.pop();
-                    }
-                    let base = {
-                        let s = format!("sec-{}", slug(&label.to_lowercase()));
-                        s.trim_matches('-').to_string()
-                    };
-                    let mut id = base.clone();
-                    let mut k = 2;
-                    while seen.contains(&id) {
-                        id = format!("{base}-{k}");
-                        k += 1;
-                    }
-                    seen.insert(id.clone());
-                    entries.push((level, label.to_string(), 0, id.clone()));
-                    out.push_str(&format!("<section id=\"{id}\">"));
-                    open.push(level);
-                    copied = i; // the bare heading itself is copied with the next run
-                    i += rel + close.len();
-                    continue;
-                }
-            }
-        }
-        // Close all open sections right before </body> so nothing leaks outside the body.
-        if b[i..].starts_with(b"</body>") {
-            out.push_str(&html[copied..i]);
-            while open.pop().is_some() {
-                out.push_str("</section>");
-            }
-            copied = i;
-            i += "</body>".len();
-            continue;
-        }
-        i += 1;
-    }
-    out.push_str(&html[copied..]);
-    if entries.is_empty() || !include_nav {
-        return out;
-    }
-    insert_nav(out, &build_nav(&entries, false))
-}
-
-/// Merge a graphic-only `<figure>` immediately adjacent to a caption-only `<figure>`
-/// (in either order) into one — the literal "graphic and caption split into two
-/// figures" defect, resolved regardless of why caption-anchoring missed the pair.
-fn merge_adjacent_figures(html: &str) -> String {
-    fn take_figure(s: &str) -> Option<(&str, usize)> {
-        if !s.starts_with("<figure") {
-            return None;
-        }
-        s.find("</figure>").map(|e| (&s[..e + 9], e + 9))
-    }
-    // The opening tag attributes (after "<figure", before '>') and inner content.
-    fn parts(fig: &str) -> (&str, &str) {
-        let open_end = fig.find('>').map(|i| i + 1).unwrap_or(0);
-        let attrs = fig["<figure".len()..open_end.saturating_sub(1)].trim();
-        let inner = &fig[open_end..fig.len() - 9];
-        (attrs, inner)
-    }
-    let is_graphic = |f: &str| f.contains("<img") || f.contains("<svg");
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    while !rest.is_empty() {
-        if let Some((f1, l1)) = take_figure(rest) {
-            let tail = rest[l1..].trim_start();
-            if let Some((f2, l2)) = take_figure(tail) {
-                let (g1, c1) = (is_graphic(f1), f1.contains("<figcaption"));
-                let (g2, c2) = (is_graphic(f2), f2.contains("<figcaption"));
-                // one is graphic-only, the other caption-only → merge graphic + caption
-                let pair = (g1 && !c1 && c2 && !g2) || (c1 && !g1 && g2 && !c2);
-                if pair {
-                    let (graphic, caption) = if g1 { (f1, f2) } else { (f2, f1) };
-                    let (gattr, ginner) = parts(graphic);
-                    let (cattr, cinner) = parts(caption);
-                    let attr = if !cattr.is_empty() { cattr } else { gattr }; // keep the id (on the caption figure)
-                    out.push_str("<figure");
-                    if !attr.is_empty() {
-                        out.push(' ');
-                        out.push_str(attr);
-                    }
-                    out.push('>');
-                    out.push_str(ginner);
-                    out.push_str(cinner);
-                    out.push_str("</figure>");
-                    let consumed = (rest.len() - tail.len()) + l2;
-                    rest = &rest[consumed..];
-                    continue;
-                }
-            }
-            out.push_str(f1);
-            rest = &rest[l1..];
-            continue;
-        }
-        let c = rest.chars().next().unwrap();
-        out.push(c);
-        rest = &rest[c.len_utf8()..];
-    }
-    out
-}
-
-fn strip_tags_inline(s: &str) -> String {
-    let mut o = String::new();
-    let mut in_tag = false;
-    for c in s.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => o.push(c),
-            _ => {}
-        }
-    }
-    o
-}
-
-/// A `<p>` whose content is a fragment of a DISPLAY EQUATION rather than prose: a
-/// lone operator/number/punctuation, an equation number "(N)", a single symbol, or
-/// a short run with math operators/Greek and ≤1 real word.
-fn is_math_fragment(inner: &str) -> bool {
-    let t = strip_tags_inline(inner);
-    let t = t.trim();
-    let n = t.chars().count();
-    if t.is_empty() || n > 60 {
-        return false;
-    }
-    let alpha_words = t.split(|c: char| !c.is_alphabetic()).filter(|w| w.chars().count() >= 2).count();
-    if alpha_words > 1 {
-        return false; // real prose
-    }
-    const MATH: &str = "=+-−–×÷·≤≥≠≈∝∫∑∏√∈∉⊂⊆∂∇∞()[]{}|/^_<>";
-    const GREEK: &str = "αβγδεζηθικλμνξπρστυϕφχψωΓΔΘΛΞΠΣΦΨΩ";
-    t.chars().any(|c| MATH.contains(c) || GREEK.contains(c)) || n <= 2 || t.chars().all(|c| !c.is_alphabetic())
-}
-
-/// Rejoin a display equation shattered into per-token `<p>`s: merge a RUN of ≥2
-/// consecutive math-fragment `<p>`s (only whitespace between) into one `<p>` so the
-/// equation is a single block and stray operators/numbers/commas stop being orphan
-/// paragraphs. A lone fragment is left alone.
-fn merge_math_fragments(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    while !rest.is_empty() {
-        if rest.starts_with("<p>") {
-            let mut frags: Vec<&str> = Vec::new();
-            let mut cursor = rest;
-            loop {
-                let c2 = cursor.trim_start();
-                if let Some(body) = c2.strip_prefix("<p>") {
-                    if let Some(rel) = body.find("</p>") {
-                        let inner = &body[..rel];
-                        if is_math_fragment(inner) {
-                            frags.push(inner);
-                            let adv = (cursor.len() - c2.len()) + 3 + rel + 4;
-                            cursor = &cursor[adv..];
-                            continue;
-                        }
-                    }
-                }
-                break;
-            }
-            if frags.len() >= 2 {
-                out.push_str("<p>");
-                out.push_str(&frags.join(" "));
-                out.push_str("</p>");
-                rest = cursor;
-                continue;
-            }
-        }
-        let ch = rest.chars().next().unwrap();
-        out.push(ch);
-        rest = &rest[ch.len_utf8()..];
-    }
-    out
-}
-
-/// Whether a `<p>` between two same-type lists INTRODUCES the following list (its text
-/// ends with ':', e.g. "The second procedure has these steps:"). Such a line is a real
-/// separator — the next list is its own list, not a fragment of the previous one — so
-/// the two must not be fused. A genuine wrapped continuation of the last item never ends
-/// with a colon.
-fn introduces_list(inner: &str) -> bool {
-    let mut t = String::new();
-    let mut depth = 0i32;
-    for ch in inner.chars() {
-        match ch {
-            '<' => depth += 1,
-            '>' => depth = (depth - 1).max(0),
-            _ if depth == 0 => t.push(ch),
-            _ => {}
-        }
-    }
-    t.trim_end().ends_with(':')
-}
-
-/// Rejoin a list fragmented into single-item lists: `…A</li></ul> <p>cont</p>… <ul><li>B…`
-/// becomes `…A cont…</li><li>B…`. The intervening `<p>`s are the wrapped continuation
-/// of item A that the line loop couldn't attach (flush-left wrap, column break). Only
-/// fires for same-type adjacent lists with a few short continuation paragraphs between,
-/// and never across a `<p>` that introduces the next list (ends with ':') — so two real
-/// lists, the second introduced by a lead-in line, are left separate.
-fn merge_fragmented_lists(html: &str) -> String {
-    let mut s = html.to_string();
-    for tag in ["ul", "ol"] {
-        let close = format!("</li></{tag}>");
-        let open_li = format!("<{tag}><li>");
-        let mut out = String::with_capacity(s.len());
-        let mut i = 0;
-        while i < s.len() {
-            if s[i..].starts_with(&close) {
-                // After the close: optional whitespace + up to 3 short <p>…</p> blocks
-                // (the wrapped continuation), then the SAME-type list reopening.
-                let mut k = i + close.len();
-                let mut conts: Vec<&str> = Vec::new();
-                let mut ok = true;
-                loop {
-                    while k < s.len() && s.as_bytes()[k].is_ascii_whitespace() {
-                        k += 1;
-                    }
-                    if s[k..].starts_with(&open_li) {
-                        break;
-                    }
-                    if conts.len() < 3 {
-                        if let Some(body) = s[k..].strip_prefix("<p>") {
-                            if let Some(rel) = body.find("</p>") {
-                                // A lead-in line ("… steps:") separates two real lists;
-                                // never fold across it.
-                                if rel < 400 && !introduces_list(&body[..rel]) {
-                                    conts.push(&body[..rel]);
-                                    k += 3 + rel + 4;
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                    ok = false;
-                    break;
-                }
-                if ok && s[k..].starts_with(&open_li) {
-                    out.push(' ');
-                    out.push_str(&conts.join(" "));
-                    out.push_str("</li><li>");
-                    i = k + open_li.len();
-                    continue;
-                }
-            }
-            let ch = s[i..].chars().next().unwrap();
-            out.push(ch);
-            i += ch.len_utf8();
-        }
-        s = out;
-    }
-    s
-}
-
-/// Guarantee unique `id=` attributes: the first use of an id keeps it, later uses
-/// are suffixed ("tab-3" → "tab-3-2"). The inline-cross-reference guard removes the
-/// common cause (phantom figures), but genuine same-number elements (sub-tables on
-/// different pages) can still collide — an HTML document must not repeat an id.
-fn dedup_ids(html: &str) -> String {
-    let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    while let Some(pos) = rest.find("id=\"") {
-        out.push_str(&rest[..pos + 4]);
-        rest = &rest[pos + 4..];
-        let end = match rest.find('"') {
-            Some(e) => e,
-            None => break,
-        };
-        let id = &rest[..end];
-        let n = seen.entry(id.to_string()).or_insert(0);
-        *n += 1;
-        if *n == 1 {
-            out.push_str(id);
-        } else {
-            out.push_str(&format!("{id}-{n}"));
-        }
-        out.push('"');
-        rest = &rest[end + 1..];
-    }
-    out.push_str(rest);
-    out
-}
-
-/// Collapse adjacent same-href anchors into one: a citation/URL split across styled
-/// runs or line breaks ("Rad"+"ford", a wrapped DOI) emits `…</a><a href="H">…`.
-/// When the just-closed `<a>` and the next opening `<a>` share the same href, drop
-/// the boundary (keeping any whitespace) so the link is a single atomic anchor.
-fn merge_adjacent_links(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut open_href: Option<String> = None;
-    let mut rest = s;
-    let read_anchor = |t: &str| -> Option<(String, usize)> {
-        // (href, total tag length) for a leading `<a href="...">`
-        let body = t.strip_prefix("<a href=\"")?;
-        let q = body.find('"')?;
-        let gt = body[q..].find('>')?;
-        Some((body[..q].to_string(), 9 + q + gt + 1))
-    };
-    while !rest.is_empty() {
-        if let Some((href, len)) = read_anchor(rest) {
-            out.push_str(&rest[..len]);
-            open_href = Some(href);
-            rest = &rest[len..];
-            continue;
-        }
-        if let Some(after) = rest.strip_prefix("</a>") {
-            let ws = after.len() - after.trim_start().len();
-            if let (Some(cur), Some((href2, len2))) = (&open_href, read_anchor(after[ws..].as_ref())) {
-                if &href2 == cur {
-                    // merge: keep whitespace, drop the </a> and the reopening <a>
-                    out.push_str(&after[..ws]);
-                    rest = &after[ws + len2..];
-                    continue;
-                }
-            }
-            out.push_str("</a>");
-            open_href = None;
-            rest = after;
-            continue;
-        }
-        let c = rest.chars().next().unwrap();
-        out.push(c);
-        rest = &rest[c.len_utf8()..];
-    }
-    out
-}
-
-/// Doc-level pass: a real section title appears once, but a running page header
-/// (the paper title or author list repeated atop every page) gets emitted as a
-/// heading on each page. Any heading whose text (minus a leading page/section
-/// number) recurs 3+ times across the document is a running head — demote those
-/// occurrences from `<hN>` to `<p>` so they don't pollute the heading outline.
-fn demote_running_headings(html: String) -> String {
-    // Collect (range, inner) for every <h1-6>…</h1-6>.
-    let bytes = html.as_bytes();
-    let mut spans: Vec<(usize, usize, usize, usize, String)> = Vec::new(); // open,close_end,lvl, inner_start,inner
-    let mut i = 0;
-    while i + 3 < bytes.len() {
-        if bytes[i] == b'<' && bytes[i + 1] == b'h' && matches!(bytes[i + 2], b'1'..=b'6') && bytes[i + 3] == b'>' {
-            let lvl = (bytes[i + 2] - b'0') as usize;
-            let close = format!("</h{lvl}>");
-            if let Some(rel) = html[i..].find(&close) {
-                let inner_start = i + 4;
-                let inner = html[inner_start..i + rel].to_string();
-                spans.push((i, i + rel + close.len(), lvl, inner_start, inner));
-                i += rel + close.len();
-                continue;
-            }
-        }
-        i += 1;
-    }
-    // Count normalized keys (strip tags + a leading number/roman/letter token).
-    let key = |inner: &str| -> String {
-        let text: String = {
-            let mut s = String::new();
-            let mut intag = false;
-            for c in inner.chars() {
-                match c {
-                    '<' => intag = true,
-                    '>' => intag = false,
-                    _ if !intag => s.push(c),
-                    _ => {}
-                }
-            }
-            s
-        };
-        let t = text.trim_start();
-        // drop a leading "12 ", "3.2.1", "IV.", "A." token
-        let t = t.trim_start_matches(|c: char| c.is_alphanumeric() || c == '.' );
-        t.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
-    };
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for s in &spans {
-        let k = key(&s.4);
-        if k.len() >= 4 {
-            *counts.entry(k).or_insert(0) += 1;
-        }
-    }
-    // Rebuild, demoting repeated ones to <p>.
-    let mut outp = String::with_capacity(html.len());
-    let mut pos = 0;
-    let mut kept_h1: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (open, close_end, lvl, _is, inner) in &spans {
-        let k = key(inner);
-        if counts.get(&k).copied().unwrap_or(0) >= 3 {
-            // A heading repeated ≥3× is a running page-header — demote to <p>. But the
-            // document title legitimately recurs in the running head: keep its first
-            // <h1> occurrence (the real title) and demote every other repeat.
-            if *lvl == 1 && kept_h1.insert(k) {
-                continue;
-            }
-            outp.push_str(&html[pos..*open]);
-            outp.push_str("<p>");
-            outp.push_str(inner);
-            outp.push_str("</p>");
-            pos = *close_end;
-        }
-    }
-    outp.push_str(&html[pos..]);
-    outp
 }
 
 fn clone_span(s: &Span) -> Span {

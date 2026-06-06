@@ -310,8 +310,10 @@ impl PlacedSvg {
     /// data points are a raster within the axes/legend). The raster sits behind the ink;
     /// the vector's opaque plot-area background is dropped in `build_svg`, so the raster
     /// shows and the grid/curves/axes overlay it. Each entry is
-    /// `(href, (x_left, x_right, y_bottom, y_top))`: the source and its PDF page rect (y up).
-    pub fn composite_svg(&self, rasters: &[(&str, (f32, f32, f32, f32))]) -> String {
+    /// `(href, (x_left, x_right, y_bottom, y_top), ctm)`: the source, its PDF page rect (y up),
+    /// and an optional placement matrix `[a,b,c,d,e,f]` (page space) when the image is ROTATED
+    /// — then the pixels are mapped through that matrix instead of stretched into the rect.
+    pub fn composite_svg(&self, rasters: &[(&str, (f32, f32, f32, f32), Option<[f32; 6]>)]) -> String {
         // viewBox base: the plot area if detected (crops overshooting reference curves).
         // When no plot box was found, start from an empty box and grow it from the rasters
         // + labels only (NOT the full ink): that still bounds the figure to its real content
@@ -322,9 +324,10 @@ impl PlacedSvg {
         let (mut min_x, mut min_y, mut max_x, mut max_y) = self
             .plot
             .unwrap_or((f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY));
-        // Raster rects in local coords (origin (x_left, y_top), y DOWN).
+        // Raster rects in local coords (origin (x_left, y_top), y DOWN). The viewBox grows by
+        // the axis-aligned placement bbox in both cases (a rotated image's bbox IS that box).
         let mut images = String::new();
-        for (href, (ix0, ix1, iy0, iy1)) in rasters {
+        for (href, (ix0, ix1, iy0, iy1), ctm) in rasters {
             let img_lx = ix0 - self.x_left;
             let img_ly = self.y_top - iy1;
             let img_lw = (ix1 - ix0).max(0.1);
@@ -333,14 +336,37 @@ impl PlacedSvg {
             min_y = min_y.min(img_ly);
             max_x = max_x.max(img_lx + img_lw);
             max_y = max_y.max(img_ly + img_lh);
-            images.push_str(&format!(
-                "<image href=\"{}\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\"/>",
-                href,
-                fmt(img_lx),
-                fmt(img_ly),
-                fmt(img_lw),
-                fmt(img_lh)
-            ));
+            match ctm {
+                // ROTATED: map the image's unit square [0,1]² through the placement matrix into
+                // figure-local coords. A PDF image's unit square has (0,0) bottom-left and its
+                // first pixel row at the top (v=1), so SVG image-space (su,sv) (y down, top-left
+                // origin) maps as u=su, v=1-sv. With page CTM (a,b,c,d,e,f) and figure origin
+                // (x_left, y_top) under the y-flip (ly = y_top - pagey), the SVG transform is
+                // matrix(a, -b, -c, d, c+e-x_left, y_top-d-f).
+                Some([a, b, c, d, e, f]) => {
+                    images.push_str(&format!(
+                        "<image href=\"{}\" x=\"0\" y=\"0\" width=\"1\" height=\"1\" preserveAspectRatio=\"none\" transform=\"matrix({} {} {} {} {} {})\"/>",
+                        href,
+                        fmt(*a),
+                        fmt(-b),
+                        fmt(-c),
+                        fmt(*d),
+                        fmt(c + e - self.x_left),
+                        fmt(self.y_top - d - f),
+                    ));
+                }
+                // Axis-aligned (common case): place directly in the local rect (unchanged).
+                None => {
+                    images.push_str(&format!(
+                        "<image href=\"{}\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\"/>",
+                        href,
+                        fmt(img_lx),
+                        fmt(img_ly),
+                        fmt(img_lw),
+                        fmt(img_lh)
+                    ));
+                }
+            }
         }
         // Grow to every (rotation-aware) label too.
         for l in &self.labels {
@@ -718,7 +744,7 @@ fn walk(
                     Some(&id) => id,
                     None => continue,
                 };
-                let stream = match doc.get_object(id).and_then(|x| x.as_stream().map(|s| s.clone())) {
+                let stream = match doc.get_object(id).and_then(|x| x.as_stream().cloned()) {
                     Ok(s) => s,
                     Err(_) => continue,
                 };

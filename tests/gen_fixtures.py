@@ -662,6 +662,35 @@ def gen_twocol():
     }
 
 
+def gen_rotated_image_fig():
+    """A vector chart with a small raster placed ROTATED 90° inside it (an axis label that the
+    source flattened to a bitmap and set sideways — the Kaspersen 'Temp (Celsius)' case). The
+    composited <image> must carry a `transform="matrix(...)"` so the pixels are rotated, not
+    stretched into an axis-aligned box (which mangles a rotated label)."""
+    pdf = os.path.join(OUT, "rotated_image.pdf")
+    png = os.path.join(OUT, "_lbl.png")
+    img = Image.new("RGB", (160, 40), "white")
+    ImageDraw.Draw(img).text((6, 12), "TEMPLABEL", fill="black")
+    img.save(png)
+    c = canvas.Canvas(pdf, pagesize=letter)
+    title(c, "Rotated Image Label")
+    ox, oy, vw, vh = LM + 40, PAGE_H - 320, 240, 150
+    _vector_chart(c, ox, oy, vw, vh)  # vector ink (axes/bars) → qualifies as a figure
+    # place the label raster rotated 90° just inside the chart's right edge. Rendered ≥24pt on
+    # both sides (90×38) so it clears the tiny-tile filter.
+    c.saveState()
+    c.translate(ox + vw - 10, oy + 20)
+    c.rotate(90)
+    c.drawImage(png, 0, 0, width=90, height=38)
+    c.restoreState()
+    c.setFont("Helvetica", 9.5)
+    c.drawString(LM, oy - 18, "Figure 1: A chart whose right-axis label is a rotated raster.")
+    c.showPage()
+    c.save()
+    os.remove(png)
+    GT["rotated_image.pdf"] = {"caption": "Figure 1: A chart whose right-axis label is a rotated raster."}
+
+
 def gen_twocol_tight():
     """A TIGHT two-column page set in Times-Roman (a Standard-14 font with NO /Widths) with a
     narrow gutter AND a centered page number sitting in that gutter — the SEC/PRL regime.
@@ -957,6 +986,7 @@ def main():
     gen_typography()
     gen_twocol()
     gen_twocol_tight()
+    gen_rotated_image_fig()
     gen_yflip_page()
     gen_math()
     gen_mathfonts()
