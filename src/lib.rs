@@ -19,6 +19,7 @@ mod layout;
 mod links;
 mod markdown;
 mod nav;
+mod ocr;
 mod postprocess;
 mod profile;
 mod text;
@@ -424,11 +425,54 @@ fn from_bytes(data: &[u8]) -> PyResult<Pdf> {
     Pdf::from_bytes(data)
 }
 
+/// OCR: render one page's DocTags (granite-docling output) to a distillPDF HTML fragment.
+#[pyfunction]
+fn ocr_doctags_to_html(doctags: &str) -> String {
+    ocr::render::doctags_to_html(doctags)
+}
+
+/// OCR: join a list of per-page DocTags into a full distillPDF-style HTML document.
+#[pyfunction]
+fn ocr_doctags_doc_html(pages: Vec<String>) -> String {
+    let mut body = String::new();
+    for (i, dt) in pages.iter().enumerate() {
+        body.push_str(&format!("<section data-page=\"{}\">\n", i + 1));
+        body.push_str(&ocr::render::doctags_to_html(dt));
+        body.push_str("</section>\n");
+    }
+    format!("<!doctype html>\n<html><head><meta charset=\"utf-8\"></head>\n<body>\n{body}</body></html>\n")
+}
+
+/// OCR: write a clean, searchable PDF from per-page DocTags. Each item is
+/// `(doctags, image_path_or_empty, width_pts, height_pts)`; figure regions are cropped
+/// from the page image when a path is given. Page size defaults to US-Letter if 0.
+#[pyfunction]
+fn ocr_doctags_to_pdf(pages: Vec<(String, String, f64, f64)>, out_path: &str) -> PyResult<()> {
+    let inputs: Vec<ocr::pdf::PageInput> = pages
+        .iter()
+        .map(|(dt, img, w, h)| {
+            let image = if img.is_empty() { None } else { image::open(img).ok() };
+            ocr::pdf::PageInput {
+                page: ocr::doctags::parse(dt),
+                width: if *w > 0.0 { *w as f32 } else { 612.0 },
+                height: if *h > 0.0 { *h as f32 } else { 792.0 },
+                image,
+            }
+        })
+        .collect();
+    let bytes = ocr::pdf::write_pdf(&inputs).map_err(PyValueError::new_err)?;
+    std::fs::write(out_path, bytes).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
+    Ok(())
+}
+
 #[pymodule]
 fn _distillpdf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Pdf>()?;
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(from_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(ocr_doctags_to_html, m)?)?;
+    m.add_function(wrap_pyfunction!(ocr_doctags_doc_html, m)?)?;
+    m.add_function(wrap_pyfunction!(ocr_doctags_to_pdf, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
