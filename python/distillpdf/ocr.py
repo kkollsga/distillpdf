@@ -116,6 +116,15 @@ def get_backend(name: str = "granite-docling", **kwargs) -> OcrBackend:
 
 import re as _re
 
+# Pure-Rust converters (no model needed): render DocTags — e.g. a model's raw output —
+# straight to distillPDF HTML.  `render_doctags(dt)` is one page; `render_doctags_document`
+# joins a list of pages into a full HTML document.
+try:  # the compiled module is always present in a real install
+    from ._distillpdf import ocr_doctags_doc_html as render_doctags_document  # noqa: F401
+    from ._distillpdf import ocr_doctags_to_html as render_doctags  # noqa: F401
+except ImportError:  # pragma: no cover
+    pass
+
 
 def _doctags_for(pdf, backend: OcrBackend, only: Optional[set] = None) -> Dict[int, str]:
     """Run `backend` on every page the Rust core flags for OCR; return {page: DocTags}."""

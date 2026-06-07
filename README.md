@@ -8,6 +8,9 @@
 [![CI](https://github.com/kkollsga/distillpdf/actions/workflows/ci.yml/badge.svg)](https://github.com/kkollsga/distillpdf/actions/workflows/ci.yml)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org)
 
+> 📓 **New — OCR for scanned PDFs:** detect image-only pages, OCR them with granite-docling, and
+> emit clean HTML or a compact **searchable PDF**. See the **[OCR example notebook »](examples/ocr.ipynb)**
+
 `distillpdf` reads a PDF and reconstructs its *structure* — reading order, headings,
 paragraphs, lists, tables, and figures — then emits compact, semantic **HTML** or
 **Markdown** (or plain text) ready to feed to an LLM or a RAG pipeline. No styling noise, no
