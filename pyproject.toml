@@ -47,6 +47,17 @@ classifiers = [
     "Topic :: Utilities",
 ]
 
+[project.optional-dependencies]
+# OCR for image-only / scanned pages. The core (detection, DocTags parsing,
+# HTML/searchable-PDF rendering) is pure Rust and always available; this extra only adds
+# the model runtime.  Install with:  pip install 'distillpdf[ocr]'
+# (A zero-Python-dep path also exists: bring your own llama-server and use the built-in
+#  Rust ServerOcrEngine, or build from source with a future llama-cpp-2 cargo feature.)
+ocr = [
+    "huggingface-hub>=0.23",
+    "llama-cpp-python>=0.3.0",
+]
+
 [project.scripts]
 distillpdf = "distillpdf.cli:main"
 
