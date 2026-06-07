@@ -58,11 +58,8 @@ fn block_bbox(b: &Block) -> Option<BBox> {
     }
 }
 
-/// Build the whole PDF and return its bytes.
-pub(crate) fn write_pdf(pages: &[PageInput]) -> Result<Vec<u8>, String> {
-    let mut doc = Document::with_version("1.5");
-    let pages_id = doc.new_object_id();
-
+/// Add Helvetica + Helvetica-Bold (WinAnsi) font objects, returning their ids.
+pub(crate) fn add_fonts(doc: &mut Document) -> (lopdf::ObjectId, lopdf::ObjectId) {
     let helv = doc.add_object(dictionary! {
         "Type" => "Font", "Subtype" => "Type1",
         "BaseFont" => "Helvetica", "Encoding" => "WinAnsiEncoding",
@@ -71,6 +68,14 @@ pub(crate) fn write_pdf(pages: &[PageInput]) -> Result<Vec<u8>, String> {
         "Type" => "Font", "Subtype" => "Type1",
         "BaseFont" => "Helvetica-Bold", "Encoding" => "WinAnsiEncoding",
     });
+    (helv, helv_b)
+}
+
+/// Build the whole PDF and return its bytes.
+pub(crate) fn write_pdf(pages: &[PageInput]) -> Result<Vec<u8>, String> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let (helv, helv_b) = add_fonts(&mut doc);
 
     let mut kids: Vec<Object> = Vec::new();
     for pin in pages {
@@ -114,7 +119,7 @@ pub(crate) fn write_pdf(pages: &[PageInput]) -> Result<Vec<u8>, String> {
 }
 
 /// Build one page's content stream operations + any image XObjects it references.
-fn build_page_content(doc: &mut Document, pin: &PageInput) -> Result<(Content, Vec<(String, lopdf::ObjectId)>), String> {
+pub(crate) fn build_page_content(doc: &mut Document, pin: &PageInput) -> Result<(Content, Vec<(String, lopdf::ObjectId)>), String> {
     let (w, h) = (pin.width, pin.height);
     let mut ops: Vec<Operation> = Vec::new();
     let mut xobjects = Vec::new();

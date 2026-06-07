@@ -4,6 +4,7 @@
 //! Engine (lopdf) is confined to this boundary module; higher-level extraction
 //! layers will be added above it (text spans, tables, images, fonts).
 
+use lopdf::dictionary;
 use lopdf::Document;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -351,6 +352,78 @@ impl Pdf {
         d.set_item("abstract", fm.abstract_text)?;
         d.set_item("keywords", fm.keywords)?;
         Ok(d)
+    }
+
+    /// OCR plan: per page, whether OCR is needed and (if so) the page's main raster as
+    /// standard image bytes for a backend to read. Each dict:
+    /// {page, needs_ocr:bool, reason:str, width_pts, height_pts, image:bytes|None}.
+    /// Drives the `distillpdf.ocr` orchestrators (the model runs in the optional [ocr] extra).
+    fn ocr_plan<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        for (&pno, &page_id) in &self.doc.get_pages() {
+            let decision = ocr::detect::decide(&self.doc, page_id, &self.raw);
+            let needs = !matches!(decision, ocr::detect::OcrDecision::NotNeeded);
+            let (w, h) = ocr::page_size_pts(&self.doc, page_id);
+            let d = PyDict::new(py);
+            d.set_item("page", pno)?;
+            d.set_item("needs_ocr", needs)?;
+            d.set_item("reason", format!("{decision:?}"))?;
+            d.set_item("width_pts", w)?;
+            d.set_item("height_pts", h)?;
+            let img = if needs {
+                ocr::page_main_image(&self.doc, page_id).map(|(b, _)| b)
+            } else {
+                None
+            };
+            match img {
+                Some(b) => d.set_item("image", pyo3::types::PyBytes::new(py, &b))?,
+                None => d.set_item("image", py.None())?,
+            }
+            list.append(d)?;
+        }
+        Ok(list)
+    }
+
+    /// Write a clean, searchable PDF: pages in `ocr` (a {1-based page: DocTags} map) are
+    /// rebuilt as real text + cropped figures (raster dropped); all other pages are kept
+    /// verbatim. This is what makes `to_html(in) ≈ to_html(to_pdf(in))` hold. Returns `1`.
+    #[pyo3(signature = (path, ocr))]
+    fn to_pdf(&self, py: Python<'_>, path: &str, ocr: std::collections::HashMap<u32, String>) -> PyResult<Py<PyAny>> {
+        let buf = py.allow_threads(|| -> Result<Vec<u8>, String> {
+            let mut doc = Document::load_mem(&self.raw).map_err(|e| e.to_string())?;
+            let (helv, helv_b) = ocr::pdf::add_fonts(&mut doc);
+            let pages = doc.get_pages();
+            for (&pno, &page_id) in &pages {
+                let Some(dt) = ocr.get(&pno) else { continue };
+                let (w, h) = ocr::page_size_pts(&doc, page_id);
+                let image = ocr::page_main_image(&doc, page_id).map(|(_, img)| img);
+                let pin = ocr::pdf::PageInput { page: ocr::doctags::parse(dt), width: w, height: h, image };
+                let (content, xobjs) = ocr::pdf::build_page_content(&mut doc, &pin)?;
+                let data = content.encode().map_err(|e| e.to_string())?;
+                let stream_id = doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), data));
+                // Replace the page's content with our clean stream + matching resources.
+                // (The old full-page image XObject simply goes undrawn.)
+                let mut xo = lopdf::Dictionary::new();
+                for (name, id) in &xobjs {
+                    xo.set(name.as_bytes().to_vec(), lopdf::Object::Reference(*id));
+                }
+                let res = dictionary! {
+                    "Font" => dictionary! { "F1" => helv, "F2" => helv_b },
+                    "XObject" => xo,
+                };
+                let page = doc.get_object_mut(page_id).map_err(|e| e.to_string())?.as_dict_mut().map_err(|e| e.to_string())?;
+                page.set("Contents", lopdf::Object::Reference(stream_id));
+                page.set("Resources", lopdf::Object::Dictionary(res));
+            }
+            // Drop the now-unreferenced full-page rasters + old content streams so the
+            // clean PDF is actually small ("remove rasters").
+            doc.prune_objects();
+            let mut buf = Vec::new();
+            doc.save_to(&mut buf).map_err(|e| e.to_string())?;
+            Ok(buf)
+        }).map_err(PyValueError::new_err)?;
+        std::fs::write(path, buf).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
+        ok_one(py)
     }
 
     /// Diagnostic: force our ToUnicode extractor for all pages (eval only).

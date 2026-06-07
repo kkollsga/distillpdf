@@ -112,6 +112,67 @@ def get_backend(name: str = "granite-docling", **kwargs) -> OcrBackend:
     return factory(**kwargs)
 
 
+# ---- high-level orchestration ----------------------------------------------
+
+import re as _re
+
+
+def _doctags_for(pdf, backend: OcrBackend, only: Optional[set] = None) -> Dict[int, str]:
+    """Run `backend` on every page the Rust core flags for OCR; return {page: DocTags}."""
+    out: Dict[int, str] = {}
+    for item in pdf.ocr_plan():
+        if not item["needs_ocr"] or (only is not None and item["page"] not in only):
+            continue
+        img = item["image"]
+        if not img:
+            continue
+        out[item["page"]] = backend.ocr_page(bytes(img))
+    return out
+
+
+def _splice(page_html: str, fragments: Dict[int, str]) -> str:
+    """Replace the body of each `<section data-page="N">…</section>` whose page has an OCR
+    fragment, leaving born-digital pages' sections untouched."""
+    def repl(m):
+        page = int(m.group(2))
+        frag = fragments.get(page)
+        return m.group(1) + "\n" + frag + m.group(4) if frag is not None else m.group(0)
+
+    return _re.sub(
+        r'(<section data-page="(\d+)"[^>]*>)(.*?)(</section>)',
+        repl, page_html, flags=_re.DOTALL,
+    )
+
+
+def to_html(pdf, backend: OcrBackend, *, path: Optional[str] = None,
+            return_string: bool = True, image_mode: str = "embed") -> str:
+    """OCR-augmented HTML: image-only/scanned pages are rendered from the model's DocTags;
+    born-digital pages keep distillPDF's normal extraction. Pages are spliced into the
+    page-mode document so structure stays consistent."""
+    from ._distillpdf import ocr_doctags_to_html
+
+    fragments = {p: ocr_doctags_to_html(dt) for p, dt in _doctags_for(pdf, backend).items()}
+    base = pdf.to_html(mode="page", return_string=True, image_mode=image_mode)
+    html = _splice(base, fragments) if fragments else base
+    if path:
+        with builtins_open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+        return path
+    return html
+
+
+def to_pdf(pdf, backend: OcrBackend, path: str) -> str:
+    """Write a clean, searchable PDF: OCR'd pages are rebuilt as real text + cropped
+    figures (raster dropped); born-digital pages are kept verbatim."""
+    pdf.to_pdf(path, _doctags_for(pdf, backend))
+    return path
+
+
+# `open` is shadowed by distillpdf.open at the package root; keep the builtin handy.
+import builtins as _builtins  # noqa: E402
+
+builtins_open = _builtins.open
+
 # Built-in backends register themselves on import (lazily — importing this module does
 # NOT import their heavy dependencies).
 from . import _backends_granite  # noqa: E402,F401  (side-effect: registration)
