@@ -176,8 +176,14 @@ over them, and folds the recovered text back into the same HTML / Markdown / **s
 outputs — born-digital pages keep distillPDF's normal extraction.
 
 ```bash
-pip install 'distillpdf[ocr]'      # adds llama-cpp-python + huggingface-hub + pillow
+pip install 'distillpdf[ocr]'      # Apple Silicon: mlx-vlm + transformers (no PyTorch)
 ```
+
+> **Platform:** OCR currently runs on **Apple Silicon** (macOS, M-series) via the official
+> MLX build of granite-docling, on the Metal GPU — fast, and **no PyTorch**. A
+> **Windows/Linux** path (granite-docling via PyTorch/vLLM) is planned; until then OCR there
+> raises a clear "not yet implemented". All of distillPDF's pure-Rust extraction works on
+> every platform regardless.
 
 ```python
 import distillpdf
@@ -205,6 +211,10 @@ Flate-wrapped JPEG encodings, and full-page rasters whose only text is an e-fili
   destroy content (best for archival/legal use).
 - **`remove_raster=True`** — pages are reflowed to clean visible text + cropped figures and the
   raster is dropped, for a much smaller file.
+
+**Tables** are recovered natively: granite-docling emits OTSL table structure, which distillPDF
+renders as a real `<table>` (with `<th>` / `colspan` / `rowspan`) in HTML and a positioned
+table in the searchable PDF.
 
 > Quality scales with the model: granite-docling-258M is small and tuned for documents; clean
 > typed pages come out near-verbatim, dense or low-quality scans less so. See the

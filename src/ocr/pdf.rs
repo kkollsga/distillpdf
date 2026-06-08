@@ -190,13 +190,17 @@ fn weighted_median(items: &mut [(f32, usize)]) -> Option<f32> {
 }
 
 /// Resolve a block's render size: body text is snapped to the single page body size. A block
-/// keeps a distinct, larger size only if it's a tagged heading/title, or it's a SHORT
-/// (single-line) block whose box is much bigger than body — i.e. an unlabelled letterhead.
-/// A LONG block is always body, even if its loose box implies a big size (it's a paragraph,
-/// not a heading).
+/// keeps a distinct, larger size only if it's a tagged heading/title, a SHORT (single-line)
+/// block whose box is moderately bigger than body (an unlabelled letterhead), or ANY block
+/// whose box is *far* bigger than body (≥2.5×) — display/cover text, which a loose paragraph
+/// box never reaches (those sit ~1.5–2×). Otherwise it's body.
 fn harmonize_size(natural: f32, body: f32, is_heading: bool, single_line: bool) -> f32 {
     if is_heading || (single_line && natural > body * 1.45) {
-        natural.max(body) // a heading is at least body-sized
+        natural.max(body) // tagged heading / letterhead — keep its full size
+    } else if natural > body * 2.5 {
+        // Untagged display text (e.g. a section-divider title): render it larger, but cap the
+        // boost so a mis-read line on a faint page (a big box around garbage) isn't blown up.
+        natural.min(body * 2.2)
     } else {
         body
     }

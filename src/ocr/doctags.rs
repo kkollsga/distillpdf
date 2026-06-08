@@ -239,9 +239,6 @@ fn strip_tags(line: &str) -> String {
 fn collapse_loops(input: &str) -> String {
     let lines: Vec<&str> = input.split('\n').collect();
     let n = lines.len();
-    if n < 3 {
-        return input.to_string();
-    }
     let keys: Vec<String> = lines.iter().map(|l| strip_tags(l)).collect();
     let mut keep = vec![true; n];
     let mut i = 0;
@@ -255,10 +252,67 @@ fn collapse_loops(input: &str) -> String {
             while i + (reps + 1) * p <= n && keys[i + reps * p..i + (reps + 1) * p] == keys[i..i + p] {
                 reps += 1;
             }
-            // A single repeated line (p==1) is always a loop; for a longer cycle require it
-            // to carry real text (≥4 chars), so we never collapse incidental short patterns.
+            // A single repeated line (p==1) is always a loop; a longer cycle normally must
+            // carry real text (≥4 chars) so we don't collapse incidental short patterns — but
+            // a short cycle that repeats *many* times (≥4) is a loop too (e.g. "A S T S T …"
+            // from a vertical margin stamp read one char per line).
             let block_has_text = (0..p).any(|k| keys[i + k].chars().count() >= 4);
-            if reps >= 3 && (p == 1 || block_has_text) {
+            if reps >= 3 && (p == 1 || block_has_text || reps >= 4) {
+                for slot in keep.iter_mut().take(i + reps * p).skip(i + p) {
+                    *slot = false;
+                }
+                i += reps * p;
+                hit = true;
+                break;
+            }
+        }
+        if !hit {
+            i += 1;
+        }
+    }
+    // Rebuild surviving lines, also collapsing any *within-line* token loop (a margin stamp
+    // the model emits as one element whose text is one token repeated ~100×).
+    let mut out: Vec<String> = Vec::with_capacity(n);
+    let mut changed = false;
+    for (l, k) in lines.iter().zip(&keep) {
+        if !k {
+            changed = true;
+            continue;
+        }
+        let collapsed = collapse_inline(l);
+        changed |= collapsed.len() != l.len();
+        out.push(collapsed);
+    }
+    if !changed {
+        return input.to_string();
+    }
+    out.join("\n")
+}
+
+/// Collapse an adjacent repeated token cycle *within* a single line — the within-line
+/// analogue of the line-level loop collapse. granite sometimes reads a vertical margin
+/// stamp as one text element whose content is a short token cycle repeated dozens of times
+/// ("© 2019 5/2019 5/2019 5/2019 …"); keep a single copy so it doesn't render as a column
+/// of garbage down the page edge.
+fn collapse_inline(line: &str) -> String {
+    let toks: Vec<&str> = line.split(' ').collect();
+    let n = toks.len();
+    if n < 6 {
+        return line.to_string();
+    }
+    let mut keep = vec![true; n];
+    let mut i = 0;
+    while i < n {
+        let mut hit = false;
+        for p in 1..=4usize {
+            if i + 3 * p > n {
+                continue; // need >=3 cycles to be a loop
+            }
+            let mut reps = 1usize;
+            while i + (reps + 1) * p <= n && toks[i + reps * p..i + (reps + 1) * p] == toks[i..i + p] {
+                reps += 1;
+            }
+            if reps >= 3 {
                 for slot in keep.iter_mut().take(i + reps * p).skip(i + p) {
                     *slot = false;
                 }
@@ -272,14 +326,13 @@ fn collapse_loops(input: &str) -> String {
         }
     }
     if keep.iter().all(|&k| k) {
-        return input.to_string(); // no loops — avoid a needless reallocation
+        return line.to_string();
     }
-    lines
-        .iter()
+    toks.iter()
         .zip(keep)
-        .filter_map(|(l, k)| k.then_some(*l))
+        .filter_map(|(t, k)| k.then_some(*t))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join(" ")
 }
 
 /// Parse a DocTags string into a typed page model.
@@ -579,6 +632,30 @@ mod tests {
         }
         // a real `< b` comparison is still kept as text (not mistaken for a marker)
         assert!(parse("<loc_1><loc_1><loc_9><loc_9>if a < b then").blocks.iter().any(|b| matches!(b, Block::Para(t) if t.text.contains("a < b"))));
+    }
+
+    #[test]
+    fn collapse_inline_margin_stamp() {
+        // A foliation stamp read as one element: a token repeated dozens of times inline.
+        let mut s = String::from("<text><loc_489><loc_1><loc_492><loc_499>\u{a9} 2019");
+        for _ in 0..40 {
+            s.push_str(" 5/2019");
+        }
+        s.push_str("</text>");
+        let page = parse(&s);
+        // Across whatever block(s) it parses into, only ~one copy of the repeat should survive.
+        let all: String = page
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Title(t) | Block::Para(t) | Block::ListItem(t) | Block::Caption(t)
+                | Block::Footnote(t) | Block::Formula(t) | Block::Code(t) | Block::PageHeader(t)
+                | Block::PageFooter(t) => Some(t.text.clone()),
+                Block::Heading { block, .. } => Some(block.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(all.matches("5/2019").count() <= 2, "inline loop not collapsed: {all:?}");
     }
 
     #[test]
