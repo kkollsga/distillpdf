@@ -181,23 +181,24 @@ pip install 'distillpdf[ocr]'      # adds llama-cpp-python + huggingface-hub + p
 
 ```python
 import distillpdf
-from distillpdf import ocr
 
 doc = distillpdf.open("scanned.pdf")
-backend = ocr.get_backend("granite-docling")   # downloads the GGUF on first use
-
-ocr.run(doc, backend)              # ONE model pass over every scanned page; cached on `doc`
-ocr.to_pdf(doc, path="out.pdf")    # searchable PDF (reuses the cache — no second pass)
-ocr.to_html(doc, path="out.html")  #   "
-ocr.to_markdown(doc, path="out.md")#   "
+doc.run_ocr()                  # ONE model pass over every scanned page; cached on the document
+                               # (downloads the granite-docling model on first use)
+doc.to_pdf("out.pdf")          # searchable PDF        (reuses the cache — no second pass)
+doc.to_html("out.html")        # OCR text folded into clean HTML
+doc.to_markdown("out.md")      # …and Markdown
 ```
 
-`ocr.run` OCRs each flagged page once and caches the result on the document, so every output
-is rendered from a single pass. Detection handles real-world scans — images nested in Form
-XObjects, CCITT Group-4 fax and Flate-wrapped JPEG encodings, and full-page rasters whose only
-text is an e-filing stamp.
+`run_ocr` OCRs each scanned page once and caches the result on the document, so every output
+is rendered from a single pass. For a single output you can skip the explicit call and pass
+`ocr=True` — e.g. `doc.to_pdf("out.pdf", ocr=True)` runs OCR (once) then writes. The render
+methods (`to_html` / `to_markdown` / `to_pdf`) also work *without* OCR — they just **warn**
+that scanned pages have no text and point you at `run_ocr`.
+Detection handles real-world scans — images nested in Form XObjects, CCITT Group-4 fax and
+Flate-wrapped JPEG encodings, and full-page rasters whose only text is an e-filing stamp.
 
-**Searchable-PDF modes** (`ocr.to_pdf`):
+**Searchable-PDF modes** (`doc.to_pdf`):
 
 - **keep the scan (default)** — the original page image is preserved and the OCR text is added
   as an *invisible, selectable* layer over it. The scan always shows, so OCR errors never

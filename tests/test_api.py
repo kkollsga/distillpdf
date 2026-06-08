@@ -22,10 +22,11 @@ def test_open_and_page_count():
 
 
 def test_module_level_open():
-    """The top-level distillpdf.open()/from_bytes() shorthands return a Pdf and match
-    the Pdf.open()/Pdf.from_bytes() classmethods."""
+    """The top-level distillpdf.open()/from_bytes() return a Document (the Rust core plus the
+    OCR workflow); for born-digital PDFs it renders identically to the Pdf classmethods, and
+    delegates every core method to the wrapped Pdf."""
     doc = distillpdf.open(HEADINGS)
-    assert isinstance(doc, distillpdf.Pdf)
+    assert isinstance(doc, distillpdf.Document)
     assert doc.page_count() == 1
     assert doc.to_html(return_string=True) == distillpdf.Pdf.open(HEADINGS).to_html(return_string=True)
     with open(HEADINGS, "rb") as f:

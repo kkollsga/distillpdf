@@ -57,7 +57,10 @@ class OcrConfig:
     hf_token: Optional[str] = None
     device: str = "auto"
     prompt: str = "Convert this page to docling."
-    max_tokens: int = 4096
+    # Per-image generation cap. Real content tops out ~1.6k tokens for a (tiled) half page;
+    # the surplus only ever gets filled by a repetition loop, so a tight cap bounds the
+    # worst-case page without ever clipping legitimate text (and the de-loop strips the rest).
+    max_tokens: int = 2048
 
 
 class OcrBackend:
@@ -142,12 +145,14 @@ def _doctags_for(pdf, backend: OcrBackend, only: Optional[set] = None,
     return out
 
 
-def run(pdf, backend: OcrBackend, *, only: Optional[set] = None,
+def run(pdf, backend: Optional[OcrBackend] = None, *, only: Optional[set] = None,
         progress: Optional[Callable[[int, int, int], None]] = None) -> Dict[int, str]:
-    """Run the OCR model **once** over every flagged page and cache the result *on the
-    `pdf` object* (``pdf.set_ocr``). After this, ``ocr.to_pdf`` / ``ocr.to_html`` /
-    ``ocr.to_markdown`` reuse the cached DocTags — the model does not run again. Returns
-    the ``{page: DocTags}`` map."""
+    """OCR every scanned page of `pdf` **once** and cache the result on the `pdf` object.
+    After this, ``ocr.to_pdf`` / ``ocr.to_html`` / ``ocr.to_markdown`` reuse the cached text
+    — the model never re-runs. `backend` defaults to the bundled granite-docling backend
+    (the model is downloaded on first use). Returns the ``{page: DocTags}`` map."""
+    if backend is None:
+        backend = get_backend()
     doctags = _doctags_for(pdf, backend, only=only, progress=progress)
     pdf.set_ocr(doctags)
     return doctags
