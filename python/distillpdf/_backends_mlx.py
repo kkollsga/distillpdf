@@ -13,6 +13,7 @@ cheap and a base install still gives a clear error the first time OCR is actuall
 from __future__ import annotations
 
 import io
+import re
 from typing import Any, List, Optional
 
 from .ocr import OcrBackend, OcrConfig, _require, register_backend
@@ -20,6 +21,14 @@ from .ocr import OcrBackend, OcrConfig, _require, register_backend
 # The official IBM MLX (Apple-Silicon) build. Emits DocTags incl. native OTSL tables.
 _MLX_REPO = "ibm-granite/granite-docling-258M-mlx"
 _STOP_STRINGS = ["</doctag>", "<|end_of_text|>"]
+
+_TAG = re.compile(r"<[^>]+>")
+# Generation-time loop guard (docling ships a DocTagsRepetitionStopper for the same reason):
+# if the last LOOP_WINDOW emitted lines collapse to <= LOOP_DISTINCT distinct strings, the
+# model is stuck repeating — stop early to save tokens/time. The Rust de-loop still cleans
+# any residue post-hoc.
+_LOOP_WINDOW = 12
+_LOOP_DISTINCT = 2
 
 
 class MlxGraniteDoclingBackend(OcrBackend):
@@ -70,6 +79,8 @@ class MlxGraniteDoclingBackend(OcrBackend):
         stops: List[str] = self.config.stop_strings or _STOP_STRINGS
         out: List[str] = []
         text = ""
+        pending = ""  # current (incomplete) line
+        recent: List[str] = []  # stripped text of recently completed lines
         for token in self._stream_generate(
             self._model,
             self._processor,
@@ -84,6 +95,17 @@ class MlxGraniteDoclingBackend(OcrBackend):
             # Stop as soon as the document-end / EOS marker appears (avoids over-generation).
             if any(s in text for s in stops):
                 break
+            # Loop guard: track completed lines; bail if recent ones collapse to ~one string.
+            pending += token.text
+            if "\n" in token.text:
+                *done, pending = pending.split("\n")
+                for ln in done:
+                    key = _TAG.sub("", ln).strip()
+                    if key:
+                        recent.append(key)
+                recent = recent[-_LOOP_WINDOW:]
+                if len(recent) >= _LOOP_WINDOW and len(set(recent)) <= _LOOP_DISTINCT:
+                    break
         return "".join(out)
 
     def close(self) -> None:

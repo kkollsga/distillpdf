@@ -185,6 +185,21 @@ mod tests {
     }
 
     #[test]
+    fn otsl_realistic_table_from_mlx_shape() {
+        // The exact OTSL shape granite-docling (MLX) emits for the Attention BLEU table:
+        // a loc-prefixed <otsl>, an <ecel> corner, column-spanning headers via <lcel>, and
+        // <nl> row breaks. This is what we now receive natively (tiling used to drop it).
+        let dt = "<otsl><loc_104><loc_60><loc_391><loc_156>\
+                  <ecel><fcel>BLEU<lcel><fcel>Training Cost<lcel><nl>\
+                  <fcel>Model<fcel>EN-DE<fcel>EN-FR<fcel>EN-DE<fcel>EN-FR<nl>\
+                  <fcel>ByteNet<fcel>23.75<ecel><fcel>1.0e20<ecel><nl></otsl>";
+        let html = render_page(&parse(dt), &RenderOpts::default());
+        assert!(html.contains("<table>"), "{html}");
+        assert!(html.contains("colspan=\"2\""), "spanned headers preserved: {html}");
+        assert!(html.contains("ByteNet") && html.contains("23.75"), "row data: {html}");
+    }
+
+    #[test]
     fn picture_figure_with_class() {
         let dt = "<loc_1><loc_1><loc_9><loc_9><logo>";
         let html = render_page(&parse(dt), &RenderOpts::default());
