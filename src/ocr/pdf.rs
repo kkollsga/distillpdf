@@ -147,7 +147,8 @@ pub(crate) fn build_text_overlay(pin: &PageInput) -> Content {
                         continue;
                     }
                     let font = if is_bold(b) { OVERLAY_FONT_BOLD } else { OVERLAY_FONT };
-                    emit_wrapped_text(&mut ops, text, &bb, w, h, role_size(b), font);
+                    // Invisible overlay over the kept scan: stretch full lines to align selection.
+                    emit_wrapped_text(&mut ops, text, &bb, w, h, font, is_bold(b), true);
                 }
             }
         }
@@ -190,9 +191,9 @@ pub(crate) fn build_page_content(doc: &mut Document, pin: &PageInput) -> Result<
                     if text.is_empty() {
                         continue;
                     }
-                    let size = role_size(b);
                     let font = if is_bold(b) { "F2" } else { "F1" };
-                    emit_wrapped_text(&mut ops, text, &bb, w, h, size, font);
+                    // Visible reflow: natural spacing (no per-line stretch).
+                    emit_wrapped_text(&mut ops, text, &bb, w, h, font, is_bold(b), false);
                 }
             }
         }
@@ -200,25 +201,95 @@ pub(crate) fn build_page_content(doc: &mut Document, pin: &PageInput) -> Result<
     Ok((Content { operations: ops }, xobjects))
 }
 
-/// Word-wrap `text` to the box width and emit each line as positioned PDF text, top-down.
-fn emit_wrapped_text(ops: &mut Vec<Operation>, text: &str, bb: &BBox, w: f32, h: f32, size: f32, font: &str) {
-    let [x0, _y0, x1, y1] = bb.to_pdf(w, h);
-    let box_w = (x1 - x0).max(size * 4.0);
-    let leading = size * 1.2;
-    let max_chars = (box_w / (size * 0.5)).max(8.0) as usize; // ~0.5em average glyph
-    let lines = wrap(text, max_chars);
-    let mut y = y1 - size; // first baseline just below the box top
-    for line in lines {
-        let bytes = to_winansi(&line);
-        if bytes.is_empty() {
-            y -= leading;
-            continue;
+/// Baseline-to-baseline spacing as a multiple of the font size.
+const LINE_SPACING: f32 = 1.16;
+
+/// Helvetica glyph advance (1000-em units) for a char, via its WinAnsi byte.
+fn glyph_adv(widths: &[u16; 256], c: char) -> f32 {
+    widths[win_ansi_byte(c) as usize] as f32
+}
+
+/// Total advance of `s` at font size 1 pt (i.e. in points-per-pt).
+fn advance(widths: &[u16; 256], s: &str) -> f32 {
+    s.chars().map(|c| glyph_adv(widths, c)).sum::<f32>() / 1000.0
+}
+
+/// Word-wrap `text` so each line's advance (at size 1) fits `budget` points-per-pt.
+fn wrap_to_budget(widths: &[u16; 256], text: &str, budget: f32) -> Vec<String> {
+    let space = advance(widths, " ").max(1e-4);
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0.0f32;
+    for word in text.split_whitespace() {
+        let ww = advance(widths, word);
+        if cur.is_empty() {
+            cur.push_str(word);
+            cur_w = ww;
+        } else if cur_w + space + ww <= budget {
+            cur.push(' ');
+            cur.push_str(word);
+            cur_w += space + ww;
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+            cur_w = ww;
         }
-        ops.push(Operation::new("BT", vec![]));
-        ops.push(Operation::new("Tf", vec![Object::Name(font.as_bytes().to_vec()), size.into()]));
-        ops.push(Operation::new("Td", vec![x0.into(), y.into()]));
-        ops.push(Operation::new("Tj", vec![Object::String(bytes, lopdf::StringFormat::Literal)]));
-        ops.push(Operation::new("ET", vec![]));
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Emit `text` positioned to fill its bounding box: the font size is derived from the box
+/// (not a fixed role size), the text is wrapped with real Helvetica metrics, and the lines
+/// are distributed down the box's height — so the rendered text tracks the page's real
+/// layout/scale instead of a generic 10 pt block.
+///
+/// `stretch` (used for the invisible overlay over a kept scan): horizontally scale each FULL
+/// line to span the box width, so text selection/highlight aligns with the scanned glyphs
+/// even when the original font is wider/narrower than Helvetica. Off for the visible reflow,
+/// where uniform spacing reads better.
+fn emit_wrapped_text(ops: &mut Vec<Operation>, text: &str, bb: &BBox, w: f32, h: f32, font: &str, bold: bool, stretch: bool) {
+    let widths = crate::afm::standard_widths("Helvetica", bold, false).unwrap_or(&[500u16; 256]);
+    let [x0, y0, x1, y1] = bb.to_pdf(w, h);
+    let box_w = (x1 - x0).abs().max(1.0);
+    let box_h = (y1 - y0).abs().max(1.0);
+
+    // Pick a font size: the value at which the text, wrapped to box_w, fills box_h — but
+    // never taller than a single line in the box (so short text in a wide box, e.g. a
+    // heading, isn't blown up to fill the height).
+    let total = advance(widths, text).max(0.01);
+    let fill = (box_h * box_w / (total * LINE_SPACING)).sqrt();
+    let size = fill.min(box_h / LINE_SPACING).clamp(4.0, 48.0);
+
+    let lines = wrap_to_budget(widths, text, box_w / size);
+    let n = lines.len().max(1);
+    // Spread baselines across the box height (matches the page's line spacing); never tighter
+    // than the font itself.
+    let leading = (box_h / n as f32).max(size * LINE_SPACING).min(size * 2.0);
+    let mut y = y1 - size * 0.82; // first baseline just under the box top
+    let last = n - 1;
+    for (i, line) in lines.iter().enumerate() {
+        let bytes = to_winansi(line);
+        if !bytes.is_empty() {
+            ops.push(Operation::new("BT", vec![]));
+            // Stretch full (non-last) lines to the box width for selection alignment.
+            if stretch && i < last {
+                let lw = advance(widths, line) * size;
+                if lw > 1.0 {
+                    let tz = (box_w / lw * 100.0).clamp(50.0, 200.0);
+                    ops.push(Operation::new("Tz", vec![tz.into()]));
+                }
+            }
+            ops.push(Operation::new("Tf", vec![Object::Name(font.as_bytes().to_vec()), size.into()]));
+            ops.push(Operation::new("Td", vec![x0.into(), y.into()]));
+            ops.push(Operation::new("Tj", vec![Object::String(bytes, lopdf::StringFormat::Literal)]));
+            ops.push(Operation::new("ET", vec![]));
+        }
         y -= leading;
     }
 }
