@@ -124,49 +124,100 @@ pub(crate) fn write_pdf(pages: &[PageInput]) -> Result<Vec<u8>, String> {
 pub(crate) const OVERLAY_FONT: &str = "OcrHelv";
 pub(crate) const OVERLAY_FONT_BOLD: &str = "OcrHelvB";
 
-/// The dominant body font size for a page: the text-length-weighted median of every text
-/// block's natural (box-derived) size. Box-to-box noise makes the same paragraph's blocks
-/// resolve to a dozen slightly different sizes; snapping body text to this one value (see
-/// [`harmonize_size`]) makes the page read as a single consistent size.
+/// A reliable single-line font-size sample, or None. A single line of text whose box is a
+/// normal line height (≈6–24 pt) directly implies the font size — the box is ≈1.15× the
+/// font. Multi-line paragraphs and loosely-boxed elements (a few words in a tall box) don't,
+/// so they're skipped: their box-fill estimate is what makes loose boxes over-size.
+fn line_sample(text: &str, bb: &BBox, w: f32, h: f32) -> Option<f32> {
+    let widths = crate::afm::standard_widths("Helvetica", false, false).unwrap_or(&[500u16; 256]);
+    let [x0, y0, x1, y1] = bb.to_pdf(w, h);
+    let box_w = (x1 - x0).abs().max(1.0);
+    let box_h = (y1 - y0).abs().max(1.0);
+    if !(6.0..=24.0).contains(&box_h) {
+        return None;
+    }
+    let size = box_h / 1.15;
+    // The text must plausibly fit on one line at that size (else the box isn't one line).
+    (advance(widths, text) * size <= box_w * 1.25).then_some(size)
+}
+
+/// The page body font size. Estimated from reliable single-line samples (see [`line_sample`])
+/// — robust to the model's loose/oversized boxes — and only falling back to the box-fill
+/// median when a page has no clean single lines. Body text is then snapped to this one value
+/// so a page reads as a single consistent size.
 fn page_body_size(page: &OcrPage, w: f32, h: f32) -> f32 {
-    let mut items: Vec<(f32, usize)> = Vec::new();
+    let mut samples: Vec<f32> = Vec::new();
+    let mut fill: Vec<(f32, usize)> = Vec::new();
     for b in &page.blocks {
         if is_bold(b) {
             continue; // headings/titles don't define the body size
         }
         if let (Some(text), Some(bb)) = (block_text(b), block_bbox(b)) {
             let text = text.trim();
-            if !text.is_empty() {
-                items.push((natural_size(text, &bb, w, h, false), text.chars().count()));
+            if text.is_empty() {
+                continue;
             }
+            if let Some(s) = line_sample(text, &bb, w, h) {
+                samples.push(s);
+            }
+            fill.push((natural_size(text, &bb, w, h, false), text.chars().count()));
         }
     }
+    let body = if samples.len() >= 2 {
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        samples[samples.len() / 2]
+    } else {
+        weighted_median(&mut fill).unwrap_or(10.0)
+    };
+    body.clamp(7.5, 16.0)
+}
+
+/// Text-length-weighted median of `(size, weight)` items.
+fn weighted_median(items: &mut [(f32, usize)]) -> Option<f32> {
     if items.is_empty() {
-        return 10.0;
+        return None;
     }
     items.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let total: usize = items.iter().map(|x| x.1).sum();
     let mut cum = 0usize;
-    for (size, weight) in &items {
+    for (size, weight) in items.iter() {
         cum += weight;
         if cum * 2 >= total {
-            return *size;
+            return Some(*size);
         }
     }
-    items.last().map(|x| x.0).unwrap_or(10.0)
+    items.last().map(|x| x.0)
 }
 
-/// Resolve a block's render size. Body text is snapped to the single page body size (its
-/// box-derived size is noisy — short lines in loose boxes resolve all over the place — and
-/// the page really is one size). Only an actual heading/title (`is_heading`), or untagged
-/// text whose box is clearly far larger than body (a letterhead the model didn't label),
-/// keeps a distinct, larger size.
-fn harmonize_size(natural: f32, body: f32, is_heading: bool) -> f32 {
-    if is_heading || natural > body * 1.6 {
+/// Resolve a block's render size: body text is snapped to the single page body size. A block
+/// keeps a distinct, larger size only if it's a tagged heading/title, or it's a SHORT
+/// (single-line) block whose box is much bigger than body — i.e. an unlabelled letterhead.
+/// A LONG block is always body, even if its loose box implies a big size (it's a paragraph,
+/// not a heading).
+fn harmonize_size(natural: f32, body: f32, is_heading: bool, single_line: bool) -> f32 {
+    if is_heading || (single_line && natural > body * 1.45) {
         natural.max(body) // a heading is at least body-sized
     } else {
         body
     }
+}
+
+/// Pick the render size for a text block: its natural (box-derived) size harmonized against
+/// the page body size. A block whose box is only ~one line tall is meant to be a single line,
+/// so its size is also capped to fit the text on one line in the box width — otherwise a
+/// narrow box (e.g. a signature line) would wrap a body-sized line awkwardly.
+fn resolve_size(text: &str, bb: &BBox, w: f32, h: f32, bold: bool, body: f32) -> f32 {
+    let widths = crate::afm::standard_widths("Helvetica", bold, false).unwrap_or(&[500u16; 256]);
+    let [x0, y0, x1, y1] = bb.to_pdf(w, h);
+    let box_w = (x1 - x0).abs().max(1.0);
+    let box_h = (y1 - y0).abs().max(1.0);
+    let one_line = box_h < body * 1.8; // box is about a single line tall
+    let mut size = harmonize_size(natural_size(text, bb, w, h, bold), body, bold, one_line);
+    if one_line {
+        let adv = advance(widths, text).max(0.01);
+        size = size.min(box_w / adv); // keep the single line within the box width
+    }
+    size.max(4.0)
 }
 
 /// Build an INVISIBLE (text render mode 3) overlay of the OCR text, positioned over the
@@ -194,9 +245,10 @@ pub(crate) fn build_text_overlay(pin: &PageInput) -> Content {
                     }
                     let bold = is_bold(b);
                     let font = if bold { OVERLAY_FONT_BOLD } else { OVERLAY_FONT };
-                    let size = harmonize_size(natural_size(text, &bb, w, h, bold), body, bold);
+                    let size = resolve_size(text, &bb, w, h, bold, body);
+                    let top = bb.to_pdf(w, h)[3]; // box top; overlay stays aligned to the scan
                     // Invisible overlay over the kept scan: stretch full lines to align selection.
-                    emit_wrapped_text(&mut ops, text, &bb, w, h, size, font, bold, true);
+                    emit_wrapped_text(&mut ops, text, &bb, w, h, top, size, font, bold, true, true);
                 }
             }
         }
@@ -213,13 +265,37 @@ pub(crate) fn build_page_content(doc: &mut Document, pin: &PageInput) -> Result<
     let mut xobjects = Vec::new();
     let mut pic_no = 0;
 
+    // Rects (pdf space) of every non-empty text block — so a figure crop that text already
+    // covers is skipped (the model marks a text region `<other>`; in the reflow the text is
+    // the content, and drawing the crop on top of it just makes an overlapping mess).
+    let text_rects: Vec<[f32; 4]> = pin
+        .page
+        .blocks
+        .iter()
+        .filter(|b| !matches!(b, Block::Picture { .. } | Block::Table(_)))
+        .filter_map(|b| match (block_text(b), block_bbox(b)) {
+            (Some(t), Some(bb)) if !t.trim().is_empty() => Some(bb.to_pdf(w, h)),
+            _ => None,
+        })
+        .collect();
+    let overlaps = |a: &[f32; 4], b: &[f32; 4]| a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
+
+    // Already-placed block rects (pdf space, as [x0,y0,x1,y1]) — a text block is pushed down
+    // below any placed block it *horizontally* overlaps, so blocks never collide while
+    // side-by-side elements (e.g. two words on one line) stay on their line.
+    let mut placed: Vec<[f32; 4]> = Vec::new();
+
     for b in &pin.page.blocks {
         match b {
             Block::Picture { bbox, .. } => {
                 if let (Some(bb), Some(src)) = (bbox, &pin.image) {
+                    let rect = bb.to_pdf(w, h);
+                    if text_rects.iter().any(|t| overlaps(t, &rect)) {
+                        continue; // text covers this region — show the text, not a crop on top
+                    }
                     let name = format!("Im{pic_no}");
                     if let Some(id) = embed_crop(doc, src, bb) {
-                        let [x0, y0, x1, y1] = bb.to_pdf(w, h);
+                        let [x0, y0, x1, y1] = rect;
                         let (iw, ih) = ((x1 - x0).max(1.0), (y1 - y0).max(1.0));
                         ops.push(Operation::new("q", vec![]));
                         ops.push(Operation::new("cm", vec![iw.into(), 0.into(), 0.into(), ih.into(), x0.into(), y0.into()]));
@@ -227,6 +303,7 @@ pub(crate) fn build_page_content(doc: &mut Document, pin: &PageInput) -> Result<
                         ops.push(Operation::new("Q", vec![]));
                         xobjects.push((name, id));
                         pic_no += 1;
+                        placed.push(rect); // text flows below a kept figure
                     }
                 }
             }
@@ -242,9 +319,18 @@ pub(crate) fn build_page_content(doc: &mut Document, pin: &PageInput) -> Result<
                     }
                     let bold = is_bold(b);
                     let font = if bold { "F2" } else { "F1" };
-                    let size = harmonize_size(natural_size(text, &bb, w, h, bold), body, bold);
+                    let size = resolve_size(text, &bb, w, h, bold, body);
+                    let [cx0, _, cx1, cy1] = bb.to_pdf(w, h);
+                    // Push this block below any placed block it horizontally overlaps.
+                    let mut top = cy1;
+                    for p in &placed {
+                        if cx0 < p[2] + 1.0 && p[0] < cx1 + 1.0 {
+                            top = top.min(p[1] - size * 0.3);
+                        }
+                    }
                     // Visible reflow: natural spacing (no per-line stretch).
-                    emit_wrapped_text(&mut ops, text, &bb, w, h, size, font, bold, false);
+                    let used = emit_wrapped_text(&mut ops, text, &bb, w, h, top, size, font, bold, false, false);
+                    placed.push([cx0, top - used, cx1, top]);
                 }
             }
         }
@@ -255,11 +341,13 @@ pub(crate) fn build_page_content(doc: &mut Document, pin: &PageInput) -> Result<
 /// Baseline-to-baseline spacing as a multiple of the font size.
 const LINE_SPACING: f32 = 1.16;
 
-/// Fraction of an element's bounding box that its text ink actually fills. Sizing text to
-/// fill 100% of the box inflates it (line spacing, word gaps, ragged right, partial last
-/// lines, and OCR boxes drawn loose around the ink all leave the box partly empty), so the
-/// fill-size estimate is scaled by this. Calibrated against real scans (~0.5).
-const TEXT_DENSITY: f32 = 0.5;
+/// Fraction of an element's bounding box that its text ink "fills" in the size estimate.
+/// In principle text doesn't fill 100% of its box (line spacing, word gaps, ragged right),
+/// which would argue for < 1 — but Helvetica is narrower than typical scan fonts, so our
+/// advance() under-counts width and the two effects roughly cancel. Calibrated against real
+/// scans (page 89/700 paragraphs land at the source's ~12 pt) at ≈1.0; a lower value
+/// under-fills the page (text too small).
+const TEXT_DENSITY: f32 = 1.0;
 
 /// Helvetica glyph advance (1000-em units) for a char, via its WinAnsi byte.
 fn glyph_adv(widths: &[u16; 256], c: char) -> f32 {
@@ -301,15 +389,6 @@ fn wrap_to_budget(widths: &[u16; 256], text: &str, budget: f32) -> Vec<String> {
     lines
 }
 
-/// Emit `text` positioned to fill its bounding box: the font size is derived from the box
-/// (not a fixed role size), the text is wrapped with real Helvetica metrics, and the lines
-/// are distributed down the box's height — so the rendered text tracks the page's real
-/// layout/scale instead of a generic 10 pt block.
-///
-/// `stretch` (used for the invisible overlay over a kept scan): horizontally scale each FULL
-/// line to span the box width, so text selection/highlight aligns with the scanned glyphs
-/// even when the original font is wider/narrower than Helvetica. Off for the visible reflow,
-/// where uniform spacing reads better.
 /// The font size an element's box alone implies, before page-level harmonization. The naive
 /// "size that fills the box area" overshoots — real text only fills a fraction of its box
 /// (line spacing, word gaps, ragged right, a partial last line, and OCR boxes drawn loose
@@ -322,10 +401,21 @@ fn natural_size(text: &str, bb: &BBox, w: f32, h: f32, bold: bool) -> f32 {
     let box_h = (y1 - y0).abs().max(1.0);
     let total = advance(widths, text).max(0.01);
     let fill = (box_h * box_w * TEXT_DENSITY / (total * LINE_SPACING)).sqrt();
-    fill.min(box_h / 1.35).clamp(4.0, 48.0)
+    // A single line shouldn't exceed the box; boxes bound a line ~1.2× the font (not 1.35×,
+    // which under-sized single lines).
+    fill.min(box_h / 1.2).clamp(4.0, 48.0)
 }
 
-fn emit_wrapped_text(ops: &mut Vec<Operation>, text: &str, bb: &BBox, w: f32, h: f32, size: f32, font: &str, bold: bool, stretch: bool) {
+/// Emit `text` wrapped to its box, with the first baseline placed just below `top_y` (the
+/// caller decides the top — for the reflow it's clamped so blocks can't overlap; for the
+/// overlay it's the box top). Returns the vertical extent consumed (top_y → text bottom) so
+/// the reflow can advance a non-overlapping cursor.
+///
+/// `spread`: distribute lines to fill the box height (overlay — matches the scan's line
+/// positions); otherwise use natural single-spacing (reflow — compact, no spill).
+/// `stretch`: horizontally scale each full line to span the box width (overlay — keeps text
+/// selection aligned with the scanned glyphs even under a different font).
+fn emit_wrapped_text(ops: &mut Vec<Operation>, text: &str, bb: &BBox, w: f32, h: f32, top_y: f32, size: f32, font: &str, bold: bool, stretch: bool, spread: bool) -> f32 {
     let widths = crate::afm::standard_widths("Helvetica", bold, false).unwrap_or(&[500u16; 256]);
     let [x0, y0, x1, y1] = bb.to_pdf(w, h);
     let box_w = (x1 - x0).abs().max(1.0);
@@ -333,10 +423,13 @@ fn emit_wrapped_text(ops: &mut Vec<Operation>, text: &str, bb: &BBox, w: f32, h:
 
     let lines = wrap_to_budget(widths, text, box_w / size);
     let n = lines.len().max(1);
-    // Baseline-to-baseline: natural spacing, allowed to open up to fill the box but never to
-    // a loose double-space (so a few short lines in a tall box don't drift apart).
-    let leading = (box_h / n as f32).max(size * LINE_SPACING).min(size * 1.5);
-    let mut y = y1 - size * 0.82; // first baseline just under the box top
+    let leading = if spread {
+        (box_h / n as f32).max(size * LINE_SPACING).min(size * 1.5)
+    } else {
+        size * LINE_SPACING
+    };
+    let mut y = top_y - size * 0.82; // first baseline just under the top
+    let mut last_baseline = y;
     let last = n - 1;
     for (i, line) in lines.iter().enumerate() {
         let bytes = to_winansi(line);
@@ -355,8 +448,11 @@ fn emit_wrapped_text(ops: &mut Vec<Operation>, text: &str, bb: &BBox, w: f32, h:
             ops.push(Operation::new("Tj", vec![Object::String(bytes, lopdf::StringFormat::Literal)]));
             ops.push(Operation::new("ET", vec![]));
         }
+        last_baseline = y;
         y -= leading;
     }
+    // Height from the requested top down to the descender of the last line.
+    (top_y - (last_baseline - size * 0.25)).max(size * 0.5)
 }
 
 fn emit_table_text(ops: &mut Vec<Operation>, t: &crate::ocr::doctags::Table, w: f32, h: f32, regular: &str, bold: &str) {
