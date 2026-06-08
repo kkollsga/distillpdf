@@ -17,8 +17,8 @@ backend, so a base install gives a precise, actionable error the moment OCR is u
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional
 
 
 class OcrDependencyError(ImportError):
@@ -49,7 +49,8 @@ class OcrConfig:
                 ambient HF_TOKEN / cached login).
     device:     "auto" | "cpu" | "metal" | "cuda" — backend maps as appropriate.
     prompt:     instruction given to the model (DocTags conversion by default).
-    max_tokens: generation cap per page.
+    max_tokens: generation cap per page (a backstop — stop_strings normally terminate).
+    stop_strings: strings that end generation (e.g. the DocTags end marker).
     """
 
     model_id: Optional[str] = None
@@ -57,10 +58,10 @@ class OcrConfig:
     hf_token: Optional[str] = None
     device: str = "auto"
     prompt: str = "Convert this page to docling."
-    # Per-image generation cap. Real content tops out ~1.6k tokens for a (tiled) half page;
-    # the surplus only ever gets filled by a repetition loop, so a tight cap bounds the
-    # worst-case page without ever clipping legitimate text (and the de-loop strips the rest).
-    max_tokens: int = 2048
+    # A full page at native resolution fits well under this; the DocTags end marker
+    # (stop_strings) is the real terminator, so this is just a runaway backstop.
+    max_tokens: int = 4096
+    stop_strings: List[str] = field(default_factory=list)
 
 
 class OcrBackend:
@@ -103,9 +104,21 @@ def available_backends() -> list[str]:
     return sorted(_BACKENDS)
 
 
-def get_backend(name: str = "granite-docling", **kwargs) -> OcrBackend:
-    """Construct a backend by name. Raises OcrDependencyError if its deps are missing,
-    with the exact install command."""
+def default_backend_name() -> str:
+    """The OCR backend for this platform: MLX granite-docling on Apple Silicon, otherwise
+    the (currently placeholder) PyTorch/vLLM backend for Windows/Linux."""
+    import platform
+
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        return "granite-docling"  # MLX, no PyTorch
+    return "granite-docling-pytorch"
+
+
+def get_backend(name: Optional[str] = None, **kwargs) -> OcrBackend:
+    """Construct a backend by name (default: the best one for this platform). Raises
+    OcrDependencyError if its deps are missing, with the exact install command."""
+    if name is None:
+        name = default_backend_name()
     try:
         factory = _BACKENDS[name]
     except KeyError:
@@ -254,4 +267,5 @@ builtins_open = _builtins.open
 
 # Built-in backends register themselves on import (lazily — importing this module does
 # NOT import their heavy dependencies).
-from . import _backends_granite  # noqa: E402,F401  (side-effect: registration)
+from . import _backends_mlx  # noqa: E402,F401  (side-effect: registration — Apple Silicon)
+from . import _backends_pytorch  # noqa: E402,F401  (side-effect: registration — Win/Linux placeholder)

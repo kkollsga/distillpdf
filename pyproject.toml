@@ -55,9 +55,16 @@ classifiers = [
 #  Rust ServerOcrEngine, or build from source with a future llama-cpp-2 cargo feature.)
 ocr = [
     "huggingface-hub>=0.23",
-    "llama-cpp-python>=0.3.0",
     "pillow>=10",
+    # Apple Silicon: run granite-docling natively on Metal via MLX. mlx-vlm pulls
+    # mlx + transformers but NOT PyTorch. transformers is pinned <5 (the idefics3 image
+    # processor changed in 5.x and breaks the MLX load).
+    "mlx-vlm>=0.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "transformers>=4.57,<5; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
+# Windows/Linux OCR (granite-docling via PyTorch/vLLM) is PLANNED — see
+# python/distillpdf/_backends_pytorch.py. When implemented it will install under a
+# separate extra so Apple-Silicon users never pull PyTorch.
 
 [project.scripts]
 distillpdf = "distillpdf.cli:main"
