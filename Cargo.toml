@@ -1,6 +1,6 @@
 [package]
 name = "distillpdf"
-version = "0.0.20"
+version = "0.0.21"
 edition = "2021"
 license = "MIT"
 description = "Pure-Rust PDF extraction (text/tables/figures/fonts) that distills documents into clean, LLM-ready HTML — on lopdf, for Python"
@@ -26,6 +26,7 @@ lopdf = "0.40"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 jpeg-decoder = "0.3"
+fax = "0.2"
 rayon = "1"
 
 [profile.release]

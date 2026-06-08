@@ -168,6 +168,47 @@ doc.extract_fonts()    # font inventory
 doc.page_count()       # number of pages
 ```
 
+## OCR — scanned PDFs
+
+Image-only / scanned pages have no text to extract. The optional `[ocr]` extra detects those
+pages, runs a local vision-OCR model ([granite-docling](https://huggingface.co/ibm-granite/granite-docling-258M))
+over them, and folds the recovered text back into the same HTML / Markdown / **searchable PDF**
+outputs — born-digital pages keep distillPDF's normal extraction.
+
+```bash
+pip install 'distillpdf[ocr]'      # adds llama-cpp-python + huggingface-hub + pillow
+```
+
+```python
+import distillpdf
+from distillpdf import ocr
+
+doc = distillpdf.open("scanned.pdf")
+backend = ocr.get_backend("granite-docling")   # downloads the GGUF on first use
+
+ocr.run(doc, backend)              # ONE model pass over every scanned page; cached on `doc`
+ocr.to_pdf(doc, path="out.pdf")    # searchable PDF (reuses the cache — no second pass)
+ocr.to_html(doc, path="out.html")  #   "
+ocr.to_markdown(doc, path="out.md")#   "
+```
+
+`ocr.run` OCRs each flagged page once and caches the result on the document, so every output
+is rendered from a single pass. Detection handles real-world scans — images nested in Form
+XObjects, CCITT Group-4 fax and Flate-wrapped JPEG encodings, and full-page rasters whose only
+text is an e-filing stamp.
+
+**Searchable-PDF modes** (`ocr.to_pdf`):
+
+- **keep the scan (default)** — the original page image is preserved and the OCR text is added
+  as an *invisible, selectable* layer over it. The scan always shows, so OCR errors never
+  destroy content (best for archival/legal use).
+- **`remove_raster=True`** — pages are reflowed to clean visible text + cropped figures and the
+  raster is dropped, for a much smaller file.
+
+> Quality scales with the model: granite-docling-258M is small and tuned for documents; clean
+> typed pages come out near-verbatim, dense or low-quality scans less so. See the
+> **[OCR example notebook »](examples/ocr.ipynb)**.
+
 ## Why distillPDF
 
 - **Structure, not just text.** Two-column reading order, multi-level table headers mapped
@@ -183,10 +224,10 @@ doc.page_count()       # number of pages
 
 ## Scope
 
-**In scope:** text, table, image, and font extraction, plus an HTML/markdown output layer
-for RAG and LLM ingestion.
+**In scope:** text, table, image, and font extraction; an HTML/markdown output layer for RAG
+and LLM ingestion; and optional OCR for scanned pages with a searchable-PDF writer.
 
-**Out of scope (for now):** page rendering, PDF generation, OCR.
+**Out of scope (for now):** page rendering.
 
 ## Comparison
 

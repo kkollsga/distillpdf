@@ -3,10 +3,18 @@
 //!
 //! Three cases the feature handles:
 //!  (a) page has an image but no extractable text          → `NeedsOcr`
-//!  (b) page has an image and only sparse/stamp text       → `NeedsOcr`
+//!  (b) page has a *full-page raster* and only stamp text  → `NeedsOcr`
+//!      (e.g. a scan with header/footer annotations baked in by the e-filing
+//!       system — the real content is the image, the text layer is boilerplate)
 //!  (c) page has an image and a *scanner/Tesseract* text   → `DropAndOcr`
 //!      layer (low-quality OCR baked into the PDF)
 //! A born-digital text page (no image, real text) is left untouched (`NotNeeded`).
+//!
+//! Image presence/coverage is measured with [`crate::img::positioned_images`], which
+//! recurses into Form XObjects and stitches tile mosaics. `Document::get_page_images`
+//! only scans the page's *direct* resources, so it misses the very common case of a
+//! scan wrapped in a single Form XObject (e.g. iText-produced e-filing PDFs) — every
+//! such page would otherwise be (wrongly) reported as having no image.
 
 use lopdf::{Document, Object, ObjectId};
 
@@ -24,20 +32,38 @@ pub(crate) enum OcrDecision {
 /// Below this many characters, an imaged page is treated as having no real text layer.
 const MIN_TEXT_CHARS: usize = 120;
 
+/// A page whose largest placed image covers at least this fraction of the page area is a
+/// full-page raster (a scan), as opposed to an inline figure on a born-digital page.
+const FULL_PAGE_COVER: f32 = 0.5;
+
+/// On a full-page scan, this many characters or fewer is treated as a stamp/boilerplate
+/// text layer (e-filing header/footer annotations) rather than a real body text layer —
+/// so the page is OCR'd. A real born-digital page carries far more text than this.
+const MAX_STAMP_CHARS: usize = 900;
+
 /// PDF producers/creators that indicate a baked-in OCR layer we shouldn't trust.
 const OCR_PRODUCERS: &[&str] = &[
     "tesseract", "abbyy", "finereader", "ocrmypdf", "ocr", "scan", "scansnap",
     "kofax", "omnipage", "readiris", "adobe acrobat capture", "paperport",
 ];
 
-/// Pure decision given the page facts. Separated for testability.
-fn decide_from(has_image: bool, n_text: usize, producer: &str, garbled: bool) -> OcrDecision {
+/// Pure decision given the page facts (`coverage` = largest placed image as a fraction of
+/// the page area). Separated for testability.
+fn decide_from(has_image: bool, coverage: f32, n_text: usize, producer: &str, garbled: bool) -> OcrDecision {
     if !has_image {
         return OcrDecision::NotNeeded;
     }
+    // Image page with essentially no extractable text → OCR.
     if n_text < MIN_TEXT_CHARS {
         return OcrDecision::NeedsOcr;
     }
+    // Full-page raster whose only text is a stamp/boilerplate header → the real content
+    // lives in the image; OCR it. (This separates a scan with margin stamps from a
+    // born-digital page that merely embeds a small figure alongside real text.)
+    if coverage >= FULL_PAGE_COVER && n_text <= MAX_STAMP_CHARS {
+        return OcrDecision::NeedsOcr;
+    }
+    // Image page with a baked, untrusted OCR/scanner text layer → drop it and re-OCR.
     if looks_like_ocr_producer(producer) || garbled {
         return OcrDecision::DropAndOcr;
     }
@@ -46,14 +72,31 @@ fn decide_from(has_image: bool, n_text: usize, producer: &str, garbled: bool) ->
 
 /// Per-page OCR decision against a real document.
 pub(crate) fn decide(doc: &Document, page_id: ObjectId, raw: &[u8]) -> OcrDecision {
-    let has_image = doc.get_page_images(page_id).map(|v| !v.is_empty()).unwrap_or(false);
-    if !has_image {
-        return OcrDecision::NotNeeded;
+    let coverage = image_coverage(doc, page_id);
+    if coverage <= 0.0 {
+        return OcrDecision::NotNeeded; // no renderable image → leave the page alone
     }
     let txt = text::extract_page(doc, page_id, raw).unwrap_or_default();
     let n = txt.trim().chars().count();
     let producer = doc_producer(doc).unwrap_or_default();
-    decide_from(has_image, n, &producer, text_is_garbled(&txt))
+    decide_from(true, coverage, n, &producer, text_is_garbled(&txt))
+}
+
+/// Largest single placed image as a fraction of the page area, via the HTML image walker
+/// (recurses into Form XObjects, stitches tile mosaics into one bbox). `0.0` means no
+/// renderable figure-sized image — the same view the OCR image extractor (`page_main_image`)
+/// has, so detection never flags a page whose image we couldn't actually read.
+fn image_coverage(doc: &Document, page_id: ObjectId) -> f32 {
+    let placed = crate::img::positioned_images(doc, page_id, false);
+    if placed.is_empty() {
+        return 0.0;
+    }
+    let (w, h) = super::page_size_pts(doc, page_id);
+    let page_area = (w * h).max(1.0);
+    placed
+        .iter()
+        .map(|p| ((p.x_right - p.x_left).abs() * (p.y_top - p.y_bottom).abs()) / page_area)
+        .fold(0.0_f32, f32::max)
 }
 
 fn looks_like_ocr_producer(s: &str) -> bool {
@@ -127,31 +170,45 @@ mod tests {
 
     #[test]
     fn no_image_never_ocr() {
-        assert_eq!(decide_from(false, 0, "", false), OcrDecision::NotNeeded);
-        assert_eq!(decide_from(false, 9999, "tesseract", true), OcrDecision::NotNeeded);
+        assert_eq!(decide_from(false, 0.0, 0, "", false), OcrDecision::NotNeeded);
+        assert_eq!(decide_from(false, 1.0, 9999, "tesseract", true), OcrDecision::NotNeeded);
     }
 
     #[test]
     fn image_no_text_needs_ocr() {
-        assert_eq!(decide_from(true, 0, "", false), OcrDecision::NeedsOcr);
-        assert_eq!(decide_from(true, 50, "PJe", false), OcrDecision::NeedsOcr); // stamp-only
+        assert_eq!(decide_from(true, 0.9, 0, "", false), OcrDecision::NeedsOcr);
+        assert_eq!(decide_from(true, 0.9, 50, "PJe", false), OcrDecision::NeedsOcr); // stamp-only
     }
 
     #[test]
-    fn image_good_digital_text_left_alone() {
-        assert_eq!(decide_from(true, 3000, "Microsoft Word", false), OcrDecision::NotNeeded);
+    fn full_page_scan_with_stamp_text_needs_ocr() {
+        // The reported bug: a full-page scan (iText e-filing) whose only text is a
+        // header/footer stamp (~388 chars) and a clean, non-OCR producer.
+        assert_eq!(
+            decide_from(true, 0.89, 388, "iText® 5.4.1 ©2000-2012 1T3XT BVBA", false),
+            OcrDecision::NeedsOcr
+        );
+    }
+
+    #[test]
+    fn small_figure_with_real_text_left_alone() {
+        // Born-digital page: a small logo (low coverage) beside real body text.
+        assert_eq!(decide_from(true, 0.05, 3000, "Microsoft Word", false), OcrDecision::NotNeeded);
+        // Even a large figure is left alone when accompanied by substantial real text.
+        assert_eq!(decide_from(true, 0.7, 3000, "Microsoft Word", false), OcrDecision::NotNeeded);
     }
 
     #[test]
     fn scanner_producer_drops_layer() {
-        assert_eq!(decide_from(true, 3000, "Tesseract OCR 5.3", false), OcrDecision::DropAndOcr);
-        assert_eq!(decide_from(true, 3000, "ABBYY FineReader", false), OcrDecision::DropAndOcr);
-        assert_eq!(decide_from(true, 3000, "ocrmypdf 14", false), OcrDecision::DropAndOcr);
+        // Full-page scan with an abundant (>stamp) baked OCR layer from a flagged producer.
+        assert_eq!(decide_from(true, 0.95, 3000, "Tesseract OCR 5.3", false), OcrDecision::DropAndOcr);
+        assert_eq!(decide_from(true, 0.95, 3000, "ABBYY FineReader", false), OcrDecision::DropAndOcr);
+        assert_eq!(decide_from(true, 0.95, 3000, "ocrmypdf 14", false), OcrDecision::DropAndOcr);
     }
 
     #[test]
     fn garbled_text_drops_layer() {
-        assert_eq!(decide_from(true, 3000, "Unknown", true), OcrDecision::DropAndOcr);
+        assert_eq!(decide_from(true, 0.95, 3000, "Unknown", true), OcrDecision::DropAndOcr);
     }
 
     #[test]

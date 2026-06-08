@@ -162,7 +162,10 @@ fn capture_balanced(html: &str, start: usize, tag: &str) -> String {
                 return html[start..i].to_string();
             }
         } else {
-            i += 1;
+            // Advance one full UTF-8 char, not one byte — SVG content may hold multi-byte
+            // chars (e.g. accented text labels), and a byte step would land `i` mid-char and
+            // panic the next `html[i..]`.
+            i += html[i..].chars().next().map_or(1, |c| c.len_utf8());
         }
     }
     html[start..].to_string()
@@ -869,4 +872,18 @@ fn clone_node(n: &Node) -> Node {
 }
 fn clone_nodes(nodes: &[Node]) -> Vec<Node> {
     nodes.iter().map(clone_node).collect()
+}
+
+#[cfg(test)]
+mod md_tests {
+    use super::*;
+
+    #[test]
+    fn svg_with_multibyte_chars_does_not_panic() {
+        // Regression: capture_balanced stepped one BYTE at a time, landing mid-char on
+        // multi-byte UTF-8 (e.g. the accented label below) and panicking on the next slice.
+        let html = "<body><p>Antes</p><svg><text>Inválido Ré Ção</text></svg><p>Depois</p></body>";
+        let (md, _) = html_to_markdown(html, false, ImgMode::Placeholder);
+        assert!(md.contains("Antes") && md.contains("Depois"));
+    }
 }

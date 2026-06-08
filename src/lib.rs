@@ -66,6 +66,45 @@ fn parse_image_mode(s: &str, writing: bool, string_fallback: markdown::ImgMode) 
     }
 }
 
+/// Append `stream_id` to a page's `/Contents` (PDF concatenates a content array), so an
+/// extra content stream — e.g. the invisible OCR text overlay — draws after the page's own
+/// content while leaving it untouched.
+fn append_page_content(doc: &mut Document, page_id: lopdf::ObjectId, stream_id: lopdf::ObjectId) {
+    let Ok(page) = doc.get_object_mut(page_id).and_then(|o| o.as_dict_mut()) else { return };
+    let new = match page.get(b"Contents").ok().cloned() {
+        Some(lopdf::Object::Array(mut a)) => {
+            a.push(lopdf::Object::Reference(stream_id));
+            lopdf::Object::Array(a)
+        }
+        Some(existing @ lopdf::Object::Reference(_)) => lopdf::Object::Array(vec![existing, lopdf::Object::Reference(stream_id)]),
+        _ => lopdf::Object::Reference(stream_id),
+    };
+    page.set("Contents", new);
+}
+
+/// Give a page its own `/Resources` carrying the OCR overlay fonts (under names distinct from
+/// the page's own fonts), preserving its existing resources so the page's raster/text still
+/// render. Used by the keep-raster searchable-PDF path.
+fn add_overlay_fonts(doc: &mut Document, page_id: lopdf::ObjectId, helv: lopdf::ObjectId, helv_b: lopdf::ObjectId) {
+    // Resolve the page's effective resources (own or inherited from /Pages), as an owned copy.
+    let mut res = match doc.get_page_resources(page_id) {
+        Ok((Some(d), _)) => d.clone(),
+        Ok((None, ids)) => ids.first().and_then(|id| doc.get_dictionary(*id).ok()).cloned().unwrap_or_default(),
+        Err(_) => lopdf::Dictionary::new(),
+    };
+    let mut fonts = match res.get(b"Font").ok().cloned() {
+        Some(lopdf::Object::Dictionary(d)) => d,
+        Some(lopdf::Object::Reference(r)) => doc.get_dictionary(r).cloned().unwrap_or_default(),
+        _ => lopdf::Dictionary::new(),
+    };
+    fonts.set(ocr::pdf::OVERLAY_FONT, lopdf::Object::Reference(helv));
+    fonts.set(ocr::pdf::OVERLAY_FONT_BOLD, lopdf::Object::Reference(helv_b));
+    res.set("Font", fonts);
+    if let Ok(page) = doc.get_object_mut(page_id).and_then(|o| o.as_dict_mut()) {
+        page.set("Resources", lopdf::Object::Dictionary(res));
+    }
+}
+
 /// A loaded PDF document.
 #[pyclass]
 struct Pdf {
@@ -75,6 +114,10 @@ struct Pdf {
     /// Source path (`open`); `None` when constructed from bytes. Used to derive the
     /// default `<source>.html` / `<source>.md` output name when `outputfile=True`.
     source: Option<std::path::PathBuf>,
+    /// Cached OCR results: `{1-based page: DocTags}`, populated once by `set_ocr` (the
+    /// `distillpdf.ocr.run` orchestrator) so a single model pass feeds every renderer
+    /// (`to_pdf` / OCR-augmented HTML / Markdown) — the model never re-runs per output.
+    ocr_cache: std::sync::Mutex<std::collections::HashMap<u32, String>>,
 }
 
 impl Pdf {
@@ -143,7 +186,7 @@ impl Pdf {
         let raw = std::fs::read(path).map_err(|e| PyValueError::new_err(format!("read failed: {e}")))?;
         let doc =
             Document::load_mem(&raw).map_err(|e| PyValueError::new_err(format!("open failed: {e}")))?;
-        Ok(Pdf { doc, raw, source: Some(std::path::PathBuf::from(path)) })
+        Ok(Pdf { doc, raw, source: Some(std::path::PathBuf::from(path)), ocr_cache: Default::default() })
     }
 
     /// Open a PDF from raw bytes. There is no source path, so writing output with
@@ -153,7 +196,7 @@ impl Pdf {
         let raw = data.to_vec();
         let doc =
             Document::load_mem(&raw).map_err(|e| PyValueError::new_err(format!("parse failed: {e}")))?;
-        Ok(Pdf { doc, raw, source: None })
+        Ok(Pdf { doc, raw, source: None, ocr_cache: Default::default() })
     }
 
     /// Number of pages.
@@ -384,11 +427,44 @@ impl Pdf {
         Ok(list)
     }
 
-    /// Write a clean, searchable PDF: pages in `ocr` (a {1-based page: DocTags} map) are
-    /// rebuilt as real text + cropped figures (raster dropped); all other pages are kept
-    /// verbatim. This is what makes `to_html(in) ≈ to_html(to_pdf(in))` hold. Returns `1`.
-    #[pyo3(signature = (path, ocr))]
-    fn to_pdf(&self, py: Python<'_>, path: &str, ocr: std::collections::HashMap<u32, String>) -> PyResult<Py<PyAny>> {
+    /// Store OCR results on this object: `ocr` is a `{1-based page: DocTags}` map produced
+    /// by one model pass. Once set, `to_pdf` (and the `distillpdf.ocr` HTML/Markdown
+    /// orchestrators) reuse it, so the model runs **once** regardless of how many outputs
+    /// are produced. Merges into any existing cache. Returns the cached page count.
+    fn set_ocr(&self, ocr: std::collections::HashMap<u32, String>) -> PyResult<usize> {
+        let mut cache = self.ocr_cache.lock().map_err(|_| PyValueError::new_err("ocr cache poisoned"))?;
+        cache.extend(ocr);
+        Ok(cache.len())
+    }
+
+    /// The cached OCR results (`{page: DocTags}`), empty if `set_ocr` was never called.
+    fn get_ocr(&self) -> PyResult<std::collections::HashMap<u32, String>> {
+        Ok(self.ocr_cache.lock().map_err(|_| PyValueError::new_err("ocr cache poisoned"))?.clone())
+    }
+
+    /// True if OCR results have been cached on this object (a model pass already ran).
+    fn has_ocr(&self) -> PyResult<bool> {
+        Ok(!self.ocr_cache.lock().map_err(|_| PyValueError::new_err("ocr cache poisoned"))?.is_empty())
+    }
+
+    /// Write a searchable PDF from the OCR results (`ocr`, a `{1-based page: DocTags}` map;
+    /// when omitted the results cached on this object via `set_ocr` are used).
+    ///
+    /// Two modes, controlled by `remove_raster`:
+    /// * `False` (default) — **keep the original scan** and add the OCR text as an INVISIBLE
+    ///   (selectable/searchable) layer over it. The scan stays exactly as-is, so OCR errors
+    ///   never destroy content — the safe choice for archival/legal use.
+    /// * `True` — **clean reflow**: rebuild OCR'd pages as real visible text + cropped figure
+    ///   regions and drop the page raster (a much smaller file; makes
+    ///   `to_html(in) ≈ to_html(to_pdf(in))` hold). OCR errors are then the only text.
+    ///
+    /// Non-OCR'd pages are kept verbatim either way. Returns `1`.
+    #[pyo3(signature = (path, ocr=None, remove_raster=false))]
+    fn to_pdf(&self, py: Python<'_>, path: &str, ocr: Option<std::collections::HashMap<u32, String>>, remove_raster: bool) -> PyResult<Py<PyAny>> {
+        let ocr = match ocr {
+            Some(m) => m,
+            None => self.ocr_cache.lock().map_err(|_| PyValueError::new_err("ocr cache poisoned"))?.clone(),
+        };
         let buf = py.allow_threads(|| -> Result<Vec<u8>, String> {
             let mut doc = Document::load_mem(&self.raw).map_err(|e| e.to_string())?;
             let (helv, helv_b) = ocr::pdf::add_fonts(&mut doc);
@@ -396,28 +472,38 @@ impl Pdf {
             for (&pno, &page_id) in &pages {
                 let Some(dt) = ocr.get(&pno) else { continue };
                 let (w, h) = ocr::page_size_pts(&doc, page_id);
-                let image = ocr::page_main_image(&doc, page_id).map(|(_, img)| img);
-                let pin = ocr::pdf::PageInput { page: ocr::doctags::parse(dt), width: w, height: h, image };
-                let (content, xobjs) = ocr::pdf::build_page_content(&mut doc, &pin)?;
-                let data = content.encode().map_err(|e| e.to_string())?;
-                let stream_id = doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), data));
-                // Replace the page's content with our clean stream + matching resources.
-                // (The old full-page image XObject simply goes undrawn.)
-                let mut xo = lopdf::Dictionary::new();
-                for (name, id) in &xobjs {
-                    xo.set(name.as_bytes().to_vec(), lopdf::Object::Reference(*id));
+                if remove_raster {
+                    // Clean reflow: replace the page's content with our text + cropped figures.
+                    let image = ocr::page_main_image(&doc, page_id).map(|(_, img)| img);
+                    let pin = ocr::pdf::PageInput { page: ocr::doctags::parse(dt), width: w, height: h, image };
+                    let (content, xobjs) = ocr::pdf::build_page_content(&mut doc, &pin)?;
+                    let data = content.encode().map_err(|e| e.to_string())?;
+                    let stream_id = doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), data));
+                    // (The old full-page image XObject simply goes undrawn, then is pruned.)
+                    let mut xo = lopdf::Dictionary::new();
+                    for (name, id) in &xobjs {
+                        xo.set(name.as_bytes().to_vec(), lopdf::Object::Reference(*id));
+                    }
+                    let res = dictionary! {
+                        "Font" => dictionary! { "F1" => helv, "F2" => helv_b },
+                        "XObject" => xo,
+                    };
+                    let page = doc.get_object_mut(page_id).map_err(|e| e.to_string())?.as_dict_mut().map_err(|e| e.to_string())?;
+                    page.set("Contents", lopdf::Object::Reference(stream_id));
+                    page.set("Resources", lopdf::Object::Dictionary(res));
+                } else {
+                    // Keep the scan: append an invisible OCR text layer over the original page.
+                    let pin = ocr::pdf::PageInput { page: ocr::doctags::parse(dt), width: w, height: h, image: None };
+                    let data = ocr::pdf::build_text_overlay(&pin).encode().map_err(|e| e.to_string())?;
+                    let stream_id = doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), data));
+                    append_page_content(&mut doc, page_id, stream_id);
+                    add_overlay_fonts(&mut doc, page_id, helv, helv_b);
                 }
-                let res = dictionary! {
-                    "Font" => dictionary! { "F1" => helv, "F2" => helv_b },
-                    "XObject" => xo,
-                };
-                let page = doc.get_object_mut(page_id).map_err(|e| e.to_string())?.as_dict_mut().map_err(|e| e.to_string())?;
-                page.set("Contents", lopdf::Object::Reference(stream_id));
-                page.set("Resources", lopdf::Object::Dictionary(res));
             }
-            // Drop the now-unreferenced full-page rasters + old content streams so the
-            // clean PDF is actually small ("remove rasters").
-            doc.prune_objects();
+            if remove_raster {
+                // Drop the now-unreferenced full-page rasters + old content streams.
+                doc.prune_objects();
+            }
             let mut buf = Vec::new();
             doc.save_to(&mut buf).map_err(|e| e.to_string())?;
             Ok(buf)
@@ -504,6 +590,19 @@ fn ocr_doctags_to_html(doctags: &str) -> String {
     ocr::render::doctags_to_html(doctags)
 }
 
+/// Convert a distillPDF HTML document to Markdown. Exposed so the OCR orchestrator can
+/// derive Markdown from the *same* OCR-augmented HTML it already built — one model pass
+/// feeds both outputs. `image_mode`: "drop" (caption placeholders), "embed" (data URIs),
+/// "external" (returns the figure files to write alongside the .md). Returns
+/// `(markdown, [(relative_path, bytes), …])`.
+#[pyfunction]
+#[pyo3(signature = (html, toc=true, image_mode="drop"))]
+fn html_to_markdown(html: &str, toc: bool, image_mode: &str) -> PyResult<(String, Vec<(String, Vec<u8>)>)> {
+    let im = parse_image_mode(image_mode, true, markdown::ImgMode::Placeholder)?;
+    let (md, files) = markdown::html_to_markdown(html, toc, im);
+    Ok((md, files.into_iter().map(|f| (f.path, f.bytes)).collect()))
+}
+
 /// OCR: join a list of per-page DocTags into a full distillPDF-style HTML document.
 #[pyfunction]
 fn ocr_doctags_doc_html(pages: Vec<String>) -> String {
@@ -544,6 +643,7 @@ fn _distillpdf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(from_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(ocr_doctags_to_html, m)?)?;
+    m.add_function(wrap_pyfunction!(html_to_markdown, m)?)?;
     m.add_function(wrap_pyfunction!(ocr_doctags_doc_html, m)?)?;
     m.add_function(wrap_pyfunction!(ocr_doctags_to_pdf, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;

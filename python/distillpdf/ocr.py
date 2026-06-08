@@ -126,17 +126,43 @@ except ImportError:  # pragma: no cover
     pass
 
 
-def _doctags_for(pdf, backend: OcrBackend, only: Optional[set] = None) -> Dict[int, str]:
-    """Run `backend` on every page the Rust core flags for OCR; return {page: DocTags}."""
+def _doctags_for(pdf, backend: OcrBackend, only: Optional[set] = None,
+                 progress: Optional[Callable[[int, int, int], None]] = None) -> Dict[int, str]:
+    """Run `backend` on every page the Rust core flags for OCR; return {page: DocTags}.
+
+    `progress(page, done, total)` is called after each page if given."""
+    plan = [it for it in pdf.ocr_plan()
+            if it["needs_ocr"] and it["image"] and (only is None or it["page"] in only)]
+    total = len(plan)
     out: Dict[int, str] = {}
-    for item in pdf.ocr_plan():
-        if not item["needs_ocr"] or (only is not None and item["page"] not in only):
-            continue
-        img = item["image"]
-        if not img:
-            continue
-        out[item["page"]] = backend.ocr_page(bytes(img))
+    for i, item in enumerate(plan, 1):
+        out[item["page"]] = backend.ocr_page(bytes(item["image"]))
+        if progress:
+            progress(item["page"], i, total)
     return out
+
+
+def run(pdf, backend: OcrBackend, *, only: Optional[set] = None,
+        progress: Optional[Callable[[int, int, int], None]] = None) -> Dict[int, str]:
+    """Run the OCR model **once** over every flagged page and cache the result *on the
+    `pdf` object* (``pdf.set_ocr``). After this, ``ocr.to_pdf`` / ``ocr.to_html`` /
+    ``ocr.to_markdown`` reuse the cached DocTags — the model does not run again. Returns
+    the ``{page: DocTags}`` map."""
+    doctags = _doctags_for(pdf, backend, only=only, progress=progress)
+    pdf.set_ocr(doctags)
+    return doctags
+
+
+def _resolve_doctags(pdf, backend: Optional[OcrBackend]) -> Dict[int, str]:
+    """The cached OCR results, running `backend` once (and caching) if none are cached yet."""
+    if pdf.has_ocr():
+        return pdf.get_ocr()
+    if backend is None:
+        raise ValueError(
+            "no cached OCR results on this pdf; call distillpdf.ocr.run(pdf, backend) first, "
+            "or pass a backend."
+        )
+    return run(pdf, backend)
 
 
 def _splice(page_html: str, fragments: Dict[int, str]) -> str:
@@ -153,16 +179,24 @@ def _splice(page_html: str, fragments: Dict[int, str]) -> str:
     )
 
 
-def to_html(pdf, backend: OcrBackend, *, path: Optional[str] = None,
+def _augmented_html(pdf, backend: Optional[OcrBackend], image_mode: str) -> str:
+    """The page-mode HTML with OCR fragments spliced in, using cached OCR (running the
+    backend once if nothing is cached yet)."""
+    from ._distillpdf import ocr_doctags_to_html
+
+    doctags = _resolve_doctags(pdf, backend)
+    fragments = {p: ocr_doctags_to_html(dt) for p, dt in doctags.items()}
+    base = pdf.to_html(mode="page", return_string=True, image_mode=image_mode)
+    return _splice(base, fragments) if fragments else base
+
+
+def to_html(pdf, backend: Optional[OcrBackend] = None, *, path: Optional[str] = None,
             return_string: bool = True, image_mode: str = "embed") -> str:
     """OCR-augmented HTML: image-only/scanned pages are rendered from the model's DocTags;
     born-digital pages keep distillPDF's normal extraction. Pages are spliced into the
-    page-mode document so structure stays consistent."""
-    from ._distillpdf import ocr_doctags_to_html
-
-    fragments = {p: ocr_doctags_to_html(dt) for p, dt in _doctags_for(pdf, backend).items()}
-    base = pdf.to_html(mode="page", return_string=True, image_mode=image_mode)
-    html = _splice(base, fragments) if fragments else base
+    page-mode document so structure stays consistent. Reuses OCR cached on `pdf` (via
+    ``ocr.run``); if none is cached, runs `backend` once and caches it."""
+    html = _augmented_html(pdf, backend, image_mode)
     if path:
         with builtins_open(path, "w", encoding="utf-8") as f:
             f.write(html)
@@ -170,10 +204,41 @@ def to_html(pdf, backend: OcrBackend, *, path: Optional[str] = None,
     return html
 
 
-def to_pdf(pdf, backend: OcrBackend, path: str) -> str:
-    """Write a clean, searchable PDF: OCR'd pages are rebuilt as real text + cropped
-    figures (raster dropped); born-digital pages are kept verbatim."""
-    pdf.to_pdf(path, _doctags_for(pdf, backend))
+def to_markdown(pdf, backend: Optional[OcrBackend] = None, *, path: Optional[str] = None,
+                return_string: bool = True, toc: bool = True, image_mode: str = "drop") -> str:
+    """OCR-augmented Markdown, derived from the *same* OCR HTML as ``to_html`` — no extra
+    model pass. Reuses OCR cached on `pdf`; runs `backend` once if nothing is cached."""
+    from ._distillpdf import html_to_markdown
+
+    # Markdown can't inline figures usefully; "external" writes them next to the .md.
+    html = _augmented_html(pdf, backend, "embed" if image_mode == "embed" else "drop")
+    md, files = html_to_markdown(html, toc, image_mode)
+    if path:
+        with builtins_open(path, "w", encoding="utf-8") as f:
+            f.write(md)
+        if files:
+            import os
+            base = os.path.dirname(path) or "."
+            for rel, data in files:
+                fp = os.path.join(base, rel)
+                os.makedirs(os.path.dirname(fp), exist_ok=True)
+                with builtins_open(fp, "wb") as f:
+                    f.write(bytes(data))
+        return path
+    return md
+
+
+def to_pdf(pdf, backend: Optional[OcrBackend] = None, path: str = None,
+           *, remove_raster: bool = False) -> str:
+    """Write a searchable PDF from the OCR results. By default (``remove_raster=False``) the
+    original scan is KEPT and the OCR text is added as an invisible, selectable layer over it
+    — OCR errors never destroy content (best for archival/legal use). With
+    ``remove_raster=True`` the OCR'd pages are reflowed to visible text + cropped figures and
+    the raster is dropped (much smaller file). Reuses OCR cached on `pdf` (via ``ocr.run``);
+    if none is cached, runs `backend` once and caches it."""
+    if path is None:
+        raise ValueError("to_pdf requires an output path")
+    pdf.to_pdf(path, _resolve_doctags(pdf, backend), remove_raster=remove_raster)
     return path
 
 

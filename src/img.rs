@@ -104,6 +104,52 @@ fn filters_of(dict: &Dictionary) -> Vec<Vec<u8>> {
     }
 }
 
+/// A content stream's decoded bytes. lopdf's `decompressed_content()` returns an error for an
+/// UNFILTERED stream (no `/Filter` key) — some producers store form XObject / content streams
+/// raw — so fall back to the verbatim content in that case (and on any decode error) rather
+/// than losing the stream.
+fn stream_content(stream: &lopdf::Stream) -> std::borrow::Cow<'_, [u8]> {
+    if stream.dict.get(b"Filter").is_err() {
+        return std::borrow::Cow::Borrowed(&stream.content);
+    }
+    match stream.decompressed_content() {
+        Ok(b) => std::borrow::Cow::Owned(b),
+        Err(_) => std::borrow::Cow::Borrowed(&stream.content),
+    }
+}
+
+/// Generic (non-image-codec) compression filters that an image codec can be wrapped in,
+/// e.g. `[FlateDecode, DCTDecode]` — a JPEG stored Flate-compressed. These are exactly the
+/// ones lopdf's `decompressed_content` can apply.
+fn is_generic_filter(f: &[u8]) -> bool {
+    matches!(f, b"FlateDecode" | b"Fl" | b"LZWDecode" | b"LZW" | b"ASCII85Decode" | b"A85")
+}
+
+/// The image codec payload: the stream bytes after peeling any leading generic compression
+/// layers (Flate/LZW/ASCII85), but BEFORE the terminal image codec (DCT/CCITT/JPX/JBIG2),
+/// which the codec decoders read directly. For the common single-filter case this is just
+/// `stream.content`. We peel by handing lopdf a copy whose `/Filter` lists only the leading
+/// generic filters — so it stops before the codec it can't decode.
+fn image_payload(stream: &lopdf::Stream) -> std::borrow::Cow<'_, [u8]> {
+    let filters = filters_of(&stream.dict);
+    let lead: Vec<Object> = filters
+        .iter()
+        .take_while(|f| is_generic_filter(f))
+        .map(|f| Object::Name(f.clone()))
+        .collect();
+    if lead.is_empty() {
+        return std::borrow::Cow::Borrowed(&stream.content);
+    }
+    let mut s = stream.clone();
+    s.dict.set("Filter", Object::Array(lead));
+    s.dict.remove(b"DecodeParms"); // codec parms (e.g. CCITT) don't apply to the generic layers
+    s.dict.remove(b"DP");
+    match s.decompressed_content() {
+        Ok(b) => std::borrow::Cow::Owned(b),
+        Err(_) => std::borrow::Cow::Borrowed(&stream.content),
+    }
+}
+
 /// The Adobe APP14 `transform` byte of a JPEG, if the marker is present.
 /// `2` = YCCK (Photoshop/Adobe CMYK, stored with inverted polarity).
 fn adobe_transform(buf: &[u8]) -> Option<u8> {
@@ -226,6 +272,90 @@ fn decode_inverts(dict: &Dictionary) -> bool {
     }
 }
 
+/// The `/DecodeParms` fields that govern a CCITTFax stream.
+struct CcittParms {
+    /// Encoding scheme: `< 0` → Group 4 (T.6, pure 2-D); `>= 0` → Group 3 (T.4).
+    k: i64,
+    /// Pixels per row (PDF default 1728).
+    columns: u32,
+    /// Image height in rows; `0` when absent (decode runs to the end-of-block marker).
+    rows: u32,
+    /// When true, 1 bits are black (inverts the default 0=black mapping).
+    black_is1: bool,
+}
+
+/// Read the CCITTFax `/DecodeParms` (or the abbreviated `/DP`), which may be a single dict
+/// or — when the stream has a filter chain — an array of per-filter dicts.
+fn ccitt_parms(doc: &Document, dict: &Dictionary) -> CcittParms {
+    let raw = dict.get(b"DecodeParms").or_else(|_| dict.get(b"DP")).ok().and_then(|o| deref(doc, o));
+    let pd: Option<&Dictionary> = match raw {
+        Some(Object::Dictionary(d)) => Some(d),
+        Some(Object::Array(a)) => a.iter().filter_map(|o| deref(doc, o)).find_map(|o| o.as_dict().ok()),
+        _ => None,
+    };
+    let geti = |k: &[u8], def: i64| pd.and_then(|d| d.get(k).ok()).and_then(|o| o.as_i64().ok()).unwrap_or(def);
+    let getb = |k: &[u8]| pd.and_then(|d| d.get(k).ok()).and_then(|o| o.as_bool().ok()).unwrap_or(false);
+    CcittParms {
+        k: geti(b"K", 0),
+        columns: geti(b"Columns", 1728).max(0) as u32,
+        rows: geti(b"Rows", 0).max(0) as u32,
+        black_is1: getb(b"BlackIs1"),
+    }
+}
+
+/// Decode a CCITT Group 3/4 fax image (the encoding of most black-and-white PDF scans) to
+/// grayscale. lopdf cannot apply this filter, so the raw (encoded) stream bytes are decoded
+/// here via the pure-Rust `fax` crate. Honors `/DecodeParms` (`K`, `Columns`, `Rows`,
+/// `BlackIs1`) and an inverting `/Decode` array. `content` must be the raw CCITT bitstream.
+fn decode_ccitt(doc: &Document, dict: &Dictionary, content: &[u8]) -> Option<image::GrayImage> {
+    use fax::decoder::{decode_g3, decode_g4, pels};
+    use fax::Color;
+
+    let parms = ccitt_parms(doc, dict);
+    let cols = parms.columns;
+    let img_h = dict.get(b"Height").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0).max(0) as u32;
+    let rows = if parms.rows > 0 { parms.rows } else { img_h };
+    if cols == 0 || !dims_sane(cols, rows.max(1)) {
+        return None;
+    }
+    let width = cols.min(u16::MAX as u32) as u16;
+
+    // Default (BlackIs1=false): a fax-"black" pel is a black pixel (0). A `/Decode [1 0]`
+    // array flips the mapping; the two inversions compose.
+    let invert = parms.black_is1 ^ decode_inverts(dict);
+    let (black, white) = if invert { (255u8, 0u8) } else { (0u8, 255u8) };
+
+    let mut buf: Vec<u8> = Vec::new();
+    let cap = (cols as usize).saturating_mul(rows.max(1) as usize).min(MAX_IMAGE_PIXELS);
+    buf.try_reserve(cap).ok()?;
+    let mut emit = |line: &[u16]| {
+        for c in pels(line, width) {
+            buf.push(match c {
+                Color::Black => black,
+                Color::White => white,
+            });
+        }
+    };
+    // On a truncated/corrupt stream the decoder stops early; keep the rows it produced
+    // (a partial scan still OCRs) rather than discarding the page.
+    if parms.k < 0 {
+        // Group 4: known height lets the decoder pad omitted trailing white rows.
+        let max_rows = if rows > 0 { Some(rows.min(u16::MAX as u32) as u16) } else { None };
+        let _ = decode_g4(content.iter().copied(), width, max_rows, &mut emit);
+    } else {
+        // Group 3 (rare in PDFs): rows are delimited in-band.
+        let _ = decode_g3(content.iter().copied(), &mut emit);
+    }
+
+    let stride = cols as usize;
+    if stride == 0 || buf.len() < stride {
+        return None;
+    }
+    let h = (buf.len() / stride) as u32;
+    buf.truncate(stride * h as usize);
+    image::GrayImage::from_raw(cols, h, buf)
+}
+
 /// Decode an image stream to RGB8, handling JPEG (DCTDecode) and Flate/raw
 /// samples (gray/rgb). Returns None for formats we don't assemble.
 /// Per-dimension sanity cap and a total-pixel ceiling. A malformed/hostile stream can declare
@@ -243,9 +373,14 @@ fn decode_rgb(doc: &Document, id: ObjectId) -> Option<image::RgbImage> {
     let dict = &stream.dict;
     let filters = filters_of(dict);
     if filters.iter().any(|f| f == b"DCTDecode") {
-        return decode_jpeg_rgb(&stream.content, decode_inverts(dict));
+        return decode_jpeg_rgb(&image_payload(stream), decode_inverts(dict));
     }
-    if filters.iter().any(|f| f == b"JPXDecode" || f == b"CCITTFaxDecode" || f == b"JBIG2Decode") {
+    if filters.iter().any(|f| f == b"CCITTFaxDecode") {
+        // Fax bitstreams are 1-bpc gray; lopdf can't apply the filter, so decode the codec
+        // payload here (peeling any Flate wrapper first), then widen gray → RGB.
+        return decode_ccitt(doc, dict, &image_payload(stream)).map(|g| image::DynamicImage::ImageLuma8(g).to_rgb8());
+    }
+    if filters.iter().any(|f| f == b"JPXDecode" || f == b"JBIG2Decode") {
         return None;
     }
     let w = dict.get(b"Width").ok().and_then(|o| o.as_i64().ok())? as u32;
@@ -274,7 +409,7 @@ fn decode_smask(doc: &Document, dict: &Dictionary) -> Option<image::GrayImage> {
     let sd = &stream.dict;
     let filters = filters_of(sd);
     if filters.iter().any(|f| f == b"DCTDecode") {
-        return image::load_from_memory_with_format(&stream.content, image::ImageFormat::Jpeg)
+        return image::load_from_memory_with_format(&image_payload(stream), image::ImageFormat::Jpeg)
             .ok()
             .map(|d| d.to_luma8());
     }
@@ -306,11 +441,11 @@ fn decodable(doc: &Document, id: ObjectId) -> bool {
     };
     let dict = &stream.dict;
     let filters = filters_of(dict);
-    if filters.iter().any(|f| f == b"JPXDecode" || f == b"CCITTFaxDecode" || f == b"JBIG2Decode") {
+    if filters.iter().any(|f| f == b"JPXDecode" || f == b"JBIG2Decode") {
         return false;
     }
-    if filters.iter().any(|f| f == b"DCTDecode") {
-        return true; // JPEG: always renderable
+    if filters.iter().any(|f| f == b"DCTDecode" || f == b"CCITTFaxDecode") {
+        return true; // JPEG / CCITT fax: renderable (fax via decode_ccitt)
     }
     let w = dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0);
     let h = dict.get(b"Height").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0);
@@ -334,17 +469,20 @@ fn data_uri(doc: &Document, id: ObjectId) -> Option<String> {
     // Flate raster, bail on formats we can't decode.
     if !has_smask {
         if filters.iter().any(|f| f == b"DCTDecode") {
+            // Peel any generic wrapper (e.g. [FlateDecode, DCTDecode]) to get the raw JPEG.
+            let jpeg = image_payload(stream);
             // Gray/RGB JPEGs pass straight through (cheap, lossless). CMYK JPEGs can't:
             // browsers render Adobe CMYK inverted/black, so decode → RGB and re-encode.
-            if jpeg_is_cmyk(&stream.content) {
-                let rgb = decode_jpeg_rgb(&stream.content, decode_inverts(&dict))?;
+            if jpeg_is_cmyk(&jpeg) {
+                let rgb = decode_jpeg_rgb(&jpeg, decode_inverts(&dict))?;
                 return jpeg_uri(rgb);
             }
-            return Some(format!("data:image/jpeg;base64,{}", b64.encode(&stream.content)));
+            return Some(format!("data:image/jpeg;base64,{}", b64.encode(&jpeg)));
         }
-        if filters.iter().any(|f| f == b"JPXDecode" || f == b"CCITTFaxDecode" || f == b"JBIG2Decode") {
+        if filters.iter().any(|f| f == b"JPXDecode" || f == b"JBIG2Decode") {
             return None;
         }
+        // CCITTFax falls through to decode_rgb (which decodes it via decode_ccitt) → PNG.
         let rgb = decode_rgb(doc, id)?;
         let png = png_bytes(image::DynamicImage::ImageRgb8(rgb))?;
         return Some(format!("data:image/png;base64,{}", b64.encode(&png)));
@@ -608,7 +746,7 @@ fn walk(
                             child.insert(k, v);
                         }
                     }
-                    if let Ok(content) = lopdf::content::Content::decode(&stream.decompressed_content().unwrap_or_default()) {
+                    if let Ok(content) = lopdf::content::Content::decode(&stream_content(&stream)) {
                         walk(doc, &content.operations, &child, form_ctm, out, depth + 1);
                     }
                 }

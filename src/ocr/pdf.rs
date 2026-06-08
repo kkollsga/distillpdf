@@ -118,6 +118,44 @@ pub(crate) fn write_pdf(pages: &[PageInput]) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
+/// Font resource names for the invisible OCR overlay. Deliberately distinct from the
+/// page's own `/F1`,`/F2` so adding them to a scanned page's resources never clobbers the
+/// fonts that page already uses (e.g. its stamp text).
+pub(crate) const OVERLAY_FONT: &str = "OcrHelv";
+pub(crate) const OVERLAY_FONT_BOLD: &str = "OcrHelvB";
+
+/// Build an INVISIBLE (text render mode 3) overlay of the OCR text, positioned over the
+/// page. Appended to a page that keeps its original raster, this is the "image + hidden
+/// text" searchable-PDF model: the scan stays visible, the text is selectable/searchable,
+/// and OCR errors never destroy the original. No images are drawn (the page keeps its own
+/// raster). The ops are wrapped in `q … Q` and set `3 Tr` once, so the invisible text
+/// state can't leak into the page's own content.
+pub(crate) fn build_text_overlay(pin: &PageInput) -> Content {
+    let (w, h) = (pin.width, pin.height);
+    let mut ops: Vec<Operation> = vec![
+        Operation::new("q", vec![]),
+        Operation::new("Tr", vec![3.into()]), // 3 = invisible (neither fill nor stroke)
+    ];
+    for b in &pin.page.blocks {
+        match b {
+            Block::Picture { .. } => {} // raster already on the page; nothing to draw
+            Block::Table(t) => emit_table_text(&mut ops, t, w, h, OVERLAY_FONT, OVERLAY_FONT_BOLD),
+            _ => {
+                if let (Some(text), Some(bb)) = (block_text(b), block_bbox(b)) {
+                    let text = text.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let font = if is_bold(b) { OVERLAY_FONT_BOLD } else { OVERLAY_FONT };
+                    emit_wrapped_text(&mut ops, text, &bb, w, h, role_size(b), font);
+                }
+            }
+        }
+    }
+    ops.push(Operation::new("Q", vec![]));
+    Content { operations: ops }
+}
+
 /// Build one page's content stream operations + any image XObjects it references.
 pub(crate) fn build_page_content(doc: &mut Document, pin: &PageInput) -> Result<(Content, Vec<(String, lopdf::ObjectId)>), String> {
     let (w, h) = (pin.width, pin.height);
@@ -144,7 +182,7 @@ pub(crate) fn build_page_content(doc: &mut Document, pin: &PageInput) -> Result<
             }
             Block::Table(t) => {
                 // Render table cells as positioned text (row-major within the table box).
-                emit_table_text(&mut ops, t, w, h);
+                emit_table_text(&mut ops, t, w, h, "F1", "F2");
             }
             _ => {
                 if let (Some(text), Some(bb)) = (block_text(b), block_bbox(b)) {
@@ -185,7 +223,7 @@ fn emit_wrapped_text(ops: &mut Vec<Operation>, text: &str, bb: &BBox, w: f32, h:
     }
 }
 
-fn emit_table_text(ops: &mut Vec<Operation>, t: &crate::ocr::doctags::Table, w: f32, h: f32) {
+fn emit_table_text(ops: &mut Vec<Operation>, t: &crate::ocr::doctags::Table, w: f32, h: f32, regular: &str, bold: &str) {
     let bb = t.bbox.unwrap_or(BBox { l: 0.05, t: 0.1, r: 0.95, b: 0.9 });
     let [x0, y0, x1, y1] = bb.to_pdf(w, h);
     let rows = t.rows.len().max(1);
@@ -202,7 +240,7 @@ fn emit_table_text(ops: &mut Vec<Operation>, t: &crate::ocr::doctags::Table, w: 
             }
             let x = x0 + ci as f32 * col_w;
             let bytes = to_winansi(txt);
-            let font = if cell.header { "F2" } else { "F1" };
+            let font = if cell.header { bold } else { regular };
             ops.push(Operation::new("BT", vec![]));
             ops.push(Operation::new("Tf", vec![Object::Name(font.as_bytes().to_vec()), size.into()]));
             ops.push(Operation::new("Td", vec![x.into(), y.into()]));
