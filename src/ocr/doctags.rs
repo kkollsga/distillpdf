@@ -113,6 +113,13 @@ fn tokenize(s: &str) -> Vec<Tok> {
                     i += 1;
                     continue;
                 }
+                // Code-block language marker (`<_Fortran_>`, `<_SQL_>`, `<_unknown_>`, …):
+                // docling tags a `code` element's language with these; granite over-emits
+                // them on plain scanned prose. They carry no content — drop, don't leak.
+                if is_code_lang(inner) {
+                    i += 1 + rel + 1;
+                    continue;
+                }
                 // Only treat `<...>` as a token if it's a *known* DocTags tag; otherwise
                 // it's literal content (e.g. a math `a < b`), kept verbatim as text.
                 let tok = if let Some(n) = inner.strip_prefix("loc_") {
@@ -157,6 +164,20 @@ fn utf8_len(b: u8) -> usize {
 }
 
 // ---- tag classification ----------------------------------------------------
+
+/// A docling code-block language marker — `_Fortran_`, `_SQL_`, `_C++_`, `_unknown_`,
+/// `_ObjectiveC_`, … : an underscore-wrapped language id with no content. (granite emits
+/// these even when it wrongly classifies scanned prose as code, so they must be stripped.)
+fn is_code_lang(inner: &str) -> bool {
+    match inner.strip_prefix('_').and_then(|s| s.strip_suffix('_')) {
+        Some(mid) => {
+            !mid.is_empty()
+                && mid.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '#' | '-'))
+                && mid.chars().any(|c| c.is_ascii_alphabetic())
+        }
+        None => false,
+    }
+}
 
 /// Is `name` a DocTags tag we recognize (so `<name>` is a token, not literal text)?
 fn is_known_tag(name: &str) -> bool {
@@ -540,6 +561,25 @@ fn parse_otsl(toks: &[Tok], mut i: usize) -> (Table, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_code_language_markers() {
+        // granite tags scanned prose as a code block and leaks the language id — drop it,
+        // keep the text as a normal block.
+        for lang in ["_Fortran_", "_SQL_", "_unknown_", "_ObjectiveC_", "_C++_"] {
+            let dt = format!("<loc_22><loc_36><loc_499><loc_242><{lang}>Solicito o esclarecimento.");
+            let page = parse(&dt);
+            assert_eq!(page.blocks.len(), 1, "{lang}");
+            let txt = match &page.blocks[0] {
+                Block::Para(t) | Block::Code(t) | Block::Title(t) => t.text.clone(),
+                Block::Heading { block, .. } => block.text.clone(),
+                other => panic!("unexpected block for {lang}: {other:?}"),
+            };
+            assert_eq!(txt, "Solicito o esclarecimento.", "marker {lang} leaked: {txt:?}");
+        }
+        // a real `< b` comparison is still kept as text (not mistaken for a marker)
+        assert!(parse("<loc_1><loc_1><loc_9><loc_9>if a < b then").blocks.iter().any(|b| matches!(b, Block::Para(t) if t.text.contains("a < b"))));
+    }
 
     #[test]
     fn collapse_single_line_loop() {

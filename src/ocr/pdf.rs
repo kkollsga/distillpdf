@@ -124,6 +124,51 @@ pub(crate) fn write_pdf(pages: &[PageInput]) -> Result<Vec<u8>, String> {
 pub(crate) const OVERLAY_FONT: &str = "OcrHelv";
 pub(crate) const OVERLAY_FONT_BOLD: &str = "OcrHelvB";
 
+/// The dominant body font size for a page: the text-length-weighted median of every text
+/// block's natural (box-derived) size. Box-to-box noise makes the same paragraph's blocks
+/// resolve to a dozen slightly different sizes; snapping body text to this one value (see
+/// [`harmonize_size`]) makes the page read as a single consistent size.
+fn page_body_size(page: &OcrPage, w: f32, h: f32) -> f32 {
+    let mut items: Vec<(f32, usize)> = Vec::new();
+    for b in &page.blocks {
+        if is_bold(b) {
+            continue; // headings/titles don't define the body size
+        }
+        if let (Some(text), Some(bb)) = (block_text(b), block_bbox(b)) {
+            let text = text.trim();
+            if !text.is_empty() {
+                items.push((natural_size(text, &bb, w, h, false), text.chars().count()));
+            }
+        }
+    }
+    if items.is_empty() {
+        return 10.0;
+    }
+    items.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let total: usize = items.iter().map(|x| x.1).sum();
+    let mut cum = 0usize;
+    for (size, weight) in &items {
+        cum += weight;
+        if cum * 2 >= total {
+            return *size;
+        }
+    }
+    items.last().map(|x| x.0).unwrap_or(10.0)
+}
+
+/// Resolve a block's render size. Body text is snapped to the single page body size (its
+/// box-derived size is noisy — short lines in loose boxes resolve all over the place — and
+/// the page really is one size). Only an actual heading/title (`is_heading`), or untagged
+/// text whose box is clearly far larger than body (a letterhead the model didn't label),
+/// keeps a distinct, larger size.
+fn harmonize_size(natural: f32, body: f32, is_heading: bool) -> f32 {
+    if is_heading || natural > body * 1.6 {
+        natural.max(body) // a heading is at least body-sized
+    } else {
+        body
+    }
+}
+
 /// Build an INVISIBLE (text render mode 3) overlay of the OCR text, positioned over the
 /// page. Appended to a page that keeps its original raster, this is the "image + hidden
 /// text" searchable-PDF model: the scan stays visible, the text is selectable/searchable,
@@ -132,6 +177,7 @@ pub(crate) const OVERLAY_FONT_BOLD: &str = "OcrHelvB";
 /// state can't leak into the page's own content.
 pub(crate) fn build_text_overlay(pin: &PageInput) -> Content {
     let (w, h) = (pin.width, pin.height);
+    let body = page_body_size(&pin.page, w, h);
     let mut ops: Vec<Operation> = vec![
         Operation::new("q", vec![]),
         Operation::new("Tr", vec![3.into()]), // 3 = invisible (neither fill nor stroke)
@@ -146,9 +192,11 @@ pub(crate) fn build_text_overlay(pin: &PageInput) -> Content {
                     if text.is_empty() {
                         continue;
                     }
-                    let font = if is_bold(b) { OVERLAY_FONT_BOLD } else { OVERLAY_FONT };
+                    let bold = is_bold(b);
+                    let font = if bold { OVERLAY_FONT_BOLD } else { OVERLAY_FONT };
+                    let size = harmonize_size(natural_size(text, &bb, w, h, bold), body, bold);
                     // Invisible overlay over the kept scan: stretch full lines to align selection.
-                    emit_wrapped_text(&mut ops, text, &bb, w, h, font, is_bold(b), true);
+                    emit_wrapped_text(&mut ops, text, &bb, w, h, size, font, bold, true);
                 }
             }
         }
@@ -160,6 +208,7 @@ pub(crate) fn build_text_overlay(pin: &PageInput) -> Content {
 /// Build one page's content stream operations + any image XObjects it references.
 pub(crate) fn build_page_content(doc: &mut Document, pin: &PageInput) -> Result<(Content, Vec<(String, lopdf::ObjectId)>), String> {
     let (w, h) = (pin.width, pin.height);
+    let body = page_body_size(&pin.page, w, h);
     let mut ops: Vec<Operation> = Vec::new();
     let mut xobjects = Vec::new();
     let mut pic_no = 0;
@@ -191,9 +240,11 @@ pub(crate) fn build_page_content(doc: &mut Document, pin: &PageInput) -> Result<
                     if text.is_empty() {
                         continue;
                     }
-                    let font = if is_bold(b) { "F2" } else { "F1" };
+                    let bold = is_bold(b);
+                    let font = if bold { "F2" } else { "F1" };
+                    let size = harmonize_size(natural_size(text, &bb, w, h, bold), body, bold);
                     // Visible reflow: natural spacing (no per-line stretch).
-                    emit_wrapped_text(&mut ops, text, &bb, w, h, font, is_bold(b), false);
+                    emit_wrapped_text(&mut ops, text, &bb, w, h, size, font, bold, false);
                 }
             }
         }
@@ -203,6 +254,12 @@ pub(crate) fn build_page_content(doc: &mut Document, pin: &PageInput) -> Result<
 
 /// Baseline-to-baseline spacing as a multiple of the font size.
 const LINE_SPACING: f32 = 1.16;
+
+/// Fraction of an element's bounding box that its text ink actually fills. Sizing text to
+/// fill 100% of the box inflates it (line spacing, word gaps, ragged right, partial last
+/// lines, and OCR boxes drawn loose around the ink all leave the box partly empty), so the
+/// fill-size estimate is scaled by this. Calibrated against real scans (~0.5).
+const TEXT_DENSITY: f32 = 0.5;
 
 /// Helvetica glyph advance (1000-em units) for a char, via its WinAnsi byte.
 fn glyph_adv(widths: &[u16; 256], c: char) -> f32 {
@@ -253,24 +310,32 @@ fn wrap_to_budget(widths: &[u16; 256], text: &str, budget: f32) -> Vec<String> {
 /// line to span the box width, so text selection/highlight aligns with the scanned glyphs
 /// even when the original font is wider/narrower than Helvetica. Off for the visible reflow,
 /// where uniform spacing reads better.
-fn emit_wrapped_text(ops: &mut Vec<Operation>, text: &str, bb: &BBox, w: f32, h: f32, font: &str, bold: bool, stretch: bool) {
+/// The font size an element's box alone implies, before page-level harmonization. The naive
+/// "size that fills the box area" overshoots — real text only fills a fraction of its box
+/// (line spacing, word gaps, ragged right, a partial last line, and OCR boxes drawn loose
+/// around the ink) — so the fill estimate is scaled by TEXT_DENSITY and capped so a single
+/// line isn't taller than its box (boxes bound a line loosely, hence /1.35 not /1.0).
+fn natural_size(text: &str, bb: &BBox, w: f32, h: f32, bold: bool) -> f32 {
+    let widths = crate::afm::standard_widths("Helvetica", bold, false).unwrap_or(&[500u16; 256]);
+    let [x0, y0, x1, y1] = bb.to_pdf(w, h);
+    let box_w = (x1 - x0).abs().max(1.0);
+    let box_h = (y1 - y0).abs().max(1.0);
+    let total = advance(widths, text).max(0.01);
+    let fill = (box_h * box_w * TEXT_DENSITY / (total * LINE_SPACING)).sqrt();
+    fill.min(box_h / 1.35).clamp(4.0, 48.0)
+}
+
+fn emit_wrapped_text(ops: &mut Vec<Operation>, text: &str, bb: &BBox, w: f32, h: f32, size: f32, font: &str, bold: bool, stretch: bool) {
     let widths = crate::afm::standard_widths("Helvetica", bold, false).unwrap_or(&[500u16; 256]);
     let [x0, y0, x1, y1] = bb.to_pdf(w, h);
     let box_w = (x1 - x0).abs().max(1.0);
     let box_h = (y1 - y0).abs().max(1.0);
 
-    // Pick a font size: the value at which the text, wrapped to box_w, fills box_h — but
-    // never taller than a single line in the box (so short text in a wide box, e.g. a
-    // heading, isn't blown up to fill the height).
-    let total = advance(widths, text).max(0.01);
-    let fill = (box_h * box_w / (total * LINE_SPACING)).sqrt();
-    let size = fill.min(box_h / LINE_SPACING).clamp(4.0, 48.0);
-
     let lines = wrap_to_budget(widths, text, box_w / size);
     let n = lines.len().max(1);
-    // Spread baselines across the box height (matches the page's line spacing); never tighter
-    // than the font itself.
-    let leading = (box_h / n as f32).max(size * LINE_SPACING).min(size * 2.0);
+    // Baseline-to-baseline: natural spacing, allowed to open up to fill the box but never to
+    // a loose double-space (so a few short lines in a tall box don't drift apart).
+    let leading = (box_h / n as f32).max(size * LINE_SPACING).min(size * 1.5);
     let mut y = y1 - size * 0.82; // first baseline just under the box top
     let last = n - 1;
     for (i, line) in lines.iter().enumerate() {
