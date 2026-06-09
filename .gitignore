@@ -20,3 +20,6 @@ CLAUDE.md
 
 # Python build artifacts
 dist/
+
+# Downloaded granite GGUF models (default --ocr-engine granite location)
+ocr_model/

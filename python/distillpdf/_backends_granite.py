@@ -26,6 +26,9 @@ from .ocr import OcrBackend, OcrConfig, _require, register_backend
 _REPO = "ggml-org/granite-docling-258M-GGUF"
 _MODEL_FILE = "granite-docling-258M-Q8_0.gguf"
 _MMPROJ_FILE = "mmproj-granite-docling-258M-f16.gguf"
+# Default download folder: a visible, project-local dir (relative to the working dir) instead
+# of the global HF cache. Overridable via OcrConfig.model_dir.
+_MODEL_DIR = "ocr_model"
 
 # Above this rendered height (px), a full page is downscaled so far by the vision encoder
 # that dense body text becomes unreadable (the model then loops or emits `<other>`). We
@@ -88,11 +91,17 @@ class GraniteDoclingBackend(OcrBackend):
         hub = _require("huggingface_hub", package="huggingface-hub")
         llama_cpp = _require("llama_cpp", package="llama-cpp-python")
 
+        # Download the GGUF + projector into a plain, project-local folder (default
+        # ``ocr_model/``, relative to the working dir) rather than the hidden global HF cache,
+        # so the model is visible and easy to manage. Override with config.model_dir (or an
+        # absolute path). Re-runs reuse the files (no re-download).
+        target_dir = self.config.model_dir or _MODEL_DIR
+
         def fetch(fname: str) -> str:
             return hub.hf_hub_download(
                 repo_id=self.config.model_id,
                 filename=fname,
-                cache_dir=self.config.model_dir,  # None → HF cache (HF_HOME/HF_HUB_CACHE)
+                local_dir=target_dir,
                 token=self.config.hf_token,
             )
 

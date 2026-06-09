@@ -47,8 +47,9 @@ class OcrConfig:
     """Configuration common to every backend.
 
     model_id:   backend-specific model identifier (e.g. a Hugging Face repo id).
-    model_dir:  where model files are downloaded / loaded from. None → the backend's
-                default cache (honors HF_HOME / HF_HUB_CACHE for HF-backed models).
+    model_dir:  directory the model files are downloaded to. None → the engine default; the
+                granite GGUF engine uses a visible, project-local ``./ocr_model`` folder
+                (relative to the working dir) rather than the hidden global HF cache.
     hf_token:   Hugging Face access token for gated/private models (else uses the
                 ambient HF_TOKEN / cached login).
     device:     "auto" | "cpu" | "metal" | "cuda" — backend maps as appropriate.
