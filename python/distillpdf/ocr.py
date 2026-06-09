@@ -38,39 +38,44 @@ def setup_help(engine: str) -> str:
     system = platform.system()
     win, linux = system == "Windows", system == "Linux"
     mac_arm = system == "Darwin" and platform.machine() == "arm64"
-    tail = f"Full per-OS setup guide: {_SETUP_GUIDE}\n\n(The default 'fast' engine is bundled — it needs none of this.)"
+    guide = f"Full per-OS setup guide: {_SETUP_GUIDE}"
+    bundled = "(The default 'fast' engine is bundled — it needs none of this.)"
+    # transformers is pinned <5 on purpose; explain so the constraint doesn't look arbitrary.
+    tf_note = ("(transformers is pinned <5: 5.x changed the idefics3 image processor and fails "
+               "to load granite-docling; >=4.57 is the floor that supports it.)")
 
     if engine == "granite-docling":  # MLX
         if mac_arm:
-            return ('Install the accurate tier (granite-docling on Apple Silicon / MLX):\n'
-                    '    pip install mlx-vlm "transformers>=4.57,<5" pillow\n\n' + tail)
-        return ('The MLX engine only runs on Apple Silicon. On your platform use the PyTorch '
-                'engine instead:\n'
+            return ("For Apple Silicon, granite-docling on MLX is recommended (runs on the Metal GPU).\n"
+                    '    pip install mlx-vlm "transformers>=4.57,<5" pillow\n'
+                    f"{tf_note}\n\n{guide}\n\n{bundled}")
+        return ("MLX is Apple Silicon only. For your platform, granite-docling on PyTorch is recommended.\n"
                 '    pip install torch "transformers>=4.57,<5" pillow\n'
-                '    doc.run_ocr(engine="granite")\n\n' + tail)
+                '    doc.run_ocr(engine="granite")\n'
+                f"{tf_note}\n\n{guide}\n\n{bundled}")
 
     if engine == "granite-docling-pytorch":
-        lines = ['Install the accurate tier (granite-docling via PyTorch — prebuilt wheels, no C++ compiler):',
+        lines = ["For Windows/Linux, granite-docling on PyTorch is recommended (prebuilt wheels, no C++ compiler).",
                  '    pip install torch "transformers>=4.57,<5" pillow']
         if win or linux:
-            lines += ['', "For NVIDIA GPU acceleration install the CUDA build of torch instead",
-                      "(PyPI's default torch is CPU-only and slow for a VLM):",
-                      '    pip install torch --index-url https://download.pytorch.org/whl/cu124']
-        return "\n".join(lines) + f"\n\n{tail}"
+            lines += ["", "For an NVIDIA GPU, install the CUDA build of torch instead",
+                      "(the default torch is CPU-only and slow for a VLM):",
+                      "    pip install torch --index-url https://download.pytorch.org/whl/cu124"]
+        lines.append(tf_note)
+        return "\n".join(lines) + f"\n\n{guide}\n\n{bundled}"
 
     if engine == "granite-docling-gguf":
-        lines = ['Install the GGUF runtime (granite-docling via llama.cpp):',
-                 '    pip install llama-cpp-python huggingface-hub pillow']
+        lines = ["granite-docling on llama.cpp (GGUF) is a lighter, no-PyTorch alternative.",
+                 "    pip install llama-cpp-python huggingface-hub pillow"]
         if win:
-            lines += ['', 'On Windows, llama-cpp-python may build from source when no prebuilt wheel',
-                      'matches your Python (needs MSVC). Use a prebuilt wheel instead:',
-                      '    pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu',
-                      '    pip install huggingface-hub pillow',
-                      'or use the PyTorch engine (no compiler): pip install torch "transformers>=4.57,<5" pillow']
-        return "\n".join(lines) + f"\n\n{tail}"
+            lines += ["", "On Windows, llama-cpp-python may build from source when no prebuilt wheel",
+                      "matches your Python (needs MSVC). Use a prebuilt wheel instead:",
+                      "    pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu",
+                      "    pip install huggingface-hub pillow",
+                      'or use the PyTorch path (no compiler): pip install torch "transformers>=4.57,<5" pillow']
+        return "\n".join(lines) + f"\n\n{guide}\n\n{bundled}"
 
-    return ('Install a granite-docling runtime — see the per-OS guide:\n'
-            f'    {_SETUP_GUIDE}\n\n(The default \'fast\' engine is bundled — it needs none of this.)')
+    return f"Install a granite-docling runtime — see the per-OS guide:\n    {_SETUP_GUIDE}\n\n{bundled}"
 
 
 def install_help(engine: Optional[str] = None) -> str:

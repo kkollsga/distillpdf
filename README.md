@@ -203,6 +203,8 @@ pip install torch --index-url https://download.pytorch.org/whl/cu124
 # Lightweight alternative — GGUF (engine="granite-docling-gguf"):
 pip install llama-cpp-python huggingface-hub pillow
 ```
+(`transformers` is pinned `<5`: 5.x changed the idefics3 image processor and fails to load
+granite-docling; `>=4.57` is the floor that supports it.)
 Then `doc.run_ocr(engine="granite")`. The speed gap is real: a 509-page scan OCRs in **~6 min**
 on the fast tier vs much longer on the accurate tier — and the accurate tier on **CPU is very
 slow** (minutes/page), so use a GPU for it or stick with the fast tier.

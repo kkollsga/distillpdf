@@ -25,12 +25,14 @@ print(distillpdf.ocr.install_help("granite"))   # prints the commands for your O
 ```
 
 ### macOS (Apple Silicon) — MLX (Metal GPU, automatic)
+For Apple Silicon, granite-docling on MLX is recommended (runs on the Metal GPU):
 ```bash
 pip install mlx-vlm "transformers>=4.57,<5" pillow
 ```
 
 ### Windows / Linux / Intel-Mac — PyTorch (no C++ compiler)
-`torch` ships prebuilt wheels for every platform + Python, so this installs cleanly:
+For Windows/Linux, granite-docling on PyTorch is recommended — `torch` ships prebuilt wheels for
+every platform + Python, so this installs cleanly with no C++ compiler:
 ```bash
 pip install torch "transformers>=4.57,<5" pillow
 ```
@@ -56,6 +58,10 @@ pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-c
 pip install huggingface-hub pillow
 ```
 or just use the PyTorch path above (no compiler).
+
+> **Why `transformers>=4.57,<5`?** transformers 5.x changed the idefics3 image processor and
+> fails to load granite-docling; `>=4.57` is the floor that supports it. mlx-vlm's own
+> dependency range can pull in 5.x, so pin it explicitly.
 
 > Optional: `pip install tqdm` to get a progress bar during OCR.
 
