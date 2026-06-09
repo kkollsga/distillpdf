@@ -70,11 +70,20 @@ fn build_tesseract() {
         .cxxflag("-fdata-sections")
         .build();
 
-    // Link order: tesseract depends on leptonica, so name it first.
-    println!("cargo:rustc-link-search=native={}/lib", tess.display());
-    println!("cargo:rustc-link-search=native={}/lib", lept.display());
-    println!("cargo:rustc-link-lib=static=tesseract");
-    println!("cargo:rustc-link-lib=static=leptonica");
+    // Link the produced static libs. Their filenames vary by platform/version
+    // (libtesseract.a on unix vs e.g. tesseract55.lib / leptonica-1.85.0.lib on MSVC), so
+    // discover the real names rather than hard-coding them. Order matters for GNU ld:
+    // tesseract depends on leptonica, so name it first.
+    for dir in [&tess, &lept] {
+        println!("cargo:rustc-link-search=native={}/lib", dir.display());
+    }
+    let lib_dirs = [tess.join("lib"), lept.join("lib")];
+    for substr in ["tesseract", "leptonica"] {
+        match find_static_lib(&lib_dirs, substr) {
+            Some(stem) => println!("cargo:rustc-link-lib=static={stem}"),
+            None => panic!("could not find the built {substr} static lib in {lib_dirs:?}"),
+        }
+    }
 
     // C++ runtime + platform extras.
     let target = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -87,4 +96,29 @@ fn build_tesseract() {
             println!("cargo:rustc-link-lib=dylib=m");
         }
     }
+}
+
+/// Find a built static library whose filename contains `substr` in any of `dirs`, and return
+/// the `rustc-link-lib=static=` stem: `.a`/`.lib` extension stripped, plus a leading `lib`
+/// prefix on the unix archive form (`libtesseract.a` -> `tesseract`). Handles the version
+/// suffixes MSVC adds (`tesseract55.lib`, `leptonica-1.85.0.lib`).
+#[cfg(feature = "tesseract")]
+fn find_static_lib(dirs: &[std::path::PathBuf], substr: &str) -> Option<String> {
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for ent in entries.flatten() {
+            let path = ent.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            if !name.contains(substr) {
+                continue;
+            }
+            if let Some(stem) = name.strip_suffix(".lib") {
+                return Some(stem.to_string()); // MSVC: link by the exact stem
+            }
+            if let Some(stem) = name.strip_suffix(".a") {
+                return Some(stem.strip_prefix("lib").unwrap_or(stem).to_string());
+            }
+        }
+    }
+    None
 }
