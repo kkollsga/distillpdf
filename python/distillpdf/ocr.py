@@ -135,6 +135,10 @@ class OcrBackend:
         """Return the model's DocTags for one page image (PNG/JPEG bytes)."""
         raise NotImplementedError
 
+    def prepare(self, samples: "List[bytes]") -> None:
+        """One-time setup before the per-page loop, given a few sample page images. Default
+        no-op; the bundled Tesseract backend uses it to auto-detect the document language."""
+
     def close(self) -> None:
         """Release any held resources (model handle, server process)."""
 
@@ -277,6 +281,8 @@ def _doctags_for(pdf, backend: OcrBackend, only: Optional[set] = None,
             if it["needs_ocr"] and it["image"] and (only is None or it["page"] in only)]
     total = len(plan)
     out: Dict[int, str] = {}
+    # One-time backend setup on a sample (e.g. language auto-detection) before the loop.
+    backend.prepare([bytes(it["image"]) for it in plan[:3]])
     closer = None
     if progress is None:
         progress, closer = _auto_progress(total)

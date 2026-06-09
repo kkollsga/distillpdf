@@ -199,6 +199,22 @@ def _tesseract_compiled_in():
 
 
 @pytest.mark.skipif(not _tesseract_compiled_in(), reason="tesseract feature not in this build")
+def test_language_detection_maps_to_bundled_codes():
+    from distillpdf._distillpdf import detect_language
+    assert detect_language("The quick brown fox jumps over the lazy dog every morning today") == "eng"
+    assert detect_language("Os promotores de justiça apresentaram a denúncia ao tribunal hoje") == "por"
+    assert detect_language("xy 12 ...") is None  # too short / unreliable → keep all bundled
+
+
+@pytest.mark.skipif(not _tesseract_compiled_in(), reason="tesseract feature not in this build")
+def test_prepare_respects_explicit_languages():
+    # an explicit languages config is never overridden by detection
+    be = ocr.get_backend("tesseract", config=ocr.OcrConfig(languages=["eng"]))
+    be.prepare([])  # no samples; must not change the explicit choice
+    assert be.config.languages == ["eng"]
+
+
+@pytest.mark.skipif(not _tesseract_compiled_in(), reason="tesseract feature not in this build")
 def test_tesseract_is_the_fast_default_when_compiled_in():
     # In a wheel built with the tesseract feature, the fast tier (and the bare default) is it.
     assert "tesseract" in ocr.available_backends()

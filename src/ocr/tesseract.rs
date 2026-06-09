@@ -4,11 +4,10 @@
 //! pixels (`SetImage`), so Leptonica needs no image codecs. Recognized lines become
 //! bare-dialect DocTags via [`tess_synth::lines_to_doctags`].
 //!
-//! `eng` language data is embedded in the binary (`include_bytes!`) and written to a
-//! per-version cache dir on first use — so English works fully offline with no download.
-//! Additional languages come from a tessdata directory resolved on the Python side (the
-//! optional `distillpdf[languages]` companion package) and passed in via `cfg.tessdata_dir`,
-//! or from `TESSDATA_PREFIX`.
+//! `eng`, `por` and `nor` language data are embedded in the binary (`include_bytes!`) and
+//! written to a per-version cache dir on first use — so English, Portuguese and Norwegian all
+//! work fully offline with no download, and are recognized by default. Additional languages
+//! come from a tessdata directory via `TESSDATA_PREFIX` (or `cfg.tessdata_dir`).
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
@@ -19,10 +18,13 @@ use super::engine::{NativeCfg, OcrEngine};
 use super::tess_synth::{lines_to_doctags, OcrLine};
 
 // -- embedded language data (tessdata_fast) ----------------------------------
-// Only English ships in the base wheel (offline out of the box). Other languages arrive via
-// the `distillpdf[languages]` companion, whose dir is passed in `cfg.tessdata_dir`.
+// English, Portuguese and Norwegian all ship in the base wheel, so the three work fully
+// offline out of the box. Other languages are brought in via `TESSDATA_PREFIX` /
+// `cfg.tessdata_dir` (a directory of `*.traineddata`).
 const TESSDATA: &[(&str, &[u8])] = &[
     ("eng", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/models/tessdata/eng.traineddata"))),
+    ("por", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/models/tessdata/por.traineddata"))),
+    ("nor", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/models/tessdata/nor.traineddata"))),
 ];
 
 const RIL_TEXTLINE: c_int = 2;
@@ -97,9 +99,9 @@ fn embedded_datadir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// Resolve the tessdata directory and whether it is external (user/companion-provided, so any
-/// language it contains is allowed). Priority: `cfg.tessdata_dir` (the `distillpdf[languages]`
-/// companion) → `TESSDATA_PREFIX` → the embedded English cache.
+/// Resolve the tessdata directory and whether it is external (user-provided, so any language
+/// it contains is allowed). Priority: `cfg.tessdata_dir` → `TESSDATA_PREFIX` → the embedded
+/// eng/por/nor cache.
 fn resolve_datadir(cfg: &NativeCfg) -> Result<(PathBuf, bool), String> {
     if let Some(d) = cfg.tessdata_dir.as_deref().filter(|s| !s.is_empty()) {
         return Ok((PathBuf::from(d), true));
@@ -112,20 +114,22 @@ fn resolve_datadir(cfg: &NativeCfg) -> Result<(PathBuf, bool), String> {
     Ok((embedded_datadir()?, false))
 }
 
-/// Build the `+`-joined Tesseract language string. Defaults to English. When the data dir is
-/// the embedded (English-only) one, a request for any other language is a clear error pointing
-/// at the `distillpdf[languages]` extra.
+/// Build the `+`-joined Tesseract language string. With no explicit languages it defaults to
+/// ALL bundled languages (English + Portuguese + Norwegian), so documents in any of the three
+/// work with no configuration. Pass an explicit `languages` (e.g. `["eng"]`) to restrict it —
+/// a single language is a touch faster and avoids cross-language confusion on known-language
+/// documents. A request for a non-bundled language (without an external tessdata dir) is a
+/// clear, actionable error.
 fn resolve_langs(cfg: &NativeCfg, external: bool) -> Result<String, String> {
     if cfg.languages.is_empty() {
-        return Ok("eng".into());
+        return Ok(bundled_langs().join("+"));
     }
     if !external {
         for l in &cfg.languages {
             if !bundled_langs().contains(&l.as_str()) {
                 return Err(format!(
-                    "Tesseract language {l:?} is not bundled — only {} ships in the base wheel. \
-                     Install more with `pip install 'distillpdf[languages]'`, or point \
-                     TESSDATA_PREFIX at a tessdata folder containing it.",
+                    "Tesseract language {l:?} is not bundled (have: {}). Point TESSDATA_PREFIX \
+                     at a tessdata folder that contains its .traineddata.",
                     bundled_langs().join(", ")
                 ));
             }

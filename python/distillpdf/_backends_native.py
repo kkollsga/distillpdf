@@ -67,23 +67,13 @@ class NativeBackend(OcrBackend):
         return cls.engine in _NATIVE
 
 
-def _companion_tessdata_dir():
-    """The optional ``distillpdf-tessdata`` companion's data directory (extra languages), or
-    None if it isn't installed. Import-light: only imports the tiny data package, not Tesseract."""
-    try:
-        import distillpdf_tessdata  # the `distillpdf[languages]` extra
-        return distillpdf_tessdata.tessdata_dir()
-    except Exception:
-        return None
-
-
 class TesseractBackend(NativeBackend):
     """Bundled Tesseract — the fast, dependency-free default. Flat text (no tables).
 
-    **English** ships in the base wheel and works offline out of the box. Additional
-    languages (Portuguese, Norwegian, …) come from the optional companion installed with
-    ``pip install 'distillpdf[languages]'``; this backend discovers it automatically and
-    points the engine at its data. ``TESSDATA_PREFIX`` is also honored for custom data."""
+    English, Portuguese and Norwegian language data ship in the wheel, so all three work
+    offline out of the box and are recognized by default. Restrict to one with
+    ``config.languages=["eng"]`` (a touch faster); bring other languages via
+    ``TESSDATA_PREFIX``."""
 
     name = "tesseract"
     engine = "tesseract"
@@ -91,15 +81,30 @@ class TesseractBackend(NativeBackend):
     structure_aware = False
     bundled = True
     offline = True
-    languages = ("eng",)  # base wheel; the [languages] extra adds por/nor/…
-    detail = "Bundled Tesseract (eng; +[languages] extra) — fast, no extra, no download. Flat text."
+    languages = ("eng", "por", "nor")
+    detail = "Bundled Tesseract (eng/por/nor, auto-detected) — fast, no extra, no download."
 
-    def _opts(self) -> dict:
-        opts = super()._opts()
-        d = _companion_tessdata_dir()
-        if d:
-            opts["tessdata_dir"] = d
-        return opts
+    def prepare(self, samples) -> None:
+        """Auto-detect the document language from a sample and narrow OCR to it — faster and a
+        touch more accurate than always running all bundled languages. Skipped when the caller
+        set ``config.languages`` explicitly, or when detection is low-confidence (then all
+        bundled languages are used)."""
+        if self.config.languages:
+            return
+        try:
+            import re
+            from ._distillpdf import detect_language
+        except Exception:
+            return
+        # OCR a few sample pages with all bundled languages, then detect from the text.
+        text = " ".join(
+            re.sub(r"<[^>]+>", " ", self.ocr_page(bytes(img))) for img in samples[:3]
+        )
+        if len(text.strip()) < 80:
+            return  # too little text to detect reliably — keep all bundled
+        lang = detect_language(text)
+        if lang:
+            self.config.languages = [lang]
 
 
 class ServerBackend(NativeBackend):

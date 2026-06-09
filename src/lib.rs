@@ -701,6 +701,26 @@ fn ocr_native_shutdown() {
     ocr::tesseract::clear_cache();
 }
 
+/// Detect the dominant language of a text sample and map it to a bundled Tesseract code
+/// (`eng`/`por`/`nor`). Returns None when detection is low-confidence or the language isn't
+/// one we bundle — the caller then keeps the full bundled set. Pure-Rust (whatlang), so it's
+/// only present with the `tesseract` feature.
+#[cfg(feature = "tesseract")]
+#[pyfunction]
+fn detect_language(text: &str) -> Option<String> {
+    let info = whatlang::detect(text)?;
+    if !info.is_reliable() || info.confidence() < 0.55 {
+        return None;
+    }
+    let code = match info.lang() {
+        whatlang::Lang::Eng => "eng",
+        whatlang::Lang::Por => "por",
+        whatlang::Lang::Nob => "nor", // Norwegian Bokmål → the bundled `nor` model
+        _ => return None,
+    };
+    Some(code.to_string())
+}
+
 #[pymodule]
 fn _distillpdf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Pdf>()?;
@@ -713,6 +733,8 @@ fn _distillpdf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ocr_page_native, m)?)?;
     m.add_function(wrap_pyfunction!(native_engines, m)?)?;
     m.add_function(wrap_pyfunction!(ocr_native_shutdown, m)?)?;
+    #[cfg(feature = "tesseract")]
+    m.add_function(wrap_pyfunction!(detect_language, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

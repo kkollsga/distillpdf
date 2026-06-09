@@ -22,8 +22,9 @@ extension-module = ["pyo3/extension-module"]
 # Bundled Tesseract "fast" OCR engine: builds minimal static Leptonica + Tesseract from the
 # vendored `third_party/` submodules via CMake and links them into the core. Off by default
 # for `cargo test`/`cargo check` (keeps the pure-Rust crate fast to build); maturin turns it
-# on for the wheels.
-tesseract = ["dep:cmake"]
+# on for the wheels. `whatlang` is the pure-Rust language detector used to pick which bundled
+# language to OCR with.
+tesseract = ["dep:cmake", "dep:whatlang"]
 
 [dependencies]
 pyo3 = { version = "0.25", features = ["abi3-py38"] }
@@ -33,6 +34,9 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 jpeg-decoder = "0.3"
 fax = "0.2"
 rayon = "1"
+# Pure-Rust language detection (n-gram, no model files); only built with the `tesseract`
+# feature, used to auto-pick the OCR language from a sample of the document.
+whatlang = { version = "0.16", optional = true }
 
 [build-dependencies]
 # Only pulled in when the `tesseract` feature is on (the from-source C/C++ build).

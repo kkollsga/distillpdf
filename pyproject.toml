@@ -48,11 +48,6 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-# Extra Tesseract languages for the bundled fast OCR engine. The base wheel ships English;
-# this pulls a companion data package (Portuguese, Norwegian, …) that the engine discovers
-# at runtime — fully offline.  Install with:  pip install 'distillpdf[languages]'
-languages = ["distillpdf-tessdata>=0.0.1"]
-
 # OCR for image-only / scanned pages. The core (detection, DocTags parsing,
 # HTML/searchable-PDF rendering) is pure Rust and always available; this extra only adds
 # the model runtime.  Install with:  pip install 'distillpdf[ocr]'

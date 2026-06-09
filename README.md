@@ -183,12 +183,14 @@ pages keep distillPDF's normal extraction. There are two tiers:
 | **accurate** | **granite-docling** VLM | `pip install 'distillpdf[ocr]'` | ~6 s/page | char ~97% | structure + **tables**; downloads a model |
 
 The **fast** tier works out of the box on a plain `pip install distillpdf` — no extra, no
-PyTorch, no model download, fully offline. English ships in the wheel; add more languages with
-`pip install 'distillpdf[languages]'` (Portuguese, Norwegian, …) or point `TESSDATA_PREFIX` at
-your own tessdata. The **accurate** tier auto-selects a no-PyTorch runtime — MLX on Apple
-Silicon, granite-docling GGUF via `llama-cpp-python` on Windows/Linux/Intel-Mac. The gap is
-real at scale: a 509-page scanned document OCRs in **~6 min** on the fast tier vs ~47 min on the
-accurate tier.
+PyTorch, no model download, fully offline. **English, Portuguese and Norwegian** ship in the
+wheel; the document's language is **auto-detected** from a sample at the start of processing and
+OCR runs in just that language (faster, more accurate). Pin it with
+`OcrConfig(languages=["eng"])`, or point `TESSDATA_PREFIX` at your own tessdata for other
+languages. The
+**accurate** tier auto-selects a no-PyTorch runtime — MLX on Apple Silicon, granite-docling GGUF
+via `llama-cpp-python` on Windows/Linux/Intel-Mac. The gap is real at scale: a 509-page scanned
+document OCRs in **~6 min** on the fast tier vs ~47 min on the accurate tier.
 
 From the command line — open → OCR (progress bar shown automatically) → write, no Python:
 
