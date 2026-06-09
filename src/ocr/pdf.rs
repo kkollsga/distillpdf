@@ -240,7 +240,7 @@ pub(crate) fn build_text_overlay(pin: &PageInput) -> Content {
     for b in &pin.page.blocks {
         match b {
             Block::Picture { .. } => {} // raster already on the page; nothing to draw
-            Block::Table(t) => emit_table_text(&mut ops, t, w, h, OVERLAY_FONT, OVERLAY_FONT_BOLD),
+            Block::Table(t) => emit_table_text(&mut ops, t, w, h, OVERLAY_FONT, OVERLAY_FONT_BOLD, false),
             _ => {
                 if let (Some(text), Some(bb)) = (block_text(b), block_bbox(b)) {
                     let text = text.trim();
@@ -252,7 +252,7 @@ pub(crate) fn build_text_overlay(pin: &PageInput) -> Content {
                     let size = resolve_size(text, &bb, w, h, bold, body);
                     let top = bb.to_pdf(w, h)[3]; // box top; overlay stays aligned to the scan
                     // Invisible overlay over the kept scan: stretch full lines to align selection.
-                    emit_wrapped_text(&mut ops, text, &bb, w, h, top, size, font, bold, true, true);
+                    emit_wrapped_text(&mut ops, text, &bb, w, h, top, size, font, bold, true, true, false);
                 }
             }
         }
@@ -312,8 +312,9 @@ pub(crate) fn build_page_content(doc: &mut Document, pin: &PageInput) -> Result<
                 }
             }
             Block::Table(t) => {
-                // Render table cells as positioned text (row-major within the table box).
-                emit_table_text(&mut ops, t, w, h, "F1", "F2");
+                // Render the table as a real grid (lines + header shading) + positioned cell
+                // text — leaning into granite's OTSL structure that the fast tier can't produce.
+                emit_table_text(&mut ops, t, w, h, "F1", "F2", true);
             }
             _ => {
                 if let (Some(text), Some(bb)) = (block_text(b), block_bbox(b)) {
@@ -332,8 +333,9 @@ pub(crate) fn build_page_content(doc: &mut Document, pin: &PageInput) -> Result<
                             top = top.min(p[1] - size * 0.3);
                         }
                     }
-                    // Visible reflow: natural spacing (no per-line stretch).
-                    let used = emit_wrapped_text(&mut ops, text, &bb, w, h, top, size, font, bold, false, false);
+                    // Visible reflow: natural spacing; justify body paragraphs (not headings) for
+                    // a typeset look that leans into granite's clean paragraph segmentation.
+                    let used = emit_wrapped_text(&mut ops, text, &bb, w, h, top, size, font, bold, false, false, !bold);
                     placed.push([cx0, top - used, cx1, top]);
                 }
             }
@@ -419,7 +421,7 @@ fn natural_size(text: &str, bb: &BBox, w: f32, h: f32, bold: bool) -> f32 {
 /// positions); otherwise use natural single-spacing (reflow — compact, no spill).
 /// `stretch`: horizontally scale each full line to span the box width (overlay — keeps text
 /// selection aligned with the scanned glyphs even under a different font).
-fn emit_wrapped_text(ops: &mut Vec<Operation>, text: &str, bb: &BBox, w: f32, h: f32, top_y: f32, size: f32, font: &str, bold: bool, stretch: bool, spread: bool) -> f32 {
+fn emit_wrapped_text(ops: &mut Vec<Operation>, text: &str, bb: &BBox, w: f32, h: f32, top_y: f32, size: f32, font: &str, bold: bool, stretch: bool, spread: bool, justify: bool) -> f32 {
     let widths = crate::afm::standard_widths("Helvetica", bold, false).unwrap_or(&[500u16; 256]);
     let [x0, y0, x1, y1] = bb.to_pdf(w, h);
     let box_w = (x1 - x0).abs().max(1.0);
@@ -447,6 +449,20 @@ fn emit_wrapped_text(ops: &mut Vec<Operation>, text: &str, bb: &BBox, w: f32, h:
                     ops.push(Operation::new("Tz", vec![tz.into()]));
                 }
             }
+            // Justify body paragraphs: spread the inter-word spaces of full (non-last) lines
+            // to the box width via word spacing, for a typeset look. Only when the gap is
+            // modest (a short wrapped line isn't stretched into rivers). Always emit Tw so the
+            // setting never leaks into the next line/block.
+            let mut tw = 0.0f32;
+            if justify && i < last {
+                let nat = advance(widths, line) * size;
+                let gap = box_w - nat;
+                let spaces = line.bytes().filter(|&c| c == b' ').count();
+                if spaces > 0 && gap > 0.5 && gap < box_w * 0.28 {
+                    tw = gap / spaces as f32;
+                }
+            }
+            ops.push(Operation::new("Tw", vec![tw.into()]));
             ops.push(Operation::new("Tf", vec![Object::Name(font.as_bytes().to_vec()), size.into()]));
             ops.push(Operation::new("Td", vec![x0.into(), y.into()]));
             ops.push(Operation::new("Tj", vec![Object::String(bytes, lopdf::StringFormat::Literal)]));
@@ -459,22 +475,53 @@ fn emit_wrapped_text(ops: &mut Vec<Operation>, text: &str, bb: &BBox, w: f32, h:
     (top_y - (last_baseline - size * 0.25)).max(size * 0.5)
 }
 
-fn emit_table_text(ops: &mut Vec<Operation>, t: &crate::ocr::doctags::Table, w: f32, h: f32, regular: &str, bold: &str) {
+fn emit_table_text(ops: &mut Vec<Operation>, t: &crate::ocr::doctags::Table, w: f32, h: f32, regular: &str, bold: &str, draw_grid: bool) {
     let bb = t.bbox.unwrap_or(BBox { l: 0.05, t: 0.1, r: 0.95, b: 0.9 });
     let [x0, y0, x1, y1] = bb.to_pdf(w, h);
-    let rows = t.rows.len().max(1);
-    let row_h = ((y1 - y0) / rows as f32).max(10.0);
-    let size = (row_h * 0.6).clamp(7.0, 11.0);
+    let nrows = t.rows.len().max(1);
+    let ncols = t.rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+    let row_h = ((y1 - y0) / nrows as f32).max(10.0);
+    let col_w = (x1 - x0) / ncols as f32;
+    let size = (row_h * 0.5).clamp(7.0, 11.0);
+    let pad = (col_w * 0.06).clamp(1.5, 4.0);
+    let header_rows = t.rows.first().map(|r| r.iter().any(|c| c.header)).unwrap_or(false) as usize;
+
+    // The visible reflow draws a real grid + header shading; the invisible overlay over the
+    // kept scan must NOT (the scan already shows the table — visible rules would double it).
+    if draw_grid {
+        if header_rows > 0 {
+            ops.push(Operation::new("q", vec![]));
+            ops.push(Operation::new("g", vec![0.90.into()]));
+            ops.push(Operation::new("re", vec![x0.into(), (y1 - row_h).into(), (x1 - x0).into(), row_h.into()]));
+            ops.push(Operation::new("f", vec![]));
+            ops.push(Operation::new("Q", vec![]));
+        }
+        ops.push(Operation::new("q", vec![]));
+        ops.push(Operation::new("w", vec![0.5.into()]));
+        ops.push(Operation::new("G", vec![0.55.into()]));
+        for ci in 0..=ncols {
+            let x = x0 + ci as f32 * col_w;
+            ops.push(Operation::new("m", vec![x.into(), y0.into()]));
+            ops.push(Operation::new("l", vec![x.into(), y1.into()]));
+        }
+        for ri in 0..=nrows {
+            let y = y1 - ri as f32 * row_h;
+            ops.push(Operation::new("m", vec![x0.into(), y.into()]));
+            ops.push(Operation::new("l", vec![x1.into(), y.into()]));
+        }
+        ops.push(Operation::new("S", vec![]));
+        ops.push(Operation::new("Q", vec![]));
+    }
+
+    // Cell text, top-aligned within each cell, on uniform columns so it lines up with the grid.
     for (ri, row) in t.rows.iter().enumerate() {
-        let cols = row.len().max(1);
-        let col_w = (x1 - x0) / cols as f32;
-        let y = y1 - size - ri as f32 * row_h;
+        let y = y1 - ri as f32 * row_h - size * 1.05;
         for (ci, cell) in row.iter().enumerate() {
             let txt = cell.text.trim();
             if txt.is_empty() {
                 continue;
             }
-            let x = x0 + ci as f32 * col_w;
+            let x = x0 + ci as f32 * col_w + pad;
             let bytes = to_winansi(txt);
             let font = if cell.header { bold } else { regular };
             ops.push(Operation::new("BT", vec![]));
