@@ -18,5 +18,7 @@ Homepage = "https://github.com/kkollsga/distillpdf"
 [tool.hatch.build.targets.wheel]
 packages = ["distillpdf_tessdata"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"distillpdf_tessdata/tessdata" = "distillpdf_tessdata/tessdata"
+# The .traineddata are data files inside the package; mark them as artifacts so hatchling
+# includes them in the wheel (they'd otherwise be treated as non-source and skipped).
+[tool.hatch.build]
+artifacts = ["distillpdf_tessdata/tessdata/*.traineddata"]

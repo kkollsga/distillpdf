@@ -33,6 +33,7 @@ extern "C" {
     fn TessBaseAPICreate() -> *mut c_void;
     fn TessBaseAPIDelete(h: *mut c_void);
     fn TessBaseAPIInit3(h: *mut c_void, datapath: *const c_char, lang: *const c_char) -> c_int;
+    fn TessBaseAPISetVariable(h: *mut c_void, name: *const c_char, value: *const c_char) -> c_int;
     fn TessBaseAPISetPageSegMode(h: *mut c_void, mode: c_int);
     fn TessBaseAPISetImage(h: *mut c_void, data: *const u8, w: c_int, hgt: c_int, bpp: c_int, bpl: c_int);
     fn TessBaseAPISetSourceResolution(h: *mut c_void, ppi: c_int);
@@ -161,6 +162,12 @@ impl TesseractEngine {
             if TessBaseAPIInit3(h, dp.as_ptr(), lg.as_ptr()) != 0 {
                 TessBaseAPIDelete(h);
                 return Err(format!("Tesseract init failed for languages {langs:?} (data dir {})", dir.display()));
+            }
+            // Silence Tesseract's own stderr chatter (e.g. "Detected N diacritics") so a long
+            // run doesn't flood the terminal; send its debug output to the null device.
+            let dev_null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+            if let (Ok(k), Ok(v)) = (CString::new("debug_file"), CString::new(dev_null)) {
+                TessBaseAPISetVariable(h, k.as_ptr(), v.as_ptr());
             }
             TessBaseAPISetPageSegMode(h, PSM_AUTO);
             TessApi(h)
