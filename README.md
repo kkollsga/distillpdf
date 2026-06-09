@@ -186,7 +186,9 @@ The **fast** tier works out of the box on a plain `pip install distillpdf` — n
 PyTorch, no model download, fully offline. English ships in the wheel; add more languages with
 `pip install 'distillpdf[languages]'` (Portuguese, Norwegian, …) or point `TESSDATA_PREFIX` at
 your own tessdata. The **accurate** tier auto-selects a no-PyTorch runtime — MLX on Apple
-Silicon, granite-docling GGUF via `llama-cpp-python` on Windows/Linux/Intel-Mac.
+Silicon, granite-docling GGUF via `llama-cpp-python` on Windows/Linux/Intel-Mac. The gap is
+real at scale: a 509-page scanned document OCRs in **~6 min** on the fast tier vs ~47 min on the
+accurate tier.
 
 From the command line — open → OCR (progress bar shown automatically) → write, no Python:
 
@@ -230,8 +232,9 @@ Flate-wrapped JPEG encodings, and full-page rasters whose only text is an e-fili
 
 **Tables** are recovered natively by the **accurate** tier: granite-docling emits OTSL table
 structure, which distillPDF renders as a real `<table>` (with `<th>` / `colspan` / `rowspan`) in
-HTML and a positioned table in the searchable PDF. The fast (Tesseract) tier produces flat text
-only — use the accurate tier when table structure matters.
+HTML and a **gridded table** (cell rules + shaded header row) in the searchable PDF. The reflow
+also **justifies** granite's paragraph blocks for a typeset look. The fast (Tesseract) tier
+produces flat text only — use the accurate tier when table structure matters.
 
 > Pick the tier for the job: the fast tier is great for "make this scan searchable, now"; the
 > accurate tier is for structure-faithful extraction (tables, headings, reading order). See the
