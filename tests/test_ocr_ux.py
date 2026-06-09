@@ -273,6 +273,33 @@ def test_pytorch_device_picker_prefers_gpu():
     assert _pick_device(t, "auto") == "cuda"
 
 
+def test_setup_help_is_os_and_engine_specific(monkeypatch):
+    import platform
+    # Windows
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setattr(platform, "machine", lambda: "AMD64")
+    pt = ocr.setup_help("granite-docling-pytorch")
+    assert 'distillpdf[ocr]' in pt and "download.pytorch.org/whl/cu" in pt  # CUDA hint on Windows
+    gg = ocr.setup_help("granite-docling-gguf")
+    assert "ocr-gguf" in gg and "abetlen.github.io" in gg                   # prebuilt-wheel hint on Windows
+    mlx = ocr.setup_help("granite-docling")
+    assert "Apple Silicon" in mlx                                           # MLX not usable on Windows
+    assert "docs/ocr-setup.md" in pt and "docs/ocr-setup.md" in gg          # links the full guide
+    # Apple Silicon: no CUDA hint, MLX is the install
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(platform, "machine", lambda: "arm64")
+    assert "cu124" not in ocr.setup_help("granite-docling-pytorch")
+    assert 'distillpdf[ocr]' in ocr.setup_help("granite-docling")
+
+
+def test_require_uses_hint(monkeypatch):
+    # the dependency error embeds the OS/engine setup guidance
+    with pytest.raises(ocr.OcrDependencyError) as ei:
+        ocr._require("definitely_absent_mod", package="torch", hint=ocr.setup_help("granite-docling-pytorch"))
+    msg = str(ei.value)
+    assert "torch" in msg and "distillpdf[ocr]" in msg and "docs/ocr-setup.md" in msg
+
+
 def test_native_server_engine_registered():
     # The native "server" engine is compiled in and surfaces in the unified registry.
     from distillpdf import _distillpdf as core

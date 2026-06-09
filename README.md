@@ -175,7 +175,8 @@ doc.page_count()       # number of pages
 
 Image-only / scanned pages have no text to extract. distillPDF OCRs them and folds the
 recovered text back into the same HTML / Markdown / **searchable PDF** outputs — born-digital
-pages keep distillPDF's normal extraction. There are two tiers:
+pages keep distillPDF's normal extraction. There are two tiers (full **[OCR setup
+guide »](docs/ocr-setup.md)** for per-OS install + GPU):
 
 | Tier | Engine | Install | Speed | Quality | Notes |
 |---|---|---|---|---|---|

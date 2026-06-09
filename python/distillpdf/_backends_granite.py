@@ -20,7 +20,7 @@ import io
 import re
 from typing import List, Optional
 
-from .ocr import OcrBackend, OcrConfig, _require, register_backend, resolve_hf_token
+from .ocr import OcrBackend, OcrConfig, _require, register_backend, resolve_hf_token, setup_help
 
 # Defaults: the GGUF the llama.cpp team publishes (Q8_0 weights + F16 vision projector).
 _REPO = "ggml-org/granite-docling-258M-GGUF"
@@ -88,8 +88,9 @@ class GraniteDoclingBackend(OcrBackend):
     def _load(self):
         if self._llm is not None:
             return self._llm
-        hub = _require("huggingface_hub", package="huggingface-hub")
-        llama_cpp = _require("llama_cpp", package="llama-cpp-python")
+        hint = setup_help(self.name)
+        hub = _require("huggingface_hub", package="huggingface-hub", hint=hint)
+        llama_cpp = _require("llama_cpp", package="llama-cpp-python", hint=hint)
 
         # Download the GGUF + projector into a plain, project-local folder (default
         # ``ocr_model/``, relative to the working dir) rather than the hidden global HF cache,

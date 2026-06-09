@@ -25,20 +25,59 @@ class OcrDependencyError(ImportError):
     """Raised when an OCR backend's optional dependencies are not installed."""
 
 
-def _require(module: str, *, package: Optional[str] = None):
-    """Import an optional dependency or raise a clear, actionable error."""
+_SETUP_GUIDE = "https://github.com/kkollsga/distillpdf/blob/main/docs/ocr-setup.md"
+
+
+def setup_help(engine: str) -> str:
+    """OS- and engine-specific install instructions for an accurate-tier engine whose runtime
+    isn't installed. Used as the body of the dependency error so the message reads like a
+    setup guide for the user's actual platform."""
+    import platform
+
+    system = platform.system()
+    win, linux = system == "Windows", system == "Linux"
+    mac_arm = system == "Darwin" and platform.machine() == "arm64"
+    tail = f"Full setup guide: {_SETUP_GUIDE}\n\n(The default 'fast' engine is bundled — it needs none of this.)"
+
+    if engine == "granite-docling":  # MLX
+        if mac_arm:
+            return f'Install the accurate tier (MLX, Apple Silicon):\n    pip install "distillpdf[ocr]"\n\n{tail}'
+        return ('The MLX engine only runs on Apple Silicon. On your platform use the default '
+                'accurate tier instead (PyTorch, no compiler):\n'
+                '    pip install "distillpdf[ocr]"\n    doc.run_ocr(engine="granite")\n\n' + tail)
+
+    if engine == "granite-docling-pytorch":
+        lines = ['Install the accurate tier (PyTorch — prebuilt wheels, no C++ compiler):',
+                 '    pip install "distillpdf[ocr]"']
+        if win or linux:
+            lines += ['', 'For NVIDIA GPU acceleration, install the CUDA build of torch first',
+                      '(PyPI\'s default torch is CPU-only and slow for a VLM):',
+                      '    pip install torch --index-url https://download.pytorch.org/whl/cu124']
+        return "\n".join(lines) + f"\n\n{tail}"
+
+    if engine == "granite-docling-gguf":
+        lines = ['Install the GGUF runtime:', '    pip install "distillpdf[ocr-gguf]"']
+        if win:
+            lines += ['', 'On Windows, llama-cpp-python may build from source when no prebuilt wheel',
+                      'matches your Python (needs MSVC). Avoid that with a prebuilt wheel:',
+                      '    pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu',
+                      'or use the default PyTorch tier (no compiler): pip install "distillpdf[ocr]"']
+        return "\n".join(lines) + f"\n\n{tail}"
+
+    return f'Install the OCR extra:\n    pip install "distillpdf[ocr]"\n\n{tail}'
+
+
+def _require(module: str, *, package: Optional[str] = None, hint: Optional[str] = None):
+    """Import an optional dependency or raise a clear, actionable error. ``hint`` is the
+    OS/engine-specific setup text (see ``setup_help``); falls back to the generic extra."""
     try:
         return __import__(module)
     except ImportError as e:  # pragma: no cover - exercised via backends
         pkg = package or module
+        guidance = hint or f'    pip install "distillpdf[ocr]"\n\nFull setup guide: {_SETUP_GUIDE}'
         raise OcrDependencyError(
-            f"distillpdf's accurate OCR engine (granite-docling) needs the optional "
-            f"'{pkg}' package, which isn't installed.\n\n"
-            f'    pip install "distillpdf[ocr]"\n\n'
-            f"That installs the right OCR runtime for your platform (here, including {pkg!r}) "
-            f"in one step. The default 'fast' engine needs none of this — it's bundled in the "
-            f"wheel.\n\n"
-            f"(missing module: {module!r})"
+            f"distillpdf's accurate OCR engine needs the optional '{pkg}' package, which isn't "
+            f"installed.\n\n{guidance}\n\n(missing module: {module!r})"
         ) from e
 
 
