@@ -30,10 +30,14 @@ def _require(module: str, *, package: Optional[str] = None):
     try:
         return __import__(module)
     except ImportError as e:  # pragma: no cover - exercised via backends
+        pkg = package or module
         raise OcrDependencyError(
-            f"distillpdf OCR requires the optional '{package or module}' dependency, "
-            f"which is not installed.\n\n"
-            f"    pip install 'distillpdf[ocr]'\n\n"
+            f"distillpdf's accurate OCR engine (granite-docling) needs the optional "
+            f"'{pkg}' package, which isn't installed.\n\n"
+            f'    pip install "distillpdf[ocr]"\n\n'
+            f"That installs the right OCR runtime for your platform (here, including {pkg!r}) "
+            f"in one step. The default 'fast' engine needs none of this — it's bundled in the "
+            f"wheel.\n\n"
             f"(missing module: {module!r})"
         ) from e
 

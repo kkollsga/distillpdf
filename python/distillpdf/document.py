@@ -63,18 +63,26 @@ class Document:
     def run_ocr(self, backend: Optional["_ocr.OcrBackend"] = None, *,
                 engine: Optional[str] = None,
                 only: Optional[set] = None,
-                progress: Optional[Callable[[int, int, int], None]] = None) -> "Document":
+                progress: Optional[Callable[[int, int, int], None]] = None,
+                **config) -> "Document":
         """OCR every scanned page once, caching the result on this document. After this, the
         render methods fold the recovered text into their output.
 
         By default the bundled **fast** engine (Tesseract) is used — no extra, no download,
         offline. Pick another with ``engine=``: ``"accurate"`` / ``"granite"`` for the
         granite-docling VLM (needs the ``distillpdf[ocr]`` extra), or a specific backend name.
-        Power users can pass a constructed ``backend=`` instead. Chainable:
+
+        Engine options go straight in as keyword args (no need to build an OcrConfig):
+
+            doc.run_ocr(engine="granite", model_dir=r"D:\\models")   # custom model cache
+            doc.run_ocr(engine="granite", languages=["por"])         # force a language
+
+        ``**config`` accepts any OcrConfig field (model_dir, hf_token, device, languages,
+        prompt, …). Power users can still pass a constructed ``backend=`` instead. Chainable:
         ``doc.run_ocr().to_html("out.html")``."""
         self.run_processing()
-        if backend is None and engine is not None:
-            backend = _ocr.backend_for(engine)
+        if backend is None and (engine is not None or config):
+            backend = _ocr.backend_for(engine, **config)
         _ocr.run(self._pdf, backend, only=only, progress=progress)
         return self
 
