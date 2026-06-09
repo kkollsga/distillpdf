@@ -16,7 +16,7 @@ import io
 import re
 from typing import Any, List, Optional
 
-from .ocr import OcrBackend, OcrConfig, _require, register_backend
+from .ocr import OcrBackend, OcrConfig, _require, register_backend, resolve_hf_token
 
 # The official IBM MLX (Apple-Silicon) build. Emits DocTags incl. native OTSL tables.
 _MLX_REPO = "ibm-granite/granite-docling-258M-mlx"
@@ -68,6 +68,7 @@ class MlxGraniteDoclingBackend(OcrBackend):
         from mlx_vlm.prompt_utils import apply_chat_template
         from mlx_vlm.utils import load_config
 
+        resolve_hf_token(self.config)  # exports HF_TOKEN (from config/.env) so mlx-vlm sees it
         # `model_id` may be a HF repo id or a local path; mlx-vlm downloads/caches as needed.
         src = self.config.model_id
         self._model, self._processor = load(src)

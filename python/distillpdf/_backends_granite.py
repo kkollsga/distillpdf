@@ -20,7 +20,7 @@ import io
 import re
 from typing import List, Optional
 
-from .ocr import OcrBackend, OcrConfig, _require, register_backend
+from .ocr import OcrBackend, OcrConfig, _require, register_backend, resolve_hf_token
 
 # Defaults: the GGUF the llama.cpp team publishes (Q8_0 weights + F16 vision projector).
 _REPO = "ggml-org/granite-docling-258M-GGUF"
@@ -96,13 +96,14 @@ class GraniteDoclingBackend(OcrBackend):
         # so the model is visible and easy to manage. Override with config.model_dir (or an
         # absolute path). Re-runs reuse the files (no re-download).
         target_dir = self.config.model_dir or _MODEL_DIR
+        token = resolve_hf_token(self.config)  # explicit → HF_TOKEN env → .env file
 
         def fetch(fname: str) -> str:
             return hub.hf_hub_download(
                 repo_id=self.config.model_id,
                 filename=fname,
                 local_dir=target_dir,
-                token=self.config.hf_token,
+                token=token,
             )
 
         model_path = fetch(_MODEL_FILE)

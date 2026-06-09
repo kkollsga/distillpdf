@@ -190,6 +190,45 @@ def test_backend_for_engine_selector():
     assert ocr.backend_for(be) is be
 
 
+def _clear_hf_env(mp):
+    mp.delenv("HF_TOKEN", raising=False)
+    mp.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+
+
+def test_hf_token_priority(monkeypatch, tmp_path):
+    _clear_hf_env(monkeypatch)
+    env = str(tmp_path / ".env")
+    # explicit token wins
+    assert ocr.resolve_hf_token(ocr.OcrConfig(hf_token="explicit", env_file=env)) == "explicit"
+    # then the HF_TOKEN env var
+    monkeypatch.setenv("HF_TOKEN", "fromenv")
+    assert ocr.resolve_hf_token(ocr.OcrConfig(env_file=env)) == "fromenv"
+    # nothing set, no file → None (fine for public models)
+    _clear_hf_env(monkeypatch)
+    assert ocr.resolve_hf_token(ocr.OcrConfig(env_file=str(tmp_path / "absent.env"))) is None
+
+
+def test_hf_token_from_dotenv(monkeypatch, tmp_path):
+    _clear_hf_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text('# secrets\nFOO=bar\nexport HF_TOKEN="from_dotenv"\n')
+    assert ocr.resolve_hf_token(ocr.OcrConfig(env_file=str(env))) == "from_dotenv"
+    # only HF_TOKEN is read, not the rest of the file
+    import os
+    assert os.environ.get("FOO") != "bar"
+
+
+def test_store_token_writes_then_reads_back(monkeypatch, tmp_path):
+    _clear_hf_env(monkeypatch)
+    env = str(tmp_path / ".env")
+    # store_token persists an explicit token to the .env
+    assert ocr.resolve_hf_token(ocr.OcrConfig(hf_token="secret", store_token=True, env_file=env)) == "secret"
+    assert "HF_TOKEN=secret" in open(env).read()
+    # a later run with no explicit token picks it up from that .env
+    _clear_hf_env(monkeypatch)
+    assert ocr.resolve_hf_token(ocr.OcrConfig(env_file=env)) == "secret"
+
+
 def test_native_server_engine_registered():
     # The native "server" engine is compiled in and surfaces in the unified registry.
     from distillpdf import _distillpdf as core

@@ -42,6 +42,82 @@ def _require(module: str, *, package: Optional[str] = None):
         ) from e
 
 
+def _hf_token_from_env_file(path: Optional[str]) -> Optional[str]:
+    """Read HF_TOKEN (or HUGGING_FACE_HUB_TOKEN) from a .env-style file. Only that one key is
+    read — the rest of the file is ignored. Returns None if the file is absent or has no token."""
+    import os
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with builtins_open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):]
+                key, sep, val = line.partition("=")
+                if sep and key.strip() in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+                    return val.strip().strip('"').strip("'") or None
+    except OSError:
+        return None
+    return None
+
+
+def _write_env_token(path: str, token: str) -> None:
+    """Persist ``HF_TOKEN=<token>`` into a .env file: update the existing key in place, append
+    it otherwise, create the file if absent. Best-effort 0600 perms (the file holds a secret)."""
+    import os
+    lines = []
+    if os.path.isfile(path):
+        try:
+            with builtins_open(path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            lines = []
+    out, found = [], False
+    for line in lines:
+        s = line.strip()
+        bare = s[len("export "):] if s.startswith("export ") else s
+        if bare.partition("=")[0].strip() in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+            out.append(f"HF_TOKEN={token}")
+            found = True
+        else:
+            out.append(line)
+    if not found:
+        out.append(f"HF_TOKEN={token}")
+    try:
+        with builtins_open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+        try:
+            os.chmod(path, 0o600)  # no-op on Windows; restricts the secret on POSIX
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def resolve_hf_token(config: "OcrConfig") -> Optional[str]:
+    """The Hugging Face token for model downloads, in priority order: ``config.hf_token`` →
+    the ``HF_TOKEN`` env var → ``HF_TOKEN`` in a ``.env`` file (``config.env_file`` or, by
+    default, ``./.env``). When found in a .env it's also exported to ``HF_TOKEN`` so
+    huggingface_hub / mlx-vlm pick it up. With ``config.store_token`` an explicit token is
+    persisted to the .env for next time. Returns None if none is found (fine for public
+    models)."""
+    import os
+    if config.hf_token:
+        if config.store_token:
+            _write_env_token(config.env_file or ".env", config.hf_token)
+        return config.hf_token
+    env = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if env:
+        return env
+    tok = _hf_token_from_env_file(config.env_file or ".env")
+    if tok:
+        os.environ.setdefault("HF_TOKEN", tok)
+    return tok
+
+
 @dataclass
 class OcrConfig:
     """Configuration common to every backend.
@@ -50,8 +126,14 @@ class OcrConfig:
     model_dir:  directory the model files are downloaded to. None → the engine default; the
                 granite GGUF engine uses a visible, project-local ``./ocr_model`` folder
                 (relative to the working dir) rather than the hidden global HF cache.
-    hf_token:   Hugging Face access token for gated/private models (else uses the
-                ambient HF_TOKEN / cached login).
+    hf_token:   Hugging Face access token for gated/private models. If unset, falls back to
+                the HF_TOKEN env var, then HF_TOKEN in a .env file (see env_file). The default
+                public models need no token.
+    env_file:   path to a .env file to read HF_TOKEN from when no explicit token / env var is
+                set. None → auto-detect ``./.env``. Only HF_TOKEN is read (not the whole file).
+    store_token: if True and an ``hf_token`` is given, persist it as ``HF_TOKEN`` in the .env
+                (``env_file`` or ``./.env``, created if absent, perms 0600) so later runs pick
+                it up — one-time setup. Note: the token is stored in plaintext.
     device:     "auto" | "cpu" | "metal" | "cuda" — backend maps as appropriate.
     prompt:     instruction given to the model (DocTags conversion by default).
     max_tokens: generation cap per page (a backstop — stop_strings normally terminate).
@@ -67,6 +149,8 @@ class OcrConfig:
     model_id: Optional[str] = None
     model_dir: Optional[str] = None
     hf_token: Optional[str] = None
+    env_file: Optional[str] = None
+    store_token: bool = False
     device: str = "auto"
     prompt: str = "Convert this page to docling."
     # A full page at native resolution fits well under this; the DocTags end marker
