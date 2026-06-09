@@ -43,16 +43,24 @@ def setup_help(engine: str) -> str:
     # transformers is pinned <5 on purpose; explain so the constraint doesn't look arbitrary.
     tf_note = ("(transformers is pinned <5: 5.x changed the idefics3 image processor and fails "
                "to load granite-docling; >=4.57 is the floor that supports it.)")
+    # Where weights land + when a token is needed. MLX uses the HF cache; PyTorch/GGUF use a
+    # visible ./ocr_model/ folder. The default models are public (no token); gated/private need one.
+    token_note = ("The default model is public — no token needed. For a gated/private repo set HF_TOKEN "
+                  '(env var or a .env file), or pass OcrConfig(hf_token="hf_…", store_token=True).')
+    mlx_model_note = ("Weights download on first run to the Hugging Face cache (set HF_HOME to relocate). "
+                      + token_note)
+    local_model_note = ('Weights download on first run to a visible ./ocr_model/ folder '
+                        '(override with OcrConfig(model_dir="…")). ' + token_note)
 
     if engine == "granite-docling":  # MLX
         if mac_arm:
             return ("For Apple Silicon, granite-docling on MLX is recommended (runs on the Metal GPU).\n"
                     '    pip install mlx-vlm "transformers>=4.57,<5" pillow\n'
-                    f"{tf_note}\n\n{guide}\n\n{bundled}")
+                    f"{tf_note}\n{mlx_model_note}\n\n{guide}\n\n{bundled}")
         return ("MLX is Apple Silicon only. For your platform, granite-docling on PyTorch is recommended.\n"
                 '    pip install torch "transformers>=4.57,<5" pillow\n'
                 '    doc.run_ocr(engine="granite")\n'
-                f"{tf_note}\n\n{guide}\n\n{bundled}")
+                f"{tf_note}\n{local_model_note}\n\n{guide}\n\n{bundled}")
 
     if engine == "granite-docling-pytorch":
         lines = ["For Windows/Linux, granite-docling on PyTorch is recommended (prebuilt wheels, no C++ compiler).",
@@ -61,7 +69,7 @@ def setup_help(engine: str) -> str:
             lines += ["", "For an NVIDIA GPU, install the CUDA build of torch instead",
                       "(the default torch is CPU-only and slow for a VLM):",
                       "    pip install torch --index-url https://download.pytorch.org/whl/cu124"]
-        lines.append(tf_note)
+        lines += [tf_note, local_model_note]
         return "\n".join(lines) + f"\n\n{guide}\n\n{bundled}"
 
     if engine == "granite-docling-gguf":
@@ -73,6 +81,7 @@ def setup_help(engine: str) -> str:
                       "    pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu",
                       "    pip install huggingface-hub pillow",
                       'or use the PyTorch path (no compiler): pip install torch "transformers>=4.57,<5" pillow']
+        lines.append(local_model_note)
         return "\n".join(lines) + f"\n\n{guide}\n\n{bundled}"
 
     return f"Install a granite-docling runtime — see the per-OS guide:\n    {_SETUP_GUIDE}\n\n{bundled}"

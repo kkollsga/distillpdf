@@ -205,9 +205,12 @@ pip install llama-cpp-python huggingface-hub pillow
 ```
 (`transformers` is pinned `<5`: 5.x changed the idefics3 image processor and fails to load
 granite-docling; `>=4.57` is the floor that supports it.)
-Then `doc.run_ocr(engine="granite")`. The speed gap is real: a 509-page scan OCRs in **~6 min**
-on the fast tier vs much longer on the accurate tier — and the accurate tier on **CPU is very
-slow** (minutes/page), so use a GPU for it or stick with the fast tier.
+Then `doc.run_ocr(engine="granite")`. Weights download on first run — **MLX** to the Hugging Face
+cache (`HF_HOME` relocates it), **PyTorch/GGUF** to a visible **`./ocr_model/`** folder
+(`OcrConfig(model_dir=…)` overrides). The default models are public (no token); a gated repo needs
+`HF_TOKEN` (env or `.env`) or `OcrConfig(hf_token=…, store_token=True)`. The speed gap is real: a
+509-page scan OCRs in **~6 min** on the fast tier vs much longer on the accurate tier — and the
+accurate tier on **CPU is very slow** (minutes/page), so use a GPU for it or stick with the fast tier.
 
 From the command line — open → OCR (progress bar shown automatically) → write, no Python:
 
