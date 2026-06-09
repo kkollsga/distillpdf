@@ -82,9 +82,10 @@ class Document:
         if pending:
             warnings.warn(
                 f"{len(pending)} page(s) look scanned / image-only and have no extractable "
-                f"text. Call doc.run_ocr() to recover it (requires the 'distillpdf[ocr]' extra "
-                f"and downloads an OCR model). Rendering now leaves those pages with little or "
-                f"no text.",
+                f"text. Call doc.run_ocr() (or pass ocr=True) to OCR them with the bundled "
+                f"engine — no extra, no download, offline. (For the higher-accuracy granite "
+                f"engine instead, `pip install 'distillpdf[ocr]'`.) Rendering now leaves those "
+                f"pages with little or no text.",
                 stacklevel=3,
             )
 
