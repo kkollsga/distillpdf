@@ -53,6 +53,9 @@ fn build_tesseract() {
     let lept_cmake = lept.join("lib").join("cmake").join("leptonica");
     let tess = cmake::Config::new("third_party/tesseract")
         .define("BUILD_SHARED_LIBS", "OFF")
+        // Same Windows quirk as Leptonica: Tesseract defaults SW_BUILD=ON on Windows and
+        // does `find_package(SW REQUIRED)`, which fails on a clean MSVC runner.
+        .define("SW_BUILD", "OFF")
         .define("DISABLED_LEGACY_ENGINE", "ON")
         .define("BUILD_TRAINING_TOOLS", "OFF")
         .define("BUILD_TESTS", "OFF")
