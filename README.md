@@ -8,8 +8,9 @@
 [![CI](https://github.com/kkollsga/distillpdf/actions/workflows/ci.yml/badge.svg)](https://github.com/kkollsga/distillpdf/actions/workflows/ci.yml)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org)
 
-> 📓 **New — OCR for scanned PDFs:** detect image-only pages, OCR them with granite-docling, and
-> emit clean HTML or a compact **searchable PDF**. See the **[OCR example notebook »](examples/ocr.ipynb)**
+> 📓 **New — OCR for scanned PDFs:** detect image-only pages and OCR them into clean HTML or a
+> compact **searchable PDF** — with a **bundled, offline fast engine** (no extra, no download) or
+> an optional accurate VLM. See the **[OCR example notebook »](examples/ocr.ipynb)**
 
 `distillpdf` reads a PDF and reconstructs its *structure* — reading order, headings,
 paragraphs, lists, tables, and figures — then emits compact, semantic **HTML** or
@@ -172,28 +173,29 @@ doc.page_count()       # number of pages
 
 ## OCR — scanned PDFs
 
-Image-only / scanned pages have no text to extract. The optional `[ocr]` extra detects those
-pages, runs a local vision-OCR model ([granite-docling](https://huggingface.co/ibm-granite/granite-docling-258M))
-over them, and folds the recovered text back into the same HTML / Markdown / **searchable PDF**
-outputs — born-digital pages keep distillPDF's normal extraction.
+Image-only / scanned pages have no text to extract. distillPDF OCRs them and folds the
+recovered text back into the same HTML / Markdown / **searchable PDF** outputs — born-digital
+pages keep distillPDF's normal extraction. There are two tiers:
 
-```bash
-pip install 'distillpdf[ocr]'      # Apple Silicon: mlx-vlm   ·   Windows/Linux: llama-cpp-python
-```
+| Tier | Engine | Install | Speed | Quality | Notes |
+|---|---|---|---|---|---|
+| **fast** (default) | bundled **Tesseract** | none — in the wheel | ~0.8 s/page | char ~95% | offline, no download; flat text (no tables) |
+| **accurate** | **granite-docling** VLM | `pip install 'distillpdf[ocr]'` | ~6 s/page | char ~97% | structure + **tables**; downloads a model |
 
-> **Platform:** the right runtime is selected automatically and **neither needs PyTorch**:
-> on **Apple Silicon** (macOS, M-series) the official MLX build of granite-docling runs on the
-> Metal GPU; on **Windows / Linux / Intel Mac** the granite-docling GGUF runs via
-> `llama-cpp-python` (CUDA or CPU). An optional PyTorch/vLLM accelerator is planned for
-> high-throughput Linux+CUDA but is never installed or selected by default. All of distillPDF's
-> pure-Rust extraction works on every platform regardless.
+The **fast** tier works out of the box on a plain `pip install distillpdf` — no extra, no
+PyTorch, no model download, fully offline. English ships in the wheel; add more languages with
+`pip install 'distillpdf[languages]'` (Portuguese, Norwegian, …) or point `TESSDATA_PREFIX` at
+your own tessdata. The **accurate** tier auto-selects a no-PyTorch runtime — MLX on Apple
+Silicon, granite-docling GGUF via `llama-cpp-python` on Windows/Linux/Intel-Mac.
 
 From the command line — open → OCR (progress bar shown automatically) → write, no Python:
 
 ```bash
-distillpdf scan.pdf --ocr                  # → scan.searchable.pdf  (keeps scan + hidden text layer)
-distillpdf scan.pdf --ocr --remove-raster  # → reflowed clean text + figures, much smaller file
-distillpdf scan.pdf --ocr -o out.html      # OCR'd HTML  (use a .md path for Markdown)
+distillpdf scan.pdf --ocr                       # → scan.searchable.pdf  (fast tier, bundled)
+distillpdf scan.pdf --ocr --remove-raster       # → reflowed clean text + figures, smaller file
+distillpdf scan.pdf --ocr -o out.html           # OCR'd HTML  (use a .md path for Markdown)
+distillpdf scan.pdf --ocr --ocr-engine accurate # granite-docling (needs the [ocr] extra)
+distillpdf --list-ocr-engines                   # show engines: name, tier, bundled, offline
 ```
 
 Or from Python:
@@ -202,9 +204,9 @@ Or from Python:
 import distillpdf
 
 doc = distillpdf.open("scanned.pdf")
-doc.run_ocr()                  # ONE model pass over every scanned page; cached on the document
-                               # (downloads the granite-docling model on first use; shows a
-                               #  progress bar on a terminal — pass progress=False to silence)
+doc.run_ocr()                  # fast tier by default — bundled, offline; cached on the document
+                               # (a progress bar shows on a terminal — pass progress=False to silence)
+# accurate tier:  doc.run_ocr(distillpdf.get_backend(tier="accurate"))
 doc.to_pdf("out.pdf")          # searchable PDF        (reuses the cache — no second pass)
 doc.to_html("out.html")        # OCR text folded into clean HTML
 doc.to_markdown("out.md")      # …and Markdown
@@ -226,12 +228,13 @@ Flate-wrapped JPEG encodings, and full-page rasters whose only text is an e-fili
 - **`remove_raster=True`** — pages are reflowed to clean visible text + cropped figures and the
   raster is dropped, for a much smaller file.
 
-**Tables** are recovered natively: granite-docling emits OTSL table structure, which distillPDF
-renders as a real `<table>` (with `<th>` / `colspan` / `rowspan`) in HTML and a positioned
-table in the searchable PDF.
+**Tables** are recovered natively by the **accurate** tier: granite-docling emits OTSL table
+structure, which distillPDF renders as a real `<table>` (with `<th>` / `colspan` / `rowspan`) in
+HTML and a positioned table in the searchable PDF. The fast (Tesseract) tier produces flat text
+only — use the accurate tier when table structure matters.
 
-> Quality scales with the model: granite-docling-258M is small and tuned for documents; clean
-> typed pages come out near-verbatim, dense or low-quality scans less so. See the
+> Pick the tier for the job: the fast tier is great for "make this scan searchable, now"; the
+> accurate tier is for structure-faithful extraction (tables, headings, reading order). See the
 > **[OCR example notebook »](examples/ocr.ipynb)**.
 
 ## Why distillPDF

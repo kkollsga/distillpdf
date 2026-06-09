@@ -90,3 +90,5 @@ Source = "https://github.com/kkollsga/distillpdf"
 features = ["extension-module"]
 module-name = "distillpdf._distillpdf"
 python-source = "python"
+# Ship the bundled-component attributions (Tesseract/Leptonica/tessdata) in the wheel.
+include = ["THIRD_PARTY_LICENSES"]
