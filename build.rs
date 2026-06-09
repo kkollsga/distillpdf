@@ -34,6 +34,10 @@ fn build_tesseract() {
     let lept = cmake::Config::new("third_party/leptonica")
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("BUILD_PROG", "OFF")
+        // Leptonica defaults SW_BUILD=ON on Windows, which does `find_package(SW REQUIRED)`
+        // for the Software Network package manager and fails on a clean MSVC runner. Force it
+        // off (it's already off on macOS/Linux) so the from-source build works everywhere.
+        .define("SW_BUILD", "OFF")
         .define("ENABLE_ZLIB", "OFF")
         .define("ENABLE_PNG", "OFF")
         .define("ENABLE_JPEG", "OFF")
