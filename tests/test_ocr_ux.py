@@ -185,6 +185,9 @@ def test_backend_for_engine_selector():
     # default (None / "fast") resolves to whatever the fast tier is in this build
     assert ocr.backend_for().name == ocr.default_backend_name("fast")
     assert ocr.backend_for("fast").name == ocr.default_backend_name("fast")
+    # engine= also accepts an already-constructed backend (passed through unchanged)
+    be = ocr.get_backend("granite-docling-gguf")
+    assert ocr.backend_for(be) is be
 
 
 def test_native_server_engine_registered():
