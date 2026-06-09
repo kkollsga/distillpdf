@@ -19,6 +19,49 @@ pub(crate) trait OcrEngine: Sync {
     fn ocr_page(&self, image: &[u8]) -> Result<String, String>;
 }
 
+/// Engine-agnostic options parsed from the Python side (a plain dict crosses the PyO3
+/// boundary). Each engine picks the fields it cares about and ignores the rest — mirroring
+/// how the Python `OcrConfig` dataclass is shared across backends.
+#[derive(Default, Clone)]
+pub(crate) struct NativeCfg {
+    pub languages: Vec<String>,
+    pub dpi: Option<u32>,
+    pub prompt: Option<String>,
+    pub max_tokens: Option<u32>,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+}
+
+/// Build a Rust-native OCR engine by name. Unknown / compiled-out engines return `Err`.
+/// This is the single registry that surfaces native engines (the bundled Tesseract, the
+/// bring-your-own server) into the Python backend registry via `ocr_page_native`.
+pub(crate) fn native_engine(name: &str, cfg: &NativeCfg) -> Result<Box<dyn OcrEngine>, String> {
+    match name {
+        #[cfg(feature = "tesseract")]
+        "tesseract" => Ok(Box::new(crate::ocr::tesseract::TesseractEngine::from_cfg(cfg)?)),
+        "server" => Ok(Box::new(ServerOcrEngine::from_cfg(cfg))),
+        _ => Err(format!("unknown native OCR engine {name:?}")),
+    }
+}
+
+/// Whether `name` is a native engine compiled into this build — cheap, constructs nothing,
+/// so capability/`--list-ocr-engines` queries never touch a model or the C FFI.
+pub(crate) fn native_engine_available(name: &str) -> bool {
+    match name {
+        "tesseract" => cfg!(feature = "tesseract"),
+        "server" => true,
+        _ => false,
+    }
+}
+
+/// The native engines compiled into this build, in preference order.
+pub(crate) fn native_engine_names() -> Vec<&'static str> {
+    ["tesseract", "server"]
+        .into_iter()
+        .filter(|n| native_engine_available(n))
+        .collect()
+}
+
 /// Returns pre-captured DocTags in call order. For tests / replaying a captured corpus.
 pub(crate) struct ReplayEngine {
     pages: Vec<String>,
@@ -55,6 +98,20 @@ impl Default for ServerOcrEngine {
             prompt: "Convert this page to docling.".into(),
             max_tokens: 4096,
             timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+impl ServerOcrEngine {
+    /// Build from the engine-agnostic `NativeCfg`, falling back to defaults for unset fields.
+    pub(crate) fn from_cfg(cfg: &NativeCfg) -> Self {
+        let d = ServerOcrEngine::default();
+        ServerOcrEngine {
+            host: cfg.host.clone().unwrap_or(d.host),
+            port: cfg.port.unwrap_or(d.port),
+            prompt: cfg.prompt.clone().unwrap_or(d.prompt),
+            max_tokens: cfg.max_tokens.unwrap_or(d.max_tokens),
+            timeout: d.timeout,
         }
     }
 }

@@ -63,6 +63,16 @@ class GraniteDoclingBackend(OcrBackend):
 
     name = "granite-docling-gguf"
     output = "doctags"
+    tier = "accurate"
+    structure_aware = True          # emits OTSL tables + tagged headings
+    bundled = False                 # needs the [ocr] extra + a model download
+    offline = False
+    detail = "granite-docling VLM via llama.cpp GGUF (Win/Linux/Intel-Mac). Needs [ocr]."
+
+    @classmethod
+    def is_available(cls) -> bool:
+        import importlib.util
+        return importlib.util.find_spec("llama_cpp") is not None
 
     def __init__(self, config: Optional[OcrConfig] = None, **kwargs):
         super().__init__(config, **kwargs)

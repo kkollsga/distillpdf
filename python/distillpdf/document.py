@@ -118,13 +118,13 @@ class Document:
     # scanned pages that haven't been OCR'd. OCR-augmented output is inherently page-scoped.
     def to_html(self, path: Optional[str] = None, return_string: bool = False,
                 mode: str = "section", toc: bool = True, image_mode: str = "embed",
-                ocr: bool = False):
+                ocr: bool = False, backend: Optional["_ocr.OcrBackend"] = None):
         """Render to HTML. Pass ``ocr=True`` to OCR any scanned pages first (runs ``run_ocr``
-        once if it hasn't been). When the document has OCR results, scanned pages are rendered
-        from the recovered text (page mode); otherwise this is the core extractor verbatim and
-        un-OCR'd scanned pages trigger a warning."""
+        once if it hasn't been), optionally with a specific ``backend``. When the document has
+        OCR results, scanned pages are rendered from the recovered text (page mode); otherwise
+        this is the core extractor verbatim and un-OCR'd scanned pages trigger a warning."""
         if ocr and not self._pdf.has_ocr():
-            self.run_ocr()
+            self.run_ocr(backend)
         self._warn_pending()
         if self._pdf.has_ocr():
             result = _ocr.to_html(self._pdf, path=path, return_string=return_string, image_mode=image_mode)
@@ -135,23 +135,24 @@ class Document:
 
     def to_markdown(self, path: Optional[str] = None, return_string: bool = False,
                     mode: str = "section", toc: bool = True, image_mode: str = "external",
-                    ocr: bool = False):
-        """Render to Markdown. ``ocr=True`` OCRs scanned pages first; otherwise OCR-augmented
-        only if ``run_ocr`` was already called."""
+                    ocr: bool = False, backend: Optional["_ocr.OcrBackend"] = None):
+        """Render to Markdown. ``ocr=True`` OCRs scanned pages first (optionally with a given
+        ``backend``); otherwise OCR-augmented only if ``run_ocr`` was already called."""
         if ocr and not self._pdf.has_ocr():
-            self.run_ocr()
+            self.run_ocr(backend)
         self._warn_pending()
         if self._pdf.has_ocr():
             return _ocr.to_markdown(self._pdf, path=path, return_string=return_string, toc=toc, image_mode=image_mode)
         return self._pdf.to_markdown(path, return_string, mode, toc, image_mode)
 
-    def to_pdf(self, path: str, remove_raster: bool = False, ocr: bool = False) -> str:
-        """Write a searchable PDF. ``ocr=True`` OCRs scanned pages first. By default the
-        original scan is kept and an invisible selectable text layer is added;
-        ``remove_raster=True`` reflows to clean text and drops the raster. Warns if no pages
-        have been OCR'd (the result would otherwise just be the original)."""
+    def to_pdf(self, path: str, remove_raster: bool = False, ocr: bool = False,
+               backend: Optional["_ocr.OcrBackend"] = None) -> str:
+        """Write a searchable PDF. ``ocr=True`` OCRs scanned pages first (optionally with a
+        given ``backend``). By default the original scan is kept and an invisible selectable
+        text layer is added; ``remove_raster=True`` reflows to clean text and drops the raster.
+        Warns if no pages have been OCR'd (the result would otherwise just be the original)."""
         if ocr and not self._pdf.has_ocr():
-            self.run_ocr()
+            self.run_ocr(backend)
         if not self._pdf.has_ocr():
             self._warn_pending()
         return self._pdf.to_pdf(path, None, remove_raster=remove_raster)

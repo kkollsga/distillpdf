@@ -57,6 +57,15 @@ class PyTorchGraniteDoclingBackend(OcrBackend):
 
     name = "granite-docling-pytorch"
     output = "doctags"
+    tier = "accurate"
+    structure_aware = True
+    bundled = False
+    offline = False
+    detail = "PyTorch/vLLM granite-docling accelerator (Linux+CUDA) — planned, not yet built."
+
+    @classmethod
+    def is_available(cls) -> bool:
+        return False  # placeholder — never runnable until implemented
 
     def __init__(self, config: Optional[OcrConfig] = None, **kwargs):
         super().__init__(config, **kwargs)

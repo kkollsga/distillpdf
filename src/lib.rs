@@ -637,6 +637,58 @@ fn ocr_doctags_to_pdf(pages: Vec<(String, String, f64, f64)>, out_path: &str) ->
     Ok(())
 }
 
+/// Parse the engine-agnostic options dict (from Python `OcrConfig`/backend) into a
+/// `NativeCfg`. Unknown keys are ignored; the engine picks what it needs.
+fn parse_native_cfg(opts: Option<&Bound<'_, PyDict>>) -> PyResult<ocr::engine::NativeCfg> {
+    let mut cfg = ocr::engine::NativeCfg::default();
+    let Some(d) = opts else { return Ok(cfg) };
+    if let Ok(Some(v)) = d.get_item("languages") {
+        if let Ok(langs) = v.extract::<Vec<String>>() {
+            cfg.languages = langs;
+        }
+    }
+    if let Ok(Some(v)) = d.get_item("dpi") {
+        cfg.dpi = v.extract::<u32>().ok();
+    }
+    if let Ok(Some(v)) = d.get_item("prompt") {
+        cfg.prompt = v.extract::<String>().ok();
+    }
+    if let Ok(Some(v)) = d.get_item("max_tokens") {
+        cfg.max_tokens = v.extract::<u32>().ok();
+    }
+    if let Ok(Some(v)) = d.get_item("host") {
+        cfg.host = v.extract::<String>().ok();
+    }
+    if let Ok(Some(v)) = d.get_item("port") {
+        cfg.port = v.extract::<u16>().ok();
+    }
+    Ok(cfg)
+}
+
+/// Run a Rust-native OCR engine on one page image → DocTags. `opts` is a dict of
+/// engine-agnostic options (languages, dpi, prompt, host, port…). Mirrors the Python
+/// `OcrBackend.ocr_page` contract so a thin `NativeBackend` can wrap it. The GIL is
+/// released during inference (engines are `Sync` and CPU/IO-bound).
+#[pyfunction]
+#[pyo3(signature = (engine, image, opts=None))]
+fn ocr_page_native(
+    py: Python<'_>,
+    engine: &str,
+    image: &[u8],
+    opts: Option<&Bound<'_, PyDict>>,
+) -> PyResult<String> {
+    let cfg = parse_native_cfg(opts)?;
+    let eng = ocr::engine::native_engine(engine, &cfg).map_err(PyValueError::new_err)?;
+    py.allow_threads(|| eng.ocr_page(image)).map_err(PyValueError::new_err)
+}
+
+/// Names of native OCR engines compiled into this wheel (e.g. ["tesseract","server"], or
+/// just ["server"] when the tesseract feature is off). Import-light; constructs nothing.
+#[pyfunction]
+fn native_engines() -> Vec<String> {
+    ocr::engine::native_engine_names().into_iter().map(String::from).collect()
+}
+
 #[pymodule]
 fn _distillpdf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Pdf>()?;
@@ -646,6 +698,8 @@ fn _distillpdf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(html_to_markdown, m)?)?;
     m.add_function(wrap_pyfunction!(ocr_doctags_doc_html, m)?)?;
     m.add_function(wrap_pyfunction!(ocr_doctags_to_pdf, m)?)?;
+    m.add_function(wrap_pyfunction!(ocr_page_native, m)?)?;
+    m.add_function(wrap_pyfunction!(native_engines, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

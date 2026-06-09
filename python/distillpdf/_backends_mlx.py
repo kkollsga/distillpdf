@@ -36,6 +36,16 @@ class MlxGraniteDoclingBackend(OcrBackend):
 
     name = "granite-docling"
     output = "doctags"
+    tier = "accurate"
+    structure_aware = True          # emits OTSL tables + tagged headings
+    bundled = False                 # needs the [ocr] extra + a model download
+    offline = False
+    detail = "granite-docling VLM via MLX (Apple Silicon). Tables + structure; needs [ocr]."
+
+    @classmethod
+    def is_available(cls) -> bool:
+        import importlib.util
+        return importlib.util.find_spec("mlx_vlm") is not None
 
     def __init__(self, config: Optional[OcrConfig] = None, **kwargs):
         super().__init__(config, **kwargs)

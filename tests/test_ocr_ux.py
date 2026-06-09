@@ -118,3 +118,76 @@ def test_cli_ocr_on_born_digital_pdf_is_noop(capsys):
     assert rc == 0
     err = capsys.readouterr().err
     assert "nothing to OCR" in err
+
+
+# -- engine interface: capabilities, tiers, native registry ------------------
+
+def test_default_tier_falls_back_to_accurate_without_fast(monkeypatch):
+    # With no "tesseract" engine registered, the fast tier falls back to the platform
+    # granite (accurate) backend — preserving today's behavior.
+    monkeypatch.delitem(ocr._BACKENDS, "tesseract", raising=False)
+    assert ocr.default_backend_name() == ocr._accurate_backend_name()
+    assert ocr.default_backend_name("fast") == ocr._accurate_backend_name()
+
+
+def test_default_tier_is_fast_when_engine_present(monkeypatch):
+    # Register a throwaway "tesseract" backend; the default tier 'fast' must pick it.
+    class _Dummy(ocr.OcrBackend):
+        name = "tesseract"; tier = "fast"; bundled = True
+        def ocr_page(self, image):  # pragma: no cover - never called
+            return ""
+    monkeypatch.setitem(ocr._BACKENDS, "tesseract", _Dummy)
+    assert ocr.default_backend_name() == "tesseract"
+    assert ocr.default_backend_name("fast") == "tesseract"
+    # explicit accurate tier still bypasses it
+    assert ocr.default_backend_name("accurate") == ocr._accurate_backend_name()
+
+
+def test_unknown_tier_raises():
+    with pytest.raises(ValueError):
+        ocr.default_backend_name("turbo")
+
+
+def test_get_backend_name_overrides_tier():
+    # an explicit name wins over any tier
+    be = ocr.get_backend(name="granite-docling-gguf", tier="fast")
+    assert be.name == "granite-docling-gguf"
+
+
+def test_legacy_names_still_resolve():
+    for nm in ("granite-docling", "granite-docling-gguf"):
+        assert ocr.get_backend(nm).name == nm
+
+
+def test_backend_descriptors_shape_and_import_light():
+    # Reading capabilities must not import any heavy backend dep.
+    import sys
+    for mod in ("mlx_vlm", "llama_cpp", "torch"):
+        assert mod not in sys.modules or True  # tolerate pre-imported; we assert no NEW import
+    before = set(sys.modules)
+    rows = ocr.backend_descriptors()
+    after = set(sys.modules)
+    assert not ({"mlx_vlm", "llama_cpp", "torch"} & (after - before))
+    assert rows and all(isinstance(d, ocr.OcrCapabilities) for d in rows)
+    d = {r.name: r for r in rows}
+    # the granite backends self-describe as accurate + structure-aware + not bundled
+    assert d["granite-docling"].tier == "accurate"
+    assert d["granite-docling"].structure_aware is True
+    assert d["granite-docling"].bundled is False
+    assert d["granite-docling"].output == "doctags"
+
+
+def test_native_server_engine_registered():
+    # The native "server" engine is compiled in and surfaces in the unified registry.
+    from distillpdf import _distillpdf as core
+    assert "server" in core.native_engines()
+    assert "server" in ocr.available_backends()
+    be = ocr.get_backend("server")
+    assert be.tier == "accurate" and be.engine == "server"
+
+
+def test_cli_list_ocr_engines(capsys):
+    rc = cli.main(["x.pdf", "--list-ocr-engines"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "name" in out and "tier" in out and "granite-docling" in out

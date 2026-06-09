@@ -19,6 +19,9 @@ crate-type = ["cdylib", "rlib"]
 # (it tells pyo3 not to link libpython, so `_PyExc_*` are undefined). Keeping it OPT-IN
 # means `cargo test` links normally and the pure-Rust logic gets real unit tests.
 extension-module = ["pyo3/extension-module"]
+# Bundled Tesseract "fast" OCR engine. Empty for now (the from-source build + deps land in
+# the Tesseract stage); declaring it here keeps `cfg(feature = "tesseract")` well-defined.
+tesseract = []
 
 [dependencies]
 pyo3 = { version = "0.25", features = ["abi3-py38"] }

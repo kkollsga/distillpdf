@@ -83,9 +83,18 @@ def main(argv=None):
     p.add_argument("--section", metavar="NAME", help="emit only the named section")
     p.add_argument(
         "--ocr", action="store_true",
-        help="OCR scanned / image-only pages first (needs the 'distillpdf[ocr]' extra; "
-        "downloads a model on first use). Output is a searchable PDF by default, or HTML/"
-        "Markdown if -o ends in .html/.md (or --markdown/--text is given)",
+        help="OCR scanned / image-only pages first. Output is a searchable PDF by default, or "
+        "HTML/Markdown if -o ends in .html/.md (or --markdown/--text is given)",
+    )
+    p.add_argument(
+        "--ocr-engine", metavar="ENGINE", default=None,
+        help="OCR engine: a tier ('fast' = bundled, no extra/download; 'accurate' = "
+        "granite-docling, needs the [ocr] extra) or a specific backend name. "
+        "See --list-ocr-engines. Default: fast.",
+    )
+    p.add_argument(
+        "--list-ocr-engines", action="store_true",
+        help="list the available OCR engines (name, tier, bundled, offline) and exit",
     )
     p.add_argument(
         "--remove-raster", action="store_true",
@@ -96,6 +105,8 @@ def main(argv=None):
     p.add_argument("--version", action="version", version=f"distillpdf {__version__}")
     args = p.parse_args(argv)
 
+    if args.list_ocr_engines:
+        return _list_ocr_engines()
     if args.ocr:
         return _run_ocr(args)
 
@@ -181,12 +192,42 @@ def _ocr_out_path(src, args, multiple, fmt):
     return args.output
 
 
+def _resolve_ocr_backend(args):
+    """Turn ``--ocr-engine`` into a backend: a tier ('fast'/'accurate'), a specific name, or
+    None (→ the default fast tier). Constructed once and reused for every input."""
+    from . import ocr
+    sel = args.ocr_engine
+    if sel in (None, "fast", "accurate"):
+        return ocr.get_backend(tier=sel or "fast")
+    return ocr.get_backend(name=sel)
+
+
+def _list_ocr_engines():
+    """Print the registered OCR engines (import-light — no model load) and exit 0."""
+    from . import ocr
+    rows = ocr.backend_descriptors()
+    if not rows:
+        print("distillpdf: no OCR engines registered", file=sys.stderr)
+        return 0
+    print(f"{'name':22} {'tier':9} {'bundled':8} {'offline':8} {'avail':6} description")
+    for d in sorted(rows, key=lambda r: (r.tier != 'fast', r.name)):
+        print(f"{d.name:22} {d.tier:9} {str(d.bundled):8} {str(d.offline):8} "
+              f"{str(d.available):6} {d.detail}")
+    return 0
+
+
 def _run_ocr(args):
     """`--ocr`: OCR each input's scanned pages (progress bar shown automatically) and write a
-    searchable PDF (default) or OCR'd HTML/Markdown. The model is downloaded on first use and
-    needs the ``distillpdf[ocr]`` extra; a missing-extra error is reported per file."""
+    searchable PDF (default) or OCR'd HTML/Markdown. The engine is chosen by ``--ocr-engine``
+    (default: the fast bundled tier); errors (e.g. a missing [ocr] extra for 'accurate') are
+    reported per file."""
     multiple = len(args.pdf) > 1
     img_kw = {} if args.image_mode is None else {"image_mode": args.image_mode}
+    try:
+        backend = _resolve_ocr_backend(args)
+    except Exception as e:  # unknown engine name / tier
+        print(f"distillpdf: {e}", file=sys.stderr)
+        return 1
     rc = 0
     for src in args.pdf:
         try:
@@ -198,14 +239,14 @@ def _run_ocr(args):
                 print(f"distillpdf: {src}: no scanned/image-only pages detected; nothing to OCR",
                       file=sys.stderr)
                 continue
-            print(f"distillpdf: {src}: OCR'ing {n_scanned} scanned page(s) -> {dest}",
+            print(f"distillpdf: {src}: OCR'ing {n_scanned} scanned page(s) [{backend.name}] -> {dest}",
                   file=sys.stderr)
             if fmt == "pdf":
-                doc.to_pdf(dest, remove_raster=args.remove_raster, ocr=True)
+                doc.to_pdf(dest, remove_raster=args.remove_raster, ocr=True, backend=backend)
             elif fmt == "md":
-                doc.to_markdown(dest, ocr=True, **img_kw)
+                doc.to_markdown(dest, ocr=True, backend=backend, **img_kw)
             else:
-                doc.to_html(dest, ocr=True, **img_kw)
+                doc.to_html(dest, ocr=True, backend=backend, **img_kw)
             print(f"distillpdf: wrote {dest}", file=sys.stderr)
         except Exception as e:  # missing [ocr] extra, malformed PDF, unreadable path, etc.
             print(f"distillpdf: {src}: {e}", file=sys.stderr)

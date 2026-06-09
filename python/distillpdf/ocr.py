@@ -51,6 +51,12 @@ class OcrConfig:
     prompt:     instruction given to the model (DocTags conversion by default).
     max_tokens: generation cap per page (a backstop — stop_strings normally terminate).
     stop_strings: strings that end generation (e.g. the DocTags end marker).
+    languages:  ISO codes an engine should read, e.g. ["eng", "por"] (Tesseract). Empty =
+                the engine's default. Ignored by engines that are language-agnostic.
+    dpi:        render-resolution hint; None = engine default. Ignored where irrelevant.
+
+    Fields an engine doesn't use are simply ignored, so this stays one shared dataclass
+    across every backend.
     """
 
     model_id: Optional[str] = None
@@ -62,15 +68,65 @@ class OcrConfig:
     # (stop_strings) is the real terminator, so this is just a runaway backstop.
     max_tokens: int = 4096
     stop_strings: List[str] = field(default_factory=list)
+    languages: List[str] = field(default_factory=list)
+    dpi: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class OcrCapabilities:
+    """What an engine is and what it can do — read straight off the backend class, so it
+    can be queried (for defaulting, the CLI, ``--help``) WITHOUT importing the engine's
+    heavy dependencies or downloading any model."""
+
+    name: str
+    tier: str                    # "fast" | "accurate"
+    structure_aware: bool        # emits tables (OTSL) / tagged headings, vs flat bare-dialect text
+    bundled: bool                # works on a base `pip install distillpdf` — no extra, no download
+    offline: bool                # no network / model download at use time
+    languages: tuple             # ISO codes it can read; () = unspecified / any
+    available: bool              # can it actually run in THIS install right now?
+    output: str = "doctags"      # the immutable wire contract
+    detail: str = ""             # one-line human description
 
 
 class OcrBackend:
-    """Abstract OCR backend: a page image → DocTags string."""
+    """Abstract OCR backend: a page image → DocTags string.
+
+    The class-level capability attributes (``tier``/``structure_aware``/``bundled``/
+    ``offline``/``languages``) describe the engine and are deliberately cheap to read —
+    inspecting them never triggers the engine's heavy imports (those load lazily inside
+    ``ocr_page``). ``structure_aware`` is advisory metadata for defaulting/docs only; it is
+    NOT a pipeline switch — a flat-text engine simply emits the bare DocTags dialect the
+    Rust parser already handles."""
 
     #: human-facing name used in the registry and error messages
     name: str = "abstract"
     #: the model output dialect the Rust core should expect ("doctags")
     output: str = "doctags"
+
+    # -- capability metadata (class-level, cheap to read) --------------------
+    tier: str = "accurate"
+    structure_aware: bool = True
+    bundled: bool = False
+    offline: bool = False
+    languages: tuple = ()
+    detail: str = ""
+
+    @classmethod
+    def is_available(cls) -> bool:
+        """Whether this engine can actually run in the current install — checked
+        import-light (no heavy import, no download). Default True; backends with optional
+        deps override (e.g. via ``importlib.util.find_spec``) or native engines query the
+        compiled-in feature set."""
+        return True
+
+    @classmethod
+    def descriptor(cls) -> "OcrCapabilities":
+        return OcrCapabilities(
+            name=cls.name, tier=cls.tier, structure_aware=cls.structure_aware,
+            bundled=cls.bundled, offline=cls.offline, languages=tuple(cls.languages),
+            available=cls.is_available(), output=cls.output, detail=cls.detail,
+        )
 
     def __init__(self, config: Optional[OcrConfig] = None, **kwargs):
         self.config = config or OcrConfig(**kwargs)
@@ -91,36 +147,74 @@ class OcrBackend:
 
 # ---- registry --------------------------------------------------------------
 
-#: name → factory. Backends self-register here; today only granite-docling. Future
-#: entries (e.g. a table-capable "docling" backend) plug in without touching callers.
+#: name → factory. Backends self-register here. Engines (granite VLM, the bundled
+#: Tesseract, a bring-your-own server, …) plug in without touching callers.
 _BACKENDS: Dict[str, Callable[..., OcrBackend]] = {}
+#: name → backend CLASS, kept so capabilities can be read without instantiating. For all
+#: current backends the factory *is* the class; when it isn't, pass ``descriptor_cls``.
+_BACKENDS_DESC: Dict[str, type] = {}
 
 
-def register_backend(name: str, factory: Callable[..., OcrBackend]) -> None:
+def register_backend(name: str, factory: Callable[..., OcrBackend],
+                     descriptor_cls: Optional[type] = None) -> None:
+    """Register an engine backend under ``name``. ``descriptor_cls`` is the class whose
+    capability attributes describe the engine (defaults to ``factory`` when it is itself a
+    class, which is the common case)."""
     _BACKENDS[name] = factory
+    cls = descriptor_cls or (factory if isinstance(factory, type) else None)
+    if cls is not None:
+        _BACKENDS_DESC[name] = cls
 
 
 def available_backends() -> list[str]:
     return sorted(_BACKENDS)
 
 
-def default_backend_name() -> str:
-    """The OCR backend for this platform: native MLX granite-docling on Apple Silicon
-    (Metal, no PyTorch), otherwise the granite-docling GGUF backend via llama-cpp-python
-    on Windows/Linux/Intel-Mac (CUDA/CPU, no PyTorch). An optional PyTorch/vLLM accelerator
-    is registered as ``granite-docling-pytorch`` but is not the default."""
+def backend_descriptors() -> "list[OcrCapabilities]":
+    """Capability descriptors for every registered backend — import-light (reads class
+    attributes only; never instantiates a backend or imports its heavy deps). Drives the
+    CLI ``--list-ocr-engines`` and tier defaulting."""
+    return [_BACKENDS_DESC[n].descriptor() for n in available_backends() if n in _BACKENDS_DESC]
+
+
+# ---- selection -------------------------------------------------------------
+
+def _accurate_backend_name() -> str:
+    """The platform's granite-docling backend: native MLX on Apple Silicon (Metal, no
+    PyTorch), else the GGUF backend via llama-cpp-python (Win/Linux/Intel-Mac, no PyTorch)."""
     import platform
 
     if platform.system() == "Darwin" and platform.machine() == "arm64":
-        return "granite-docling"  # MLX, no PyTorch
-    return "granite-docling-gguf"  # llama.cpp GGUF, no PyTorch
+        return "granite-docling"  # MLX
+    return "granite-docling-gguf"  # llama.cpp GGUF
 
 
-def get_backend(name: Optional[str] = None, **kwargs) -> OcrBackend:
-    """Construct a backend by name (default: the best one for this platform). Raises
-    OcrDependencyError if its deps are missing, with the exact install command."""
+def _fast_backend_name() -> Optional[str]:
+    """The bundled fast engine (Tesseract) if it's compiled into this wheel, else None."""
+    return "tesseract" if "tesseract" in _BACKENDS else None
+
+
+def default_backend_name(tier: Optional[str] = None) -> str:
+    """Resolve a backend name for a tier. ``tier="fast"`` (the default) picks the bundled
+    Tesseract engine when it's compiled in, otherwise gracefully falls back to the platform
+    granite backend — so a wheel built without the fast engine behaves exactly as before, and
+    the default flips to fast automatically the day that engine ships. ``tier="accurate"``
+    always picks granite-docling."""
+    tier = tier or "fast"
+    if tier == "fast":
+        return _fast_backend_name() or _accurate_backend_name()
+    if tier == "accurate":
+        return _accurate_backend_name()
+    raise ValueError(f"unknown OCR tier {tier!r}; expected 'fast' or 'accurate'")
+
+
+def get_backend(name: Optional[str] = None, *, tier: Optional[str] = None, **kwargs) -> OcrBackend:
+    """Construct a backend. Precedence: explicit ``name`` > ``tier`` > the platform default
+    (fast tier). Existing names (``granite-docling``, ``granite-docling-gguf``) resolve as
+    before. Raises OcrDependencyError when the chosen engine's optional deps are missing,
+    with the exact install command."""
     if name is None:
-        name = default_backend_name()
+        name = default_backend_name(tier)
     try:
         factory = _BACKENDS[name]
     except KeyError:
@@ -307,7 +401,9 @@ import builtins as _builtins  # noqa: E402
 builtins_open = _builtins.open
 
 # Built-in backends register themselves on import (lazily — importing this module does
-# NOT import their heavy dependencies).
+# NOT import their heavy dependencies). Native (Rust-compiled) engines register FIRST so
+# the fast tier can pick them as the default when they're built into the wheel.
+from . import _backends_native  # noqa: E402,F401  (side-effect: registration — bundled Tesseract / server)
 from . import _backends_mlx  # noqa: E402,F401  (side-effect: registration — Apple Silicon, MLX)
 from . import _backends_granite  # noqa: E402,F401  (side-effect: registration — Win/Linux/Intel-Mac, GGUF)
 from . import _backends_pytorch  # noqa: E402,F401  (side-effect: registration — optional PyTorch/vLLM accelerator)
