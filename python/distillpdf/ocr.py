@@ -144,19 +144,56 @@ except ImportError:  # pragma: no cover
     pass
 
 
+def _auto_progress(total: int):
+    """Default page-progress: a tqdm bar on an interactive terminal, else nothing.
+
+    Returns ``(callback, closer)``. The bar starts labelled "loading model" so the silent
+    first-call cost (model download + load, which happens inside the first ``ocr_page``) is
+    visible rather than dead air; it switches to "OCR" once the first page returns. On a
+    non-TTY (pipes, CI, notebooks without a live stderr) or when tqdm is unavailable this is
+    a no-op, so piped/automated use stays silent and callers passing their own ``progress``
+    are unaffected."""
+    import sys
+
+    if total <= 0 or not sys.stderr.isatty():
+        return None, None
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:  # tqdm ships with huggingface-hub, but degrade gracefully
+        return None, None
+
+    bar = tqdm(total=total, desc="OCR (loading model)", unit="page")
+
+    def cb(page: int, done: int, total: int) -> None:
+        if done == 1:
+            bar.set_description("OCR")
+        bar.update(1)
+
+    return cb, bar.close
+
+
 def _doctags_for(pdf, backend: OcrBackend, only: Optional[set] = None,
                  progress: Optional[Callable[[int, int, int], None]] = None) -> Dict[int, str]:
     """Run `backend` on every page the Rust core flags for OCR; return {page: DocTags}.
 
-    `progress(page, done, total)` is called after each page if given."""
+    `progress(page, done, total)` is called after each page. If `progress` is None (the
+    default) a tqdm bar is shown automatically on an interactive terminal; pass
+    ``progress=False`` to force silence, or your own callable to handle it yourself."""
     plan = [it for it in pdf.ocr_plan()
             if it["needs_ocr"] and it["image"] and (only is None or it["page"] in only)]
     total = len(plan)
     out: Dict[int, str] = {}
-    for i, item in enumerate(plan, 1):
-        out[item["page"]] = backend.ocr_page(bytes(item["image"]))
-        if progress:
-            progress(item["page"], i, total)
+    closer = None
+    if progress is None:
+        progress, closer = _auto_progress(total)
+    try:
+        for i, item in enumerate(plan, 1):
+            out[item["page"]] = backend.ocr_page(bytes(item["image"]))
+            if progress:
+                progress(item["page"], i, total)
+    finally:
+        if closer:
+            closer()
     return out
 
 
@@ -165,7 +202,9 @@ def run(pdf, backend: Optional[OcrBackend] = None, *, only: Optional[set] = None
     """OCR every scanned page of `pdf` **once** and cache the result on the `pdf` object.
     After this, ``ocr.to_pdf`` / ``ocr.to_html`` / ``ocr.to_markdown`` reuse the cached text
     — the model never re-runs. `backend` defaults to the bundled granite-docling backend
-    (the model is downloaded on first use). Returns the ``{page: DocTags}`` map."""
+    (the model is downloaded on first use). On an interactive terminal a tqdm progress bar is
+    shown by default; pass ``progress=False`` to silence it or your own ``progress(page, done,
+    total)`` callable. Returns the ``{page: DocTags}`` map."""
     if backend is None:
         backend = get_backend()
     doctags = _doctags_for(pdf, backend, only=only, progress=progress)

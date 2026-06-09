@@ -14,8 +14,11 @@ the Rust core.
 """
 from __future__ import annotations
 
+import os
 import warnings
 from typing import Callable, Optional
+
+_LARGE_HTML = 50 * 1024 * 1024  # warn above this when images are embedded inline
 
 from . import ocr as _ocr
 from ._distillpdf import from_bytes as _from_bytes
@@ -85,6 +88,30 @@ class Document:
                 stacklevel=3,
             )
 
+    def _warn_large_embed(self, path, result, image_mode: str) -> None:
+        """Embedding page rasters inline (image_mode='embed', the HTML default) can balloon a
+        scanned document to hundreds of MB. Point users at the leaner modes when it does."""
+        if image_mode != "embed":
+            return
+        # When a path is given the result is that path (the HTML went to disk), so size the
+        # file; only when rendering to a string is `result` the HTML itself.
+        if path:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                return
+        elif isinstance(result, str):
+            size = len(result)
+        else:
+            return
+        if size and size > _LARGE_HTML:
+            warnings.warn(
+                f"HTML output is {size / 1e6:.0f} MB because page images are embedded inline "
+                f"(image_mode='embed'). Pass image_mode='external' (writes a sibling img/ "
+                f"folder) or image_mode='drop' for a much smaller file.",
+                stacklevel=3,
+            )
+
     # -- outputs (OCR-aware) -------------------------------------------------
     # Signatures mirror the Rust core's so existing calls are unchanged; the only additions
     # are `ocr=True` (auto-run OCR first if it hasn't been) and, otherwise, a warning about
@@ -100,8 +127,11 @@ class Document:
             self.run_ocr()
         self._warn_pending()
         if self._pdf.has_ocr():
-            return _ocr.to_html(self._pdf, path=path, return_string=return_string, image_mode=image_mode)
-        return self._pdf.to_html(path, return_string, mode, toc, image_mode)
+            result = _ocr.to_html(self._pdf, path=path, return_string=return_string, image_mode=image_mode)
+        else:
+            result = self._pdf.to_html(path, return_string, mode, toc, image_mode)
+        self._warn_large_embed(path, result, image_mode)
+        return result
 
     def to_markdown(self, path: Optional[str] = None, return_string: bool = False,
                     mode: str = "section", toc: bool = True, image_mode: str = "external",

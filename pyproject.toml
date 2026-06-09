@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "distillpdf"
-version = "0.0.27"
+version = "0.0.28"
 description = "Pure-Rust PDF extraction that distills documents into clean, LLM-ready HTML — for LLMs and RAG, built on lopdf"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -56,6 +56,8 @@ classifiers = [
 ocr = [
     "huggingface-hub>=0.23",
     "pillow>=10",
+    "tqdm>=4",  # default progress bar for the model download + per-page OCR
+
     # Apple Silicon: run granite-docling natively on Metal via MLX. mlx-vlm pulls
     # mlx + transformers but NOT PyTorch. transformers is pinned <5 (the idefics3 image
     # processor changed in 5.x and breaks the MLX load).

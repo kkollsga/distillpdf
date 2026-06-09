@@ -55,6 +55,8 @@ distillpdf paper.pdf --no-toc         # omit the table-of-contents nav
 distillpdf paper.pdf --text           # plain text instead of HTML
 distillpdf paper.pdf --toc            # print the table of contents
 distillpdf paper.pdf --section abstract
+
+distillpdf scan.pdf  --ocr            # OCR a scanned PDF → scan.searchable.pdf (needs [ocr] extra)
 ```
 
 (Also available as `python -m distillpdf`.)
@@ -186,19 +188,30 @@ pip install 'distillpdf[ocr]'      # Apple Silicon: mlx-vlm   ·   Windows/Linux
 > high-throughput Linux+CUDA but is never installed or selected by default. All of distillPDF's
 > pure-Rust extraction works on every platform regardless.
 
+From the command line — open → OCR (progress bar shown automatically) → write, no Python:
+
+```bash
+distillpdf scan.pdf --ocr                  # → scan.searchable.pdf  (keeps scan + hidden text layer)
+distillpdf scan.pdf --ocr --remove-raster  # → reflowed clean text + figures, much smaller file
+distillpdf scan.pdf --ocr -o out.html      # OCR'd HTML  (use a .md path for Markdown)
+```
+
+Or from Python:
+
 ```python
 import distillpdf
 
 doc = distillpdf.open("scanned.pdf")
 doc.run_ocr()                  # ONE model pass over every scanned page; cached on the document
-                               # (downloads the granite-docling model on first use)
+                               # (downloads the granite-docling model on first use; shows a
+                               #  progress bar on a terminal — pass progress=False to silence)
 doc.to_pdf("out.pdf")          # searchable PDF        (reuses the cache — no second pass)
 doc.to_html("out.html")        # OCR text folded into clean HTML
 doc.to_markdown("out.md")      # …and Markdown
 ```
 
 `run_ocr` OCRs each scanned page once and caches the result on the document, so every output
-is rendered from a single pass. For a single output you can skip the explicit call and pass
+is rendered from a single pass. Trying it out? Pass `only={1, 2, 3}` to OCR just a few pages first. For a single output you can skip the explicit call and pass
 `ocr=True` — e.g. `doc.to_pdf("out.pdf", ocr=True)` runs OCR (once) then writes. The render
 methods (`to_html` / `to_markdown` / `to_pdf`) also work *without* OCR — they just **warn**
 that scanned pages have no text and point you at `run_ocr`.
