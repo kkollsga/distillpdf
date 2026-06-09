@@ -176,14 +176,15 @@ over them, and folds the recovered text back into the same HTML / Markdown / **s
 outputs — born-digital pages keep distillPDF's normal extraction.
 
 ```bash
-pip install 'distillpdf[ocr]'      # Apple Silicon: mlx-vlm + transformers (no PyTorch)
+pip install 'distillpdf[ocr]'      # Apple Silicon: mlx-vlm   ·   Windows/Linux: llama-cpp-python
 ```
 
-> **Platform:** OCR currently runs on **Apple Silicon** (macOS, M-series) via the official
-> MLX build of granite-docling, on the Metal GPU — fast, and **no PyTorch**. A
-> **Windows/Linux** path (granite-docling via PyTorch/vLLM) is planned; until then OCR there
-> raises a clear "not yet implemented". All of distillPDF's pure-Rust extraction works on
-> every platform regardless.
+> **Platform:** the right runtime is selected automatically and **neither needs PyTorch**:
+> on **Apple Silicon** (macOS, M-series) the official MLX build of granite-docling runs on the
+> Metal GPU; on **Windows / Linux / Intel Mac** the granite-docling GGUF runs via
+> `llama-cpp-python` (CUDA or CPU). An optional PyTorch/vLLM accelerator is planned for
+> high-throughput Linux+CUDA but is never installed or selected by default. All of distillPDF's
+> pure-Rust extraction works on every platform regardless.
 
 ```python
 import distillpdf

@@ -1,8 +1,11 @@
-"""Windows/Linux OCR backend for granite-docling via PyTorch — PLANNED (placeholder).
+"""Optional PyTorch/vLLM OCR accelerator for granite-docling — PLANNED (placeholder).
 
-Paused for now. On Apple Silicon the default MLX backend (`_backends_mlx.py`) is used and
-this module is never selected. On Windows/Linux `get_backend()` returns this placeholder,
-which raises a clear, actionable error until the path is implemented.
+Not a default on any platform: Apple Silicon uses the native MLX backend
+(`_backends_mlx.py`, ``granite-docling``) and Windows/Linux/Intel-Mac use the GGUF backend
+(`_backends_granite.py`, ``granite-docling-gguf``) via llama-cpp-python — neither pulls
+PyTorch. This backend is an opt-in high-throughput path (vLLM on Linux+CUDA) selected only
+by explicit ``get_backend("granite-docling-pytorch")``; until implemented it raises a clear,
+actionable error.
 
 Intended design (grounded in docling's own engines; same `ocr_page(bytes) -> str` contract,
 native resolution, no tiling — the idefics3 processor splits the page internally):
@@ -42,9 +45,10 @@ from .ocr import OcrBackend, OcrConfig, OcrDependencyError, register_backend
 _REPO = "ibm-granite/granite-docling-258M"
 
 _NOT_READY = (
-    "Windows/Linux OCR (granite-docling via PyTorch/vLLM) is not yet implemented. "
-    "Apple Silicon users get the default MLX backend automatically. The PyTorch/vLLM "
-    "path is planned — see python/distillpdf/_backends_pytorch.py for the intended design."
+    "The optional PyTorch/vLLM granite-docling accelerator is not yet implemented. "
+    "It is never auto-selected: Apple Silicon uses the MLX backend and Windows/Linux use "
+    "the GGUF backend (granite-docling-gguf) by default — neither needs PyTorch. The "
+    "PyTorch/vLLM path is planned — see python/distillpdf/_backends_pytorch.py for the design."
 )
 
 

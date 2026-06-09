@@ -105,13 +105,15 @@ def available_backends() -> list[str]:
 
 
 def default_backend_name() -> str:
-    """The OCR backend for this platform: MLX granite-docling on Apple Silicon, otherwise
-    the (currently placeholder) PyTorch/vLLM backend for Windows/Linux."""
+    """The OCR backend for this platform: native MLX granite-docling on Apple Silicon
+    (Metal, no PyTorch), otherwise the granite-docling GGUF backend via llama-cpp-python
+    on Windows/Linux/Intel-Mac (CUDA/CPU, no PyTorch). An optional PyTorch/vLLM accelerator
+    is registered as ``granite-docling-pytorch`` but is not the default."""
     import platform
 
     if platform.system() == "Darwin" and platform.machine() == "arm64":
         return "granite-docling"  # MLX, no PyTorch
-    return "granite-docling-pytorch"
+    return "granite-docling-gguf"  # llama.cpp GGUF, no PyTorch
 
 
 def get_backend(name: Optional[str] = None, **kwargs) -> OcrBackend:
@@ -267,5 +269,6 @@ builtins_open = _builtins.open
 
 # Built-in backends register themselves on import (lazily — importing this module does
 # NOT import their heavy dependencies).
-from . import _backends_mlx  # noqa: E402,F401  (side-effect: registration — Apple Silicon)
-from . import _backends_pytorch  # noqa: E402,F401  (side-effect: registration — Win/Linux placeholder)
+from . import _backends_mlx  # noqa: E402,F401  (side-effect: registration — Apple Silicon, MLX)
+from . import _backends_granite  # noqa: E402,F401  (side-effect: registration — Win/Linux/Intel-Mac, GGUF)
+from . import _backends_pytorch  # noqa: E402,F401  (side-effect: registration — optional PyTorch/vLLM accelerator)

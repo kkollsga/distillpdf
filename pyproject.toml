@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "distillpdf"
-version = "0.0.26"
+version = "0.0.27"
 description = "Pure-Rust PDF extraction that distills documents into clean, LLM-ready HTML — for LLMs and RAG, built on lopdf"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -61,10 +61,14 @@ ocr = [
     # processor changed in 5.x and breaks the MLX load).
     "mlx-vlm>=0.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "transformers>=4.57,<5; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    # Everywhere else (Windows/Linux, Intel Mac): granite-docling GGUF via llama-cpp-python
+    # (CUDA/CPU). This wheel ships pre-built and does NOT pull PyTorch. (PEP 508 markers have
+    # no unary `not (...)`, so this is De Morgan's of "not (darwin and arm64)".)
+    "llama-cpp-python>=0.3.0; sys_platform != 'darwin' or platform_machine != 'arm64'",
 ]
-# Windows/Linux OCR (granite-docling via PyTorch/vLLM) is PLANNED — see
-# python/distillpdf/_backends_pytorch.py. When implemented it will install under a
-# separate extra so Apple-Silicon users never pull PyTorch.
+# An optional PyTorch/vLLM accelerator (granite-docling-pytorch) is PLANNED — see
+# python/distillpdf/_backends_pytorch.py. When implemented it will install under a separate
+# extra so Apple-Silicon (MLX) and Win/Linux (GGUF) users never pull PyTorch by default.
 
 [project.scripts]
 distillpdf = "distillpdf.cli:main"
