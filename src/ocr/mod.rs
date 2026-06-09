@@ -18,6 +18,9 @@ pub(crate) mod doctags;
 pub(crate) mod engine;
 pub(crate) mod pdf;
 pub(crate) mod render;
+pub(crate) mod tess_synth;
+#[cfg(feature = "tesseract")]
+pub(crate) mod tesseract;
 
 use base64::Engine as _;
 use lopdf::{Document, ObjectId};

@@ -29,6 +29,16 @@ except Exception:  # pragma: no cover - only when the extension predates this fe
     def _ocr_page_native(engine, image, opts):  # type: ignore
         raise RuntimeError("native OCR engines are not compiled into this distillPDF build")
 
+# Free native-engine C handles (Tesseract) before interpreter teardown, so the engine's C++
+# static caches don't report the dictionary objects as leaked on stderr at exit.
+if _NATIVE:
+    try:
+        import atexit
+        from ._distillpdf import ocr_native_shutdown as _ocr_native_shutdown
+        atexit.register(_ocr_native_shutdown)
+    except Exception:  # pragma: no cover
+        pass
+
 
 class NativeBackend(OcrBackend):
     """Wraps a Rust-native OCR engine behind the normal backend API. Subclasses set
@@ -57,12 +67,23 @@ class NativeBackend(OcrBackend):
         return cls.engine in _NATIVE
 
 
+def _companion_tessdata_dir():
+    """The optional ``distillpdf-tessdata`` companion's data directory (extra languages), or
+    None if it isn't installed. Import-light: only imports the tiny data package, not Tesseract."""
+    try:
+        import distillpdf_tessdata  # the `distillpdf[languages]` extra
+        return distillpdf_tessdata.tessdata_dir()
+    except Exception:
+        return None
+
+
 class TesseractBackend(NativeBackend):
     """Bundled Tesseract — the fast, dependency-free default. Flat text (no tables).
 
-    English, Portuguese and Norwegian (Bokmål) language data ship in the wheel, so all
-    three work offline out of the box; more languages can be added via ``config.languages``
-    (resolved from a ``TESSDATA`` path or downloaded on demand)."""
+    **English** ships in the base wheel and works offline out of the box. Additional
+    languages (Portuguese, Norwegian, …) come from the optional companion installed with
+    ``pip install 'distillpdf[languages]'``; this backend discovers it automatically and
+    points the engine at its data. ``TESSDATA_PREFIX`` is also honored for custom data."""
 
     name = "tesseract"
     engine = "tesseract"
@@ -70,8 +91,15 @@ class TesseractBackend(NativeBackend):
     structure_aware = False
     bundled = True
     offline = True
-    languages = ("eng", "por", "nor")
-    detail = "Bundled Tesseract (eng/por/nor) — fast, no extra, no download. Flat text, no tables."
+    languages = ("eng",)  # base wheel; the [languages] extra adds por/nor/…
+    detail = "Bundled Tesseract (eng; +[languages] extra) — fast, no extra, no download. Flat text."
+
+    def _opts(self) -> dict:
+        opts = super()._opts()
+        d = _companion_tessdata_dir()
+        if d:
+            opts["tessdata_dir"] = d
+        return opts
 
 
 class ServerBackend(NativeBackend):

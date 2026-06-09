@@ -662,6 +662,9 @@ fn parse_native_cfg(opts: Option<&Bound<'_, PyDict>>) -> PyResult<ocr::engine::N
     if let Ok(Some(v)) = d.get_item("port") {
         cfg.port = v.extract::<u16>().ok();
     }
+    if let Ok(Some(v)) = d.get_item("tessdata_dir") {
+        cfg.tessdata_dir = v.extract::<String>().ok();
+    }
     Ok(cfg)
 }
 
@@ -689,6 +692,15 @@ fn native_engines() -> Vec<String> {
     ocr::engine::native_engine_names().into_iter().map(String::from).collect()
 }
 
+/// Free cached native-engine resources (the Tesseract handles). Registered as a Python
+/// `atexit` hook so C handles are released before interpreter teardown. No-op when the
+/// tesseract feature is off.
+#[pyfunction]
+fn ocr_native_shutdown() {
+    #[cfg(feature = "tesseract")]
+    ocr::tesseract::clear_cache();
+}
+
 #[pymodule]
 fn _distillpdf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Pdf>()?;
@@ -700,6 +712,7 @@ fn _distillpdf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ocr_doctags_to_pdf, m)?)?;
     m.add_function(wrap_pyfunction!(ocr_page_native, m)?)?;
     m.add_function(wrap_pyfunction!(native_engines, m)?)?;
+    m.add_function(wrap_pyfunction!(ocr_native_shutdown, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

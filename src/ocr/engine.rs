@@ -30,6 +30,10 @@ pub(crate) struct NativeCfg {
     pub max_tokens: Option<u32>,
     pub host: Option<String>,
     pub port: Option<u16>,
+    /// A tessdata directory resolved on the Python side (e.g. the `distillpdf[languages]`
+    /// companion package). When set, the Tesseract engine reads language data from here
+    /// instead of its embedded English-only cache.
+    pub tessdata_dir: Option<String>,
 }
 
 /// Build a Rust-native OCR engine by name. Unknown / compiled-out engines return `Err`.

@@ -191,3 +191,20 @@ def test_cli_list_ocr_engines(capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "name" in out and "tier" in out and "granite-docling" in out
+
+
+def _tesseract_compiled_in():
+    from distillpdf import _distillpdf as core
+    return "tesseract" in core.native_engines()
+
+
+@pytest.mark.skipif(not _tesseract_compiled_in(), reason="tesseract feature not in this build")
+def test_tesseract_is_the_fast_default_when_compiled_in():
+    # In a wheel built with the tesseract feature, the fast tier (and the bare default) is it.
+    assert "tesseract" in ocr.available_backends()
+    assert ocr.default_backend_name() == "tesseract"
+    assert ocr.default_backend_name("fast") == "tesseract"
+    be = ocr.get_backend()
+    assert be.name == "tesseract" and be.tier == "fast"
+    d = {r.name: r for r in ocr.backend_descriptors()}["tesseract"]
+    assert d.tier == "fast" and d.bundled and d.offline and not d.structure_aware

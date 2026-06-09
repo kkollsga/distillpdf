@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "distillpdf-tessdata"
+version = "0.0.1"
+description = "Optional Tesseract language data (eng/por/nor) for distillPDF's fast OCR engine"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+authors = [{ name = "kkollsga", email = "kkollsga@gmail.com" }]
+keywords = ["tesseract", "tessdata", "ocr", "distillpdf"]
+
+[project.urls]
+Homepage = "https://github.com/kkollsga/distillpdf"
+
+[tool.hatch.build.targets.wheel]
+packages = ["distillpdf_tessdata"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"distillpdf_tessdata/tessdata" = "distillpdf_tessdata/tessdata"
