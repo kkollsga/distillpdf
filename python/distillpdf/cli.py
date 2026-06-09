@@ -193,13 +193,10 @@ def _ocr_out_path(src, args, multiple, fmt):
 
 
 def _resolve_ocr_backend(args):
-    """Turn ``--ocr-engine`` into a backend: a tier ('fast'/'accurate'), a specific name, or
-    None (→ the default fast tier). Constructed once and reused for every input."""
+    """Turn ``--ocr-engine`` into a backend: a tier ('fast'/'accurate'), the 'granite' alias,
+    a specific name, or None (→ the default fast tier). Reused for every input."""
     from . import ocr
-    sel = args.ocr_engine
-    if sel in (None, "fast", "accurate"):
-        return ocr.get_backend(tier=sel or "fast")
-    return ocr.get_backend(name=sel)
+    return ocr.backend_for(args.ocr_engine)
 
 
 def _list_ocr_engines():

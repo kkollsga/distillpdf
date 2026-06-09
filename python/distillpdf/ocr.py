@@ -212,6 +212,22 @@ def default_backend_name(tier: Optional[str] = None) -> str:
     raise ValueError(f"unknown OCR tier {tier!r}; expected 'fast' or 'accurate'")
 
 
+def backend_for(engine: Optional[str] = None, **kwargs) -> OcrBackend:
+    """Resolve an ``engine`` selector into a backend — the user-friendly entry point behind
+    ``to_html(ocr=True, engine=...)`` and ``run_ocr(engine=...)``.
+
+    ``engine`` may be:
+      * ``None`` / ``"fast"`` — the bundled fast tier (Tesseract), the default;
+      * ``"accurate"`` or ``"granite"`` — the granite-docling VLM (needs the ``[ocr]`` extra);
+      * any specific registered backend name (e.g. ``"granite-docling-gguf"``, ``"tesseract"``).
+    """
+    if engine in (None, "fast", "accurate"):
+        return get_backend(tier=engine or "fast", **kwargs)
+    if engine == "granite":
+        return get_backend(tier="accurate", **kwargs)
+    return get_backend(name=engine, **kwargs)
+
+
 def get_backend(name: Optional[str] = None, *, tier: Optional[str] = None, **kwargs) -> OcrBackend:
     """Construct a backend. Precedence: explicit ``name`` > ``tier`` > the platform default
     (fast tier). Existing names (``granite-docling``, ``granite-docling-gguf``) resolve as

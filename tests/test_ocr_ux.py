@@ -177,6 +177,16 @@ def test_backend_descriptors_shape_and_import_light():
     assert d["granite-docling"].output == "doctags"
 
 
+def test_backend_for_engine_selector():
+    # the user-facing engine= selector: tier words, the 'granite' alias, and explicit names
+    assert ocr.backend_for("granite-docling-gguf").name == "granite-docling-gguf"
+    assert ocr.backend_for("granite").name == ocr.backend_for("accurate").name
+    assert ocr.backend_for("accurate").tier == "accurate"
+    # default (None / "fast") resolves to whatever the fast tier is in this build
+    assert ocr.backend_for().name == ocr.default_backend_name("fast")
+    assert ocr.backend_for("fast").name == ocr.default_backend_name("fast")
+
+
 def test_native_server_engine_registered():
     # The native "server" engine is compiled in and surfaces in the unified registry.
     from distillpdf import _distillpdf as core

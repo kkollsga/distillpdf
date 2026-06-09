@@ -210,7 +210,8 @@ import distillpdf
 doc = distillpdf.open("scanned.pdf")
 doc.run_ocr()                  # fast tier by default — bundled, offline; cached on the document
                                # (a progress bar shows on a terminal — pass progress=False to silence)
-# accurate tier:  doc.run_ocr(distillpdf.get_backend(tier="accurate"))
+# accurate tier (needs the [ocr] extra):
+#   doc.to_html("out.html", ocr=True, engine="granite")   # or run_ocr(engine="granite")
 doc.to_pdf("out.pdf")          # searchable PDF        (reuses the cache — no second pass)
 doc.to_html("out.html")        # OCR text folded into clean HTML
 doc.to_markdown("out.md")      # …and Markdown

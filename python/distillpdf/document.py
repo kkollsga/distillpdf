@@ -61,13 +61,20 @@ class Document:
         return self
 
     def run_ocr(self, backend: Optional["_ocr.OcrBackend"] = None, *,
+                engine: Optional[str] = None,
                 only: Optional[set] = None,
                 progress: Optional[Callable[[int, int, int], None]] = None) -> "Document":
         """OCR every scanned page once, caching the result on this document. After this, the
-        render methods fold the recovered text into their output. `backend` defaults to the
-        bundled granite-docling model — which requires the ``distillpdf[ocr]`` extra and is
-        downloaded on first use. Chainable: ``doc.run_ocr().to_html("out.html")``."""
+        render methods fold the recovered text into their output.
+
+        By default the bundled **fast** engine (Tesseract) is used — no extra, no download,
+        offline. Pick another with ``engine=``: ``"accurate"`` / ``"granite"`` for the
+        granite-docling VLM (needs the ``distillpdf[ocr]`` extra), or a specific backend name.
+        Power users can pass a constructed ``backend=`` instead. Chainable:
+        ``doc.run_ocr().to_html("out.html")``."""
         self.run_processing()
+        if backend is None and engine is not None:
+            backend = _ocr.backend_for(engine)
         _ocr.run(self._pdf, backend, only=only, progress=progress)
         return self
 
@@ -119,13 +126,15 @@ class Document:
     # scanned pages that haven't been OCR'd. OCR-augmented output is inherently page-scoped.
     def to_html(self, path: Optional[str] = None, return_string: bool = False,
                 mode: str = "section", toc: bool = True, image_mode: str = "embed",
-                ocr: bool = False, backend: Optional["_ocr.OcrBackend"] = None):
+                ocr: bool = False, engine: Optional[str] = None,
+                backend: Optional["_ocr.OcrBackend"] = None):
         """Render to HTML. Pass ``ocr=True`` to OCR any scanned pages first (runs ``run_ocr``
-        once if it hasn't been), optionally with a specific ``backend``. When the document has
-        OCR results, scanned pages are rendered from the recovered text (page mode); otherwise
-        this is the core extractor verbatim and un-OCR'd scanned pages trigger a warning."""
+        once if it hasn't been); choose the engine with ``engine=`` (default fast/Tesseract;
+        ``"granite"``/``"accurate"`` for the VLM). When the document has OCR results, scanned
+        pages are rendered from the recovered text (page mode); otherwise this is the core
+        extractor verbatim and un-OCR'd scanned pages trigger a warning."""
         if ocr and not self._pdf.has_ocr():
-            self.run_ocr(backend)
+            self.run_ocr(backend, engine=engine)
         self._warn_pending()
         if self._pdf.has_ocr():
             result = _ocr.to_html(self._pdf, path=path, return_string=return_string, image_mode=image_mode)
@@ -136,24 +145,27 @@ class Document:
 
     def to_markdown(self, path: Optional[str] = None, return_string: bool = False,
                     mode: str = "section", toc: bool = True, image_mode: str = "external",
-                    ocr: bool = False, backend: Optional["_ocr.OcrBackend"] = None):
-        """Render to Markdown. ``ocr=True`` OCRs scanned pages first (optionally with a given
-        ``backend``); otherwise OCR-augmented only if ``run_ocr`` was already called."""
+                    ocr: bool = False, engine: Optional[str] = None,
+                    backend: Optional["_ocr.OcrBackend"] = None):
+        """Render to Markdown. ``ocr=True`` OCRs scanned pages first (pick the engine with
+        ``engine=``, default fast/Tesseract); otherwise OCR-augmented only if ``run_ocr`` was
+        already called."""
         if ocr and not self._pdf.has_ocr():
-            self.run_ocr(backend)
+            self.run_ocr(backend, engine=engine)
         self._warn_pending()
         if self._pdf.has_ocr():
             return _ocr.to_markdown(self._pdf, path=path, return_string=return_string, toc=toc, image_mode=image_mode)
         return self._pdf.to_markdown(path, return_string, mode, toc, image_mode)
 
     def to_pdf(self, path: str, remove_raster: bool = False, ocr: bool = False,
-               backend: Optional["_ocr.OcrBackend"] = None) -> str:
-        """Write a searchable PDF. ``ocr=True`` OCRs scanned pages first (optionally with a
-        given ``backend``). By default the original scan is kept and an invisible selectable
-        text layer is added; ``remove_raster=True`` reflows to clean text and drops the raster.
-        Warns if no pages have been OCR'd (the result would otherwise just be the original)."""
+               engine: Optional[str] = None, backend: Optional["_ocr.OcrBackend"] = None) -> str:
+        """Write a searchable PDF. ``ocr=True`` OCRs scanned pages first (pick the engine with
+        ``engine=``, default fast/Tesseract). By default the original scan is kept and an
+        invisible selectable text layer is added; ``remove_raster=True`` reflows to clean text
+        and drops the raster. Warns if no pages have been OCR'd (the result would otherwise just
+        be the original)."""
         if ocr and not self._pdf.has_ocr():
-            self.run_ocr(backend)
+            self.run_ocr(backend, engine=engine)
         if not self._pdf.has_ocr():
             self._warn_pending()
         return self._pdf.to_pdf(path, None, remove_raster=remove_raster)
