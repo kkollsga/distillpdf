@@ -43,12 +43,11 @@ def setup_help(engine: str) -> str:
     # transformers is pinned <5 on purpose; explain so the constraint doesn't look arbitrary.
     tf_note = ("(transformers is pinned <5: 5.x changed the idefics3 image processor and fails "
                "to load granite-docling; >=4.57 is the floor that supports it.)")
-    # Where weights land + when a token is needed. MLX uses the HF cache; PyTorch/GGUF use a
-    # visible ./ocr_model/ folder. The default models are public (no token); gated/private need one.
+    # Where weights land + when a token is needed. PyTorch/GGUF download to a visible ./ocr_model/
+    # folder. (MLX pulls a public model automatically — no location/token note needed there.)
     token_note = ("The default model is public — no token needed. For a gated/private repo set HF_TOKEN "
                   '(env var or a .env file), or pass OcrConfig(hf_token="hf_…", store_token=True).')
-    mlx_model_note = ("Weights download on first run to the Hugging Face cache (set HF_HOME to relocate). "
-                      + token_note)
+    mlx_model_note = "The model is public and downloads automatically on first run."
     local_model_note = ('Weights download on first run to a visible ./ocr_model/ folder '
                         '(override with OcrConfig(model_dir="…")). ' + token_note)
 

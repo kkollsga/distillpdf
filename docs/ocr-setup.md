@@ -66,8 +66,8 @@ or just use the PyTorch path above (no compiler).
 > Optional: `pip install tqdm` to get a progress bar during OCR.
 
 ## Models / cache
-The **PyTorch** and **GGUF** runtimes download granite weights on first use to a visible
-**`./ocr_model/`** folder (override with `OcrConfig(model_dir=...)`). The **MLX** runtime uses
-the standard Hugging Face cache (mlx-vlm manages it; set `HF_HOME` to relocate). Gated/private
-repos: set `HF_TOKEN` (env or a `.env`; or `OcrConfig(hf_token=..., store_token=True)`). The
-default public models need no token.
+The default granite models are **public** and download on first use. The **PyTorch** and **GGUF**
+runtimes put weights in a visible **`./ocr_model/`** folder (override with
+`OcrConfig(model_dir=...)`); the **MLX** runtime fetches the model automatically (mlx-vlm manages
+it). No token is needed for the default models. For a gated/private repo, set `HF_TOKEN` (env or a
+`.env`; or `OcrConfig(hf_token=..., store_token=True)`).

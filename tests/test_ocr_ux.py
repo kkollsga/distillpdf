@@ -292,8 +292,10 @@ def test_setup_help_is_os_and_engine_specific(monkeypatch):
     assert "cu124" not in ocr.setup_help("granite-docling-pytorch")
     mlx = ocr.setup_help("granite-docling")
     assert "mlx-vlm" in mlx
-    # download location + HF-token guidance is surfaced in the error
-    assert "Hugging Face cache" in mlx and "HF_TOKEN" in mlx                   # MLX uses the HF cache
+    # MLX model is public + mlx-vlm-managed: no ./ocr_model/, no HF/token noise
+    assert "downloads automatically" in mlx
+    assert "HF_TOKEN" not in mlx and "ocr_model" not in mlx
+    # PyTorch/GGUF download to a visible ./ocr_model/ and surface the token rule
     assert "ocr_model" in gg and "HF_TOKEN" in gg                             # GGUF uses ./ocr_model/
     assert "ocr_model" in pt                                                   # PyTorch uses ./ocr_model/
 
