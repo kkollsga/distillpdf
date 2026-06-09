@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "distillpdf"
-version = "0.0.29"
+version = "0.0.30"
 description = "Pure-Rust PDF extraction that distills documents into clean, LLM-ready HTML — for LLMs and RAG, built on lopdf"
 readme = "README.md"
 requires-python = ">=3.8"
