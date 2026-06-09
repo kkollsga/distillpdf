@@ -57,20 +57,26 @@ ocr = [
     "huggingface-hub>=0.23",
     "pillow>=10",
     "tqdm>=4",  # default progress bar for the model download + per-page OCR
-
-    # Apple Silicon: run granite-docling natively on Metal via MLX. mlx-vlm pulls
-    # mlx + transformers but NOT PyTorch. transformers is pinned <5 (the idefics3 image
-    # processor changed in 5.x and breaks the MLX load).
+    # transformers drives both runtimes; pinned <5 (the idefics3 image processor changed in
+    # 5.x and breaks the granite-docling load).
+    "transformers>=4.57,<5",
+    # Apple Silicon: run granite-docling natively on Metal via MLX (no PyTorch).
     "mlx-vlm>=0.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    "transformers>=4.57,<5; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    # Everywhere else (Windows/Linux, Intel Mac): granite-docling GGUF via llama-cpp-python
-    # (CUDA/CPU). This wheel ships pre-built and does NOT pull PyTorch. (PEP 508 markers have
-    # no unary `not (...)`, so this is De Morgan's of "not (darwin and arm64)".)
-    "llama-cpp-python>=0.3.0; sys_platform != 'darwin' or platform_machine != 'arm64'",
+    # Everywhere else (Windows/Linux, Intel Mac): PyTorch. torch ships prebuilt wheels for every
+    # platform + Python, so this installs with NO C++ compiler (unlike llama-cpp-python). (PEP 508
+    # has no unary `not (...)`, so this marker is De Morgan's of "not (darwin and arm64)".)
+    "torch>=2.1; sys_platform != 'darwin' or platform_machine != 'arm64'",
 ]
-# An optional PyTorch/vLLM accelerator (granite-docling-pytorch) is PLANNED — see
-# python/distillpdf/_backends_pytorch.py. When implemented it will install under a separate
-# extra so Apple-Silicon (MLX) and Win/Linux (GGUF) users never pull PyTorch by default.
+# Lighter alternative accurate-tier runtime: granite-docling GGUF via llama-cpp-python (small,
+# no PyTorch). Install with `pip install 'distillpdf[ocr-gguf]'` and select with
+# engine="granite-docling-gguf". NOTE: llama-cpp-python may build from source on Windows when no
+# prebuilt wheel matches your Python (needs a C++ compiler) — use [ocr] (PyTorch) to avoid that.
+ocr-gguf = [
+    "huggingface-hub>=0.23",
+    "pillow>=10",
+    "tqdm>=4",
+    "llama-cpp-python>=0.3.0",
+]
 
 [project.scripts]
 distillpdf = "distillpdf.cli:main"

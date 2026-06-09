@@ -273,13 +273,15 @@ def backend_descriptors() -> "list[OcrCapabilities]":
 # ---- selection -------------------------------------------------------------
 
 def _accurate_backend_name() -> str:
-    """The platform's granite-docling backend: native MLX on Apple Silicon (Metal, no
-    PyTorch), else the GGUF backend via llama-cpp-python (Win/Linux/Intel-Mac, no PyTorch)."""
+    """The platform's granite-docling backend: native MLX on Apple Silicon (Metal), else
+    PyTorch/transformers on Win/Linux/Intel-Mac (torch has prebuilt wheels everywhere, so it
+    installs with no C++ compiler). The lighter GGUF runtime stays opt-in via
+    ``engine="granite-docling-gguf"`` + the ``[ocr-gguf]`` extra."""
     import platform
 
     if platform.system() == "Darwin" and platform.machine() == "arm64":
         return "granite-docling"  # MLX
-    return "granite-docling-gguf"  # llama.cpp GGUF
+    return "granite-docling-pytorch"  # PyTorch/transformers — no compiler needed
 
 
 def _fast_backend_name() -> Optional[str]:

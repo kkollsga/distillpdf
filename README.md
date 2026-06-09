@@ -180,17 +180,30 @@ pages keep distillPDF's normal extraction. There are two tiers:
 | Tier | Engine | Install | Speed | Quality | Notes |
 |---|---|---|---|---|---|
 | **fast** (default) | bundled **Tesseract** | none — in the wheel | ~0.8 s/page | char ~95% | offline, no download; flat text (no tables) |
-| **accurate** | **granite-docling** VLM | `pip install 'distillpdf[ocr]'` | ~6 s/page | char ~97% | structure + **tables**; downloads a model |
+| **accurate** | **granite-docling** VLM | `pip install 'distillpdf[ocr]'` | ~6 s/page (GPU) | char ~97% | structure + **tables**; downloads a model |
 
 The **fast** tier works out of the box on a plain `pip install distillpdf` — no extra, no
 PyTorch, no model download, fully offline. **English, Portuguese and Norwegian** ship in the
 wheel; the document's language is **auto-detected** from a sample at the start of processing and
 OCR runs in just that language (faster, more accurate). Pin it with
 `OcrConfig(languages=["eng"])`, or point `TESSDATA_PREFIX` at your own tessdata for other
-languages. The
-**accurate** tier auto-selects a no-PyTorch runtime — MLX on Apple Silicon, granite-docling GGUF
-via `llama-cpp-python` on Windows/Linux/Intel-Mac. The gap is real at scale: a 509-page scanned
-document OCRs in **~6 min** on the fast tier vs ~47 min on the accurate tier.
+languages.
+
+The **accurate** tier auto-selects a runtime that installs with **no C++ compiler**: MLX on
+Apple Silicon, and **PyTorch/transformers** on Windows/Linux/Intel-Mac (torch ships prebuilt
+wheels for every platform + Python).
+
+**GPU:** on Apple Silicon the accurate tier runs on the **Metal GPU via MLX** by default — fast,
+nothing to do. On Windows/Linux, PyPI's default `torch` is **CPU-only and slow** for a VLM; for
+**NVIDIA acceleration** install the CUDA build and the engine uses it automatically:
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu124   # then pip install 'distillpdf[ocr]'
+```
+(force a device with `OcrConfig(device="cuda"|"cpu")`). Prefer a small, no-PyTorch runtime and
+have a compiler / matching `llama-cpp-python` wheel? Use `pip install 'distillpdf[ocr-gguf]'` +
+`engine="granite-docling-gguf"`. The speed gap is real: a 509-page scan OCRs in **~6 min** on the
+fast tier vs much longer on the accurate tier — and the accurate tier on **CPU is very slow**
+(minutes/page), so use a GPU for it or stick with the fast tier.
 
 From the command line — open → OCR (progress bar shown automatically) → write, no Python:
 

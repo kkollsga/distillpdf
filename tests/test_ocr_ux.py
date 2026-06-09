@@ -229,6 +229,50 @@ def test_store_token_writes_then_reads_back(monkeypatch, tmp_path):
     assert ocr.resolve_hf_token(ocr.OcrConfig(env_file=env)) == "secret"
 
 
+def test_accurate_default_is_pytorch_off_apple_silicon(monkeypatch):
+    import platform
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setattr(platform, "machine", lambda: "AMD64")
+    assert ocr._accurate_backend_name() == "granite-docling-pytorch"
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    assert ocr._accurate_backend_name() == "granite-docling-pytorch"
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(platform, "machine", lambda: "arm64")
+    assert ocr._accurate_backend_name() == "granite-docling"  # MLX
+
+
+def test_pytorch_device_picker_prefers_gpu():
+    from distillpdf._backends_pytorch import _pick_device
+
+    class _Backends:
+        class mps:
+            avail = False
+            @classmethod
+            def is_available(cls):
+                return cls.avail
+
+    class _Torch:
+        class cuda:
+            avail = False
+            @classmethod
+            def is_available(cls):
+                return cls.avail
+        backends = _Backends
+
+    t = _Torch()
+    # explicit choices are honored (even mps, though it's not auto-selected)
+    assert _pick_device(t, "cpu") == "cpu"
+    assert _pick_device(t, "cuda") == "cuda"
+    assert _pick_device(t, "mps") == "mps"
+    # auto: CPU when no CUDA (MPS is deliberately NOT auto-selected — unreliable for this model)
+    assert _pick_device(t, "auto") == "cpu"
+    _Backends.mps.avail = True
+    assert _pick_device(t, "auto") == "cpu"
+    _Torch.cuda.avail = True
+    assert _pick_device(t, "auto") == "cuda"
+
+
 def test_native_server_engine_registered():
     # The native "server" engine is compiled in and surfaces in the unified registry.
     from distillpdf import _distillpdf as core
