@@ -1,11 +1,13 @@
 # distillPDF OCR — setup guide
 
-distillPDF OCRs scanned / image-only pages. There are two tiers; pick by what you need.
+distillPDF OCRs scanned / image-only pages. There are two tiers. The **fast** tier is bundled
+and needs nothing. The **accurate** tier needs a heavy, platform-specific model runtime — there's
+**no catch-all `[ocr]` extra**; you pick a path and install it yourself (distillpdf prints the
+exact commands via `distillpdf.ocr.install_help("granite")`).
 
 ## Fast tier (default) — nothing to install
-The **fast** engine (Tesseract) is **bundled in the wheel** — no extra, no model download,
-fully offline. English, Portuguese and Norwegian ship in it (the document language is
-auto-detected). Just:
+The **fast** engine (Tesseract) is **bundled in the wheel** — no extra, no model download, fully
+offline. English, Portuguese and Norwegian ship in it (language auto-detected).
 ```bash
 pip install distillpdf
 ```
@@ -15,52 +17,51 @@ doc = distillpdf.open("scan.pdf"); doc.run_ocr(); doc.to_pdf("out.pdf")
 ```
 Other languages: point `TESSDATA_PREFIX` at a tessdata folder.
 
-## Accurate tier — the granite-docling VLM (tables + structure)
-Heavier and slower, but recovers **tables, headings and reading order**. Installed via the
-`[ocr]` extra, which pulls the right runtime for your platform — **no C++ compiler needed**:
-
-| OS | `pip install 'distillpdf[ocr]'` pulls | Engine | GPU |
-|---|---|---|---|
-| **macOS (Apple Silicon)** | `mlx-vlm` | granite-docling (MLX) | Metal — automatic |
-| **Windows / Linux / Intel-Mac** | `torch` + `transformers` | granite-docling (PyTorch) | CUDA — see below |
-
-```bash
-pip install "distillpdf[ocr]"
-```
+## Accurate tier — granite-docling VLM (tables + structure)
+Heavier and slower, but recovers **tables, headings and reading order**. Install the runtime for
+your platform, then `doc.run_ocr(engine="granite")`. Not sure what you need? Run:
 ```python
-doc.run_ocr(engine="granite"); doc.to_pdf("out.pdf")
-# or:  distillpdf scan.pdf --ocr --ocr-engine granite
+print(distillpdf.ocr.install_help("granite"))   # prints the commands for your OS
 ```
 
-### GPU acceleration
-- **macOS:** MLX runs on the Metal GPU automatically — nothing to do.
-- **Windows / Linux (NVIDIA):** PyPI's default `torch` is **CPU-only and slow** for a VLM.
-  Install the CUDA build first, then the engine uses it automatically:
-  ```bash
-  pip install torch --index-url https://download.pytorch.org/whl/cu124
-  pip install "distillpdf[ocr]"
-  ```
-  Force a device with `OcrConfig(device="cuda"|"cpu")`. On **CPU** granite is very slow
-  (minutes/page) — prefer a GPU, or use the fast tier.
-- **PyTorch on Mac (MPS)** is *not* used: granite/idefics3 misbehaves on MPS — use MLX (the
-  default) for Mac GPU.
-
-### Lightweight alternative: GGUF (llama.cpp)
-A smaller, no-PyTorch runtime. Opt in and select it explicitly:
+### macOS (Apple Silicon) — MLX (Metal GPU, automatic)
 ```bash
-pip install "distillpdf[ocr-gguf]"
+pip install mlx-vlm "transformers>=4.57,<5" pillow
 ```
-```python
-doc.run_ocr(engine="granite-docling-gguf")
+
+### Windows / Linux / Intel-Mac — PyTorch (no C++ compiler)
+`torch` ships prebuilt wheels for every platform + Python, so this installs cleanly:
+```bash
+pip install torch "transformers>=4.57,<5" pillow
+```
+**GPU (NVIDIA):** PyPI's default `torch` is **CPU-only and slow** for a VLM. Install the CUDA
+build instead and the engine uses it automatically:
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+pip install "transformers>=4.57,<5" pillow
+```
+Force a device with `OcrConfig(device="cuda"|"cpu")`. On **CPU** granite is very slow
+(minutes/page) — use a GPU or the fast tier. (PyTorch-on-Mac MPS is not used — granite/idefics3
+misbehaves there; Mac uses MLX for GPU.)
+
+### Lightweight alternative — GGUF (llama.cpp), `engine="granite-docling-gguf"`
+Smaller, no PyTorch:
+```bash
+pip install llama-cpp-python huggingface-hub pillow
 ```
 ⚠️ On **Windows**, `llama-cpp-python` may build from source when no prebuilt wheel matches your
-Python (needs a C++ compiler / MSVC). To avoid that, install a prebuilt wheel:
+Python (needs MSVC). Use a prebuilt wheel:
 ```bash
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+pip install huggingface-hub pillow
 ```
-or just use the default PyTorch tier (`pip install "distillpdf[ocr]"`), which needs no compiler.
+or just use the PyTorch path above (no compiler).
+
+> Optional: `pip install tqdm` to get a progress bar during OCR.
 
 ## Models / cache
-Granite weights download on first use to a visible **`./ocr_model/`** folder (override with
-`OcrConfig(model_dir=...)`). Gated/private repos: set `HF_TOKEN` (env, or a `.env` file; or
-`OcrConfig(hf_token=..., store_token=True)`). The default public model needs no token.
+The **PyTorch** and **GGUF** runtimes download granite weights on first use to a visible
+**`./ocr_model/`** folder (override with `OcrConfig(model_dir=...)`). The **MLX** runtime uses
+the standard Hugging Face cache (mlx-vlm manages it; set `HF_HOME` to relocate). Gated/private
+repos: set `HF_TOKEN` (env or a `.env`; or `OcrConfig(hf_token=..., store_token=True)`). The
+default public models need no token.

@@ -57,7 +57,7 @@ distillpdf paper.pdf --text           # plain text instead of HTML
 distillpdf paper.pdf --toc            # print the table of contents
 distillpdf paper.pdf --section abstract
 
-distillpdf scan.pdf  --ocr            # OCR a scanned PDF → scan.searchable.pdf (needs [ocr] extra)
+distillpdf scan.pdf  --ocr            # OCR a scanned PDF → scan.searchable.pdf (bundled, no extra)
 ```
 
 (Also available as `python -m distillpdf`.)
@@ -181,7 +181,7 @@ guide »](docs/ocr-setup.md)** for per-OS install + GPU):
 | Tier | Engine | Install | Speed | Quality | Notes |
 |---|---|---|---|---|---|
 | **fast** (default) | bundled **Tesseract** | none — in the wheel | ~0.8 s/page | char ~95% | offline, no download; flat text (no tables) |
-| **accurate** | **granite-docling** VLM | `pip install 'distillpdf[ocr]'` | ~6 s/page (GPU) | char ~97% | structure + **tables**; downloads a model |
+| **accurate** | **granite-docling** VLM | install a runtime yourself (see below) | ~6 s/page (GPU) | char ~97% | structure + **tables**; downloads a model |
 
 The **fast** tier works out of the box on a plain `pip install distillpdf` — no extra, no
 PyTorch, no model download, fully offline. **English, Portuguese and Norwegian** ship in the
@@ -190,21 +190,22 @@ OCR runs in just that language (faster, more accurate). Pin it with
 `OcrConfig(languages=["eng"])`, or point `TESSDATA_PREFIX` at your own tessdata for other
 languages.
 
-The **accurate** tier auto-selects a runtime that installs with **no C++ compiler**: MLX on
-Apple Silicon, and **PyTorch/transformers** on Windows/Linux/Intel-Mac (torch ships prebuilt
-wheels for every platform + Python).
-
-**GPU:** on Apple Silicon the accurate tier runs on the **Metal GPU via MLX** by default — fast,
-nothing to do. On Windows/Linux, PyPI's default `torch` is **CPU-only and slow** for a VLM; for
-**NVIDIA acceleration** install the CUDA build and the engine uses it automatically:
+The **accurate** tier needs a heavier model runtime that's genuinely platform- and
+hardware-specific, so there's **no catch-all `[ocr]` extra** — you pick a path and install it,
+and distillpdf prints the exact commands: `python -c "import distillpdf; print(distillpdf.ocr.install_help('granite'))"`. The short version (full **[OCR setup guide »](docs/ocr-setup.md)**):
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu124   # then pip install 'distillpdf[ocr]'
+# macOS (Apple Silicon) — Metal GPU via MLX, automatic:
+pip install mlx-vlm "transformers>=4.57,<5" pillow
+# Windows / Linux / Intel-Mac — PyTorch, no C++ compiler:
+pip install torch "transformers>=4.57,<5" pillow
+#   …for an NVIDIA GPU, install the CUDA build instead (default torch is CPU-only and slow):
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+# Lightweight alternative — GGUF (engine="granite-docling-gguf"):
+pip install llama-cpp-python huggingface-hub pillow
 ```
-(force a device with `OcrConfig(device="cuda"|"cpu")`). Prefer a small, no-PyTorch runtime and
-have a compiler / matching `llama-cpp-python` wheel? Use `pip install 'distillpdf[ocr-gguf]'` +
-`engine="granite-docling-gguf"`. The speed gap is real: a 509-page scan OCRs in **~6 min** on the
-fast tier vs much longer on the accurate tier — and the accurate tier on **CPU is very slow**
-(minutes/page), so use a GPU for it or stick with the fast tier.
+Then `doc.run_ocr(engine="granite")`. The speed gap is real: a 509-page scan OCRs in **~6 min**
+on the fast tier vs much longer on the accurate tier — and the accurate tier on **CPU is very
+slow** (minutes/page), so use a GPU for it or stick with the fast tier.
 
 From the command line — open → OCR (progress bar shown automatically) → write, no Python:
 
@@ -212,7 +213,7 @@ From the command line — open → OCR (progress bar shown automatically) → wr
 distillpdf scan.pdf --ocr                       # → scan.searchable.pdf  (fast tier, bundled)
 distillpdf scan.pdf --ocr --remove-raster       # → reflowed clean text + figures, smaller file
 distillpdf scan.pdf --ocr -o out.html           # OCR'd HTML  (use a .md path for Markdown)
-distillpdf scan.pdf --ocr --ocr-engine accurate # granite-docling (needs the [ocr] extra)
+distillpdf scan.pdf --ocr --ocr-engine accurate # granite-docling (install a runtime — see setup guide)
 distillpdf --list-ocr-engines                   # show engines: name, tier, bundled, offline
 ```
 
@@ -224,7 +225,7 @@ import distillpdf
 doc = distillpdf.open("scanned.pdf")
 doc.run_ocr()                  # fast tier by default — bundled, offline; cached on the document
                                # (a progress bar shows on a terminal — pass progress=False to silence)
-# accurate tier (needs the [ocr] extra):
+# accurate tier (install a granite runtime first — see the setup guide / install_help):
 #   doc.to_html("out.html", ocr=True, engine="granite")   # or run_ocr(engine="granite")
 doc.to_pdf("out.pdf")          # searchable PDF        (reuses the cache — no second pass)
 doc.to_html("out.html")        # OCR text folded into clean HTML

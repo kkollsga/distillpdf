@@ -47,36 +47,12 @@ classifiers = [
     "Topic :: Utilities",
 ]
 
-[project.optional-dependencies]
-# OCR for image-only / scanned pages. The core (detection, DocTags parsing,
-# HTML/searchable-PDF rendering) is pure Rust and always available; this extra only adds
-# the model runtime.  Install with:  pip install 'distillpdf[ocr]'
-# (A zero-Python-dep path also exists: bring your own llama-server and use the built-in
-#  Rust ServerOcrEngine, or build from source with a future llama-cpp-2 cargo feature.)
-ocr = [
-    "huggingface-hub>=0.23",
-    "pillow>=10",
-    "tqdm>=4",  # default progress bar for the model download + per-page OCR
-    # transformers drives both runtimes; pinned <5 (the idefics3 image processor changed in
-    # 5.x and breaks the granite-docling load).
-    "transformers>=4.57,<5",
-    # Apple Silicon: run granite-docling natively on Metal via MLX (no PyTorch).
-    "mlx-vlm>=0.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    # Everywhere else (Windows/Linux, Intel Mac): PyTorch. torch ships prebuilt wheels for every
-    # platform + Python, so this installs with NO C++ compiler (unlike llama-cpp-python). (PEP 508
-    # has no unary `not (...)`, so this marker is De Morgan's of "not (darwin and arm64)".)
-    "torch>=2.1; sys_platform != 'darwin' or platform_machine != 'arm64'",
-]
-# Lighter alternative accurate-tier runtime: granite-docling GGUF via llama-cpp-python (small,
-# no PyTorch). Install with `pip install 'distillpdf[ocr-gguf]'` and select with
-# engine="granite-docling-gguf". NOTE: llama-cpp-python may build from source on Windows when no
-# prebuilt wheel matches your Python (needs a C++ compiler) — use [ocr] (PyTorch) to avoid that.
-ocr-gguf = [
-    "huggingface-hub>=0.23",
-    "pillow>=10",
-    "tqdm>=4",
-    "llama-cpp-python>=0.3.0",
-]
+# NOTE: there is intentionally no `[ocr]` extra. The default **fast** OCR engine (Tesseract)
+# is bundled in the wheel and needs nothing. The **accurate** granite-docling tier needs a
+# heavier runtime (PyTorch+CUDA, MLX, or llama.cpp) whose install is genuinely platform- and
+# hardware-specific — we don't pretend one extra handles that. Pick a path and install it
+# yourself; distillpdf prints the exact per-OS commands (see `distillpdf.ocr.install_help()`
+# and docs/ocr-setup.md). The pure-Rust core (extraction, fast OCR) needs no optional deps.
 
 [project.scripts]
 distillpdf = "distillpdf.cli:main"

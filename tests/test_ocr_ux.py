@@ -279,17 +279,18 @@ def test_setup_help_is_os_and_engine_specific(monkeypatch):
     monkeypatch.setattr(platform, "system", lambda: "Windows")
     monkeypatch.setattr(platform, "machine", lambda: "AMD64")
     pt = ocr.setup_help("granite-docling-pytorch")
-    assert 'distillpdf[ocr]' in pt and "download.pytorch.org/whl/cu" in pt  # CUDA hint on Windows
+    assert "pip install torch" in pt and "download.pytorch.org/whl/cu" in pt   # direct torch + CUDA hint
     gg = ocr.setup_help("granite-docling-gguf")
-    assert "ocr-gguf" in gg and "abetlen.github.io" in gg                   # prebuilt-wheel hint on Windows
+    assert "llama-cpp-python" in gg and "abetlen.github.io" in gg              # direct pkg + prebuilt-wheel hint
     mlx = ocr.setup_help("granite-docling")
-    assert "Apple Silicon" in mlx                                           # MLX not usable on Windows
-    assert "docs/ocr-setup.md" in pt and "docs/ocr-setup.md" in gg          # links the full guide
-    # Apple Silicon: no CUDA hint, MLX is the install
+    assert "Apple Silicon" in mlx                                              # MLX not usable on Windows
+    assert "docs/ocr-setup.md" in pt and "docs/ocr-setup.md" in gg            # links the full guide
+    assert "distillpdf[ocr]" not in pt and "distillpdf[ocr]" not in gg        # no fictional extra
+    # Apple Silicon: no CUDA hint; MLX install is the direct mlx-vlm package
     monkeypatch.setattr(platform, "system", lambda: "Darwin")
     monkeypatch.setattr(platform, "machine", lambda: "arm64")
     assert "cu124" not in ocr.setup_help("granite-docling-pytorch")
-    assert 'distillpdf[ocr]' in ocr.setup_help("granite-docling")
+    assert "mlx-vlm" in ocr.setup_help("granite-docling")
 
 
 def test_require_uses_hint(monkeypatch):
@@ -297,7 +298,16 @@ def test_require_uses_hint(monkeypatch):
     with pytest.raises(ocr.OcrDependencyError) as ei:
         ocr._require("definitely_absent_mod", package="torch", hint=ocr.setup_help("granite-docling-pytorch"))
     msg = str(ei.value)
-    assert "torch" in msg and "distillpdf[ocr]" in msg and "docs/ocr-setup.md" in msg
+    assert "torch" in msg and "pip install" in msg and "docs/ocr-setup.md" in msg
+
+
+def test_install_help_selector(monkeypatch):
+    # the user-facing helper: fast tier is bundled (nothing); accurate resolves to a runtime
+    assert "bundled" in ocr.install_help("fast").lower()
+    assert "bundled" in ocr.install_help("tesseract").lower()
+    acc = ocr.install_help("granite")
+    assert "pip install" in acc and "docs/ocr-setup.md" in acc
+    assert ocr.install_help("accurate") == ocr.install_help("granite")
 
 
 def test_native_server_engine_registered():

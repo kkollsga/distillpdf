@@ -29,52 +29,76 @@ _SETUP_GUIDE = "https://github.com/kkollsga/distillpdf/blob/main/docs/ocr-setup.
 
 
 def setup_help(engine: str) -> str:
-    """OS- and engine-specific install instructions for an accurate-tier engine whose runtime
-    isn't installed. Used as the body of the dependency error so the message reads like a
-    setup guide for the user's actual platform."""
+    """OS- and engine-specific install instructions for an accurate-tier engine. The accurate
+    tiers need a heavy, platform-specific runtime, so we point at the exact packages to install
+    yourself (there is no catch-all extra). ``engine`` is a backend name. Used both as the body
+    of dependency errors and by the public ``install_help``."""
     import platform
 
     system = platform.system()
     win, linux = system == "Windows", system == "Linux"
     mac_arm = system == "Darwin" and platform.machine() == "arm64"
-    tail = f"Full setup guide: {_SETUP_GUIDE}\n\n(The default 'fast' engine is bundled — it needs none of this.)"
+    tail = f"Full per-OS setup guide: {_SETUP_GUIDE}\n\n(The default 'fast' engine is bundled — it needs none of this.)"
 
     if engine == "granite-docling":  # MLX
         if mac_arm:
-            return f'Install the accurate tier (MLX, Apple Silicon):\n    pip install "distillpdf[ocr]"\n\n{tail}'
-        return ('The MLX engine only runs on Apple Silicon. On your platform use the default '
-                'accurate tier instead (PyTorch, no compiler):\n'
-                '    pip install "distillpdf[ocr]"\n    doc.run_ocr(engine="granite")\n\n' + tail)
+            return ('Install the accurate tier (granite-docling on Apple Silicon / MLX):\n'
+                    '    pip install mlx-vlm "transformers>=4.57,<5" pillow\n\n' + tail)
+        return ('The MLX engine only runs on Apple Silicon. On your platform use the PyTorch '
+                'engine instead:\n'
+                '    pip install torch "transformers>=4.57,<5" pillow\n'
+                '    doc.run_ocr(engine="granite")\n\n' + tail)
 
     if engine == "granite-docling-pytorch":
-        lines = ['Install the accurate tier (PyTorch — prebuilt wheels, no C++ compiler):',
-                 '    pip install "distillpdf[ocr]"']
+        lines = ['Install the accurate tier (granite-docling via PyTorch — prebuilt wheels, no C++ compiler):',
+                 '    pip install torch "transformers>=4.57,<5" pillow']
         if win or linux:
-            lines += ['', 'For NVIDIA GPU acceleration, install the CUDA build of torch first',
-                      '(PyPI\'s default torch is CPU-only and slow for a VLM):',
+            lines += ['', "For NVIDIA GPU acceleration install the CUDA build of torch instead",
+                      "(PyPI's default torch is CPU-only and slow for a VLM):",
                       '    pip install torch --index-url https://download.pytorch.org/whl/cu124']
         return "\n".join(lines) + f"\n\n{tail}"
 
     if engine == "granite-docling-gguf":
-        lines = ['Install the GGUF runtime:', '    pip install "distillpdf[ocr-gguf]"']
+        lines = ['Install the GGUF runtime (granite-docling via llama.cpp):',
+                 '    pip install llama-cpp-python huggingface-hub pillow']
         if win:
             lines += ['', 'On Windows, llama-cpp-python may build from source when no prebuilt wheel',
-                      'matches your Python (needs MSVC). Avoid that with a prebuilt wheel:',
+                      'matches your Python (needs MSVC). Use a prebuilt wheel instead:',
                       '    pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu',
-                      'or use the default PyTorch tier (no compiler): pip install "distillpdf[ocr]"']
+                      '    pip install huggingface-hub pillow',
+                      'or use the PyTorch engine (no compiler): pip install torch "transformers>=4.57,<5" pillow']
         return "\n".join(lines) + f"\n\n{tail}"
 
-    return f'Install the OCR extra:\n    pip install "distillpdf[ocr]"\n\n{tail}'
+    return ('Install a granite-docling runtime — see the per-OS guide:\n'
+            f'    {_SETUP_GUIDE}\n\n(The default \'fast\' engine is bundled — it needs none of this.)')
+
+
+def install_help(engine: Optional[str] = None) -> str:
+    """What to install to use an OCR engine — the user-facing helper. Accepts a selector
+    (``None``/``"fast"``, ``"accurate"``/``"granite"``, or a backend name). The fast tier is
+    bundled and needs nothing; accurate tiers return the pip commands for your platform.
+
+        print(distillpdf.ocr.install_help("granite"))
+    """
+    if engine in (None, "fast"):
+        name = _fast_backend_name() or _accurate_backend_name()
+    elif engine in ("accurate", "granite"):
+        name = _accurate_backend_name()
+    else:
+        name = engine
+    if name == "tesseract":
+        return "The fast OCR engine (Tesseract) is bundled in the wheel — nothing to install."
+    return setup_help(name)
 
 
 def _require(module: str, *, package: Optional[str] = None, hint: Optional[str] = None):
     """Import an optional dependency or raise a clear, actionable error. ``hint`` is the
-    OS/engine-specific setup text (see ``setup_help``); falls back to the generic extra."""
+    OS/engine-specific setup text (see ``setup_help``); falls back to the per-OS guide link."""
     try:
         return __import__(module)
     except ImportError as e:  # pragma: no cover - exercised via backends
         pkg = package or module
-        guidance = hint or f'    pip install "distillpdf[ocr]"\n\nFull setup guide: {_SETUP_GUIDE}'
+        guidance = hint or f'Install a granite-docling runtime — see {_SETUP_GUIDE}'
         raise OcrDependencyError(
             f"distillpdf's accurate OCR engine needs the optional '{pkg}' package, which isn't "
             f"installed.\n\n{guidance}\n\n(missing module: {module!r})"
