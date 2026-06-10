@@ -19,6 +19,7 @@ mod img;
 mod layout;
 mod links;
 mod markdown;
+mod model;
 mod nav;
 mod ocr;
 mod postprocess;
@@ -103,6 +104,31 @@ fn add_overlay_fonts(doc: &mut Document, page_id: lopdf::ObjectId, helv: lopdf::
     if let Ok(page) = doc.get_object_mut(page_id).and_then(|o| o.as_dict_mut()) {
         page.set("Resources", lopdf::Object::Dictionary(res));
     }
+}
+
+/// Current UTC time as an ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` string. This is the ONLY clock
+/// read into a `.dpdf` model (`source.generated_at`); everything else is content-derived and
+/// deterministic. Computed from `SystemTime` by hand (a civil-date conversion) so the model
+/// path needs no `chrono`/`time` direct dependency for one timestamp.
+fn iso8601_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (days, rem) = ((secs / 86400) as i64, secs % 86400);
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Civil-from-days (Howard Hinnant's algorithm), epoch 1970-01-01.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
 /// A loaded PDF document.
@@ -512,6 +538,43 @@ impl Pdf {
         ok_one(py)
     }
 
+    /// Distill the document into a `.dpdf` container (the durable analysis model) — the
+    /// engine-track artifact: a zip of `model.json` (the typed element tree: pages, the
+    /// section tree, blocks in reading order, tables, figures, links, indexes) plus `img/`
+    /// assets. Re-render HTML / Markdown / text from the file later, in milliseconds, instead
+    /// of re-paying the full analysis cost.
+    ///
+    /// `path` chooses where to write: an explicit `*.dpdf` file, a directory (→
+    /// `<source-stem>.dpdf` inside it), or `None` to write `<source>.dpdf` next to the opened
+    /// PDF. Returns the written path.
+    ///
+    /// **Experimental (`schema_version = 0`).** Wave-1 distill records the born-digital
+    /// analysis; figure image bytes are dropped with a regenerable stub by default (a named,
+    /// reversible hole — re-extractable from the hash-bound source PDF). OCR passes and
+    /// per-block bboxes are filled by later waves.
+    #[pyo3(signature = (path=None))]
+    fn distill(&self, py: Python<'_>, path: Option<&str>) -> PyResult<String> {
+        let dest = self.resolve_out_path(path, "dpdf")?;
+        // The display name recorded in source.file: the source PDF's basename when known.
+        let file = self
+            .source
+            .as_ref()
+            .and_then(|s| s.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "document.pdf".to_string());
+        // The single timestamp in the model — taken once here so the rest is deterministic.
+        let generated_at = iso8601_now();
+        let model = py.allow_threads(|| model::build::build_model(&self.doc, &self.raw, &file, generated_at));
+        if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|e| PyValueError::new_err(format!("mkdir failed: {e}")))?;
+        }
+        // Wave 1 distill carries no embedded asset bytes (figures are dropped-with-stub by
+        // default); the container records the stubs from `model.assets`.
+        model::container::save(&model, &dest, &model::container::AssetBytes::new(), None)
+            .map_err(PyValueError::new_err)?;
+        Ok(dest.to_string_lossy().into_owned())
+    }
+
     /// Diagnostic: force our ToUnicode extractor for all pages (eval only).
     fn _mine_text(&self) -> PyResult<String> {
         let mut out = String::new();
@@ -582,6 +645,17 @@ fn open(path: &str) -> PyResult<Pdf> {
 #[pyfunction]
 fn from_bytes(data: &[u8]) -> PyResult<Pdf> {
     Pdf::from_bytes(data)
+}
+
+/// Load a `.dpdf` container and return its `model.json` as a JSON string — the minimal
+/// Wave-1 handle so callers (and pytest) can exercise distill → load round-trips and inspect
+/// the model. (The rich `Doc` accessor API is a later wave.) The returned JSON is the
+/// canonical, sorted-key form, so `distill` → `load_model` → re-save is byte-stable.
+#[pyfunction]
+fn load_model(path: &str) -> PyResult<String> {
+    let (model, _assets) = model::container::load(std::path::Path::new(path)).map_err(PyValueError::new_err)?;
+    let bytes = model::container::to_canonical_json(&model).map_err(PyValueError::new_err)?;
+    String::from_utf8(bytes).map_err(|e| PyValueError::new_err(format!("model json not utf-8: {e}")))
 }
 
 /// OCR: render one page's DocTags (granite-docling output) to a distillPDF HTML fragment.
@@ -760,6 +834,7 @@ fn _distillpdf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Pdf>()?;
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(from_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(load_model, m)?)?;
     m.add_function(wrap_pyfunction!(ocr_doctags_to_html, m)?)?;
     m.add_function(wrap_pyfunction!(html_to_markdown, m)?)?;
     m.add_function(wrap_pyfunction!(ocr_doctags_doc_html, m)?)?;

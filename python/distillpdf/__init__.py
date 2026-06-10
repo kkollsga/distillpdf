@@ -1,5 +1,5 @@
 """distillpdf — pure-Rust PDF extraction on lopdf."""
-from ._distillpdf import Pdf, __version__, from_bytes as _from_bytes_raw, open as _open_raw
+from ._distillpdf import Pdf, __version__, from_bytes as _from_bytes_raw, load_model, open as _open_raw
 from . import ocr
 from .document import Document
 from .ocr import OcrBackend, OcrConfig, OcrDependencyError, available_backends, get_backend
@@ -21,6 +21,7 @@ __all__ = [
     "Document",
     "open",
     "from_bytes",
+    "load_model",
     "__version__",
     "ocr",
     "OcrBackend",

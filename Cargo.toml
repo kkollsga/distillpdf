@@ -34,6 +34,15 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 jpeg-decoder = "0.3"
 fax = "0.2"
 rayon = "1"
+# The `.dpdf` document model (src/model/): serde structs → a deterministic model.json. All
+# three crates were already in the dependency tree transitively (serde/serde_json via the
+# decoders' build glue, sha2 via `image`), so promoting them to DIRECT deps adds only the
+# serde-derive proc-macro at build time — no new linked code, the wheel stays the same size.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Content-addressed asset stubs: the `dropped` storage mode records a sha256 so a dropped
+# binary is a *named* hole — rehydratable from the hash-verified source PDF (honest coverage).
+sha2 = "0.10"
 # Pure-Rust language detection (n-gram, no model files); only built with the `tesseract`
 # feature, used to auto-pick the OCR language from a sample of the document.
 whatlang = { version = "0.16", optional = true }
