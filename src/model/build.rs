@@ -1,33 +1,23 @@
 //! Build a [`DocModel`] from a loaded PDF.
 //!
-//! **The boundary principle (Wave 1):** we do NOT re-implement the analysis. distillPDF's
-//! `to_html` already produces the typed element tree — reading order, the section tree
-//! (heading ids), tables, figures, footnotes — serialized as a small, regular HTML
-//! vocabulary. We render in PAGE mode (so every block carries its physical page from the
-//! `<section data-page="N">` wrapper) and parse that element stream back into blocks. The
-//! section tree is reconstructed from heading levels; section ids are exactly the renderer's
-//! `sec-…` slugs, so model ids == HTML ids == CLI/agent addresses.
+//! **The single-stream principle.** distillPDF's render walk ([`html::render_doc_elements`])
+//! materializes one post-transform element IR — reading order, the section tree, tables,
+//! figures, footnotes, page chrome, each with its bbox. We PROJECT that IR directly into
+//! [`Block`]s here (no HTML round-trip): one block per emitted construct, in reading order, each
+//! carrying its physical page, its bbox, and (for the query-lossy parts) the fidelity fields the
+//! renderer needs to rebuild the byte-identical IR from blocks alone ([`crate::model::render`]).
+//! The section tree comes from the heading levels; section ids are minted to match the
+//! renderer's `build_toc` exactly (via the shared [`nav::mint_section_id`]), so model ids == HTML
+//! ids == CLI/agent addresses. Figure/table ids adopt their post-`dedup_ids` form — a block
+//! addresses the id the final HTML actually uses.
 //!
-//! Why parse the HTML rather than refactor `to_html` to emit a typed tree directly? For Wave 1
-//! the HTML *is* the serialized element tree, and parsing our OWN deterministic output is far
-//! less risky than surgery on the 800-line parallel render.
-//!
-//! **Wave 2** keeps this parse path for the block decomposition but adds the render-fidelity
-//! capture that makes "renderers are pure functions of the model" hold: each page's verbatim
-//! PRE-id body (`Page.body_html`, via the shared `html::render_doc` head), captured here, lets
-//! a model-only re-render run the identical `html::assemble` tail. It also captures figure
-//! raster bytes (sha256 + dims) under the `assets` profile.
-//!
-//! **Per-block bbox stays `None` — a DELIBERATE, documented Wave-2 decision, not an oversight.**
-//! Blocks are decomposed from the FLATTENED page HTML, which carries no positions; threading
-//! boxes would require a second, structured render alongside the fidelity render — exactly the
-//! deep refactor the spec says NOT to do for bbox (it would risk destabilising the fidelity
-//! pipeline for marginal gain). Positions remain available per-page via `_dbg_spans_xy`; a
-//! future wave that needs pinpoint citations can thread spans through a structured render.
+//! **bbox is threaded from the walk** (PDF user space `[x0,y0,x1,y1]`) onto every block the IR
+//! gives a position for (100% of content blocks on the born-digital path). The figure raster
+//! bytes (sha256 + dims) are still captured under the `assets` profile.
 
 use lopdf::{Document, Object};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use super::container::AssetBytes;
 use super::{
@@ -35,6 +25,7 @@ use super::{
     Metadata, NamedDest, OcrDecision, Page, Regen, Section, Source, TocEntry, NATIVE_CONFIDENCE,
     SCHEMA_VERSION,
 };
+use crate::html::{Bbox, ElKind, PageIR};
 use crate::{frontmatter, html, links, nav, ocr};
 
 /// Build the document model from a parsed PDF plus its raw bytes (the raw bytes back the
@@ -52,7 +43,7 @@ pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: 
     // Per-page geometry + OCR decision + PDF page labels. Built first so blocks can be
     // attributed and the page index is complete even for pages with no extracted blocks.
     let labels = page_labels(doc, page_count);
-    let mut pages: Vec<Page> = page_map
+    let pages: Vec<Page> = page_map
         .iter()
         .map(|(&n, &pid)| {
             let (w, h) = ocr::page_size_pts(doc, pid);
@@ -70,34 +61,22 @@ pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: 
                 // `NotNeeded` is the default and would just be noise on every page).
                 ocr_decision: (decision != OcrDecision::NotNeeded).then_some(decision),
                 active_ocr_pass: None, // Wave 2 sets this when an OCR pass feeds the page
-                body_html: None,       // filled from the parsed page HTML below
             }
         })
         .collect();
 
-    // Render the element tree to PAGE-mode HTML via the SHARED pipeline head (`render_doc`),
-    // stopping BEFORE the `assemble` tail (id-minting + nav). Images are dropped to `<image N>`
-    // placeholders — we only need to KNOW a figure exists, not carry megabytes of base64
-    // through the parser. The resulting body is the *pre-id* page-mode body: it is what the
-    // model stores per page (`Page.body_html`), so a model-only re-render runs the identical
-    // `assemble` (minting the SAME `sec-…` ids and the SAME nav) — Wave 2's round-trip contract.
-    let (pre_body, img_uris, _outline) = html::render_doc(doc, raw, html::Mode::Page, false);
-    // Resolve the `\0idx\0` image sentinels to `<image N>` so the stored body is clean JSON
-    // (no NUL bytes); this is independent of id-minting, so doing it before `build_toc` yields
-    // a body identical to `to_html`'s except that headings are still bare.
-    let pre_body = crate::postprocess::substitute_images(pre_body, &img_uris, false);
-    // The per-page PRE-id bodies the model stores (what re-render reassembles + `assemble`s).
-    let (_, _, pre_bodies) = parse_page_html(&pre_body);
-    // Mint heading ids exactly as `to_html(Mode::Page, …)` does, then parse THAT for blocks +
-    // sections (their `sec-…` ids are the authoritative id space) — `build_toc` is independent
-    // of image substitution, so this equals the Wave-1 `to_html(Page,false,false)` body.
-    let page_html = nav::build_toc(pre_body, false);
-    let (mut blocks, sections, _) = parse_page_html(&page_html);
-    // Fold each page's verbatim PRE-id body HTML (the `<section>` inner content) onto its
-    // geometry page, so a model-only re-render reproduces the page-mode body byte-for-byte.
-    for p in pages.iter_mut() {
-        p.body_html = pre_bodies.get(&p.n).cloned();
-    }
+    // The single-stream analysis: materialize the post-transform element IR (page mode, images
+    // dropped to `<image N>` placeholders) ONCE, then project blocks + sections directly from it
+    // — no HTML round-trip, no stored fidelity body. The blocks ARE the render source of truth
+    // (`render::render_html` rebuilds the IR from them byte-identically), so the page's content
+    // is held once, in `blocks`.
+    let (pages_ir, _outline) = html::render_doc_elements(doc, raw, html::Mode::Page, false);
+    // The post-dedup id map (`fig-3` → `fig-3-2` when ids collide) and the `sec-…` minting both
+    // key off the deduped body's id namespace, exactly as the renderer's `build_toc` does —
+    // computed directly from the IR's element fragments in document order (no full-body emit).
+    let dedup_map = post_dedup_id_map(&pages_ir);
+    let sec_ids = mint_section_ids(&pages_ir, &dedup_map);
+    let (mut blocks, sections) = project_blocks(&pages_ir, &dedup_map, &sec_ids);
 
     // Front-matter / metadata: reuse the dedicated extractor (the same one the public
     // `metadata()` method exposes) rather than re-deriving from the HTML <header>.
@@ -435,220 +414,364 @@ fn image_dims(bytes: &[u8]) -> (Option<u32>, Option<u32>) {
     }
 }
 
-// ---- the page-mode HTML element-stream parser ------------------------------
+// ---- the element-IR block projection ---------------------------------------
 
-/// Parse page-mode HTML into `(blocks, sections, page_bodies)`.
-///
-/// The page-mode body is a flat sequence of `<section data-page="N" id="page-N">…</section>`
-/// wrappers, each containing the page's blocks: `<h1..6 id="sec-…">`, `<p>`, `<table>`,
-/// `<figure>`, `<aside>` (footnotes), `<div id="tab-…">` (standalone table captions). We walk
-/// the byte stream tag-by-tag (NOT a general HTML parser — this is OUR known, regular output)
-/// and emit one [`Block`] per element in document/reading order, attributing each to its
-/// current page and the most recent open section at-or-above its level.
-///
-/// `page_bodies` maps each page number to the VERBATIM inner HTML of its `<section>` wrapper —
-/// the render-fidelity capture that lets a model-only re-render reproduce this exact page-mode
-/// body (it carries inline markup, list grouping, table structure, headers, dest anchors, and
-/// SVG, none of which survive block decomposition). Block decomposition and the body capture
-/// are two views of the same single parse pass.
-fn parse_page_html(html: &str) -> (Vec<Block>, Vec<Section>, BTreeMap<u32, String>) {
-    let body = html.split_once("<body>").map(|x| x.1).unwrap_or(html);
-    let body = body.split_once("</body>").map(|x| x.0).unwrap_or(body);
+/// Map every id-bearing element (figure / table-caption / dest-anchor) to the id it carries in
+/// the FINAL deduped HTML. `dedup_ids` renumbers a colliding `id="fig-3"` to `fig-3-2` in the
+/// body; a block/asset must address the id the rendered HTML actually uses (addressability beats
+/// purity), so we replay the same counting dedup over the emitted ids IN DOCUMENT ORDER and
+/// return, for each occurrence index of a base id, its post-dedup form. Keyed `(base_id ->
+/// Vec<deduped_id>)` in occurrence order; the projection consumes them in the same walk order.
+fn post_dedup_id_map(pages_ir: &[PageIR]) -> BTreeMap<String, Vec<String>> {
+    let mut seen: BTreeMap<String, u32> = BTreeMap::new();
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut bump = |raw: &str, out: &mut BTreeMap<String, Vec<String>>| {
+        let n = seen.entry(raw.to_string()).or_insert(0);
+        *n += 1;
+        let deduped = if *n == 1 { raw.to_string() } else { format!("{raw}-{n}") };
+        out.entry(raw.to_string()).or_default().push(deduped);
+    };
+    for (_pno, els, _uris) in pages_ir {
+        for e in els {
+            for raw in ids_in_fragment(&e.html()) {
+                bump(&raw, &mut out);
+            }
+        }
+    }
+    out
+}
 
+/// Every `id="…"` literal in an element's emitted HTML fragment, in order — the exact ids
+/// `dedup_ids` would see (figure/table ids AND any SVG-internal `id`s the fragment carries).
+fn ids_in_fragment(frag: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut rest = frag;
+    while let Some(p) = rest.find("id=\"") {
+        rest = &rest[p + 4..];
+        if let Some(e) = rest.find('"') {
+            ids.push(rest[..e].to_string());
+            rest = &rest[e + 1..];
+        } else {
+            break;
+        }
+    }
+    ids
+}
+
+/// Mint the `sec-…` id for every heading in the IR, EXACTLY as `nav::build_toc` does on the
+/// rendered body: seed the uniqueness set from the deduped body's existing ids (figure/table/
+/// dest/SVG ids), skip the front-matter `<header>`'s `<h1>` (it gets no `sec-` id), then mint
+/// in document order via the shared [`nav::mint_section_id`]. Returns one `Option<String>` per
+/// [`ElKind::Heading`] in walk order (`None` for an empty-label heading, which build_toc skips).
+fn mint_section_ids(pages_ir: &[PageIR], dedup_map: &BTreeMap<String, Vec<String>>) -> Vec<Option<String>> {
+    // The id namespace already in the deduped body (everything `build_toc` seeds `seen` with).
+    let mut seen: HashSet<String> = HashSet::new();
+    for deduped in dedup_map.values().flatten() {
+        seen.insert(deduped.clone());
+    }
+    let mut out = Vec::new();
+    for (_pno, els, _uris) in pages_ir {
+        for e in els {
+            // The front-matter <header> carries the title <h1> as opaque HTML, not a `Heading`
+            // element — so it never reaches this walk, matching build_toc's header skip.
+            if let ElKind::Heading { text, .. } = &e.kind {
+                let label = nav::strip_inline(text);
+                let label = label.trim();
+                out.push((!label.is_empty()).then(|| nav::mint_section_id(label, &mut seen)));
+            }
+        }
+    }
+    out
+}
+
+/// Project the post-transform element IR into `(blocks, sections)` — the single-stream
+/// replacement for parsing the rendered HTML back into blocks. One [`Block`] per emitted
+/// construct in reading order (a list emits one `list_item` block per item, a footnote `<aside>`
+/// one `footnote` block per note — the query/index granularity the consumers expect), each
+/// carrying its bbox (from the walk) and its section (the open-heading stack). Section ids come
+/// from `sec_ids` (minted to match `build_toc`); figure/table ids adopt their post-dedup form
+/// from `dedup_map`.
+fn project_blocks(
+    pages_ir: &[PageIR],
+    dedup_map: &BTreeMap<String, Vec<String>>,
+    sec_ids: &[Option<String>],
+) -> (Vec<Block>, Vec<Section>) {
     let mut blocks: Vec<Block> = Vec::new();
     let mut sections: Vec<Section> = Vec::new();
-    let mut page_bodies: BTreeMap<u32, String> = BTreeMap::new();
-    // The open-section stack: (id, level). A heading at level L pops everything >= L, then
-    // pushes itself, so each block's section is the stack top.
     let mut stack: Vec<(String, u8)> = Vec::new();
-    let mut cur_page: u32 = 0;
-    // Byte offset (into `body`) where the current page's `<section>` inner content begins
-    // (just past the open tag's `>`); `None` between pages.
-    let mut sec_inner_start: Option<usize> = None;
     let mut ord: usize = 0;
+    let mut heading_idx = 0usize; // indexes into sec_ids, in heading walk order
+    let mut group: u32 = 0; // per-document element-group ordinal (list / footnote grouping)
+    // The running GLOBAL image index across pages — emit_and_merge offsets each page's local
+    // `\0idx\0` sentinels by the count of prior pages' images, so a single running counter (in
+    // document order) reproduces the global numbering for the stored fidelity fragments.
+    let mut global_img: usize = 0;
+    // Per-base-id occurrence cursor into dedup_map, advanced as we consume ids in walk order.
+    let mut dedup_cursor: BTreeMap<String, usize> = BTreeMap::new();
+    let deduped = |raw: &str, cursor: &mut BTreeMap<String, usize>| -> String {
+        let k = cursor.entry(raw.to_string()).or_insert(0);
+        let v = dedup_map.get(raw).and_then(|v| v.get(*k)).cloned().unwrap_or_else(|| raw.to_string());
+        *k += 1;
+        v
+    };
     let next_id = |ord: &mut usize| {
         *ord += 1;
         format!("b{:04}", *ord)
     };
 
-    let bytes = body.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'<' {
-            i += 1;
-            continue;
-        }
-        // Close the current page's body capture at its `</section>` before any other dispatch
-        // (the close tag is not a block-opening element).
-        if body[i..].starts_with("</section>") {
-            if let (Some(start), true) = (sec_inner_start, cur_page > 0) {
-                page_bodies.insert(cur_page, body[start..i].to_string());
-            }
-            sec_inner_start = None;
-            i += "</section>".len();
-            continue;
-        }
-        // A `<section data-page="N">` wrapper sets the current page; an inner element starts
-        // a block. We dispatch on the tag name.
-        let Some(close_rel) = body[i..].find('>') else { break };
-        let tag = &body[i + 1..i + close_rel]; // contents between < and >
-        let name = tag_name(tag);
-
-        match name {
-            "section" => {
-                if let Some(p) = attr(tag, "data-page") {
-                    cur_page = p.parse().unwrap_or(cur_page);
+    for (pno, els, _uris) in pages_ir {
+        let page = *pno;
+        for e in els {
+            let bbox = e.bbox;
+            match &e.kind {
+                ElKind::DestAnchors(s) => {
+                    // Page-head named-destination anchors: a fidelity-only chrome carrier. Store
+                    // its FINAL (deduped, image-substituted) fragment so render reproduces it.
+                    let frag = finalize_fragment(s, &mut dedup_cursor, &mut global_img, &deduped);
+                    let mut b = text_block(next_id(&mut ord), BlockKind::DestAnchors, String::new(), page, bbox, &stack);
+                    b.el_html = Some(frag);
+                    blocks.push(b);
                 }
-                i += close_rel + 1;
-                sec_inner_start = Some(i); // inner content begins just past the open tag
-            }
-            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                let level = name.as_bytes()[1] - b'0';
-                let id = attr(tag, "id").unwrap_or_default();
-                let (inner, end) = element_inner(body, i, name);
-                let title = nav::strip_inline(inner).trim().to_string();
-                // Maintain the section stack.
-                while stack.last().is_some_and(|(_, l)| *l >= level) {
-                    stack.pop();
+                ElKind::Header(_) => {
+                    // The first-page front-matter `<header>`: a fidelity carrier (rebuilding it
+                    // from `metadata` is lossy — sup author markers, the affiliation `<ol>`), so
+                    // store its FINAL fragment verbatim.
+                    let frag = finalize_fragment(&e.html(), &mut dedup_cursor, &mut global_img, &deduped);
+                    let mut b = text_block(next_id(&mut ord), BlockKind::Header, String::new(), page, bbox, &stack);
+                    b.el_html = Some(frag);
+                    blocks.push(b);
                 }
-                let parent = stack.last().map(|(pid, _)| pid.clone());
-                if !id.is_empty() {
-                    let sec_page = cur_page;
-                    // Provisional page_end = page_start; widened as later blocks land.
-                    sections.push(Section {
-                        id: id.clone(),
-                        level,
-                        title: title.clone(),
-                        parent,
-                        page_start: sec_page,
-                        page_end: sec_page,
+                ElKind::Heading { level, text, .. } => {
+                    let level = *level;
+                    let label = nav::strip_inline(text).trim().to_string();
+                    let sid = sec_ids.get(heading_idx).cloned().flatten();
+                    heading_idx += 1;
+                    while stack.last().is_some_and(|(_, l)| *l >= level) {
+                        stack.pop();
+                    }
+                    let parent = stack.last().map(|(pid, _)| pid.clone());
+                    if let Some(id) = &sid {
+                        sections.push(Section {
+                            id: id.clone(),
+                            level,
+                            title: label.clone(),
+                            parent,
+                            page_start: page,
+                            page_end: page,
+                        });
+                        stack.push((id.clone(), level));
+                    }
+                    let section = stack.last().map(|(sid, _)| sid.clone());
+                    blocks.push(Block {
+                        section,
+                        heading_level: Some(level),
+                        // The heading's INNER HTML carries the minimal inline markup the emit
+                        // uses; the block text is that fragment (consumers strip it for display).
+                        ..mk_block(next_id(&mut ord), BlockKind::Heading, text.clone(), page, bbox)
                     });
-                    stack.push((id.clone(), level));
                 }
-                let section = stack.last().map(|(sid, _)| sid.clone());
-                blocks.push(Block {
-                    id: next_id(&mut ord),
-                    kind: BlockKind::Heading,
-                    text: title,
-                    page: cur_page,
-                    section,
-                    bbox: None,
-                    confidence: NATIVE_CONFIDENCE,
-                    ocr_pass: None,
-                    heading_level: Some(level),
-                    cells: None,
-                    image: None,
-                    label: None,
-                    caption: None,
-                });
-                i = end;
-            }
-            "p" => {
-                let (inner, end) = element_inner(body, i, "p");
-                let text = nav::strip_inline(inner).trim().to_string();
-                if !text.is_empty() {
-                    // A `<p>` whose text begins a list marker is a list item; otherwise prose.
-                    let kind = if html::list_kind(&text).is_some() {
-                        BlockKind::ListItem
-                    } else {
-                        BlockKind::Para
-                    };
-                    blocks.push(text_block(next_id(&mut ord), kind, text, cur_page, &stack));
-                }
-                i = end;
-            }
-            "li" => {
-                let (inner, end) = element_inner(body, i, "li");
-                let text = nav::strip_inline(inner).trim().to_string();
-                if !text.is_empty() {
-                    blocks.push(text_block(next_id(&mut ord), BlockKind::ListItem, text, cur_page, &stack));
-                }
-                i = end;
-            }
-            "aside" => {
-                // Footnote block: an <aside> wrapping one <p> per footnote. Emit each as a
-                // footnote block (preserving the per-note granularity the renderer gives).
-                let (inner, end) = element_inner(body, i, "aside");
-                for note in split_top_level(inner, "p") {
-                    let text = nav::strip_inline(note).trim().to_string();
-                    if !text.is_empty() {
-                        blocks.push(text_block(next_id(&mut ord), BlockKind::Footnote, text, cur_page, &stack));
+                ElKind::Para { text } => {
+                    if !nav::strip_inline(text).trim().is_empty() {
+                        // A paragraph whose visible text opens a list marker is a list item.
+                        let kind = if html::list_kind(&nav::strip_inline(text)).is_some() {
+                            BlockKind::ListItem
+                        } else {
+                            BlockKind::Para
+                        };
+                        blocks.push(text_block(next_id(&mut ord), kind, text.clone(), page, bbox, &stack));
                     }
                 }
-                i = end;
-            }
-            "table" => {
-                let (inner, end) = element_inner(body, i, "table");
-                let (cells, caption) = parse_table(inner);
-                let mut b = text_block(next_id(&mut ord), BlockKind::Table, String::new(), cur_page, &stack);
-                b.cells = Some(cells);
-                b.caption = caption;
-                b.label = b.caption.as_deref().and_then(caption_label);
-                blocks.push(b);
-                i = end;
-            }
-            "figure" => {
-                let (inner, end) = element_inner(body, i, "figure");
-                let fig_id = attr(tag, "id").and_then(|s| s.strip_prefix("fig-").map(String::from));
-                let caption = element_text(inner, "figcaption");
-                // The renderer drops images to `<image N>` (placeholder mode); a figure that
-                // had a raster carries that marker. Mint a stable asset id keyed on the
-                // figure id so the asset table and the block agree.
-                let has_image = inner.contains("<image ") || inner.contains("<img ") || inner.contains("<svg");
-                let image = (has_image)
-                    .then(|| fig_id.as_ref().map(|n| format!("img/fig_{n}.png")))
-                    .flatten();
-                let mut b = text_block(next_id(&mut ord), BlockKind::Figure, String::new(), cur_page, &stack);
-                b.caption = caption.clone();
-                b.label = caption.as_deref().and_then(caption_label);
-                b.image = image;
-                blocks.push(b);
-                i = end;
-            }
-            "div" => {
-                // A standalone table/figure caption `<div id="tab-…">…</div>` (no detected
-                // table nearby). Emit as a caption block so its label/anchor survive.
-                if attr(tag, "id").is_some_and(|s| s.starts_with("tab-") || s.starts_with("fig-")) {
-                    let (inner, end) = element_inner(body, i, "div");
-                    let text = nav::strip_inline(inner).trim().to_string();
-                    let mut b = text_block(next_id(&mut ord), BlockKind::Caption, text.clone(), cur_page, &stack);
-                    b.label = caption_label(&text);
-                    blocks.push(b);
-                    i = end;
-                } else {
-                    i += close_rel + 1;
+                ElKind::List { ordered, items } => {
+                    // One `list_item` block per item (the query granularity), all sharing one
+                    // `el_group` + `list_ordered` so render regroups them into the single
+                    // `<ul>/<ol>` they were projected from. EVERY item is kept — including an
+                    // empty `<li>` (some sources emit a bullet list of empty items) — so the
+                    // reconstruction is byte-faithful; the query views simply skip empty text.
+                    group += 1;
+                    for it in items {
+                        let mut b = text_block(next_id(&mut ord), BlockKind::ListItem, it.clone(), page, bbox, &stack);
+                        b.list_ordered = Some(*ordered);
+                        b.el_group = Some(group);
+                        blocks.push(b);
+                    }
                 }
-            }
-            _ => {
-                // Any other tag (header, nav, ul/ol wrappers, inline) — skip the open tag and
-                // let the walk descend into its children (lists, headers) so their <p>/<li>
-                // are still captured.
-                i += close_rel + 1;
+                ElKind::Code { text } => {
+                    // The monospace block's inner is `<pre><code>…</code></pre>`; keep that exact
+                    // fragment as the block text so the IR is reproducible from the block.
+                    blocks.push(text_block(next_id(&mut ord), BlockKind::Code, text.clone(), page, bbox, &stack));
+                }
+                ElKind::Footnotes { notes } => {
+                    group += 1;
+                    for n in notes {
+                        if !nav::strip_inline(n).trim().is_empty() {
+                            let mut b = text_block(next_id(&mut ord), BlockKind::Footnote, n.clone(), page, bbox, &stack);
+                            b.el_group = Some(group);
+                            blocks.push(b);
+                        }
+                    }
+                }
+                ElKind::Table { header, grid, caption } => {
+                    // Consume the table's `tab-N` id (post-dedup) in walk order, carrying the
+                    // deduped caption number so re-emit lands the same `<table id>`.
+                    let mut deduped_tab: Option<String> = None;
+                    for raw in ids_in_fragment(&e.html()) {
+                        let d = deduped(&raw, &mut dedup_cursor);
+                        if raw.starts_with("tab-") {
+                            deduped_tab = Some(d);
+                        }
+                    }
+                    let mut b = text_block(next_id(&mut ord), BlockKind::Table, String::new(), page, bbox, &stack);
+                    b.cells = Some(table_cells(header, grid));
+                    b.caption = caption.as_ref().map(|(_, c, _)| nav::strip_inline(c).trim().to_string());
+                    b.label = b.caption.as_deref().and_then(caption_label);
+                    // Fidelity parts for byte-exact re-emit: the detached header rows, the data
+                    // grid, and the caption `(number, html, below)` with the number re-keyed to
+                    // its post-dedup `tab-N` form.
+                    b.table_header = Some(header.clone());
+                    b.table_grid = Some(grid.clone());
+                    b.table_caption = caption.as_ref().map(|(num, c, below)| {
+                        let n = deduped_tab.as_deref().map(strip_tab_prefix).unwrap_or_else(|| num.clone());
+                        (n, c.clone(), *below)
+                    });
+                    blocks.push(b);
+                }
+                ElKind::Figure { id, caption, .. } => {
+                    // Store the figure's FINAL (deduped, image-substituted) fragment as the
+                    // fidelity surface, and re-key the image asset id to the figure's post-dedup
+                    // `fig-N`. `finalize_fragment` applies the SAME dedup + image substitution the
+                    // body does, so the stored fragment is byte-identical to its place in the body.
+                    let raw_frag = e.html();
+                    let frag = finalize_fragment(&raw_frag, &mut dedup_cursor, &mut global_img, &deduped);
+                    let deduped_fig = ids_in_fragment(&frag).into_iter().find(|d| d.starts_with("fig-"));
+                    let mut b = text_block(next_id(&mut ord), BlockKind::Figure, String::new(), page, bbox, &stack);
+                    b.caption = caption.as_ref().map(|c| nav::strip_inline(c).trim().to_string());
+                    b.label = b.caption.as_deref().and_then(caption_label);
+                    let has_graphic = raw_frag.contains("<image ") || raw_frag.contains("<img ") || raw_frag.contains("<svg");
+                    b.image = (!id.is_empty() && has_graphic).then(|| {
+                        let fid = deduped_fig.as_deref().map(strip_fig_prefix).unwrap_or_else(|| num_fig_id(id));
+                        format!("img/fig_{fid}.png")
+                    });
+                    b.el_html = Some(frag);
+                    blocks.push(b);
+                }
+                ElKind::Caption { text, .. } => {
+                    let frag = finalize_fragment(&e.html(), &mut dedup_cursor, &mut global_img, &deduped);
+                    let cap_text = nav::strip_inline(text).trim().to_string();
+                    let mut b = text_block(next_id(&mut ord), BlockKind::Caption, text.clone(), page, bbox, &stack);
+                    b.label = caption_label(&cap_text);
+                    b.el_html = Some(frag);
+                    blocks.push(b);
+                }
             }
         }
     }
 
-    // A final unclosed page (no trailing `</section>` — shouldn't happen for our output, but
-    // capture defensively so the body is never silently lost).
-    if let (Some(start), true) = (sec_inner_start, cur_page > 0) {
-        page_bodies.entry(cur_page).or_insert_with(|| body[start..].to_string());
-    }
-
-    // Widen each section's page_end to the max page of any block attributed to it (or any of
-    // its descendants — a parent spans all its children's pages).
     finalize_section_ranges(&mut sections, &blocks);
-    (blocks, sections, page_bodies)
+    (blocks, sections)
 }
 
-/// Construct a text-bearing block attributing it to the current open section.
-fn text_block(id: String, kind: BlockKind, text: String, page: u32, stack: &[(String, u8)]) -> Block {
+/// The numeric part of a figure id field (`Figure.id` is the bare "N"; the emitted id is
+/// `fig-{num_id(N)}`). Mirrors `html::num_id`'s slugging.
+fn num_fig_id(id: &str) -> String {
+    id.chars().map(|c| if c == '.' { '-' } else { c.to_ascii_lowercase() }).collect()
+}
+
+/// Strip the `fig-` prefix off a deduped figure id (`fig-3-2` → `3-2`).
+fn strip_fig_prefix(id: &str) -> String {
+    id.strip_prefix("fig-").unwrap_or(id).to_string()
+}
+
+/// Strip the `tab-` prefix off a deduped table id (`tab-3-2` → `3-2`).
+fn strip_tab_prefix(id: &str) -> String {
+    id.strip_prefix("tab-").unwrap_or(id).to_string()
+}
+
+/// Finalize an element's emitted HTML fragment into the FORM IT TAKES IN THE FINAL BODY, so the
+/// model can store it as a byte-exact fidelity surface (and a model-only re-render reproduces it
+/// even though `emit_and_merge`/`assemble` are idempotent over already-finalized fragments):
+/// (1) every `id="…"` is renamed to its post-dedup form (via the running `dedup_cursor` over the
+/// document-order `dedup_map`), exactly as `dedup_ids` does; (2) every page-local `\0idx\0` image
+/// sentinel becomes its FINAL `<image N>` placeholder (drop mode), with `N` the 1-based GLOBAL
+/// image index — `global_img` is the running count of images seen in document order, which
+/// reproduces `emit_and_merge`'s per-page offset accumulation.
+fn finalize_fragment(
+    frag: &str,
+    dedup_cursor: &mut BTreeMap<String, usize>,
+    global_img: &mut usize,
+    deduped: &impl Fn(&str, &mut BTreeMap<String, usize>) -> String,
+) -> String {
+    let mut out = String::with_capacity(frag.len());
+    let bytes = frag.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // An `id="…"` literal → emit the deduped id.
+        if frag[i..].starts_with("id=\"") {
+            out.push_str("id=\"");
+            i += 4;
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += 1;
+            }
+            let raw = &frag[start..i];
+            out.push_str(&deduped(raw, dedup_cursor));
+            // keep the closing quote
+            if i < bytes.len() {
+                out.push('"');
+                i += 1;
+            }
+            continue;
+        }
+        // A `\0idx\0` image sentinel → its final global `<image N>` number (drop mode).
+        if bytes[i] == 0 {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j] != 0 {
+                j += 1;
+            }
+            // (idx is page-local; the number we emit is the running global index + 1.)
+            out.push_str(&(*global_img + 1).to_string());
+            *global_img += 1;
+            i = j + 1; // skip past the closing NUL
+            continue;
+        }
+        let c = frag[i..].chars().next().unwrap();
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
+/// A table's row-major cell grid for the block projection: detached header rows (text only,
+/// colspans expanded to one cell per spanned column) followed by the data grid — the same cell
+/// sequence the rendered `<table>` shows, so `find`/markdown over `cells` matches the HTML.
+fn table_cells(header: &[Vec<(String, usize)>], grid: &[Vec<String>]) -> Vec<Vec<String>> {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for hrow in header {
+        let mut row = Vec::new();
+        for (text, span) in hrow {
+            for _ in 0..(*span).max(1) {
+                row.push(text.trim().to_string());
+            }
+        }
+        rows.push(row);
+    }
+    for r in grid {
+        rows.push(r.iter().map(|c| c.trim().to_string()).collect());
+    }
+    rows
+}
+
+/// Make a block carrying the common fields (the kind-specific fields are filled by the caller),
+/// with `text` taken VERBATIM (it is the element's inner HTML — the query consumers strip
+/// markup; the renderer reconstructs from it).
+fn mk_block(id: String, kind: BlockKind, text: String, page: u32, bbox: Option<Bbox>) -> Block {
     Block {
         id,
         kind,
         text,
         page,
-        section: stack.last().map(|(sid, _)| sid.clone()),
-        bbox: None,
+        section: None,
+        bbox,
         confidence: NATIVE_CONFIDENCE,
         ocr_pass: None,
         heading_level: None,
@@ -656,6 +779,20 @@ fn text_block(id: String, kind: BlockKind, text: String, page: u32, stack: &[(St
         image: None,
         label: None,
         caption: None,
+        list_ordered: None,
+        el_group: None,
+        table_header: None,
+        table_grid: None,
+        table_caption: None,
+        el_html: None,
+    }
+}
+
+/// Construct a text-bearing block attributing it to the current open section, carrying its bbox.
+fn text_block(id: String, kind: BlockKind, text: String, page: u32, bbox: Option<Bbox>, stack: &[(String, u8)]) -> Block {
+    Block {
+        section: stack.last().map(|(sid, _)| sid.clone()),
+        ..mk_block(id, kind, text, page, bbox)
     }
 }
 
@@ -697,128 +834,7 @@ fn finalize_section_ranges(sections: &mut [Section], blocks: &[Block]) {
     }
 }
 
-// ---- small HTML helpers (scoped to distillPDF's known output) --------------
-
-/// The tag name from a tag's inner text (between `<` and `>`), lowercased view of the leading
-/// name token. e.g. `section data-page="1"` → `section`, `/p` → `/p`.
-fn tag_name(tag: &str) -> &str {
-    let t = tag.trim_start();
-    let end = t.find(|c: char| c.is_whitespace() || c == '/').unwrap_or(t.len());
-    // A self-closing or close tag begins with '/'; keep it for callers that check, but the
-    // dispatcher only matches open names, so a leading '/' simply won't match.
-    &t[..end]
-}
-
-/// The value of `key="…"` in a tag's inner text, if present.
-fn attr(tag: &str, key: &str) -> Option<String> {
-    let pat = format!("{key}=\"");
-    let s = tag.find(&pat)? + pat.len();
-    let e = tag[s..].find('"')?;
-    Some(tag[s..s + e].to_string())
-}
-
-/// Given the byte offset of an element's open tag `<name …>` in `html`, return
-/// `(inner_html, byte_offset_just_past_the_matching_close)`. Handles nesting of the SAME tag
-/// name (e.g. nested `<section>`s never occur in page-mode body, but `<div>`/`<p>` safety).
-fn element_inner<'a>(html: &'a str, open: usize, name: &str) -> (&'a str, usize) {
-    // Scan over BYTES (tag delimiters and the ASCII tag names are single-byte, so byte
-    // matching is correct), advancing one byte at a time. We only ever slice `html` at the
-    // byte offsets where a `<…>` boundary starts — all char boundaries — so multibyte body
-    // text (em dashes, accents) never trips a char-boundary panic.
-    let bytes = html.as_bytes();
-    // Move past the open tag.
-    let after_open = match html[open..].find('>') {
-        Some(r) => open + r + 1,
-        None => return ("", html.len()),
-    };
-    let open_pat = format!("<{name}").into_bytes();
-    let close_pat = format!("</{name}>").into_bytes();
-    let mut depth = 1i32;
-    let mut i = after_open;
-    while i < bytes.len() {
-        if bytes[i..].starts_with(&close_pat) {
-            depth -= 1;
-            if depth == 0 {
-                return (&html[after_open..i], i + close_pat.len());
-            }
-            i += close_pat.len();
-        } else if bytes[i..].starts_with(&open_pat) {
-            // Only count as nesting if the next byte ends the tag name (`<p>` vs `<pre>`).
-            let nb = bytes.get(i + open_pat.len());
-            if matches!(nb, Some(b) if *b == b'>' || *b == b' ' || *b == b'/') {
-                depth += 1;
-                i += open_pat.len();
-            } else {
-                i += 1;
-            }
-        } else {
-            i += 1;
-        }
-    }
-    (&html[after_open..], html.len())
-}
-
-/// Inner text of the first `<tag>…</tag>` inside `html`, stripped of inline markup. Used for
-/// `<figcaption>` extraction. Returns `None` when the tag is absent.
-fn element_text(html: &str, tag: &str) -> Option<String> {
-    let open = html.find(&format!("<{tag}"))?;
-    let (inner, _) = element_inner(html, open, tag);
-    let t = nav::strip_inline(inner).trim().to_string();
-    (!t.is_empty()).then_some(t)
-}
-
-/// Split `html` into the inner texts of each TOP-LEVEL `<tag>…</tag>` (non-nested). Used to
-/// pull each `<p>` out of a footnote `<aside>`.
-fn split_top_level<'a>(html: &'a str, tag: &str) -> Vec<&'a str> {
-    let mut out = Vec::new();
-    let open_pat = format!("<{tag}");
-    let mut i = 0;
-    // `str::find` returns a char-boundary offset, and `open_pat`/the next byte are ASCII, so
-    // the indices used to slice here are always valid boundaries.
-    while let Some(rel) = html[i..].find(&open_pat) {
-        let open = i + rel;
-        // Ensure it's the tag, not a prefix (`<p` vs `<pre`).
-        let nb = html.as_bytes().get(open + open_pat.len());
-        if !matches!(nb, Some(b) if *b == b'>' || *b == b' ' || *b == b'/') {
-            i = open + open_pat.len();
-            continue;
-        }
-        let (inner, end) = element_inner(html, open, tag);
-        out.push(inner);
-        i = end;
-    }
-    out
-}
-
-/// Parse a `<table>`'s inner HTML into a row-major cell grid plus an optional caption
-/// (`<caption>`). Each `<tr>` is a row of `<th>`/`<td>` cell texts.
-fn parse_table(inner: &str) -> (Vec<Vec<String>>, Option<String>) {
-    let caption = element_text(inner, "caption");
-    let mut rows = Vec::new();
-    for tr in split_top_level(inner, "tr") {
-        let mut row = Vec::new();
-        // Cells are <th> or <td>, never nested — a simple byte scan suffices (byte-indexed so
-        // multibyte cell text doesn't trip a char-boundary slice).
-        let mut j = 0;
-        let tb = tr.as_bytes();
-        while j < tb.len() {
-            let is_th = tb[j..].starts_with(b"<th");
-            let is_td = tb[j..].starts_with(b"<td");
-            if is_th || is_td {
-                let cell_tag = if is_th { "th" } else { "td" };
-                let (cinner, end) = element_inner(tr, j, cell_tag);
-                row.push(nav::strip_inline(cinner).trim().to_string());
-                j = end;
-            } else {
-                j += 1;
-            }
-        }
-        if !row.is_empty() {
-            rows.push(row);
-        }
-    }
-    (rows, caption)
-}
+// ---- small helpers (scoped to distillPDF's known output) -------------------
 
 /// Parse a leading element label ("Table 3", "Figure 1") from a caption string, if present.
 /// Mirrors the renderer's caption convention ("Table N: …" / "Figure N. …").
@@ -844,46 +860,72 @@ fn caption_label(caption: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::html::PageElement;
+
+    /// Project a hand-built per-page IR into blocks + sections (minting + dedup like build_model).
+    fn project(pages_ir: &[PageIR]) -> (Vec<Block>, Vec<Section>) {
+        let dedup = post_dedup_id_map(pages_ir);
+        let sec_ids = mint_section_ids(pages_ir, &dedup);
+        project_blocks(pages_ir, &dedup, &sec_ids)
+    }
+
+    fn heading(level: u8, text: &str) -> PageElement {
+        PageElement::at(ElKind::Heading { level, id: String::new(), text: text.into() }, None)
+    }
+    fn para(text: &str) -> PageElement {
+        PageElement::at(ElKind::Para { text: text.into() }, None)
+    }
 
     #[test]
-    fn parses_sections_blocks_and_pages() {
-        let html = "<!doctype html><html><body>\n\
-            <section data-page=\"1\" id=\"page-1\">\n\
-            <h1 id=\"sec-a\">Title A</h1><p>Intro para.</p>\
-            <h2 id=\"sec-b\">Sub B</h2><p>Body of B.</p></section>\n\
-            <section data-page=\"2\" id=\"page-2\">\n\
-            <p>More B on page 2.</p></section>\n\
-            </body></html>";
-        let (blocks, sections, _) = parse_page_html(html);
+    fn projects_sections_blocks_and_pages() {
+        let ir: Vec<PageIR> = vec![
+            (1, vec![heading(1, "Title A"), para("Intro para."), heading(2, "Sub B"), para("Body of B.")], vec![]),
+            (2, vec![para("More B on page 2.")], vec![]),
+        ];
+        let (blocks, sections) = project(&ir);
         // 5 blocks: h1, p, h2, p, p.
         assert_eq!(blocks.len(), 5);
         assert_eq!(blocks[0].kind, BlockKind::Heading);
         assert_eq!(blocks[0].text, "Title A");
         assert_eq!(blocks[0].page, 1);
+        assert_eq!(blocks[0].section.as_deref(), Some("sec-title-a"));
         assert_eq!(blocks[1].kind, BlockKind::Para);
-        assert_eq!(blocks[1].section.as_deref(), Some("sec-a"));
-        // sec-b is nested under sec-a; its blocks attribute to sec-b.
-        assert_eq!(blocks[3].section.as_deref(), Some("sec-b"));
-        // the page-2 block stays in sec-b (no new heading), page tracked.
+        assert_eq!(blocks[1].section.as_deref(), Some("sec-title-a"));
+        // the sub-heading nests; its body attributes to it.
+        assert_eq!(blocks[3].section.as_deref(), Some("sec-sub-b"));
+        // the page-2 block stays in sec-sub-b (no new heading), page tracked.
         assert_eq!(blocks[4].page, 2);
-        assert_eq!(blocks[4].section.as_deref(), Some("sec-b"));
-        // sections: sec-a (parent None), sec-b (parent sec-a, spans pages 1..2).
+        assert_eq!(blocks[4].section.as_deref(), Some("sec-sub-b"));
+        // sections: sec-title-a (parent None), sec-sub-b (parent sec-title-a, spans pages 1..2).
         assert_eq!(sections.len(), 2);
-        assert_eq!(sections[1].id, "sec-b");
-        assert_eq!(sections[1].parent.as_deref(), Some("sec-a"));
+        assert_eq!(sections[1].id, "sec-sub-b");
+        assert_eq!(sections[1].parent.as_deref(), Some("sec-title-a"));
         assert_eq!(sections[1].page_start, 1);
         assert_eq!(sections[1].page_end, 2);
-        // sec-a spans both its own + child pages.
         assert_eq!(sections[0].page_end, 2);
     }
 
     #[test]
-    fn parses_table_and_figure() {
-        let html = "<body><section data-page=\"1\" id=\"page-1\">\
-            <table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>\
-            <figure id=\"fig-3\"><image 1><figcaption>Figure 3: A chart.</figcaption></figure>\
-            </section></body>";
-        let (blocks, _, _) = parse_page_html(html);
+    fn projects_table_and_figure() {
+        let table = PageElement::at(
+            ElKind::Table {
+                header: vec![vec![("A".into(), 1), ("B".into(), 1)]],
+                grid: vec![vec!["1".into(), "2".into()]],
+                caption: None,
+            },
+            None,
+        );
+        let fig = PageElement::at(
+            ElKind::Figure {
+                html: "<figure id=\"fig-3\"><image 1><figcaption>Figure 3: A chart.</figcaption></figure>".into(),
+                id: "3".into(),
+                caption: Some("Figure 3: A chart.".into()),
+                image: Some("img/fig_3.png".into()),
+                svg: None,
+            },
+            None,
+        );
+        let (blocks, _) = project(&[(1, vec![table, fig], vec![])]);
         let table = blocks.iter().find(|b| b.kind == BlockKind::Table).unwrap();
         assert_eq!(table.cells.as_ref().unwrap(), &vec![vec!["A".to_string(), "B".into()], vec!["1".into(), "2".into()]]);
         let fig = blocks.iter().find(|b| b.kind == BlockKind::Figure).unwrap();
@@ -893,13 +935,35 @@ mod tests {
     }
 
     #[test]
-    fn parses_footnote_aside() {
-        let html = "<body><section data-page=\"1\" id=\"page-1\">\
-            <aside><p>1. First note.</p><p>2. Second note.</p></aside></section></body>";
-        let (blocks, _, _) = parse_page_html(html);
+    fn projects_footnote_aside() {
+        let notes = PageElement::at(
+            ElKind::Footnotes { notes: vec!["1. First note.".into(), "2. Second note.".into()] },
+            None,
+        );
+        let (blocks, _) = project(&[(1, vec![notes], vec![])]);
         let notes: Vec<_> = blocks.iter().filter(|b| b.kind == BlockKind::Footnote).collect();
         assert_eq!(notes.len(), 2);
         assert_eq!(notes[0].text, "1. First note.");
+    }
+
+    #[test]
+    fn duplicate_figure_id_adopts_post_dedup_form() {
+        // Two figures both minted fig-3 — dedup renames the second to fig-3-2 in the HTML, and
+        // the block/asset must address that post-dedup id.
+        let mk = || PageElement::at(
+            ElKind::Figure {
+                html: "<figure id=\"fig-3\"><image 1></figure>".into(),
+                id: "3".into(),
+                caption: None,
+                image: Some("img/fig_3.png".into()),
+                svg: None,
+            },
+            None,
+        );
+        let (blocks, _) = project(&[(1, vec![mk(), mk()], vec![])]);
+        let figs: Vec<_> = blocks.iter().filter(|b| b.kind == BlockKind::Figure).collect();
+        assert_eq!(figs[0].image.as_deref(), Some("img/fig_3.png"));
+        assert_eq!(figs[1].image.as_deref(), Some("img/fig_3-2.png"));
     }
 
     #[test]

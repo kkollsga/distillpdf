@@ -18,7 +18,7 @@
 //! changes the output. The adjacency passes therefore run PER PAGE here, which reproduces the
 //! legacy output byte-for-byte in both modes (verified across the corpus).
 
-use crate::html::PageElement;
+use crate::html::{bbox_union, ElKind, PageElement};
 use crate::postprocess;
 
 /// Run every cross-page transform that has been ported to the element IR, in place. `pages` is
@@ -66,7 +66,7 @@ fn merge_fragmented_lists_across_pages(pages: &mut [(u32, Vec<PageElement>, Vec<
     let mut p = 0;
     while p < pages.len() {
         // Page p must END with a List for a straddle to start.
-        let Some(PageElement::List { ordered, .. }) = pages[p].1.last() else {
+        let Some(PageElement { kind: ElKind::List { ordered, .. }, .. }) = pages[p].1.last() else {
             p += 1;
             continue;
         };
@@ -93,8 +93,8 @@ fn merge_fragmented_lists_across_pages(pages: &mut [(u32, Vec<PageElement>, Vec<
                     break;
                 }
                 match &pages[cp].1[ci] {
-                    PageElement::List { ordered: o2, .. } if *o2 == ordered => break, // reopening list
-                    PageElement::Para { text } if conts.len() < 3 && cont_ok(text) => {
+                    PageElement { kind: ElKind::List { ordered: o2, .. }, .. } if *o2 == ordered => break, // reopening list
+                    PageElement { kind: ElKind::Para { text }, .. } if conts.len() < 3 && cont_ok(text) => {
                         conts.push(text.clone());
                         ci += 1;
                     }
@@ -110,16 +110,17 @@ fn merge_fragmented_lists_across_pages(pages: &mut [(u32, Vec<PageElement>, Vec<
             // cursor (cp, ci) points at the reopening same-type List. Append conts to page p's
             // last item, absorb the reopening list's items, and remove the consumed elements
             // (the conts paras + the reopening list) from their pages.
-            let items2 = match &pages[cp].1[ci] {
-                PageElement::List { items, .. } => items.clone(),
+            let (items2, box2) = match &pages[cp].1[ci] {
+                PageElement { kind: ElKind::List { items, .. }, bbox } => (items.clone(), *bbox),
                 _ => unreachable!(),
             };
-            if let Some(PageElement::List { items, .. }) = pages[p].1.last_mut() {
+            if let Some(PageElement { kind: ElKind::List { items, .. }, bbox }) = pages[p].1.last_mut() {
                 if let Some(last) = items.last_mut() {
                     last.push(' ');
                     last.push_str(&conts.join(" "));
                 }
                 items.extend(items2);
+                *bbox = bbox_union(*bbox, box2); // the merged list spans both pages' regions
             }
             // Remove consumed: every element from (p+1,0) up to and INCLUDING (cp, ci).
             for page in pages.iter_mut().take(cp).skip(p + 1) {
@@ -137,7 +138,7 @@ fn merge_fragmented_lists_across_pages(pages: &mut [(u32, Vec<PageElement>, Vec<
 /// begins with one, the run continues across — gather the whole straddling run (it may cross
 /// several pages), merge it into one `Para` placed at the run's start page, and drop the rest.
 fn merge_math_fragments_across_pages(pages: &mut [(u32, Vec<PageElement>, Vec<String>)]) {
-    let is_frag = |e: &PageElement| matches!(e, PageElement::Para { text } if postprocess::is_math_fragment(text));
+    let is_frag = |e: &PageElement| matches!(&e.kind, ElKind::Para { text } if postprocess::is_math_fragment(text));
     let mut p = 0;
     while p < pages.len() {
         // A straddling run requires page p to END with a fragment paragraph.
@@ -148,12 +149,17 @@ fn merge_math_fragments_across_pages(pages: &mut [(u32, Vec<PageElement>, Vec<St
         // Count the trailing fragment run on page p (after per-page merge this is exactly one
         // Para when the run was wholly on-page; a single trailing fragment when it began mid-page).
         let start_run = pages[p].1.iter().rposition(|e| !is_frag(e)).map(|i| i + 1).unwrap_or(0);
-        // Gather following pages whose LEADING elements continue the fragment run.
+        // Gather following pages whose LEADING elements continue the fragment run. `merged_box`
+        // unions every fragment's region so the merged `Para` carries the run's full span.
+        let mut merged_box = None;
         let mut collected: Vec<String> = pages[p].1[start_run..]
             .iter()
-            .map(|e| match e {
-                PageElement::Para { text } => text.clone(),
-                _ => unreachable!(),
+            .map(|e| {
+                merged_box = bbox_union(merged_box, e.bbox);
+                match &e.kind {
+                    ElKind::Para { text } => text.clone(),
+                    _ => unreachable!(),
+                }
             })
             .collect();
         let mut last_page = p;
@@ -164,8 +170,9 @@ fn merge_math_fragments_across_pages(pages: &mut [(u32, Vec<PageElement>, Vec<St
                 break; // page q does not begin with a fragment — run ends at page p..=last_page
             }
             for e in &pages[q].1[..lead] {
-                if let PageElement::Para { text } = e {
+                if let ElKind::Para { text } = &e.kind {
                     collected.push(text.clone());
+                    merged_box = bbox_union(merged_box, e.bbox);
                 }
             }
             // If the whole page was fragments, the run may continue onto q+1.
@@ -180,7 +187,7 @@ fn merge_math_fragments_across_pages(pages: &mut [(u32, Vec<PageElement>, Vec<St
         if last_page > p && collected.len() >= 2 {
             // Merge: replace page p's trailing run with one Para, strip the consumed leading
             // fragments from the intervening/last pages.
-            let merged = PageElement::Para { text: collected.join(" ") };
+            let merged = PageElement::at(ElKind::Para { text: collected.join(" ") }, merged_box);
             pages[p].1.truncate(start_run);
             pages[p].1.push(merged);
             for (qi, page) in pages.iter_mut().enumerate().take(last_page + 1).skip(p + 1) {
@@ -213,20 +220,21 @@ fn merge_adjacent_links(els: &mut [PageElement]) {
 /// (list items, table cells, code) carry no inline markup but are still mapped — `f` is a no-op
 /// on text with no anchors, keeping the surface uniform.
 fn map_inline_html(e: &mut PageElement, f: impl Fn(&str) -> String) {
-    match e {
-        PageElement::DestAnchors(s) | PageElement::Header(s) | PageElement::Code { text: s } => *s = f(s),
-        PageElement::Heading { text, .. } | PageElement::Para { text } => *text = f(text),
-        PageElement::List { items, .. } => {
+    use ElKind::*;
+    match &mut e.kind {
+        DestAnchors(s) | Header(s) | Code { text: s } => *s = f(s),
+        Heading { text, .. } | Para { text } => *text = f(text),
+        List { items, .. } => {
             for it in items.iter_mut() {
                 *it = f(it);
             }
         }
-        PageElement::Footnotes { notes } => {
+        Footnotes { notes } => {
             for n in notes.iter_mut() {
                 *n = f(n);
             }
         }
-        PageElement::Table { header, grid, caption } => {
+        Table { header, grid, caption } => {
             for row in header.iter_mut() {
                 for (t, _) in row.iter_mut() {
                     *t = f(t);
@@ -241,7 +249,7 @@ fn map_inline_html(e: &mut PageElement, f: impl Fn(&str) -> String) {
                 *cap = f(cap);
             }
         }
-        PageElement::Figure { html, .. } | PageElement::Caption { html, .. } => *html = f(html),
+        Figure { html, .. } | Caption { html, .. } => *html = f(html),
     }
 }
 
@@ -257,7 +265,7 @@ fn demote_running_headings(pages: &mut [(u32, Vec<PageElement>, Vec<String>)]) {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for (_p, els, _u) in pages.iter() {
         for e in els {
-            if let PageElement::Heading { text, .. } = e {
+            if let ElKind::Heading { text, .. } = &e.kind {
                 let k = postprocess::demote_key(text);
                 if k.len() >= 4 {
                     *counts.entry(k).or_insert(0) += 1;
@@ -268,7 +276,7 @@ fn demote_running_headings(pages: &mut [(u32, Vec<PageElement>, Vec<String>)]) {
     let mut kept_h1: HashSet<String> = HashSet::new();
     for (_p, els, _u) in pages.iter_mut() {
         for e in els.iter_mut() {
-            let PageElement::Heading { level, text, .. } = e else { continue };
+            let ElKind::Heading { level, text, .. } = &mut e.kind else { continue };
             let k = postprocess::demote_key(text);
             if counts.get(&k).copied().unwrap_or(0) < 3 {
                 continue;
@@ -277,7 +285,8 @@ fn demote_running_headings(pages: &mut [(u32, Vec<PageElement>, Vec<String>)]) {
             if *level == 1 && kept_h1.insert(k) {
                 continue;
             }
-            *e = PageElement::Para { text: std::mem::take(text) };
+            // Demote to a `Para`, preserving the heading's bbox (the demote keeps its region).
+            e.kind = ElKind::Para { text: std::mem::take(text) };
         }
     }
 }
@@ -324,12 +333,14 @@ fn merge_adjacent_figures(els: &mut Vec<PageElement>) {
 /// side carried it and the id/caption from whichever side carried the caption — so the block
 /// projection (Stage B) sees one figure with both its graphic asset and its caption.
 fn merge_figure_pair(html: String, a: PageElement, b: PageElement) -> PageElement {
+    // The merged figure spans both shells' regions.
+    let bbox = bbox_union(a.bbox, b.bbox);
     // Pull (id, caption, image, svg) from each side; the graphic side has image/svg, the caption
     // side has the caption (and usually the id, which the merged html already keeps).
     let dissolve = |e: PageElement| -> (String, Option<String>, Option<String>, Option<String>) {
-        match e {
-            PageElement::Figure { id, caption, image, svg, .. } => (id, caption, image, svg),
-            PageElement::Caption { id, text, is_figure, .. } => {
+        match e.kind {
+            ElKind::Figure { id, caption, image, svg, .. } => (id, caption, image, svg),
+            ElKind::Caption { id, text, is_figure, .. } => {
                 // A figure-shell caption: it carries the caption text + the fig-N id (the
                 // Caption.id is the full "fig-N"; strip the prefix to match Figure.id's "N").
                 let num = if is_figure { id.strip_prefix("fig-").unwrap_or(&id).to_string() } else { id };
@@ -340,7 +351,7 @@ fn merge_figure_pair(html: String, a: PageElement, b: PageElement) -> PageElemen
     };
     let (ida, capa, imga, svga) = dissolve(a);
     let (idb, capb, imgb, svgb) = dissolve(b);
-    PageElement::Figure {
+    PageElement::at(ElKind::Figure {
         html,
         // The id the merged html keeps is the caption figure's; mirror that in the projection:
         // prefer the side that carries a caption (it owns the id), else either.
@@ -348,7 +359,7 @@ fn merge_figure_pair(html: String, a: PageElement, b: PageElement) -> PageElemen
         caption: capa.or(capb),
         image: imga.or(imgb),
         svg: svga.or(svgb),
-    }
+    }, bbox)
 }
 
 /// Rejoin a list fragmented into single-item lists (the element twin of
@@ -368,40 +379,44 @@ fn merge_fragmented_lists(els: &mut Vec<PageElement>) {
     let mut out: Vec<PageElement> = Vec::with_capacity(src.len());
     let mut i = 0;
     while i < src.len() {
-        let PageElement::List { ordered, items } = &src[i] else {
+        let ElKind::List { ordered, items } = &src[i].kind else {
             out.push(src[i].clone());
             i += 1;
             continue;
         };
         let ordered = *ordered;
         let mut items = items.clone();
+        let mut bbox = src[i].bbox;
         i += 1;
         // Greedily absorb [≤3 qualifying continuation Paras][same-type List] runs.
         loop {
             let mut j = i;
             let mut conts: Vec<String> = Vec::new();
+            let mut conts_box = None;
             while j < src.len() && conts.len() < 3 {
-                match &src[j] {
-                    PageElement::Para { text } if cont_ok(text) => {
+                match &src[j].kind {
+                    ElKind::Para { text } if cont_ok(text) => {
                         conts.push(text.clone());
+                        conts_box = bbox_union(conts_box, src[j].bbox);
                         j += 1;
                     }
                     _ => break,
                 }
             }
             match src.get(j) {
-                Some(PageElement::List { ordered: o2, items: items2 }) if *o2 == ordered => {
+                Some(PageElement { kind: ElKind::List { ordered: o2, items: items2 }, bbox: lbox }) if *o2 == ordered => {
                     if let Some(last) = items.last_mut() {
                         last.push(' ');
                         last.push_str(&conts.join(" "));
                     }
                     items.extend(items2.iter().cloned());
+                    bbox = bbox_union(bbox_union(bbox, conts_box), *lbox);
                     i = j + 1;
                 }
                 _ => break,
             }
         }
-        out.push(PageElement::List { ordered, items });
+        out.push(PageElement::at(ElKind::List { ordered, items }, bbox));
     }
     *els = out;
 }
@@ -464,29 +479,32 @@ fn merge_math_fragments(els: &mut Vec<PageElement>) {
     while let Some(e) = iter.next() {
         // A footnote `<aside>`'s notes are each emitted as `<p>`; the legacy pass merged a
         // math-fragment run INSIDE the aside too (bounded by `</aside>`). Mirror that.
-        if let PageElement::Footnotes { notes } = e {
-            out.push(PageElement::Footnotes { notes: merge_fragment_run(notes) });
+        if let ElKind::Footnotes { notes } = e.kind {
+            out.push(PageElement::at(ElKind::Footnotes { notes: merge_fragment_run(notes) }, e.bbox));
             continue;
         }
-        let frag_inner = match &e {
-            PageElement::Para { text } if postprocess::is_math_fragment(text) => Some(text.clone()),
+        let frag_inner = match &e.kind {
+            ElKind::Para { text } if postprocess::is_math_fragment(text) => Some(text.clone()),
             _ => None,
         };
         let Some(first) = frag_inner else {
             out.push(e);
             continue;
         };
-        // `e` is a math-fragment paragraph; gather the maximal run of further fragment paras.
+        // `e` is a math-fragment paragraph; gather the maximal run of further fragment paras
+        // (unioning their boxes onto the merged `Para`).
         let mut run = vec![first];
-        while matches!(iter.peek(), Some(PageElement::Para { text }) if postprocess::is_math_fragment(text)) {
-            if let Some(PageElement::Para { text }) = iter.next() {
+        let mut box_acc = e.bbox;
+        while matches!(iter.peek(), Some(PageElement { kind: ElKind::Para { text }, .. }) if postprocess::is_math_fragment(text)) {
+            if let Some(PageElement { kind: ElKind::Para { text }, bbox }) = iter.next() {
                 run.push(text);
+                box_acc = bbox_union(box_acc, bbox);
             }
         }
         if run.len() >= 2 {
-            out.push(PageElement::Para { text: run.join(" ") });
+            out.push(PageElement::at(ElKind::Para { text: run.join(" ") }, box_acc));
         } else {
-            out.push(PageElement::Para { text: run.into_iter().next().unwrap_or_default() });
+            out.push(PageElement::at(ElKind::Para { text: run.into_iter().next().unwrap_or_default() }, box_acc));
         }
     }
     *els = out;

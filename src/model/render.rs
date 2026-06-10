@@ -1,71 +1,172 @@
 //! Render a loaded [`DocModel`] back to HTML / Markdown / plain text — the proof that
 //! "renderers are pure functions of the model" (see docs/datamodel-design.md).
 //!
-//! ## The design decision (Wave 2)
+//! ## The design (single-stream, Stage C)
 //!
 //! We do NOT fork the renderer. The page renderer ([`crate::html`]) is split into a HEAD
-//! (`render_doc`: all the positional analysis → the PRE-id page-mode body) and a TAIL
-//! (`assemble`: id-minting + `<nav>` + image substitution). The model captures each page's
-//! PRE-id body verbatim at distill time (`Page.body_html`); this module reassembles those
-//! page bodies into the exact same merged `body` the parse path produces, then runs the
-//! IDENTICAL [`crate::html::assemble`] tail. So a model-only re-render is the same code path
-//! as a fresh parse — equivalence holds by construction, not by a parallel implementation
-//! that could drift. Markdown is then the existing HTML→Markdown transform over that HTML,
-//! and `extract_text` concatenates the page bodies' visible text — the same shapes the PDF
-//! paths produce, but sourced from the file, with no source PDF present.
+//! ([`crate::html::render_doc_elements`]: positional analysis → the per-page element IR + the
+//! cross-page transforms), a MIDDLE ([`crate::html::emit_and_merge`]: IR → the PRE-id merged
+//! body + `dedup_ids`), and a TAIL ([`crate::html::assemble`]: id-minting + `<nav>` + image
+//! substitution). The MODEL is the IR's durable form: [`crate::model::build`] PROJECTS the
+//! post-transform element IR into [`crate::model::Block`]s. This module does the inverse — it
+//! REBUILDS the page-element IR from those blocks ([`rebuild_ir`]) and runs the SAME middle +
+//! tail the parse path runs. So a model-only re-render is the identical emit/merge/assemble
+//! code, only the IR's source differs (blocks, not a fresh parse) — equivalence holds by
+//! construction, byte-for-byte across page AND section mode (verified across the corpus).
+//! Markdown is the HTML→Markdown transform over that HTML; `extract_text` is the visible text
+//! of each rebuilt page body — all sourced from the file, with no source PDF present.
 //!
-//! ## What this needs from the model (and why)
+//! ## What the blocks carry for this (and why)
 //!
-//! The block decomposition (the queryable structure + the index source of truth) is LOSSY for
-//! rendering — it drops inline emphasis, list `<ul>/<ol>` grouping, `<th>/<td>` table
-//! structure, footnote `<aside>`s, front-matter `<header>`s, and SVG. So the render-fidelity
-//! data lives in `Page.body_html` (the verbatim page body), not reconstructed from blocks.
-//! Re-rendering from blocks alone is intentionally NOT attempted: it would be a second,
-//! drifting renderer — exactly what the split avoids.
+//! The blocks are BOTH the queryable structure / index source of truth AND the render source of
+//! truth — there is no separate stored body. The query-lossy parts are carried as dedicated
+//! fidelity fields on the block (see [`crate::model::Block`]): figures/captions and the
+//! page-chrome `header`/`dest_anchors` carriers keep their exact emitted `el_html` fragment;
+//! tables keep their header/grid/caption parts; consecutive `list_item`/`footnote` blocks carry
+//! an `el_group` so they regroup into the single `<ul>/<ol>` / `<aside>` they came from; and
+//! `block.text` is the element's minimal inline HTML. One structure, two faces.
 
-use crate::html::{self, Mode, DOC_SHELL_HEAD};
+use crate::html::{self, Bbox, ElKind, Mode, PageElement, PageIR};
 use crate::links::OutlineEntry;
 use crate::markdown::{self, ImgMode};
 
-use super::{DocModel, TocEntry};
+use super::{Block, BlockKind, DocModel, TocEntry};
 
-/// Reassemble the PRE-id, PRE-nav `body` (full `<!doctype…></html>` document) from the model's
-/// per-page bodies — byte-identical to what [`crate::html::render_doc`] produced at distill
-/// time for the requested `mode`. Pages are emitted in `n` order (the model stores them
-/// sorted).
-///
-/// The two modes differ ONLY in framing, exactly as the per-page render does:
-/// - **Page** wraps each page in `<section data-page="N" id="page-N">…</section>\n`. The stored
-///   `body_html` is that section's verbatim INNER (it already carries the `\n` right after the
-///   open tag and the `\n` before the close), so wrapping it reproduces the page-mode body.
-/// - **Section** emits the page CONTENT bare (no page wrappers), and the per-page render adds
-///   no framing newlines — so we strip the single leading/trailing `\n` `body_html` carries for
-///   the page wrapper and concatenate the contents directly. `build_sections` (in `assemble`)
-///   then regroups them by heading.
-fn reassemble_body(model: &DocModel, mode: Mode) -> String {
-    let mut out = String::with_capacity(DOC_SHELL_HEAD.len() + 4096);
-    out.push_str(DOC_SHELL_HEAD);
+/// Rebuild the post-transform page-element IR ([`PageIR`] list) from the model's BLOCKS — the
+/// single-stream "renderers are pure functions of the model" property, sourced from blocks (no
+/// stored `body_html`). Each block reconstructs the [`crate::html::PageElement`] it was projected
+/// from in [`crate::model::build`]; consecutive `list_item` / `footnote` blocks sharing an
+/// `el_group` regroup into the single `<ul>/<ol>` / `<aside>` element they came from; figures,
+/// captions, and the page-chrome carriers re-emit their stored `el_html` fragment verbatim
+/// (already in its FINAL deduped + image-substituted form, so [`crate::html::emit_and_merge`]'s
+/// `dedup_ids` is idempotent over it). Pages are emitted in `n` order (the model stores them
+/// sorted); a page with no blocks renders as an empty section, matching an empty source page.
+fn rebuild_ir(model: &DocModel) -> Vec<PageIR> {
+    // Group blocks by their page, preserving reading order.
+    let mut by_page: std::collections::BTreeMap<u32, Vec<&Block>> = std::collections::BTreeMap::new();
+    for b in &model.blocks {
+        by_page.entry(b.page).or_default().push(b);
+    }
+    let mut pages: Vec<PageIR> = Vec::with_capacity(model.pages.len());
     for p in &model.pages {
-        // A page the renderer produced no body for (should not happen — every page renders a
-        // section) degrades to an empty section, matching an empty source page.
-        let inner = p.body_html.as_deref().unwrap_or("\n\n");
-        match mode {
-            Mode::Page => {
-                out.push_str(&format!("<section data-page=\"{n}\" id=\"page-{n}\">", n = p.n));
-                out.push_str(inner);
-                out.push_str("</section>\n");
+        let blocks = by_page.remove(&p.n).unwrap_or_default();
+        pages.push((p.n, elements_from_blocks(&blocks), Vec::new()));
+    }
+    pages
+}
+
+/// Reconstruct one page's ordered [`PageElement`] list from its blocks. The `el_group` ordinal
+/// groups the consecutive `list_item` / `footnote` blocks a single list / aside was decomposed
+/// into; every other block maps one-to-one to its element. Bbox is threaded back (it does not
+/// affect emission but keeps the rebuilt IR a faithful twin of the distill-time one).
+fn elements_from_blocks(blocks: &[&Block]) -> Vec<PageElement> {
+    let mut out: Vec<PageElement> = Vec::with_capacity(blocks.len());
+    let mut i = 0;
+    while i < blocks.len() {
+        let b = blocks[i];
+        match b.kind {
+            BlockKind::Heading => {
+                out.push(PageElement::at(
+                    ElKind::Heading { level: b.heading_level.unwrap_or(1), id: String::new(), text: b.text.clone() },
+                    b.bbox,
+                ));
+                i += 1;
             }
-            Mode::Section => {
-                // Drop the page-wrapper framing newlines (one leading + one trailing) the
-                // page-mode INNER carries; section mode strings the bare contents together.
-                let content = inner.strip_prefix('\n').unwrap_or(inner);
-                let content = content.strip_suffix('\n').unwrap_or(content);
-                out.push_str(content);
+            BlockKind::Para => {
+                out.push(PageElement::at(ElKind::Para { text: b.text.clone() }, b.bbox));
+                i += 1;
+            }
+            BlockKind::Code => {
+                out.push(PageElement::at(ElKind::Code { text: b.text.clone() }, b.bbox));
+                i += 1;
+            }
+            BlockKind::ListItem => {
+                // A `list_item` block with NO `el_group` is a PARAGRAPH whose visible text merely
+                // opens a list marker ("1. …") — the renderer emitted it as `<p>`, and the
+                // `list_item` kind is only a query-view label; reconstruct it as a `Para`. Only an
+                // item that came from a real `<ul>/<ol>` List element carries `el_group`.
+                if b.el_group.is_none() {
+                    out.push(PageElement::at(ElKind::Para { text: b.text.clone() }, b.bbox));
+                    i += 1;
+                    continue;
+                }
+                // Absorb the maximal run of `list_item` blocks sharing this one's `el_group`
+                // into one `<ul>/<ol>` element (the projection split it into per-item blocks).
+                let group = b.el_group;
+                let ordered = b.list_ordered.unwrap_or(false);
+                let mut items = Vec::new();
+                let mut bbox = b.bbox;
+                while i < blocks.len()
+                    && blocks[i].kind == BlockKind::ListItem
+                    && blocks[i].el_group == group
+                {
+                    items.push(blocks[i].text.clone());
+                    bbox = bbox_union(bbox, blocks[i].bbox);
+                    i += 1;
+                }
+                out.push(PageElement::at(ElKind::List { ordered, items }, bbox));
+            }
+            BlockKind::Footnote => {
+                let group = b.el_group;
+                let mut notes = Vec::new();
+                let mut bbox = b.bbox;
+                while i < blocks.len()
+                    && blocks[i].kind == BlockKind::Footnote
+                    && blocks[i].el_group == group
+                {
+                    notes.push(blocks[i].text.clone());
+                    bbox = bbox_union(bbox, blocks[i].bbox);
+                    i += 1;
+                }
+                out.push(PageElement::at(ElKind::Footnotes { notes }, bbox));
+            }
+            BlockKind::Table => {
+                out.push(PageElement::at(
+                    ElKind::Table {
+                        header: b.table_header.clone().unwrap_or_default(),
+                        grid: b.table_grid.clone().unwrap_or_default(),
+                        caption: b.table_caption.clone(),
+                    },
+                    b.bbox,
+                ));
+                i += 1;
+            }
+            BlockKind::Figure => {
+                out.push(PageElement::at(
+                    ElKind::Figure {
+                        html: b.el_html.clone().unwrap_or_default(),
+                        id: String::new(),
+                        caption: None,
+                        image: None,
+                        svg: None,
+                    },
+                    b.bbox,
+                ));
+                i += 1;
+            }
+            BlockKind::Caption => {
+                out.push(PageElement::at(
+                    ElKind::Caption { html: b.el_html.clone().unwrap_or_default(), id: String::new(), text: String::new(), is_figure: false },
+                    b.bbox,
+                ));
+                i += 1;
+            }
+            BlockKind::Header => {
+                out.push(PageElement::at(ElKind::Header(b.el_html.clone().unwrap_or_default()), b.bbox));
+                i += 1;
+            }
+            BlockKind::DestAnchors => {
+                out.push(PageElement::at(ElKind::DestAnchors(b.el_html.clone().unwrap_or_default()), b.bbox));
+                i += 1;
             }
         }
     }
-    out.push_str("</body>\n</html>\n");
     out
+}
+
+/// Union two bboxes (re-exported shape of `html::bbox_union`, used by the list/footnote regroup).
+fn bbox_union(a: Option<Bbox>, b: Option<Bbox>) -> Option<Bbox> {
+    html::bbox_union(a, b)
 }
 
 /// Reconstruct the PDF's own outline (`/Outlines`) from the model's `toc`, for the `assemble`
@@ -109,10 +210,23 @@ fn parse_image_mode(image_mode: &str, string_fallback: ImgMode) -> Result<ImgMod
 /// re-render awaits the asset-bytes capture (Wave 3/4). This still produces the EXACT HTML the
 /// PDF path produces for `image_mode="drop"`, which is the round-trip contract.
 pub(crate) fn render_html(model: &DocModel, mode: Mode, include_toc: bool) -> String {
-    let body = reassemble_body(model, mode);
+    // Rebuild the post-transform element IR from the blocks, then run the SAME emit + merge +
+    // assemble path the PDF parse path runs — so a model-only re-render is the identical code,
+    // only the IR source differs (blocks, not a fresh parse). The rebuilt figure/chrome fragments
+    // are already in their final deduped + image-substituted form, so `emit_and_merge`'s
+    // `dedup_ids` is idempotent over them and the merge carries no `\0idx\0` sentinels (the URI
+    // list comes back empty → `assemble`'s `substitute_images` is a no-op).
+    let mut pages_ir = rebuild_ir(model);
+    // The blocks are projected from the PAGE-mode IR, so they carry the page-LOCAL transforms but
+    // NOT the SECTION-mode cross-page merges (a list / display equation straddling a page break is
+    // folded into one element only when the per-page bodies are concatenated bare — see
+    // `elem_passes`). Re-run the cross-page passes on the rebuilt IR for the requested mode: in
+    // page mode they are page-local + idempotent (a no-op over the already-transformed IR); in
+    // section mode they additionally apply the straddling-list / straddling-math merges page mode
+    // omits, so the section-mode re-render matches `to_html(section)` byte-for-byte.
+    crate::elem_passes::run_cross_page_passes(&mut pages_ir, mode);
+    let (body, _img_uris) = html::emit_and_merge(&pages_ir, mode);
     let outline = outline_from_model(&model.toc);
-    // No deferred image URIs: the stored body already has resolved `<image N>` placeholders, so
-    // `substitute_images` inside `assemble` is a no-op (no `\0idx\0` sentinels remain).
     html::assemble(body, mode, include_toc, &outline, &[], false)
 }
 
@@ -141,12 +255,14 @@ pub(crate) fn render_markdown(model: &DocModel, mode: Mode, include_toc: bool, i
 /// is the substantive content; the round-trip regression asserts that token equality (and pins
 /// HTML/Markdown byte-for-byte, since those ARE pure HTML transforms).
 pub(crate) fn extract_text(model: &DocModel) -> String {
+    // Each page's body is the emit of its rebuilt element IR (the page-mode INNER, the same body
+    // the fidelity render carries) — SVG subtrees dropped, inline tags → token boundaries.
+    let pages_ir = rebuild_ir(model);
     let mut out = String::new();
-    for p in &model.pages {
-        if let Some(body) = &p.body_html {
-            let no_svg = strip_svg(body);
-            out.push_str(visible_text(&no_svg).trim());
-        }
+    for (_pno, els, _uris) in &pages_ir {
+        let body = html::emit_page_elements(els);
+        let no_svg = strip_svg(&body);
+        out.push_str(visible_text(&no_svg).trim());
         out.push('\n');
     }
     out
@@ -217,41 +333,27 @@ mod tests {
     use crate::model::{Block, BlockKind, Coverage, Indexes, Metadata, Page, Source, NATIVE_CONFIDENCE, SCHEMA_VERSION};
     use std::collections::BTreeMap;
 
-    fn model_with_pages(bodies: Vec<(u32, &str)>) -> DocModel {
-        let pages = bodies
-            .iter()
-            .map(|(n, body)| Page {
-                n: *n,
+    /// A model built from BLOCKS (the render source of truth, post-`body_html`). Pages carry
+    /// geometry only; render rebuilds the page-element IR from the per-page blocks.
+    fn model_with_blocks(npages: u32, blocks: Vec<Block>) -> DocModel {
+        let pages = (1..=npages)
+            .map(|n| Page {
+                n,
                 width_pts: 612.0,
                 height_pts: 792.0,
                 labels: BTreeMap::new(),
                 ocr_decision: None,
                 active_ocr_pass: None,
-                body_html: Some(body.to_string()),
             })
             .collect();
         DocModel {
             schema_version: SCHEMA_VERSION,
-            source: Source { file: "x.pdf".into(), sha256: "ab".into(), pages: bodies.len() as u32, distillpdf: "0".into(), generated_at: "t".into() },
+            source: Source { file: "x.pdf".into(), sha256: "ab".into(), pages: npages, distillpdf: "0".into(), generated_at: "t".into() },
             metadata: Metadata::default(),
             pages,
             ocr_passes: Vec::new(),
             sections: Vec::new(),
-            blocks: vec![Block {
-                id: "b0001".into(),
-                kind: BlockKind::Para,
-                text: "x".into(),
-                page: 1,
-                section: None,
-                bbox: None,
-                confidence: NATIVE_CONFIDENCE,
-                ocr_pass: None,
-                heading_level: None,
-                cells: None,
-                image: None,
-                label: None,
-                caption: None,
-            }],
+            blocks,
             indexes: Indexes { coverage: Coverage::default(), ..Default::default() },
             assets: Vec::new(),
             links: Vec::new(),
@@ -260,29 +362,47 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reassembled_body_frames_pages_exactly() {
-        let m = model_with_pages(vec![(1, "\n<h1>A</h1><p>one</p>\n"), (2, "\n<p>two</p>\n")]);
-        let body = reassemble_body(&m, Mode::Page);
-        assert!(body.starts_with(DOC_SHELL_HEAD));
-        // page wrappers + the inter-page newline framing.
-        assert!(body.contains("<section data-page=\"1\" id=\"page-1\">\n<h1>A</h1><p>one</p>\n</section>\n"));
-        assert!(body.contains("<section data-page=\"2\" id=\"page-2\">\n<p>two</p>\n</section>\n"));
-        assert!(body.ends_with("</body>\n</html>\n"));
+    fn blk(id: &str, kind: BlockKind, page: u32, text: &str) -> Block {
+        Block {
+            id: id.into(),
+            kind,
+            text: text.into(),
+            page,
+            section: None,
+            bbox: None,
+            confidence: NATIVE_CONFIDENCE,
+            ocr_pass: None,
+            heading_level: None,
+            cells: None,
+            image: None,
+            label: None,
+            caption: None,
+            list_ordered: None,
+            el_group: None,
+            table_header: None,
+            table_grid: None,
+            table_caption: None,
+            el_html: None,
+        }
     }
 
     #[test]
     fn page_mode_mints_ids_and_nav() {
-        let m = model_with_pages(vec![(1, "\n<h1>Intro</h1><p>body</p>\n")]);
+        let h = Block { heading_level: Some(1), ..blk("b0001", BlockKind::Heading, 1, "Intro") };
+        let p = blk("b0002", BlockKind::Para, 1, "body");
+        let m = model_with_blocks(1, vec![h, p]);
         let html = render_html(&m, Mode::Page, true);
         // build_toc minted the heading id and built the nav (page-mode keeps <section data-page>).
+        assert!(html.contains("<section data-page=\"1\" id=\"page-1\">"));
         assert!(html.contains("<h1 id=\"sec-intro\">Intro</h1>"));
         assert!(html.contains("<nav>") && html.contains("href=\"#sec-intro\""));
     }
 
     #[test]
     fn section_mode_wraps_sections() {
-        let m = model_with_pages(vec![(1, "\n<h1>Intro</h1><p>body</p>\n")]);
+        let h = Block { heading_level: Some(1), ..blk("b0001", BlockKind::Heading, 1, "Intro") };
+        let p = blk("b0002", BlockKind::Para, 1, "body");
+        let m = model_with_blocks(1, vec![h, p]);
         let html = render_html(&m, Mode::Section, false);
         // section mode regroups into a <section id="sec-…"> wrapper (no page wrappers).
         assert!(html.contains("<section id=\"sec-intro\">"));
@@ -291,14 +411,20 @@ mod tests {
 
     #[test]
     fn extract_text_surfaces_all_visible_text_and_drops_svg() {
-        // The visible text of the body — table cells + figure captions included (they live in
-        // the body HTML, not block.text), markup stripped, SVG label text dropped — one page
-        // per line.
-        let m = model_with_pages(vec![(
-            1,
-            "\n<h1>Title</h1><table><tr><th>Cell</th></tr></table>\
-             <figure><svg><text>axis</text></svg><figcaption>Cap</figcaption></figure><p>Body <b>bold</b></p>\n",
-        )]);
+        // The visible text of the rebuilt page body — table cells + figure captions included,
+        // markup stripped, SVG label text dropped — one page per line.
+        let h = Block { heading_level: Some(1), ..blk("b0001", BlockKind::Heading, 1, "Title") };
+        let table = Block {
+            table_header: Some(vec![vec![("Cell".into(), 1)]]),
+            table_grid: Some(vec![]),
+            ..blk("b0002", BlockKind::Table, 1, "")
+        };
+        let fig = Block {
+            el_html: Some("<figure><svg><text>axis</text></svg><figcaption>Cap</figcaption></figure>".into()),
+            ..blk("b0003", BlockKind::Figure, 1, "")
+        };
+        let para = blk("b0004", BlockKind::Para, 1, "Body <b>bold</b>");
+        let m = model_with_blocks(1, vec![h, table, fig, para]);
         let txt = extract_text(&m);
         assert!(txt.contains("Title") && txt.contains("Cell") && txt.contains("Cap") && txt.contains("Body bold"));
         assert!(!txt.contains("axis"), "SVG label text is figure-internal, not page prose");
@@ -308,7 +434,9 @@ mod tests {
 
     #[test]
     fn markdown_transforms_the_rendered_html() {
-        let m = model_with_pages(vec![(1, "\n<h1>Intro</h1><p>hello</p>\n")]);
+        let h = Block { heading_level: Some(1), ..blk("b0001", BlockKind::Heading, 1, "Intro") };
+        let p = blk("b0002", BlockKind::Para, 1, "hello");
+        let m = model_with_blocks(1, vec![h, p]);
         let (md, files) = render_markdown(&m, Mode::Section, false, "drop").unwrap();
         assert!(md.contains("# Intro") && md.contains("hello"));
         assert!(files.is_empty());

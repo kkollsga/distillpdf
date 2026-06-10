@@ -25,7 +25,23 @@ import re
 from typing import Any, Iterable, Iterator, Optional
 
 # The default reading-order kinds that carry body prose for the query-markdown view.
-_TEXT_KINDS = ("heading", "para", "list_item", "footnote", "caption")
+_TEXT_KINDS = ("heading", "para", "list_item", "footnote", "caption", "code")
+
+# `block.text` carries the element's MINIMAL INLINE HTML (`<b>/<i>/<a>/<sup>/<sub>/<code>`) —
+# the faithful projection of the render IR. The QUERY views (search, query-markdown) want plain
+# text, so they strip those inline tags. `_INLINE_TAG` matches any `<...>` run (the text only
+# ever carries inline markup, never block tags).
+_INLINE_TAG = re.compile(r"<[^>]+>")
+
+
+def _plain(text: str) -> str:
+    """Strip inline markup from a block's `text` for the plain-text query views."""
+    if not text or "<" not in text:
+        return text
+    s = _INLINE_TAG.sub("", text)
+    for a, b in (("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&#39;", "'")):
+        s = s.replace(a, b)
+    return s
 
 
 class DpdfError(ValueError):
@@ -356,7 +372,7 @@ def _block_search_text(b: dict[str, Any]) -> str:
     figure/table caption (so `find` reaches table contents and captions, not just prose)."""
     parts: list[str] = []
     if b.get("text"):
-        parts.append(b["text"])
+        parts.append(_plain(b["text"]))
     if b.get("kind") == "table" and b.get("cells"):
         parts.append(" ".join(c for row in b["cells"] for c in row))
     if b.get("caption"):
@@ -365,9 +381,10 @@ def _block_search_text(b: dict[str, Any]) -> str:
 
 
 def _block_md(b: dict[str, Any]) -> str:
-    """One block as query-markdown."""
+    """One block as query-markdown. `block.text` carries inline HTML markup (the render IR
+    projection); the query-markdown view strips it to plain text."""
     kind = b.get("kind")
-    text = b.get("text", "")
+    text = _plain(b.get("text", ""))
     if kind == "heading":
         level = min(int(b.get("heading_level") or 1), 6)
         return f"{'#' * level} {text}".rstrip()
@@ -382,6 +399,10 @@ def _block_md(b: dict[str, Any]) -> str:
         return f"_{text}_" if text else ""
     if kind == "footnote":
         return f"> {text}" if text else ""
+    if kind == "code":
+        # The code block's text is `<pre><code>…</code></pre>`; show the inner as a fenced block.
+        inner = _plain(text)
+        return f"```\n{inner.rstrip(chr(10))}\n```" if inner.strip() else ""
     return text
 
 

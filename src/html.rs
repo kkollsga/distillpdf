@@ -371,9 +371,51 @@ pub(crate) fn looks_like_reference(s: &str) -> bool {
 // populated by the emit walk (this commit) and READ by the block projection in
 // `crate::model::build` (the next stage of the single-stream refactor). Allowed dead until the
 // projection lands — same staged-wiring pattern `model::mod` uses.
+/// A bounding box in PDF user space `[x0, y0, x1, y1]` (origin bottom-left, points), threaded
+/// from the render walk's positioned items onto the element it produced and unioned through the
+/// cross-page merges, so the block projection can carry it. `None` for page-chrome elements
+/// (dest anchors, the front-matter header) and constructs the walk produced from no positioned
+/// line.
+pub(crate) type Bbox = [f32; 4];
+
+/// Union two bounding boxes (the enclosing box). `None` is the identity, so a run of merged
+/// elements unions to the box covering all of them; merging a positioned element with an
+/// unpositioned one keeps the positioned box.
+pub(crate) fn bbox_union(a: Option<Bbox>, b: Option<Bbox>) -> Option<Bbox> {
+    match (a, b) {
+        (Some([ax0, ay0, ax1, ay1]), Some([bx0, by0, bx1, by1])) => {
+            Some([ax0.min(bx0), ay0.min(by0), ax1.max(bx1), ay1.max(by1)])
+        }
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+/// One page-body element: its kind-specific payload ([`ElKind`]) plus the bounding box of the
+/// page region it came from (when the walk could attribute one). The bbox travels with the
+/// element through the cross-page transforms (unioned on merge) so the block projection records
+/// each block's position.
 #[allow(dead_code)]
 #[derive(Clone)]
-pub(crate) enum PageElement {
+pub(crate) struct PageElement {
+    pub(crate) kind: ElKind,
+    pub(crate) bbox: Option<Bbox>,
+}
+
+impl PageElement {
+    /// A page-chrome / unpositioned element (no bbox).
+    pub(crate) fn new(kind: ElKind) -> PageElement {
+        PageElement { kind, bbox: None }
+    }
+    /// A positioned element carrying the page region it was emitted from.
+    pub(crate) fn at(kind: ElKind, bbox: Option<Bbox>) -> PageElement {
+        PageElement { kind, bbox }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub(crate) enum ElKind {
     /// `<a id="…"></a>` named-destination anchor(s) emitted at the page head (one string,
     /// possibly several anchors concatenated, ending in the `\n` the head emits).
     DestAnchors(String),
@@ -414,18 +456,26 @@ impl PageElement {
     /// The exact HTML fragment this element contributes to the page body. Concatenating these
     /// in order reproduces the legacy string-built page body byte-for-byte.
     pub(crate) fn html(&self) -> String {
+        self.kind.html()
+    }
+}
+
+impl ElKind {
+    /// The exact HTML fragment this element contributes to the page body.
+    pub(crate) fn html(&self) -> String {
+        use ElKind::*;
         match self {
-            PageElement::DestAnchors(s) | PageElement::Header(s) => s.clone(),
-            PageElement::Code { text } => text.clone(),
-            PageElement::Heading { level, id, text } => {
+            DestAnchors(s) | Header(s) => s.clone(),
+            Code { text } => text.clone(),
+            Heading { level, id, text } => {
                 if id.is_empty() {
                     format!("<h{level}>{text}</h{level}>")
                 } else {
                     format!("<h{level} id=\"{id}\">{text}</h{level}>")
                 }
             }
-            PageElement::Para { text } => format!("<p>{text}</p>"),
-            PageElement::List { ordered, items } => {
+            Para { text } => format!("<p>{text}</p>"),
+            List { ordered, items } => {
                 let tag = if *ordered { "ol" } else { "ul" };
                 let mut s = format!("<{tag}>");
                 for it in items {
@@ -434,7 +484,7 @@ impl PageElement {
                 s.push_str(&format!("</{tag}>"));
                 s
             }
-            PageElement::Footnotes { notes } => {
+            Footnotes { notes } => {
                 let mut s = String::from("<aside>");
                 for n in notes {
                     s.push_str(&format!("<p>{n}</p>"));
@@ -442,10 +492,10 @@ impl PageElement {
                 s.push_str("</aside>");
                 s
             }
-            PageElement::Table { header, grid, caption } => {
+            Table { header, grid, caption } => {
                 table_html_from_parts(header, grid, caption.as_ref().map(|(n, c, b)| (n.as_str(), c.as_str(), *b)))
             }
-            PageElement::Figure { html, .. } | PageElement::Caption { html, .. } => html.clone(),
+            Figure { html, .. } | Caption { html, .. } => html.clone(),
         }
     }
 }
@@ -584,6 +634,17 @@ fn footnote_notes(lines: &[&Line]) -> Vec<String> {
     notes
 }
 
+/// A single text line's PDF-user-space bbox `[x0, y0, x1, y1]` (the glyph baseline `y` to
+/// `y + size`). The page-element bbox the block projection records is unioned from these.
+fn box_of_line(l: &Line) -> Bbox {
+    [l.x0, l.y, l.x1.max(l.x0), l.y + l.size.max(0.0)]
+}
+
+/// The union bbox of a run of lines (None for an empty run).
+fn box_of_lines(lines: &[&Line]) -> Option<Bbox> {
+    lines.iter().fold(None, |acc, l| bbox_union(acc, Some(box_of_line(l))))
+}
+
 /// Emit a run of consecutive text lines as headings / paragraphs / lists / code, pushing one
 /// [`PageElement`] per emitted construct (a heading, a paragraph, a list, a code block, a
 /// footnote aside). Headings carry NO id here — ids are minted later by the `assemble` tail,
@@ -596,11 +657,15 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], pro
     // the wrap). It is flushed only at a real paragraph start, or a header/list/
     // mono boundary, or end of input.
     let mut para = String::new();
+    // The bbox accumulator for the open paragraph: the union of every line folded into it
+    // (across column wraps), threaded onto the emitted `Para` so the block carries its region.
+    let mut para_box: Option<Bbox> = None;
     macro_rules! flush_para {
         () => {
             if !para.trim().is_empty() {
-                out.push(PageElement::Para { text: para.trim().to_string() });
+                out.push(PageElement::at(ElKind::Para { text: para.trim().to_string() }, para_box));
                 para.clear();
+                para_box = None;
             }
         };
     }
@@ -631,7 +696,7 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], pro
             while i < lines.len() && foot[i] {
                 i += 1;
             }
-            out.push(PageElement::Footnotes { notes: footnote_notes(&lines[a..i]) });
+            out.push(PageElement::at(ElKind::Footnotes { notes: footnote_notes(&lines[a..i]) }, box_of_lines(&lines[a..i])));
             continue;
         }
         let ln = lines[i];
@@ -668,7 +733,7 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], pro
             } else {
                 (lvl + 1).min(6)
             };
-            out.push(PageElement::Heading { level: tag, id: String::new(), text: render_runs(&ln.runs[..k]) });
+            out.push(PageElement::at(ElKind::Heading { level: tag, id: String::new(), text: render_runs(&ln.runs[..k]) }, Some(box_of_line(ln))));
             if k < ln.runs.len() {
                 // Run-in lead ("Model Architecture BERT's model architec-"): the rest
                 // of THIS line begins the body. Seed the paragraph accumulator with it
@@ -679,6 +744,8 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], pro
                 let rest = render_runs(&ln.runs[k..]);
                 if !rest.trim().is_empty() {
                     append_piece(&mut para, rest.trim());
+                    // The run-in body line seeds the open paragraph's box too.
+                    para_box = bbox_union(para_box, Some(box_of_line(ln)));
                 }
             }
             // Standalone header: consume just the heading line and let the body
@@ -693,6 +760,7 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], pro
             flush_para!();
             let ordered = list_kind(&txt).unwrap();
             let mut item_htmls: Vec<String> = Vec::new();
+            let mut list_box: Option<Bbox> = None;
             // Each <li> is its marker line PLUS any wrapped continuation lines (no
             // marker, indented past the marker, same column, small gap). Keeping the
             // continuations inside the item — and the list open across them — stops a
@@ -704,6 +772,7 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], pro
                 let marker_x = lines[i].x0;
                 let mut item = strip_marker(&lines[i].text());
                 let mut prev_y = lines[i].y;
+                list_box = bbox_union(list_box, Some(box_of_line(lines[i])));
                 i += 1;
                 while i < lines.len() {
                     let l = lines[i];
@@ -718,24 +787,27 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], pro
                     }
                     item.push(' ');
                     item.push_str(l.text().trim());
+                    list_box = bbox_union(list_box, Some(box_of_line(l)));
                     prev_y = l.y;
                     i += 1;
                 }
                 item_htmls.push(esc(item.trim()));
             }
-            out.push(PageElement::List { ordered, items: item_htmls });
+            out.push(PageElement::at(ElKind::List { ordered, items: item_htmls }, list_box));
             continue;
         }
         // code / monospace block
         if ln.mono {
             flush_para!();
             let mut inner = String::new();
+            let mut code_box: Option<Bbox> = None;
             while i < lines.len() && lines[i].mono && list_kind(&lines[i].text()).is_none() {
                 inner.push_str(&esc(&lines[i].text()));
                 inner.push('\n');
+                code_box = bbox_union(code_box, Some(box_of_line(lines[i])));
                 i += 1;
             }
-            out.push(PageElement::Code { text: format!("<pre><code>{inner}</code></pre>") });
+            out.push(PageElement::at(ElKind::Code { text: format!("<pre><code>{inner}</code></pre>") }, code_box));
             continue;
         }
         // paragraph block: gather consecutive normal lines. The starting line is
@@ -793,11 +865,15 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], pro
                 flush_para!();
             }
             append_piece(&mut para, &render_runs(&l.runs));
+            para_box = bbox_union(para_box, Some(box_of_line(l)));
         }
         // Intentionally NOT flushed here: a paragraph may continue in the next
         // column's block (handled by the j==0 continuation rule above).
     }
-    flush_para!();
+    // Final flush: emit any paragraph still open at end of input (no reset needed — we return).
+    if !para.trim().is_empty() {
+        out.push(PageElement::at(ElKind::Para { text: para.trim().to_string() }, para_box));
+    }
 }
 
 /// Append a rendered line to a paragraph, joining a line-break hyphen. The hyphen
@@ -1142,7 +1218,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                 anchors.push_str(&format!("<a id=\"{sl}\"></a>"));
             }
             anchors.push('\n');
-            els.push(PageElement::DestAnchors(anchors));
+            els.push(PageElement::new(ElKind::DestAnchors(anchors)));
         }
         let mut tables = extract::detect_tables_pos(spans);
         let mut images = img::positioned_images(doc, *_pid, inline_images);
@@ -1278,7 +1354,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
             if is_paper_front_matter(&fm) {
                 let mut hdr = String::new();
                 emit_header_block(&fm, &mut hdr);
-                els.push(PageElement::Header(hdr));
+                els.push(PageElement::new(ElKind::Header(hdr)));
                 let mut i = 0usize;
                 lines.retain(|_| {
                     let keep = !consumed.contains(&i);
@@ -1766,7 +1842,16 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
             boxes.push((*cx0, *cx0 + 0.1, *cy, *cy + body.max(1.0)));
         }
         let order = text::xy_cut_order(&boxes, body);
-        let items: Vec<&Item> = order.iter().map(|&i| &items[i]).collect();
+        // The non-text items (tables/figures/captions) carry their positioned box onto the
+        // emitted [`PageElement`] so the block projection records it; text runs get their box
+        // inside `emit_lines` (unioned over the run's lines). `boxes` is `(x_left, x_right,
+        // y_bottom, y_top)`; the [`Bbox`] form is `[x0, y0, x1, y1]` = `[x_left, y_bottom,
+        // x_right, y_top]`.
+        let item_box = |bi: usize| -> Option<Bbox> {
+            let (xl, xr, yb, yt) = boxes[bi];
+            Some([xl, yb, xr, yt])
+        };
+        let items: Vec<(&Item, Option<Bbox>)> = order.iter().map(|&i| (&items[i], item_box(i))).collect();
 
         // Emit, grouping consecutive lines into text blocks. `page_promote` lists the
         // PDF-outline titles whose target page is this one, so body-size section titles
@@ -1779,17 +1864,18 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                 run.clear();
             }
         };
-        for it in &items {
+        for (it, ibox) in &items {
+            let ibox = *ibox;
             match it {
                 Item::L(l) => run.push(l),
                 Item::T(j) => {
                     flush(&mut run, &mut els);
                     let caption = tab_cap[*j].as_ref().map(|(n, c, b)| (n.clone(), c.clone(), *b));
-                    els.push(PageElement::Table {
+                    els.push(PageElement::at(ElKind::Table {
                         header: tables[*j].header.clone(),
                         grid: tables[*j].grid.clone(),
                         caption,
-                    });
+                    }, ibox));
                 }
                 Item::Img(j) => {
                     flush(&mut run, &mut els);
@@ -1822,7 +1908,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                             ),
                             None => (format!("<figure>{svg}</figure>"), String::new(), None),
                         };
-                        els.push(PageElement::Figure { html, id, caption, image: None, svg: Some(svg) });
+                        els.push(PageElement::at(ElKind::Figure { html, id, caption, image: None, svg: Some(svg) }, ibox));
                         continue;
                     }
                     // Both the inline data URI (often megabytes) and the `<image N>`
@@ -1875,7 +1961,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                     // The figure carries a raster placeholder (`<image N>`/`<img>`): mint the
                     // asset id keyed on the figure number so block projection can name it.
                     let image = (!id.is_empty()).then(|| format!("img/fig_{}.png", num_id(&id)));
-                    els.push(PageElement::Figure { html, id, caption, image, svg: svg_field });
+                    els.push(PageElement::at(ElKind::Figure { html, id, caption, image, svg: svg_field }, ibox));
                 }
                 Item::Svg(j) => {
                     flush(&mut run, &mut els);
@@ -1908,18 +1994,18 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                         ),
                         None => (format!("<figure>{svg}</figure>"), String::new(), None),
                     };
-                    els.push(PageElement::Figure { html, id, caption, image: None, svg: Some(svg) });
+                    els.push(PageElement::at(ElKind::Figure { html, id, caption, image: None, svg: Some(svg) }, ibox));
                 }
                 Item::Cap(j) => {
                     flush(&mut run, &mut els);
                     let (.., html) = &standalone[*j];
                     let meta = &standalone_meta[*j];
-                    els.push(PageElement::Caption {
+                    els.push(PageElement::at(ElKind::Caption {
                         html: html.clone(),
                         id: meta.0.clone(),
                         text: meta.1.clone(),
                         is_figure: meta.2,
-                    });
+                    }, ibox));
                 }
             }
         }

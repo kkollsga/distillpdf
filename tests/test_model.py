@@ -116,7 +116,7 @@ def test_blocks_in_reading_order_with_stable_ids(tmp_path):
     for b in model["blocks"]:
         assert b["page"] >= 1
         assert b["kind"] in ("heading", "para", "list_item", "table", "figure",
-                             "caption", "footnote")
+                             "caption", "footnote", "code", "header", "dest_anchors")
         # native text layer → confidence 1.0, no OCR provenance.
         assert b["confidence"] == 1.0
         assert "ocr_pass" not in b or b["ocr_pass"] is None
@@ -267,8 +267,15 @@ def test_roundtrip_seed_sections_and_text(path, tmp_path):
     # Every model block's text appears in the rendered text, in order. We assert a strong
     # subsequence/containment property rather than exact equality (the HTML carries figure
     # captions and table cells the joined block text presents differently).
+    #
+    # NOTE (engine track, Stage B): `block.text` now carries the element's MINIMAL INLINE HTML
+    # (`<b>/<i>/<a>/<sup>/<sub>/<code>` — exactly what the renderer emits), so the block is a
+    # faithful projection of the post-transform element IR. We strip that inline markup before
+    # the containment check (the rendered visible text has it stripped too).
+    def _strip_inline(s):
+        return re.sub(r"<[^>]+>", "", s)
     for b in model["blocks"]:
-        t = re.sub(r"\s+", " ", b.get("text", "")).strip()
+        t = re.sub(r"\s+", " ", _strip_inline(b.get("text", ""))).strip()
         if t and b["kind"] in ("heading", "para", "list_item", "footnote"):
             assert t in html_text, f"block text {t!r} absent from rendered HTML"
 

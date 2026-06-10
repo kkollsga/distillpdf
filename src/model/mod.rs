@@ -77,9 +77,10 @@ impl AssetProfile {
 /// `1.0` is the design's sentinel for "born-digital, no OCR uncertainty".
 pub(crate) const NATIVE_CONFIDENCE: f32 = 1.0;
 
-/// A bounding box in PDF user space `[x0, y0, x1, y1]` (origin bottom-left, points).
-/// Optional on a block — Wave 1's HTML-derived build path does not yet thread per-block
-/// boxes through (the renderer flattens them), so it is `None` until Wave 2 surfaces them.
+/// A bounding box in PDF user space `[x0, y0, x1, y1]` (origin bottom-left, points), threaded
+/// from the render walk's positioned items onto each block. `Option` on a block — `None` for a
+/// construct the walk produced from no positioned line (rare); 100% of content blocks carry one
+/// on the born-digital path.
 pub(crate) type Bbox = [f32; 4];
 
 /// The whole document model — the root of `model.json`.
@@ -156,19 +157,10 @@ pub(crate) struct Page {
     /// Which OCR pass feeds this page's blocks/renders (`None` = native text layer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_ocr_pass: Option<String>,
-    /// The page's body content as the PAGE renderer emitted it: the INNER HTML of this page's
-    /// `<section data-page>` wrapper, verbatim, with raster/vector graphics reduced to
-    /// `<image N>` placeholders (the bytes live in `assets`). This is the RENDER-FIDELITY
-    /// field. Blocks are the decomposed, queryable structural view (and the index source of
-    /// truth); this is the faithful render so `render_html(model)` reproduces `to_html(pdf)`
-    /// byte-for-byte for BOTH page mode and section mode (section mode is `build_sections` run
-    /// over exactly this body). It carries everything block decomposition drops — inline
-    /// emphasis (`<b>/<i>/<a>/<sup>`), front-matter `<header>`, named-dest `<a id>` anchors,
-    /// `<ul>/<ol>` list grouping, `<th>/<td>` table structure, footnote `<aside>`s, and SVG
-    /// vector figures. `None` only for a page the renderer produced no body for (it then
-    /// renders as an empty `<section>`, matching the source).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub body_html: Option<String>,
+    // (No `body_html`: the per-page render-fidelity body USED to be stored verbatim here, but the
+    // BLOCKS are now the single render source of truth — `render::render_html` rebuilds the
+    // page-element IR from them byte-identically (Stage C of the single-stream refactor). The
+    // page's content lives entirely in `DocModel.blocks`, indexed by page; nothing is duplicated.)
 }
 
 /// Mirror of `ocr::detect::OcrDecision` as a serde enum (kept here so the model module owns
@@ -285,6 +277,38 @@ pub(crate) struct Block {
     /// Figure/table caption text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caption: Option<String>,
+
+    // ---- render-reconstruction fields (Stage C; the model is the render source of truth) ----
+    // These let `render::render_html` rebuild the byte-identical page-element IR from blocks
+    // alone — the single-stream "renderers are pure functions of the model" property, now WITHOUT
+    // a stored `body_html`. They are FIDELITY data, distinct from the query fields above.
+    /// For `kind = list_item`: the `<ul>`/`<ol>` tag (`true` = ordered) the item belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_ordered: Option<bool>,
+    /// Groups consecutive `list_item` (→ one `<ul>/<ol>`) or `footnote` (→ one `<aside>`) blocks
+    /// back into the single element they were projected from, so two adjacent distinct lists /
+    /// asides don't merge on reconstruction. A per-document ordinal; same group ⇒ same element.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub el_group: Option<u32>,
+    /// A `kind = table`'s detached header rows (`(cell text, colspan)`), distinct from the data
+    /// `cells` grid — the exact parts `table_html_from_parts` re-emits. (`cells` carries the
+    /// query view: header rows expanded + the grid.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_header: Option<Vec<Vec<(String, usize)>>>,
+    /// A `kind = table`'s data grid (without the detached header rows), for faithful re-emit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_grid: Option<Vec<Vec<String>>>,
+    /// A `kind = table`'s caption as `(number, inner-html, below)` — the renderer's
+    /// `<caption>` parts (separate from the plain-text `caption` query field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_caption: Option<(String, String, bool)>,
+    /// The EXACT emitted HTML fragment for constructs not faithfully reconstructible from the
+    /// structured fields alone — `figure`/`caption` (SVG, overlays, composite, captions) and the
+    /// page-chrome `header`/`dest_anchors` carriers. SVG subtrees are pulled out to `\0svg:ID\0`
+    /// sentinels (the bytes live in a `kind = svg` asset); render splices them back. `None` for
+    /// the structured kinds (heading/para/list_item/code/table/footnote).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub el_html: Option<String>,
 }
 
 /// The block kinds the extractor distinguishes. Lowercase wire names match the design.
@@ -298,6 +322,14 @@ pub(crate) enum BlockKind {
     Figure,
     Caption,
     Footnote,
+    /// A `<pre><code>…</code></pre>` monospace/code block.
+    Code,
+    /// The first-page semantic `<header>` front-matter carrier (fidelity-only; reconstructed
+    /// from `el_html`, since rebuilding it from `metadata` is lossy — sup author markers, the
+    /// affiliation `<ol>`). Not a queryable content block.
+    Header,
+    /// The page-head named-destination `<a id>` anchors carrier (fidelity-only). Not content.
+    DestAnchors,
 }
 
 impl BlockKind {
@@ -312,6 +344,9 @@ impl BlockKind {
             BlockKind::Figure => "figure",
             BlockKind::Caption => "caption",
             BlockKind::Footnote => "footnote",
+            BlockKind::Code => "code",
+            BlockKind::Header => "header",
+            BlockKind::DestAnchors => "dest_anchors",
         }
     }
 }
@@ -621,6 +656,12 @@ mod tests {
             image: None,
             label: label.map(String::from),
             caption: None,
+            list_ordered: None,
+            el_group: None,
+            table_header: None,
+            table_grid: None,
+            table_caption: None,
+            el_html: None,
         }
     }
 

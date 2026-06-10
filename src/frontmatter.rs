@@ -556,7 +556,11 @@ pub(crate) fn find_title_sized(lines: &[Line], body: f32) -> Option<(String, Has
 /// front-matter path) so non-paper output matches the long-standing baseline exactly.
 pub(crate) fn emit_document_title(lines: &mut Vec<Line>, body: f32, out: &mut Vec<crate::html::PageElement>) {
     if let Some((title, set)) = find_document_title(lines, body) {
-        out.push(crate::html::PageElement::Heading { level: 1, id: String::new(), text: esc(&title) });
+        // The title's bbox is the union of the lines it consumed (in PDF user space).
+        let bbox = set.iter().filter_map(|&j| lines.get(j)).fold(None, |acc, l| {
+            crate::html::bbox_union(acc, Some([l.x0, l.y, l.x1.max(l.x0), l.y + l.size.max(0.0)]))
+        });
+        out.push(crate::html::PageElement::at(crate::html::ElKind::Heading { level: 1, id: String::new(), text: esc(&title) }, bbox));
         let mut i = 0usize;
         lines.retain(|_| {
             let keep = !set.contains(&i);

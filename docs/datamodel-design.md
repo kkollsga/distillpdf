@@ -9,22 +9,25 @@ cross-library analysis with kglite-docs (the first downstream consumer). Compani
 fidelity worklist in `ROADMAP.md` — this is the "engine track": making distillPDF the
 extraction engine other systems build on, not just a converter.*
 
-> **Implementation notes (Waves 1–4).**
-> * **Render fidelity — the "renderers are pure functions of the model" property.** Satisfied
->   in practice via a **verbatim per-page body** captured at distill time plus a shared
->   *assemble tail* (TOC nav, section grouping, document chrome) applied at render time:
->   `render_html`/`render_markdown`/`render_text` reproduce the source PDF's
+> **Implementation notes.**
+> * **Render fidelity — the "renderers are pure functions of the model" property.** The
+>   **blocks** array is the SINGLE source of truth — both the query/index view AND the render
+>   view. There is no separate stored body: `render_html` REBUILDS the post-transform
+>   page-element IR from the blocks and runs the SAME emit + merge + `assemble` tail the source
+>   PDF path runs, so `render_html`/`render_markdown`/`render_text` reproduce the source PDF's
 >   `to_html`/`to_markdown`/`extract_text` (with `image_mode="drop"`, the born-digital model
->   carrying no figure bytes) **byte-for-byte**. The **blocks** array remains the
->   query/index source of truth (reading order, ids, sections, kinds); the per-page body is
->   the fidelity surface. The two are intentionally distinct — the query-markdown view
->   (`Doc.section`, the `read` verb) is addressable per section/block/page, the fidelity view
->   is whole-document — and each is documented as which it is.
-> * **`bbox` is deferred.** Block records carry no `bbox` yet (the schema sketch's
->   `"bbox": […]` and `detail="spans"` are not implemented). Citations resolve to
->   `(block id, section, physical page, page label)` — enough for the agent-CLI and `Doc`
->   surface — and per-block geometry is a later additive field behind the version bump, not a
->   silent omission.
+>   carrying no figure bytes) **byte-for-byte across both page AND section mode** (verified over
+>   the whole corpus). The query-lossy parts are carried as dedicated FIDELITY fields on the
+>   block: a figure/caption (and the page-chrome `header`/`dest_anchors` carriers) keep their
+>   exact emitted `el_html` fragment; a table keeps its header/grid/caption parts; consecutive
+>   `list_item`/`footnote` blocks share an `el_group` so they regroup into the one `<ul>/<ol>` /
+>   `<aside>` they came from; and `block.text` is the element's minimal inline HTML. The
+>   query-markdown view (`Doc.section`, the `read` verb) strips that markup and is addressable
+>   per section/block/page; the fidelity render is whole-document — each is documented as which.
+> * **`bbox` is threaded.** Every content block carries its `bbox` (`[x0,y0,x1,y1]` in PDF user
+>   space, origin bottom-left), threaded from the render walk's positioned items and unioned
+>   through the cross-page merges — 100% coverage of content blocks on the born-digital path.
+>   Citations resolve to `(block id, section, physical page, page label, bbox)`.
 
 ## Why
 

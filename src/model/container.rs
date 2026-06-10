@@ -272,6 +272,12 @@ mod tests {
             image: None,
             label: None,
             caption: None,
+            list_ordered: None,
+            el_group: None,
+            table_header: None,
+            table_grid: None,
+            table_caption: None,
+            el_html: None,
         }];
         let indexes = derive_indexes(&blocks);
         DocModel {
@@ -284,7 +290,7 @@ mod tests {
                 generated_at: "2026-06-10T00:00:00Z".into(),
             },
             metadata: Metadata::default(),
-            pages: vec![Page { n: 1, width_pts: 612.0, height_pts: 792.0, labels: BTreeMap::new(), ocr_decision: None, active_ocr_pass: None, body_html: None }],
+            pages: vec![Page { n: 1, width_pts: 612.0, height_pts: 792.0, labels: BTreeMap::new(), ocr_decision: None, active_ocr_pass: None }],
             ocr_passes: Vec::new(),
             sections: Vec::new(),
             blocks,
@@ -378,6 +384,12 @@ mod tests {
             image: None,
             label: None,
             caption: None,
+            list_ordered: None,
+            el_group: None,
+            table_header: None,
+            table_grid: None,
+            table_caption: None,
+            el_html: None,
         });
         // (indexes still reflect only b0001 — drift)
         let dir = std::env::temp_dir().join(format!("dpdf_drift_{}", std::process::id()));
