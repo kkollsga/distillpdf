@@ -554,9 +554,9 @@ pub(crate) fn find_title_sized(lines: &[Line], body: f32) -> Option<(String, Has
 /// Non-paper first page: emit the detected title as a bare `<h1>` and consume its lines.
 /// Uses only the prominence heuristic (the size fallback is reserved for the structured
 /// front-matter path) so non-paper output matches the long-standing baseline exactly.
-pub(crate) fn emit_document_title(lines: &mut Vec<Line>, body: f32, out: &mut String) {
+pub(crate) fn emit_document_title(lines: &mut Vec<Line>, body: f32, out: &mut Vec<crate::html::PageElement>) {
     if let Some((title, set)) = find_document_title(lines, body) {
-        out.push_str(&format!("<h1>{}</h1>", esc(&title)));
+        out.push(crate::html::PageElement::Heading { level: 1, id: String::new(), text: esc(&title) });
         let mut i = 0usize;
         lines.retain(|_| {
             let keep = !set.contains(&i);

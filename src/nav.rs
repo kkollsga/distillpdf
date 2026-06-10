@@ -106,6 +106,26 @@ pub(crate) fn strip_inline(html: &str) -> String {
     s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'")
 }
 
+/// Mint a heading's stable `sec-*` anchor id from its (already inline-stripped, trimmed)
+/// label, deduped against `seen` (`-2`, `-3`, … on collision) and recorded in it. This is the
+/// SINGLE id-minting rule, shared by [`build_toc`] (which mints over the rendered HTML) and the
+/// model build path (which mints over the typed element IR), so section ids cannot drift
+/// between the two faces of the document.
+pub(crate) fn mint_section_id(label: &str, seen: &mut std::collections::HashSet<String>) -> String {
+    let base = {
+        let s = format!("sec-{}", slug(&label.to_lowercase()));
+        s.trim_matches('-').to_string()
+    };
+    let mut id = base.clone();
+    let mut k = 2;
+    while seen.contains(&id) {
+        id = format!("{base}-{k}");
+        k += 1;
+    }
+    seen.insert(id.clone());
+    id
+}
+
 /// Give every heading a stable `sec-*` anchor id and prepend an auto table of
 /// contents. Page is the primary organiser (headings stay inside their
 /// `<section data-page>`), so each TOC entry carries its page. A FLAT `<ol>` (level
@@ -163,17 +183,7 @@ pub(crate) fn build_toc(html: String, include_nav: bool) -> String {
                 let label = label.trim();
                 if !label.is_empty() {
                     out.push_str(&html[copied..i]);
-                    let base = {
-                        let s = format!("sec-{}", slug(&label.to_lowercase()));
-                        s.trim_matches('-').to_string()
-                    };
-                    let mut id = base.clone();
-                    let mut k = 2;
-                    while seen.contains(&id) {
-                        id = format!("{base}-{k}");
-                        k += 1;
-                    }
-                    seen.insert(id.clone());
+                    let id = mint_section_id(label, &mut seen);
                     entries.push((level, label.to_string(), page, id.clone()));
                     out.push_str(&format!("<h{level} id=\"{id}\">{inner}{close}"));
                     i += rel + close.len();

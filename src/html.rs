@@ -5,7 +5,7 @@
 //! no classes, no script — minimal tags for LLM consumption.
 
 use crate::captions::*;
-use crate::extract::{self, PosTable};
+use crate::extract;
 use crate::frontmatter::*;
 use crate::headings::*;
 use crate::img;
@@ -352,10 +352,119 @@ pub(crate) fn looks_like_reference(s: &str) -> bool {
     }
     false
 }
-/// Render a positioned table. A caption (when present) is emitted as the table's
-/// own `<caption>` and the anchor id goes on the `<table>` — a table is tabular
-/// data, not a figure, so it is NOT wrapped in `<figure>`.
-fn table_html(t: &PosTable, cap: Option<(&str, &str, bool)>) -> String {
+/// The page-level intermediate representation: the ordered sequence of typed content
+/// elements a single page's render produces. This is THE in-memory IR of the single-stream
+/// architecture (see docs/datamodel-design.md): `render_doc` materializes it per page,
+/// [`emit_page_elements`] renders it to HTML (a pure function of the IR — byte-identical to
+/// the legacy string-building it replaced), and the model build path projects it into
+/// queryable [`crate::model::Block`]s. Each variant carries (a) the exact HTML fragment it
+/// emits — so emission is a faithful concatenation — plus (b) the structured projection the
+/// blocks need (inline-markup text, table cells, caption/label, figure asset + SVG, bbox).
+///
+/// Inline-markup encoding: a text-bearing element's `text` is the element's INNER HTML — i.e.
+/// it carries the minimal inline vocabulary the renderer emits (`<b>/<i>/<a>/<sup>/<sub>/
+/// <code>`), HTML-escaped otherwise. This is the pragmatic faithful choice: `emit_page_elements`
+/// reproduces the fragment from `text` directly (no re-escaping, no re-markup), so the
+/// blocks→HTML inverse in `crate::model::render` is byte-exact.
+//
+// The structured figure/caption fields (`id`/`caption`/`image`/`svg`/`text`/`is_figure`) are
+// populated by the emit walk (this commit) and READ by the block projection in
+// `crate::model::build` (the next stage of the single-stream refactor). Allowed dead until the
+// projection lands — same staged-wiring pattern `model::mod` uses.
+#[allow(dead_code)]
+pub(crate) enum PageElement {
+    /// `<a id="…"></a>` named-destination anchor(s) emitted at the page head (one string,
+    /// possibly several anchors concatenated, ending in the `\n` the head emits).
+    DestAnchors(String),
+    /// The first-page semantic `<header>` front-matter block (title/authors/abstract/keywords)
+    /// — opaque for projection (front-matter is reconstructed from `metadata`, not blocks).
+    Header(String),
+    /// A heading `<hN id="sec-…">inner</hN>`. `level` is the HTML tag number (1..6); `text` is
+    /// the inner HTML (inline markup preserved); `id` is the `sec-…`/empty id on the tag.
+    Heading { level: u8, id: String, text: String },
+    /// A paragraph `<p>inner</p>`; `text` is the inner HTML.
+    Para { text: String },
+    /// A `<ul>`/`<ol>` list. `ordered` picks the tag; `items` are the per-`<li>` inner HTML
+    /// strings (already escaped, no inline markup — list items are emitted via `esc`).
+    List { ordered: bool, items: Vec<String> },
+    /// A `<pre><code>…</code></pre>` monospace block; `text` is the escaped inner (with the
+    /// trailing `\n` per line the emitter produced).
+    Code { text: String },
+    /// A footnote `<aside>` wrapping one `<p>` per note; `notes` are the per-note inner HTML.
+    Footnotes { notes: Vec<String> },
+    /// A `<table>` (with optional `<caption>`). Carries the full cell structure for projection:
+    /// `header` rows (text + colspan) render as `<th>`, `grid` rows as `<td>` (or `<th>` for
+    /// row 0 when there is no detached header — see [`table_html`]). `caption` is `(num, html,
+    /// below)`.
+    Table { header: Vec<Vec<(String, usize)>>, grid: Vec<Vec<String>>, caption: Option<(String, String, bool)> },
+    /// A `<figure>` (raster `<img>`/`<image N>`, vector `<svg>`, or composite). `html` is the
+    /// exact fragment; `id` is the `fig-N` number (or empty); `caption` the figcaption inner;
+    /// `image` the asset id when a raster placeholder is present; `svg` the inline SVG markup
+    /// when the figure is/contains a vector graphic. The structured fields let the block carry
+    /// the figure's identity + caption + asset reference; `html` lets emission stay byte-exact.
+    Figure { html: String, id: String, caption: Option<String>, image: Option<String>, svg: Option<String> },
+    /// A standalone caption (`<figure id="fig-N"><figcaption>…` with no graphic, or a table
+    /// caption `<div id="tab-N">…`). `html` is the fragment; `text` the caption inner; `id` the
+    /// `fig-N`/`tab-N`; `is_figure` distinguishes the two shells.
+    Caption { html: String, id: String, text: String, is_figure: bool },
+}
+
+impl PageElement {
+    /// The exact HTML fragment this element contributes to the page body. Concatenating these
+    /// in order reproduces the legacy string-built page body byte-for-byte.
+    pub(crate) fn html(&self) -> String {
+        match self {
+            PageElement::DestAnchors(s) | PageElement::Header(s) => s.clone(),
+            PageElement::Code { text } => text.clone(),
+            PageElement::Heading { level, id, text } => {
+                if id.is_empty() {
+                    format!("<h{level}>{text}</h{level}>")
+                } else {
+                    format!("<h{level} id=\"{id}\">{text}</h{level}>")
+                }
+            }
+            PageElement::Para { text } => format!("<p>{text}</p>"),
+            PageElement::List { ordered, items } => {
+                let tag = if *ordered { "ol" } else { "ul" };
+                let mut s = format!("<{tag}>");
+                for it in items {
+                    s.push_str(&format!("<li>{it}</li>"));
+                }
+                s.push_str(&format!("</{tag}>"));
+                s
+            }
+            PageElement::Footnotes { notes } => {
+                let mut s = String::from("<aside>");
+                for n in notes {
+                    s.push_str(&format!("<p>{n}</p>"));
+                }
+                s.push_str("</aside>");
+                s
+            }
+            PageElement::Table { header, grid, caption } => {
+                table_html_from_parts(header, grid, caption.as_ref().map(|(n, c, b)| (n.as_str(), c.as_str(), *b)))
+            }
+            PageElement::Figure { html, .. } | PageElement::Caption { html, .. } => html.clone(),
+        }
+    }
+}
+
+/// Render an ordered page-element list to its page body HTML — the pure projection
+/// `IR → HTML`. Used by both the parse path (after [`render_doc`] builds the list) and the
+/// model-only re-render (which rebuilds the list from blocks), so the two share ONE emit path.
+pub(crate) fn emit_page_elements(els: &[PageElement]) -> String {
+    let mut out = String::new();
+    for e in els {
+        out.push_str(&e.html());
+    }
+    out
+}
+
+/// The table-emit core, over the bare parts (`header` rows of `(text, colspan)`, the data
+/// `grid`, optional caption). Shared by [`table_html`] (parse path, from a [`PosTable`]) and
+/// [`PageElement::html`] (model path, from the serialized cell structure) so a `<table>`
+/// renders byte-identically whichever side built it.
+fn table_html_from_parts(header: &[Vec<(String, usize)>], grid: &[Vec<String>], cap: Option<(&str, &str, bool)>) -> String {
     let mut tbl = match cap {
         Some((num, _, _)) => format!("<table id=\"tab-{}\">", num_id(num)),
         None => String::from("<table>"),
@@ -374,7 +483,7 @@ fn table_html(t: &PosTable, cap: Option<(&str, &str, bool)>) -> String {
     // Detached grouped/multi-level header rows (mapped onto the data column grid with
     // colspans) render first as <th>. When present, the data grid is ALL <td> (its row
     // 0 is data, not the header). When absent, fall back to treating grid row 0 as <th>.
-    for hrow in &t.header {
+    for hrow in header {
         tbl.push_str("<tr>");
         for (text, span) in hrow {
             if *span > 1 {
@@ -385,8 +494,8 @@ fn table_html(t: &PosTable, cap: Option<(&str, &str, bool)>) -> String {
         }
         tbl.push_str("</tr>");
     }
-    let has_header = !t.header.is_empty();
-    for (ri, row) in t.grid.iter().enumerate() {
+    let has_header = !header.is_empty();
+    for (ri, row) in grid.iter().enumerate() {
         tbl.push_str("<tr>");
         let tag = if ri == 0 && !has_header { "th" } else { "td" };
         for cell in row {
@@ -427,10 +536,11 @@ fn footnote_region_mask(lines: &[&Line], body: f32) -> Vec<bool> {
     mark
 }
 
-/// Render a footnote block's lines as `<p>` items inside the caller's `<aside>`: a lone
-/// marker number ("1") begins a new footnote and is joined to the definition that
-/// follows ("1." + "https://…"); wrapped continuation lines fold in (de-hyphenated).
-fn emit_footnotes(lines: &[&Line], out: &mut String) {
+/// A footnote block's lines as the per-note inner HTML strings (each a `<p>` body in the
+/// caller's `<aside>`): a lone marker number ("1") begins a new footnote and is joined to the
+/// definition that follows ("1." + "https://…"); wrapped continuation lines fold in
+/// (de-hyphenated). Returns the notes so the caller can build one [`PageElement::Footnotes`].
+fn footnote_notes(lines: &[&Line]) -> Vec<String> {
     // A footnote begins with its marker number: either a lone "1" line, or a number
     // glued to the start of the definition ("3In all cases…"). Split the marker off and
     // begin a new <p>; a line with no leading marker (a wrapped definition line, or a URL
@@ -450,17 +560,18 @@ fn emit_footnotes(lines: &[&Line], out: &mut String) {
             None
         }
     };
+    let mut notes: Vec<String> = Vec::new();
     let mut cur = String::new();
-    let flush = |cur: &mut String, out: &mut String| {
+    let flush = |cur: &mut String, notes: &mut Vec<String>| {
         if !cur.trim().is_empty() {
-            out.push_str(&format!("<p>{}</p>", cur.trim()));
+            notes.push(cur.trim().to_string());
             cur.clear();
         }
     };
     for l in lines {
         match lead_marker(&l.text()) {
             Some((num, rest)) => {
-                flush(&mut cur, out);
+                flush(&mut cur, &mut notes);
                 cur.push_str(&num);
                 cur.push_str(". ");
                 cur.push_str(&rest);
@@ -468,11 +579,15 @@ fn emit_footnotes(lines: &[&Line], out: &mut String) {
             None => append_piece(&mut cur, render_runs(&l.runs).trim()),
         }
     }
-    flush(&mut cur, out);
+    flush(&mut cur, &mut notes);
+    notes
 }
 
-/// Emit a run of consecutive text lines as headings / paragraphs / lists / code.
-fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], profile: &DocProfile, plan: &HeadingPlan, out: &mut String) {
+/// Emit a run of consecutive text lines as headings / paragraphs / lists / code, pushing one
+/// [`PageElement`] per emitted construct (a heading, a paragraph, a list, a code block, a
+/// footnote aside). Headings carry NO id here — ids are minted later by the `assemble` tail,
+/// matching the legacy bare-`<hN>` emit.
+fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], profile: &DocProfile, plan: &HeadingPlan, out: &mut Vec<PageElement>) {
     let mut i = 0;
     // The currently-open paragraph. It is NOT flushed at a column-wrap block
     // boundary — a paragraph that wraps from the bottom of one column to the top
@@ -483,7 +598,7 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], pro
     macro_rules! flush_para {
         () => {
             if !para.trim().is_empty() {
-                out.push_str(&format!("<p>{}</p>", para.trim()));
+                out.push(PageElement::Para { text: para.trim().to_string() });
                 para.clear();
             }
         };
@@ -515,9 +630,7 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], pro
             while i < lines.len() && foot[i] {
                 i += 1;
             }
-            out.push_str("<aside>");
-            emit_footnotes(&lines[a..i], out);
-            out.push_str("</aside>");
+            out.push(PageElement::Footnotes { notes: footnote_notes(&lines[a..i]) });
             continue;
         }
         let ln = lines[i];
@@ -554,7 +667,7 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], pro
             } else {
                 (lvl + 1).min(6)
             };
-            out.push_str(&format!("<h{tag}>{}</h{tag}>", render_runs(&ln.runs[..k])));
+            out.push(PageElement::Heading { level: tag, id: String::new(), text: render_runs(&ln.runs[..k]) });
             if k < ln.runs.len() {
                 // Run-in lead ("Model Architecture BERT's model architec-"): the rest
                 // of THIS line begins the body. Seed the paragraph accumulator with it
@@ -578,8 +691,7 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], pro
         if list_kind(&txt).is_some() && !(has_year(&txt) || initials_count(&txt) >= 2) {
             flush_para!();
             let ordered = list_kind(&txt).unwrap();
-            let tag = if ordered { "ol" } else { "ul" };
-            out.push_str(&format!("<{tag}>"));
+            let mut item_htmls: Vec<String> = Vec::new();
             // Each <li> is its marker line PLUS any wrapped continuation lines (no
             // marker, indented past the marker, same column, small gap). Keeping the
             // continuations inside the item — and the list open across them — stops a
@@ -608,21 +720,21 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], pro
                     prev_y = l.y;
                     i += 1;
                 }
-                out.push_str(&format!("<li>{}</li>", esc(item.trim())));
+                item_htmls.push(esc(item.trim()));
             }
-            out.push_str(&format!("</{tag}>"));
+            out.push(PageElement::List { ordered, items: item_htmls });
             continue;
         }
         // code / monospace block
         if ln.mono {
             flush_para!();
-            out.push_str("<pre><code>");
+            let mut inner = String::new();
             while i < lines.len() && lines[i].mono && list_kind(&lines[i].text()).is_none() {
-                out.push_str(&esc(&lines[i].text()));
-                out.push('\n');
+                inner.push_str(&esc(&lines[i].text()));
+                inner.push('\n');
                 i += 1;
             }
-            out.push_str("</code></pre>");
+            out.push(PageElement::Code { text: format!("<pre><code>{inner}</code></pre>") });
             continue;
         }
         // paragraph block: gather consecutive normal lines. The starting line is
@@ -1006,24 +1118,25 @@ pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: 
         .enumerate()
         .map(|(pidx, (pno, _pid, spans))| {
         let pno = pno;
-        let mut out = String::new();
+        // The page's typed element IR — the single-stream in-memory representation. The walk
+        // below pushes one [`PageElement`] per construct; the page body HTML is then a pure
+        // `emit_page_elements` of this list (byte-identical to the legacy string-building),
+        // and the model build path projects the same list into blocks.
+        let mut els: Vec<PageElement> = Vec::new();
         // Per-page deferred inline-image data URIs (placeholder mode stores empty strings
         // to keep the index aligned for `<image N>` numbering). The leading `\0<idx>\0`
         // sentinel is rewritten to a global index at merge time.
         let mut img_uris: Vec<String> = Vec::new();
-        // Page mode wraps each page in its own <section>; section mode emits the page's
-        // content bare into the stream and regroups it by heading afterwards.
-        if mode == Mode::Page {
-            out.push_str(&format!("<section data-page=\"{pno}\" id=\"page-{pno}\">\n"));
-        }
         // Anchor targets for this page's named destinations, so the semantic links
         // (#cite.x / #figure.n / #equation.n / #section.x) resolve. Empty <a id> at
         // the section head land the reader on the correct page + the exact target id.
         if let Some(ds) = dests_by_page.get(pno) {
+            let mut anchors = String::new();
             for (sl, _y) in ds {
-                out.push_str(&format!("<a id=\"{sl}\"></a>"));
+                anchors.push_str(&format!("<a id=\"{sl}\"></a>"));
             }
-            out.push('\n');
+            anchors.push('\n');
+            els.push(PageElement::DestAnchors(anchors));
         }
         let mut tables = extract::detect_tables_pos(spans);
         let mut images = img::positioned_images(doc, *_pid, inline_images);
@@ -1157,7 +1270,9 @@ pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: 
         if pidx == 0 && !lines.is_empty() {
             let (fm, consumed) = detect_front_matter(&lines, body);
             if is_paper_front_matter(&fm) {
-                emit_header_block(&fm, &mut out);
+                let mut hdr = String::new();
+                emit_header_block(&fm, &mut hdr);
+                els.push(PageElement::Header(hdr));
                 let mut i = 0usize;
                 lines.retain(|_| {
                     let keep = !consumed.contains(&i);
@@ -1165,7 +1280,7 @@ pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: 
                     keep
                 });
             } else {
-                emit_document_title(&mut lines, body, &mut out);
+                emit_document_title(&mut lines, body, &mut els);
             }
         }
 
@@ -1463,6 +1578,9 @@ pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: 
         // still figure/table regions — emit the caption standalone so the number +
         // description and its anchor id survive.
         let mut standalone: Vec<(f32, f32, String)> = Vec::new(); // (x0, y, html)
+        // Parallel to `standalone`: the structured projection for each standalone caption —
+        // (id without the `fig-`/`tab-` prefix slug, caption inner html, is_figure).
+        let mut standalone_meta: Vec<(String, String, bool)> = Vec::new();
         // Each caption is gathered as its full (multi-line) block and anchored to the
         // nearest figure (image) / table by y; unanchored captions stand alone.
         for &(idx, is_fig, ref num) in &cap_lines {
@@ -1532,12 +1650,13 @@ pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: 
                 // suppression + caption-aware weak-vector promotion), so what remains here is
                 // a genuine figure whose graphic we could not extract.
                 let nid = num_id(num);
-                let block = if is_fig {
-                    format!("<figure id=\"fig-{nid}\"><figcaption>{html}</figcaption></figure>")
+                let (block, full_id) = if is_fig {
+                    (format!("<figure id=\"fig-{nid}\"><figcaption>{html}</figcaption></figure>"), format!("fig-{nid}"))
                 } else {
-                    format!("<div id=\"tab-{nid}\">{html}</div>")
+                    (format!("<div id=\"tab-{nid}\">{html}</div>"), format!("tab-{nid}"))
                 };
                 standalone.push((lines[idx].x0, cy, block));
+                standalone_meta.push((full_id, html.clone(), is_fig));
             }
             for u in used {
                 consumed_caption.insert(u);
@@ -1648,7 +1767,7 @@ pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: 
         // still become headings.
         let page_promote: &[String] = promote_by_page.get(pno).map(|v| v.as_slice()).unwrap_or(&[]);
         let mut run: Vec<&Line> = Vec::new();
-        let flush = |run: &mut Vec<&Line>, out: &mut String| {
+        let flush = |run: &mut Vec<&Line>, out: &mut Vec<PageElement>| {
             if !run.is_empty() {
                 emit_lines(run, body, title_sz, page_promote, &profile, &head_plan, out);
                 run.clear();
@@ -1658,14 +1777,16 @@ pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: 
             match it {
                 Item::L(l) => run.push(l),
                 Item::T(j) => {
-                    flush(&mut run, &mut out);
-                    match &tab_cap[*j] {
-                        Some((num, cap, below)) => out.push_str(&table_html(&tables[*j], Some((num, cap, *below)))),
-                        None => out.push_str(&table_html(&tables[*j], None)),
-                    }
+                    flush(&mut run, &mut els);
+                    let caption = tab_cap[*j].as_ref().map(|(n, c, b)| (n.clone(), c.clone(), *b));
+                    els.push(PageElement::Table {
+                        header: tables[*j].header.clone(),
+                        grid: tables[*j].grid.clone(),
+                        caption,
+                    });
                 }
                 Item::Img(j) => {
-                    flush(&mut run, &mut out);
+                    flush(&mut run, &mut els);
                     // This raster is embedded inside a larger vector figure (a plot whose
                     // data points are a raster within the axes) — emitted by that vector's
                     // Item::Svg composite, not here.
@@ -1687,10 +1808,15 @@ pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: 
                         let svg = vectors[vi].composite_svg(&[(&href, (im.x_left, im.x_right, im.y_bottom, im.y_top), im.ctm)]);
                         // Caption may have attached to the image OR its overlay vector.
                         let cap = img_cap[*j].as_ref().or(svg_cap[vi].as_ref());
-                        match cap {
-                            Some((num, cap)) => out.push_str(&format!("<figure id=\"fig-{}\">{svg}<figcaption>{cap}</figcaption></figure>", num_id(num))),
-                            None => out.push_str(&format!("<figure>{svg}</figure>")),
-                        }
+                        let (html, id, caption) = match cap {
+                            Some((num, cap)) => (
+                                format!("<figure id=\"fig-{}\">{svg}<figcaption>{cap}</figcaption></figure>", num_id(num)),
+                                num.clone(),
+                                Some(cap.clone()),
+                            ),
+                            None => (format!("<figure>{svg}</figure>"), String::new(), None),
+                        };
+                        els.push(PageElement::Figure { html, id, caption, image: None, svg: Some(svg) });
                         continue;
                     }
                     // Both the inline data URI (often megabytes) and the `<image N>`
@@ -1728,16 +1854,25 @@ pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: 
                         })
                         .collect();
                     let rel = if overlays.is_empty() { "" } else { " style=\"position:relative\"" };
-                    match &img_cap[*j] {
-                        Some((num, cap)) => out.push_str(&format!(
-                            "<figure{rel} id=\"fig-{nid}\">{graphic}{overlays}<figcaption>{cap}</figcaption></figure>",
-                            nid = num_id(num)
-                        )),
-                        None => out.push_str(&format!("<figure{rel}>{graphic}{overlays}</figure>")),
-                    }
+                    let svg_field = (!overlays.is_empty()).then(|| overlays.clone());
+                    let (html, id, caption) = match &img_cap[*j] {
+                        Some((num, cap)) => (
+                            format!(
+                                "<figure{rel} id=\"fig-{nid}\">{graphic}{overlays}<figcaption>{cap}</figcaption></figure>",
+                                nid = num_id(num)
+                            ),
+                            num.clone(),
+                            Some(cap.clone()),
+                        ),
+                        None => (format!("<figure{rel}>{graphic}{overlays}</figure>"), String::new(), None),
+                    };
+                    // The figure carries a raster placeholder (`<image N>`/`<img>`): mint the
+                    // asset id keyed on the figure number so block projection can name it.
+                    let image = (!id.is_empty()).then(|| format!("img/fig_{}.png", num_id(&id)));
+                    els.push(PageElement::Figure { html, id, caption, image, svg: svg_field });
                 }
                 Item::Svg(j) => {
-                    flush(&mut run, &mut out);
+                    flush(&mut run, &mut els);
                     // A vector frame containing raster image(s) (a plot whose data points
                     // are a raster within the axes): composite into ONE `<svg>` with each
                     // raster embedded as an `<image>` in the figure's coordinate space.
@@ -1759,24 +1894,38 @@ pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: 
                     // Caption may have attached to the vector OR to one of its embedded
                     // rasters — use whichever has it so the composite keeps its caption.
                     let cap = svg_cap[*j].as_ref().or_else(|| svg_rasters[*j].iter().find_map(|&ii| img_cap[ii].as_ref()));
-                    match cap {
-                        Some((num, cap)) => out.push_str(&format!(
-                            "<figure id=\"fig-{nid}\">{svg}<figcaption>{cap}</figcaption></figure>",
-                            nid = num_id(num)
-                        )),
-                        None => out.push_str(&format!("<figure>{svg}</figure>")),
-                    }
+                    let (html, id, caption) = match cap {
+                        Some((num, cap)) => (
+                            format!("<figure id=\"fig-{nid}\">{svg}<figcaption>{cap}</figcaption></figure>", nid = num_id(num)),
+                            num.clone(),
+                            Some(cap.clone()),
+                        ),
+                        None => (format!("<figure>{svg}</figure>"), String::new(), None),
+                    };
+                    els.push(PageElement::Figure { html, id, caption, image: None, svg: Some(svg) });
                 }
                 Item::Cap(j) => {
-                    flush(&mut run, &mut out);
-                    out.push_str(&standalone[*j].2);
+                    flush(&mut run, &mut els);
+                    let (.., html) = &standalone[*j];
+                    let meta = &standalone_meta[*j];
+                    els.push(PageElement::Caption {
+                        html: html.clone(),
+                        id: meta.0.clone(),
+                        text: meta.1.clone(),
+                        is_figure: meta.2,
+                    });
                 }
             }
         }
-        flush(&mut run, &mut out);
-        if mode == Mode::Page {
-            out.push_str("\n</section>\n");
-        }
+        flush(&mut run, &mut els);
+        // Render the page's element IR to its body HTML (a pure function of `els`), then apply
+        // the page-mode `<section data-page>` framing. Section mode emits the bare content.
+        let body_inner = emit_page_elements(&els);
+        let out = if mode == Mode::Page {
+            format!("<section data-page=\"{pno}\" id=\"page-{pno}\">\n{body_inner}\n</section>\n")
+        } else {
+            body_inner
+        };
         (out, img_uris)
         })
         .collect();
