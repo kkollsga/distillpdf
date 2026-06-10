@@ -1,5 +1,5 @@
 """The agent document shell over a `.dpdf` — the CLI verbs `info / toc / read / find /
-tables / figures / ocr-status`.
+search / embed / tables / figures / ocr-status`.
 
 These are what makes a `.dpdf` *better* than HTML/Markdown for an agent (see
 docs/datamodel-design.md, "The agent CLI"): every listing emits ids that thread into the
@@ -25,6 +25,8 @@ from .dpdf import DpdfError, FindResult, Model, iter_blocks_from
 DEFAULT_MAX_CHARS = 6000
 # `find` never silently truncates; it caps the printed rows and says how many it held back.
 DEFAULT_FIND_LIMIT = 20
+# `search` returns a small ranked set by default — top-k chunks, ids thread into `read`.
+DEFAULT_SEARCH_K = 8
 
 
 def _emit_json(obj: Any) -> None:
@@ -96,6 +98,16 @@ def verb_info(model: Model, args: argparse.Namespace) -> int:
     prof = data["assets"]
     if prof:
         print("  assets: " + ", ".join(f"{k}={v}" for k, v in sorted(prof.items())))
+    emb = data.get("embeddings", {})
+    if emb.get("spaces"):
+        spaces = "; ".join(
+            f"{s['id']} ({s['model']}, {s['chunks']} chunks, dim {s['dimension']})"
+            for s in emb["spaces"]
+        )
+        stale = "  [STALE — chunks changed since embedding; re-run embed]" if emb.get("stale") else ""
+        print(f"  embeddings: {spaces}{stale}")
+    else:
+        print("  embeddings: none (run `embed` to enable semantic search)")
     return 0
 
 
@@ -267,6 +279,12 @@ def _coverage_line(res: FindResult) -> str:
 
 
 def verb_find(model: Model, args: argparse.Namespace) -> int:
+    # `find --semantic` is an alias for `search` (one implementation): the lexical scope flags
+    # don't apply to a vector query, so route straight through with the query + k + space.
+    if getattr(args, "semantic", False):
+        args.k = getattr(args, "k", None) or args.limit
+        args.space = getattr(args, "space", None)
+        return verb_search(model, args)
     pages = model.resolve_page_range(args.pages) if args.pages else None
     if args.section is not None and model.section_by_id(args.section) is None:
         close = model.closest_section_ids(args.section)
@@ -336,6 +354,81 @@ def _context_ids(model: Model, bid: str, n: int) -> list[str]:
     return [b["id"] for b in model.blocks[lo:hi] if b["id"] != bid]
 
 
+# ---- embed (compute the semantic index) -------------------------------------
+
+def verb_embed(model: Model, args: argparse.Namespace) -> int:
+    """`embed`: derive chunks, embed them with BAAI/bge-m3, and write the vectors into the
+    .dpdf as an embedding space (saving the file). Needs the optional ONNX runtime — a missing
+    dependency prints the exact install line and exits non-zero (never a silent no-op)."""
+    from .doc import Doc
+    from .embed import EmbedDependencyError
+
+    doc = Doc.from_model(model, path=args.dpdf)
+    try:
+        info = doc.embed(args.space, cache_dir=args.cache_dir, batch_size=args.batch_size)
+    except EmbedDependencyError as e:
+        print(f"distillpdf: {e}", file=sys.stderr)
+        return 1
+    except DpdfError as e:
+        print(f"distillpdf: {e}", file=sys.stderr)
+        return 1
+    if args.json:
+        _emit_json(info)
+        return 0
+    drop = (f"  (dropped stale: {', '.join(info['dropped_stale'])})" if info.get("dropped_stale") else "")
+    print(f"distillpdf: embedded {info['chunks']} chunks into space '{info['space']}' "
+          f"({info['model']}, dim {info['dimension']}, backend {info['backend']}){drop}")
+    return 0
+
+
+# ---- search (semantic) ------------------------------------------------------
+
+def verb_search(model: Model, args: argparse.Namespace) -> int:
+    """`search`: semantic search over the chunk embeddings. Ranks chunks by cosine similarity to
+    the query and prints the top-k with ids that thread into `read`. Honest coverage: a header
+    line stating how many chunks (and the model) were searched; an actionable error when no
+    space exists or the runtime is missing; a staleness warning when the chunking has drifted."""
+    from .doc import Doc
+    from .embed import EmbedDependencyError
+
+    doc = Doc.from_model(model, path=args.dpdf)
+    try:
+        res = doc.search(args.query, k=args.k, space=args.space)
+    except EmbedDependencyError as e:
+        print(f"distillpdf: {e}", file=sys.stderr)
+        return 1
+    except DpdfError as e:
+        print(f"distillpdf: {e}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        _emit_json({
+            "query": res.query, "space": res.space, "model": res.model,
+            "searched_chunks": res.searched, "stale": res.stale, "hits": res.hits,
+        })
+        return 0
+
+    print(f"semantic search over {res.searched} chunks (model {res.model}, space {res.space})")
+    if res.stale:
+        print("  WARNING: this space is STALE — the document's blocks changed since embedding; "
+              "scores may be off. Refresh with `embed`.")
+    if not res.hits:
+        print(f"no chunks for {args.query!r}")
+        return 0
+    for h in res.hits:
+        sec = h["section"] or "—"
+        ps, pe = h["page_start"], h["page_end"]
+        span = f"p{ps}" if ps == pe else f"p{ps}-{pe}"
+        snippet = h["snippet"].replace("\n", " ")
+        if len(snippet) > 100:
+            snippet = snippet[:99] + "…"
+        bids = " ".join(h["block_ids"])
+        print(f"{h['chunk_id']}  score={h['score']:.4f}  [{sec}]  {span}")
+        print(f"    {snippet}")
+        print(f"    blocks: {bids}")
+    return 0
+
+
 # ---- ocr-status -------------------------------------------------------------
 
 def verb_ocr_status(model: Model, args: argparse.Namespace) -> int:
@@ -383,6 +476,8 @@ VERBS = {
     "toc": verb_toc,
     "read": verb_read,
     "find": verb_find,
+    "search": verb_search,
+    "embed": verb_embed,
     "tables": verb_tables,
     "figures": verb_figures,
     "ocr-status": verb_ocr_status,
@@ -424,7 +519,26 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="also list N neighbouring block ids per hit")
     fd.add_argument("--limit", type=int, default=DEFAULT_FIND_LIMIT,
                     help=f"max matches to print (default {DEFAULT_FIND_LIMIT}); never silent")
+    fd.add_argument("--semantic", action="store_true",
+                    help="semantic (embedding) search instead of lexical — alias for `search`")
+    fd.add_argument("--space", metavar="ID", help="(with --semantic) embedding space id (default: first)")
     add_json(fd)
+
+    sr = sub.add_parser("search", help="semantic search over the chunk embeddings (needs `embed` first)")
+    sr.add_argument("query", help="natural-language query")
+    sr.add_argument("--k", type=int, default=DEFAULT_SEARCH_K,
+                    help=f"how many chunks to return (default {DEFAULT_SEARCH_K})")
+    sr.add_argument("--space", metavar="ID", help="embedding space id (default: the first)")
+    add_json(sr)
+
+    em = sub.add_parser("embed", help="compute the semantic index (chunk + embed with BAAI/bge-m3)")
+    em.add_argument("--space", default="e1", metavar="ID", help="embedding space id to write (default: e1)")
+    em.add_argument("--cache-dir", dest="cache_dir", metavar="DIR",
+                    help="where the bge-m3 weights are cached (default: ~/.cache/fastembed or "
+                    "FASTEMBED_CACHE_PATH; HF_HOME also honoured)")
+    em.add_argument("--batch-size", dest="batch_size", type=int, default=32,
+                    help="chunks per embedding batch (default 32)")
+    add_json(em)
     return p
 
 

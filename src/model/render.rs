@@ -356,6 +356,8 @@ mod tests {
             blocks,
             indexes: Indexes { coverage: Coverage::default(), ..Default::default() },
             assets: Vec::new(),
+            chunks: None,
+            embedding_spaces: Vec::new(),
             links: Vec::new(),
             named_dests: Vec::new(),
             toc: Vec::new(),

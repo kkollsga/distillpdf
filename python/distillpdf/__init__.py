@@ -5,9 +5,11 @@ from ._distillpdf import (
     from_bytes as _from_bytes_raw,
     load_model,
     open as _open_raw,
+    read_dpdf_member,
     render_html,
     render_markdown,
     render_text,
+    save_dpdf,
 )
 from . import ocr
 from .doc import Doc
@@ -44,6 +46,8 @@ __all__ = [
     "from_bytes",
     "load",
     "load_model",
+    "save_dpdf",
+    "read_dpdf_member",
     "render_html",
     "render_markdown",
     "render_text",

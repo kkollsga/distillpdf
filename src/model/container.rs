@@ -60,13 +60,32 @@ pub(crate) fn to_canonical_json(model: &DocModel) -> Result<Vec<u8>, String> {
 /// Save a model to a `.dpdf` file at `path`. `assets` supplies the bytes for any
 /// `embedded`/`external` asset; `external_dir`, when given, is where `external` assets are
 /// written (defaults to a sibling `<stem>_assets/` next to the `.dpdf`). Returns the written
-/// path.
+/// path. Convenience wrapper over [`save_with_members`] with no extra members.
 pub(crate) fn save(model: &DocModel, path: &Path, assets: &AssetBytes, external_dir: Option<&Path>) -> Result<(), String> {
+    save_with_members(model, path, assets, &AssetBytes::new(), external_dir)
+}
+
+/// Save a model PLUS arbitrary verbatim container members (e.g. `embeddings/<id>.bin` vector
+/// matrices). `extra_members` are written into the zip byte-for-byte alongside `model.json` and
+/// the embedded asset bytes — they are ARTIFACTS the model references but does not derive, so
+/// the container carries them losslessly and save→load→save stays byte-identical. Member names
+/// must not collide with `model.json` or any embedded asset id.
+pub(crate) fn save_with_members(
+    model: &DocModel,
+    path: &Path,
+    assets: &AssetBytes,
+    extra_members: &AssetBytes,
+    external_dir: Option<&Path>,
+) -> Result<(), String> {
     // Index-coverage guard (honest-coverage north star): the stored indexes must equal a fresh
     // derive (no drift) AND every block must be reachable from the page index and from a
     // section or the explicit unsectioned bucket. A violation is a typed save error, never a
     // silently-shipped coverage hole. Cheap (a re-derive + set compares).
     super::validate_indexes(model)?;
+    // Embedding-space guard: every declared space must have its member present in
+    // `extra_members`, of the exact expected byte length (rows × dim × 4). A space whose vectors
+    // are missing or the wrong size is a typed save error, never a silently-shipped half-record.
+    validate_embeddings(model, extra_members)?;
     let json = to_canonical_json(model)?;
 
     // Partition assets by storage mode (the model's asset table is authoritative).
@@ -96,13 +115,39 @@ pub(crate) fn save(model: &DocModel, path: &Path, assets: &AssetBytes, external_
             AssetStorage::Dropped => {} // stub-only, no bytes
         }
     }
-    // Deterministic entry order: model.json first, then embedded assets by id.
-    embedded.sort_by(|a, b| a.0.cmp(b.0));
+    // Deterministic entry order: model.json first, then every other member (embedded assets +
+    // extra members such as embedding bins) sorted by name. Sorting the merged set keeps the
+    // archive byte-stable regardless of whether a member is an asset or an artifact.
+    let mut rest: Vec<(&str, &[u8])> = embedded;
+    for (name, bytes) in extra_members {
+        rest.push((name.as_str(), bytes.as_slice()));
+    }
+    rest.sort_by(|a, b| a.0.cmp(b.0));
     let mut entries: Vec<(&str, &[u8])> = vec![(MODEL_JSON, json.as_slice())];
-    entries.extend(embedded);
+    entries.extend(rest);
 
     let zip = write_store_zip(&entries);
     std::fs::write(path, zip).map_err(|e| format!("write {path:?}: {e}"))?;
+    Ok(())
+}
+
+/// Validate that every declared [`EmbeddingSpace`] has its vector member present and correctly
+/// sized: the member bytes must be exactly `chunk_ids.len() * dimension * 4` (little-endian
+/// f32, row-major). A missing or mis-sized member is a typed save error — the honest-coverage
+/// rule applied to vectors: a space is fully present or it is not written.
+fn validate_embeddings(model: &DocModel, members: &AssetBytes) -> Result<(), String> {
+    for sp in &model.embedding_spaces {
+        let bytes = members.get(&sp.member).ok_or_else(|| {
+            format!("embedding space {:?}: member {:?} not provided", sp.id, sp.member)
+        })?;
+        let expected = sp.chunk_ids.len() * sp.dimension as usize * 4;
+        if bytes.len() != expected {
+            return Err(format!(
+                "embedding space {:?}: member {:?} is {} bytes, expected {} ({} chunks × {} dim × 4)",
+                sp.id, sp.member, bytes.len(), expected, sp.chunk_ids.len(), sp.dimension
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -296,6 +341,8 @@ mod tests {
             blocks,
             indexes,
             assets: Vec::new(),
+            chunks: None,
+            embedding_spaces: Vec::new(),
             links: Vec::new(),
             named_dests: Vec::new(),
             toc: Vec::new(),
@@ -400,6 +447,78 @@ mod tests {
         // reindex repairs it; save then succeeds and validates clean.
         super::super::reindex(&mut model);
         save(&model, &path, &AssetBytes::new(), None).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn f32_le_bytes(rows: &[Vec<f32>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for row in rows {
+            for &v in row {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn embedding_member_round_trips_and_stays_byte_identical() {
+        // A model with one embedding space + its f32 matrix as a verbatim container member must
+        // round-trip AND keep save→load→save byte-identity (the artifact-carry invariant).
+        let mut model = tiny_model();
+        let vectors = vec![vec![0.1f32, 0.2, 0.3, 0.4]];
+        let member = "embeddings/e1.bin".to_string();
+        model.embedding_spaces.push(EmbeddingSpace {
+            id: "e1".into(),
+            model: "BAAI/bge-m3".into(),
+            dimension: 4,
+            normalized: true,
+            member: member.clone(),
+            chunk_ids: vec!["c0001".into()],
+            generated_at: "2026-06-10T00:00:00Z".into(),
+            distillpdf_version: "0.0.0".into(),
+        });
+        let mut extras = AssetBytes::new();
+        extras.insert(member.clone(), f32_le_bytes(&vectors));
+        let dir = std::env::temp_dir().join(format!("dpdf_emb_space_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.dpdf");
+        save_with_members(&model, &path, &AssetBytes::new(), &extras, None).unwrap();
+        let first = std::fs::read(&path).unwrap();
+        let (loaded, members) = load(&path).unwrap();
+        assert_eq!(loaded.embedding_spaces[0].member, member);
+        assert_eq!(members.get(&member).unwrap(), &f32_le_bytes(&vectors));
+        // The space-carrying load splits members from assets at the Python boundary; here we
+        // confirm a re-save with the same members is byte-identical.
+        save_with_members(&loaded, &path, &AssetBytes::new(), &members, None).unwrap();
+        let second = std::fs::read(&path).unwrap();
+        assert_eq!(first, second, "save→load→save with embeddings must be byte-identical");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_rejects_missing_or_missized_embedding_member() {
+        let mut model = tiny_model();
+        model.embedding_spaces.push(EmbeddingSpace {
+            id: "e1".into(),
+            model: "BAAI/bge-m3".into(),
+            dimension: 4,
+            normalized: true,
+            member: "embeddings/e1.bin".into(),
+            chunk_ids: vec!["c0001".into()],
+            generated_at: "t".into(),
+            distillpdf_version: "0".into(),
+        });
+        let dir = std::env::temp_dir().join(format!("dpdf_emb_bad_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.dpdf");
+        // Missing member: loud error.
+        let err = save_with_members(&model, &path, &AssetBytes::new(), &AssetBytes::new(), None).unwrap_err();
+        assert!(err.contains("not provided"), "expected missing-member error, got {err:?}");
+        // Wrong size (3 floats, expected 4): loud error.
+        let mut extras = AssetBytes::new();
+        extras.insert("embeddings/e1.bin".into(), f32_le_bytes(&[vec![0.0, 0.0, 0.0]]));
+        let err = save_with_members(&model, &path, &AssetBytes::new(), &extras, None).unwrap_err();
+        assert!(err.contains("expected"), "expected size-mismatch error, got {err:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

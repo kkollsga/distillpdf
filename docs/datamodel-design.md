@@ -134,9 +134,52 @@ existing `image_mode="embed"` for the self-contained case.
     "regen": {"page": 13, "dpi": 300}   // how to rebuild it from the source PDF
   }],
 
+  // ---- chunks: DERIVED, like indexes — no text duplication ----
+  "chunks": {
+    "policy": "sec-contig-v1:tgt400",   // the regeneration recipe (chars/4 ≈ token target)
+    "items": [{"id": "c0001", "block_ids": ["b0001", "b0042"],
+               "section": "sec-1-introduction", "page_start": 1, "page_end": 4}]
+  },
+
+  // ---- embedding spaces: ARTIFACT metadata; vectors live as a binary member ----
+  "embedding_spaces": [{
+    "id": "e1", "model": "BAAI/bge-m3", "dimension": 1024, "normalized": true,
+    "member": "embeddings/e1.bin",      // little-endian f32, row-major, n_chunks × dim
+    "chunk_ids": ["c0001", "c0002"],    // row order — AND the staleness key
+    "generated_at": "…", "distillpdf_version": "0.0.33"
+  }],
+
   "links": [...], "named_dests": [...], "toc": [...]
 }
 ```
+
+The container is then `model.json` + `img/…` assets + `embeddings/<id>.bin` vector matrices —
+all STORE-only, deterministically ordered, so save→load→save stays byte-identical with
+embeddings present.
+
+### Embeddings & chunks (semantic search)
+
+Semantic search is opt-in and self-contained — no corpus, no server, no source PDF:
+
+- **Chunks are DERIVED, exactly like the indexes.** `derive_chunks(blocks)` groups consecutive
+  blocks *within one section* toward a ~400-token target (a cheap `chars/4` proxy — the
+  tokenizer is **not** loaded to chunk), never splitting a block; an oversize block is its own
+  chunk. A chunk stores only addresses (`block_ids`) + spans, **never text** — the chunk text is
+  recomposed from the blocks (inline markup stripped) at embed/search time. The `policy` string
+  makes the derivation reproducible, so a stored set can be diff'd against a fresh derive to
+  detect drift.
+- **Vectors are an ARTIFACT, not a derivation.** They are BAAI/bge-m3 embeddings (1024-dim,
+  L2-normalized) stored as a raw little-endian f32 matrix in a container member
+  (`embeddings/<id>.bin`), `n_chunks × dim`, rows in the order of the space's `chunk_ids`. The
+  bytes ride verbatim through save/load (like asset bytes); `embedding_spaces[]` records what
+  they are. Multiple spaces may coexist (re-embed with a different model); a typical file has
+  one. distillpdf uses kglite's own bge-m3 embedder when it's installed (identical vectors,
+  zero duplication) and a faithful vendored twin of it otherwise.
+- **Staleness is loud, never silent.** A space's `chunk_ids` are the staleness key: if the
+  blocks change (re-distill, an OCR pass switch), a fresh chunk derive no longer matches and the
+  space is **stale** — `info` flags it, `search` warns, and re-embedding **drops** the stale
+  space rather than silently keeping out-of-date vectors. A space is also written all-or-nothing
+  (full matrix or no space), so a mid-batch embed failure leaves the file untouched.
 
 ### Multiple OCR passes (append-only, comparable)
 

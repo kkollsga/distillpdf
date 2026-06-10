@@ -130,6 +130,8 @@ pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: 
         blocks,
         indexes,
         assets,
+        chunks: None,
+        embedding_spaces: Vec::new(),
         links,
         named_dests,
         toc,

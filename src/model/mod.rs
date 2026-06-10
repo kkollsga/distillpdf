@@ -104,12 +104,64 @@ pub(crate) struct DocModel {
     pub indexes: Indexes,
     #[serde(default)]
     pub assets: Vec<Asset>,
+    /// DERIVED chunks (consecutive same-section blocks grouped to a token target) — like
+    /// [`Indexes`], regenerable from blocks via the Python deriver; carried here so the JSON is
+    /// self-describing and so embedding spaces can reference chunk ids. `None` = not yet derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunks: Option<Chunks>,
+    /// Embedding spaces: ARTIFACT metadata (model, dimension, chunk-id order) for the binary
+    /// vectors stored as `embeddings/<id>.bin` container members. The bytes ride verbatim through
+    /// save/load (like asset bytes); this records what they are. Empty for an un-embedded model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub embedding_spaces: Vec<EmbeddingSpace>,
     #[serde(default)]
     pub links: Vec<Link>,
     #[serde(default)]
     pub named_dests: Vec<NamedDest>,
     #[serde(default)]
     pub toc: Vec<TocEntry>,
+}
+
+/// DERIVED chunks over `blocks`: consecutive blocks within one section grouped toward a token
+/// target (a cheap chars/4 proxy — the tokenizer is NOT loaded to chunk). `policy` is the
+/// regeneration recipe string (e.g. `"sec-contig-v1:tgt400"`) so the chunking is reproducible
+/// and a drift check can compare a fresh derive. Text is NOT duplicated — a chunk references its
+/// `block_ids`; chunk text is recomposed from the blocks at embed/search time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct Chunks {
+    /// The chunking-policy recipe string; a fresh derive under the same policy must match.
+    pub policy: String,
+    pub items: Vec<Chunk>,
+}
+
+/// One chunk: a contiguous run of blocks in one section (or unsectioned), addressed by a `c0001`
+/// id. Carries only addresses + spans — never block text (no duplication).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct Chunk {
+    pub id: String,
+    pub block_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    pub page_start: u32,
+    pub page_end: u32,
+}
+
+/// An embedding space: the metadata for one set of vectors (one model, one chunk order). The
+/// vectors live in the container member named by `member` as little-endian f32, row-major,
+/// `len(chunk_ids)` rows × `dimension` cols, rows in `chunk_ids` order. Multiple spaces may
+/// coexist (re-embed with a different model); a typical file has one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct EmbeddingSpace {
+    pub id: String,
+    pub model: String,
+    pub dimension: u32,
+    pub normalized: bool,
+    /// Container member holding the f32 matrix, e.g. `"embeddings/e1.bin"`.
+    pub member: String,
+    /// Chunk ids in row order — also the staleness key (must equal the current chunk ids).
+    pub chunk_ids: Vec<String>,
+    pub generated_at: String,
+    pub distillpdf_version: String,
 }
 
 /// Binds the model to its source PDF (by hash) and records the extractor version + the one

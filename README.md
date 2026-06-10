@@ -194,6 +194,11 @@ hits = doc.find("indemnification")                 # lexical search…
 print(len(hits.hits), "in", hits.searched_blocks, "blocks;",
       len(hits.no_text_pages), "pages had no text")  # …with HONEST coverage, never a silent miss
 
+doc.embed()                                        # build the semantic index (BAAI/bge-m3 vectors)
+res = doc.search("limits on the seller's liability")  # semantic search over chunks…
+for h in res.hits[:3]:
+    print(h["chunk_id"], round(h["score"], 3), h["section"], h["block_ids"])  # ids thread into read
+
 doc.to_markdown("case.md")                         # fidelity re-render from the model (byte-identical
 doc.to_html("case.html")                           #   to to_markdown/to_html on the original PDF)
 ```
@@ -217,7 +222,24 @@ prev: sec-introduction · next: sec-results · parent: —
 $ distillpdf case.dpdf find "fls. 249" --pages xii-xv   # scoped lexical search
 b0421  [sec-methods]  p13 (fls. 249)  …matched «fls. 249» phrase…
 searched 318 blocks across 4 pages
+$ distillpdf case.dpdf embed                  # build the semantic index (BAAI/bge-m3)
+distillpdf: embedded 612 chunks into space 'e1' (BAAI/bge-m3, dim 1024, backend vendored)
+$ distillpdf case.dpdf search "limits on liability"     # semantic search; ids thread into read
+semantic search over 612 chunks (model BAAI/bge-m3, space e1)
+c0207  score=0.7193  [sec-indemnification]  p41-42
+    Neither party's aggregate liability shall exceed the fees paid in the twelve months…
+    blocks: b1180 b1181 b1182
 ```
+
+Semantic search is **opt-in** and self-contained: `embed` chunks the document (consecutive
+same-section blocks, ~400 tokens each — *derived* from blocks, like the indexes, so no text is
+duplicated) and stores BAAI/bge-m3 vectors **inside the `.dpdf`** as a binary member; `search`
+ranks chunks by cosine similarity. The vectors are byte-identical to what kglite's bge-m3 stack
+produces (distillpdf uses kglite's embedder directly when installed, else a faithful vendored
+twin of it). The embedding runtime is an **optional dependency** (`pip install onnxruntime
+tokenizers huggingface_hub`) — a missing one yields the exact install line, never a silent
+miss; `find --semantic` is an alias for `search`. If the document's blocks change (re-distill),
+a stale space is dropped loudly and `info` flags it.
 
 **Asset profiles** make the size/sharing trade-off an explicit choice, never a surprise:
 `distill(assets="figures")` (the default) embeds figure images; `assets="none"` keeps text +

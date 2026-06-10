@@ -23,6 +23,7 @@ Two markdown views, named honestly (same split the CLI documents):
 """
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Optional
 
@@ -229,6 +230,150 @@ class Doc:
             )
         return res
 
+    # -- embeddings (semantic search) ----------------------------------------
+    def embed(self, space_id: str = "e1", *, cache_dir: Optional[str] = None,
+              batch_size: int = 32, progress: bool = True) -> dict[str, Any]:
+        """Derive chunks (if needed), embed every chunk's text with BAAI/bge-m3, and write the
+        vectors into this ``.dpdf`` as embedding space ``space_id`` — then SAVE the file. The
+        document must have been loaded from disk (it needs ``self._path`` to write back).
+
+        Atomic: vectors are computed in full before anything is written, so a mid-batch failure
+        leaves the file untouched (full space or no space — no half-record). Re-embedding an
+        existing ``space_id`` overwrites it. A stale space (chunks changed since a prior embed)
+        is dropped here as the chunks are re-derived. Returns ``{space, model, chunks, dimension,
+        backend}``. Raises :class:`~distillpdf.embed.EmbedDependencyError` (with the install
+        line) when the ONNX runtime is missing."""
+        import sys
+
+        from . import embed as _emb
+        from . import save_dpdf
+
+        path = self._require_path("embed")
+        m = self._model
+        # Chunks are derived fresh — this is the single regeneration point, so the space's
+        # chunk_ids always match the current blocks (no stale-on-write).
+        chunks = m.derive_chunks()
+        items = chunks["items"]
+        if not items:
+            raise DpdfError("no chunks to embed (the document has no text blocks)")
+        texts = [m.chunk_text(c) for c in items]
+        chunk_ids = [c["id"] for c in items]
+
+        embedder = _emb.make_embedder(cache_dir=cache_dir)
+        if progress and sys.stderr.isatty():
+            print(f"distillpdf: embedding {len(texts)} chunks with {_emb.MODEL_ID} "
+                  f"[{_emb.backend_name()}]…", file=sys.stderr)
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), batch_size):
+            batch = texts[start:start + batch_size]
+            vectors.extend(_emb.embed_normalized(embedder, batch))
+            if progress and sys.stderr.isatty():
+                print(f"  {min(start + batch_size, len(texts))}/{len(texts)}", file=sys.stderr)
+        try:
+            embedder.release()
+        except Exception:  # pragma: no cover - release is best-effort
+            pass
+
+        # Build the new model dict: store the derived chunks + the space metadata, drop any
+        # other now-stale space whose chunk_ids no longer match (loud, via the save info).
+        from . import __version__
+        member = f"embeddings/{space_id}.bin"
+        space = {
+            "id": space_id, "model": _emb.MODEL_ID, "dimension": _emb.DIMENSION,
+            "normalized": True, "member": member, "chunk_ids": chunk_ids,
+            "generated_at": _iso_now(), "distillpdf_version": __version__,
+        }
+        data = dict(m.raw)
+        data["chunks"] = chunks
+        spaces = [s for s in m.embedding_spaces if s.get("id") != space_id]
+        dropped = [s["id"] for s in spaces if s.get("chunk_ids") != chunk_ids]
+        spaces = [s for s in spaces if s.get("chunk_ids") == chunk_ids]
+        spaces.append(space)
+        data["embedding_spaces"] = spaces
+
+        members = {member: _emb.pack_vectors(vectors, _emb.DIMENSION)}
+        save_dpdf(path, path, json.dumps(data), members)
+        # Refresh the in-memory model so a subsequent search() sees the new space.
+        self._model = Model.from_dict(data)
+        if dropped:
+            print(f"distillpdf: dropped {len(dropped)} stale embedding space(s) "
+                  f"({', '.join(dropped)}) — their chunks no longer match the document",
+                  file=sys.stderr)
+        return {"space": space_id, "model": _emb.MODEL_ID, "chunks": len(items),
+                "dimension": _emb.DIMENSION, "backend": _emb.backend_name(),
+                "dropped_stale": dropped}
+
+    def search(self, query: str, *, k: int = 8, space: Optional[str] = None) -> "SearchResult":
+        """Semantic search: embed ``query`` with the same model and rank this document's chunks
+        by cosine similarity, returning the top ``k`` as a :class:`SearchResult` (chunks expanded
+        to id, score, section, pages, a text snippet, and the chunk's block ids — the ids thread
+        into ``read``).
+
+        Honest coverage: the result carries the number of chunks searched and the model, and
+        ``stale`` is True when the document's blocks changed since this space was embedded (the
+        scores then reflect an out-of-date chunking — refresh with :meth:`embed`). Raises
+        :class:`~distillpdf.dpdf.DpdfError` (pointing at :meth:`embed`) when no embedding space
+        exists, and :class:`~distillpdf.embed.EmbedDependencyError` when the runtime is missing.
+        """
+        from . import embed as _emb
+        from . import read_dpdf_member
+
+        m = self._model
+        spaces = m.embedding_spaces
+        if not spaces:
+            raise DpdfError(
+                "no embedding space in this .dpdf — run `distillpdf <file>.dpdf embed` (or "
+                "Doc.embed()) first to enable semantic search."
+                + ("" if _emb.runtime_available() else "\n\n" + _emb.install_help()))
+        sp = m.space_by_id(space) if space else spaces[0]
+        if sp is None:
+            ids = ", ".join(s["id"] for s in spaces)
+            raise DpdfError(f"unknown embedding space {space!r}; available: {ids}")
+
+        path = self._require_path("search")
+        raw = read_dpdf_member(path, sp["member"])
+        if raw is None:
+            raise DpdfError(f"embedding space {sp['id']!r} references member {sp['member']!r}, "
+                            "but it is missing from the container (corrupt .dpdf)")
+        matrix = _emb.unpack_vectors(raw, int(sp["dimension"]))
+        space_chunk_ids = sp.get("chunk_ids", [])
+        # Map the space's chunk ids back to the chunk records. The space stored its own ids; we
+        # re-derive chunks to resolve them to block_ids/section/pages and to detect staleness.
+        derived = {c["id"]: c for c in m.derive_chunks()["items"]}
+        stale = m.chunks_stale()
+
+        embedder = _emb.make_embedder()
+        qvec = _emb.embed_normalized(embedder, [query])[0]
+        try:
+            embedder.release()
+        except Exception:  # pragma: no cover
+            pass
+        ranked = _emb.cosine_topk(qvec, matrix, k)
+
+        hits: list[dict[str, Any]] = []
+        for row, score in ranked:
+            if row >= len(space_chunk_ids):
+                continue
+            cid = space_chunk_ids[row]
+            chunk = derived.get(cid)
+            if chunk is None:
+                # The space references a chunk id that no longer derives (blocks changed) — skip
+                # it but surface via `stale`; we still recompose what we can from block ids.
+                continue
+            page_start, page_end = chunk.get("page_start"), chunk.get("page_end")
+            snippet = m.chunk_text(chunk)
+            hits.append({
+                "chunk_id": cid, "score": round(float(score), 6),
+                "section": chunk.get("section"),
+                "page_start": page_start, "page_end": page_end,
+                "page_label_start": m.page_label(page_start) if page_start else None,
+                "page_label_end": m.page_label(page_end) if page_end else None,
+                "block_ids": chunk.get("block_ids", []),
+                "snippet": snippet,
+            })
+        return SearchResult(query=query, hits=hits, space=sp["id"], model=sp["model"],
+                            searched=len(matrix), stale=stale)
+
     # -- info ----------------------------------------------------------------
     def info(self) -> dict[str, Any]:
         """A compact roll-up of the model — the ``info`` CLI verb as data: source binding,
@@ -256,6 +401,23 @@ class Doc:
             "ocr": _ocr_state_summary(m),
             "assets": _asset_profile(m),
             "coverage": m.indexes.get("coverage", {}),
+            "embeddings": self._embeddings_summary(),
+        }
+
+    def _embeddings_summary(self) -> dict[str, Any]:
+        """Embedding state for `info`: per-space model + chunk count, and whether the chunking
+        has drifted from blocks since embedding (stale → re-embed)."""
+        m = self._model
+        spaces = m.embedding_spaces
+        chunks = m.chunks
+        return {
+            "spaces": [
+                {"id": s.get("id"), "model": s.get("model"),
+                 "dimension": s.get("dimension"), "chunks": len(s.get("chunk_ids", []))}
+                for s in spaces
+            ],
+            "chunks": len(chunks["items"]) if chunks else 0,
+            "stale": (m.chunks_stale() if spaces else False),
         }
 
     # -- OCR -----------------------------------------------------------------
@@ -345,3 +507,30 @@ class Doc:
         :meth:`distillpdf.Pdf.extract_text`."""
         from . import render_text
         return render_text(self._require_path("text"))
+
+
+def _iso_now() -> str:
+    """An ISO-8601 UTC timestamp for an embedding space's ``generated_at`` (the one timestamp a
+    space carries; the model body stays deterministic)."""
+    import datetime
+
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class SearchResult:
+    """The result of :meth:`Doc.search` — the ranked chunk hits plus the honest-coverage
+    accounting: how many chunks were searched, which space/model, and whether the space is stale
+    (its chunking drifted from the current blocks). Each hit is a dict
+    (``chunk_id``/``score``/``section``/``page_start``/``page_end``/``block_ids``/``snippet``);
+    the ids thread into ``read``."""
+
+    __slots__ = ("query", "hits", "space", "model", "searched", "stale")
+
+    def __init__(self, query: str, hits: list[dict[str, Any]], space: str, model: str,
+                 searched: int, stale: bool):
+        self.query = query
+        self.hits = hits
+        self.space = space
+        self.model = model
+        self.searched = searched
+        self.stale = stale

@@ -667,6 +667,58 @@ fn load_model(path: &str) -> PyResult<String> {
     String::from_utf8(bytes).map_err(|e| PyValueError::new_err(format!("model json not utf-8: {e}")))
 }
 
+/// Re-save a `.dpdf` from `src_path` to `dst_path` with a NEW `model.json` and additional
+/// verbatim binary members (e.g. `embeddings/<id>.bin` vector matrices). The original
+/// container's members (img/ assets AND any pre-existing embedding bins) are carried byte-for-
+/// byte; `extra_members` (name → bytes) are written/overwritten on top. This is the durable
+/// write path the Python `Doc.embed` uses to add an embedding space without a source PDF: it
+/// re-validates indexes + embedding spaces, so a half-record is a loud error, and keeps the
+/// archive deterministic (sorted members, zeroed timestamps) so save→load→save is byte-stable
+/// WITH embeddings present. `src_path == dst_path` is supported (read fully, then overwrite).
+#[pyfunction]
+#[pyo3(signature = (src_path, dst_path, model_json, extra_members))]
+fn save_dpdf(
+    src_path: &str,
+    dst_path: &str,
+    model_json: &str,
+    extra_members: std::collections::BTreeMap<String, Vec<u8>>,
+) -> PyResult<()> {
+    let (_old_model, carried) =
+        model::container::load(std::path::Path::new(src_path)).map_err(PyValueError::new_err)?;
+    let model: model::DocModel =
+        serde_json::from_str(model_json).map_err(|e| PyValueError::new_err(format!("parse model_json: {e}")))?;
+    // The carried members are everything that was in the old container except model.json (the
+    // loader already strips it). Split them: embedded ASSET bytes (referenced by model.assets)
+    // ride via the asset map; everything else (embedding bins, etc.) is an extra member. The
+    // new extra_members overwrite any same-named carried member (re-embedding a space).
+    let asset_ids: std::collections::BTreeSet<&str> =
+        model.assets.iter().map(|a| a.id.as_str()).collect();
+    let mut assets = model::container::AssetBytes::new();
+    let mut extras = model::container::AssetBytes::new();
+    for (name, bytes) in carried {
+        if asset_ids.contains(name.as_str()) {
+            assets.insert(name, bytes);
+        } else {
+            extras.insert(name, bytes);
+        }
+    }
+    for (name, bytes) in extra_members {
+        extras.insert(name, bytes);
+    }
+    model::container::save_with_members(&model, std::path::Path::new(dst_path), &assets, &extras, None)
+        .map_err(PyValueError::new_err)
+}
+
+/// Read the raw bytes of a single container member (e.g. an `embeddings/<id>.bin` vector
+/// matrix) from a `.dpdf`, or `None` if the member isn't present. Lets the Python search path
+/// pull a space's f32 matrix without re-implementing the zip reader.
+#[pyfunction]
+fn read_dpdf_member(path: &str, member: &str) -> PyResult<Option<Vec<u8>>> {
+    let (_model, members) =
+        model::container::load(std::path::Path::new(path)).map_err(PyValueError::new_err)?;
+    Ok(members.get(member).cloned())
+}
+
 /// Render a loaded `.dpdf` model to HTML, with NO source PDF present — the model-only
 /// re-render (the proof that renderers are pure functions of the model). `mode`
 /// (`"section"` default / `"page"`) and `toc` match `to_html`. The Wave-1/2 born-digital
@@ -880,6 +932,8 @@ fn _distillpdf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(from_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(load_model, m)?)?;
+    m.add_function(wrap_pyfunction!(save_dpdf, m)?)?;
+    m.add_function(wrap_pyfunction!(read_dpdf_member, m)?)?;
     m.add_function(wrap_pyfunction!(render_html, m)?)?;
     m.add_function(wrap_pyfunction!(render_markdown, m)?)?;
     m.add_function(wrap_pyfunction!(render_text, m)?)?;

@@ -21,8 +21,8 @@
 
 A `.dpdf` OUTPUT path distills the durable model (distillpdf.Pdf.distill) instead of
 converting. When the INPUT is a distilled `.dpdf` model rather than a source PDF, the document-shell
-verbs apply instead — `info / toc / read / find / tables / figures / ocr-status` (see
-distillpdf.shell). The convert behaviour above is unchanged for PDFs.
+verbs apply instead — `info / toc / read / find / search / embed / tables / figures / ocr-status`
+(see distillpdf.shell). The convert behaviour above is unchanged for PDFs.
 """
 import argparse
 import os

@@ -44,6 +44,76 @@ def _plain(text: str) -> str:
     return s
 
 
+# ---- chunking (DERIVED, like indexes; no text duplication) ------------------
+#
+# Chunks group consecutive blocks WITHIN ONE SECTION toward a token target, so a semantic
+# search hit lands on a coherent passage rather than a bare sentence. They are DERIVED from
+# blocks (regenerable, like the indexes) — a chunk stores only block-id addresses + spans, never
+# text; the text is recomposed from the blocks at embed/search time. The policy string makes the
+# derivation reproducible and lets a staleness check confirm a stored set still matches blocks.
+
+#: Target chunk size in the cheap token proxy (chars/4). ~400 tokens ≈ a paragraph or two —
+#: enough context for a dense retriever without diluting the vector.
+CHUNK_TARGET_TOKENS = 400
+#: The chunking-policy recipe string stored in the model so chunks are regenerable + checkable.
+CHUNK_POLICY = "sec-contig-v1:tgt400"
+
+
+def _token_proxy(text: str) -> int:
+    """A cheap token count: chars / 4. Deliberately NOT the real tokenizer — chunking must be
+    derivable without loading a 2 GB model. Good enough to bound chunk size; the exact token
+    count only matters at embed time, where the tokenizer truncates to 8192 anyway."""
+    return max(1, len(text) // 4)
+
+
+def _chunk_block_text(b: dict[str, Any]) -> str:
+    """The plain text a block contributes to a chunk — its searchable text (prose + flattened
+    table cells + caption), inline markup stripped. Mirrors `_block_search_text` so chunk text
+    and `find` see the same content."""
+    return _block_search_text(b).strip()
+
+
+def derive_chunks(blocks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Group ``blocks`` into chunks: a contiguous run within one section accumulates until it
+    reaches ~``CHUNK_TARGET_TOKENS`` (chars/4 proxy), then a new chunk starts. A section boundary
+    always starts a new chunk (section purity), and a single block larger than the target is its
+    own chunk (a block is never split). Returns ``{"policy", "items"}`` where each item is
+    ``{id, block_ids, section, page_start, page_end}`` — addresses + spans only, no text.
+
+    Deterministic and regenerable: same blocks → same chunks, so a stored set can be diff'd
+    against a fresh derive to detect drift (the staleness signal)."""
+    items: list[dict[str, Any]] = []
+    cur: list[dict[str, Any]] = []
+    cur_tokens = 0
+    cur_section: Any = None
+
+    def flush() -> None:
+        if not cur:
+            return
+        pages = [b.get("page") for b in cur if b.get("page") is not None]
+        items.append({
+            "id": f"c{len(items) + 1:04d}",
+            "block_ids": [b["id"] for b in cur],
+            "section": cur[0].get("section"),
+            "page_start": min(pages) if pages else 0,
+            "page_end": max(pages) if pages else 0,
+        })
+
+    for b in blocks:
+        sec = b.get("section")
+        tok = _token_proxy(_chunk_block_text(b))
+        # Start a new chunk on a section change, or when adding this block would overflow the
+        # target (but never split: a lone oversize block still forms its own chunk).
+        if cur and (sec != cur_section or cur_tokens + tok > CHUNK_TARGET_TOKENS):
+            flush()
+            cur, cur_tokens = [], 0
+        cur.append(b)
+        cur_tokens += tok
+        cur_section = sec
+    flush()
+    return {"policy": CHUNK_POLICY, "items": items}
+
+
 class DpdfError(ValueError):
     """A `.dpdf` could not be read as a model (not a container, wrong shape, …)."""
 
@@ -84,6 +154,12 @@ class Model:
 
     # -- top-level accessors -------------------------------------------------
     @property
+    def raw(self) -> dict[str, Any]:
+        """The underlying parsed model dict — for the write path (``Doc.embed`` builds the next
+        model.json from a shallow copy of this). Treat as read-only."""
+        return self._d
+
+    @property
     def schema_version(self) -> int:
         return int(self._d.get("schema_version", 0))
 
@@ -118,6 +194,55 @@ class Model:
     @property
     def ocr_passes(self) -> list[dict[str, Any]]:
         return self._d.get("ocr_passes", [])
+
+    @property
+    def chunks(self) -> Optional[dict[str, Any]]:
+        """The stored DERIVED chunks ``{policy, items}``, or None if never derived."""
+        return self._d.get("chunks")
+
+    @property
+    def embedding_spaces(self) -> list[dict[str, Any]]:
+        """The embedding-space metadata records (vectors live as container members). Empty for
+        an un-embedded model."""
+        return self._d.get("embedding_spaces", [])
+
+    # -- chunking (DERIVED) --------------------------------------------------
+    def derive_chunks(self) -> dict[str, Any]:
+        """A fresh chunk derivation over this model's blocks (see :func:`derive_chunks`)."""
+        return derive_chunks(self.blocks)
+
+    def fresh_chunk_ids(self) -> list[str]:
+        """The chunk ids a fresh derive would produce — the staleness reference for embedding
+        spaces (a space whose ``chunk_ids`` differ from this is stale)."""
+        return [c["id"] for c in self.derive_chunks()["items"]]
+
+    def chunks_stale(self) -> bool:
+        """True when the STORED chunks differ from a fresh derive (blocks changed since chunking,
+        or never derived). Used to surface staleness in `info` and to refuse stale search."""
+        stored = self.chunks
+        if stored is None:
+            return True
+        fresh = self.derive_chunks()
+        return stored.get("policy") != fresh["policy"] or stored.get("items") != fresh["items"]
+
+    def chunk_text(self, chunk: dict[str, Any]) -> str:
+        """Recompose a chunk's text from its blocks — the blocks' searchable text (inline markup
+        stripped) joined by blank lines. This is what gets embedded / shown as a snippet; the
+        text is NOT stored on the chunk (no duplication)."""
+        parts = []
+        for bid in chunk.get("block_ids", []):
+            b = self._block_by_id.get(bid)
+            if b is not None:
+                t = _chunk_block_text(b)
+                if t:
+                    parts.append(t)
+        return "\n\n".join(parts)
+
+    def space_by_id(self, space_id: str) -> Optional[dict[str, Any]]:
+        for sp in self.embedding_spaces:
+            if sp.get("id") == space_id:
+                return sp
+        return None
 
     # -- id lookups ----------------------------------------------------------
     def section_by_id(self, sid: str) -> Optional[dict[str, Any]]:
