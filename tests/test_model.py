@@ -190,23 +190,59 @@ def test_distill_twice_same_model_modulo_timestamp(tmp_path):
     assert a == b, "model must be deterministic apart from the single timestamp"
 
 
-# ---- dropped asset stub ------------------------------------------------------
+# ---- asset save profiles (Wave 2) --------------------------------------------
 
-def test_dropped_figure_asset_keeps_stub(tmp_path):
-    """Wave-1 distill drops figure bytes by default but keeps a stub: a named, regenerable
-    hole, never a silent one."""
+def test_asset_table_complete_and_ids_agree(tmp_path):
+    """Every figure block's image id has an asset entry — the asset table is always complete
+    (no figure references a missing asset), under any profile."""
     _, model = _distill_load(FIGURES, tmp_path)
     assets = model.get("assets", [])
     assert assets, "figures fixture should register at least one asset"
-    a = assets[0]
-    assert a["storage"] == "dropped"
-    assert a["kind"] in ("figure", "page_raster", "svg")
-    # the regen recipe records the source page so the bytes are re-extractable.
-    assert a["regen"]["page"] >= 1
-    # asset ids agree with the figure blocks that reference them.
     asset_ids = {x["id"] for x in assets}
     fig_images = {b["image"] for b in model["blocks"] if b.get("image")}
     assert fig_images <= asset_ids, "every figure image id must have an asset entry"
+    for a in assets:
+        assert a["kind"] in ("figure", "page_raster", "svg")
+        assert a["regen"]["page"] >= 1  # regen recipe records the source page
+
+
+def test_default_profile_embeds_figure_bytes_with_hash_and_dims(tmp_path):
+    """Wave-2 default (`assets="figures"`): a raster figure's bytes are embedded with a
+    verifying sha256 and pixel dimensions filled — the Wave-1 unfilled-stub hole is closed."""
+    _, model = _distill_load(FIGURES, tmp_path)
+    embedded = [a for a in model["assets"] if a["storage"] == "embedded"]
+    assert embedded, "figures fixture's raster figure should be embedded by default"
+    a = embedded[0]
+    assert len(a["sha256"]) == 64 and a["bytes"] > 0
+    assert a["width"] and a["height"], "embedded figure carries pixel dimensions"
+
+
+def test_vector_figure_stays_dropped_stub(tmp_path):
+    """A pure VECTOR figure (SVG, no raster) keeps a dropped stub even under `figures` — a
+    named, reversible hole, never silent."""
+    _, model = _distill_load(FIGURES, tmp_path)
+    dropped = [a for a in model["assets"] if a["storage"] == "dropped"]
+    assert dropped, "the vector figure has no raster to embed → dropped stub"
+    assert dropped[0]["regen"]["page"] >= 1
+
+
+def test_assets_none_drops_all_bytes(tmp_path):
+    """`assets="none"`: text + structure only — every asset dropped to a stub, but the stubs
+    (and the regen recipes) remain, so nothing becomes a silent hole."""
+    d = distillpdf.Pdf.open(FIGURES)
+    dpdf = d.distill(os.path.join(str(tmp_path), "none.dpdf"), assets="none")
+    model = json.loads(distillpdf.load_model(dpdf))
+    assert model["assets"], "stubs must remain even with no bytes"
+    assert all(a["storage"] == "dropped" for a in model["assets"])
+
+    full = d.distill(os.path.join(str(tmp_path), "full.dpdf"), assets="figures")
+    # the figures profile keeps real bytes → a larger container than the text-only one.
+    assert os.path.getsize(full) > os.path.getsize(dpdf)
+
+
+def test_invalid_assets_profile_rejected(tmp_path):
+    with pytest.raises(Exception):
+        distillpdf.Pdf.open(FIGURES).distill(os.path.join(str(tmp_path), "x.dpdf"), assets="bogus")
 
 
 # ---- THE ROUND-TRIP SEED TEST (Wave 2 extends this) --------------------------

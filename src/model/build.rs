@@ -8,20 +8,32 @@
 //! section tree is reconstructed from heading levels; section ids are exactly the renderer's
 //! `sec-…` slugs, so model ids == HTML ids == CLI/agent addresses.
 //!
-//! Why parse the HTML rather than refactor `to_html` to emit a typed tree directly? That
-//! refactor (renderers as pure functions of the model) is explicitly Wave 2. For Wave 1 the
-//! HTML *is* the serialized element tree, and parsing our OWN deterministic output is far
-//! less risky than surgery on the 800-line parallel render. The known holes this leaves
-//! (per-block bboxes, native confidence-vs-OCR provenance threading) are recorded as Wave-2
-//! gaps, not silent ones.
+//! Why parse the HTML rather than refactor `to_html` to emit a typed tree directly? For Wave 1
+//! the HTML *is* the serialized element tree, and parsing our OWN deterministic output is far
+//! less risky than surgery on the 800-line parallel render.
+//!
+//! **Wave 2** keeps this parse path for the block decomposition but adds the render-fidelity
+//! capture that makes "renderers are pure functions of the model" hold: each page's verbatim
+//! PRE-id body (`Page.body_html`, via the shared `html::render_doc` head), captured here, lets
+//! a model-only re-render run the identical `html::assemble` tail. It also captures figure
+//! raster bytes (sha256 + dims) under the `assets` profile.
+//!
+//! **Per-block bbox stays `None` — a DELIBERATE, documented Wave-2 decision, not an oversight.**
+//! Blocks are decomposed from the FLATTENED page HTML, which carries no positions; threading
+//! boxes would require a second, structured render alongside the fidelity render — exactly the
+//! deep refactor the spec says NOT to do for bbox (it would risk destabilising the fidelity
+//! pipeline for marginal gain). Positions remain available per-page via `_dbg_spans_xy`; a
+//! future wave that needs pinpoint citations can thread spans through a structured render.
 
 use lopdf::{Document, Object};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+use super::container::AssetBytes;
 use super::{
-    derive_indexes, Asset, AssetKind, AssetStorage, Block, BlockKind, DocModel, Link, Metadata,
-    NamedDest, OcrDecision, Page, Regen, Section, Source, TocEntry, NATIVE_CONFIDENCE, SCHEMA_VERSION,
+    derive_indexes, Asset, AssetKind, AssetProfile, AssetStorage, Block, BlockKind, DocModel, Link,
+    Metadata, NamedDest, OcrDecision, Page, Regen, Section, Source, TocEntry, NATIVE_CONFIDENCE,
+    SCHEMA_VERSION,
 };
 use crate::{frontmatter, html, links, nav, ocr};
 
@@ -29,14 +41,18 @@ use crate::{frontmatter, html, links, nav, ocr};
 /// source hash and lenient stream recovery). `file` is the display name recorded in
 /// `source.file` (the source PDF's basename, typically). `generated_at` is the ONE timestamp
 /// in the file — taken once by the caller so the model is otherwise fully deterministic.
-pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: String) -> DocModel {
+/// `profile` chooses which asset bytes are captured/embedded (see [`AssetProfile`]).
+///
+/// Returns the model plus the embedded-asset bytes map (keyed by asset id) the container
+/// writer needs; it is empty under `assets="none"` or when no figure raster was recoverable.
+pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: String, profile: AssetProfile) -> (DocModel, AssetBytes) {
     let page_map = doc.get_pages(); // BTreeMap<u32, ObjectId> — 1-indexed, sorted
     let page_count = page_map.len() as u32;
 
     // Per-page geometry + OCR decision + PDF page labels. Built first so blocks can be
     // attributed and the page index is complete even for pages with no extracted blocks.
     let labels = page_labels(doc, page_count);
-    let pages: Vec<Page> = page_map
+    let mut pages: Vec<Page> = page_map
         .iter()
         .map(|(&n, &pid)| {
             let (w, h) = ocr::page_size_pts(doc, pid);
@@ -54,15 +70,34 @@ pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: 
                 // `NotNeeded` is the default and would just be noise on every page).
                 ocr_decision: (decision != OcrDecision::NotNeeded).then_some(decision),
                 active_ocr_pass: None, // Wave 2 sets this when an OCR pass feeds the page
+                body_html: None,       // filled from the parsed page HTML below
             }
         })
         .collect();
 
-    // Render the element tree to PAGE-mode HTML (no nav; images dropped to `<image N>`
+    // Render the element tree to PAGE-mode HTML via the SHARED pipeline head (`render_doc`),
+    // stopping BEFORE the `assemble` tail (id-minting + nav). Images are dropped to `<image N>`
     // placeholders — we only need to KNOW a figure exists, not carry megabytes of base64
-    // through the parser). This is the single source of the blocks + sections.
-    let page_html = html::to_html(doc, raw, html::Mode::Page, false, false);
-    let (blocks, sections) = parse_page_html(&page_html);
+    // through the parser. The resulting body is the *pre-id* page-mode body: it is what the
+    // model stores per page (`Page.body_html`), so a model-only re-render runs the identical
+    // `assemble` (minting the SAME `sec-…` ids and the SAME nav) — Wave 2's round-trip contract.
+    let (pre_body, img_uris, _outline) = html::render_doc(doc, raw, html::Mode::Page, false);
+    // Resolve the `\0idx\0` image sentinels to `<image N>` so the stored body is clean JSON
+    // (no NUL bytes); this is independent of id-minting, so doing it before `build_toc` yields
+    // a body identical to `to_html`'s except that headings are still bare.
+    let pre_body = crate::postprocess::substitute_images(pre_body, &img_uris, false);
+    // The per-page PRE-id bodies the model stores (what re-render reassembles + `assemble`s).
+    let (_, _, pre_bodies) = parse_page_html(&pre_body);
+    // Mint heading ids exactly as `to_html(Mode::Page, …)` does, then parse THAT for blocks +
+    // sections (their `sec-…` ids are the authoritative id space) — `build_toc` is independent
+    // of image substitution, so this equals the Wave-1 `to_html(Page,false,false)` body.
+    let page_html = nav::build_toc(pre_body, false);
+    let (mut blocks, sections, _) = parse_page_html(&page_html);
+    // Fold each page's verbatim PRE-id body HTML (the `<section>` inner content) onto its
+    // geometry page, so a model-only re-render reproduces the page-mode body byte-for-byte.
+    for p in pages.iter_mut() {
+        p.body_html = pre_bodies.get(&p.n).cloned();
+    }
 
     // Front-matter / metadata: reuse the dedicated extractor (the same one the public
     // `metadata()` method exposes) rather than re-deriving from the HTML <header>.
@@ -89,10 +124,12 @@ pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: 
     // reconstructed — so anchors are exactly the section ids.
     let toc = build_toc(doc, &sections);
 
-    // Assets: one per figure block that carried an image. Wave 1 distill drops the bytes by
-    // default (a born-digital figure is regenerable from the source PDF) and records a stub —
-    // a NAMED hole. The container's save profiles (Wave 4 surface) decide embedded/external.
-    let assets = figure_assets(&blocks);
+    // Assets: one per figure block that carried an image. Under `assets="figures"`/`"full"`
+    // we capture the figure's actual bytes (re-rendering inline once), fill sha256 + width +
+    // height, and embed them; under `"none"` (or when a figure's graphic is vector-only / not
+    // recoverable as a raster) the bytes are dropped and only the regen STUB remains — a named,
+    // reversible hole. The asset table is always complete (every figure image id has an entry).
+    let (assets, asset_bytes) = build_assets(doc, raw, &mut blocks, profile);
 
     let source = Source {
         file: file.to_string(),
@@ -104,7 +141,7 @@ pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: 
 
     let indexes = derive_indexes(&blocks);
 
-    DocModel {
+    let model = DocModel {
         schema_version: SCHEMA_VERSION,
         source,
         metadata,
@@ -117,7 +154,8 @@ pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: 
         links,
         named_dests,
         toc,
-    }
+    };
+    (model, asset_bytes)
 }
 
 /// Read the PDF `/PageLabels` number tree into a `{1-based page: label}` map (e.g. roman
@@ -275,33 +313,131 @@ fn build_toc(doc: &Document, sections: &[Section]) -> Vec<TocEntry> {
         .collect()
 }
 
-/// One asset stub per figure block whose image was extracted. Wave 1 records the stub with a
-/// `regen` recipe (the figure is rebuildable from its source page) and DROPS the bytes by
-/// default — a named, reversible hole. (Embedding/externalizing the actual bytes is the
-/// container save-profile's job, Wave 4; here we only register the asset's existence so the
-/// hole is never silent.)
-fn figure_assets(blocks: &[Block]) -> Vec<Asset> {
-    blocks
-        .iter()
-        .filter_map(|b| {
-            let id = b.image.as_ref()?;
-            Some(Asset {
+/// Build the asset table + the embedded-bytes map for the figure blocks.
+///
+/// One asset per figure block that carried an image (id `img/fig_{N}.{ext}`). Under a profile
+/// that keeps figures, we re-render the pages with images INLINE once and pull each figure's
+/// actual raster bytes out of its `<figure id="fig-N">` data URI, then fill the verifying hash
+/// and pixel dimensions and embed the bytes. A figure with no recoverable raster (a pure
+/// vector/SVG figure, or one whose graphic the inline render didn't materialise) keeps a
+/// DROPPED stub with a `regen` recipe — a named, reversible hole, never silent. Under
+/// `assets="none"` every figure is a dropped stub.
+fn build_assets(doc: &Document, raw: &[u8], blocks: &mut [Block], profile: AssetProfile) -> (Vec<Asset>, AssetBytes) {
+    let mut assets = Vec::new();
+    let mut bytes_map = AssetBytes::new();
+    // The figure-id → raster bytes map, built only when the profile keeps figures (re-rendering
+    // inline is the cost we pay exactly once, and only when bytes are wanted).
+    let rasters = if profile.keeps_figures() { figure_rasters(doc, raw) } else { BTreeMap::new() };
+
+    for b in blocks.iter_mut() {
+        let Some(id) = b.image.clone() else { continue };
+        // The figure number is the `N` in `img/fig_{N}.png` (== the HTML `fig-N`).
+        let fig_n = id.strip_prefix("img/fig_").and_then(|s| s.split('.').next()).unwrap_or("").to_string();
+        match rasters.get(&fig_n) {
+            Some((data, ext, w, h)) => {
+                // Re-key the asset id to the real extension (a JPEG figure stays `.jpg`) and
+                // re-point the block at it so `block.image` always names a real asset entry.
+                let aid = format!("img/fig_{fig_n}.{ext}");
+                b.image = Some(aid.clone());
+                bytes_map.insert(aid.clone(), data.clone());
+                assets.push(Asset {
+                    id: aid,
+                    kind: AssetKind::Figure,
+                    storage: AssetStorage::Embedded,
+                    sha256: Some(sha256_hex(data)),
+                    bytes: Some(data.len() as u64),
+                    width: *w,
+                    height: *h,
+                    regen: Some(Regen { page: b.page, dpi: None }),
+                });
+            }
+            None => assets.push(Asset {
                 id: id.clone(),
                 kind: AssetKind::Figure,
                 storage: AssetStorage::Dropped,
-                sha256: None, // Wave 1 has no figure bytes in hand here; Wave 2 hashes on extract
+                sha256: None,
                 bytes: None,
                 width: None,
                 height: None,
                 regen: Some(Regen { page: b.page, dpi: None }),
-            })
-        })
-        .collect()
+            }),
+        }
+    }
+    (assets, bytes_map)
+}
+
+/// A captured figure raster: its bytes, file extension, and decoded pixel dimensions.
+type FigureRaster = (Vec<u8>, String, Option<u32>, Option<u32>);
+
+/// Re-render the document with images INLINE (once) and decode each figure's raster into
+/// `figure_number → `[`FigureRaster`]. Vector-only figures yield no entry (their graphic is
+/// `<svg>`, not a raster). Width/height come from decoding the image header.
+fn figure_rasters(doc: &Document, raw: &[u8]) -> BTreeMap<String, FigureRaster> {
+    let mut out = BTreeMap::new();
+    let html = html::to_html(doc, raw, html::Mode::Page, true, false);
+    // Walk `<figure id="fig-N"> … <img src="data:…"> … </figure>` occurrences. We only need the
+    // FIRST raster `<img>` inside each figure (a composite figure's base raster).
+    let mut rest = html.as_str();
+    while let Some(fpos) = rest.find("<figure id=\"fig-") {
+        let after = &rest[fpos + "<figure id=\"fig-".len()..];
+        let Some(qpos) = after.find('"') else { break };
+        let fig_n = after[..qpos].to_string();
+        // Bound the search to this figure's element.
+        let fig_end = after.find("</figure>").map(|e| e + "</figure>".len()).unwrap_or(after.len());
+        let fig_html = &after[..fig_end];
+        if let Some((data, ext)) = first_img_data_uri(fig_html) {
+            let (w, h) = image_dims(&data);
+            out.entry(fig_n).or_insert((data, ext, w, h));
+        }
+        rest = &after[fig_end..];
+    }
+    out
+}
+
+/// Decode the first `<img src="data:image/…;base64,…">` inside a fragment into `(bytes, ext)`.
+fn first_img_data_uri(html: &str) -> Option<(Vec<u8>, String)> {
+    let at = html.find("src=\"data:")?;
+    let start = at + "src=\"".len();
+    let end = html[start..].find('"')? + start;
+    decode_data_uri(&html[start..end])
+}
+
+/// Decode a `data:image/<fmt>;base64,…` URI into raw bytes + a file extension. (A small,
+/// dependency-light mirror of `markdown::decode_data_uri`, scoped to the figure-capture path.)
+fn decode_data_uri(uri: &str) -> Option<(Vec<u8>, String)> {
+    use base64::Engine;
+    let rest = uri.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    if !meta.contains("base64") {
+        return None;
+    }
+    let ext = match meta.split(';').next().unwrap_or("") {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "bin",
+    };
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).ok()?;
+    Some((bytes, ext.to_string()))
+}
+
+/// Pixel dimensions of an encoded image, via the `image` crate's cheap header probe. `None` if
+/// the format can't be sniffed (the asset still embeds with a hash; dims are an honest absence).
+fn image_dims(bytes: &[u8]) -> (Option<u32>, Option<u32>) {
+    match image::load_from_memory(bytes) {
+        Ok(img) => {
+            use image::GenericImageView;
+            let (w, h) = img.dimensions();
+            (Some(w), Some(h))
+        }
+        Err(_) => (None, None),
+    }
 }
 
 // ---- the page-mode HTML element-stream parser ------------------------------
 
-/// Parse page-mode HTML into `(blocks, sections)`.
+/// Parse page-mode HTML into `(blocks, sections, page_bodies)`.
 ///
 /// The page-mode body is a flat sequence of `<section data-page="N" id="page-N">…</section>`
 /// wrappers, each containing the page's blocks: `<h1..6 id="sec-…">`, `<p>`, `<table>`,
@@ -309,16 +445,26 @@ fn figure_assets(blocks: &[Block]) -> Vec<Asset> {
 /// the byte stream tag-by-tag (NOT a general HTML parser — this is OUR known, regular output)
 /// and emit one [`Block`] per element in document/reading order, attributing each to its
 /// current page and the most recent open section at-or-above its level.
-fn parse_page_html(html: &str) -> (Vec<Block>, Vec<Section>) {
+///
+/// `page_bodies` maps each page number to the VERBATIM inner HTML of its `<section>` wrapper —
+/// the render-fidelity capture that lets a model-only re-render reproduce this exact page-mode
+/// body (it carries inline markup, list grouping, table structure, headers, dest anchors, and
+/// SVG, none of which survive block decomposition). Block decomposition and the body capture
+/// are two views of the same single parse pass.
+fn parse_page_html(html: &str) -> (Vec<Block>, Vec<Section>, BTreeMap<u32, String>) {
     let body = html.split_once("<body>").map(|x| x.1).unwrap_or(html);
     let body = body.split_once("</body>").map(|x| x.0).unwrap_or(body);
 
     let mut blocks: Vec<Block> = Vec::new();
     let mut sections: Vec<Section> = Vec::new();
+    let mut page_bodies: BTreeMap<u32, String> = BTreeMap::new();
     // The open-section stack: (id, level). A heading at level L pops everything >= L, then
     // pushes itself, so each block's section is the stack top.
     let mut stack: Vec<(String, u8)> = Vec::new();
     let mut cur_page: u32 = 0;
+    // Byte offset (into `body`) where the current page's `<section>` inner content begins
+    // (just past the open tag's `>`); `None` between pages.
+    let mut sec_inner_start: Option<usize> = None;
     let mut ord: usize = 0;
     let next_id = |ord: &mut usize| {
         *ord += 1;
@@ -330,6 +476,16 @@ fn parse_page_html(html: &str) -> (Vec<Block>, Vec<Section>) {
     while i < bytes.len() {
         if bytes[i] != b'<' {
             i += 1;
+            continue;
+        }
+        // Close the current page's body capture at its `</section>` before any other dispatch
+        // (the close tag is not a block-opening element).
+        if body[i..].starts_with("</section>") {
+            if let (Some(start), true) = (sec_inner_start, cur_page > 0) {
+                page_bodies.insert(cur_page, body[start..i].to_string());
+            }
+            sec_inner_start = None;
+            i += "</section>".len();
             continue;
         }
         // A `<section data-page="N">` wrapper sets the current page; an inner element starts
@@ -344,6 +500,7 @@ fn parse_page_html(html: &str) -> (Vec<Block>, Vec<Section>) {
                     cur_page = p.parse().unwrap_or(cur_page);
                 }
                 i += close_rel + 1;
+                sec_inner_start = Some(i); // inner content begins just past the open tag
             }
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 let level = name.as_bytes()[1] - b'0';
@@ -471,10 +628,16 @@ fn parse_page_html(html: &str) -> (Vec<Block>, Vec<Section>) {
         }
     }
 
+    // A final unclosed page (no trailing `</section>` — shouldn't happen for our output, but
+    // capture defensively so the body is never silently lost).
+    if let (Some(start), true) = (sec_inner_start, cur_page > 0) {
+        page_bodies.entry(cur_page).or_insert_with(|| body[start..].to_string());
+    }
+
     // Widen each section's page_end to the max page of any block attributed to it (or any of
     // its descendants — a parent spans all its children's pages).
     finalize_section_ranges(&mut sections, &blocks);
-    (blocks, sections)
+    (blocks, sections, page_bodies)
 }
 
 /// Construct a text-bearing block attributing it to the current open section.
@@ -691,7 +854,7 @@ mod tests {
             <section data-page=\"2\" id=\"page-2\">\n\
             <p>More B on page 2.</p></section>\n\
             </body></html>";
-        let (blocks, sections) = parse_page_html(html);
+        let (blocks, sections, _) = parse_page_html(html);
         // 5 blocks: h1, p, h2, p, p.
         assert_eq!(blocks.len(), 5);
         assert_eq!(blocks[0].kind, BlockKind::Heading);
@@ -720,7 +883,7 @@ mod tests {
             <table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>\
             <figure id=\"fig-3\"><image 1><figcaption>Figure 3: A chart.</figcaption></figure>\
             </section></body>";
-        let (blocks, _) = parse_page_html(html);
+        let (blocks, _, _) = parse_page_html(html);
         let table = blocks.iter().find(|b| b.kind == BlockKind::Table).unwrap();
         assert_eq!(table.cells.as_ref().unwrap(), &vec![vec!["A".to_string(), "B".into()], vec!["1".into(), "2".into()]]);
         let fig = blocks.iter().find(|b| b.kind == BlockKind::Figure).unwrap();
@@ -733,7 +896,7 @@ mod tests {
     fn parses_footnote_aside() {
         let html = "<body><section data-page=\"1\" id=\"page-1\">\
             <aside><p>1. First note.</p><p>2. Second note.</p></aside></section></body>";
-        let (blocks, _) = parse_page_html(html);
+        let (blocks, _, _) = parse_page_html(html);
         let notes: Vec<_> = blocks.iter().filter(|b| b.kind == BlockKind::Footnote).collect();
         assert_eq!(notes.len(), 2);
         assert_eq!(notes[0].text, "1. First note.");

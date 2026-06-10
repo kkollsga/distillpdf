@@ -548,12 +548,20 @@ impl Pdf {
     /// `<source-stem>.dpdf` inside it), or `None` to write `<source>.dpdf` next to the opened
     /// PDF. Returns the written path.
     ///
-    /// **Experimental (`schema_version = 0`).** Wave-1 distill records the born-digital
-    /// analysis; figure image bytes are dropped with a regenerable stub by default (a named,
-    /// reversible hole — re-extractable from the hash-bound source PDF). OCR passes and
-    /// per-block bboxes are filled by later waves.
-    #[pyo3(signature = (path=None))]
-    fn distill(&self, py: Python<'_>, path: Option<&str>) -> PyResult<String> {
+    /// `assets` chooses the asset save profile (size is a deliberate choice, never a surprise):
+    /// * `"figures"` (default) — embed figure image bytes (hash + dimensions filled); page
+    ///   rasters stay dropped-with-stub (regenerable).
+    /// * `"full"` — figures and (eventually) page rasters; equals `"figures"` on the
+    ///   born-digital path until page-raster capture lands.
+    /// * `"none"` — text + structure only; all asset bytes dropped, the regenerable stubs kept
+    ///   (a few MB even for a large scan; emailable).
+    ///
+    /// **Experimental (`schema_version = 0`).** A dropped asset always keeps a stub (hash/dims/
+    /// regen) — a named, reversible hole, re-extractable from the hash-bound source PDF. OCR
+    /// passes and per-block bboxes are filled by later waves.
+    #[pyo3(signature = (path=None, assets="figures"))]
+    fn distill(&self, py: Python<'_>, path: Option<&str>, assets: &str) -> PyResult<String> {
+        let profile = model::AssetProfile::parse(assets).map_err(PyValueError::new_err)?;
         let dest = self.resolve_out_path(path, "dpdf")?;
         // The display name recorded in source.file: the source PDF's basename when known.
         let file = self
@@ -564,14 +572,14 @@ impl Pdf {
             .unwrap_or_else(|| "document.pdf".to_string());
         // The single timestamp in the model — taken once here so the rest is deterministic.
         let generated_at = iso8601_now();
-        let model = py.allow_threads(|| model::build::build_model(&self.doc, &self.raw, &file, generated_at));
+        let (model, asset_bytes) =
+            py.allow_threads(|| model::build::build_model(&self.doc, &self.raw, &file, generated_at, profile));
         if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(|e| PyValueError::new_err(format!("mkdir failed: {e}")))?;
         }
-        // Wave 1 distill carries no embedded asset bytes (figures are dropped-with-stub by
-        // default); the container records the stubs from `model.assets`.
-        model::container::save(&model, &dest, &model::container::AssetBytes::new(), None)
-            .map_err(PyValueError::new_err)?;
+        // Embedded figure bytes (per the profile) ride along in the container; dropped assets
+        // contribute only their stub from `model.assets`.
+        model::container::save(&model, &dest, &asset_bytes, None).map_err(PyValueError::new_err)?;
         Ok(dest.to_string_lossy().into_owned())
     }
 
@@ -656,6 +664,42 @@ fn load_model(path: &str) -> PyResult<String> {
     let (model, _assets) = model::container::load(std::path::Path::new(path)).map_err(PyValueError::new_err)?;
     let bytes = model::container::to_canonical_json(&model).map_err(PyValueError::new_err)?;
     String::from_utf8(bytes).map_err(|e| PyValueError::new_err(format!("model json not utf-8: {e}")))
+}
+
+/// Render a loaded `.dpdf` model to HTML, with NO source PDF present — the model-only
+/// re-render (the proof that renderers are pure functions of the model). `mode`
+/// (`"section"` default / `"page"`) and `toc` match `to_html`. The Wave-1/2 born-digital
+/// model drops figure bytes (a regenerable stub), so figures render as the `image_mode="drop"`
+/// shape; this is byte-identical to `to_html(..., image_mode="drop")` on the source PDF.
+#[pyfunction]
+#[pyo3(signature = (path, mode="section", toc=true))]
+fn render_html(py: Python<'_>, path: &str, mode: &str, toc: bool) -> PyResult<String> {
+    let m = parse_mode(mode)?;
+    let (model, _assets) = model::container::load(std::path::Path::new(path)).map_err(PyValueError::new_err)?;
+    Ok(py.allow_threads(|| model::render::render_html(&model, m, toc)))
+}
+
+/// Render a loaded `.dpdf` model to Markdown, with no source PDF present — the existing
+/// HTML→Markdown transform over the model-only HTML. `mode`/`toc` match `to_html`;
+/// `image_mode` matches `to_markdown` (the Wave-1/2 model has no figure bytes, so `"external"`
+/// degrades to caption placeholders). Returns the Markdown string.
+#[pyfunction]
+#[pyo3(signature = (path, mode="section", toc=true, image_mode="external"))]
+fn render_markdown(py: Python<'_>, path: &str, mode: &str, toc: bool, image_mode: &str) -> PyResult<String> {
+    let m = parse_mode(mode)?;
+    let (model, _assets) = model::container::load(std::path::Path::new(path)).map_err(PyValueError::new_err)?;
+    let (md, _files) = py
+        .allow_threads(|| model::render::render_markdown(&model, m, toc, image_mode))
+        .map_err(PyValueError::new_err)?;
+    Ok(md)
+}
+
+/// Extract plain text from a loaded `.dpdf` model (one page per line) — the model-only
+/// analogue of `Pdf.extract_text`, sourced from the file with no source PDF present.
+#[pyfunction]
+fn render_text(py: Python<'_>, path: &str) -> PyResult<String> {
+    let (model, _assets) = model::container::load(std::path::Path::new(path)).map_err(PyValueError::new_err)?;
+    Ok(py.allow_threads(|| model::render::extract_text(&model)))
 }
 
 /// OCR: render one page's DocTags (granite-docling output) to a distillPDF HTML fragment.
@@ -835,6 +879,9 @@ fn _distillpdf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(from_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(load_model, m)?)?;
+    m.add_function(wrap_pyfunction!(render_html, m)?)?;
+    m.add_function(wrap_pyfunction!(render_markdown, m)?)?;
+    m.add_function(wrap_pyfunction!(render_text, m)?)?;
     m.add_function(wrap_pyfunction!(ocr_doctags_to_html, m)?)?;
     m.add_function(wrap_pyfunction!(html_to_markdown, m)?)?;
     m.add_function(wrap_pyfunction!(ocr_doctags_doc_html, m)?)?;

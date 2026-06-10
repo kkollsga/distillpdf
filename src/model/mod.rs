@@ -30,6 +30,7 @@
 
 pub(crate) mod build;
 pub(crate) mod container;
+pub(crate) mod render;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -37,6 +38,40 @@ use std::collections::BTreeMap;
 /// The current model schema version. `0` = experimental until the first downstream cutover
 /// survives the shape; see the module docs.
 pub(crate) const SCHEMA_VERSION: u32 = 0;
+
+/// Which binary assets a `distill`/save keeps. Size is a CHOICE, never a surprise (the asset
+/// policy in docs/datamodel-design.md). Every profile keeps the asset STUBS (hash/dims/regen)
+/// — only the bytes differ — so a dropped asset is always a named, reversible hole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssetProfile {
+    /// `assets="none"` — text + structure only; ALL asset bytes dropped (stubs remain). A few
+    /// MB even for a 1,500-page scan; emailable.
+    None,
+    /// `assets="figures"` (default) — embed figure image bytes; page rasters (OCR inputs) stay
+    /// dropped-with-stub (they're regenerable).
+    Figures,
+    /// `assets="full"` — figures AND page rasters (the audit archive: "this is the image the
+    /// model read"). Wave 2 has no page-raster capture yet, so this currently equals `Figures`
+    /// for the born-digital path; the variant exists so the surface is stable.
+    Full,
+}
+
+impl AssetProfile {
+    /// Parse the `assets=` string the Python `distill` accepts.
+    pub(crate) fn parse(s: &str) -> Result<AssetProfile, String> {
+        match s {
+            "none" => Ok(AssetProfile::None),
+            "figures" => Ok(AssetProfile::Figures),
+            "full" => Ok(AssetProfile::Full),
+            other => Err(format!("invalid assets {other:?}: expected \"figures\", \"full\", or \"none\"")),
+        }
+    }
+
+    /// Whether figure image bytes are kept (embedded) under this profile.
+    fn keeps_figures(self) -> bool {
+        matches!(self, AssetProfile::Figures | AssetProfile::Full)
+    }
+}
 
 /// Confidence of a block whose text comes from the PDF's NATIVE text layer (not OCR).
 /// `1.0` is the design's sentinel for "born-digital, no OCR uncertainty".
@@ -121,6 +156,19 @@ pub(crate) struct Page {
     /// Which OCR pass feeds this page's blocks/renders (`None` = native text layer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_ocr_pass: Option<String>,
+    /// The page's body content as the PAGE renderer emitted it: the INNER HTML of this page's
+    /// `<section data-page>` wrapper, verbatim, with raster/vector graphics reduced to
+    /// `<image N>` placeholders (the bytes live in `assets`). This is the RENDER-FIDELITY
+    /// field. Blocks are the decomposed, queryable structural view (and the index source of
+    /// truth); this is the faithful render so `render_html(model)` reproduces `to_html(pdf)`
+    /// byte-for-byte for BOTH page mode and section mode (section mode is `build_sections` run
+    /// over exactly this body). It carries everything block decomposition drops — inline
+    /// emphasis (`<b>/<i>/<a>/<sup>`), front-matter `<header>`, named-dest `<a id>` anchors,
+    /// `<ul>/<ol>` list grouping, `<th>/<td>` table structure, footnote `<aside>`s, and SVG
+    /// vector figures. `None` only for a page the renderer produced no body for (it then
+    /// renders as an empty `<section>`, matching the source).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_html: Option<String>,
 }
 
 /// Mirror of `ocr::detect::OcrDecision` as a serde enum (kept here so the model module owns
@@ -510,6 +558,48 @@ pub(crate) fn derive_indexes(blocks: &[Block]) -> Indexes {
         kinds,
         coverage: Coverage { sectioned, unsectioned_blocks: unsectioned },
     }
+}
+
+/// Rebuild ALL of `model.indexes` from `model.blocks` in place — the single re-derive entry
+/// point. Any mutation that touches blocks (Wave 2+: switching `active_ocr_pass` and
+/// re-deriving the page's blocks) must call this so the stored indexes can never drift from
+/// content. `container::save` calls it as a cheap guard and then asserts the stored indexes
+/// already equalled the derived ones (a build that forgot to re-derive is a loud save error,
+/// not silent drift).
+pub(crate) fn reindex(model: &mut DocModel) {
+    model.indexes = derive_indexes(&model.blocks);
+}
+
+/// Validate that the model's indexes are CONSISTENT with its blocks before persisting:
+/// (1) the stored indexes equal a fresh derive (no drift), and (2) every block is reachable
+/// from the page index AND from either a section or the explicit unsectioned bucket (no
+/// orphan / silently-unreachable content). Returns `Err(reason)` on any violation — the
+/// honest-coverage north star: a coverage hole is a typed error at save, never a silent one.
+pub(crate) fn validate_indexes(model: &DocModel) -> Result<(), String> {
+    let derived = derive_indexes(&model.blocks);
+    if derived != model.indexes {
+        return Err("indexes drifted from blocks (call reindex before save)".to_string());
+    }
+    let all: std::collections::BTreeSet<&str> = model.blocks.iter().map(|b| b.id.as_str()).collect();
+    let paged: std::collections::BTreeSet<&str> =
+        model.indexes.pages.values().flatten().map(String::as_str).collect();
+    if paged != all {
+        return Err(format!(
+            "page index does not reach every block ({} blocks, {} page-indexed)",
+            all.len(),
+            paged.len()
+        ));
+    }
+    let sectioned: std::collections::BTreeSet<&str> =
+        model.indexes.sections.values().flatten().map(String::as_str).collect();
+    let unsectioned: std::collections::BTreeSet<&str> =
+        model.indexes.coverage.unsectioned_blocks.iter().map(String::as_str).collect();
+    for id in &all {
+        if !sectioned.contains(id) && !unsectioned.contains(id) {
+            return Err(format!("block {id} is in no section and not in the unsectioned bucket"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

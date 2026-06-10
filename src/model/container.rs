@@ -62,6 +62,11 @@ pub(crate) fn to_canonical_json(model: &DocModel) -> Result<Vec<u8>, String> {
 /// written (defaults to a sibling `<stem>_assets/` next to the `.dpdf`). Returns the written
 /// path.
 pub(crate) fn save(model: &DocModel, path: &Path, assets: &AssetBytes, external_dir: Option<&Path>) -> Result<(), String> {
+    // Index-coverage guard (honest-coverage north star): the stored indexes must equal a fresh
+    // derive (no drift) AND every block must be reachable from the page index and from a
+    // section or the explicit unsectioned bucket. A violation is a typed save error, never a
+    // silently-shipped coverage hole. Cheap (a re-derive + set compares).
+    super::validate_indexes(model)?;
     let json = to_canonical_json(model)?;
 
     // Partition assets by storage mode (the model's asset table is authoritative).
@@ -279,7 +284,7 @@ mod tests {
                 generated_at: "2026-06-10T00:00:00Z".into(),
             },
             metadata: Metadata::default(),
-            pages: vec![Page { n: 1, width_pts: 612.0, height_pts: 792.0, labels: BTreeMap::new(), ocr_decision: None, active_ocr_pass: None }],
+            pages: vec![Page { n: 1, width_pts: 612.0, height_pts: 792.0, labels: BTreeMap::new(), ocr_decision: None, active_ocr_pass: None, body_html: None }],
             ocr_passes: Vec::new(),
             sections: Vec::new(),
             blocks,
@@ -351,6 +356,38 @@ mod tests {
         assert_eq!(a.sha256.as_deref(), Some("deadbeef"));
         assert_eq!(a.width, Some(640));
         assert_eq!(a.regen.as_ref().unwrap().dpi, Some(300));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_rejects_drifted_indexes() {
+        // The save-time guard: if a block is added without re-deriving indexes, save errors
+        // (no silent coverage hole). Hand-build a model whose blocks and indexes disagree.
+        let mut model = tiny_model();
+        model.blocks.push(Block {
+            id: "b0002".into(),
+            kind: BlockKind::Para,
+            text: "orphan".into(),
+            page: 1,
+            section: None,
+            bbox: None,
+            confidence: NATIVE_CONFIDENCE,
+            ocr_pass: None,
+            heading_level: None,
+            cells: None,
+            image: None,
+            label: None,
+            caption: None,
+        });
+        // (indexes still reflect only b0001 — drift)
+        let dir = std::env::temp_dir().join(format!("dpdf_drift_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.dpdf");
+        let err = save(&model, &path, &AssetBytes::new(), None).unwrap_err();
+        assert!(err.contains("drift"), "expected a drift error, got {err:?}");
+        // reindex repairs it; save then succeeds and validates clean.
+        super::super::reindex(&mut model);
+        save(&model, &path, &AssetBytes::new(), None).unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 

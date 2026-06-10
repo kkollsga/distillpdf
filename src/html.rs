@@ -905,6 +905,17 @@ fn build_doc_profile(page_spans: &[(u32, ObjectId, Vec<Span>)], body: f32, title
 /// to `<body>`. When false it is omitted — heading/section `id=` anchors are still
 /// assigned (so `#sec-…` links and `section()` keep working), only the visible TOC drops.
 pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, include_toc: bool) -> String {
+    let (body, img_uris, outline) = render_doc(doc, raw, mode, inline_images);
+    assemble(body, mode, include_toc, &outline, &img_uris, inline_images)
+}
+
+/// The render-pipeline HEAD: all the analysis + per-page render + sequential merge, producing
+/// the PRE-id, PRE-nav page-mode `body` (the full `<!doctype…></html>` document with headings
+/// still bare and image sentinels still `\0idx\0`), the global image-URI list, and the PDF's
+/// own outline. [`to_html`] feeds this straight into [`assemble`]; the model build path calls
+/// it to capture each page's body verbatim (see [`crate::model::build`]). Splitting the head
+/// from the tail is what lets a model-only re-render run the identical [`assemble`] code.
+pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool) -> (String, Vec<String>, Vec<links::OutlineEntry>) {
     // Optional coarse phase profiler: set DPDF_PROFILE=1 to print per-phase WALL time to
     // stderr. `prof_phase(label, ||…)` times a closure; zero cost when unset.
     let prof = std::env::var_os("DPDF_PROFILE").is_some();
@@ -1672,11 +1683,7 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
     // page's local `\0<idx>\0` image sentinels to global indices, and concatenating the
     // per-page URI lists into one global list.
     let t = std::time::Instant::now();
-    let mut out = String::from(
-        "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
-         <style>\nbody{max-width:48rem;margin:auto;padding:1rem}\n\
-         img,svg{max-width:100%;height:auto}\n</style>\n</head>\n<body>\n",
-    );
+    let mut out = String::from(DOC_SHELL_HEAD);
     let mut img_uris: Vec<String> = Vec::new();
     for (frag, uris) in renders {
         append_with_img_offset(&mut out, &frag, img_uris.len());
@@ -1687,6 +1694,38 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
 
     let t = std::time::Instant::now();
     let body = dedup_ids(&merge_adjacent_figures(&merge_math_fragments(&merge_fragmented_lists(&merge_adjacent_links(&demote_running_headings(out))))));
+    phase("04_merge_tail", t);
+    if let Some(t0) = prof_start {
+        eprintln!("[DPDF_PROFILE] {} pages, total {:.1}ms", page_spans.len(), t0.elapsed().as_secs_f64() * 1e3);
+    }
+    (body, img_uris, outline)
+}
+
+/// The render-pipeline TAIL, shared by the PDF parse path ([`to_html`]) and the model-only
+/// re-render ([`crate::model::render`]): turn the merged, deduped, PRE-id page-mode `body`
+/// (the full `<!doctype…></html>` document, headings still bare, images as `\0idx\0` sentinels
+/// or already-resolved `<image N>` placeholders) into the final HTML.
+///
+/// Splitting this out is what makes "renderers are pure functions of the model" hold by
+/// construction: the model captures each page's body verbatim (image sentinels already
+/// resolved), reconstructs the same merged `body`, and runs THIS function — so a model-only
+/// re-render is the identical code path as a fresh parse, only the `body` source differs.
+///
+/// - `mode`: page mode IDs + TOCs headings in place; section mode regroups into nested
+///   `<section id="sec-…">` wrappers (both mint the SAME `sec-…` ids from heading text).
+/// - `outline`: the PDF's own `/Outlines`; when non-empty and `include_toc`, its clean TOC
+///   replaces the heading-detected `<nav>`.
+/// - `img_uris` / `inline_images`: splice the deferred image data URIs / `<image N>` numbers
+///   into any remaining `\0idx\0` sentinels (a no-op when the body carries none, e.g. the
+///   model path, whose stored body already has resolved `<image N>` placeholders).
+pub(crate) fn assemble(
+    body: String,
+    mode: Mode,
+    include_toc: bool,
+    outline: &[links::OutlineEntry],
+    img_uris: &[String],
+    inline_images: bool,
+) -> String {
     // Page mode: id + TOC on headings, keyed by page. Section mode: regroup content into
     // nested <section id="sec-…"> wrappers with a pageless TOC.
     let result = match mode {
@@ -1698,18 +1737,19 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
     // approximation. Only the visible `<nav>` is swapped; heading/section anchors are
     // unchanged (the outline links to them).
     let result = if include_toc && !outline.is_empty() {
-        nav_from_outline(result, &outline, mode)
+        nav_from_outline(result, outline, mode)
     } else {
         result
     };
     // Splice the deferred image URIs / `<image N>` numbers into their sentinels.
-    let result = substitute_images(result, &img_uris, inline_images);
-    phase("04_assemble", t);
-    if let Some(t0) = prof_start {
-        eprintln!("[DPDF_PROFILE] {} pages, total {:.1}ms", page_spans.len(), t0.elapsed().as_secs_f64() * 1e3);
-    }
-    result
+    substitute_images(result, img_uris, inline_images)
 }
+
+/// The HTML document shell `to_html` (and the model re-render) wrap the page bodies in.
+/// Exposed so the model path reconstructs the byte-identical `<head>`/`<style>` prelude.
+pub(crate) const DOC_SHELL_HEAD: &str = "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
+     <style>\nbody{max-width:48rem;margin:auto;padding:1rem}\n\
+     img,svg{max-width:100%;height:auto}\n</style>\n</head>\n<body>\n";
 
 pub(crate) fn clone_span(s: &Span) -> Span {
     Span {
