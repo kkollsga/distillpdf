@@ -1183,6 +1183,40 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
         // out of the body flow (it belongs to the figure, not the prose).
         let fig_boxes: Vec<(f32, f32, f32, f32)> = vectors.iter().map(|v| (v.x_left, v.x_right, v.y_bottom, v.y_top)).collect();
         let in_figure = |x: f32, y: f32| fig_boxes.iter().any(|&(xl, xr, yb, yt)| x >= xl - 4.0 && x <= xr + 4.0 && y >= yb - 4.0 && y <= yt + 4.0);
+        // A vector region that is really a FRAMED TEXT BLOCK — a bordered certificate / form
+        // whose frame and rules are vector ink but whose content is a wall of body text — must
+        // not scoop that text into the SVG. Tell it from a real chart/diagram by text density:
+        // a chart carries a handful of short labels, a framed document many lines of multi-word
+        // prose (often in smaller-than-body print). Mark such boxes so all their text stays in
+        // the prose flow regardless of font size (these forms are routinely set below the
+        // document body size, which the body-size prose gate below would otherwise miss).
+        const FRAMED_DOC_MIN_PROSE_LINES: usize = 8;
+        // Precompute, once per line, whether it is a multi-word non-axis "prose line" plus its
+        // center — so the per-box scan below is a cheap point/flag test, not a fresh `l.text()`
+        // build for every (box, line) pair (that nested rebuild dominated render time on a
+        // form-heavy doc with many vector boxes).
+        let line_is_prose: Vec<bool> = lines
+            .iter()
+            .map(|l| l.text().split_whitespace().count() >= 4 && !is_axis_label_text(&l.text()))
+            .collect();
+        let line_centers: Vec<(f32, f32)> = lines.iter().map(|l| ((l.x0 + l.x1) * 0.5, l.y)).collect();
+        let framed_doc_boxes: Vec<(f32, f32, f32, f32)> = fig_boxes
+            .iter()
+            .copied()
+            .filter(|&(xl, xr, yb, yt)| {
+                line_centers
+                    .iter()
+                    .zip(&line_is_prose)
+                    .filter(|&(&(cx, cy), &prose)| prose && cx >= xl && cx <= xr && cy >= yb && cy <= yt)
+                    .count()
+                    >= FRAMED_DOC_MIN_PROSE_LINES
+            })
+            .collect();
+        let in_framed_doc = |x: f32, y: f32| {
+            framed_doc_boxes
+                .iter()
+                .any(|&(xl, xr, yb, yt)| x >= xl - 4.0 && x <= xr + 4.0 && y >= yb - 4.0 && y <= yt + 4.0)
+        };
         // Axis tick labels and axis titles sit just OUTSIDE the plotted ink (left of the
         // y-axis, below the x-axis) — beyond `in_figure`'s tight 4pt margin, so without
         // this they leak into the prose ("84 82 80 78 76", "Pre-training Steps …"). They
@@ -1210,12 +1244,18 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
         // are unaffected.
         let mut prose_rows: Vec<(f32, f32, f32, f32)> = Vec::new();
         for l in &lines {
-            if l.size >= body * 0.95
+            let cx = (l.x0 + l.x1) * 0.5;
+            let body_prose = l.size >= body * 0.95
                 && l.text().split_whitespace().count() > 5
                 && !is_axis_label_text(&l.text()) // a body-size numeric tick row is a figure label, not prose
                 && detect_header(l, body, Some(&profile)).is_none()
-                && in_figure((l.x0 + l.x1) * 0.5, l.y)
-            {
+                && in_figure(cx, l.y);
+            // Inside a framed text block, keep ALL multi-word text as prose — including the
+            // small print these forms use, which the body-size gate above would miss.
+            let framed_prose = in_framed_doc(cx, l.y)
+                && l.text().split_whitespace().count() >= 2
+                && !is_axis_label_text(&l.text());
+            if body_prose || framed_prose {
                 prose_rows.push((l.x0, l.x1, l.y - 1.0, l.y + l.size + 1.0));
             }
         }
@@ -1235,21 +1275,14 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
         let in_caption = |x: f32, y: f32| {
             caption_bands.iter().any(|&(x0, x1, y0, y1)| x >= x0 - 2.0 && x <= x1 + 2.0 && y >= y0 && y <= y1)
         };
-        // Render the figures' text as SVG <text>: a figure's labels are drawn either
-        // inside its Form XObject (form_text_spans) OR directly in the page content
-        // within the figure's bbox (DAG node labels, plot axis ticks) — both are
-        // collected here so the figure shows its labels, and the body-content ones
-        // are removed from the prose flow below (see the in_figure filter).
+        // Render the figures' text as SVG <text>: a figure's labels (axis ticks, DAG
+        // node labels) are the spans that fall within its bbox — whether drawn in the
+        // page content OR inside a Form XObject (`extract_spans` now captures both into
+        // `spans`). They're collected here and removed from the prose flow below (the
+        // in_figure / fig_label filter), so each shows on its figure, not in the body.
         if !vectors.is_empty() {
             let mk = |s: text::Span| vector::LabelSpan { x: s.x, y: s.y, size: s.size, width: s.width, text: s.text, bold: s.bold, italic: s.italic, angle: s.angle };
-            let mut labels: Vec<vector::LabelSpan> = text::form_text_spans(doc, *_pid, raw)
-                .into_iter()
-                .filter(|s| {
-                    let (cx, cy) = (s.x + s.width * 0.5, s.y + s.size * 0.5);
-                    !in_prose(cx, cy) && !in_caption(cx, cy)
-                })
-                .map(mk)
-                .collect();
+            let mut labels: Vec<vector::LabelSpan> = Vec::new();
             for s in spans {
                 let (cx, cy) = (s.x + s.width * 0.5, s.y + s.size * 0.5);
                 if (in_figure(cx, cy) || near_fig_label(cx, cy, s.size, &s.text)) && !in_prose(cx, cy) && !in_caption(cx, cy) {

@@ -29,6 +29,13 @@ except Exception:  # pragma: no cover - only when the extension predates this fe
     def _ocr_page_native(engine, image, opts):  # type: ignore
         raise RuntimeError("native OCR engines are not compiled into this distillPDF build")
 
+# Optional on older compiled cores: the text-vs-true-image classifier (added with the
+# precise OCR gate). Absent → callers fall back to a DocTags-based decision.
+try:
+    from ._distillpdf import ocr_classify_native as _ocr_classify_native
+except Exception:  # pragma: no cover - extension predates the classify pyfunction
+    _ocr_classify_native = None
+
 # Free native-engine C handles (Tesseract) before interpreter teardown, so the engine's C++
 # static caches don't report the dictionary objects as leaked on stderr at exit.
 if _NATIVE:
@@ -49,6 +56,15 @@ class NativeBackend(OcrBackend):
 
     def ocr_page(self, image: bytes) -> str:
         return _ocr_page_native(self.engine, bytes(image), self._opts())
+
+    def classify(self, image: bytes):
+        """Text-vs-true-image stats for the OCR gate: ``(raw_words, confident_chars)``.
+        ``raw_words`` ignores OCR confidence, so a blurry photo of a text document still
+        reports many words while a genuine image reports almost none. Returns ``None`` when
+        the compiled core predates the classifier (caller falls back to a DocTags check)."""
+        if _ocr_classify_native is None:
+            return None
+        return _ocr_classify_native(self.engine, bytes(image), self._opts())
 
     def _opts(self) -> dict:
         """The engine-agnostic options dict crossing the PyO3 boundary. Only non-empty

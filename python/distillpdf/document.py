@@ -70,7 +70,8 @@ class Document:
 
         By default the bundled **fast** engine (Tesseract) is used — no extra, no download,
         offline. Pick another with ``engine=``: ``"accurate"`` / ``"granite"`` for the
-        granite-docling VLM (needs the ``distillpdf[ocr]`` extra), or a specific backend name.
+        granite-docling VLM (needs a runtime you install yourself — see
+        ``distillpdf.ocr.install_help('granite')``), or a specific backend name.
 
         Engine options go straight in as keyword args (no need to build an OcrConfig):
 
@@ -99,8 +100,8 @@ class Document:
                 f"{len(pending)} page(s) look scanned / image-only and have no extractable "
                 f"text. Call doc.run_ocr() (or pass ocr=True) to OCR them with the bundled "
                 f"engine — no extra, no download, offline. (For the higher-accuracy granite "
-                f"engine instead, `pip install 'distillpdf[ocr]'`.) Rendering now leaves those "
-                f"pages with little or no text.",
+                f"engine instead, run distillpdf.ocr.install_help('granite') for the per-OS "
+                f"setup.) Rendering now leaves those pages with little or no text.",
                 stacklevel=3,
             )
 

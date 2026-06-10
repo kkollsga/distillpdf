@@ -685,6 +685,40 @@ fn ocr_page_native(
     py.allow_threads(|| eng.ocr_page(image)).map_err(PyValueError::new_err)
 }
 
+/// Classify a page image for the text-vs-true-image gate: returns `(raw_words,
+/// confident_chars)`. `raw_words` ignores OCR confidence (a blurry photo of text still
+/// reports many word-like tokens; a genuine image reports almost none), so the caller can
+/// keep a hard-but-readable scan while skipping a real photo. One OCR pass; GIL released.
+#[pyfunction]
+#[pyo3(signature = (engine, image, opts=None))]
+fn ocr_classify_native(
+    py: Python<'_>,
+    engine: &str,
+    image: &[u8],
+    opts: Option<&Bound<'_, PyDict>>,
+) -> PyResult<(usize, usize)> {
+    let cfg = parse_native_cfg(opts)?;
+    let eng = ocr::engine::native_engine(engine, &cfg).map_err(PyValueError::new_err)?;
+    py.allow_threads(|| eng.classify(image)).map_err(PyValueError::new_err)
+}
+
+/// Fraction of "ink" pixels (luma below mid-grey) in a page image, in per-mille (0–1000). A
+/// cheap content signal for the OCR gate: a blank/near-blank scan is ~0, a page of text or a
+/// photo is well above. Used to rescue a document-like image that Tesseract can't read at all
+/// into the accurate (granite) pass — a VLM may recover a degraded scan. Decodes once; GIL
+/// released.
+#[pyfunction]
+fn image_ink_permille(py: Python<'_>, image: &[u8]) -> PyResult<u32> {
+    py.allow_threads(|| {
+        let img = image::load_from_memory(image).map_err(|e| format!("decode image: {e}"))?;
+        let g = img.to_luma8();
+        let total = (g.width() as u64 * g.height() as u64).max(1);
+        let ink = g.pixels().filter(|p| p.0[0] < 128).count() as u64;
+        Ok::<u32, String>((ink * 1000 / total) as u32)
+    })
+    .map_err(PyValueError::new_err)
+}
+
 /// Names of native OCR engines compiled into this wheel (e.g. ["tesseract","server"], or
 /// just ["server"] when the tesseract feature is off). Import-light; constructs nothing.
 #[pyfunction]
@@ -731,6 +765,8 @@ fn _distillpdf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ocr_doctags_doc_html, m)?)?;
     m.add_function(wrap_pyfunction!(ocr_doctags_to_pdf, m)?)?;
     m.add_function(wrap_pyfunction!(ocr_page_native, m)?)?;
+    m.add_function(wrap_pyfunction!(ocr_classify_native, m)?)?;
+    m.add_function(wrap_pyfunction!(image_ink_permille, m)?)?;
     m.add_function(wrap_pyfunction!(native_engines, m)?)?;
     m.add_function(wrap_pyfunction!(ocr_native_shutdown, m)?)?;
     #[cfg(feature = "tesseract")]

@@ -965,26 +965,45 @@ fn num(o: &Object) -> f32 {
     }
 }
 
-/// Extract positioned text spans for one page via content-stream interpretation.
+/// Extract positioned text spans for one page via content-stream interpretation,
+/// recursing into the Form XObjects the page draws (`Do`). Body text rendered
+/// through a template/overlay form — the norm in e-filing bundles (SEI/PROJUDI/PJe,
+/// iText-assembled PDFs) where each appended document is a full-page Form XObject —
+/// would otherwise be invisible to the page-direct walk. Page-direct and
+/// form-internal text land in the same page user space.
 pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span> {
     let content = match doc.get_and_decode_page_content(page_id) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
     let fonts = build_fonts(doc, page_id, raw);
+    let xmap = page_xobjects(doc, page_id);
     let mut spans = Vec::new();
-    let mut tm = Mat::ID;
-    let mut tlm = Mat::ID;
-    let mut leading = 0.0f32;
-    let mut size = 0.0f32;
-    let mut tc = 0.0f32; // char spacing
-    let mut tw = 0.0f32; // word spacing
-    let mut ts = 0.0f32; // text rise (Ts): baseline shift in text space — sub/superscripts
-    let mut cur: Option<&FontInfo> = None;
-    let mut ctm = Mat::ID; // graphics CTM (q/Q/cm) — needed for rotated/transformed text
-    let mut cstack: Vec<Mat> = Vec::new();
+    decode_spans(doc, &content.operations, &fonts, &xmap, Mat::ID, raw, 0, &mut spans);
+    dedup_coincident(&mut spans);
+    spans
+}
 
-    let mut emit = |wtm: &Mat, ctm: &Mat, base_size: f32, width: f32, style: (bool, bool, bool, u32), s: String| {
+/// XObject name -> object id from a page's resources (the forms/images the page may
+/// `Do`). Mirrors `xobjects_of` but resolves the page's resource dict first.
+fn page_xobjects(doc: &Document, page_id: ObjectId) -> HashMap<Vec<u8>, ObjectId> {
+    let resources = match doc.get_page_resources(page_id) {
+        Ok((Some(d), _)) => d.clone(),
+        Ok((None, ids)) => match ids.first().and_then(|id| doc.get_dictionary(*id).ok()).cloned() {
+            Some(d) => d,
+            None => return HashMap::new(),
+        },
+        Err(_) => return HashMap::new(),
+    };
+    xobjects_of(doc, &resources)
+}
+
+/// Emit one positioned text span from a decoded word, resolving its device position
+/// from the text matrix and the graphics CTM (pure-translate / Y-flip / rotation
+/// handling). A free fn — not a closure — so the page walk and its Form-XObject
+/// recursion position text identically.
+fn push_positioned_span(spans: &mut Vec<Span>, wtm: &Mat, ctm: &Mat, base_size: f32, width: f32, style: (bool, bool, bool, u32), s: String) {
+        // Resolve the device position from the text matrix and the graphics CTM.
         // Resolve the device position from the text matrix and the graphics CTM.
         //  - ROTATED text (non-horizontal baseline) uses the full combined matrix: its
         //    true position, a magnitude-based height (so a 90° title isn't dropped by a
@@ -1026,7 +1045,13 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
         } else if yflip {
             (dm.e, dm.f, base_size * dm.d.abs(), 0.0, dm.a.abs())
         } else {
-            (wtm.e, wtm.f, base_size * wtm.d, 0.0, wtm.a)
+            // Axis-aligned CTM that is neither a pure translate nor a pure Y-flip — e.g. a
+            // SCALED (and possibly double-flipped) frame: a form drawn under `s 0 0 -s tx ty
+            // cm`, the norm in e-filing template bundles where the body lives in a 0.06×,
+            // Y-flipped XObject. When that scale/flip is in the CTM, the text matrix alone
+            // omits it (positions collapse / invert); use the full device matrix. Identical
+            // to `wtm` when the CTM is identity (dm == wtm), correct when it isn't.
+            (dm.e, dm.f, base_size * dm.d.abs(), 0.0, dm.a.abs())
         };
         if !s.is_empty() && height.abs() >= 2.0 {
             spans.push(Span {
@@ -1042,9 +1067,25 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
                 font: style.3,
             });
         }
-    };
+}
 
-    for op in &content.operations {
+/// Walk a content stream's operators, emitting positioned spans and recursing into
+/// Form XObjects on `Do`. `base` is the graphics CTM the stream is placed under
+/// (identity for the page; the form `/Matrix` × the invoking CTM for a nested form).
+#[allow(clippy::too_many_arguments)]
+fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashMap<Vec<u8>, FontInfo>, xmap: &HashMap<Vec<u8>, ObjectId>, base: Mat, raw: &[u8], depth: u32, spans: &mut Vec<Span>) {
+    let mut tm = Mat::ID;
+    let mut tlm = Mat::ID;
+    let mut leading = 0.0f32;
+    let mut size = 0.0f32;
+    let mut tc = 0.0f32; // char spacing
+    let mut tw = 0.0f32; // word spacing
+    let mut ts = 0.0f32; // text rise (Ts): baseline shift in text space — sub/superscripts
+    let mut cur: Option<&FontInfo> = None;
+    let mut ctm = base; // graphics CTM (q/Q/cm) — needed for rotated/transformed text
+    let mut cstack: Vec<Mat> = Vec::new();
+
+    for op in ops {
         let o = &op.operands;
         match op.operator.as_str() {
             "q" => cstack.push(ctm),
@@ -1107,7 +1148,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
                     let (words, total) = decode_words(&[Show::Str(s)], cur, size, tc, tw);
                     for wd in words {
                         let wtm = Mat::translate(wd.x_off, ts).mul(tm);
-                        emit(&wtm, &ctm, size, wd.width, style, wd.text);
+                        push_positioned_span(spans, &wtm, &ctm, size, wd.width, style, wd.text);
                     }
                     tm = Mat::translate(total, 0.0).mul(tm);
                 }
@@ -1120,7 +1161,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
                     let (words, total) = decode_words(&[Show::Str(s)], cur, size, tc, tw);
                     for wd in words {
                         let wtm = Mat::translate(wd.x_off, ts).mul(tm);
-                        emit(&wtm, &ctm, size, wd.width, style, wd.text);
+                        push_positioned_span(spans, &wtm, &ctm, size, wd.width, style, wd.text);
                     }
                     tm = Mat::translate(total, 0.0).mul(tm);
                 }
@@ -1140,203 +1181,16 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
                     let (words, total) = decode_words(&elems, cur, size, tc, tw);
                     for wd in words {
                         let wtm = Mat::translate(wd.x_off, ts).mul(tm);
-                        emit(&wtm, &ctm, size, wd.width, style, wd.text);
+                        push_positioned_span(spans, &wtm, &ctm, size, wd.width, style, wd.text);
                     }
                     tm = Mat::translate(total, 0.0).mul(tm);
                 }
             }
-            _ => {}
-        }
-    }
-    dedup_coincident(&mut spans);
-    spans
-}
-
-/// Drop spans that coincide with one already emitted — same text at the same
-/// position (to the nearest point). Some generators draw each glyph run twice at
-/// the same spot (faux-bold / a duplicated content block); a viewer overprints
-/// them into one, but extraction sees both, doubling every token. This is a
-/// general structural de-duplication (what mature extractors do), not a per-doc
-/// patch: two *distinct* words can never share an identical baseline position.
-fn dedup_coincident(spans: &mut Vec<Span>) {
-    let mut seen = std::collections::HashSet::new();
-    spans.retain(|s| seen.insert((s.x.round() as i32, s.y.round() as i32, s.text.clone())));
-}
-
-/// Positioned text spans found INSIDE Form XObjects, which `extract_spans` does
-/// not descend into. Used to render figure labels as SVG `<text>`. Returns only
-/// form-internal text (page-level text is handled by `extract_spans`), in page
-/// user space — so this is purely additive and leaves the main pipeline alone.
-pub(crate) fn form_text_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span> {
-    let resources = match doc.get_page_resources(page_id) {
-        Ok((Some(d), _)) => d.clone(),
-        Ok((None, ids)) => match ids.first().and_then(|id| doc.get_dictionary(*id).ok()).cloned() {
-            Some(d) => d,
-            None => return Vec::new(),
-        },
-        Err(_) => return Vec::new(),
-    };
-    let xmap = xobjects_of(doc, &resources);
-    // `decode_text_ctm` only emits spans INSIDE a Form XObject (depth ≥ 1). If the page
-    // references no form, there is nothing to collect — skip the page-content decode,
-    // font build, and op walk entirely (a large saving on form-free pages).
-    let has_form = xmap.values().any(|&id| {
-        doc.get_object(id)
-            .ok()
-            .and_then(|o| o.as_stream().ok())
-            .and_then(|s| s.dict.get(b"Subtype").ok())
-            .and_then(|o| o.as_name().ok())
-            == Some(b"Form")
-    });
-    if !has_form {
-        return Vec::new();
-    }
-    let content = match doc.get_and_decode_page_content(page_id) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    let fonts = build_fonts(doc, page_id, raw);
-    let mut out = Vec::new();
-    decode_text_ctm(doc, &content.operations, &fonts, &xmap, Mat::ID, raw, 0, &mut out);
-    out
-}
-
-/// XObject name -> object id from a resources dict.
-fn xobjects_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, ObjectId> {
-    let mut map = HashMap::new();
-    if let Some(xd) = resources.get(b"XObject").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
-        for (name, val) in xd.iter() {
-            if let Ok(id) = val.as_reference() {
-                map.insert(name.clone(), id);
-            }
-        }
-    }
-    map
-}
-
-/// Decode text with graphics-CTM tracking, recursing into Form XObjects. Emits
-/// spans only at depth >= 1 (inside a form), mapped to page space via the CTM.
-#[allow(clippy::too_many_arguments)]
-fn decode_text_ctm(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashMap<Vec<u8>, FontInfo>, xmap: &HashMap<Vec<u8>, ObjectId>, base: Mat, raw: &[u8], depth: u32, out: &mut Vec<Span>) {
-    if depth > crate::MAX_FORM_DEPTH {
-        return;
-    }
-    let mut g = base; // graphics CTM (form placement)
-    let mut gstack: Vec<Mat> = Vec::new();
-    let mut tm = Mat::ID;
-    let mut tlm = Mat::ID;
-    let mut leading = 0.0f32;
-    let mut size = 0.0f32;
-    let mut tc = 0.0f32;
-    let mut tw = 0.0f32;
-    let mut cur: Option<&FontInfo> = None;
-
-    let emit_show = |elems: &[Show], cur: Option<&FontInfo>, size: f32, tc: f32, tw: f32, tm: &mut Mat, g: Mat, out: &mut Vec<Span>| {
-        let style = cur.map(|f| (f.bold, f.italic, f.mono, f.font_id)).unwrap_or((false, false, false, 0));
-        let (words, total) = decode_words(elems, cur, size, tc, tw);
-        for wd in words {
-            let posm = Mat::translate(wd.x_off, 0.0).mul(*tm).mul(g);
-            let scalem = tm.mul(g);
-            // Upright form text keeps `size × d`; rotated form labels use the magnitude
-            // (so a rotated label inside a figure form isn't dropped on a near-zero `d`).
-            // Detect rotation by the BASELINE angle so italic skew stays upright.
-            let baseline = scalem.b.atan2(scalem.a);
-            let rotated = baseline.abs() > 0.1;
-            let rendered = if rotated {
-                size * (scalem.c * scalem.c + scalem.d * scalem.d).sqrt()
-            } else {
-                size * scalem.d
-            };
-            let angle = if rotated { baseline } else { 0.0 };
-            if depth >= 1 && !wd.text.is_empty() && rendered.abs() >= 2.0 {
-                out.push(Span {
-                    x: posm.e,
-                    y: posm.f,
-                    size: rendered.abs().max(1.0),
-                    width: (wd.width * scalem.a).abs(),
-                    text: wd.text,
-                    bold: style.0,
-                    italic: style.1,
-                    mono: style.2,
-                    angle,
-                    font: style.3,
-                });
-            }
-        }
-        *tm = Mat::translate(total, 0.0).mul(*tm);
-    };
-
-    for op in ops {
-        let o = &op.operands;
-        match op.operator.as_str() {
-            "q" => gstack.push(g),
-            "Q" => {
-                if let Some(m) = gstack.pop() {
-                    g = m;
-                }
-            }
-            "cm" if o.len() >= 6 => {
-                g = Mat { a: num(&o[0]), b: num(&o[1]), c: num(&o[2]), d: num(&o[3]), e: num(&o[4]), f: num(&o[5]) }.mul(g);
-            }
-            "BT" => {
-                tm = Mat::ID;
-                tlm = Mat::ID;
-            }
-            "Tf" => {
-                if let Some(Object::Name(n)) = o.first() {
-                    cur = fonts.get(n);
-                }
-                if let Some(s) = o.get(1) {
-                    size = num(s);
-                }
-            }
-            "Td" if o.len() >= 2 => {
-                tlm = Mat::translate(num(&o[0]), num(&o[1])).mul(tlm);
-                tm = tlm;
-            }
-            "TD" if o.len() >= 2 => {
-                leading = -num(&o[1]);
-                tlm = Mat::translate(num(&o[0]), num(&o[1])).mul(tlm);
-                tm = tlm;
-            }
-            "Tm" if o.len() >= 6 => {
-                tlm = Mat { a: num(&o[0]), b: num(&o[1]), c: num(&o[2]), d: num(&o[3]), e: num(&o[4]), f: num(&o[5]) };
-                tm = tlm;
-            }
-            "TL" if !o.is_empty() => leading = num(&o[0]),
-            "Tc" if !o.is_empty() => tc = num(&o[0]),
-            "Tw" if !o.is_empty() => tw = num(&o[0]),
-            "T*" => {
-                tlm = Mat::translate(0.0, -leading).mul(tlm);
-                tm = tlm;
-            }
-            "Tj" => {
-                if let Some(Object::String(s, _)) = o.first() {
-                    emit_show(&[Show::Str(s)], cur, size, tc, tw, &mut tm, g, out);
-                }
-            }
-            "'" | "\"" => {
-                tlm = Mat::translate(0.0, -leading).mul(tlm);
-                tm = tlm;
-                if let Some(Object::String(s, _)) = o.last() {
-                    emit_show(&[Show::Str(s)], cur, size, tc, tw, &mut tm, g, out);
-                }
-            }
-            "TJ" => {
-                if let Some(Object::Array(arr)) = o.first() {
-                    let elems: Vec<Show> = arr
-                        .iter()
-                        .filter_map(|el| match el {
-                            Object::String(s, _) => Some(Show::Str(s)),
-                            Object::Integer(n) => Some(Show::Kern(*n as f32)),
-                            Object::Real(r) => Some(Show::Kern(*r)),
-                            _ => None,
-                        })
-                        .collect();
-                    emit_show(&elems, cur, size, tc, tw, &mut tm, g, out);
-                }
-            }
-            "Do" => {
+            // Draw a Form XObject: recurse into its content so body text rendered
+            // through a template/overlay form is captured (placed under the form's
+            // /Matrix and the CTM in effect at the `Do`). Inline images / non-Form
+            // XObjects carry no text and are skipped.
+            "Do" if depth < crate::MAX_FORM_DEPTH => {
                 let id = match o.first().and_then(|x| x.as_name().ok()).and_then(|n| xmap.get(n)) {
                     Some(&id) => id,
                     None => continue,
@@ -1356,17 +1210,44 @@ fn decode_text_ctm(doc: &Document, ops: &[lopdf::content::Operation], fonts: &Ha
                     .filter(|a| a.len() >= 6)
                     .map(|a| Mat { a: num(&a[0]), b: num(&a[1]), c: num(&a[2]), d: num(&a[3]), e: num(&a[4]), f: num(&a[5]) })
                     .unwrap_or(Mat::ID);
+                // A form's fonts/XObjects live in its OWN /Resources (PDF spec: a form
+                // inherits the page's, never the invoking form's). Without Resources we
+                // can't resolve its fonts, so skip rather than mis-decode.
                 if let Some(fr) = stream.dict.get(b"Resources").ok().and_then(|x| deref(doc, x)).and_then(|x| x.as_dict().ok()).cloned() {
                     let ff = build_fonts_from_resources(doc, &fr, raw);
                     let fx = xobjects_of(doc, &fr);
                     if let Ok(content) = lopdf::content::Content::decode(&stream.decompressed_content().unwrap_or_default()) {
-                        decode_text_ctm(doc, &content.operations, &ff, &fx, fm.mul(g), raw, depth + 1, out);
+                        decode_spans(doc, &content.operations, &ff, &fx, fm.mul(ctm), raw, depth + 1, spans);
                     }
                 }
             }
             _ => {}
         }
     }
+}
+
+/// Drop spans that coincide with one already emitted — same text at the same
+/// position (to the nearest point). Some generators draw each glyph run twice at
+/// the same spot (faux-bold / a duplicated content block); a viewer overprints
+/// them into one, but extraction sees both, doubling every token. This is a
+/// general structural de-duplication (what mature extractors do), not a per-doc
+/// patch: two *distinct* words can never share an identical baseline position.
+fn dedup_coincident(spans: &mut Vec<Span>) {
+    let mut seen = std::collections::HashSet::new();
+    spans.retain(|s| seen.insert((s.x.round() as i32, s.y.round() as i32, s.text.clone())));
+}
+
+/// XObject name -> object id from a resources dict.
+fn xobjects_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, ObjectId> {
+    let mut map = HashMap::new();
+    if let Some(xd) = resources.get(b"XObject").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
+        for (name, val) in xd.iter() {
+            if let Ok(id) = val.as_reference() {
+                map.insert(name.clone(), id);
+            }
+        }
+    }
+    map
 }
 
 /// Effective span width (fall back to a char estimate if widths were absent).

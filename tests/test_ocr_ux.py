@@ -364,3 +364,48 @@ def test_tesseract_is_the_fast_default_when_compiled_in():
     assert be.name == "tesseract" and be.tier == "fast"
     d = {r.name: r for r in ocr.backend_descriptors()}["tesseract"]
     assert d.tier == "fast" and d.bundled and d.offline and not d.structure_aware
+
+
+def test_doctags_text_len_strips_tags():
+    # a true image (no text) reads as 0; tags don't count toward the length
+    assert ocr._doctags_text_len("") == 0
+    assert ocr._doctags_text_len("<loc_1><loc_2><loc_3><loc_4>") == 0
+    assert ocr._is_text_image("<loc_1><loc_2><loc_3><loc_4>Encaminhe-se a Reclamacao")
+    assert not ocr._is_text_image("<loc_1><loc_2><loc_3><loc_4>x")  # one stray char
+
+
+class _FakeGate:
+    """Stand-in for the bundled Tesseract gate: returns canned (raw_words, conf_chars)."""
+    def __init__(self, stats):
+        self._stats = stats
+
+    def classify(self, image):
+        return self._stats
+
+
+def test_gate_routes_text_vs_image(monkeypatch):
+    # a page with confident text -> run the model
+    assert ocr._gate_says_text(_FakeGate((400, 2500)), b"img")
+    # many low-confidence words (a faded-but-legible scan) -> run the model
+    assert ocr._gate_says_text(_FakeGate((120, 0)), b"img")
+    # Tesseract reads nothing: the ink rescue decides. Substantial ink -> run the model
+    monkeypatch.setattr(ocr, "_image_has_content", lambda img: True)
+    assert ocr._gate_says_text(_FakeGate((0, 0)), b"img")
+    # ...blank/near-blank -> skip (stays an image)
+    monkeypatch.setattr(ocr, "_image_has_content", lambda img: False)
+    assert not ocr._gate_says_text(_FakeGate((0, 0)), b"img")
+
+
+def test_image_ink_permille_blank_vs_inked():
+    # the rescue signal: a near-blank image is ~0, an inked one is well above the floor
+    from distillpdf import _distillpdf
+    import io
+    try:
+        from PIL import Image
+    except Exception:
+        import pytest
+        pytest.skip("PIL not available to synthesize a test image")
+    white = io.BytesIO(); Image.new("RGB", (64, 64), "white").save(white, "PNG")
+    black = io.BytesIO(); Image.new("RGB", (64, 64), "black").save(black, "PNG")
+    assert _distillpdf.image_ink_permille(white.getvalue()) < ocr._RESCUE_MIN_INK_PERMILLE
+    assert _distillpdf.image_ink_permille(black.getvalue()) >= ocr._RESCUE_MIN_INK_PERMILLE

@@ -17,6 +17,42 @@ use base64::Engine as _;
 /// A backend that turns a single page image (PNG/JPEG bytes) into a DocTags string.
 pub(crate) trait OcrEngine: Sync {
     fn ocr_page(&self, image: &[u8]) -> Result<String, String>;
+
+    /// Classify a page image for the text-vs-true-image gate: `(raw_words, confident_chars)`.
+    /// `raw_words` ignores confidence — a blurry photo of a text document still reports many
+    /// word-like tokens, whereas a genuine image (a photo, a signature) reports almost none;
+    /// `confident_chars` is the text that survives the engine's own confidence filter (what
+    /// the DocTags hold). The default derives both from the DocTags output; the Tesseract
+    /// engine overrides it with the true pre-filter word count, which is exactly what tells a
+    /// hard-but-readable text scan apart from a real image.
+    fn classify(&self, image: &[u8]) -> Result<(usize, usize), String> {
+        Ok(doctags_text_stats(&self.ocr_page(image)?))
+    }
+}
+
+/// Strip `<...>` tags from a DocTags string and return (word-like-token count, non-space
+/// char count). A "word" is a whitespace token with >= 2 alphanumeric chars, so stray
+/// specks/punctuation don't inflate it.
+pub(crate) fn doctags_text_stats(doctags: &str) -> (usize, usize) {
+    let mut text = String::with_capacity(doctags.len());
+    let mut in_tag = false;
+    for c in doctags.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                text.push(' ');
+            }
+            _ if !in_tag => text.push(c),
+            _ => {}
+        }
+    }
+    let words = text
+        .split_whitespace()
+        .filter(|w| w.chars().filter(|c| c.is_alphanumeric()).count() >= 2)
+        .count();
+    let chars = text.chars().filter(|c| !c.is_whitespace()).count();
+    (words, chars)
 }
 
 /// Engine-agnostic options parsed from the Python side (a plain dict crosses the PyO3

@@ -182,8 +182,11 @@ impl TesseractEngine {
     }
 }
 
-impl OcrEngine for TesseractEngine {
-    fn ocr_page(&self, image: &[u8]) -> Result<String, String> {
+impl TesseractEngine {
+    /// Run recognition and return the raw recognized lines plus the image dimensions. Shared
+    /// by `ocr_page` (→ DocTags) and `classify` (→ text-vs-image stats) so a single Tesseract
+    /// pass serves both.
+    fn recognize(&self, image: &[u8]) -> Result<(Vec<OcrLine>, i32, i32), String> {
         let img = image::load_from_memory(image).map_err(|e| format!("decode image: {e}"))?.to_rgb8();
         let (w, h) = (img.width() as i32, img.height() as i32);
         let raw = img.into_raw(); // tightly packed RGB
@@ -219,6 +222,21 @@ impl OcrEngine for TesseractEngine {
             }
         }
         drop(guard);
+        Ok((lines, w, h))
+    }
+}
+
+impl OcrEngine for TesseractEngine {
+    fn ocr_page(&self, image: &[u8]) -> Result<String, String> {
+        let (lines, w, h) = self.recognize(image)?;
         Ok(lines_to_doctags(lines, w, h))
+    }
+
+    /// True raw (pre-confidence-filter) word count + confident chars — lets the text-vs-image
+    /// gate keep a hard-but-readable scan (many words, low confidence) while skipping a genuine
+    /// image (almost no words).
+    fn classify(&self, image: &[u8]) -> Result<(usize, usize), String> {
+        let (lines, _w, _h) = self.recognize(image)?;
+        Ok(super::tess_synth::classify_lines(&lines))
     }
 }

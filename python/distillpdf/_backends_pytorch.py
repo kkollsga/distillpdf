@@ -3,8 +3,9 @@
 This is the **accurate** tier's default on Windows / Linux / Intel-Mac: unlike the GGUF
 runtime (`_backends_granite.py`, which needs a compiler when no llama-cpp-python wheel
 exists), PyTorch ships prebuilt wheels for every platform and Python version, so
-``pip install 'distillpdf[ocr]'`` works with **no C++ compiler**. Apple Silicon keeps the
-lighter MLX backend. The same accurate granite-docling VLM, same DocTags output.
+``pip install torch "transformers>=4.57,<5" pillow`` works with **no C++ compiler**. Apple
+Silicon keeps the lighter MLX backend. The same accurate granite-docling VLM, same DocTags
+output.
 
 Runs the official transformers checkpoint ``ibm-granite/granite-docling-258M`` (idefics3):
 the processor splits the page internally, so no manual tiling. CPU by default (slower) or

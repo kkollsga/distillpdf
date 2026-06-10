@@ -45,12 +45,49 @@ pub(crate) fn lines_to_doctags(mut lines: Vec<OcrLine>, w: i32, h: i32) -> Strin
     out
 }
 
+/// Stats for the text-vs-true-image gate, over ALL recognized lines: `(raw_words,
+/// confident_chars)`. `raw_words` ignores confidence — a blurry photo of text still yields
+/// many word-like tokens, whereas a genuine image yields almost none. `confident_chars`
+/// counts non-space characters on lines that pass [`MIN_CONF`] (what the DocTags contain).
+/// A "word" is a whitespace token with >= 2 alphanumeric chars, so specks and stray
+/// punctuation don't inflate the count.
+pub(crate) fn classify_lines(lines: &[OcrLine]) -> (usize, usize) {
+    let mut words = 0usize;
+    let mut conf_chars = 0usize;
+    for ln in lines {
+        for w in ln.text.split_whitespace() {
+            if w.chars().filter(|c| c.is_alphanumeric()).count() >= 2 {
+                words += 1;
+            }
+        }
+        if ln.conf >= MIN_CONF {
+            conf_chars += ln.text.chars().filter(|c| !c.is_whitespace()).count();
+        }
+    }
+    (words, conf_chars)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn line(text: &str, x1: i32, y1: i32, x2: i32, y2: i32, conf: f32) -> OcrLine {
         OcrLine { text: text.into(), x1, y1, x2, y2, conf }
+    }
+
+    #[test]
+    fn classify_separates_photo_from_text_scan() {
+        // A genuine image: Tesseract finds almost no word-like tokens.
+        let photo = vec![line(".", 0, 0, 5, 5, 8.0), line("- ~", 0, 10, 9, 15, 5.0)];
+        let (raw, conf) = classify_lines(&photo);
+        assert!(raw <= 1 && conf == 0, "photo: raw={raw} conf={conf}");
+        // A poor scan of text: many word tokens, but all below MIN_CONF (low confidence).
+        let bad_scan: Vec<OcrLine> = (0..30)
+            .map(|i| line("foo bar baz qux", 0, i * 10, 200, i * 10 + 8, 18.0))
+            .collect();
+        let (raw, conf) = classify_lines(&bad_scan);
+        assert!(raw >= 100, "bad scan raw words={raw}");
+        assert_eq!(conf, 0, "all below MIN_CONF, so no confident chars");
     }
 
     #[test]

@@ -1,10 +1,10 @@
 """OCR backends for distillpdf.
 
 distillpdf's core (detection, DocTags parsing, HTML/searchable-PDF rendering) is pure
-Rust and always available. *Running the OCR model* is optional and pulls in larger
-dependencies, installed via:
-
-    pip install 'distillpdf[ocr]'
+Rust and always available, and the default **fast** OCR engine (Tesseract) is bundled in
+the wheel. The higher-accuracy **accurate** tier (granite-docling VLM) needs a heavier,
+platform-specific runtime you install yourself — there is no catch-all extra; print the
+exact per-OS commands with ``distillpdf.ocr.install_help('granite')``.
 
 A backend is a thin, standardized wrapper around a model: it handles model download /
 caching (``model_dir``) and authentication (``hf_token``), and turns a page image into
@@ -456,9 +456,73 @@ def _auto_progress(total: int):
     return cb, bar.close
 
 
+# Below this many non-whitespace characters, a page's OCR result is treated as a *true
+# image* (a photo / signature / stamp scan Tesseract reads as ~nothing) rather than a
+# *text image* — so the page keeps its own raster instead of being blanked or fed to the
+# expensive model. A genuine text scan yields far more than this.
+_TEXT_IMAGE_MIN_CHARS = 8
+
+
+def _doctags_text_len(doctags: Optional[str]) -> int:
+    """Visible text length of a DocTags string: tags stripped, whitespace ignored. The
+    signal that distinguishes a text image (real recovered text) from a true image."""
+    return len("".join(_re.sub(r"<[^>]*>", " ", doctags or "").split()))
+
+
+def _is_text_image(doctags: Optional[str]) -> bool:
+    return _doctags_text_len(doctags) >= _TEXT_IMAGE_MIN_CHARS
+
+
+# When the bundled Tesseract gates the expensive accurate model, a page it reads as fewer
+# than this many RAW word-like tokens (ignoring confidence) is treated as having no
+# Tesseract-readable text. A poor-quality scan of text still yields far more word tokens than
+# this even when Tesseract's confidence is too low to use the text — so granite runs on it.
+_GATE_MIN_RAW_WORDS = 25
+
+# Rescue: a page Tesseract can't read at all (e.g. a degraded color-photo of a document) may
+# still be readable by the VLM. If such a page carries at least this much ink (per-mille of
+# dark pixels) it has real content — a scan or a photo, not a blank — and is sent to the
+# accurate model anyway. A blank/near-blank page stays an image.
+_RESCUE_MIN_INK_PERMILLE = 40
+
+
+def _image_has_content(image: bytes) -> bool:
+    """Whether a page image is more than blank/near-blank — the rescue signal for pages
+    Tesseract reads as no text. Returns False when the compiled core lacks the ink helper."""
+    try:
+        from ._distillpdf import image_ink_permille
+    except Exception:  # pragma: no cover - extension predates the ink helper
+        return False
+    return image_ink_permille(bytes(image)) >= _RESCUE_MIN_INK_PERMILLE
+
+
+def _gate_says_text(gate: "OcrBackend", image: bytes) -> bool:
+    """Should this page get the expensive accurate-tier pass? Prefers the precise classifier
+    (``raw_words`` ignores OCR confidence, so a blurry-but-legible scan still counts). When
+    Tesseract reads ~nothing, rescue a page that still has substantial ink (a degraded scan
+    the VLM may read) and skip only blanks. Falls back to the gate's confident DocTags text
+    when the compiled core lacks the classifier."""
+    stats = gate.classify(image)
+    if stats is not None:
+        raw_words, conf_chars = stats
+        if conf_chars >= _TEXT_IMAGE_MIN_CHARS or raw_words >= _GATE_MIN_RAW_WORDS:
+            return True
+        return _image_has_content(image)
+    return _is_text_image(gate.ocr_page(image))
+
+
 def _doctags_for(pdf, backend: OcrBackend, only: Optional[set] = None,
                  progress: Optional[Callable[[int, int, int], None]] = None) -> Dict[int, str]:
-    """Run `backend` on every page the Rust core flags for OCR; return {page: DocTags}.
+    """Run `backend` on every page the Rust core flags as a candidate (image present, no
+    usable born-digital text) and return {page: DocTags} for the ones that turn out to hold
+    text. The text-vs-image call is made by *reading the pixels*, not by an upfront guess:
+
+    * **fast tier** — Tesseract runs and is its own decider; a page whose result has no real
+      text is a true image and is left as its raster (not stored, so the figure is kept).
+    * **accurate tier** — the bundled Tesseract is a cheap *gate*: it runs first, and the
+      heavy model (granite) only runs on pages it confirms contain text. A photo/stamp scan
+      never reaches the expensive pass. (If the heavy model returns nothing on a confirmed
+      page, we fall back to the gate's text.)
 
     `progress(page, done, total)` is called after each page. If `progress` is None (the
     default) a tqdm bar is shown automatically on an interactive terminal; pass
@@ -467,14 +531,39 @@ def _doctags_for(pdf, backend: OcrBackend, only: Optional[set] = None,
             if it["needs_ocr"] and it["image"] and (only is None or it["page"] in only)]
     total = len(plan)
     out: Dict[int, str] = {}
+    samples = [bytes(it["image"]) for it in plan[:3]]
     # One-time backend setup on a sample (e.g. language auto-detection) before the loop.
-    backend.prepare([bytes(it["image"]) for it in plan[:3]])
+    backend.prepare(samples)
+    # For a heavy (accurate) backend, gate each page with the bundled fast engine so the
+    # expensive model only runs where there's actually text. The fast tier needs no separate
+    # gate — its own output is the decision.
+    gate: Optional[OcrBackend] = None
+    if getattr(backend, "tier", None) == "accurate" and _fast_backend_name():
+        gate = backend_for("fast")
+        gate.prepare(samples)
     closer = None
     if progress is None:
         progress, closer = _auto_progress(total)
     try:
         for i, item in enumerate(plan, 1):
-            out[item["page"]] = backend.ocr_page(bytes(item["image"]))
+            img = bytes(item["image"])
+            if gate is None:
+                # Fast tier: Tesseract is its own decider — keep its text, or leave the page as
+                # its raster when it found none (a true image), rather than blanking it.
+                dt = backend.ocr_page(img)
+                if _is_text_image(dt):
+                    out[item["page"]] = dt
+            elif _gate_says_text(gate, img):
+                # Accurate tier, text page: run the expensive model. If it comes back empty on
+                # a page Tesseract said holds text, fall back to the Tesseract text.
+                dt = backend.ocr_page(img)
+                if _is_text_image(dt):
+                    out[item["page"]] = dt
+                else:
+                    probe = gate.ocr_page(img)
+                    if _is_text_image(probe):
+                        out[item["page"]] = probe
+            # else (accurate tier, genuine image): skip the model, keep the page's raster.
             if progress:
                 progress(item["page"], i, total)
     finally:
