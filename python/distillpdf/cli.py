@@ -17,7 +17,10 @@
     distillpdf scan.pdf --ocr -o out.html      # ...or OCR'd HTML / Markdown (by extension)
     distillpdf scan.pdf --ocr --remove-raster  # reflow to clean text, drop the page images
 
-When the input is a distilled `.dpdf` model rather than a source PDF, the document-shell
+    distillpdf case.pdf -o case.dpdf           # distill the durable .dpdf document model
+
+A `.dpdf` OUTPUT path distills the durable model (distillpdf.Pdf.distill) instead of
+converting. When the INPUT is a distilled `.dpdf` model rather than a source PDF, the document-shell
 verbs apply instead — `info / toc / read / find / tables / figures / ocr-status` (see
 distillpdf.shell). The convert behaviour above is unchanged for PDFs.
 """
@@ -131,6 +134,12 @@ def main(argv=None):
     if args.ocr:
         return _run_ocr(args)
 
+    # `distillpdf case.pdf -o case.dpdf` distills the durable model instead of converting.
+    # (A `.dpdf` *input* with a verb already routed to the shell above; this is a .dpdf
+    # OUTPUT path on a PDF input.)
+    if args.output and args.output.lower().endswith(".dpdf"):
+        return _run_distill(args)
+
     multiple = len(args.pdf) > 1
     rc = 0
     for src in args.pdf:
@@ -183,6 +192,32 @@ def main(argv=None):
             with open(dest, "w", encoding="utf-8") as f:
                 f.write(content)
             print(f"distillpdf: wrote {dest}", file=sys.stderr)
+    return rc
+
+
+def _run_distill(args):
+    """`-o <file>.dpdf`: distill each input PDF to a durable ``.dpdf`` document model (a zip of
+    model.json + assets) instead of converting it. For a single input the ``.dpdf`` path is the
+    output; for a batch, ``-o`` names a directory and each input writes ``<stem>.dpdf`` into it.
+    Reuses the convert CLI's ``--image-mode``? No — the asset profile is the .dpdf knob; the
+    default ('figures') is used. Errors are reported per file."""
+    multiple = len(args.pdf) > 1
+    out_dir = args.output if multiple else None
+    if out_dir is not None:
+        os.makedirs(out_dir, exist_ok=True)
+    rc = 0
+    for src in args.pdf:
+        try:
+            pdf = _open(src)._pdf  # the Rust core carries distill()
+            if multiple:
+                stem = os.path.splitext(os.path.basename(src))[0]
+                dest = pdf.distill(os.path.join(out_dir, stem + ".dpdf"))
+            else:
+                dest = pdf.distill(args.output)
+            print(f"distillpdf: wrote {dest}", file=sys.stderr)
+        except Exception as e:  # malformed PDF, unwritable path, etc.
+            print(f"distillpdf: {src}: {e}", file=sys.stderr)
+            rc = 1
     return rc
 
 

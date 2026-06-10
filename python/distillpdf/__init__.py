@@ -10,7 +10,9 @@ from ._distillpdf import (
     render_text,
 )
 from . import ocr
+from .doc import Doc
 from .document import Document
+from .dpdf import DpdfError, FindResult
 from .ocr import OcrBackend, OcrConfig, OcrDependencyError, available_backends, get_backend
 
 
@@ -25,15 +27,28 @@ def from_bytes(data: bytes) -> Document:
     return Document.from_bytes(data)
 
 
+def load(path: str) -> Doc:
+    """Load a distilled ``.dpdf`` document model from a path. Returns a :class:`Doc` — the
+    single-document reading surface (sections, blocks, ``find``, fidelity re-renders). The
+    counterpart to :func:`open`: ``open`` reads a source PDF, ``load`` reads a model distilled
+    from one (``distillpdf.open('x.pdf').distill('x.dpdf')``). Raises
+    :class:`~distillpdf.dpdf.DpdfError` when ``path`` is not a readable ``.dpdf``."""
+    return Doc.load(path)
+
+
 __all__ = [
     "Pdf",
     "Document",
+    "Doc",
     "open",
     "from_bytes",
+    "load",
     "load_model",
     "render_html",
     "render_markdown",
     "render_text",
+    "DpdfError",
+    "FindResult",
     "__version__",
     "ocr",
     "OcrBackend",

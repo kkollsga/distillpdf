@@ -70,27 +70,12 @@ def _asset_profile(model: Model) -> dict[str, int]:
 
 
 def verb_info(model: Model, args: argparse.Namespace) -> int:
+    # One source of truth for the info roll-up: Doc.info() shapes it, the CLI prints it.
+    from .doc import Doc
+
+    data = Doc.from_model(model).info()
     src = model.source
-    kinds = model.indexes.get("kinds", {})
-    ocr = _ocr_state_summary(model)
-    data = {
-        "schema_version": model.schema_version,
-        "source": {
-            "file": src.get("file"),
-            "sha256_prefix": (src.get("sha256") or "")[:12],
-            "distillpdf": src.get("distillpdf"),
-            "generated_at": src.get("generated_at"),
-        },
-        "pages": len(model.pages),
-        "sections": len(model.sections),
-        "blocks": len(model.blocks),
-        "tables": len(kinds.get("table", [])),
-        "figures": len(kinds.get("figure", [])),
-        "footnotes": len(kinds.get("footnote", [])),
-        "ocr": ocr,
-        "assets": _asset_profile(model),
-        "coverage": model.indexes.get("coverage", {}),
-    }
+    ocr = data["ocr"]
     if args.json:
         _emit_json(data)
         return 0
@@ -144,17 +129,11 @@ def verb_toc(model: Model, args: argparse.Namespace) -> int:
 # ---- tables / figures (kind index listings) --------------------------------
 
 def _kind_listing(model: Model, kind: str, args: argparse.Namespace) -> int:
-    entries = model.indexes.get("kinds", {}).get(kind, [])
-    rows = []
-    for e in entries:
-        b = model.block_by_id(e["id"]) or {}
-        caption = (b.get("caption") or "").splitlines()
-        rows.append({
-            "id": e["id"],
-            "label": e.get("label"),
-            "page": e.get("page"),
-            "caption": caption[0] if caption else None,
-        })
+    from .doc import Doc
+
+    # Shared row shape with Doc.tables()/figures() (each row carries an extra page_label the
+    # human listing recomputes via page_label_suffix); the id threads into the next call.
+    rows = Doc.from_model(model)._kind_index(kind)
     if args.json:
         _emit_json({kind + "s": rows})
         return 0

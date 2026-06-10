@@ -587,6 +587,53 @@ def gen_links():
     }
 
 
+# --------------------------------------------------------------------------- pagelabels
+def gen_pagelabels():
+    """A hand-written PDF carrying a real ``/PageLabels`` number tree (reportlab cannot emit
+    one). Four pages: front matter labelled lowercase-roman ``i, ii`` (style ``/r``), then the
+    body labelled arabic ``1, 2`` (style ``/D``) restarting at 1. The model build's
+    ``page_labels`` reader fills ``pages[n].labels.pdf`` from this, so distill → ``read --pages
+    ii`` / ``find --pages 1`` resolve a LABEL to its physical page (the Wave-3 gap: no owned
+    fixture carried /PageLabels). Each page has one short heading + body line so it yields real
+    sections/blocks to read and find."""
+    pdf = os.path.join(OUT, "pagelabels.pdf")
+
+    def page_content(head, body):
+        return (b"BT /F1 16 Tf 72 720 Td (%s) Tj ET\n"
+                b"BT /F1 11 Tf 72 690 Td (%s) Tj ET" % (head, body))
+
+    pages = [
+        (b"Preface", b"The preface is front matter on roman page i of the document."),
+        (b"Acknowledgements", b"Acknowledgements continue the front matter on roman page ii."),
+        (b"Introduction", b"The introduction opens the body on arabic page 1 of the work."),
+        (b"Methods", b"The methods section is the body content on arabic page 2 here."),
+    ]
+    # Object plan: 1 catalog, 2 pages-tree, 3 font, 4..7 page dicts, 8..11 content streams,
+    # 12 PageLabels dict. Page kids 4,5,6,7.
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R /PageLabels 12 0 R >>",
+        2: b"<< /Type /Pages /Kids [4 0 R 5 0 R 6 0 R 7 0 R] /Count 4 >>",
+        3: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        12: (b"<< /Nums [ 0 << /S /r >> 2 << /S /D /St 1 >> ] >>"),
+    }
+    for i, (head, body) in enumerate(pages):
+        page_num = 4 + i
+        content_num = 8 + i
+        objs[page_num] = (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>" % content_num)
+        c = page_content(head, body)
+        objs[content_num] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c), c)
+    _assemble_pdf(objs, pdf)
+    GT["pagelabels.pdf"] = {
+        "labels": {1: "i", 2: "ii", 3: "1", 4: "2"},  # physical page -> /PageLabels label
+        "roman_pages": ["i", "ii"],
+        "arabic_pages": ["1", "2"],
+        "page_ii_text": "front matter on roman page ii",
+        "page_arabic1_text": "opens the body on arabic page 1",
+    }
+
+
 # -------------------------------------------------------------------------- typography
 def gen_typography():
     """Superscript / subscript (via text rise so they stay on one line), accented Latin
@@ -1028,6 +1075,7 @@ def main():
     gen_small_vector_fig()
     gen_no_spurious_figs()
     gen_links()
+    gen_pagelabels()
     gen_typography()
     gen_twocol()
     gen_twocol_tight()

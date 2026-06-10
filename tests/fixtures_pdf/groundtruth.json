@@ -308,5 +308,23 @@
       "Results and Discussion"
     ],
     "body_snippet": "ordinary Helvetica prose at the body size"
+  },
+  "pagelabels.pdf": {
+    "labels": {
+      "1": "i",
+      "2": "ii",
+      "3": "1",
+      "4": "2"
+    },
+    "roman_pages": [
+      "i",
+      "ii"
+    ],
+    "arabic_pages": [
+      "1",
+      "2"
+    ],
+    "page_ii_text": "front matter on roman page ii",
+    "page_arabic1_text": "opens the body on arabic page 1"
   }
 }

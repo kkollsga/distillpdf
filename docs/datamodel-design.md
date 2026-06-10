@@ -1,9 +1,30 @@
 # The distillPDF document model (`.dpdf`) — design proposal
 
-*Status: design draft, not yet scheduled. Origin: 2026-06-10 cross-library analysis
-with kglite-docs (the first downstream consumer). Companion to the fidelity
-worklist in `ROADMAP.md` — this is the "engine track": making distillPDF the
+*Status: **engine track Waves 1–4 implemented** (the model + container + load,
+renderers-from-model, the agent CLI, and the public `Doc` API + `distillpdf.load`).
+`schema_version` is still `0` — the phase-4 downstream cutover (kglite-docs on the
+1,564-page legal corpus) is the gate that promotes it to `1`. OCR-pass writing (phase 2)
+and per-block bboxes are not yet filled (see the notes below). Origin: 2026-06-10
+cross-library analysis with kglite-docs (the first downstream consumer). Companion to the
+fidelity worklist in `ROADMAP.md` — this is the "engine track": making distillPDF the
 extraction engine other systems build on, not just a converter.*
+
+> **Implementation notes (Waves 1–4).**
+> * **Render fidelity — the "renderers are pure functions of the model" property.** Satisfied
+>   in practice via a **verbatim per-page body** captured at distill time plus a shared
+>   *assemble tail* (TOC nav, section grouping, document chrome) applied at render time:
+>   `render_html`/`render_markdown`/`render_text` reproduce the source PDF's
+>   `to_html`/`to_markdown`/`extract_text` (with `image_mode="drop"`, the born-digital model
+>   carrying no figure bytes) **byte-for-byte**. The **blocks** array remains the
+>   query/index source of truth (reading order, ids, sections, kinds); the per-page body is
+>   the fidelity surface. The two are intentionally distinct — the query-markdown view
+>   (`Doc.section`, the `read` verb) is addressable per section/block/page, the fidelity view
+>   is whole-document — and each is documented as which it is.
+> * **`bbox` is deferred.** Block records carry no `bbox` yet (the schema sketch's
+>   `"bbox": […]` and `detail="spans"` are not implemented). Citations resolve to
+>   `(block id, section, physical page, page label)` — enough for the agent-CLI and `Doc`
+>   surface — and per-block geometry is a later additive field behind the version bump, not a
+>   silent omission.
 
 ## Why
 
@@ -239,9 +260,14 @@ for code, applied to documents):
 
 - **Tier 1 — the JSON itself.** Agent-legible with file tools alone; the
   stored indexes make it navigable without computation.
-- **Tier 2 — accessors + CLI:** `Doc.load("case.dpdf")`, `.section(id)`,
-  `.tables()`, `.page(5)`, `.find("phrase")`, `.ocr_passes(page=…)`,
-  `.diff_ocr("p1","p2",page=…)`; the CLI above is the same surface.
+- **Tier 2 — accessors + CLI:** `distillpdf.load("case.dpdf")` → `Doc`, with
+  `.pages` / `.sections` / `.toc()`, `.section(id)`, `.blocks(kind=, section=,
+  pages=)` / `.block(id)`, `.tables()` / `.figures()`, `.find("phrase", …)`
+  (returns a coverage-honest `FindResult`), `.info()`, `.ocr_passes()` /
+  `.ocr_status()`, and the fidelity re-renders `.to_html()` / `.to_markdown()` /
+  `.text()`; the CLI above is the same surface over the same internal reader, so
+  the two cannot drift. (Per-pass `.diff_ocr(…)` waits on phase-2 OCR-pass
+  writing.)
 - **Stop there.** Cross-document indexing, embeddings, semantic search,
   coverage accounting across a corpus, annotations — that's the corpus layer
   (kglite-docs), which consumes `.dpdf` as its ingestion contract. distillPDF

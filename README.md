@@ -171,6 +171,65 @@ doc.extract_fonts()    # font inventory
 doc.page_count()       # number of pages
 ```
 
+## The `.dpdf` document model
+
+distillPDF builds a typed element tree per document — reading order, headings, the section
+tree, tables, figures, OCR provenance — and normally renders it once and throws it away.
+**Distilling** persists that analysis to a `.dpdf` file (a zip of `model.json` + image
+assets). Distill once → re-render HTML / Markdown / text from the file, forever and
+byte-identically, with no source PDF and no re-analysis. The model is also **queryable on its
+own** — for a single document, an agent with file tools needs no corpus or vector store.
+
+```python
+import distillpdf
+
+distillpdf.open("case.pdf").distill("case.dpdf")   # analyse once → a durable model file
+
+doc = distillpdf.load("case.dpdf")                 # reopen it — no source PDF needed
+doc.info()                                         # counts, OCR state, asset profile (as data)
+doc.toc()                                          # [(level, title, page, section-id), ...]
+print(doc.section("sec-methods"))                  # one section as markdown (the whole subtree)
+
+hits = doc.find("indemnification")                 # lexical search…
+print(len(hits.hits), "in", hits.searched_blocks, "blocks;",
+      len(hits.no_text_pages), "pages had no text")  # …with HONEST coverage, never a silent miss
+
+doc.to_markdown("case.md")                         # fidelity re-render from the model (byte-identical
+doc.to_html("case.html")                           #   to to_markdown/to_html on the original PDF)
+```
+
+It distributes itself as an **agent CLI** — any shell with `distillpdf` installed can drive a
+`.dpdf`, no SDK or server. Every listing emits ids that thread into the next call, `read`
+carries navigation breadcrumbs and resumable truncation, and `find` ends with a coverage line:
+
+```console
+$ distillpdf case.pdf -o case.dpdf            # distill (a .dpdf output path, not HTML)
+distillpdf: wrote case.dpdf
+$ distillpdf case.dpdf info                   # pages, sections, tables, OCR state, assets
+case.pdf  (schema v0, distillpdf 0.0.32)
+  pages: 1564   sections: 42   blocks: 9210
+$ distillpdf case.dpdf toc                    # section tree: ids → read targets
+sec-introduction  Introduction  (p1-4)
+sec-methods  Methods  (p5-12)
+$ distillpdf case.dpdf read sec-methods       # one section as markdown + breadcrumbs
+…
+prev: sec-introduction · next: sec-results · parent: —
+$ distillpdf case.dpdf find "fls. 249" --pages xii-xv   # scoped lexical search
+b0421  [sec-methods]  p13 (fls. 249)  …matched «fls. 249» phrase…
+searched 318 blocks across 4 pages
+```
+
+**Asset profiles** make the size/sharing trade-off an explicit choice, never a surprise:
+`distill(assets="figures")` (the default) embeds figure images; `assets="none"` keeps text +
+structure only (a few MB even for a 1,500-page scan — emailable); every dropped binary leaves
+a *named, regenerable stub* (hash, dimensions, a recipe to re-extract it from the source PDF),
+so a hole is observable, not silent.
+
+> 🧪 **Experimental (`schema_version 0`).** The `.dpdf` schema is not yet frozen — it stays at
+> `0` until the first downstream cutover proves the shape; treat it as a working format, not a
+> stable contract, and re-distill to pick up extraction improvements (a `.dpdf` is a snapshot
+> of extractor quality at distill time). See [docs/datamodel-design.md](docs/datamodel-design.md).
+
 ## OCR — scanned PDFs
 
 Image-only / scanned pages have no text to extract. distillPDF OCRs them and folds the
