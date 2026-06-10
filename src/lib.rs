@@ -11,6 +11,7 @@ use pyo3::prelude::*;
 
 mod afm;
 mod captions;
+mod elem_passes;
 mod extract;
 mod frontmatter;
 mod headings;

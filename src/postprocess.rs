@@ -2,16 +2,14 @@
 //! HTML to merge split figures, rejoin math/list fragments, dedup ids, merge adjacent
 //! links, and demote running-header lines. Pure string→string; extracted from html.rs.
 
-/// Merge a graphic-only `<figure>` immediately adjacent to a caption-only `<figure>`
-/// (in either order) into one — the literal "graphic and caption split into two
-/// figures" defect, resolved regardless of why caption-anchoring missed the pair.
-pub(crate) fn merge_adjacent_figures(html: &str) -> String {
-    fn take_figure(s: &str) -> Option<(&str, usize)> {
-        if !s.starts_with("<figure") {
-            return None;
-        }
-        s.find("</figure>").map(|e| (&s[..e + 9], e + 9))
-    }
+/// Pair a graphic-only `<figure>` with an adjacent caption-only `<figure>` (in either order):
+/// the literal "graphic and caption split into two figures" defect. Given the two complete
+/// `<figure>…</figure>` fragments `f1` (first) and `f2` (second), return the merged single
+/// `<figure>` when one is graphic-only and the other caption-only, else `None`. The merged
+/// figure keeps the CAPTION figure's opening-tag attributes (the id) and concatenates the
+/// graphic inner then the caption inner. Shared by the element-IR figure pass
+/// (`crate::elem_passes`) — the single home of this rule.
+pub(crate) fn pair_adjacent_figures(f1: &str, f2: &str) -> Option<String> {
     // The opening tag attributes (after "<figure", before '>') and inner content.
     fn parts(fig: &str) -> (&str, &str) {
         let open_end = fig.find('>').map(|i| i + 1).unwrap_or(0);
@@ -20,44 +18,28 @@ pub(crate) fn merge_adjacent_figures(html: &str) -> String {
         (attrs, inner)
     }
     let is_graphic = |f: &str| f.contains("<img") || f.contains("<svg");
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    while !rest.is_empty() {
-        if let Some((f1, l1)) = take_figure(rest) {
-            let tail = rest[l1..].trim_start();
-            if let Some((f2, l2)) = take_figure(tail) {
-                let (g1, c1) = (is_graphic(f1), f1.contains("<figcaption"));
-                let (g2, c2) = (is_graphic(f2), f2.contains("<figcaption"));
-                // one is graphic-only, the other caption-only → merge graphic + caption
-                let pair = (g1 && !c1 && c2 && !g2) || (c1 && !g1 && g2 && !c2);
-                if pair {
-                    let (graphic, caption) = if g1 { (f1, f2) } else { (f2, f1) };
-                    let (gattr, ginner) = parts(graphic);
-                    let (cattr, cinner) = parts(caption);
-                    let attr = if !cattr.is_empty() { cattr } else { gattr }; // keep the id (on the caption figure)
-                    out.push_str("<figure");
-                    if !attr.is_empty() {
-                        out.push(' ');
-                        out.push_str(attr);
-                    }
-                    out.push('>');
-                    out.push_str(ginner);
-                    out.push_str(cinner);
-                    out.push_str("</figure>");
-                    let consumed = (rest.len() - tail.len()) + l2;
-                    rest = &rest[consumed..];
-                    continue;
-                }
-            }
-            out.push_str(f1);
-            rest = &rest[l1..];
-            continue;
-        }
-        let c = rest.chars().next().unwrap();
-        out.push(c);
-        rest = &rest[c.len_utf8()..];
+    let (g1, c1) = (is_graphic(f1), f1.contains("<figcaption"));
+    let (g2, c2) = (is_graphic(f2), f2.contains("<figcaption"));
+    // one is graphic-only, the other caption-only → merge graphic + caption
+    let pair = (g1 && !c1 && c2 && !g2) || (c1 && !g1 && g2 && !c2);
+    if !pair {
+        return None;
     }
-    out
+    let (graphic, caption) = if g1 { (f1, f2) } else { (f2, f1) };
+    let (gattr, ginner) = parts(graphic);
+    let (cattr, cinner) = parts(caption);
+    let attr = if !cattr.is_empty() { cattr } else { gattr }; // keep the id (on the caption figure)
+    let mut out = String::with_capacity(f1.len() + f2.len());
+    out.push_str("<figure");
+    if !attr.is_empty() {
+        out.push(' ');
+        out.push_str(attr);
+    }
+    out.push('>');
+    out.push_str(ginner);
+    out.push_str(cinner);
+    out.push_str("</figure>");
+    Some(out)
 }
 
 pub(crate) fn strip_tags_inline(s: &str) -> String {
@@ -93,47 +75,6 @@ pub(crate) fn is_math_fragment(inner: &str) -> bool {
     t.chars().any(|c| MATH.contains(c) || GREEK.contains(c)) || n <= 2 || t.chars().all(|c| !c.is_alphabetic())
 }
 
-/// Rejoin a display equation shattered into per-token `<p>`s: merge a RUN of ≥2
-/// consecutive math-fragment `<p>`s (only whitespace between) into one `<p>` so the
-/// equation is a single block and stray operators/numbers/commas stop being orphan
-/// paragraphs. A lone fragment is left alone.
-pub(crate) fn merge_math_fragments(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    while !rest.is_empty() {
-        if rest.starts_with("<p>") {
-            let mut frags: Vec<&str> = Vec::new();
-            let mut cursor = rest;
-            loop {
-                let c2 = cursor.trim_start();
-                if let Some(body) = c2.strip_prefix("<p>") {
-                    if let Some(rel) = body.find("</p>") {
-                        let inner = &body[..rel];
-                        if is_math_fragment(inner) {
-                            frags.push(inner);
-                            let adv = (cursor.len() - c2.len()) + 3 + rel + 4;
-                            cursor = &cursor[adv..];
-                            continue;
-                        }
-                    }
-                }
-                break;
-            }
-            if frags.len() >= 2 {
-                out.push_str("<p>");
-                out.push_str(&frags.join(" "));
-                out.push_str("</p>");
-                rest = cursor;
-                continue;
-            }
-        }
-        let ch = rest.chars().next().unwrap();
-        out.push(ch);
-        rest = &rest[ch.len_utf8()..];
-    }
-    out
-}
-
 /// Whether a `<p>` between two same-type lists INTRODUCES the following list (its text
 /// ends with ':', e.g. "The second procedure has these steps:"). Such a line is a real
 /// separator — the next list is its own list, not a fragment of the previous one — so
@@ -151,66 +92,6 @@ pub(crate) fn introduces_list(inner: &str) -> bool {
         }
     }
     t.trim_end().ends_with(':')
-}
-
-/// Rejoin a list fragmented into single-item lists: `…A</li></ul> <p>cont</p>… <ul><li>B…`
-/// becomes `…A cont…</li><li>B…`. The intervening `<p>`s are the wrapped continuation
-/// of item A that the line loop couldn't attach (flush-left wrap, column break). Only
-/// fires for same-type adjacent lists with a few short continuation paragraphs between,
-/// and never across a `<p>` that introduces the next list (ends with ':') — so two real
-/// lists, the second introduced by a lead-in line, are left separate.
-pub(crate) fn merge_fragmented_lists(html: &str) -> String {
-    let mut s = html.to_string();
-    for tag in ["ul", "ol"] {
-        let close = format!("</li></{tag}>");
-        let open_li = format!("<{tag}><li>");
-        let mut out = String::with_capacity(s.len());
-        let mut i = 0;
-        while i < s.len() {
-            if s[i..].starts_with(&close) {
-                // After the close: optional whitespace + up to 3 short <p>…</p> blocks
-                // (the wrapped continuation), then the SAME-type list reopening.
-                let mut k = i + close.len();
-                let mut conts: Vec<&str> = Vec::new();
-                let mut ok = true;
-                loop {
-                    while k < s.len() && s.as_bytes()[k].is_ascii_whitespace() {
-                        k += 1;
-                    }
-                    if s[k..].starts_with(&open_li) {
-                        break;
-                    }
-                    if conts.len() < 3 {
-                        if let Some(body) = s[k..].strip_prefix("<p>") {
-                            if let Some(rel) = body.find("</p>") {
-                                // A lead-in line ("… steps:") separates two real lists;
-                                // never fold across it.
-                                if rel < 400 && !introduces_list(&body[..rel]) {
-                                    conts.push(&body[..rel]);
-                                    k += 3 + rel + 4;
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                    ok = false;
-                    break;
-                }
-                if ok && s[k..].starts_with(&open_li) {
-                    out.push(' ');
-                    out.push_str(&conts.join(" "));
-                    out.push_str("</li><li>");
-                    i = k + open_li.len();
-                    continue;
-                }
-            }
-            let ch = s[i..].chars().next().unwrap();
-            out.push(ch);
-            i += ch.len_utf8();
-        }
-        s = out;
-    }
-    s
 }
 
 /// Guarantee unique `id=` attributes: the first use of an id keeps it, later uses
@@ -287,79 +168,29 @@ pub(crate) fn merge_adjacent_links(s: &str) -> String {
     out
 }
 
-/// Doc-level pass: a real section title appears once, but a running page header
-/// (the paper title or author list repeated atop every page) gets emitted as a
-/// heading on each page. Any heading whose text (minus a leading page/section
-/// number) recurs 3+ times across the document is a running head — demote those
-/// occurrences from `<hN>` to `<p>` so they don't pollute the heading outline.
-pub(crate) fn demote_running_headings(html: String) -> String {
-    // Collect (range, inner) for every <h1-6>…</h1-6>.
-    let bytes = html.as_bytes();
-    let mut spans: Vec<(usize, usize, usize, usize, String)> = Vec::new(); // open,close_end,lvl, inner_start,inner
-    let mut i = 0;
-    while i + 3 < bytes.len() {
-        if bytes[i] == b'<' && bytes[i + 1] == b'h' && matches!(bytes[i + 2], b'1'..=b'6') && bytes[i + 3] == b'>' {
-            let lvl = (bytes[i + 2] - b'0') as usize;
-            let close = format!("</h{lvl}>");
-            if let Some(rel) = html[i..].find(&close) {
-                let inner_start = i + 4;
-                let inner = html[inner_start..i + rel].to_string();
-                spans.push((i, i + rel + close.len(), lvl, inner_start, inner));
-                i += rel + close.len();
-                continue;
+/// Normalize a heading's inner HTML to the running-head recurrence key: strip tags to text,
+/// drop a leading number/roman/letter token ("12 ", "3.2.1", "IV.", "A."), lowercase, collapse
+/// whitespace. A real section title appears once; a running page header (the paper title /
+/// author list repeated atop every page) shares this key across many pages. Shared by the
+/// element-IR demote pass (`crate::elem_passes`).
+pub(crate) fn demote_key(inner: &str) -> String {
+    let text: String = {
+        let mut s = String::new();
+        let mut intag = false;
+        for c in inner.chars() {
+            match c {
+                '<' => intag = true,
+                '>' => intag = false,
+                _ if !intag => s.push(c),
+                _ => {}
             }
         }
-        i += 1;
-    }
-    // Count normalized keys (strip tags + a leading number/roman/letter token).
-    let key = |inner: &str| -> String {
-        let text: String = {
-            let mut s = String::new();
-            let mut intag = false;
-            for c in inner.chars() {
-                match c {
-                    '<' => intag = true,
-                    '>' => intag = false,
-                    _ if !intag => s.push(c),
-                    _ => {}
-                }
-            }
-            s
-        };
-        let t = text.trim_start();
-        // drop a leading "12 ", "3.2.1", "IV.", "A." token
-        let t = t.trim_start_matches(|c: char| c.is_alphanumeric() || c == '.' );
-        t.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+        s
     };
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for s in &spans {
-        let k = key(&s.4);
-        if k.len() >= 4 {
-            *counts.entry(k).or_insert(0) += 1;
-        }
-    }
-    // Rebuild, demoting repeated ones to <p>.
-    let mut outp = String::with_capacity(html.len());
-    let mut pos = 0;
-    let mut kept_h1: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (open, close_end, lvl, _is, inner) in &spans {
-        let k = key(inner);
-        if counts.get(&k).copied().unwrap_or(0) >= 3 {
-            // A heading repeated ≥3× is a running page-header — demote to <p>. But the
-            // document title legitimately recurs in the running head: keep its first
-            // <h1> occurrence (the real title) and demote every other repeat.
-            if *lvl == 1 && kept_h1.insert(k) {
-                continue;
-            }
-            outp.push_str(&html[pos..*open]);
-            outp.push_str("<p>");
-            outp.push_str(inner);
-            outp.push_str("</p>");
-            pos = *close_end;
-        }
-    }
-    outp.push_str(&html[pos..]);
-    outp
+    let t = text.trim_start();
+    // drop a leading "12 ", "3.2.1", "IV.", "A." token
+    let t = t.trim_start_matches(|c: char| c.is_alphanumeric() || c == '.');
+    t.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Generic single pass over `\0<idx>\0` sentinels: each is replaced by `repl(idx)`'s

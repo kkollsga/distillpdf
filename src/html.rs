@@ -372,6 +372,7 @@ pub(crate) fn looks_like_reference(s: &str) -> bool {
 // `crate::model::build` (the next stage of the single-stream refactor). Allowed dead until the
 // projection lands — same staged-wiring pattern `model::mod` uses.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) enum PageElement {
     /// `<a id="…"></a>` named-destination anchor(s) emitted at the page head (one string,
     /// possibly several anchors concatenated, ending in the `\n` the head emits).
@@ -1021,13 +1022,18 @@ pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, incl
     assemble(body, mode, include_toc, &outline, &img_uris, inline_images)
 }
 
-/// The render-pipeline HEAD: all the analysis + per-page render + sequential merge, producing
-/// the PRE-id, PRE-nav page-mode `body` (the full `<!doctype…></html>` document with headings
-/// still bare and image sentinels still `\0idx\0`), the global image-URI list, and the PDF's
-/// own outline. [`to_html`] feeds this straight into [`assemble`]; the model build path calls
-/// it to capture each page's body verbatim (see [`crate::model::build`]). Splitting the head
-/// from the tail is what lets a model-only re-render run the identical [`assemble`] code.
-pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool) -> (String, Vec<String>, Vec<links::OutlineEntry>) {
+/// One page's post-transform element IR: the page number, the typed [`PageElement`] list (after
+/// the cross-page transforms), and the page-LOCAL deferred image-URI list (`\0idx\0`-indexed).
+/// This is the single-stream document IR — `to_html` emits + merges it; `crate::model::build`
+/// projects it into blocks; both see EXACTLY the same post-transform elements.
+pub(crate) type PageIR = (u32, Vec<PageElement>, Vec<String>);
+
+/// The render-pipeline HEAD up to the element IR: all the analysis + per-page render + the
+/// cross-page element transforms, producing the post-transform per-page [`PageIR`] list, the
+/// PDF's own outline. [`render_doc`] emits + merges this into the PRE-id, PRE-nav body; the model
+/// build path ([`crate::model::build`]) projects the SAME elements into blocks. Splitting the IR
+/// from the emit is what lets HTML and the model derive from one materialized structure.
+pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool) -> (Vec<PageIR>, Vec<links::OutlineEntry>) {
     // Optional coarse phase profiler: set DPDF_PROFILE=1 to print per-phase WALL time to
     // stderr. `prof_phase(label, ||…)` times a closure; zero cost when unset.
     let prof = std::env::var_os("DPDF_PROFILE").is_some();
@@ -1113,7 +1119,7 @@ pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: 
     // page-LOCAL `\0<idx>\0` sentinels (so the string passes never touch the base64) and
     // remapped to global indices during the sequential merge below.
     let t = std::time::Instant::now();
-    let renders: Vec<(String, Vec<String>)> = page_spans
+    let renders: Vec<(u32, Vec<PageElement>, Vec<String>)> = page_spans
         .par_iter()
         .enumerate()
         .map(|(pidx, (pno, _pid, spans))| {
@@ -1918,38 +1924,60 @@ pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: 
             }
         }
         flush(&mut run, &mut els);
-        // Render the page's element IR to its body HTML (a pure function of `els`), then apply
-        // the page-mode `<section data-page>` framing. Section mode emits the bare content.
-        let body_inner = emit_page_elements(&els);
-        let out = if mode == Mode::Page {
-            format!("<section data-page=\"{pno}\" id=\"page-{pno}\">\n{body_inner}\n</section>\n")
-        } else {
-            body_inner
-        };
-        (out, img_uris)
+        // Return the page's typed element IR (NOT yet rendered to HTML) plus its image-URI
+        // list. The cross-page element transforms run on the assembled `Vec<Vec<PageElement>>`
+        // below, then each page is emitted and the bodies merged. Keeping the IR un-rendered
+        // here is what lets the cross-page passes operate on the elements, not on a string.
+        (*pno, els, img_uris)
         })
         .collect();
     phase("02_render", t);
 
-    // Sequential merge (page order): concatenate the per-page fragments, rewriting each
-    // page's local `\0<idx>\0` image sentinels to global indices, and concatenating the
-    // per-page URI lists into one global list.
+    // Cross-page element transforms (the single-stream replacement for the legacy HTML-string
+    // post-processing passes). They run on the per-page element lists BEFORE emission, so the
+    // model's block projection sees the same post-transform elements the HTML is emitted from.
     let t = std::time::Instant::now();
-    let mut out = String::from(DOC_SHELL_HEAD);
-    let mut img_uris: Vec<String> = Vec::new();
-    for (frag, uris) in renders {
-        append_with_img_offset(&mut out, &frag, img_uris.len());
-        img_uris.extend(uris);
-    }
-    out.push_str("</body>\n</html>\n");
-    phase("03_merge", t);
-
-    let t = std::time::Instant::now();
-    let body = dedup_ids(&merge_adjacent_figures(&merge_math_fragments(&merge_fragmented_lists(&merge_adjacent_links(&demote_running_headings(out))))));
-    phase("04_merge_tail", t);
+    let mut pages_els: Vec<PageIR> = renders;
+    crate::elem_passes::run_cross_page_passes(&mut pages_els, mode);
+    phase("04_elem_passes", t);
     if let Some(t0) = prof_start {
         eprintln!("[DPDF_PROFILE] {} pages, total {:.1}ms", page_spans.len(), t0.elapsed().as_secs_f64() * 1e3);
     }
+    (pages_els, outline)
+}
+
+/// Emit + merge the post-transform [`PageIR`] list into the PRE-id, PRE-nav `body` (the full
+/// `<!doctype…></html>` document, headings still bare, image sentinels resolved per
+/// `inline_images`), returning `(body, global_image_uris)`. Each page's element IR is rendered
+/// to its body HTML, framed per `mode` (page mode wraps `<section data-page>`; section mode is
+/// bare), its page-local `\0idx\0` sentinels remapped to global indices, and the global URI list
+/// accumulated. The final `dedup_ids` string pass (the one not in the element IR — see
+/// [`crate::elem_passes::run_residual_string_passes`]) runs over the merged body.
+pub(crate) fn emit_and_merge(pages_els: &[PageIR], mode: Mode) -> (String, Vec<String>) {
+    let mut out = String::from(DOC_SHELL_HEAD);
+    let mut img_uris: Vec<String> = Vec::new();
+    for (pno, els, uris) in pages_els {
+        let body_inner = emit_page_elements(els);
+        let frag = if mode == Mode::Page {
+            format!("<section data-page=\"{pno}\" id=\"page-{pno}\">\n{body_inner}\n</section>\n")
+        } else {
+            body_inner
+        };
+        append_with_img_offset(&mut out, &frag, img_uris.len());
+        img_uris.extend(uris.iter().cloned());
+    }
+    out.push_str("</body>\n</html>\n");
+    let out = crate::elem_passes::run_residual_string_passes(out);
+    (out, img_uris)
+}
+
+/// The render-pipeline HEAD: the analysis + per-page render + cross-page transforms + emit +
+/// merge, producing the PRE-id, PRE-nav `body`, the global image-URI list, and the PDF's own
+/// outline. A thin composition of [`render_doc_elements`] (the IR) + [`emit_and_merge`] (the
+/// HTML), kept so [`to_html`] and the legacy callers have one entry point.
+pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool) -> (String, Vec<String>, Vec<links::OutlineEntry>) {
+    let (pages_els, outline) = render_doc_elements(doc, raw, mode, inline_images);
+    let (body, img_uris) = emit_and_merge(&pages_els, mode);
     (body, img_uris, outline)
 }
 
