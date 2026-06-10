@@ -1028,6 +1028,33 @@ pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: 
         let mut tables = extract::detect_tables_pos(spans);
         let mut images = img::positioned_images(doc, *_pid, inline_images);
         let (raw_vectors, weak_vectors) = vector::positioned_vectors(doc, *_pid);
+        // Vector figures that carry a "Figure N" caption — their *internal* text (a diagram's
+        // node labels: "E[CLS] E1 … EN", "Trm Trm … Trm") now lands in the page span stream
+        // (extract_spans recurses into Form XObjects), where detect_tables_pos reads the
+        // regular label grid as a data TABLE. That false table overlaps the figure and the
+        // not_in_table filter below would then drop the diagram, leaving an empty <figure>.
+        // We mark these figure regions so a label grid sitting inside one is dropped as a
+        // false table (below) — letting the diagram render as SVG with its labels intact.
+        // The "Figure N" caption is the discriminator that keeps a real ruled FORM safe: a
+        // form's table cells sit inside a large border vector too, but that vector carries no
+        // figure caption (it's a "Table N"/uncaptioned form region), so its table survives.
+        let captioned_fig_boxes: Vec<(f32, f32, f32, f32)> = {
+            let cap_lines = lines_of(spans.iter().map(clone_span).collect(), &no_links);
+            raw_vectors
+                .iter()
+                .filter(|v| {
+                    cap_lines.iter().any(|l| {
+                        let cx = (l.x0 + l.x1) * 0.5;
+                        opens_figure_caption(&l.text())
+                            && !caption_is_continued(&l.text())
+                            && (l.y - v.y_bottom).abs().min((l.y - v.y_top).abs()) < body * 4.0
+                            && cx >= v.x_left - 40.0
+                            && cx <= v.x_right + 40.0
+                    })
+                })
+                .map(|v| (v.x_left, v.x_right, v.y_bottom, v.y_top))
+                .collect()
+        };
         // Drop FALSE tables — a "table" that is really a figure's own structure, not a data
         // table — BEFORE filtering vectors, so the real plot vector survives the vector
         // filter below while a genuine ruled form table is preserved:
@@ -1038,6 +1065,9 @@ pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: 
         //       so the strip is the plot's axis-number row / legend. Requiring the vector to
         //       contain a raster is what protects a ruled form (e.g. the IRS W-9): its cell
         //       borders are a large vector with NO raster, so its real table is never dropped.
+        //   (c) a label grid sitting inside a CAPTIONED vector figure — a diagram's own node
+        //       labels, read as a table now that Form-XObject text reaches the span stream.
+        //       The captioned-figure marker (not a raster) is what tells this from a ruled form.
         // Left in, such a false table both consumes the figure's labels as cells AND
         // suppresses the overlapping vector, fragmenting a raster+vector plot (a Vp-depth
         // crossplot) into a lone raster plus loose axis text.
@@ -1064,7 +1094,35 @@ pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: 
                     iox * ioy >= ia * 0.5
                 })
             });
-            !(raster_covered || strip_in_plot)
+            // A label grid belonging to a captioned vector figure — a diagram's node labels
+            // / a scatter's point legend — read as a data table now that Form-XObject text
+            // reaches the span stream. It is the figure's own content, so it must NOT block
+            // the figure (the not_in_table filter would otherwise drop the diagram). Two
+            // shapes, both keyed on the figure CARRYING A CAPTION (the discriminator that
+            // keeps a real ruled FORM — no figure caption — safe):
+            //   • the table sits inside the figure's ink box (center within it), or
+            //   • the table is column-aligned with the figure (its x-center within the figure's
+            //     x-span) and vertically OVERLAPS the figure's ink — i.e. label text the
+            //     vector-ink bbox didn't quite cover (a scatter's top-edge legend).
+            // A REAL data table that merely sits near a figure is column-offset or vertically
+            // separated from the ink, so neither shape matches and it survives.
+            let (tcx, tcy) = ((t.x_left + t.x_right) * 0.5, (t.y_bottom + t.y_top) * 0.5);
+            let label_grid_in_fig = captioned_fig_boxes.iter().any(|&(xl, xr, yb, yt)| {
+                let center_in = tcx >= xl && tcx <= xr && tcy >= yb && tcy <= yt;
+                let v_overlap = yt.min(t.y_top) > yb.max(t.y_bottom);
+                let x_aligned = tcx >= xl && tcx <= xr;
+                let va = ((xr - xl) * (yt - yb)).max(1.0);
+                // The table blankets the figure horizontally: its x-extent covers most of the
+                // figure's width within the figure's y-band (the figure's labels mis-clustered
+                // into a row wider than the figure, often spanning into the neighbouring column).
+                // Bound the height so a genuine full-column data table that merely crosses the
+                // figure's y-band isn't swallowed.
+                let fw = (xr - xl).max(1.0);
+                let xcov = (xr.min(t.x_right) - xl.max(t.x_left)).max(0.0) / fw;
+                let blankets = xcov >= 0.6 && v_overlap && (t.y_top - t.y_bottom) < (yt - yb) * 1.2;
+                center_in || (x_aligned && v_overlap && ta < va) || blankets
+            });
+            !(raster_covered || strip_in_plot || label_grid_in_fig)
         });
         let plinks = links_by_page.get(pno).unwrap_or(&no_links);
         let mut lines = lines_of(spans.iter().map(clone_span).collect(), plinks);
@@ -1215,12 +1273,20 @@ pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: 
             .iter()
             .copied()
             .filter(|&(xl, xr, yb, yt)| {
-                line_centers
+                // A CAPTIONED figure ("Figure N") is a diagram, never a framed certificate —
+                // its many short node labels must NOT make it read as a wall of prose (which
+                // would scoop them into the body and out of the SVG). Only an UNcaptioned
+                // bordered text block qualifies as a framed document.
+                let captioned = captioned_fig_boxes
                     .iter()
-                    .zip(&line_is_prose)
-                    .filter(|&(&(cx, cy), &prose)| prose && cx >= xl && cx <= xr && cy >= yb && cy <= yt)
-                    .count()
-                    >= FRAMED_DOC_MIN_PROSE_LINES
+                    .any(|&(cxl, cxr, cyb, cyt)| (xl - cxl).abs() < 1.0 && (xr - cxr).abs() < 1.0 && (yb - cyb).abs() < 1.0 && (yt - cyt).abs() < 1.0);
+                !captioned
+                    && line_centers
+                        .iter()
+                        .zip(&line_is_prose)
+                        .filter(|&(&(cx, cy), &prose)| prose && cx >= xl && cx <= xr && cy >= yb && cy <= yt)
+                        .count()
+                        >= FRAMED_DOC_MIN_PROSE_LINES
             })
             .collect();
         let in_framed_doc = |x: f32, y: f32| {
@@ -1293,10 +1359,26 @@ pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: 
         // in_figure / fig_label filter), so each shows on its figure, not in the body.
         if !vectors.is_empty() {
             let mk = |s: text::Span| vector::LabelSpan { x: s.x, y: s.y, size: s.size, width: s.width, text: s.text, bold: s.bold, italic: s.italic, angle: s.angle };
+            // A captioned figure's labels routinely sit just OUTSIDE its (tight) vector-ink
+            // box — node labels above/beside a DAG, a pipeline diagram's stage captions. Claim
+            // them onto the SVG within the same margin axis ticks use, so a label split between
+            // form-internal text (inside the box) and page-direct text (just outside) is
+            // reunited on the figure instead of leaking to a body <aside>.
+            let cap_m = axis_margin;
+            let in_captioned_fig_pt = |x: f32, y: f32| {
+                captioned_fig_boxes
+                    .iter()
+                    .any(|&(xl, xr, yb, yt)| x >= xl - cap_m && x <= xr + cap_m && y >= yb - cap_m && y <= yt + cap_m)
+            };
             let mut labels: Vec<vector::LabelSpan> = Vec::new();
             for s in spans {
                 let (cx, cy) = (s.x + s.width * 0.5, s.y + s.size * 0.5);
-                if (in_figure(cx, cy) || near_fig_label(cx, cy, s.size, &s.text)) && !in_prose(cx, cy) && !in_caption(cx, cy) {
+                // Inside a CAPTIONED figure, all interior text is the diagram's labels — render
+                // it on the SVG even if the in-figure "prose" gate flagged it (that gate guards
+                // an UNcaptioned framed block). This keeps the labels visible (figure_text) while
+                // the body flow drops them as figure content. A caption line is still excluded.
+                let take = (in_figure(cx, cy) || near_fig_label(cx, cy, s.size, &s.text)) && !in_prose(cx, cy);
+                if (take || in_captioned_fig_pt(cx, cy)) && !in_caption(cx, cy) {
                     labels.push(mk(clone_span(s)));
                 }
             }
@@ -1475,9 +1557,30 @@ pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: 
             // look like a heading (a plot's "Vp (m/s)" title); a merely-contained line is a
             // figure label only when it isn't a real section heading.
             let axis_label = near_fig_label(fig_cx, l.y, l.size, &l.text());
-            let fig_label = (in_figure(fig_cx, l.y) || axis_label)
+            // Text sitting INSIDE a CAPTIONED figure's ink box is that diagram's own label
+            // ("Image Semantics", "Group 2", "Outputs") — a figure carries a caption, so its
+            // interior is figure content, never a section heading. (A real heading sits OUTSIDE
+            // the ink box; this is why we use the tight box with no margin, distinct from the
+            // generic in_figure path below that deliberately spares a heading overlapping a
+            // figure.) Without this, such labels — now visible via Form-XObject text — promote
+            // to spurious <h4>s and drag heading precision down.
+            // A SHORT line sitting INSIDE a CAPTIONED figure's ink box is that diagram's own
+            // label ("Image Semantics", "Group 2", "Outputs", a plot's axis title) — figure
+            // content, never a section heading. A figure carries a caption, so its interior is
+            // figure text; this holds even when the figure's wall of small labels tripped the
+            // in-figure "prose" gate (that gate exists for an UNcaptioned framed certificate,
+            // not a captioned diagram). The ≤6-word bound keeps any genuine wrapped sentence
+            // that overlaps the box out of this branch. Without it these labels — now visible
+            // via Form-XObject text — leak into the body as spurious <h4>s.
+            let label_words = l.text().split_whitespace().count();
+            let in_captioned_fig = label_words <= 6
+                && captioned_fig_boxes
+                    .iter()
+                    .any(|&(xl, xr, yb, yt)| fig_cx >= xl && fig_cx <= xr && l.y >= yb && l.y <= yt);
+            let fig_label = ((in_figure(fig_cx, l.y) || axis_label)
                 && !in_prose(fig_cx, l.y)
-                && (axis_label || detect_header(l, body, Some(&profile)).is_none());
+                && (axis_label || detect_header(l, body, Some(&profile)).is_none()))
+                || in_captioned_fig;
             if !in_table(l.x0, l.x1, l.y) && !consumed_caption.contains(&idx) && !fig_label {
                 items.push(Item::L(l));
                 boxes.push((l.x0, l.x1.max(l.x0 + 0.1), l.y, l.y + l.size.max(1.0)));

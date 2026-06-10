@@ -158,6 +158,19 @@
     "caption": "Figure 1: A small diagram of the mapping between two objects.",
     "n_figures": 1
   },
+  "xobject_figure.pdf": {
+    "caption": "Figure 1: The model pipeline encodes images and text into logits.",
+    "n_figures": 1,
+    "body_once": [
+      "assembled as a single full-page form overlay",
+      "feeds the output layer"
+    ],
+    "figure_labels": [
+      "Image Encoder",
+      "Text Encoder",
+      "Output Layer"
+    ]
+  },
   "no_spurious_figs.pdf": {
     "page1_figures": 0,
     "total_figures": 1

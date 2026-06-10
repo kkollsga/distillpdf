@@ -43,7 +43,21 @@ pub(crate) fn is_inline_xref(text: &str) -> bool {
         "indicat", "suggest", "impl", "exhibit", "contain", "yield", "mark", "reveal",
         "we ", "it ", "is ", "are ", "can ", "highlight", "visuali", "plots",
     ];
-    PREDICATE.iter().any(|v| after.starts_with(v))
+    let has_predicate = |s: &str| PREDICATE.iter().any(|v| s.starts_with(v));
+    if has_predicate(after) {
+        return true;
+    }
+    // Tolerate ONE intervening adverb/ordinal between the reference number and its verb —
+    // "Figure 4 first illustrates …", "Table 2 also shows …" — a sentence, not a caption. A
+    // real caption "Figure 4 Overview of …" stays safe: the word after the intervening one
+    // ("of") is not a predicate. Only a lowercase first word qualifies (a Title-Case word
+    // opens a real caption phrase).
+    let mut it = after.splitn(2, ' ');
+    matches!(
+        (it.next(), it.next()),
+        (Some(w1), Some(rest))
+            if w1.chars().next().is_some_and(|c| c.is_ascii_lowercase()) && has_predicate(rest)
+    )
 }
 
 /// If a line is a figure/table caption ("Figure 3: …", "Fig. 2 …", "Table 1 …"),
@@ -97,6 +111,48 @@ pub(crate) fn caption_parts(text: &str) -> Option<(bool, String, &str)> {
 /// If a line is a figure/table caption, return (is_figure, full number).
 pub(crate) fn caption_label(text: &str) -> Option<(bool, String)> {
     caption_parts(text).map(|(f, n, _)| (f, n))
+}
+
+/// Does a line OPEN a figure caption — for the looser purpose of marking a vector region as
+/// a figure (NOT for emitting/anchoring a caption)? Accepts the strict `caption_parts`
+/// figures AND appendix/supplementary labels whose number leads with a letter group —
+/// "Figure B.1.", "Fig. S3", "Figure A2" — which `caption_parts` (digit-first) rejects.
+/// These are real figure captions in appendices; a region they abut is a figure, so its
+/// internal label grid must not block it as a false table. A "Figure shows …" cross-ref is
+/// still excluded so a sentence doesn't mark a region.
+pub(crate) fn opens_figure_caption(text: &str) -> bool {
+    if matches!(caption_parts(text), Some((true, _, _))) {
+        return !is_inline_xref(text);
+    }
+    let t = text.trim_start();
+    let low = t.to_lowercase();
+    let after = if let Some(r) = low.strip_prefix("figure") {
+        &t[t.len() - r.len()..]
+    } else if let Some(_r) = low.strip_prefix("fig.") {
+        &t[4..]
+    } else if low.starts_with("fig ") || low.starts_with("fig\t") {
+        &t[3..]
+    } else {
+        return false;
+    };
+    let rest = after.trim_start();
+    let b = rest.as_bytes();
+    // 1–2 leading letters (an appendix/section letter: "B", "S", "AB"), an optional '.'/'-'
+    // separator, then a digit — "B.1", "S3", "A-2".
+    let mut i = 0;
+    while i < b.len() && i < 2 && b[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    if i == 0 {
+        return false;
+    }
+    if i < b.len() && (b[i] == b'.' || b[i] == b'-') {
+        i += 1;
+    }
+    if i >= b.len() || !b[i].is_ascii_digit() {
+        return false;
+    }
+    !is_inline_xref(text)
 }
 
 /// A multi-page CONTINUATION marker ("Figure 5.—Continued", "Table 2 (continued)"): the

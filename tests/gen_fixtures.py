@@ -439,6 +439,80 @@ def gen_small_vector_fig():
     }
 
 
+def gen_xobject_figure():
+    """Regression lock for the Form-XObject text recursion (commit 864694e). The WHOLE page
+    — body prose AND a captioned diagram with internal node labels — is drawn inside ONE Form
+    XObject (the e-filing/iText layout). `extract_spans` recurses into the form, so all that
+    text reaches the page span stream. The captioned diagram's node labels ("Image Encoder",
+    "Text Encoder", "Output Layer") must NOT (a) be read as a data <table> that suppresses the
+    figure, nor (b) leak into the body as <p>/<h*>; they belong to the figure's <svg>. The
+    surrounding body prose must still flow as prose, appearing exactly once."""
+    pdf = os.path.join(OUT, "xobject_figure.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    c.beginForm("page1")
+    # Body prose ABOVE the figure (must flow as prose, once).
+    c.setFont("Helvetica-Bold", 19)
+    c.drawString(LM, PAGE_H - 90, "Form XObject Diagram")
+    c.setFont(BODY_F, BODY_S)
+    intro = ("This document is assembled as a single full-page form overlay, the layout that "
+             "electronic-filing bundles use. The body narrative is set inside the form and must "
+             "read as ordinary prose. A schematic of the model pipeline appears below.")
+    yy = PAGE_H - 120
+    for line in simpleSplit(intro, BODY_F, BODY_S, COL_W):
+        c.drawString(LM, yy, line)
+        yy -= LEAD
+    # A boxed diagram whose node labels form a DENSE regular grid (3 columns × several rows of
+    # short, column-aligned tokens) — the exact shape the table detector reads as a data table,
+    # which on the buggy tree both suppressed the figure and scattered labels into the body.
+    bx, by, bw, bh = LM + 30, yy - 180, 330, 150
+    c.setLineWidth(1)
+    cols = [bx + 14, bx + 124, bx + 234]
+    grid = [
+        ("Image Encoder", "Text Encoder", "Output Layer"),
+        ("patches", "tokens", "logits"),
+        ("conv", "embed", "softmax"),
+        ("relu", "relu", "argmax"),
+        ("pool", "norm", "label"),
+    ]
+    # Rich vector ink — a node box around every cell plus connecting arrows — so the diagram
+    # clears the strong-vector bar (a real schematic, not a stray rule), like the corpus
+    # diagrams whose internal labels triggered the regression.
+    ry = by + bh - 26
+    cell_h = 24
+    for r, row in enumerate(grid):
+        for cx0, cell in zip(cols, row):
+            c.rect(cx0 - 4, ry - 6, 96, 16, stroke=1, fill=0)  # a node box per cell
+            c.setFont("Helvetica", 9)
+            c.drawString(cx0, ry, cell)
+        if r:  # vertical connectors between rows
+            for cx0 in cols:
+                c.line(cx0 + 44, ry + 10, cx0 + 44, ry + cell_h - 6)
+        ry -= cell_h
+    c.line(cols[0] + 92, by + bh - 22, cols[1] - 4, by + bh - 22)  # cross arrows top row
+    c.line(cols[1] + 92, by + bh - 22, cols[2] - 4, by + bh - 22)
+    # Figure caption directly beneath the diagram.
+    c.setFont("Helvetica", 9.5)
+    c.drawString(LM, by - 16, "Figure 1: The model pipeline encodes images and text into logits.")
+    # Body prose BELOW the figure.
+    c.setFont(BODY_F, BODY_S)
+    yb = by - 44
+    outro = ("The remainder of the section discusses how each encoder is trained and how the "
+             "fused representation feeds the output layer.")
+    for line in simpleSplit(outro, BODY_F, BODY_S, COL_W):
+        c.drawString(LM, yb, line)
+        yb -= LEAD
+    c.endForm()
+    c.doForm("page1")
+    c.showPage()
+    c.save()
+    GT["xobject_figure.pdf"] = {
+        "caption": "Figure 1: The model pipeline encodes images and text into logits.",
+        "n_figures": 1,
+        "body_once": ["assembled as a single full-page form overlay", "feeds the output layer"],
+        "figure_labels": ["Image Encoder", "Text Encoder", "Output Layer"],
+    }
+
+
 def gen_no_spurious_figs():
     """Precision gate: a prose page with incidental tiny marks (a short underline rule, a
     small box) and NO figure caption anywhere. Weak vector candidates must NOT be promoted
@@ -1073,6 +1147,7 @@ def main():
     gen_figure_nodot()
     gen_lof_dotleader()
     gen_small_vector_fig()
+    gen_xobject_figure()
     gen_no_spurious_figs()
     gen_links()
     gen_pagelabels()

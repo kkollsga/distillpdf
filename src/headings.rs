@@ -89,6 +89,26 @@ pub(crate) fn looks_like_clause(trimmed: &str) -> bool {
     if trimmed.ends_with(',') {
         return true;
     }
+    // A line ENDING in a coordinating conjunction / preposition ("…, and", "… of",
+    // "… with", "… that") is a wrapped mid-sentence fragment, never a section title.
+    // A real heading ends on its last content word. (This catches a math/prose fragment
+    // — "… {Φij(xj)⌞M}, and" — that gets isolated onto its own line and would otherwise
+    // be promoted to a heading by the style path.)
+    {
+        const TRAILING_FN: &[&str] = &[
+            "and", "or", "but", "with", "of", "that", "which", "the", "a", "an", "to",
+            "for", "in", "on", "at", "by", "as", "from", "into", "than", "where", "while",
+        ];
+        let last = trimmed
+            .rsplit(|c: char| c.is_whitespace())
+            .find(|t| !t.is_empty())
+            .unwrap_or("")
+            .trim_matches(|c: char| !c.is_alphabetic())
+            .to_lowercase();
+        if TRAILING_FN.contains(&last.as_str()) {
+            return true;
+        }
+    }
     // Strip a leading section-number token ("1. ", "1.2 ", "II. ", "A. ") so its
     // separator dot is not mistaken for an internal sentence boundary ("II. METHODS").
     let core = {
