@@ -16,12 +16,17 @@
     distillpdf scan.pdf --ocr                  # OCR scanned pages -> scan.searchable.pdf
     distillpdf scan.pdf --ocr -o out.html      # ...or OCR'd HTML / Markdown (by extension)
     distillpdf scan.pdf --ocr --remove-raster  # reflow to clean text, drop the page images
+
+When the input is a distilled `.dpdf` model rather than a source PDF, the document-shell
+verbs apply instead — `info / toc / read / find / tables / figures / ocr-status` (see
+distillpdf.shell). The convert behaviour above is unchanged for PDFs.
 """
 import argparse
 import os
 import sys
 
 from . import __version__, open as _open
+from . import shell as _shell
 
 
 def _fmt(args, dest):
@@ -53,7 +58,23 @@ def _out_path(src, args, multiple, fmt):
     return args.output
 
 
+def _is_shell_invocation(argv):
+    """Document-shell vs converter routing: `distillpdf <file.dpdf> <verb> …` goes to the
+    document shell. The signal is a `.dpdf` first positional FOLLOWED by a known shell verb —
+    both conditions, so a stray `.dpdf` typo'd as a convert input still falls through to the
+    converter's normal per-file error (and a PDF input never accidentally hits a verb)."""
+    if not argv or argv[0].startswith("-"):
+        return False
+    if not argv[0].lower().endswith(".dpdf"):
+        return False
+    return len(argv) >= 2 and argv[1] in _shell.VERBS
+
+
 def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if _is_shell_invocation(argv):
+        return _shell.run(argv)
     p = argparse.ArgumentParser(
         prog="distillpdf",
         description="Convert PDFs into clean, LLM-ready HTML or Markdown (or plain text).",
