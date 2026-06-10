@@ -4,7 +4,7 @@ Wraps the pure-Rust core (`_distillpdf.Pdf`) and adds the OCR workflow as method
 document itself:
 
     doc = distillpdf.open("file.pdf")
-    doc.run_ocr()                       # OCR scanned pages (opt-in; needs the [ocr] extra)
+    doc.run_ocr()                       # OCR scanned pages (opt-in; bundled fast engine)
     doc.to_html("out.html")             # render — OCR text is folded in automatically
 
 `run_processing()` (page analysis) is called automatically by the render methods; if the

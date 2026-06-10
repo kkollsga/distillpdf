@@ -1,0 +1,63 @@
+site_name: distillPDF
+site_description: >-
+  Pure-Rust PDF extraction that distills documents into clean, LLM-ready
+  HTML, Markdown, and a queryable document model.
+site_url: https://distillpdf.readthedocs.io/
+repo_url: https://github.com/kkollsga/distillpdf
+repo_name: kkollsga/distillpdf
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep orange
+      accent: deep orange
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep orange
+      accent: deep orange
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - content.code.copy
+    - search.suggest
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Guide:
+      - Rendering HTML & Markdown: guide/rendering.md
+      - Raw extraction: guide/extraction.md
+      - The .dpdf document model: guide/dpdf.md
+      - Searching documents: guide/search.md
+      - OCR for scanned PDFs: guide/ocr.md
+      - OCR runtime setup: ocr-setup.md
+      - Command line: guide/cli.md
+  - Reference:
+      - Python API: reference/python.md
+      - .dpdf format: reference/dpdf-format.md
+  - Project:
+      - Contributing & development: about/contributing.md
+      - 'Design notes: data model': datamodel-design.md

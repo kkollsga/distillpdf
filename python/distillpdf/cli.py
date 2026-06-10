@@ -113,7 +113,8 @@ def main(argv=None):
     p.add_argument(
         "--ocr-engine", metavar="ENGINE", default=None,
         help="OCR engine: a tier ('fast' = bundled, no extra/download; 'accurate' = "
-        "granite-docling, needs the [ocr] extra) or a specific backend name. "
+        "granite-docling, needs a model runtime you install yourself — see "
+        "distillpdf.ocr.install_help('granite')) or a specific backend name. "
         "See --list-ocr-engines. Default: fast.",
     )
     p.add_argument(

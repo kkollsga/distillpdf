@@ -51,8 +51,8 @@ Smaller, no PyTorch:
 ```bash
 pip install llama-cpp-python huggingface-hub pillow
 ```
-⚠️ On **Windows**, `llama-cpp-python` may build from source when no prebuilt wheel matches your
-Python (needs MSVC). Use a prebuilt wheel:
+**Note:** on **Windows**, `llama-cpp-python` may build from source when no prebuilt wheel matches
+your Python (needs MSVC). Use a prebuilt wheel:
 ```bash
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 pip install huggingface-hub pillow

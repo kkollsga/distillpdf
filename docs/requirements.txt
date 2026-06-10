@@ -1,0 +1,2 @@
+# Docs build (Read the Docs + local `mkdocs serve`)
+mkdocs-material>=9.5,<10
