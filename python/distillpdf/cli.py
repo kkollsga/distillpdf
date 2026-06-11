@@ -273,7 +273,7 @@ def _list_ocr_engines():
 def _run_ocr(args):
     """`--ocr`: OCR each input's scanned pages (progress bar shown automatically) and write a
     searchable PDF (default) or OCR'd HTML/Markdown. The engine is chosen by ``--ocr-engine``
-    (default: the fast bundled tier); errors (e.g. a missing [ocr] extra for 'accurate') are
+    (default: the fast bundled tier); errors (e.g. a missing runtime for 'accurate') are
     reported per file."""
     multiple = len(args.pdf) > 1
     img_kw = {} if args.image_mode is None else {"image_mode": args.image_mode}
@@ -302,7 +302,7 @@ def _run_ocr(args):
             else:
                 doc.to_html(dest, ocr=True, backend=backend, **img_kw)
             print(f"distillpdf: wrote {dest}", file=sys.stderr)
-        except Exception as e:  # missing [ocr] extra, malformed PDF, unreadable path, etc.
+        except Exception as e:  # missing OCR runtime, malformed PDF, unreadable path, etc.
             print(f"distillpdf: {src}: {e}", file=sys.stderr)
             rc = 1
     return rc

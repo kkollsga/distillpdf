@@ -352,7 +352,7 @@ def _accurate_backend_name() -> str:
     """The platform's granite-docling backend: native MLX on Apple Silicon (Metal), else
     PyTorch/transformers on Win/Linux/Intel-Mac (torch has prebuilt wheels everywhere, so it
     installs with no C++ compiler). The lighter GGUF runtime stays opt-in via
-    ``engine="granite-docling-gguf"`` + the ``[ocr-gguf]`` extra."""
+    ``engine="granite-docling-gguf"`` (install llama-cpp-python yourself)."""
     import platform
 
     if platform.system() == "Darwin" and platform.machine() == "arm64":
@@ -385,7 +385,8 @@ def backend_for(engine=None, **kwargs) -> OcrBackend:
 
     ``engine`` may be:
       * ``None`` / ``"fast"`` — the bundled fast tier (Tesseract), the default;
-      * ``"accurate"`` or ``"granite"`` — the granite-docling VLM (needs the ``[ocr]`` extra);
+      * ``"accurate"`` or ``"granite"`` — the granite-docling VLM (needs a runtime you
+        install yourself — see ``install_help("granite")``);
       * any specific registered backend name (e.g. ``"granite-docling-gguf"``, ``"tesseract"``);
       * an already-constructed ``OcrBackend`` instance (returned as-is).
     """
