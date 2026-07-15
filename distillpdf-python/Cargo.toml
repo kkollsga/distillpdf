@@ -1,0 +1,33 @@
+[package]
+name = "distillpdf-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "PyO3 bindings for distillpdf — the Python wheel built by maturin."
+
+[lib]
+# `distillpdf_python` (not the module name): keeps the rlib filename from colliding with the
+# core crate's `libdistillpdf`. The Python import name is bound by maturin's `module-name`
+# (pyproject) + `#[pymodule] fn _distillpdf`, NOT by this cargo lib name.
+name = "distillpdf_python"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# REQUIRED for the Python wheel (maturin enables it via pyproject's [tool.maturin] features).
+# It tells pyo3 NOT to link libpython, which makes the test/bench binaries unlinkable, so it is
+# OPT-IN — `cargo test`/`cargo build` then link normally.
+extension-module = ["pyo3/extension-module"]
+# Forward the core's bundled-Tesseract OCR engine. maturin passes `--features
+# extension-module,tesseract`; this makes the `tesseract` feature resolve against the core.
+tesseract = ["distillpdf/tesseract"]
+
+[dependencies]
+pyo3 = { workspace = true }
+distillpdf = { path = "../distillpdf" }
+# Used directly by the binding shim: `image::open`/`load_from_memory` for the OCR page-image
+# helpers (the decoded `DynamicImage` is handed to `distillpdf::ocr::pdf::PageInput`, so the
+# version must match the core's), and `serde_json::from_str` for `save_dpdf`'s model_json.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde_json = "1"

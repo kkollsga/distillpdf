@@ -15,7 +15,7 @@ use std::time::Duration;
 use base64::Engine as _;
 
 /// A backend that turns a single page image (PNG/JPEG bytes) into a DocTags string.
-pub(crate) trait OcrEngine: Sync {
+pub trait OcrEngine: Sync {
     fn ocr_page(&self, image: &[u8]) -> Result<String, String>;
 
     /// Classify a page image for the text-vs-true-image gate: `(raw_words, confident_chars)`.
@@ -59,7 +59,7 @@ pub(crate) fn doctags_text_stats(doctags: &str) -> (usize, usize) {
 /// boundary). Each engine picks the fields it cares about and ignores the rest — mirroring
 /// how the Python `OcrConfig` dataclass is shared across backends.
 #[derive(Default, Clone)]
-pub(crate) struct NativeCfg {
+pub struct NativeCfg {
     pub languages: Vec<String>,
     pub dpi: Option<u32>,
     pub prompt: Option<String>,
@@ -74,7 +74,7 @@ pub(crate) struct NativeCfg {
 /// Build a Rust-native OCR engine by name. Unknown / compiled-out engines return `Err`.
 /// This is the single registry that surfaces native engines (the bundled Tesseract, the
 /// bring-your-own server) into the Python backend registry via `ocr_page_native`.
-pub(crate) fn native_engine(name: &str, cfg: &NativeCfg) -> Result<Box<dyn OcrEngine>, String> {
+pub fn native_engine(name: &str, cfg: &NativeCfg) -> Result<Box<dyn OcrEngine>, String> {
     match name {
         #[cfg(feature = "tesseract")]
         "tesseract" => Ok(Box::new(crate::ocr::tesseract::TesseractEngine::from_cfg(cfg)?)),
@@ -94,7 +94,7 @@ pub(crate) fn native_engine_available(name: &str) -> bool {
 }
 
 /// The native engines compiled into this build, in preference order.
-pub(crate) fn native_engine_names() -> Vec<&'static str> {
+pub fn native_engine_names() -> Vec<&'static str> {
     ["tesseract", "server"]
         .into_iter()
         .filter(|n| native_engine_available(n))

@@ -209,7 +209,7 @@ fn parse_image_mode(image_mode: &str, string_fallback: ImgMode) -> Result<ImgMod
 /// placeholders and the HTML is the `image_mode="drop"` shape regardless — embed/external
 /// re-render awaits the asset-bytes capture (Wave 3/4). This still produces the EXACT HTML the
 /// PDF path produces for `image_mode="drop"`, which is the round-trip contract.
-pub(crate) fn render_html(model: &DocModel, mode: Mode, include_toc: bool) -> String {
+pub fn render_html(model: &DocModel, mode: Mode, include_toc: bool) -> String {
     // Rebuild the post-transform element IR from the blocks, then run the SAME emit + merge +
     // assemble path the PDF parse path runs — so a model-only re-render is the identical code,
     // only the IR source differs (blocks, not a fresh parse). The rebuilt figure/chrome fragments
@@ -233,7 +233,7 @@ pub(crate) fn render_html(model: &DocModel, mode: Mode, include_toc: bool) -> St
 /// Render the model to Markdown — the existing HTML→Markdown transform over [`render_html`],
 /// so every Markdown improvement flows in for free (the same property the PDF path has).
 /// Returns the Markdown plus any figure files (empty here — the Wave-1/2 model has no bytes).
-pub(crate) fn render_markdown(model: &DocModel, mode: Mode, include_toc: bool, image_mode: &str) -> Result<(String, Vec<markdown::ImageFile>), String> {
+pub fn render_markdown(model: &DocModel, mode: Mode, include_toc: bool, image_mode: &str) -> Result<(String, Vec<markdown::ImageFile>), String> {
     let im = parse_image_mode(image_mode, ImgMode::Placeholder)?;
     let html = render_html(model, mode, include_toc);
     Ok(markdown::html_to_markdown(&html, include_toc, im))
@@ -254,7 +254,7 @@ pub(crate) fn render_markdown(model: &DocModel, mode: Mode, include_toc: bool, i
 /// cannot reproduce its exact intra-page whitespace. The two agree on the WORD sequence, which
 /// is the substantive content; the round-trip regression asserts that token equality (and pins
 /// HTML/Markdown byte-for-byte, since those ARE pure HTML transforms).
-pub(crate) fn extract_text(model: &DocModel) -> String {
+pub fn extract_text(model: &DocModel) -> String {
     // Each page's body is the emit of its rebuilt element IR (the page-mode INNER, the same body
     // the fidelity render carries) — SVG subtrees dropped, inline tags → token boundaries.
     let pages_ir = rebuild_ir(model);

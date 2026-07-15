@@ -14,13 +14,13 @@
 #![allow(dead_code)] // wired into html.rs / lib.rs incrementally
 
 pub(crate) mod detect;
-pub(crate) mod doctags;
-pub(crate) mod engine;
-pub(crate) mod pdf;
-pub(crate) mod render;
+pub mod doctags;
+pub mod engine;
+pub mod pdf;
+pub mod render;
 pub(crate) mod tess_synth;
 #[cfg(feature = "tesseract")]
-pub(crate) mod tesseract;
+pub mod tesseract;
 
 use base64::Engine as _;
 use lopdf::{Document, ObjectId};
@@ -80,4 +80,24 @@ pub(crate) fn page_size_pts(doc: &Document, page_id: ObjectId) -> (f32, f32) {
         Some([x0, y0, x1, y1]) => ((x1 - x0).abs().max(1.0), (y1 - y0).abs().max(1.0)),
         None => (612.0, 792.0),
     }
+}
+
+/// Detect the dominant language of a text sample and map it to a bundled Tesseract code
+/// (`eng`/`por`/`nor`). Returns `None` when detection is low-confidence or the language isn't
+/// one we bundle — the caller then keeps the full bundled set. Pure-Rust (whatlang), so it is
+/// only compiled with the `tesseract` feature (which owns the `whatlang` dependency). The
+/// PyO3 wheel's `detect_language` pyfunction is a thin forward to this.
+#[cfg(feature = "tesseract")]
+pub fn detect_language(text: &str) -> Option<String> {
+    let info = whatlang::detect(text)?;
+    if !info.is_reliable() || info.confidence() < 0.55 {
+        return None;
+    }
+    let code = match info.lang() {
+        whatlang::Lang::Eng => "eng",
+        whatlang::Lang::Por => "por",
+        whatlang::Lang::Nob => "nor", // Norwegian Bokmål → the bundled `nor` model
+        _ => return None,
+    };
+    Some(code.to_string())
 }

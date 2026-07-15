@@ -29,8 +29,8 @@
 #![allow(dead_code)]
 
 pub(crate) mod build;
-pub(crate) mod container;
-pub(crate) mod render;
+pub mod container;
+pub mod render;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -81,7 +81,7 @@ pub(crate) const NATIVE_CONFIDENCE: f32 = 1.0;
 /// from the render walk's positioned items onto each block. `Option` on a block — `None` for a
 /// construct the walk produced from no positioned line (rare); 100% of content blocks carry one
 /// on the born-digital path.
-pub(crate) type Bbox = [f32; 4];
+pub type Bbox = [f32; 4];
 
 /// The whole document model — the root of `model.json`.
 ///
@@ -90,7 +90,7 @@ pub(crate) type Bbox = [f32; 4];
 /// so save→load→save is byte-identical. Nothing here carries a timestamp except
 /// [`Source::generated_at`], taken once at distill time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct DocModel {
+pub struct DocModel {
     pub schema_version: u32,
     pub source: Source,
     pub metadata: Metadata,
@@ -128,7 +128,7 @@ pub(crate) struct DocModel {
 /// and a drift check can compare a fresh derive. Text is NOT duplicated — a chunk references its
 /// `block_ids`; chunk text is recomposed from the blocks at embed/search time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct Chunks {
+pub struct Chunks {
     /// The chunking-policy recipe string; a fresh derive under the same policy must match.
     pub policy: String,
     pub items: Vec<Chunk>,
@@ -137,7 +137,7 @@ pub(crate) struct Chunks {
 /// One chunk: a contiguous run of blocks in one section (or unsectioned), addressed by a `c0001`
 /// id. Carries only addresses + spans — never block text (no duplication).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct Chunk {
+pub struct Chunk {
     pub id: String,
     pub block_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,7 +151,7 @@ pub(crate) struct Chunk {
 /// `len(chunk_ids)` rows × `dimension` cols, rows in `chunk_ids` order. Multiple spaces may
 /// coexist (re-embed with a different model); a typical file has one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct EmbeddingSpace {
+pub struct EmbeddingSpace {
     pub id: String,
     pub model: String,
     pub dimension: u32,
@@ -168,7 +168,7 @@ pub(crate) struct EmbeddingSpace {
 /// timestamp in the file. A model is a snapshot of extractor quality at `generated_at`;
 /// `distillpdf` + `schema_version` make that explicit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct Source {
+pub struct Source {
     pub file: String,
     pub sha256: String,
     pub pages: u32,
@@ -179,7 +179,7 @@ pub(crate) struct Source {
 /// Document front-matter / catalog metadata. Sparse by design — only what the extractor
 /// understood. `total = false` semantics via `#[serde(default)]` on each optional field.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub(crate) struct Metadata {
+pub struct Metadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -197,7 +197,7 @@ pub(crate) struct Metadata {
 /// write others (e-filing stamps, etc.) — addresses are separated from labels so citations
 /// resolve both ways.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct Page {
+pub struct Page {
     pub n: u32,
     pub width_pts: f32,
     pub height_pts: f32,
@@ -218,7 +218,7 @@ pub(crate) struct Page {
 /// Mirror of `ocr::detect::OcrDecision` as a serde enum (kept here so the model module owns
 /// its wire shape and doesn't leak the internal type's representation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum OcrDecision {
+pub enum OcrDecision {
     NotNeeded,
     NeedsOcr,
     DropAndOcr,
@@ -239,7 +239,7 @@ impl From<crate::ocr::detect::OcrDecision> for OcrDecision {
 /// re-OCR, the strongest-agent escalation — and `active_ocr_pass` picks which feeds blocks.
 /// Wave 2 writes these; Wave 1 only defines the shape + the legibility metric below.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct OcrPass {
+pub struct OcrPass {
     pub id: String,
     pub engine: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -251,7 +251,7 @@ pub(crate) struct OcrPass {
 
 /// One page's outcome within an [`OcrPass`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct OcrResult {
+pub struct OcrResult {
     pub page: u32,
     pub outcome: OcrOutcome,
     /// Legible alphanumeric character count (see [`legible_chars`]) — the size of the
@@ -273,7 +273,7 @@ pub(crate) struct OcrResult {
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum OcrOutcome {
+pub enum OcrOutcome {
     OcrOk,
     OcrPartial,
     OcrIllegible,
@@ -283,7 +283,7 @@ pub(crate) enum OcrOutcome {
 /// `id` is the `sec-…` slug the renderer already mints, so model ids == HTML ids == the
 /// CLI/agent addresses — one id space across every face of the document.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct Section {
+pub struct Section {
     pub id: String,
     pub level: u8,
     pub title: String,
@@ -297,7 +297,7 @@ pub(crate) struct Section {
 /// ordinal in reading order, scoped to the file (cross-file stability is the re-distill
 /// snapshot question, already accepted in the design).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct Block {
+pub struct Block {
     pub id: String,
     pub kind: BlockKind,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -366,7 +366,7 @@ pub(crate) struct Block {
 /// The block kinds the extractor distinguishes. Lowercase wire names match the design.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum BlockKind {
+pub enum BlockKind {
     Heading,
     Para,
     ListItem,
@@ -407,7 +407,7 @@ impl BlockKind {
 /// self-describing for Tier-1 agents) but formally regenerable via [`derive_indexes`]. Any
 /// mutation that touches blocks must re-derive, so drift is impossible by construction.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub(crate) struct Indexes {
+pub struct Indexes {
     /// page number (as a string key, for JSON-object stability) → block ids on that page.
     pub pages: BTreeMap<String, Vec<String>>,
     /// section id → block ids belonging to it.
@@ -419,7 +419,7 @@ pub(crate) struct Indexes {
 
 /// A `kinds`-index entry: the address (block id, page) plus the human/parsed label.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct KindEntry {
+pub struct KindEntry {
     pub id: String,
     pub page: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -429,7 +429,7 @@ pub(crate) struct KindEntry {
 /// Validated index coverage — surfaced so a consumer sees "97% sectioned, 3% unsectioned
 /// (page-reachable)" rather than trusting a green light over invisible content.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub(crate) struct Coverage {
+pub struct Coverage {
     /// Fraction of blocks that belong to a section (front-matter before the first heading is
     /// legitimately unsectioned, not an error).
     pub sectioned: f32,
@@ -443,7 +443,7 @@ pub(crate) struct Coverage {
 /// `external` references a sibling path, `dropped` keeps only a stub (hash + dims + a
 /// `regen` recipe) — a named, reversible hole.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct Asset {
+pub struct Asset {
     pub id: String,
     pub kind: AssetKind,
     pub storage: AssetStorage,
@@ -462,7 +462,7 @@ pub(crate) struct Asset {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AssetKind {
+pub enum AssetKind {
     Figure,
     PageRaster,
     Svg,
@@ -470,7 +470,7 @@ pub(crate) enum AssetKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AssetStorage {
+pub enum AssetStorage {
     Embedded,
     External,
     Dropped,
@@ -478,7 +478,7 @@ pub(crate) enum AssetStorage {
 
 /// A recipe to regenerate a dropped/external asset from the hash-verified source PDF.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct Regen {
+pub struct Regen {
     pub page: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dpi: Option<u32>,
@@ -486,7 +486,7 @@ pub(crate) struct Regen {
 
 /// A hyperlink (external URI or internal destination).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct Link {
+pub struct Link {
     pub page: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
@@ -498,7 +498,7 @@ pub(crate) struct Link {
 
 /// A PDF named destination (a label that resolves to a page/position).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct NamedDest {
+pub struct NamedDest {
     pub name: String,
     pub page: u32,
 }
@@ -506,7 +506,7 @@ pub(crate) struct NamedDest {
 /// A table-of-contents entry (from the PDF's own `/Outlines` when present, else detected
 /// headings).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct TocEntry {
+pub struct TocEntry {
     pub level: u8,
     pub title: String,
     pub page: u32,

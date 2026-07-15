@@ -73,7 +73,7 @@ fn cache() -> &'static Mutex<HashMap<String, Arc<Mutex<TessApi>>>> {
 /// Delete the cached handles. Call before interpreter shutdown (via a Python `atexit`) so the
 /// `TessBaseAPI`s are freed BEFORE Tesseract's C++ static caches tear down — otherwise the
 /// dictionary (dawg) objects are reported as leaked on stderr. Harmless either way.
-pub(crate) fn clear_cache() {
+pub fn clear_cache() {
     if let Ok(mut g) = cache().lock() {
         g.clear();
     }

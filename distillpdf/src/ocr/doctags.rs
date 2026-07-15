@@ -78,8 +78,8 @@ pub(crate) enum Block {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct OcrPage {
-    pub blocks: Vec<Block>,
+pub struct OcrPage {
+    pub(crate) blocks: Vec<Block>,
 }
 
 // ---- tokenizer -------------------------------------------------------------
@@ -336,7 +336,7 @@ fn collapse_inline(line: &str) -> String {
 }
 
 /// Parse a DocTags string into a typed page model.
-pub(crate) fn parse(input: &str) -> OcrPage {
+pub fn parse(input: &str) -> OcrPage {
     let delooped = collapse_loops(input);
     // Strip an optional <doctag>…</doctag> wrapper.
     let s = delooped.trim();

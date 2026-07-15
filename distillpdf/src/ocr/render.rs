@@ -152,7 +152,7 @@ fn render_cell(c: &Cell) -> String {
 }
 
 /// Convenience: parse DocTags and render to an HTML fragment in one call.
-pub(crate) fn doctags_to_html(doctags: &str) -> String {
+pub fn doctags_to_html(doctags: &str) -> String {
     render_page(&crate::ocr::doctags::parse(doctags), &RenderOpts::default())
 }
 

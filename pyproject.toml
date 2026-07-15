@@ -65,6 +65,9 @@ Issues = "https://github.com/kkollsga/distillpdf/issues"
 Source = "https://github.com/kkollsga/distillpdf"
 
 [tool.maturin]
+# The wheel crate now lives in the workspace member `distillpdf-python/`; pyproject STAYS at
+# the repo root (python-source / include are resolved relative to it).
+manifest-path = "distillpdf-python/Cargo.toml"
 features = ["extension-module"]
 module-name = "distillpdf._distillpdf"
 python-source = "python"

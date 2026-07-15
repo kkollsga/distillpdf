@@ -1,0 +1,45 @@
+[package]
+name = "distillpdf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Pure-Rust PDF extraction (text/tables/figures/fonts) that distills documents into clean, LLM-ready HTML — on lopdf"
+keywords = ["pdf", "extraction", "llm", "rag", "lopdf"]
+categories = ["text-processing", "parser-implementations"]
+
+# Plain rlib (the default crate-type): the pyo3-free core, consumed as a library by the
+# `distillpdf-python` wheel crate and by any Rust embedder. No `cdylib`, no `extension-module`.
+
+[features]
+# Bundled Tesseract "fast" OCR engine: builds minimal static Leptonica + Tesseract from the
+# vendored `third_party/` submodules via CMake (see `build.rs`) and links them into the core.
+# Off by default for `cargo test`/`cargo check` (keeps the pure-Rust crate fast to build);
+# maturin turns it on for the wheels via `distillpdf-python`'s FORWARDED `tesseract` feature.
+# `whatlang` is the pure-Rust language detector used to auto-pick the OCR language.
+tesseract = ["dep:cmake", "dep:whatlang"]
+
+[dependencies]
+lopdf = "0.40"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+jpeg-decoder = "0.3"
+fax = "0.2"
+rayon = "1"
+# The `.dpdf` document model (src/model/): serde structs → a deterministic model.json. All
+# three crates were already in the dependency tree transitively (serde/serde_json via the
+# decoders' build glue, sha2 via `image`), so keeping them DIRECT adds only the serde-derive
+# proc-macro at build time — no new linked code.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Content-addressed asset stubs: the `dropped` storage mode records a sha256 so a dropped
+# binary is a *named* hole — rehydratable from the hash-verified source PDF (honest coverage).
+sha2 = "0.10"
+# Pure-Rust language detection (n-gram, no model files); only built with the `tesseract`
+# feature, used to auto-pick the OCR language from a sample of the document.
+whatlang = { version = "0.16", optional = true }
+
+[build-dependencies]
+# Only pulled in when the `tesseract` feature is on (the from-source C/C++ build).
+cmake = { version = "0.1", optional = true }

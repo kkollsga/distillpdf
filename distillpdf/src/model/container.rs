@@ -36,7 +36,7 @@ const MODEL_JSON: &str = "model.json";
 /// Asset bytes to write, keyed by the asset id (which doubles as the in-container path, e.g.
 /// `img/fig_03.png`). Only `embedded`/`external` assets need an entry; `dropped` assets are
 /// stub-only and carry no bytes.
-pub(crate) type AssetBytes = BTreeMap<String, Vec<u8>>;
+pub type AssetBytes = BTreeMap<String, Vec<u8>>;
 
 /// Serialize a [`DocModel`] to CANONICAL JSON: pretty-printed (readable as a Tier-1 artifact)
 /// with object keys SORTED at every level. serde_json preserves struct field order, but our
@@ -44,7 +44,7 @@ pub(crate) type AssetBytes = BTreeMap<String, Vec<u8>>;
 /// formatting, which serde_json renders deterministically. Sorting is enforced by routing
 /// through `serde_json::Value` and a key-sorting serializer so the bytes are stable
 /// regardless of struct field declaration order changing in future.
-pub(crate) fn to_canonical_json(model: &DocModel) -> Result<Vec<u8>, String> {
+pub fn to_canonical_json(model: &DocModel) -> Result<Vec<u8>, String> {
     // Round-trip through Value, then serialize with sorted keys. `serde_json::Value`'s Map is
     // a BTreeMap by default (the crate's default feature set), giving sorted keys for free;
     // we assert that by serializing the Value, which iterates the map in key order.
@@ -70,7 +70,7 @@ pub(crate) fn save(model: &DocModel, path: &Path, assets: &AssetBytes, external_
 /// the embedded asset bytes — they are ARTIFACTS the model references but does not derive, so
 /// the container carries them losslessly and save→load→save stays byte-identical. Member names
 /// must not collide with `model.json` or any embedded asset id.
-pub(crate) fn save_with_members(
+pub fn save_with_members(
     model: &DocModel,
     path: &Path,
     assets: &AssetBytes,

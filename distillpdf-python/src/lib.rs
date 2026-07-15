@@ -1,41 +1,16 @@
-//! distillpdf — pure-Rust PDF extraction on lopdf, exposed to Python via PyO3.
+//! distillpdf-python — the PyO3 wheel: a thin Python binding over the pyo3-free
+//! [`distillpdf`] core crate.
 //!
-//! Phase 0: open a PDF, report page count, extract text.
-//! Engine (lopdf) is confined to this boundary module; higher-level extraction
-//! layers will be added above it (text spans, tables, images, fonts).
+//! Every `#[pyclass]`/`#[pyfunction]` here wraps a pure-Rust operation on the core's
+//! [`PdfDocument`] / typed model, assembling the Python objects and mapping the core's
+//! structured [`Error`] to the `ValueError` the Python API has always raised. The
+//! `#[pymodule]` name (`_distillpdf`) is bound to maturin's `module-name` and must not change.
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-
-mod afm;
-mod captions;
-mod doc;
-mod elem_passes;
-mod error;
-mod extract;
-mod frontmatter;
-mod headings;
-mod html;
-mod img;
-mod layout;
-mod links;
-mod markdown;
-mod model;
-mod nav;
-mod ocr;
-mod postprocess;
-mod profile;
-mod text;
-mod vector;
-
-use doc::PdfDocument;
-use error::Error;
-
-/// Maximum Form-XObject / content-stream recursion depth. Bounds runaway recursion and
-/// cyclic Form references while allowing legitimately deep nesting.
-pub(crate) const MAX_FORM_DEPTH: u32 = 40;
-
 use pyo3::types::{PyDict, PyList};
+
+use distillpdf::{doc, markdown, model, ocr, Error, PdfDocument};
 
 /// Map a core [`Error`] to the `ValueError` the Python API has always raised. `Display` on
 /// `Error` reproduces the exact message strings, so pytest assertions stay green.
@@ -672,17 +647,7 @@ fn ocr_native_shutdown() {
 #[cfg(feature = "tesseract")]
 #[pyfunction]
 fn detect_language(text: &str) -> Option<String> {
-    let info = whatlang::detect(text)?;
-    if !info.is_reliable() || info.confidence() < 0.55 {
-        return None;
-    }
-    let code = match info.lang() {
-        whatlang::Lang::Eng => "eng",
-        whatlang::Lang::Por => "por",
-        whatlang::Lang::Nob => "nor", // Norwegian Bokmål → the bundled `nor` model
-        _ => return None,
-    };
-    Some(code.to_string())
+    distillpdf::ocr::detect_language(text)
 }
 
 #[pymodule]

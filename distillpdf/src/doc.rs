@@ -80,12 +80,9 @@ pub fn parse_assets(s: &str) -> Result<AssetProfile, Error> {
 }
 
 /// Load a `.dpdf` container into its typed [`DocModel`] plus the raw member bytes (assets and
-/// any other members kept separate from the model, per the consumer contract).
-///
-/// `pub(crate)` for now: `DocModel`/`AssetBytes` are still `pub(crate)` (Phase 2 makes the
-/// model structs + fields `pub` and adds the root re-exports); this is the typed-load path the
-/// binding routes through in the meantime.
-pub(crate) fn load_dpdf(path: &Path) -> Result<(DocModel, AssetBytes), Error> {
+/// any other members kept separate from the model, per the consumer contract). Re-exported at
+/// the crate root ([`crate::load_dpdf`]) as the typed `.dpdf` load convenience.
+pub fn load_dpdf(path: &Path) -> Result<(DocModel, AssetBytes), Error> {
     model::container::load(path).map_err(Error::Model)
 }
 

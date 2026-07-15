@@ -1,56 +1,25 @@
-[package]
-name = "distillpdf"
+# Virtual workspace: the pyo3-free core (`distillpdf`) + the PyO3 wheel (`distillpdf-python`).
+# One version, bumped in lockstep via `[workspace.package]`, ships both crates.
+[workspace]
+members = ["distillpdf", "distillpdf-python"]
+resolver = "2"
+
+[workspace.package]
+# Keep `version` the FIRST key here: publish.yml greps `^version` off this file to gate the
+# PyPI release, and both member crates inherit it via `version.workspace = true`.
 version = "0.0.34"
 edition = "2021"
 license = "MIT"
-description = "Pure-Rust PDF extraction (text/tables/figures/fonts) that distills documents into clean, LLM-ready HTML — on lopdf, for Python"
 repository = "https://github.com/kkollsga/distillpdf"
 homepage = "https://github.com/kkollsga/distillpdf"
-keywords = ["pdf", "extraction", "llm", "rag", "lopdf"]
-categories = ["text-processing", "parser-implementations"]
 
-[lib]
-name = "distillpdf"
-crate-type = ["cdylib", "rlib"]
-
-[features]
-# `extension-module` is REQUIRED for the Python wheel (maturin enables it via
-# pyproject's [tool.maturin] features), but it makes the test/bench binaries unlinkable
-# (it tells pyo3 not to link libpython, so `_PyExc_*` are undefined). Keeping it OPT-IN
-# means `cargo test` links normally and the pure-Rust logic gets real unit tests.
-extension-module = ["pyo3/extension-module"]
-# Bundled Tesseract "fast" OCR engine: builds minimal static Leptonica + Tesseract from the
-# vendored `third_party/` submodules via CMake and links them into the core. Off by default
-# for `cargo test`/`cargo check` (keeps the pure-Rust crate fast to build); maturin turns it
-# on for the wheels. `whatlang` is the pure-Rust language detector used to pick which bundled
-# language to OCR with.
-tesseract = ["dep:cmake", "dep:whatlang"]
-
-[dependencies]
+[workspace.dependencies]
+# PyO3 is declared once and opted into ONLY by `distillpdf-python`, so the core crate (and any
+# Rust embedder of it, e.g. kglite) never drags pyo3 into its dependency tree.
 pyo3 = { version = "0.25", features = ["abi3-py38"] }
-lopdf = "0.40"
-base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-jpeg-decoder = "0.3"
-fax = "0.2"
-rayon = "1"
-# The `.dpdf` document model (src/model/): serde structs → a deterministic model.json. All
-# three crates were already in the dependency tree transitively (serde/serde_json via the
-# decoders' build glue, sha2 via `image`), so promoting them to DIRECT deps adds only the
-# serde-derive proc-macro at build time — no new linked code, the wheel stays the same size.
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-# Content-addressed asset stubs: the `dropped` storage mode records a sha256 so a dropped
-# binary is a *named* hole — rehydratable from the hash-verified source PDF (honest coverage).
-sha2 = "0.10"
-# Pure-Rust language detection (n-gram, no model files); only built with the `tesseract`
-# feature, used to auto-pick the OCR language from a sample of the document.
-whatlang = { version = "0.16", optional = true }
 
-[build-dependencies]
-# Only pulled in when the `tesseract` feature is on (the from-source C/C++ build).
-cmake = { version = "0.1", optional = true }
-
+# The release profile MUST live at the workspace root — cargo IGNORES `[profile.*]` declared in
+# a member crate. These are the exact settings the wheel has always shipped with.
 [profile.release]
 lto = true
 codegen-units = 1

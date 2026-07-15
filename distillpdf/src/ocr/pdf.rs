@@ -14,7 +14,7 @@ use crate::ocr::doctags::{BBox, Block, OcrPage};
 
 /// One page to write: its block model, page size in points, and (optional) source image
 /// for cropping figure regions.
-pub(crate) struct PageInput {
+pub struct PageInput {
     pub page: OcrPage,
     pub width: f32,
     pub height: f32,
@@ -72,7 +72,7 @@ pub(crate) fn add_fonts(doc: &mut Document) -> (lopdf::ObjectId, lopdf::ObjectId
 }
 
 /// Build the whole PDF and return its bytes.
-pub(crate) fn write_pdf(pages: &[PageInput]) -> Result<Vec<u8>, String> {
+pub fn write_pdf(pages: &[PageInput]) -> Result<Vec<u8>, String> {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
     let (helv, helv_b) = add_fonts(&mut doc);
