@@ -43,7 +43,7 @@ pub(crate) const SCHEMA_VERSION: u32 = 0;
 /// policy in docs/datamodel-design.md). Every profile keeps the asset STUBS (hash/dims/regen)
 /// — only the bytes differ — so a dropped asset is always a named, reversible hole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AssetProfile {
+pub enum AssetProfile {
     /// `assets="none"` — text + structure only; ALL asset bytes dropped (stubs remain). A few
     /// MB even for a 1,500-page scan; emailable.
     None,

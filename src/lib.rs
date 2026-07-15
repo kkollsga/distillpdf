@@ -4,14 +4,14 @@
 //! Engine (lopdf) is confined to this boundary module; higher-level extraction
 //! layers will be added above it (text spans, tables, images, fonts).
 
-use lopdf::dictionary;
-use lopdf::Document;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 mod afm;
 mod captions;
+mod doc;
 mod elem_passes;
+mod error;
 mod extract;
 mod frontmatter;
 mod headings;
@@ -28,179 +28,31 @@ mod profile;
 mod text;
 mod vector;
 
+use doc::PdfDocument;
+use error::Error;
+
 /// Maximum Form-XObject / content-stream recursion depth. Bounds runaway recursion and
 /// cyclic Form references while allowing legitimately deep nesting.
 pub(crate) const MAX_FORM_DEPTH: u32 = 40;
 
 use pyo3::types::{PyDict, PyList};
 
-/// Parse the `mode` string accepted by `open`/`from_bytes` into an `html::Mode`.
-fn parse_mode(mode: &str) -> PyResult<html::Mode> {
-    match mode {
-        "section" => Ok(html::Mode::Section),
-        "page" => Ok(html::Mode::Page),
-        other => Err(PyValueError::new_err(format!(
-            "invalid mode {other:?}: expected \"section\" or \"page\""
-        ))),
-    }
+/// Map a core [`Error`] to the `ValueError` the Python API has always raised. `Display` on
+/// `Error` reproduces the exact message strings, so pytest assertions stay green.
+fn to_py(e: Error) -> PyErr {
+    PyValueError::new_err(e.to_string())
 }
 
-/// Parse the `image_mode` string into a render strategy:
-/// * `"embed"` → inline base64 `data:` URIs (self-contained).
-/// * `"external"` → extract figures to an `img/` folder; only possible when writing to a
-///   file, so a returned string falls back to `string_fallback` (HTML uses `Embed` to stay
-///   self-contained; Markdown uses `Placeholder`, since inline data URIs are impractical).
-/// * `"drop"` → replace images with placeholder text.
 /// The success sentinel returned by the file-writing methods: Python `int` 1.
 fn ok_one(py: Python<'_>) -> PyResult<Py<PyAny>> {
     use pyo3::IntoPyObject;
     Ok(1i64.into_pyobject(py).unwrap().into_any().unbind())
 }
 
-fn parse_image_mode(s: &str, writing: bool, string_fallback: markdown::ImgMode) -> PyResult<markdown::ImgMode> {
-    match s {
-        "embed" => Ok(markdown::ImgMode::Embed),
-        "drop" => Ok(markdown::ImgMode::Placeholder),
-        "external" => Ok(if writing { markdown::ImgMode::Files } else { string_fallback }),
-        other => Err(PyValueError::new_err(format!(
-            "invalid image_mode {other:?}: expected \"embed\", \"external\", or \"drop\""
-        ))),
-    }
-}
-
-/// Append `stream_id` to a page's `/Contents` (PDF concatenates a content array), so an
-/// extra content stream — e.g. the invisible OCR text overlay — draws after the page's own
-/// content while leaving it untouched.
-fn append_page_content(doc: &mut Document, page_id: lopdf::ObjectId, stream_id: lopdf::ObjectId) {
-    let Ok(page) = doc.get_object_mut(page_id).and_then(|o| o.as_dict_mut()) else { return };
-    let new = match page.get(b"Contents").ok().cloned() {
-        Some(lopdf::Object::Array(mut a)) => {
-            a.push(lopdf::Object::Reference(stream_id));
-            lopdf::Object::Array(a)
-        }
-        Some(existing @ lopdf::Object::Reference(_)) => lopdf::Object::Array(vec![existing, lopdf::Object::Reference(stream_id)]),
-        _ => lopdf::Object::Reference(stream_id),
-    };
-    page.set("Contents", new);
-}
-
-/// Give a page its own `/Resources` carrying the OCR overlay fonts (under names distinct from
-/// the page's own fonts), preserving its existing resources so the page's raster/text still
-/// render. Used by the keep-raster searchable-PDF path.
-fn add_overlay_fonts(doc: &mut Document, page_id: lopdf::ObjectId, helv: lopdf::ObjectId, helv_b: lopdf::ObjectId) {
-    // Resolve the page's effective resources (own or inherited from /Pages), as an owned copy.
-    let mut res = match doc.get_page_resources(page_id) {
-        Ok((Some(d), _)) => d.clone(),
-        Ok((None, ids)) => ids.first().and_then(|id| doc.get_dictionary(*id).ok()).cloned().unwrap_or_default(),
-        Err(_) => lopdf::Dictionary::new(),
-    };
-    let mut fonts = match res.get(b"Font").ok().cloned() {
-        Some(lopdf::Object::Dictionary(d)) => d,
-        Some(lopdf::Object::Reference(r)) => doc.get_dictionary(r).cloned().unwrap_or_default(),
-        _ => lopdf::Dictionary::new(),
-    };
-    fonts.set(ocr::pdf::OVERLAY_FONT, lopdf::Object::Reference(helv));
-    fonts.set(ocr::pdf::OVERLAY_FONT_BOLD, lopdf::Object::Reference(helv_b));
-    res.set("Font", fonts);
-    if let Ok(page) = doc.get_object_mut(page_id).and_then(|o| o.as_dict_mut()) {
-        page.set("Resources", lopdf::Object::Dictionary(res));
-    }
-}
-
-/// Current UTC time as an ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` string. This is the ONLY clock
-/// read into a `.dpdf` model (`source.generated_at`); everything else is content-derived and
-/// deterministic. Computed from `SystemTime` by hand (a civil-date conversion) so the model
-/// path needs no `chrono`/`time` direct dependency for one timestamp.
-fn iso8601_now() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let (days, rem) = ((secs / 86400) as i64, secs % 86400);
-    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    // Civil-from-days (Howard Hinnant's algorithm), epoch 1970-01-01.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
-}
-
-/// A loaded PDF document.
+/// A loaded PDF document — a thin PyO3 wrapper over the pure-Rust [`PdfDocument`] core.
 #[pyclass]
 struct Pdf {
-    doc: Document,
-    /// Raw PDF bytes, kept for lenient recovery of malformed streams.
-    raw: Vec<u8>,
-    /// Source path (`open`); `None` when constructed from bytes. Used to derive the
-    /// default `<source>.html` / `<source>.md` output name when `outputfile=True`.
-    source: Option<std::path::PathBuf>,
-    /// Cached OCR results: `{1-based page: DocTags}`, populated once by `set_ocr` (the
-    /// `distillpdf.ocr.run` orchestrator) so a single model pass feeds every renderer
-    /// (`to_pdf` / OCR-augmented HTML / Markdown) — the model never re-runs per output.
-    ocr_cache: std::sync::Mutex<std::collections::HashMap<u32, String>>,
-}
-
-impl Pdf {
-    /// Render the HTML with the GIL released. Rendering options live on the render
-    /// methods (not `open`), since `open` only parses the container — the heavy
-    /// extraction happens here.
-    fn render(&self, py: Python<'_>, mode: &str, images: bool, toc: bool) -> PyResult<String> {
-        let mode = parse_mode(mode)?;
-        Ok(py.allow_threads(|| html::to_html(&self.doc, &self.raw, mode, images, toc)))
-    }
-
-    /// Resolve where rendered output is written, for the given default extension
-    /// (`"html"` / `"md"`): an explicit file path verbatim, `<source-stem>.<ext>` inside an
-    /// explicit directory, or `<source>.<ext>` next to the opened PDF when no path is given
-    /// (the `outputfile=True` convenience — `text.pdf` → `text.<ext>`).
-    fn resolve_out_path(&self, path: Option<&str>, ext: &str) -> PyResult<std::path::PathBuf> {
-        match path {
-            // A directory → write <source-stem>.<ext> inside it.
-            Some(p) if std::path::Path::new(p).is_dir() => {
-                let stem = self
-                    .source
-                    .as_ref()
-                    .and_then(|s| s.file_stem())
-                    .ok_or_else(|| PyValueError::new_err("a directory path needs a source filename to derive the name; pass a full file path"))?;
-                Ok(std::path::Path::new(p).join(stem).with_extension(ext))
-            }
-            Some(p) => Ok(std::path::PathBuf::from(p)),
-            // No path → <source>.<ext> next to the opened PDF.
-            None => self
-                .source
-                .as_ref()
-                .map(|s| s.with_extension(ext))
-                .ok_or_else(|| PyValueError::new_err("no source path (opened from_bytes); pass an explicit path")),
-        }
-    }
-
-    /// Write the document `content` to `dest` plus any extracted figure files (relative
-    /// paths, e.g. `img/fig_01_x.png`) under `dest`'s directory. Returns the dest path.
-    fn write_doc(&self, dest: std::path::PathBuf, content: &str, files: &[markdown::ImageFile]) -> PyResult<String> {
-        // Create the destination directory if the caller pointed at a not-yet-existing folder.
-        if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(|e| PyValueError::new_err(format!("mkdir failed: {e}")))?;
-        }
-        std::fs::write(&dest, content).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
-        if !files.is_empty() {
-            let dir = dest.parent().unwrap_or_else(|| std::path::Path::new("."));
-            for f in files {
-                let fp = dir.join(&f.path);
-                if let Some(parent) = fp.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| PyValueError::new_err(format!("mkdir failed: {e}")))?;
-                }
-                std::fs::write(&fp, &f.bytes).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
-            }
-        }
-        Ok(dest.to_string_lossy().into_owned())
-    }
+    inner: PdfDocument,
 }
 
 #[pymethods]
@@ -210,25 +62,19 @@ impl Pdf {
     /// where the rendering options (`mode`/`images`/`toc`) live.
     #[staticmethod]
     fn open(path: &str) -> PyResult<Self> {
-        let raw = std::fs::read(path).map_err(|e| PyValueError::new_err(format!("read failed: {e}")))?;
-        let doc =
-            Document::load_mem(&raw).map_err(|e| PyValueError::new_err(format!("open failed: {e}")))?;
-        Ok(Pdf { doc, raw, source: Some(std::path::PathBuf::from(path)), ocr_cache: Default::default() })
+        Ok(Pdf { inner: PdfDocument::open(path).map_err(to_py)? })
     }
 
     /// Open a PDF from raw bytes. There is no source path, so writing output with
     /// `outputfile=True` (no `path`) is an error — pass an explicit `path` instead.
     #[staticmethod]
     fn from_bytes(data: &[u8]) -> PyResult<Self> {
-        let raw = data.to_vec();
-        let doc =
-            Document::load_mem(&raw).map_err(|e| PyValueError::new_err(format!("parse failed: {e}")))?;
-        Ok(Pdf { doc, raw, source: None, ocr_cache: Default::default() })
+        Ok(Pdf { inner: PdfDocument::from_bytes(data).map_err(to_py)? })
     }
 
     /// Number of pages.
     fn page_count(&self) -> usize {
-        self.doc.get_pages().len()
+        self.inner.page_count()
     }
 
     /// Extract plain text from all pages (concatenated, page order).
@@ -237,36 +83,55 @@ impl Pdf {
     /// fonts + diacritics); fall back to lopdf's extractor per page when ours
     /// yields little (so simple-encoded PDFs never regress).
     fn extract_text(&self) -> PyResult<String> {
-        let pages = self.doc.get_pages();
-        let mut out = String::new();
-        for (&p, &page_id) in &pages {
-            // Our position+width-aware extractor is primary (handles CID fonts,
-            // accurate word boundaries, reading order). Fall back to lopdf only if
-            // ours recovers nothing on a page.
-            let mine = text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default();
-            if mine.trim().chars().count() >= 2 {
-                out.push_str(&mine);
-            } else {
-                out.push_str(&self.doc.extract_text(&[p]).unwrap_or_default());
-            }
-            out.push('\n');
-        }
-        Ok(out)
+        Ok(self.inner.extract_text())
     }
 
     /// Extract images from all pages (list of dicts incl. raw bytes).
     fn extract_images<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        extract::extract_images(py, &self.doc)
+        let list = PyList::empty(py);
+        for im in self.inner.extract_images() {
+            let d = PyDict::new(py);
+            d.set_item("page", im.page)?;
+            d.set_item("index", im.index)?;
+            d.set_item("width", im.width)?;
+            d.set_item("height", im.height)?;
+            d.set_item("color_space", im.color_space)?;
+            d.set_item("format", im.format)?;
+            d.set_item("data", pyo3::types::PyBytes::new(py, &im.data))?;
+            list.append(d)?;
+        }
+        Ok(list)
     }
 
     /// Extract per-page font info (list of dicts).
     fn extract_fonts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        extract::extract_fonts(py, &self.doc)
+        let list = PyList::empty(py);
+        for fi in self.inner.extract_fonts() {
+            let d = PyDict::new(py);
+            d.set_item("page", fi.page)?;
+            d.set_item("name", fi.name)?;
+            d.set_item("subtype", fi.subtype)?;
+            d.set_item("base_font", fi.base_font)?;
+            d.set_item("encoding", fi.encoding)?;
+            d.set_item("embedded", fi.embedded)?;
+            d.set_item("has_tounicode", fi.has_tounicode)?;
+            list.append(d)?;
+        }
+        Ok(list)
     }
 
     /// Extract tables from all pages (list of dicts with cell grids).
     fn extract_tables<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        extract::extract_tables(py, &self.doc, &self.raw)
+        let list = PyList::empty(py);
+        for t in self.inner.extract_tables() {
+            let d = PyDict::new(py);
+            d.set_item("page", t.page)?;
+            d.set_item("n_rows", t.cells.len())?;
+            d.set_item("n_cols", t.cells.first().map(|r| r.len()).unwrap_or(0))?;
+            d.set_item("cells", t.cells)?;
+            list.append(d)?;
+        }
+        Ok(list)
     }
 
     /// Extract hyperlinks from all pages. Each dict:
@@ -274,7 +139,7 @@ impl Pdf {
     ///  uri:str|None, dest_page:int|None, dest_name:str|None}.
     fn extract_links<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
-        for lk in links::extract_links(&self.doc) {
+        for lk in self.inner.extract_links() {
             let d = PyDict::new(py);
             d.set_item("page", lk.page)?;
             d.set_item("rect", lk.rect.to_vec())?;
@@ -311,19 +176,21 @@ impl Pdf {
     #[pyo3(signature = (path=None, return_string=false, mode="section", toc=true, image_mode="embed"))]
     fn to_html(&self, py: Python<'_>, path: Option<&str>, return_string: bool, mode: &str, toc: bool, image_mode: &str) -> PyResult<Py<PyAny>> {
         // Writing to disk is the default; `return_string=True` returns the HTML instead.
-        let im = parse_image_mode(image_mode, !return_string, markdown::ImgMode::Embed)?;
+        let im = doc::parse_image_mode(image_mode, !return_string, markdown::ImgMode::Embed).map_err(to_py)?;
+        let mode = doc::parse_mode(mode).map_err(to_py)?;
         // Placeholder renders `<image N>`; embed/external need the real image bytes.
-        let html = self.render(py, mode, !matches!(im, markdown::ImgMode::Placeholder), toc)?;
+        let images = !matches!(im, markdown::ImgMode::Placeholder);
+        let html = py.allow_threads(|| self.inner.render(mode, images, toc));
         if return_string {
             return Ok(pyo3::types::PyString::new(py, &html).into_any().unbind());
         }
-        let dest = self.resolve_out_path(path, "html")?;
+        let dest = self.inner.resolve_out_path(path, "html").map_err(to_py)?;
         if matches!(im, markdown::ImgMode::Files) {
             // Extract figures to img/ next to the file.
             let (html, files) = py.allow_threads(|| markdown::externalize_images(&html));
-            self.write_doc(dest, &html, &files)?;
+            self.inner.write_doc(dest, &html, &files).map_err(to_py)?;
         } else {
-            self.write_doc(dest, &html, &[])?;
+            self.inner.write_doc(dest, &html, &[]).map_err(to_py)?;
         }
         ok_one(py)
     }
@@ -349,16 +216,17 @@ impl Pdf {
     fn to_markdown(&self, py: Python<'_>, path: Option<&str>, return_string: bool, mode: &str, toc: bool, image_mode: &str) -> PyResult<Py<PyAny>> {
         // Markdown string output can't externalise and shouldn't inline, so it drops to
         // placeholders.
-        let im = parse_image_mode(image_mode, !return_string, markdown::ImgMode::Placeholder)?;
+        let im = doc::parse_image_mode(image_mode, !return_string, markdown::ImgMode::Placeholder).map_err(to_py)?;
+        let mode = doc::parse_mode(mode).map_err(to_py)?;
         let need_bytes = matches!(im, markdown::ImgMode::Embed | markdown::ImgMode::Files);
-        let html = self.render(py, mode, need_bytes, toc)?;
+        let html = py.allow_threads(|| self.inner.render(mode, need_bytes, toc));
         let (md, files) = py.allow_threads(|| markdown::html_to_markdown(&html, toc, im));
 
         if return_string {
             return Ok(pyo3::types::PyString::new(py, &md).into_any().unbind());
         }
-        let dest = self.resolve_out_path(path, "md")?;
-        self.write_doc(dest, &md, &files)?;
+        let dest = self.inner.resolve_out_path(path, "md").map_err(to_py)?;
+        self.inner.write_doc(dest, &md, &files).map_err(to_py)?;
         ok_one(py)
     }
 
@@ -368,10 +236,10 @@ impl Pdf {
     /// matches `to_html()`: `"page"` carries real page numbers, `"section"` yields 0.
     #[pyo3(signature = (mode="section"))]
     fn toc(&self, py: Python<'_>, mode: &str) -> PyResult<Vec<(u8, String, u32, String)>> {
-        let mode = parse_mode(mode)?;
+        let mode = doc::parse_mode(mode).map_err(to_py)?;
         // Force the TOC nav on (and skip image encoding — irrelevant to the outline) —
         // `nav::toc` parses the outline back out of that <nav>.
-        Ok(py.allow_threads(|| nav::toc(&html::to_html(&self.doc, &self.raw, mode, false, true))))
+        Ok(py.allow_threads(|| self.inner.toc(mode)))
     }
 
     /// The PDF's OWN table of contents — the author-supplied `/Outlines` bookmarks —
@@ -381,12 +249,7 @@ impl Pdf {
     /// no outline. This is distinct from `toc()`, which is built from detected headings;
     /// when an outline is present, `to_html()` also uses it for the rendered `<nav>`.
     fn outline(&self, py: Python<'_>) -> PyResult<Vec<(u8, String, u32, String)>> {
-        Ok(py.allow_threads(|| {
-            links::outline(&self.doc)
-                .into_iter()
-                .map(|e| ((e.level + 1), e.title, e.page, format!("page-{}", e.page)))
-                .collect()
-        }))
+        Ok(py.allow_threads(|| self.inner.outline()))
     }
 
     /// HTML of a single section: the heading matching `name` (its `sec-…` slug, an id
@@ -396,10 +259,10 @@ impl Pdf {
     /// `"embed"`).
     #[pyo3(signature = (name, mode="section", image_mode="embed"))]
     fn section(&self, py: Python<'_>, name: &str, mode: &str, image_mode: &str) -> PyResult<Option<String>> {
-        let mode = parse_mode(mode)?;
-        let images = !matches!(parse_image_mode(image_mode, false, markdown::ImgMode::Embed)?, markdown::ImgMode::Placeholder);
+        let mode = doc::parse_mode(mode).map_err(to_py)?;
+        let images = !matches!(doc::parse_image_mode(image_mode, false, markdown::ImgMode::Embed).map_err(to_py)?, markdown::ImgMode::Placeholder);
         // `nav::section` resolves via the TOC nav, so build with it present.
-        Ok(py.allow_threads(|| nav::section(&html::to_html(&self.doc, &self.raw, mode, images, true), name)))
+        Ok(py.allow_threads(|| self.inner.section(mode, name, images)))
     }
 
     /// Structured front-matter of an academic paper, parsed from page 1:
@@ -407,7 +270,7 @@ impl Pdf {
     /// keywords:[str]}`. Fields are empty/None when not detected. Authors are linked to
     /// their organisation via the affiliation superscript markers.
     fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let fm = py.allow_threads(|| frontmatter::extract_front_matter(&self.doc, &self.raw));
+        let fm = py.allow_threads(|| self.inner.front_matter());
         let d = PyDict::new(py);
         d.set_item("title", fm.title)?;
         let authors = PyList::empty(py);
@@ -430,22 +293,14 @@ impl Pdf {
     /// Drives the `distillpdf.ocr` orchestrators (the model runs in the optional [ocr] extra).
     fn ocr_plan<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
-        for (&pno, &page_id) in &self.doc.get_pages() {
-            let decision = ocr::detect::decide(&self.doc, page_id, &self.raw);
-            let needs = !matches!(decision, ocr::detect::OcrDecision::NotNeeded);
-            let (w, h) = ocr::page_size_pts(&self.doc, page_id);
+        for e in self.inner.ocr_plan() {
             let d = PyDict::new(py);
-            d.set_item("page", pno)?;
-            d.set_item("needs_ocr", needs)?;
-            d.set_item("reason", format!("{decision:?}"))?;
-            d.set_item("width_pts", w)?;
-            d.set_item("height_pts", h)?;
-            let img = if needs {
-                ocr::page_main_image(&self.doc, page_id).map(|(b, _)| b)
-            } else {
-                None
-            };
-            match img {
+            d.set_item("page", e.page)?;
+            d.set_item("needs_ocr", e.needs_ocr)?;
+            d.set_item("reason", e.reason)?;
+            d.set_item("width_pts", e.width_pts)?;
+            d.set_item("height_pts", e.height_pts)?;
+            match e.image {
                 Some(b) => d.set_item("image", pyo3::types::PyBytes::new(py, &b))?,
                 None => d.set_item("image", py.None())?,
             }
@@ -459,19 +314,17 @@ impl Pdf {
     /// orchestrators) reuse it, so the model runs **once** regardless of how many outputs
     /// are produced. Merges into any existing cache. Returns the cached page count.
     fn set_ocr(&self, ocr: std::collections::HashMap<u32, String>) -> PyResult<usize> {
-        let mut cache = self.ocr_cache.lock().map_err(|_| PyValueError::new_err("ocr cache poisoned"))?;
-        cache.extend(ocr);
-        Ok(cache.len())
+        self.inner.set_ocr(ocr).map_err(to_py)
     }
 
     /// The cached OCR results (`{page: DocTags}`), empty if `set_ocr` was never called.
     fn get_ocr(&self) -> PyResult<std::collections::HashMap<u32, String>> {
-        Ok(self.ocr_cache.lock().map_err(|_| PyValueError::new_err("ocr cache poisoned"))?.clone())
+        self.inner.get_ocr().map_err(to_py)
     }
 
     /// True if OCR results have been cached on this object (a model pass already ran).
     fn has_ocr(&self) -> PyResult<bool> {
-        Ok(!self.ocr_cache.lock().map_err(|_| PyValueError::new_err("ocr cache poisoned"))?.is_empty())
+        self.inner.has_ocr().map_err(to_py)
     }
 
     /// Write a searchable PDF from the OCR results (`ocr`, a `{1-based page: DocTags}` map;
@@ -490,52 +343,10 @@ impl Pdf {
     fn to_pdf(&self, py: Python<'_>, path: &str, ocr: Option<std::collections::HashMap<u32, String>>, remove_raster: bool) -> PyResult<Py<PyAny>> {
         let ocr = match ocr {
             Some(m) => m,
-            None => self.ocr_cache.lock().map_err(|_| PyValueError::new_err("ocr cache poisoned"))?.clone(),
+            None => self.inner.get_ocr().map_err(to_py)?,
         };
-        let buf = py.allow_threads(|| -> Result<Vec<u8>, String> {
-            let mut doc = Document::load_mem(&self.raw).map_err(|e| e.to_string())?;
-            let (helv, helv_b) = ocr::pdf::add_fonts(&mut doc);
-            let pages = doc.get_pages();
-            for (&pno, &page_id) in &pages {
-                let Some(dt) = ocr.get(&pno) else { continue };
-                let (w, h) = ocr::page_size_pts(&doc, page_id);
-                if remove_raster {
-                    // Clean reflow: replace the page's content with our text + cropped figures.
-                    let image = ocr::page_main_image(&doc, page_id).map(|(_, img)| img);
-                    let pin = ocr::pdf::PageInput { page: ocr::doctags::parse(dt), width: w, height: h, image };
-                    let (content, xobjs) = ocr::pdf::build_page_content(&mut doc, &pin)?;
-                    let data = content.encode().map_err(|e| e.to_string())?;
-                    let stream_id = doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), data));
-                    // (The old full-page image XObject simply goes undrawn, then is pruned.)
-                    let mut xo = lopdf::Dictionary::new();
-                    for (name, id) in &xobjs {
-                        xo.set(name.as_bytes().to_vec(), lopdf::Object::Reference(*id));
-                    }
-                    let res = dictionary! {
-                        "Font" => dictionary! { "F1" => helv, "F2" => helv_b },
-                        "XObject" => xo,
-                    };
-                    let page = doc.get_object_mut(page_id).map_err(|e| e.to_string())?.as_dict_mut().map_err(|e| e.to_string())?;
-                    page.set("Contents", lopdf::Object::Reference(stream_id));
-                    page.set("Resources", lopdf::Object::Dictionary(res));
-                } else {
-                    // Keep the scan: append an invisible OCR text layer over the original page.
-                    let pin = ocr::pdf::PageInput { page: ocr::doctags::parse(dt), width: w, height: h, image: None };
-                    let data = ocr::pdf::build_text_overlay(&pin).encode().map_err(|e| e.to_string())?;
-                    let stream_id = doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), data));
-                    append_page_content(&mut doc, page_id, stream_id);
-                    add_overlay_fonts(&mut doc, page_id, helv, helv_b);
-                }
-            }
-            if remove_raster {
-                // Drop the now-unreferenced full-page rasters + old content streams.
-                doc.prune_objects();
-            }
-            let mut buf = Vec::new();
-            doc.save_to(&mut buf).map_err(|e| e.to_string())?;
-            Ok(buf)
-        }).map_err(PyValueError::new_err)?;
-        std::fs::write(path, buf).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
+        let buf = py.allow_threads(|| self.inner.build_searchable_pdf(&ocr, remove_raster)).map_err(to_py)?;
+        std::fs::write(path, buf).map_err(|e| to_py(Error::Write(e)))?;
         ok_one(py)
     }
 
@@ -562,83 +373,33 @@ impl Pdf {
     /// passes and per-block bboxes are filled by later waves.
     #[pyo3(signature = (path=None, assets="figures"))]
     fn distill(&self, py: Python<'_>, path: Option<&str>, assets: &str) -> PyResult<String> {
-        let profile = model::AssetProfile::parse(assets).map_err(PyValueError::new_err)?;
-        let dest = self.resolve_out_path(path, "dpdf")?;
-        // The display name recorded in source.file: the source PDF's basename when known.
-        let file = self
-            .source
-            .as_ref()
-            .and_then(|s| s.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "document.pdf".to_string());
-        // The single timestamp in the model — taken once here so the rest is deterministic.
-        let generated_at = iso8601_now();
-        let (model, asset_bytes) =
-            py.allow_threads(|| model::build::build_model(&self.doc, &self.raw, &file, generated_at, profile));
-        if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(|e| PyValueError::new_err(format!("mkdir failed: {e}")))?;
-        }
-        // Embedded figure bytes (per the profile) ride along in the container; dropped assets
-        // contribute only their stub from `model.assets`.
-        model::container::save(&model, &dest, &asset_bytes, None).map_err(PyValueError::new_err)?;
-        Ok(dest.to_string_lossy().into_owned())
+        let opts = doc::DistillOptions::from_assets(assets).map_err(to_py)?;
+        py.allow_threads(|| self.inner.distill(path, &opts)).map_err(to_py)
     }
 
     /// Diagnostic: force our ToUnicode extractor for all pages (eval only).
     fn _mine_text(&self) -> PyResult<String> {
-        let mut out = String::new();
-        for &page_id in self.doc.get_pages().values() {
-            out.push_str(&text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default());
-            out.push('\n');
-        }
-        Ok(out)
+        Ok(self.inner.mine_text())
     }
 
     /// Diagnostic: raw spans (text, x, width, size) for a 1-indexed page.
     fn _dbg_spans(&self, page: u32) -> PyResult<Vec<(String, f32, f32, f32)>> {
-        let page_id = *self
-            .doc
-            .get_pages()
-            .get(&page)
-            .ok_or_else(|| PyValueError::new_err("no page"))?;
-        Ok(text::extract_spans(&self.doc, page_id, &self.raw)
-            .into_iter()
-            .map(|s| (s.text, s.x, s.width, s.size))
-            .collect())
+        self.inner.dbg_spans(page).map_err(to_py)
     }
 
     /// Diagnostic: spans with y for a 1-indexed page (text, x, y, width, size).
     fn _dbg_spans_xy(&self, page: u32) -> PyResult<Vec<(String, f32, f32, f32, f32)>> {
-        let page_id = *self.doc.get_pages().get(&page).ok_or_else(|| PyValueError::new_err("no page"))?;
-        Ok(text::extract_spans(&self.doc, page_id, &self.raw)
-            .into_iter()
-            .map(|s| (s.text, s.x, s.y, s.width, s.size))
-            .collect())
+        self.inner.dbg_spans_xy(page).map_err(to_py)
     }
 
     /// Diagnostic for one 1-indexed page.
     fn debug_page(&self, page: u32) -> PyResult<String> {
-        let page_id = *self
-            .doc
-            .get_pages()
-            .get(&page)
-            .ok_or_else(|| PyValueError::new_err(format!("no page {page}")))?;
-        Ok(text::debug_page(&self.doc, page_id, &self.raw))
+        self.inner.debug_page(page).map_err(to_py)
     }
 
     /// Extract text from a single 1-indexed page (hybrid).
     fn extract_page_text(&self, page: u32) -> PyResult<String> {
-        let page_id = *self
-            .doc
-            .get_pages()
-            .get(&page)
-            .ok_or_else(|| PyValueError::new_err(format!("no page {page}")))?;
-        let mine = text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default();
-        Ok(if mine.trim().chars().count() >= 2 {
-            mine
-        } else {
-            self.doc.extract_text(&[page]).unwrap_or_default()
-        })
+        self.inner.extract_page_text(page).map_err(to_py)
     }
 }
 
@@ -662,9 +423,9 @@ fn from_bytes(data: &[u8]) -> PyResult<Pdf> {
 /// canonical, sorted-key form, so `distill` → `load_model` → re-save is byte-stable.
 #[pyfunction]
 fn load_model(path: &str) -> PyResult<String> {
-    let (model, _assets) = model::container::load(std::path::Path::new(path)).map_err(PyValueError::new_err)?;
-    let bytes = model::container::to_canonical_json(&model).map_err(PyValueError::new_err)?;
-    String::from_utf8(bytes).map_err(|e| PyValueError::new_err(format!("model json not utf-8: {e}")))
+    let (model, _assets) = doc::load_dpdf(std::path::Path::new(path)).map_err(to_py)?;
+    let bytes = model::container::to_canonical_json(&model).map_err(|e| to_py(Error::Model(e)))?;
+    String::from_utf8(bytes).map_err(|e| to_py(Error::ModelNotUtf8(e.to_string())))
 }
 
 /// Re-save a `.dpdf` from `src_path` to `dst_path` with a NEW `model.json` and additional
@@ -683,10 +444,9 @@ fn save_dpdf(
     model_json: &str,
     extra_members: std::collections::BTreeMap<String, Vec<u8>>,
 ) -> PyResult<()> {
-    let (_old_model, carried) =
-        model::container::load(std::path::Path::new(src_path)).map_err(PyValueError::new_err)?;
+    let (_old_model, carried) = doc::load_dpdf(std::path::Path::new(src_path)).map_err(to_py)?;
     let model: model::DocModel =
-        serde_json::from_str(model_json).map_err(|e| PyValueError::new_err(format!("parse model_json: {e}")))?;
+        serde_json::from_str(model_json).map_err(|e| to_py(Error::ParseModelJson(e.to_string())))?;
     // The carried members are everything that was in the old container except model.json (the
     // loader already strips it). Split them: embedded ASSET bytes (referenced by model.assets)
     // ride via the asset map; everything else (embedding bins, etc.) is an extra member. The
@@ -706,7 +466,7 @@ fn save_dpdf(
         extras.insert(name, bytes);
     }
     model::container::save_with_members(&model, std::path::Path::new(dst_path), &assets, &extras, None)
-        .map_err(PyValueError::new_err)
+        .map_err(|e| to_py(Error::Model(e)))
 }
 
 /// Read the raw bytes of a single container member (e.g. an `embeddings/<id>.bin` vector
@@ -714,8 +474,7 @@ fn save_dpdf(
 /// pull a space's f32 matrix without re-implementing the zip reader.
 #[pyfunction]
 fn read_dpdf_member(path: &str, member: &str) -> PyResult<Option<Vec<u8>>> {
-    let (_model, members) =
-        model::container::load(std::path::Path::new(path)).map_err(PyValueError::new_err)?;
+    let (_model, members) = doc::load_dpdf(std::path::Path::new(path)).map_err(to_py)?;
     Ok(members.get(member).cloned())
 }
 
@@ -727,8 +486,8 @@ fn read_dpdf_member(path: &str, member: &str) -> PyResult<Option<Vec<u8>>> {
 #[pyfunction]
 #[pyo3(signature = (path, mode="section", toc=true))]
 fn render_html(py: Python<'_>, path: &str, mode: &str, toc: bool) -> PyResult<String> {
-    let m = parse_mode(mode)?;
-    let (model, _assets) = model::container::load(std::path::Path::new(path)).map_err(PyValueError::new_err)?;
+    let m = doc::parse_mode(mode).map_err(to_py)?;
+    let (model, _assets) = doc::load_dpdf(std::path::Path::new(path)).map_err(to_py)?;
     Ok(py.allow_threads(|| model::render::render_html(&model, m, toc)))
 }
 
@@ -739,11 +498,11 @@ fn render_html(py: Python<'_>, path: &str, mode: &str, toc: bool) -> PyResult<St
 #[pyfunction]
 #[pyo3(signature = (path, mode="section", toc=true, image_mode="external"))]
 fn render_markdown(py: Python<'_>, path: &str, mode: &str, toc: bool, image_mode: &str) -> PyResult<String> {
-    let m = parse_mode(mode)?;
-    let (model, _assets) = model::container::load(std::path::Path::new(path)).map_err(PyValueError::new_err)?;
+    let m = doc::parse_mode(mode).map_err(to_py)?;
+    let (model, _assets) = doc::load_dpdf(std::path::Path::new(path)).map_err(to_py)?;
     let (md, _files) = py
         .allow_threads(|| model::render::render_markdown(&model, m, toc, image_mode))
-        .map_err(PyValueError::new_err)?;
+        .map_err(|e| to_py(Error::Model(e)))?;
     Ok(md)
 }
 
@@ -751,7 +510,7 @@ fn render_markdown(py: Python<'_>, path: &str, mode: &str, toc: bool, image_mode
 /// analogue of `Pdf.extract_text`, sourced from the file with no source PDF present.
 #[pyfunction]
 fn render_text(py: Python<'_>, path: &str) -> PyResult<String> {
-    let (model, _assets) = model::container::load(std::path::Path::new(path)).map_err(PyValueError::new_err)?;
+    let (model, _assets) = doc::load_dpdf(std::path::Path::new(path)).map_err(to_py)?;
     Ok(py.allow_threads(|| model::render::extract_text(&model)))
 }
 
@@ -769,7 +528,7 @@ fn ocr_doctags_to_html(doctags: &str) -> String {
 #[pyfunction]
 #[pyo3(signature = (html, toc=true, image_mode="drop"))]
 fn html_to_markdown(html: &str, toc: bool, image_mode: &str) -> PyResult<(String, Vec<(String, Vec<u8>)>)> {
-    let im = parse_image_mode(image_mode, true, markdown::ImgMode::Placeholder)?;
+    let im = doc::parse_image_mode(image_mode, true, markdown::ImgMode::Placeholder).map_err(to_py)?;
     let (md, files) = markdown::html_to_markdown(html, toc, im);
     Ok((md, files.into_iter().map(|f| (f.path, f.bytes)).collect()))
 }

@@ -1,9 +1,40 @@
 //! Image, font and table extraction pillars, built on lopdf's object model.
+//!
+//! Pure Rust: these return plain owned structs. The PyO3 layer (`src/lib.rs`) assembles the
+//! Python dicts/lists from them — no pyo3 types appear in this module.
 
 use crate::text::{self, Span};
 use lopdf::{Dictionary, Document, Object};
-use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+
+/// One extracted raster image. Mirrors the dict `Pdf.extract_images` returns:
+/// `{page, index, width, height, color_space, format, data}`.
+pub struct ImageInfo {
+    pub page: u32,
+    pub index: usize,
+    pub width: i64,
+    pub height: i64,
+    pub color_space: Option<String>,
+    pub format: &'static str,
+    pub data: Vec<u8>,
+}
+
+/// One page/font row. Mirrors the dict `Pdf.extract_fonts` returns:
+/// `{page, name, subtype, base_font, encoding, embedded, has_tounicode}`.
+pub struct FontInfo {
+    pub page: u32,
+    pub name: String,
+    pub subtype: String,
+    pub base_font: String,
+    pub encoding: String,
+    pub embedded: bool,
+    pub has_tounicode: bool,
+}
+
+/// One detected table. `cells` is the row-major grid; the binding derives `n_rows`/`n_cols`.
+pub struct TableInfo {
+    pub page: u32,
+    pub cells: Vec<Vec<String>>,
+}
 
 fn filter_to_format(filters: &Option<Vec<String>>) -> &'static str {
     match filters {
@@ -24,28 +55,27 @@ fn filter_to_format(filters: &Option<Vec<String>>) -> &'static str {
     }
 }
 
-/// Extract images from all pages as a list of dicts:
-/// {page, index, width, height, color_space, format, data(bytes)}.
-pub fn extract_images<'py>(py: Python<'py>, doc: &Document) -> PyResult<Bound<'py, PyList>> {
-    let list = PyList::empty(py);
+/// Extract images from all pages as owned [`ImageInfo`] rows.
+pub fn extract_images(doc: &Document) -> Vec<ImageInfo> {
+    let mut out = Vec::new();
     for (&pno, &page_id) in &doc.get_pages() {
         let imgs = match doc.get_page_images(page_id) {
             Ok(v) => v,
             Err(_) => continue,
         };
         for (idx, im) in imgs.iter().enumerate() {
-            let d = PyDict::new(py);
-            d.set_item("page", pno)?;
-            d.set_item("index", idx)?;
-            d.set_item("width", im.width)?;
-            d.set_item("height", im.height)?;
-            d.set_item("color_space", im.color_space.clone())?;
-            d.set_item("format", filter_to_format(&im.filters))?;
-            d.set_item("data", PyBytes::new(py, im.content))?;
-            list.append(d)?;
+            out.push(ImageInfo {
+                page: pno,
+                index: idx,
+                width: im.width,
+                height: im.height,
+                color_space: im.color_space.clone(),
+                format: filter_to_format(&im.filters),
+                data: im.content.to_vec(),
+            });
         }
     }
-    Ok(list)
+    out
 }
 
 /// Group spans into visual rows (top-to-bottom), cells left-to-right.
@@ -865,22 +895,16 @@ fn detect_tables(spans: Vec<Span>) -> Vec<Vec<Vec<String>>> {
 }
 
 
-/// Extract tables from all pages as a list of dicts:
-/// {page, n_rows, n_cols, cells: [[str]]}.
-pub fn extract_tables<'py>(py: Python<'py>, doc: &Document, raw: &[u8]) -> PyResult<Bound<'py, PyList>> {
-    let list = PyList::empty(py);
+/// Extract tables from all pages as owned [`TableInfo`] rows (row-major grids).
+pub fn extract_tables(doc: &Document, raw: &[u8]) -> Vec<TableInfo> {
+    let mut out = Vec::new();
     for (&pno, &page_id) in &doc.get_pages() {
         let spans = text::extract_spans(doc, page_id, raw);
         for grid in detect_tables(spans) {
-            let d = PyDict::new(py);
-            d.set_item("page", pno)?;
-            d.set_item("n_rows", grid.len())?;
-            d.set_item("n_cols", grid.first().map(|r| r.len()).unwrap_or(0))?;
-            d.set_item("cells", grid)?;
-            list.append(d)?;
+            out.push(TableInfo { page: pno, cells: grid });
         }
     }
-    Ok(list)
+    out
 }
 
 /// Resolve an object that may be a direct value or an indirect reference.
@@ -917,44 +941,44 @@ fn font_embedded(doc: &Document, dict: &Dictionary) -> bool {
     }
 }
 
-/// Extract per-page font info: {page, name, subtype, base_font, encoding,
-/// embedded(bool), has_tounicode(bool)}.
-pub fn extract_fonts<'py>(py: Python<'py>, doc: &Document) -> PyResult<Bound<'py, PyList>> {
-    let list = PyList::empty(py);
+/// Extract per-page font info as owned [`FontInfo`] rows: `{page, name, subtype, base_font,
+/// encoding, embedded, has_tounicode}`.
+pub fn extract_fonts(doc: &Document) -> Vec<FontInfo> {
+    let mut out = Vec::new();
     for (&pno, &page_id) in &doc.get_pages() {
         let fonts = match doc.get_page_fonts(page_id) {
             Ok(f) => f,
             Err(_) => continue,
         };
         for (name, dict) in fonts {
-            let d = PyDict::new(py);
-            d.set_item("page", pno)?;
-            d.set_item("name", String::from_utf8_lossy(&name).into_owned())?;
             let subtype = dict
                 .get(b"Subtype")
                 .and_then(|o| o.as_name())
                 .map(|n| String::from_utf8_lossy(n).into_owned())
                 .unwrap_or_default();
-            d.set_item("subtype", subtype)?;
             let base_font = dict
                 .get(b"BaseFont")
                 .and_then(|o| o.as_name())
                 .map(|n| String::from_utf8_lossy(n).into_owned())
                 .unwrap_or_default();
-            d.set_item("base_font", base_font)?;
             let encoding = dict
                 .get(b"Encoding")
                 .ok()
                 .and_then(|o| o.as_name().ok())
                 .map(|n| String::from_utf8_lossy(n).into_owned())
                 .unwrap_or_else(|| "custom".to_string());
-            d.set_item("encoding", encoding)?;
-            d.set_item("embedded", font_embedded(doc, dict))?;
-            d.set_item("has_tounicode", dict.has(b"ToUnicode"))?;
-            list.append(d)?;
+            out.push(FontInfo {
+                page: pno,
+                name: String::from_utf8_lossy(&name).into_owned(),
+                subtype,
+                base_font,
+                encoding,
+                embedded: font_embedded(doc, dict),
+                has_tounicode: dict.has(b"ToUnicode"),
+            });
         }
     }
-    Ok(list)
+    out
 }
 
 #[cfg(test)]
