@@ -30,6 +30,9 @@ jobs:
       - uses: actions/checkout@v4
       - id: v
         run: |
+          # The single source-of-truth version lives in the workspace-root Cargo.toml under
+          # [workspace.package]; both member crates inherit it via `version.workspace = true`.
+          # It is kept the FIRST `^version` line in that file precisely so this grep is stable.
           VERSION=$(grep -m 1 '^version' Cargo.toml | cut -d '"' -f 2)
           PYPROJECT=$(grep -m 1 '^version' pyproject.toml | cut -d '"' -f 2)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"

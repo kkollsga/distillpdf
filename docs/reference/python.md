@@ -9,7 +9,7 @@ The exhaustive reference for the `distillpdf` package. Every public symbol expor
 
 The package re-exports the compiled Rust core (`Pdf` and the module-level functions) and the
 Python workflow layer (`Document`, `Doc`, the `ocr` module). Source of truth: the Rust
-`#[pymethods]` in `src/lib.rs` and the Python modules under `python/distillpdf/`.
+`#[pymethods]` in `distillpdf-python/src/lib.rs` and the Python modules under `python/distillpdf/`.
 
 !!! note "Two entry points, two surfaces"
     [`open`](#open) / [`from_bytes`](#from_bytes) read a **source PDF** and return a
@@ -142,7 +142,7 @@ The installed package version string, set by the compiled core.
 
 ## Pdf
 
-The pure-Rust core class, defined via `#[pymethods]` in `src/lib.rs`. You normally hold a
+The pure-Rust core class, defined via `#[pymethods]` in `distillpdf-python/src/lib.rs`. You normally hold a
 [`Document`](#document) rather than a `Pdf` directly — `Document` wraps a `Pdf` and forwards
 every method below by delegation (so `doc.page_count()`, `doc.extract_tables()`, etc. all
 work). The methods are documented here once, on `Pdf`; `Document` overrides only

@@ -26,12 +26,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.toml', 'distillpdf/Cargo.toml', 'distillpdf-python/Cargo.toml') }}
 
       - name: Rust unit tests
-        # `extension-module` is opt-in (see Cargo.toml [features]); WITHOUT it the test
-        # binary links libpython normally, so cargo test runs the pure-logic unit tests.
-        run: cargo test --lib
+        # Scope to the pyo3-free core: a bare `cargo test --lib` at the workspace root would
+        # also build distillpdf-python's lib tests, which need libpython linked. `-p distillpdf`
+        # runs only the core's pure-logic unit tests (it carries no pyo3).
+        run: cargo test -p distillpdf --lib
 
       - name: Build & install distillpdf (with the bundled Tesseract fast OCR engine)
         # `--features extension-module,tesseract` builds minimal static Leptonica + Tesseract from the vendored

@@ -3,7 +3,7 @@
 # release-check.sh — the full local verification chain to run BEFORE a release.
 #
 # CI (.github/workflows/ci.yml) runs the parts that work on a fresh clone:
-#   - cargo test --lib            (pure-logic Rust unit tests)
+#   - cargo test -p distillpdf --lib   (pure-logic Rust unit tests, pyo3-free core)
 #   - pytest tests/               (self-contained, self-generated fixtures)
 # It deliberately does NOT run the corpus regression gate: that gate scores real
 # third-party PDFs that are license-encumbered and cannot be published, so the
@@ -34,11 +34,13 @@ BUILD_VENV="${BUILD_VENV:-.build-venv}"
 
 step() { printf '\n\033[1;34m==> %s\033[0m\n' "$1"; }
 
-step "Rust unit tests (cargo test --lib)"
-PYO3_PYTHON="$BUILD_PY" cargo test --lib
+step "Rust unit tests (cargo test -p distillpdf --lib)"
+# Scope to the pyo3-free core; a bare workspace `--lib` would also pull in
+# distillpdf-python's lib tests, which need libpython linked.
+PYO3_PYTHON="$BUILD_PY" cargo test -p distillpdf --lib
 
-step "Clippy (lib, warnings allowed but surfaced)"
-PYO3_PYTHON="$BUILD_PY" cargo clippy --lib 2>&1 | tail -3 || true
+step "Clippy (core lib, warnings allowed but surfaced)"
+PYO3_PYTHON="$BUILD_PY" cargo clippy -p distillpdf --lib 2>&1 | tail -3 || true
 
 step "Build release wheel (maturin, $BUILD_PY)"
 if [ ! -x "$BUILD_VENV/bin/maturin" ]; then
