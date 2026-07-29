@@ -1,5 +1,21 @@
 # Core API consumer contract — kglite
 
+> **STATUS: DORMANT since 2026-07-15.** distillPDF's side is complete on
+> `refactor/workspace-split` (unmerged; `origin/main` is still 0.0.34 in the
+> pre-split single-crate layout). **kglite has not started the consumer side**
+> — no `knowledge_tree`, no `pdf` feature, no `distillpdf` reference anywhere
+> under `crates/`. Both halves idled for two weeks with nothing recording it,
+> which is the failure this single-owner copy exists to prevent.
+>
+> **Revive when** either distillPDF merges the workspace split, or kglite
+> begins the consumer side. Until then treat the terms as a design record,
+> not an active commitment.
+>
+> Kept out of `docs/` deliberately: mkdocs builds every page under `docs/`
+> whether or not it is in `nav`, so publishing this would advertise an
+> integration that does not exist.
+
+
 **Owner:** distillPDF. This is the single durable copy.
 **Status:** producer side **implemented but unmerged** (2026-07-15, PR #1,
 branch `refactor/workspace-split`); consumer side **not built** as of
