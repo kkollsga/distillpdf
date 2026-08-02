@@ -587,47 +587,17 @@ fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (
     (build(strong), build(weak))
 }
 
-/// Page width from the MediaBox (used to size each figure as a share of the page).
+/// Page width from the page box (used to size each figure as a share of the page).
 ///
-/// `/MediaBox` is an INHERITABLE page attribute (PDF 32000-1 §7.7.3.4): a writer may state it
-/// once on the `/Pages` node and omit it from every page. Reading only the page dict made such
-/// files fall back to a guessed 612pt, so every figure on them was sized as the wrong share of
-/// the page. Walk up `/Parent` when the page itself doesn't carry the key.
+/// The box itself — `/MediaBox` then `/CropBox`, inherited up `/Parent`, extents resolved
+/// through indirect references — comes from [`crate::pdfobj::page_box`]. A width of zero or
+/// one point is not a page, so it degrades to the letter default rather than scaling every
+/// figure on the page by a garbage denominator.
 fn page_width(doc: &Document, page_id: ObjectId) -> f32 {
-    inherited_box(doc, page_id)
-        .filter(|a| a.len() >= 4)
-        .map(|a| (num(&a[2]) - num(&a[0])).abs())
+    crate::pdfobj::page_box(doc, page_id)
+        .map(|b| (b[2] - b[0]).abs())
         .filter(|w| *w > 1.0)
-        .unwrap_or(612.0)
-}
-
-/// The page's effective `/MediaBox` (falling back to `/CropBox`), inherited from the page tree
-/// when absent on the page node itself. Bounded by [`crate::MAX_FORM_DEPTH`] and a visited set
-/// so a malformed file with a cyclic or absurdly deep `/Parent` chain cannot hang the walk.
-fn inherited_box(doc: &Document, page_id: ObjectId) -> Option<Vec<Object>> {
-    let mut node = page_id;
-    let mut seen = Vec::new();
-    for _ in 0..crate::MAX_FORM_DEPTH {
-        if seen.contains(&node) {
-            return None; // cyclic /Parent chain
-        }
-        seen.push(node);
-        let dict = doc.get_object(node).ok()?.as_dict().ok()?;
-        let found = dict
-            .get(b"MediaBox")
-            .ok()
-            .or_else(|| dict.get(b"CropBox").ok())
-            .and_then(|o| deref(doc, o))
-            .and_then(|o| o.as_array().ok());
-        if let Some(a) = found {
-            return Some(a.clone());
-        }
-        node = match dict.get(b"Parent") {
-            Ok(Object::Reference(r)) => *r,
-            _ => return None,
-        };
-    }
-    None
+        .unwrap_or(crate::pdfobj::DEFAULT_PAGE_PTS.0)
 }
 
 /// Distribute form-internal text labels among the figures on a page (each label
@@ -1085,6 +1055,35 @@ mod tests {
         let page = doc.get_object(page_id).unwrap().as_dict().unwrap();
         assert!(page.get(b"MediaBox").is_err() && page.get(b"CropBox").is_err());
         assert_eq!(page_width(&doc, page_id), 842.0, "must inherit A4 landscape, not guess 612");
+    }
+
+    #[test]
+    fn page_width_resolves_indirect_media_box_entries() {
+        // `indirect_mediabox.pdf`: the inheritable /MediaBox on the /Pages node is written
+        // `[0 0 9 0 R 10 0 R]` — legal for an array value, and what the direct-only `num`
+        // reader turned into `[0 0 0 0]`. The zero-width box then failed the sanity filter
+        // and the page silently became the guessed 612pt letter, so the 504pt grid on it was
+        // sized as 82% of the page instead of the 50% it really spans.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/indirect_mediabox.pdf");
+        let doc = Document::load(path).expect("indirect_mediabox.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        // The premise: the page carries no box of its own, and the inherited one really is
+        // written with indirect entries.
+        let page = doc.get_object(page_id).unwrap().as_dict().unwrap();
+        assert!(page.get(b"MediaBox").is_err() && page.get(b"CropBox").is_err());
+        let parent = page.get(b"Parent").unwrap().as_reference().unwrap();
+        let mb = doc.get_object(parent).unwrap().as_dict().unwrap().get(b"MediaBox").unwrap().as_array().unwrap();
+        assert!(matches!(mb[2], Object::Reference(_)), "the fixture's box extents must be indirect");
+        assert_eq!(page_width(&doc, page_id), 1008.0, "an indirect /MediaBox width must resolve, not read 0");
+    }
+
+    #[test]
+    fn page_width_falls_back_to_the_crop_box_when_no_media_box_exists() {
+        // Page 2 of the same fixture states only a /CropBox, with nothing to inherit.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/indirect_mediabox.pdf");
+        let doc = Document::load(path).expect("indirect_mediabox.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&2).expect("fixture has page 2");
+        assert_eq!(page_width(&doc, page_id), 400.0, "the /CropBox is the fallback page box");
     }
 
     #[test]

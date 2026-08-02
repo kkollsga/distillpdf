@@ -1,0 +1,75 @@
+%PDF-1.5
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 7 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 /MediaBox [0 0 9 0 R 10 0 R] >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 3 0 R /Resources << /Font << /F1 6 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 623 >>
+stream
+BT /F1 16 Tf 100 540 Td (An Indirect MediaBox) Tj ET
+0.8 w
+100.0 250.0 m 604.0 250.0 l S
+100.0 278.6 m 604.0 278.6 l S
+100.0 307.1 m 604.0 307.1 l S
+100.0 335.7 m 604.0 335.7 l S
+100.0 364.3 m 604.0 364.3 l S
+100.0 392.9 m 604.0 392.9 l S
+100.0 421.4 m 604.0 421.4 l S
+100.0 450.0 m 604.0 450.0 l S
+100.0 250.0 m 100.0 450.0 l S
+172.0 250.0 m 172.0 450.0 l S
+244.0 250.0 m 244.0 450.0 l S
+316.0 250.0 m 316.0 450.0 l S
+388.0 250.0 m 388.0 450.0 l S
+460.0 250.0 m 460.0 450.0 l S
+532.0 250.0 m 532.0 450.0 l S
+604.0 250.0 m 604.0 450.0 l S
+BT /F1 9 Tf 100 232 Td (Figure 1: A grid spanning 504 of the 1008 point page.) Tj ET
+endstream
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /CropBox [0 0 400 650] /Resources << /Font << /F1 6 0 R >> >> /Contents 8 0 R >>
+endobj
+8 0 obj
+<< /Length 148 >>
+stream
+BT /F1 14 Tf 40 600 Td (A CropBox Only Page) Tj ET
+BT /F1 10 Tf 40 570 Td (This page states no MediaBox anywhere up the tree, only a CropBox.) Tj ET
+endstream
+endobj
+9 0 obj
+1008
+endobj
+10 0 obj
+612
+endobj
+xref
+0 11
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000127 00000 n 
+0000000227 00000 n 
+0000000329 00000 n 
+0000001003 00000 n 
+0000001073 00000 n 
+0000001198 00000 n 
+0000001397 00000 n 
+0000001417 00000 n 
+trailer
+<< /Size 11 /Root 1 0 R >>
+startxref
+1437
+%%EOF

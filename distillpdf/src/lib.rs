@@ -119,3 +119,7 @@ pub use extract::{FontInfo, ImageInfo, TableInfo};
 pub use frontmatter::{Author, FrontMatter};
 pub use html::Mode;
 pub use links::Link;
+/// The page size to assume when a caller has no page geometry at all (US Letter, in points).
+/// Exported so the binding crate's OCR entry point states the same default as the core does
+/// instead of open-coding `612.0`/`792.0` a fifth time.
+pub use pdfobj::DEFAULT_PAGE_PTS;

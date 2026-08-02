@@ -101,3 +101,31 @@ def test_unfiltered_form_vector_ink_survives():
     cap = re.search(r"<figcaption>(.*?)</figcaption>", h, re.DOTALL)
     assert cap and g["caption"][:30] in re.sub(r"\s+", " ", cap.group(1)), \
         "the unfiltered-form figure did not get its caption"
+
+
+def test_indirect_mediabox_sizes_the_figure_against_the_real_page():
+    """A page whose inherited ``/MediaBox`` extents are INDIRECT references must be measured,
+    not guessed. The direct-only number reader turned `[0 0 9 0 R 10 0 R]` into a zero-width
+    box, so the page fell back to 612pt and every figure on it was scaled as the wrong share
+    of the page (here 82% instead of the 50% the grid really spans)."""
+    g = GT["indirect_mediabox.pdf"]
+    h = html("indirect_mediabox.pdf")
+    svgs = re.findall(r"<svg\b.*?</svg>", h, re.DOTALL)
+    assert len(svgs) == g["n_figures"], f"expected {g['n_figures']} <svg>, got {len(svgs)}"
+    # A figure renders at 1.5x its share of the page width, clamped to 100%. The grid spans
+    # 504 of 1008pt, so ~76%; measured against the 612pt guess it computes >100% and clamps
+    # to a full-width figure — visibly the wrong size.
+    m = re.search(r"width:([\d.]+)%", svgs[0])
+    assert m, f"no percentage width on the svg: {svgs[0][:200]}"
+    share = float(m.group(1))
+    expected = 150.0 * g["figure_width"] / g["page_width"]
+    assert abs(share - expected) < 6.0, \
+        f"figure sized {share:.1f}% of the body, expected ~{expected:.0f}% (the 612pt guess clamps to 100%)"
+    assert share < 99.0, "the figure is not full-width — a 100% clamp means the page was guessed"
+
+
+def test_cropbox_only_page_still_extracts():
+    """Page 2 of the same fixture states only a /CropBox — the spec's page-box fallback. It
+    must read normally rather than being measured as US-Letter."""
+    g = GT["indirect_mediabox.pdf"]
+    assert g["crop_page_text"] in text(html("indirect_mediabox.pdf"))

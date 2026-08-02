@@ -339,8 +339,8 @@ mod tests {
         let pages = (1..=npages)
             .map(|n| Page {
                 n,
-                width_pts: 612.0,
-                height_pts: 792.0,
+                width_pts: crate::pdfobj::DEFAULT_PAGE_PTS.0,
+                height_pts: crate::pdfobj::DEFAULT_PAGE_PTS.1,
                 labels: BTreeMap::new(),
                 ocr_decision: None,
                 active_ocr_pass: None,

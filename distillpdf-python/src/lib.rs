@@ -10,7 +10,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use distillpdf::{doc, markdown, model, ocr, Error, PdfDocument};
+use distillpdf::{doc, markdown, model, ocr, Error, PdfDocument, DEFAULT_PAGE_PTS};
 
 pyo3::create_exception!(
     _distillpdf,
@@ -573,8 +573,8 @@ fn ocr_doctags_to_pdf(pages: Vec<(String, String, f64, f64)>, out_path: &str) ->
             let image = if img.is_empty() { None } else { image::open(img).ok() };
             ocr::pdf::PageInput {
                 page: ocr::doctags::parse(dt),
-                width: if *w > 0.0 { *w as f32 } else { 612.0 },
-                height: if *h > 0.0 { *h as f32 } else { 792.0 },
+                width: if *w > 0.0 { *w as f32 } else { DEFAULT_PAGE_PTS.0 },
+                height: if *h > 0.0 { *h as f32 } else { DEFAULT_PAGE_PTS.1 },
                 image,
             }
         })

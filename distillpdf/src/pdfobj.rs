@@ -16,8 +16,16 @@
 //! Every function here is total: malformed input degrades (a default, `None`, or the raw
 //! bytes) and never panics, never fabricates data, and never loops unboundedly.
 
-use lopdf::{Dictionary, Document, Object};
+use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::borrow::Cow;
+
+/// The page size assumed when a document states no page box at all: US Letter, in points.
+///
+/// The one home for the `612`/`792` pair. Four call sites had it open-coded, which is how a
+/// "default page" quietly means something different in the OCR planner than in the model.
+/// A caller reaching for this is saying "the file told me nothing", never "the file is
+/// letter-sized" — [`page_box`] returning `None` is the only thing that should lead here.
+pub const DEFAULT_PAGE_PTS: (f32, f32) = (612.0, 792.0);
 
 /// Follow one indirect reference; pass a direct object straight through.
 ///
@@ -83,6 +91,49 @@ pub(crate) fn content_bytes(stream: &lopdf::Stream) -> Cow<'_, [u8]> {
         Ok(b) => Cow::Owned(b),
         Err(_) => Cow::Borrowed(&stream.content),
     }
+}
+
+/// The page's effective box as `[x0, y0, x1, y1]`: `/MediaBox`, else `/CropBox`, inherited
+/// from the page tree when the page node itself carries neither.
+///
+/// **Invariants callers may rely on and must not re-check:**
+/// - `/MediaBox` and `/CropBox` are **inheritable** page attributes (PDF 32000-1 §7.7.3.4):
+///   a writer may state one once on a `/Pages` node and omit it from every page. The walk
+///   climbs `/Parent` until it finds a box, and takes the *nearest* ancestor's.
+/// - Extents are read with [`num_deref`], because an array element may legally be an
+///   indirect reference (`/MediaBox [0 0 12 0 R 13 0 R]`). Reading them with [`num`] makes
+///   such a box measure zero — which is how a real page becomes a guessed US-Letter one.
+/// - Termination is bounded twice over: a visited set (a `/Parent` cycle returns `None`)
+///   and [`crate::MAX_FORM_DEPTH`] levels. Never loops, never panics.
+/// - `None` means the document states no usable box anywhere up the chain. It does **not**
+///   mean US Letter — that decision belongs to the caller, which should reach for
+///   [`DEFAULT_PAGE_PTS`]. The box is returned as authored: it may be inverted or
+///   degenerate, so callers take `.abs()` of the extents they care about.
+pub(crate) fn page_box(doc: &Document, page_id: ObjectId) -> Option<[f32; 4]> {
+    let mut node = page_id;
+    let mut seen: Vec<ObjectId> = Vec::new();
+    for _ in 0..crate::MAX_FORM_DEPTH {
+        if seen.contains(&node) {
+            return None; // cyclic /Parent chain
+        }
+        seen.push(node);
+        let dict = doc.get_object(node).ok()?.as_dict().ok()?;
+        let found = dict
+            .get(b"MediaBox")
+            .ok()
+            .or_else(|| dict.get(b"CropBox").ok())
+            .and_then(|o| deref(doc, o))
+            .and_then(|o| o.as_array().ok())
+            .filter(|a| a.len() >= 4);
+        if let Some(a) = found {
+            return Some([num_deref(doc, &a[0]), num_deref(doc, &a[1]), num_deref(doc, &a[2]), num_deref(doc, &a[3])]);
+        }
+        node = match dict.get(b"Parent") {
+            Ok(Object::Reference(r)) => *r,
+            _ => return None,
+        };
+    }
+    None
 }
 
 /// A single PDFDocEncoding high byte (0x80–0xFF) → char. This is the encoding PDF text
@@ -275,6 +326,109 @@ mod tests {
         assert_eq!(decode_text_string(b"\xfe\xff\x00A\x00"), "A");
         assert_eq!(decode_text_string(b"\xfe\xff\xd8\x00"), "\u{FFFD}");
         assert_eq!(decode_text_string(&[]), "");
+    }
+
+    /// A page-tree chain of `n` `/Pages` nodes above one `/Page`, with `boxes[i]` merged into
+    /// node `i` (0 = the page itself). Returns the doc and the page id.
+    fn page_tree(n: usize, boxes: &[(usize, Dictionary)]) -> (Document, lopdf::ObjectId) {
+        let mut doc = Document::with_version("1.5");
+        let ids: Vec<lopdf::ObjectId> = (0..n).map(|_| doc.add_object(Object::Null)).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let mut d = dictionary! { "Type" => if i == 0 { "Page" } else { "Pages" } };
+            if i + 1 < n {
+                d.set("Parent", Object::Reference(ids[i + 1]));
+            }
+            for (at, extra) in boxes {
+                if *at == i {
+                    for (k, v) in extra.iter() {
+                        d.set(k.clone(), v.clone());
+                    }
+                }
+            }
+            doc.set_object(*id, Object::Dictionary(d));
+        }
+        (doc, ids[0])
+    }
+
+    fn bx(v: [i64; 4]) -> Dictionary {
+        dictionary! { "MediaBox" => v.iter().map(|n| Object::Integer(*n)).collect::<Vec<_>>() }
+    }
+
+    #[test]
+    fn page_box_inherits_from_the_nearest_ancestor_that_states_one() {
+        // Both ancestors carry a box; the NEAREST wins, not the root.
+        let (doc, page) = page_tree(3, &[(1, bx([0, 0, 842, 595])), (2, bx([0, 0, 200, 200]))]);
+        assert_eq!(page_box(&doc, page), Some([0.0, 0.0, 842.0, 595.0]));
+        // The page's own box beats every ancestor's.
+        let (doc, page) = page_tree(2, &[(0, bx([0, 0, 100, 100])), (1, bx([0, 0, 842, 595]))]);
+        assert_eq!(page_box(&doc, page), Some([0.0, 0.0, 100.0, 100.0]));
+    }
+
+    #[test]
+    fn page_box_resolves_indirect_extents() {
+        // THE reason this is `num_deref` and not `num`: an array element may legally be an
+        // indirect reference, and reading it directly makes the whole page measure zero.
+        let mut doc = Document::with_version("1.5");
+        let w = doc.add_object(Object::Integer(1008));
+        let h = doc.add_object(Object::Real(612.0));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Reference(w), Object::Reference(h)],
+        });
+        assert_eq!(page_box(&doc, page), Some([0.0, 0.0, 1008.0, 612.0]));
+    }
+
+    #[test]
+    fn page_box_falls_back_to_the_crop_box_but_prefers_the_media_box() {
+        let crop = dictionary! { "CropBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(400), Object::Integer(650)] };
+        let (doc, page) = page_tree(1, &[(0, crop.clone())]);
+        assert_eq!(page_box(&doc, page), Some([0.0, 0.0, 400.0, 650.0]));
+        // With both present the /MediaBox is the page box; /CropBox is only the fallback.
+        let mut both = crop;
+        both.set("MediaBox", vec![Object::Integer(0), Object::Integer(0), Object::Integer(612), Object::Integer(792)]);
+        let (doc, page) = page_tree(1, &[(0, both)]);
+        assert_eq!(page_box(&doc, page), Some([0.0, 0.0, 612.0, 792.0]));
+    }
+
+    #[test]
+    fn page_box_degrades_a_short_or_malformed_box_to_the_ancestors() {
+        // A 2-element box is not a box: keep climbing rather than returning nonsense.
+        let short = dictionary! { "MediaBox" => vec![Object::Integer(0), Object::Integer(0)] };
+        let (doc, page) = page_tree(2, &[(0, short), (1, bx([0, 0, 842, 595]))]);
+        assert_eq!(page_box(&doc, page), Some([0.0, 0.0, 842.0, 595.0]));
+        // Non-numeric entries are 0.0 rather than a panic — the caller's sanity filter rejects it.
+        let junk = dictionary! { "MediaBox" => vec![Object::Name(b"A".to_vec()), Object::Null, Object::Null, Object::Null] };
+        let (doc, page) = page_tree(1, &[(0, junk)]);
+        assert_eq!(page_box(&doc, page), Some([0.0; 4]));
+    }
+
+    #[test]
+    fn page_box_terminates_on_a_cyclic_or_absurdly_deep_parent_chain() {
+        // A /Parent cycle: node 0 -> 1 -> 0. Without the visited set this never returns.
+        let mut doc = Document::with_version("1.5");
+        let a = doc.add_object(Object::Null);
+        let b = doc.add_object(dictionary! { "Type" => "Pages", "Parent" => Object::Reference(a) });
+        doc.set_object(a, Object::Dictionary(dictionary! { "Type" => "Page", "Parent" => Object::Reference(b) }));
+        let t = std::time::Instant::now();
+        assert_eq!(page_box(&doc, a), None, "a cyclic /Parent chain has no box");
+        assert!(t.elapsed().as_secs() < 5, "the cycle guard is not bounding the walk");
+        // Deeper than MAX_FORM_DEPTH: the box exists but is out of reach, and that is a
+        // bounded `None`, never a hang.
+        let deep = crate::MAX_FORM_DEPTH as usize + 5;
+        let (doc, page) = page_tree(deep, &[(deep - 1, bx([0, 0, 842, 595]))]);
+        assert_eq!(page_box(&doc, page), None);
+        // …and one level inside the cap it is found.
+        let ok = crate::MAX_FORM_DEPTH as usize;
+        let (doc, page) = page_tree(ok, &[(ok - 1, bx([0, 0, 842, 595]))]);
+        assert_eq!(page_box(&doc, page), Some([0.0, 0.0, 842.0, 595.0]));
+    }
+
+    #[test]
+    fn page_box_of_a_dangling_page_id_is_none_not_a_default() {
+        // `None` means "the file said nothing"; choosing US Letter is the caller's business.
+        let (doc, _) = doc_with(vec![Object::Null]);
+        assert_eq!(page_box(&doc, (9_999, 0)), None);
+        assert_eq!(DEFAULT_PAGE_PTS, (612.0, 792.0), "the one home for the letter default");
     }
 
     #[test]

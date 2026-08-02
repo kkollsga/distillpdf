@@ -612,5 +612,15 @@
     "n_bars": 5,
     "caption": "Figure 1: Five bars painted by a form stream carrying no filter.",
     "title": "A Form Stream With No Filter"
+  },
+  "indirect_mediabox.pdf": {
+    "page_width": 1008,
+    "page_height": 612,
+    "crop_width": 400,
+    "crop_height": 650,
+    "figure_width": 504,
+    "caption": "Figure 1: A grid spanning 504 of the 1008 point page.",
+    "n_figures": 1,
+    "crop_page_text": "This page states no MediaBox anywhere up the tree, only a CropBox."
   }
 }

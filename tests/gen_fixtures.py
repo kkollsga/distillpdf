@@ -441,6 +441,71 @@ def gen_small_vector_fig():
     }
 
 
+def gen_indirect_mediabox():
+    """Hand-written PDF whose page boxes are written the two ways the box walker used to miss.
+
+    Page 1's ``/MediaBox`` lives on an intermediate ``/Pages`` node AND its width/height
+    entries are INDIRECT REFERENCES (``[0 0 9 0 R 10 0 R]``) — perfectly legal for a
+    dictionary/array value (PDF 32000-1 §7.3.10; only content-stream operands may not be
+    indirect). The vector reader used the direct-only number reader, which returns 0.0 for a
+    reference, so the box measured 0pt wide, failed its sanity filter and fell back to the
+    guessed 612pt letter width — every figure on the page was then sized as the wrong share
+    of it. 1008x612 is deliberately neither 612x792 nor the 842pt of inherited_mediabox.pdf.
+
+    Page 2 hangs off a different ``/Pages`` branch that carries NO box at all, and states
+    only a ``/CropBox``. `/CropBox` is the spec's fallback when `/MediaBox` is absent; the OCR
+    page-size reader looked for `/MediaBox` alone and reported US-Letter for such a page,
+    which mis-scales every OCR bbox on it.
+
+    reportlab writes a direct per-page /MediaBox always, so this is assembled by hand."""
+    pdf = os.path.join(OUT, "indirect_mediabox.pdf")
+    page_w, page_h = 1008, 612           # page 1, via INDIRECT array entries
+    crop_w, crop_h = 400, 650            # page 2, via /CropBox only
+    fx, fy, fw, fh = 100, 250, 504, 200  # the figure spans exactly half of 1008pt
+    lines = []
+    for i in range(8):
+        yy = fy + fh * i / 7.0
+        lines.append(b"%.1f %.1f m %.1f %.1f l S" % (fx, yy, fx + fw, yy))
+    for i in range(8):
+        xx = fx + fw * i / 7.0
+        lines.append(b"%.1f %.1f m %.1f %.1f l S" % (xx, fy, xx, fy + fh))
+    c1 = (b"BT /F1 16 Tf 100 540 Td (An Indirect MediaBox) Tj ET\n"
+          b"0.8 w\n" + b"\n".join(lines) + b"\n"
+          b"BT /F1 9 Tf 100 %d Td "
+          b"(Figure 1: A grid spanning 504 of the 1008 point page.) Tj ET" % (fy - 18))
+    c2 = (b"BT /F1 14 Tf 40 600 Td (A CropBox Only Page) Tj ET\n"
+          b"BT /F1 10 Tf 40 570 Td "
+          b"(This page states no MediaBox anywhere up the tree, only a CropBox.) Tj ET")
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        # The root states NO box, so page 2 has nothing to inherit.
+        2: b"<< /Type /Pages /Kids [3 0 R 7 0 R] /Count 2 >>",
+        # Intermediate node: inheritable /MediaBox whose extents are indirect numbers.
+        3: (b"<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 "
+            b"/MediaBox [0 0 9 0 R 10 0 R] >>"),
+        4: (b"<< /Type /Page /Parent 3 0 R /Resources << /Font << /F1 6 0 R >> >> "
+            b"/Contents 5 0 R >>"),
+        5: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c1), c1),
+        6: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        7: (b"<< /Type /Page /Parent 2 0 R /CropBox [0 0 %d %d] "
+            b"/Resources << /Font << /F1 6 0 R >> >> /Contents 8 0 R >>" % (crop_w, crop_h)),
+        8: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c2), c2),
+        9: b"%d" % page_w,   # the indirect width …
+        10: b"%d" % page_h,  # … and height
+    }
+    _assemble_pdf(objs, pdf)
+    GT["indirect_mediabox.pdf"] = {
+        "page_width": page_w,
+        "page_height": page_h,
+        "crop_width": crop_w,
+        "crop_height": crop_h,
+        "figure_width": fw,
+        "caption": "Figure 1: A grid spanning 504 of the 1008 point page.",
+        "n_figures": 1,
+        "crop_page_text": "This page states no MediaBox anywhere up the tree, only a CropBox.",
+    }
+
+
 def gen_xobject_figure():
     """Regression lock for the Form-XObject text recursion (commit 864694e). The WHOLE page
     — body prose AND a captioned diagram with internal node labels — is drawn inside ONE Form
@@ -1959,6 +2024,7 @@ def main():
     gen_small_vector_fig()
     gen_dense_vector()
     gen_inherited_mediabox()
+    gen_indirect_mediabox()
     gen_xobject_figure()
     gen_form_image()
     gen_undrawn_image()
