@@ -1033,6 +1033,60 @@ def gen_form_bbox():
     }
 
 
+def gen_form_bbox_text():
+    """One form body, two ``/BBox`` bands — the shape that emitted every label TWICE.
+
+    ``med_mrna_vaccine_immunology_pmc.pdf`` p13 is a pdftex figure inclusion that embeds ONE
+    346 KB form body twice: ``/Im17`` with ``/BBox [10.5 473.2 582.3 643.9]`` and ``/Im18``
+    with ``/BBox [6.3 63.7 577.6 474.1]`` — two disjoint horizontal bands of the same figure —
+    each placed so its band lands where it belongs. §8.10.2 makes ``/BBox`` a clip, and the
+    raster and vector walks read it; the TEXT walk did not, so it decoded both bodies whole
+    and produced 4,031 chars where a reference extractor produces 2,896, with every label
+    doubled 3.13 pt apart in x and 1.61 pt in y. A real offset, so ``dedup_coincident``'s
+    integer-rounded key could never see it, and the rendered figure came out illegible.
+
+    Same shape, minimum size: one body drawing ``TOPBAND`` at form (20, 300) and ``BOTBAND``
+    at form (20, 50), invoked twice —
+
+      ``/Fm0`` ``/BBox [0 200 400 400]`` at (72, 400): only ``TOPBAND`` may paint.
+      ``/Fm1`` ``/BBox [0 0 400 200]``   at (75, 320): only ``BOTBAND`` may paint.
+
+    The two placements differ by a 3 pt / 1.6 pt nudge, exactly so a coincidence-keyed dedupe
+    cannot rescue the answer — the clip has to."""
+    pdf = os.path.join(OUT, "form_bbox_text.pdf")
+    body = (b"BT /F1 14 Tf 20 300 Td (TOPBAND) Tj ET\n"
+            b"BT /F1 14 Tf 20 50 Td (BOTBAND) Tj ET")
+
+    def form(bbox):
+        return (b"<< /Type /XObject /Subtype /Form /BBox %s "
+                b"/Resources << /Font << /F1 7 0 R >> >> /Length %d >>\nstream\n%s\nendstream"
+                % (bbox, len(body), body))
+
+    stream = b"\n".join([
+        b"BT /F1 12 Tf 72 720 Td (One body, two bands.) Tj ET",
+        b"q 1 0 0 1 72 400 cm /Fm0 Do Q",
+        b"q 1 0 0 1 75 321.6 cm /Fm1 Do Q",
+    ])
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 7 0 R >> /XObject << /Fm0 5 0 R /Fm1 6 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+        5: form(b"[0 200 400 400]"),
+        6: form(b"[0 0 400 200]"),
+        7: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["form_bbox_text.pdf"] = {
+        # Each label is painted exactly once, by the form whose /BBox contains it.
+        "labels": {"TOPBAND": 1, "BOTBAND": 1},
+        # Where the one surviving copy lands in page space (form origin + placement).
+        "topband_xy": [92, 700],
+        "botband_xy": [95, 371.6],
+    }
+
+
 def gen_clipped_raster():
     """The same raster drawn three times: whole, clipped, and clipped under a ROTATED placement.
 
@@ -3981,6 +4035,7 @@ def main():
     gen_smask_group_raster()
     gen_clipped_raster()
     gen_form_bbox()
+    gen_form_bbox_text()
     gen_decode_jpeg()
     gen_form_inherit()
     gen_form_font()

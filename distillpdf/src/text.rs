@@ -1301,11 +1301,54 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
                     Some(fr) => build_fonts_from_resources(doc, fr, raw),
                     None => continue, // unreachable under OwnOnly, which refuses a form without /Resources
                 };
-                decode_spans(doc, &f.ops, &ff, &f.scope.xobjects, f.matrix.mul(ctm), raw, depth + 1, spans, budget);
+                let sub = f.matrix.mul(ctm);
+                // §8.10.2: the form's `/BBox` clips its content, glyphs included. The raster
+                // and vector walks already read the key (`walker::form_bbox_clip`); this walk
+                // did not, so a producer that reuses ONE oversized form body and selects a
+                // band of it per placement got every glyph of the whole body, once per
+                // placement. See `clip_spans_to`.
+                let clip = crate::walker::form_bbox_clip(doc, stream, sub);
+                let mark = spans.len();
+                decode_spans(doc, &f.ops, &ff, &f.scope.xobjects, sub, raw, depth + 1, spans, budget);
+                if let Some(bb) = clip {
+                    clip_spans_to(spans, mark, bb);
+                }
             }
             _ => {}
         }
     }
+}
+
+/// Drop the spans a descended form's `/BBox` crops away — everything from index `from`
+/// onward whose glyph box does not overlap the box, which is already in page space.
+///
+/// PDF 32000-1 §8.10.2 makes `/BBox` a clip on the form's content, so a glyph outside it
+/// is not painted and is not text on the page. A LaTeX/pdftex figure inclusion leans on
+/// exactly that: `med_mrna_vaccine_immunology_pmc.pdf` p13 embeds ONE 346 KB form body
+/// twice — `/Im17` with `/BBox [10.5 473.2 582.3 643.9]` and `/Im18` with
+/// `/BBox [6.3 63.7 577.6 474.1]`, two disjoint horizontal bands of the same figure —
+/// and places each so its band lands where it belongs. Reading both bodies whole
+/// emitted every label twice, 3.13 pt apart in x and 1.61 pt in y, which is a real
+/// offset and therefore invisible to `dedup_coincident`'s integer-rounded key.
+///
+/// The test is *overlap*, not containment: a glyph the box cuts through is partly
+/// painted, and a producer whose `/BBox` hugs its content must not lose its edge text.
+/// That is the lenient reading — it can only ever keep more than a conforming reader
+/// paints, never less.
+fn clip_spans_to(spans: &mut Vec<Span>, from: usize, bb: crate::geom::Rect) {
+    if from >= spans.len() {
+        return;
+    }
+    let tail: Vec<Span> = spans
+        .split_off(from)
+        .into_iter()
+        .filter(|s| {
+            let (x0, x1, y0, y1) = span_bbox(s);
+            let hit = crate::geom::Rect::new(x0, y0, x1, y1).intersect(bb);
+            hit.width() >= 0.0 && hit.height() >= 0.0
+        })
+        .collect();
+    spans.extend(tail);
 }
 
 /// Drop spans that coincide with one already emitted — same text at the same
@@ -1885,6 +1928,34 @@ mod tests {
         let spans = extract_spans(&doc, pid, &raw);
         let s = spans.iter().find(|s| s.text.contains("INHERIT")).expect("the form's label");
         assert!((s.x - 172.0).abs() < 1.0, "x {} (72 means the indirect /Matrix was lost)", s.x);
+    }
+
+    #[test]
+    fn a_forms_bbox_clips_the_glyphs_it_crops_away() {
+        // `tests/gen_fixtures.py::gen_form_bbox_text`. One form body holding two bands of
+        // text, invoked twice through two disjoint `/BBox`es — the pdftex figure-inclusion
+        // shape that `med_mrna_vaccine_immunology_pmc.pdf` p13 uses for real. §8.10.2 makes
+        // `/BBox` a clip on the form's content; this walk did not read it, so it decoded
+        // both bodies whole and every label came out twice, at the offset between the two
+        // placements. That offset is real (3 pt here, 3.13 pt in the corpus file), so
+        // `dedup_coincident`'s integer-rounded key cannot see it.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/form_bbox_text.pdf");
+        let raw = std::fs::read(path).expect("form_bbox_text.pdf fixture must exist");
+        let doc = Document::load_mem(&raw).expect("form_bbox_text.pdf fixture must load");
+        let pid = *doc.get_pages().get(&1).expect("fixture has page 1");
+        let spans = extract_spans(&doc, pid, &raw);
+        let hits = |w: &str| spans.iter().filter(|s| s.text.contains(w)).count();
+        assert_eq!(hits("TOPBAND"), 1, "the top band paints once, not once per placement");
+        assert_eq!(hits("BOTBAND"), 1, "the bottom band paints once, not once per placement");
+        // Kept, not merely deduped: each survivor must be the copy the form whose `/BBox`
+        // contains it placed — the top one at (72+20, 400+300), the bottom at (75+20, 321.6+50).
+        let top = spans.iter().find(|s| s.text.contains("TOPBAND")).unwrap();
+        assert!((top.x - 92.0).abs() < 1.0 && (top.y - 700.0).abs() < 1.0, "TOPBAND at ({}, {})", top.x, top.y);
+        let bot = spans.iter().find(|s| s.text.contains("BOTBAND")).unwrap();
+        assert!((bot.x - 95.0).abs() < 1.0 && (bot.y - 371.6).abs() < 1.0, "BOTBAND at ({}, {})", bot.x, bot.y);
+        // The guard: the clip must not eat the page's own text, which no `/BBox` governs.
+        let out = extract_page(&doc, pid, &raw).expect("page text");
+        assert!(out.contains("One body, two bands"), "page-level text lost to a form clip: {out:?}");
     }
 
     #[test]

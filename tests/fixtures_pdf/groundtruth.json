@@ -903,6 +903,20 @@
       330
     ]
   },
+  "form_bbox_text.pdf": {
+    "labels": {
+      "TOPBAND": 1,
+      "BOTBAND": 1
+    },
+    "topband_xy": [
+      92,
+      700
+    ],
+    "botband_xy": [
+      95,
+      371.6
+    ]
+  },
   "rotated_raster.pdf": {
     "rotations": [
       0,
