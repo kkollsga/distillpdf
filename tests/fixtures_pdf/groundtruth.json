@@ -1139,5 +1139,12 @@
       ]
     ],
     "panel_own_text": "Benchmarks"
+  },
+  "undecodable_codec.pdf": {
+    "declined_object": 5,
+    "control_object": 6,
+    "filter": "JPXDecode",
+    "human": "JPEG 2000",
+    "kind": "codec-unsupported"
   }
 }

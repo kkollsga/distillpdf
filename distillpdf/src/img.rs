@@ -953,6 +953,59 @@ fn walk(
     }
 }
 
+/// A labelled stand-in for an image whose codec this crate declines to decode, as a data URI
+/// sized to the placement it replaces.
+///
+/// **Why this exists at all.** An undecodable image left a *blank frame* — and a blank frame
+/// is indistinguishable from a figure we correctly decided not to emit. A reader cannot tell
+/// "nothing here" from "we cannot read this", and every expensive defect in this effort was
+/// of the second kind: silently wrong or silently absent output that looked plausible. The
+/// placeholder converts an unknown into a known, and `stream_integrity` reports the same
+/// stream so a program can find it without looking at pixels.
+///
+/// **SVG, and no new dependency.** The only in-tree raster encoders are PNG and JPEG, and
+/// neither can draw text without a font rasteriser. An SVG is text, renders identically in
+/// an `<img src>` on the page and in an `<image href>` inside a composited figure, and
+/// scales to whatever box the placement gives it. Base64 so no consumer has to worry about
+/// what needs percent-escaping in a `data:` URI.
+fn placeholder_uri(filter: &str, human: &str, w: f32, h: f32) -> String {
+    let (w, h) = (w.max(8.0), h.max(8.0));
+    let label = format!("{human} image");
+    let sub = format!("not decoded ({filter})");
+    // Fit the longer line: ~0.55 em per character for a sans-serif at these sizes, with the
+    // height as the other bound so a wide, short placement stays legible rather than bold.
+    let fit = |s: &str| w * 0.86 / (s.chars().count() as f32 * 0.55).max(1.0);
+    let fs = fit(&label).min(fit(&sub)).min(h * 0.22).clamp(3.0, 15.0);
+    let svg = format!(
+        concat!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">"##,
+            r##"<rect x="0.75" y="0.75" width="{iw}" height="{ih}" fill="#f4f4f5" stroke="#a1a1aa" stroke-width="1.5" stroke-dasharray="6 4"/>"##,
+            r##"<text x="{cx}" y="{y1}" text-anchor="middle" font-family="sans-serif" font-size="{fs}" fill="#52525b">{label}</text>"##,
+            r##"<text x="{cx}" y="{y2}" text-anchor="middle" font-family="sans-serif" font-size="{fs2}" fill="#71717a">{sub}</text>"##,
+            "</svg>"
+        ),
+        w = round2(w),
+        h = round2(h),
+        iw = round2(w - 1.5),
+        ih = round2(h - 1.5),
+        cx = round2(w * 0.5),
+        y1 = round2(h * 0.5 - fs * 0.15),
+        y2 = round2(h * 0.5 + fs * 1.05),
+        fs = round2(fs),
+        fs2 = round2(fs * 0.85),
+        label = crate::textutil::esc_text(&label),
+        sub = crate::textutil::esc_text(&sub),
+    );
+    format!("data:image/svg+xml;base64,{}", base64::engine::general_purpose::STANDARD.encode(svg))
+}
+
+/// Two decimals, without a trailing `.0` — the placeholder SVG is part of the render's
+/// byte-for-byte determinism, so its numbers are formatted, never defaulted.
+fn round2(v: f32) -> String {
+    let s = format!("{:.2}", v);
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
 /// Turn a page's raw tiles into placed images: detect mergeable image GRIDS (clusters
 /// of ≥4 spatially-adjacent tiles spanning ≥2 columns and ≥2 rows — maps/diagrams that
 /// authoring software exports as a tile mosaic) and stitch each into ONE image; every
@@ -993,7 +1046,21 @@ fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool, rot: i32) -> Ve
             // URI carries are turned — the two must agree or a composite double-turns.
             let ctm = turned_placement(t.ctm, (t.x0, t.y0, t.x1, t.y1), rot);
             if want_uris {
-                if let Some(uri) = data_uri(doc, &t.res, t.id, window, rot) {
+                // A codec we decline leaves a LABELLED placeholder, not a blank frame — see
+                // [`placeholder_uri`]. The gate is `data_uri` having already said no, so this
+                // can never fire for an image we can decode: a decodable stream never reaches
+                // it, and `raster::declined_codec` is the same list the four decline points
+                // on this path read.
+                let uri = match data_uri(doc, &t.res, t.id, window, rot) {
+                    Some(uri) => Some(uri),
+                    None => doc
+                        .get_object(t.id)
+                        .ok()
+                        .and_then(|o| o.as_stream().ok())
+                        .and_then(|s| crate::raster::declined_codec(&s.dict))
+                        .map(|(filter, human)| placeholder_uri(filter, human, t.x1 - t.x0, t.y1 - t.y0)),
+                };
+                if let Some(uri) = uri {
                     out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri, ctm, seq: t.seq.clone(), clip: mask });
                 }
             } else if decodable(doc, &t.res, t.id) {
@@ -1525,6 +1592,47 @@ mod tests {
             backdrop.x_right - backdrop.x_left
         );
         assert_eq!(uri_rgb(&backdrop.uri).dimensions(), (2, 2), "and it keeps every sample");
+    }
+
+    #[test]
+    fn a_codec_we_decline_leaves_a_labelled_placeholder_and_a_decodable_one_never_does() {
+        // `tests/gen_fixtures.py::gen_undecodable_codec`: a `/JPXDecode` image beside an
+        // ordinary Flate raster of the same size. JPEG 2000 *decoding* stays parked (no
+        // mature pure-Rust decoder; OpenJPEG's CVE record is not worth carrying in the
+        // automatic path for untrusted files) — but the refusal used to be INVISIBLE, and a
+        // blank frame is indistinguishable from a figure we correctly chose not to emit.
+        //
+        // The control is the regression that matters: the placeholder must never fire for an
+        // image we can decode.
+        let placed = placed_top_down("undecodable_codec.pdf", 1);
+        assert_eq!(placed.len(), 2, "both placements are emitted, got {}", placed.len());
+        let mut by_x = placed;
+        by_x.sort_by(|a, b| a.x_left.partial_cmp(&b.x_left).expect("finite"));
+        let (declined, control) = (&by_x[0], &by_x[1]);
+
+        assert!(control.uri.starts_with("data:image/png;base64,"), "the control decodes normally: {}", &control.uri[..30.min(control.uri.len())]);
+        assert!(!control.uri.contains("svg"), "and never gets a placeholder");
+
+        assert!(declined.uri.starts_with("data:image/svg+xml;base64,"), "placeholder: {}", &declined.uri[..40.min(declined.uri.len())]);
+        let svg = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(declined.uri.split_once(";base64,").expect("base64 payload").1)
+                .expect("valid base64"),
+        )
+        .expect("the placeholder is text");
+        assert!(svg.contains("JPEG 2000 image"), "the codec must be NAMED: {svg}");
+        assert!(svg.contains("not decoded (JPXDecode)"), "and the filter with it: {svg}");
+        // Sized to the placement it stands in for, so it neither stretches nor shrinks.
+        assert!(svg.contains(r#"width="200" height="150""#), "placeholder geometry: {svg}");
+
+        // And a program can find it without looking at pixels — P12's report is the home for
+        // "this stream is not what it looks like".
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/undecodable_codec.pdf");
+        let doc = Document::load(path).expect("fixture must load");
+        let issues = crate::pdfobj::stream_issues(&doc);
+        let hit = issues.iter().find(|i| i.object.0 == 5).expect("the declined stream is reported");
+        assert_eq!((hit.kind, hit.filter.as_str(), hit.recovered), ("codec-unsupported", "JPXDecode", 0));
+        assert!(issues.iter().all(|i| i.object.0 != 6), "the decodable raster is NOT reported: {issues:?}");
     }
 
     #[test]

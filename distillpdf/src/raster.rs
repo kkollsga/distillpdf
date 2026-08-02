@@ -50,6 +50,30 @@ pub(crate) fn filter_to_format(filters: &Option<Vec<String>>) -> &'static str {
     }
 }
 
+/// The image codec a stream declares that this crate **declines to decode**, as
+/// `(filter name, what a reader would call it)` — or `None` for anything we can render.
+///
+/// The one list. Four gates on the raster path refuse these filters (`img`'s `decode_rgb`,
+/// `decode_smask`, `decodable` and `data_uri`), and until now that refusal was invisible:
+/// the image simply did not appear, which a reader cannot tell from a figure we correctly
+/// decided not to emit. Naming the codec here lets the render emit a labelled placeholder
+/// and `stream_integrity` report the stream, from the same source of truth.
+///
+/// JPEG 2000 decoding is **parked by decision**, not oversight — there is no mature
+/// pure-Rust decoder and OpenJPEG's CVE record is not worth carrying in the automatic path
+/// for untrusted files (`dev-docs/plans/composited-figure-raster-gaps.md` §D). Making the
+/// gap visible is the part that does not need a codec.
+///
+/// `ASCIIHexDecode` is deliberately absent: lopdf cannot apply it either, but it is a
+/// *generic* layer, and a stream wrapped in one is already reported as `filter-unapplied`.
+pub(crate) fn declined_codec(dict: &Dictionary) -> Option<(&'static str, &'static str)> {
+    filters_of(dict).into_iter().find_map(|f| match f.as_slice() {
+        b"JPXDecode" => Some(("JPXDecode", "JPEG 2000")),
+        b"JBIG2Decode" => Some(("JBIG2Decode", "JBIG2")),
+        _ => None,
+    })
+}
+
 /// Cap on colour-space indirection (`/CS0 → [/Indexed [/ICCBased …] …]`, and the cyclic
 /// resource dictionary a hostile file can write).
 pub(crate) const MAX_CS_DEPTH: u32 = 8;

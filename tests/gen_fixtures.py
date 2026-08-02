@@ -2082,6 +2082,53 @@ def gen_annot_appearance():
     }
 
 
+def gen_undecodable_codec():
+    """An image in a codec we decline, beside one we decode — the placeholder and the control.
+
+    ``JPXDecode`` is refused at every gate on the raster path, and JPEG 2000 *decoding* is
+    parked by decision: there is no mature pure-Rust decoder and OpenJPEG's CVE record is not
+    worth carrying in the automatic path for untrusted files. What was not decided is that the
+    refusal should be **invisible** — such an image left a blank frame, which a reader cannot
+    tell from a figure we correctly chose not to emit.
+
+    The fixture declares a `/JPXDecode` stream whose bytes are never decoded by anything (which
+    is exactly what the crate sees for a real one) and, beside it, an ordinary Flate RGB image
+    of the same size. The control is the point: the placeholder must not fire for an image we
+    can decode."""
+    pdf = os.path.join(OUT, "undecodable_codec.pdf")
+    ok = _flate_image(6, 2, 2, b"/DeviceRGB", 8,
+                      bytes((220, 30, 40, 30, 160, 60, 40, 60, 210, 230, 190, 40)))
+    # A JPEG 2000 codestream signature box, then filler. Nothing in the crate decodes it —
+    # writing a real .jp2 would need the very dependency this feature exists to avoid.
+    jpx = b"\x00\x00\x00\x0cjP  \r\n\x87\n" + b"\x00" * 64
+    stream = b"\n".join([
+        b"BT /F1 15 Tf 72 730 Td (An Undecodable Codec Says So) Tj ET",
+        b"q 200 0 0 150 72 520 cm /ImJpx Do Q",
+        b"q 200 0 0 150 320 520 cm /ImOk Do Q",
+        b"BT /F1 10 Tf 72 490 Td (Left: JPEG 2000. Right: a raster we decode.) Tj ET",
+    ])
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 7 0 R >> /XObject << /ImJpx 5 0 R /ImOk 6 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+        5: (b"<< /Type /XObject /Subtype /Image /Width 400 /Height 300 /ColorSpace /DeviceRGB "
+            b"/BitsPerComponent 8 /Filter /JPXDecode /Length %d >>\nstream\n%s\nendstream"
+            % (len(jpx), jpx)),
+        6: ok,
+        7: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["undecodable_codec.pdf"] = {
+        "declined_object": 5,
+        "control_object": 6,
+        "filter": "JPXDecode",
+        "human": "JPEG 2000",
+        "kind": "codec-unsupported",
+    }
+
+
 def gen_panel_table():
     """A boxed callout panel with a real ruled table inside it — each cell exactly ONCE.
 
@@ -3942,6 +3989,7 @@ def main():
     gen_annot_render()
     gen_glyph_table()
     gen_panel_table()
+    gen_undecodable_codec()
     gen_no_spurious_figs()
     gen_links()
     gen_pagelabels()

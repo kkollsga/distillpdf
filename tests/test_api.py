@@ -233,7 +233,13 @@ def test_every_extracted_image_across_the_fixtures_opens():
             continue
         for im in distillpdf.Pdf.open(os.path.join(FIX, name)).extract_images():
             where = f"{name} p{im['page']} #{im['index']} ({im['format']})"
-            if im["format"] in ("raw", "ccitt", "jbig2"):
+            # `jpx` joins this list with `undecodable_codec.pdf`: JPEG 2000 decoding is
+            # parked by decision, so the honest contract is the same one `raw`/`ccitt`/
+            # `jbig2` already meet — say what the format is and carry the metadata to
+            # reassemble it, rather than hand back bytes claiming to be an openable file.
+            # (The render says so too: `to_html` emits a labelled placeholder naming the
+            # codec, and `stream_integrity()` reports the stream as `codec-unsupported`.)
+            if im["format"] in ("raw", "ccitt", "jbig2", "jpx"):
                 assert im["color_space"] is not None or im["bits_per_component"] is not None, \
                     f"{where}: unassembled row must carry reassembly metadata"
                 continue

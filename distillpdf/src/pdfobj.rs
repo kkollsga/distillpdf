@@ -263,6 +263,10 @@ pub struct StreamIssue {
     /// * `"filter-unapplied"` — lopdf cannot apply the declared filter chain at all
     ///   (`ASCIIHexDecode` is the live case), so the reader falls back to the **encoded**
     ///   bytes verbatim. Nothing downstream can make sense of those.
+    /// * `"codec-unsupported"` — the stream is an image in a codec this crate declines to
+    ///   decode (`JPXDecode`, `JBIG2Decode` — see `raster::declined_codec`). The bytes are
+    ///   intact and the document is not damaged; what a consumer gets is **no pixels**, and
+    ///   the render emits a labelled placeholder in the image's place rather than nothing.
     pub kind: &'static str,
     /// The `/Filter` chain as the document wrote it, e.g. `"ASCIIHexDecode,DCTDecode"`.
     pub filter: String,
@@ -354,6 +358,15 @@ fn stream_issue(id: ObjectId, s: &lopdf::Stream) -> Option<StreamIssue> {
     // as [`crate::raster::codec_payload`] peels them — a stream that is `[/DCTDecode]` is a
     // JPEG, and lopdf declining to decode it is the whole point of the codec path, not a
     // fault. Probing the full chain instead reported every JPEG in the corpus as damaged.
+    // An image in a codec we decline is not damaged and decodes nothing — a distinct answer
+    // from both kinds below, and one a consumer could previously only discover by noticing
+    // that no pixels ever arrived. Checked before the generic probe because such a stream
+    // usually has NO generic layer to probe (`/Filter /JPXDecode` alone).
+    if s.dict.get(b"Subtype").and_then(|o| o.as_name()).is_ok_and(|n| n == b"Image") {
+        if let Some((_, _)) = crate::raster::declined_codec(&s.dict) {
+            return Some(StreamIssue { object: id, kind: "codec-unsupported", filter, recovered: 0 });
+        }
+    }
     let lead: Vec<Object> = filters.iter().take_while(|f| is_generic_filter(f)).map(|f| Object::Name(f.clone())).collect();
     if lead.is_empty() {
         return None;

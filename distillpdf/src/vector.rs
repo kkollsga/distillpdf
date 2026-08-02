@@ -402,6 +402,20 @@ const LABEL_MARGIN: f32 = 24.0;
 /// score 0.95 and 0.79, and the cover map that must keep its labels scores at most 0.32.
 const TABLE_YIELD_SHARE: f32 = 0.6;
 
+/// The **contents** of an `image/svg+xml` data URI — everything between its `<svg …>` root
+/// and `</svg>` — or `None` for any other URI.
+///
+/// Only [`crate::img`]'s codec placeholder produces such a URI; a decoded raster is always
+/// PNG or JPEG. See the call site in [`PlacedSvg::composite_svg`] for why a placeholder is
+/// pasted in rather than referenced.
+pub fn inline_svg_payload(href: &str) -> Option<String> {
+    use base64::Engine as _;
+    let b64 = href.strip_prefix("data:image/svg+xml;base64,")?;
+    let svg = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(b64).ok()?).ok()?;
+    let body = svg.split_once('>')?.1.strip_suffix("</svg>")?;
+    Some(body.to_string())
+}
+
 impl PlacedSvg {
     /// Whether this figure draws curves or slanted lines — see [`has_graphic_ink`]. Used by
     /// `html.rs` to tell a diagram's own label grid (which must not suppress the diagram)
@@ -745,6 +759,27 @@ impl PlacedSvg {
             // On a ROTATED page the image's PIXELS turn with the page even when its placement
             // rect is axis-aligned, so the plain-rect form below cannot express it — every
             // raster on such a page goes through the matrix path.
+            // A CODEC PLACEHOLDER is SVG, and an `<image href>` pointing at SVG is where
+            // renderers disagree: browsers draw it, and mupdf (and anything else that only
+            // decodes rasters for `<image>`) logs "ignoring external image" and draws
+            // nothing — which is the blank frame the placeholder exists to end. Inside an
+            // `<svg>` we can simply *be* the SVG: drop the placeholder's own root and paste
+            // its shapes into this figure under a translate+scale. Nothing else takes this
+            // branch — no decoded raster is ever an `image/svg+xml` URI.
+            if let Some(inner) = r.placeholder {
+                let (sw, sh) = (img_lw / (ix1 - ix0).max(0.1), img_lh / (iy1 - iy0).max(0.1));
+                content.push((
+                    r.seq,
+                    format!(
+                        "{clip_open}<g transform=\"translate({} {}) scale({} {})\">{inner}</g>{clip_close}",
+                        fmt(img_lx),
+                        fmt(img_ly),
+                        fmt(sw),
+                        fmt(sh)
+                    ),
+                ));
+                continue;
+            }
             let el = match self.rot_image_matrix(r) {
                 Some([a, b, c, d, e, f]) => format!(
                     "{clip_open}<image href=\"{}\" x=\"0\" y=\"0\" width=\"1\" height=\"1\" preserveAspectRatio=\"none\" transform=\"matrix({} {} {} {} {} {})\"/>{clip_close}",
@@ -828,6 +863,13 @@ impl PlacedSvg {
 /// page painted it, which is what decides whether it lands above or below each path.
 pub struct Raster<'a> {
     pub href: &'a str,
+    /// The **body** of this raster's URI when it is a codec placeholder rather than pixels
+    /// ([`inline_svg_payload`]) — pasted into the figure instead of referenced. `None` for
+    /// every decoded raster, which is all of them but a JPEG 2000 or JBIG2 image.
+    ///
+    /// It has to arrive here from `html.rs`: by the time a raster reaches `composite_svg`
+    /// its `href` is a substitution token, not the URI.
+    pub placeholder: Option<&'a str>,
     pub rect: (f32, f32, f32, f32),
     pub ctm: Option<[f32; 6]>,
     /// The page-space clipping rectangle in force at the `Do`, when it actually cropped the
@@ -2223,6 +2265,7 @@ mod tests {
                 .find(|im| im.x_left >= fig.x_left && im.x_right <= fig.x_right && im.y_bottom >= fig.y_bottom && im.y_top <= fig.y_top)
                 .unwrap_or_else(|| panic!("figure {fi} must contain a raster"));
             let svg = fig.composite_svg(&[Raster {
+                placeholder: None,
                 href: "IMG",
                 rect: (im.x_left, im.x_right, im.y_bottom, im.y_top),
                 ctm: im.ctm,
@@ -2509,7 +2552,7 @@ mod tests {
         assert_eq!(images.len(), 1, "one raster per page");
         assert!(images[0].ctm.is_none(), "the fixture's placement is axis-aligned");
         fn raster(im: &crate::img::Placed) -> Raster<'_> {
-            Raster { href: "IMG", rect: (im.x_left, im.x_right, im.y_bottom, im.y_top), ctm: im.ctm, clip: im.clip, seq: &im.seq }
+            Raster { href: "IMG", placeholder: None, rect: (im.x_left, im.x_right, im.y_bottom, im.y_top), ctm: im.ctm, clip: im.clip, seq: &im.seq }
         }
         let up = strong[0].composite_svg(&[raster(&images[0])]);
         assert!(up.contains("<image href=\"IMG\" x=\"20\" y=\"50\" width=\"40\" height=\"30\""), "upright: {up}");

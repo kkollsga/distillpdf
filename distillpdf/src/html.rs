@@ -2111,12 +2111,16 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                     // the marginal axis labels the CSS-overlay path used to clip.
                     if inline_images && img_overlays[*j].len() == 1 {
                         let idx = img_uris.len();
+                        // A codec placeholder is SVG, not pixels; the figure pastes it in
+                        // rather than referencing it (see `vector::Raster::placeholder`).
+                        let ph = vector::inline_svg_payload(&images[*j].uri);
                         img_uris.push(std::mem::take(&mut images[*j].uri));
                         let href = format!("\u{0}{idx}\u{0}");
                         let im = &images[*j];
                         let vi = img_overlays[*j][0];
                         let svg = vectors[vi].composite_svg(&[vector::Raster {
                             href: &href,
+                            placeholder: ph.as_deref(),
                             rect: (im.x_left, im.x_right, im.y_bottom, im.y_top),
                             ctm: im.ctm,
                             clip: im.clip,
@@ -2185,6 +2189,10 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                     // are a raster within the axes): composite into ONE `<svg>` with each
                     // raster embedded as an `<image>` in the figure's coordinate space.
                     let svg = if !svg_rasters[*j].is_empty() {
+                        // Codec placeholders are SVG, not pixels — read before the URIs are
+                        // taken (see `vector::Raster::placeholder`).
+                        let phs: Vec<Option<String>> =
+                            svg_rasters[*j].iter().map(|&ii| vector::inline_svg_payload(&images[ii].uri)).collect();
                         let hrefs: Vec<String> = svg_rasters[*j]
                             .iter()
                             .map(|&ii| {
@@ -2196,10 +2204,12 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                         let refs: Vec<vector::Raster<'_>> = svg_rasters[*j]
                             .iter()
                             .zip(&hrefs)
-                            .map(|(&ii, href)| {
+                            .zip(&phs)
+                            .map(|((&ii, href), ph)| {
                                 let im = &images[ii];
                                 vector::Raster {
                                     href: href.as_str(),
+                                    placeholder: ph.as_deref(),
                                     rect: (im.x_left, im.x_right, im.y_bottom, im.y_top),
                                     ctm: im.ctm,
                                     clip: im.clip,
