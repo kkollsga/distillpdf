@@ -112,16 +112,32 @@ pub(crate) fn image_color_space(doc: &Document, res: &Dictionary, dict: &Diction
 }
 
 /// A colour space reduced to what PNG assembly needs: how many samples make a pixel and
-/// how those samples become RGB. Spaces we cannot faithfully reduce (`Lab`, `Separation`,
-/// `DeviceN`, `Pattern`) are deliberately absent — their rows keep `format:"raw"` rather
-/// than being handed back as a plausible-looking wrong colour.
+/// how those samples become RGB. Spaces we cannot faithfully reduce (`Lab`, `Pattern`, a
+/// `Separation` whose tint transform will not evaluate) are deliberately absent — their
+/// rows keep `format:"raw"` rather than being handed back as a plausible-looking wrong
+/// colour.
 pub(crate) enum Cs {
     Gray,
     Rgb,
     Cmyk,
     /// Palette space: one index sample per pixel into `lookup`, `base`-many bytes each.
     Indexed { base: Box<Cs>, lookup: Vec<u8> },
+    /// `Separation` / `DeviceN`: `k` **tint** samples per pixel, which mean nothing until
+    /// the space's tint transform maps them into `alt`. Reading a tint as an intensity is
+    /// the image-path twin of the `scn` defect `vector.rs` fixes — a 10% spot tint decodes
+    /// to a near-black pixel where the file meant a pale one.
+    Tint { k: usize, tint: Box<crate::function::Function>, alt: Box<Cs> },
 }
+
+/// Tint quantisation for [`Cs::Tint`]: the transform is precomputed over an 8-bit grid per
+/// colorant, so the per-pixel decode is a table lookup rather than a PDF-function
+/// interpreter in the inner loop of a 64 M-pixel image.
+const TINT_LEVELS: usize = 256;
+/// …and the table is `TINT_LEVELS^k` entries, so only 1- and 2-colorant spaces are served
+/// (a `Separation` is 1 by definition; 2 is 65 536 entries). A wider `DeviceN` image keeps
+/// `format:"raw"` exactly as it did before, rather than trading a bounded decode for an
+/// unbounded one.
+const MAX_TINT_COLORANTS: usize = 2;
 
 impl Cs {
     pub(crate) fn components(&self) -> usize {
@@ -130,6 +146,7 @@ impl Cs {
             Cs::Rgb => 3,
             Cs::Cmyk => 4,
             Cs::Indexed { .. } => 1,
+            Cs::Tint { k, .. } => *k,
         }
     }
     /// True when the space is achromatic, so the PNG can be 8-bit grayscale.
@@ -140,6 +157,50 @@ impl Cs {
             _ => false,
         }
     }
+}
+
+/// One colour in a *device* space (the only kind a tint transform's alternate may be) as
+/// RGB. The same three conversions the sample loop applies, in float — a tint transform
+/// hands back floats, not bytes.
+fn device_rgb(alt: &Cs, v: &[f32]) -> Option<[u8; 3]> {
+    let q = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
+    match alt {
+        Cs::Gray if !v.is_empty() => Some([q(v[0]); 3]),
+        Cs::Rgb if v.len() >= 3 => Some([q(v[0]), q(v[1]), q(v[2])]),
+        Cs::Cmyk if v.len() >= 4 => {
+            let k = 1.0 - v[3].clamp(0.0, 1.0);
+            Some([q((1.0 - v[0].clamp(0.0, 1.0)) * k), q((1.0 - v[1].clamp(0.0, 1.0)) * k), q((1.0 - v[2].clamp(0.0, 1.0)) * k)])
+        }
+        _ => None,
+    }
+}
+
+/// The tint transform evaluated over the whole 8-bit tint grid, once per image.
+///
+/// Index layout is the PDF sample convention — **first colorant varies fastest** — so
+/// entry `i` is the tints `(i % 256, (i / 256) % 256, …)`, matching the order the decode
+/// loop packs its quantised samples in.
+///
+/// An individual grid point the transform refuses (an input its `/Domain` excludes, an
+/// output arity that disagrees with the alternate space) degrades to **ink coverage**:
+/// tint `t` of a colorant laid on white paper reads as luminance `1 - t`, the same
+/// fallback `vector.rs` gives an unevaluable `scn`. Pale stays pale; nothing inverts.
+fn tint_lut(k: usize, f: &crate::function::Function, alt: &Cs) -> Vec<[u8; 3]> {
+    let n = TINT_LEVELS.pow(k as u32);
+    let mut lut = Vec::with_capacity(n);
+    let mut t = vec![0f32; k];
+    for i in 0..n {
+        let mut rest = i;
+        for slot in t.iter_mut() {
+            *slot = (rest % TINT_LEVELS) as f32 / (TINT_LEVELS - 1) as f32;
+            rest /= TINT_LEVELS;
+        }
+        lut.push(f.eval(&t).and_then(|out| device_rgb(alt, &out)).unwrap_or_else(|| {
+            let ink = t.iter().copied().fold(0.0f32, f32::max).clamp(0.0, 1.0);
+            [((1.0 - ink) * 255.0).round() as u8; 3]
+        }));
+    }
+    lut
 }
 
 pub(crate) fn cs_model(doc: &Document, res: &Dictionary, o: &Object, depth: u32) -> Option<Cs> {
@@ -175,7 +236,28 @@ pub(crate) fn cs_model(doc: &Document, res: &Dictionary, o: &Object, depth: u32)
                 };
                 Some(Cs::Indexed { base: Box::new(base), lookup })
             }
-            _ => None, // Lab / Separation / DeviceN / Pattern: not reducible to RGB here
+            // A spot space's samples are tints; the tint transform is what makes them a
+            // colour. Without an evaluable one (a Type 4 calculator, a malformed function,
+            // an alternate we cannot reduce) the image stays `raw` rather than being
+            // decoded as if the tints were intensities.
+            b"Separation" | b"DeviceN" => {
+                let k = if a.first()?.as_name().ok()? == b"Separation" { 1 } else { deref(doc, a.get(1)?)?.as_array().ok()?.len() };
+                if k == 0 || k > MAX_TINT_COLORANTS {
+                    return None;
+                }
+                let alt = cs_model(doc, res, a.get(2)?, depth + 1)?;
+                if matches!(alt, Cs::Indexed { .. } | Cs::Tint { .. }) {
+                    return None; // an Indexed or spot alternate is illegal (§8.6.6.4)
+                }
+                let tint = crate::function::Function::parse(doc, a.get(3)?)?;
+                // A transform whose output arity disagrees with the space it feeds is not
+                // one to trust — the same refusal `vector.rs::parse_cs` makes.
+                if tint.n_outputs().is_some_and(|n| n != alt.components()) {
+                    return None;
+                }
+                Some(Cs::Tint { k, tint: Box::new(tint), alt: Box::new(alt) })
+            }
+            _ => None, // Lab / Pattern: not reducible to RGB here
         },
         _ => None,
     }
@@ -323,6 +405,13 @@ pub(crate) fn decode_samples(doc: &Document, res: &Dictionary, stream: &lopdf::S
     let mut out: Vec<u8> = Vec::new();
     out.try_reserve_exact(wu.checked_mul(hu)?.checked_mul(out_ch)?).ok()?;
 
+    // A spot space's transform, evaluated once over the tint grid (see [`tint_lut`]) so the
+    // per-pixel cost is one indexed read.
+    let lut = match &cs {
+        Cs::Tint { k, tint, alt } => Some(tint_lut(*k, tint, alt)),
+        _ => None,
+    };
+
     // One pixel's colour-space samples, reused per pixel to avoid a per-pixel allocation.
     let mut comp = vec![0u8; nc.max(4)];
     for row in samples.chunks_exact(stride).take(hu) {
@@ -345,6 +434,13 @@ pub(crate) fn decode_samples(doc: &Document, res: &Dictionary, stream: &lopdf::S
                         (v.clamp(0.0, 1.0) * 255.0).round() as u8
                     }
                 };
+            }
+            // A tint pixel is not a colour to be converted but an index into the evaluated
+            // transform: pack the quantised tints first-colorant-fastest and look it up.
+            if let Some(lut) = &lut {
+                let idx = comp[..nc].iter().rev().fold(0usize, |acc, c| acc * TINT_LEVELS + *c as usize);
+                out.extend_from_slice(&lut[idx]);
+                continue;
             }
             let px: &[u8] = match &cs {
                 Cs::Indexed { base, lookup } => {
@@ -370,7 +466,7 @@ pub(crate) fn decode_samples(doc: &Document, res: &Dictionary, stream: &lopdf::S
                         out.push(((255 - *c as u16) * k / 255) as u8);
                     }
                 }
-                Cs::Indexed { .. } => return None, // excluded above
+                Cs::Indexed { .. } | Cs::Tint { .. } => return None, // both handled above
             }
         }
     }
@@ -967,4 +1063,127 @@ mod tests {
         assert!(cs_model(&doc, &Dictionary::new(), &nested, 0).is_none());
     }
 
+    /// `[/Separation /Spot alt <function>]`, with `alt` and the transform supplied by the caller.
+    fn sep_space(doc: &mut Document, alt: Object, func: Object) -> Object {
+        let f = doc.add_object(func);
+        Object::Array(vec![Object::Name(b"Separation".to_vec()), Object::Name(b"Spot".to_vec()), alt, Object::Reference(f)])
+    }
+
+    /// A Type 2 exponential ramp from white to `c1` — the commonest spot transform there is.
+    fn ramp_to(c1: [f32; 3]) -> Object {
+        Object::Dictionary(dictionary! {
+            "FunctionType" => 2i64,
+            "Domain" => Object::Array(vec![Object::Real(0.0), Object::Real(1.0)]),
+            "C0" => Object::Array(vec![Object::Real(1.0), Object::Real(1.0), Object::Real(1.0)]),
+            "C1" => Object::Array(c1.iter().map(|v| Object::Real(*v)).collect::<Vec<_>>()),
+            "N" => 1i64,
+        })
+    }
+
+    #[test]
+    fn a_separation_image_decodes_through_its_tint_transform_not_as_intensities() {
+        // THE defect this pins: a `Separation` image's samples are TINTS. Reading them as
+        // intensities makes a 10% spot tint a near-black pixel — the image-path twin of the
+        // `scn` grey-level misreading. Both images below carried `format:"raw"` before, so
+        // extract handed back compressed samples and the render path emitted no `<img>`.
+        let mut doc = Document::with_version("1.5");
+        let cs = sep_space(&mut doc, Object::Name(b"DeviceRGB".to_vec()), ramp_to([0.776, 0.776, 0.878]));
+        let d = dictionary! { "ColorSpace" => cs, "BitsPerComponent" => 8i64, "Width" => 3, "Height" => 1 };
+        // Tints 0 / 0.5 / 1 (0x00, 0x80, 0xff).
+        let px = decode_samples(&doc, &Dictionary::new(), &Stream::new(d, vec![0x00, 0x80, 0xff]))
+            .expect("a Separation image with an evaluable transform decodes")
+            .into_rgb8();
+        assert_eq!(px.get_pixel(0, 0).0, [255, 255, 255], "tint 0 is no ink at all: white");
+        assert_eq!(px.get_pixel(2, 0).0, [198, 198, 224], "tint 1 is the transform's own colour");
+        let mid = px.get_pixel(1, 0).0;
+        assert!(mid[0] > 210 && mid[0] < 240 && mid[2] > mid[0], "half tint is PALE lavender, got {mid:?}");
+        // The intensity misreading, which this exists to exclude.
+        assert_ne!(px.get_pixel(1, 0).0, [128, 128, 128]);
+        assert_ne!(px.get_pixel(0, 0).0, [0, 0, 0]);
+    }
+
+    #[test]
+    fn a_devicen_image_reads_its_colorants_first_fastest() {
+        // The sample order a 2-colorant grid pins end to end: `(1, 0)` must be red and
+        // `(0, 1)` green, never swapped. The same convention `function.rs`'s Type 0
+        // interpolator uses, checked here at the image layer where the packing happens.
+        let mut doc = Document::with_version("1.5");
+        // 2x2x3 grid, first dimension fastest: (0,0) white, (1,0) red, (0,1) green, (1,1) blue.
+        let grid = vec![255u8, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255];
+        let f = doc.add_object(Stream::new(
+            dictionary! {
+                "FunctionType" => 0i64,
+                "Domain" => Object::Array(vec![Object::Real(0.0), Object::Real(1.0), Object::Real(0.0), Object::Real(1.0)]),
+                "Range" => Object::Array((0..3).flat_map(|_| [Object::Real(0.0), Object::Real(1.0)]).collect::<Vec<_>>()),
+                "Size" => Object::Array(vec![Object::Integer(2), Object::Integer(2)]),
+                "BitsPerSample" => 8i64,
+            },
+            grid,
+        ));
+        let cs = Object::Array(vec![
+            Object::Name(b"DeviceN".to_vec()),
+            Object::Array(vec![Object::Name(b"A".to_vec()), Object::Name(b"B".to_vec())]),
+            Object::Name(b"DeviceRGB".to_vec()),
+            Object::Reference(f),
+        ]);
+        let d = dictionary! { "ColorSpace" => cs, "BitsPerComponent" => 8i64, "Width" => 2, "Height" => 1 };
+        let px = decode_samples(&doc, &Dictionary::new(), &Stream::new(d, vec![0xff, 0x00, 0x00, 0xff]))
+            .expect("a 2-colorant DeviceN image decodes")
+            .into_rgb8();
+        assert_eq!(px.get_pixel(0, 0).0, [255, 0, 0], "(1, 0) is the FIRST colorant: red");
+        assert_eq!(px.get_pixel(1, 0).0, [0, 255, 0], "(0, 1) is the second: green");
+    }
+
+    #[test]
+    fn a_spot_image_we_cannot_evaluate_stays_raw_instead_of_guessing_pixels() {
+        // The module's standing invariant, unchanged by the tint decoder: no evaluable
+        // transform, no picture. A Type 4 calculator, an output arity that disagrees with
+        // the alternate space, and a `DeviceN` wider than the tint table all decline.
+        let mut doc = Document::with_version("1.5");
+        let dims = |cs: Object| dictionary! { "ColorSpace" => cs, "BitsPerComponent" => 8i64, "Width" => 2, "Height" => 1 };
+
+        let type4 = Object::Dictionary(dictionary! {
+            "FunctionType" => 4i64,
+            "Domain" => Object::Array(vec![Object::Real(0.0), Object::Real(1.0)]),
+            "Range" => Object::Array((0..3).flat_map(|_| [Object::Real(0.0), Object::Real(1.0)]).collect::<Vec<_>>()),
+        });
+        let cs4 = sep_space(&mut doc, Object::Name(b"DeviceRGB".to_vec()), type4);
+        assert!(!samples_decodable(&doc, &Dictionary::new(), &dims(cs4)), "a Type 4 tint transform is not evaluated");
+
+        // A 3-output ramp feeding a 1-component alternate: not a transform to trust.
+        let mismatched = sep_space(&mut doc, Object::Name(b"DeviceGray".to_vec()), ramp_to([0.5, 0.5, 0.5]));
+        assert!(!samples_decodable(&doc, &Dictionary::new(), &dims(mismatched)));
+
+        // A 3-colorant DeviceN is past the tint table's bound — declined, not decoded slowly.
+        let wide = doc.add_object(ramp_to([0.2, 0.4, 0.6]));
+        let names: Vec<Object> = [b"A", b"B", b"C"].iter().map(|n| Object::Name(n.to_vec())).collect();
+        let csw = Object::Array(vec![
+            Object::Name(b"DeviceN".to_vec()),
+            Object::Array(names),
+            Object::Name(b"DeviceRGB".to_vec()),
+            Object::Reference(wide),
+        ]);
+        assert!(!samples_decodable(&doc, &Dictionary::new(), &dims(csw)));
+    }
+
+    #[test]
+    fn a_spot_image_over_a_cmyk_alternate_converts_once_the_way_every_other_cmyk_does() {
+        // The alternate space may be any device space; a CMYK one must go through the SAME
+        // conversion the sample loop applies to a DeviceCMYK image, not a second copy of it.
+        let mut doc = Document::with_version("1.5");
+        let f = Object::Dictionary(dictionary! {
+            "FunctionType" => 2i64,
+            "Domain" => Object::Array(vec![Object::Real(0.0), Object::Real(1.0)]),
+            "C0" => Object::Array(vec![Object::Real(0.0); 4]),
+            "C1" => Object::Array(vec![Object::Real(0.0), Object::Real(1.0), Object::Real(1.0), Object::Real(0.0)]),
+            "N" => 1i64,
+        });
+        let cs = sep_space(&mut doc, Object::Name(b"DeviceCMYK".to_vec()), f);
+        let d = dictionary! { "ColorSpace" => cs, "BitsPerComponent" => 8i64, "Width" => 2, "Height" => 1 };
+        let px = decode_samples(&doc, &Dictionary::new(), &Stream::new(d, vec![0x00, 0xff]))
+            .expect("a CMYK-alternate Separation decodes")
+            .into_rgb8();
+        assert_eq!(px.get_pixel(0, 0).0, [255, 255, 255], "0 0 0 0 CMYK is white");
+        assert_eq!(px.get_pixel(1, 0).0, [255, 0, 0], "0 1 1 0 CMYK is red");
+    }
 }

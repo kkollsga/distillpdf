@@ -9,7 +9,7 @@ import re
 import distillpdf
 import pytest
 
-from _fixtures import FIX
+from _fixtures import FIX, GT
 
 HEADINGS = os.path.join(FIX, "headings.pdf")
 FIGURES = os.path.join(FIX, "figures.pdf")
@@ -179,6 +179,27 @@ def test_the_render_path_decodes_the_samples_extract_can_decode():
     # The colour-space fixture is drawn on its page too, so all four of its rasters — the
     # 4-bpc Indexed one, the raw DeviceCMYK one, and the two that already worked — appear.
     assert len(_html_image_pixels(COLORSPACE_IMAGES, 4)) == 4
+
+
+def test_a_separation_image_decodes_through_its_tint_transform():
+    """An image in a `Separation`/`DeviceN` space carries TINTS, not intensities, and the
+    raster stack refused those spaces outright: `extract_images()` reported `format:"raw"`
+    (compressed samples, no container) and `to_html` emitted no `<img>` at all. Now the
+    space's tint transform — the same evaluator the `scn` fix uses — maps each sample into
+    the alternate space, so `separation.pdf` p4's 0/.5/1 tints decode to white, pale
+    lavender, and the spot's own (198,198,224) instead of black, mid-grey and white."""
+    g = GT["separation.pdf"]
+    path = os.path.join(FIX, "separation.pdf")
+    spot = [im for im in distillpdf.Pdf.open(path).extract_images() if im["page"] == 4]
+    assert len(spot) == 1 and spot[0]["format"] == "png", f"the spot raster must assemble, got {spot}"
+    (im,) = _html_image_pixels(path, 1)
+    assert im.size == (3, 1)
+    for xy, want in g["spot_image_px"].items():
+        x, y = (int(v) for v in xy.split(","))
+        assert list(im.getpixel((x, y))) == want, f"tint at {xy}: {im.getpixel((x, y))} vs {want}"
+    for xy, wrong in g["spot_image_intensity_misreading"].items():
+        x, y = (int(v) for v in xy.split(","))
+        assert list(im.getpixel((x, y))) != wrong, f"the tint at {xy} is still read as an intensity"
 
 
 def test_an_unfiltered_raster_reaches_the_html():

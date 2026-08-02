@@ -1129,6 +1129,12 @@ def gen_separation():
               is deliberately NOT evaluated. It pins the fallback: the tint is read as INK
               COVERAGE (luminance ``1 - t``), so tint .2 degrades to a pale ``#cccccc``
               rather than inverting to the ``#333333`` the grey-level reading gave.
+      page 4  the same defect on the IMAGE path: a 3x1 raster in the page-1 spot space whose
+              samples are tints 0 / .5 / 1. The raster stack refused ``Separation`` outright,
+              so this image came back ``format:"raw"`` (compressed samples, no container) and
+              the render path emitted no ``<img>`` for it at all. Decoded through the
+              transform its pixels are white / pale lavender / ``(198,198,224)``; read as
+              INTENSITIES they would be black / mid-grey / white.
 
     Hand-assembled: reportlab emits no spot colours at all."""
     pdf = os.path.join(OUT, "separation.pdf")
@@ -1149,9 +1155,10 @@ def gen_separation():
     # (1,1) blue. Unfiltered on purpose — a function stream may legally carry no /Filter.
     grid = bytes((255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255))
     ps = b"{ dup dup }"  # a Type 4 program: 1 tint -> 3 equal components
+    p4 = b"q 120 0 0 60 100 400 cm /ImSpot Do Q"
     objs = {
         1: b"<< /Type /Catalog /Pages 2 0 R >>",
-        2: b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 /MediaBox [0 0 400 600] >>",
+        2: b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 12 0 R] /Count 4 /MediaBox [0 0 400 600] >>",
         3: (b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R /Resources << /ColorSpace "
             b"<< /CS0 [/Separation /Spot /DeviceRGB 9 0 R] >> >> >>"),
         4: (b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources << /ColorSpace "
@@ -1166,6 +1173,11 @@ def gen_separation():
              b"/BitsPerSample 8 /Length %d >>\nstream\n%s\nendstream" % (len(grid), grid)),
         11: (b"<< /FunctionType 4 /Domain [0 1] /Range [0 1 0 1 0 1] /Length %d >>\n"
              b"stream\n%s\nendstream" % (len(ps), ps)),
+        12: (b"<< /Type /Page /Parent 2 0 R /Contents 13 0 R /Resources << /XObject "
+             b"<< /ImSpot 14 0 R >> >> >>"),
+        13: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(p4), p4),
+        # Tints 0 / .5 / 1 in the page-1 spot space — the transform, not an intensity ramp.
+        14: _flate_image(14, 3, 1, b"[/Separation /Spot /DeviceRGB 9 0 R]", 8, bytes((0x00, 0x80, 0xFF))),
     }
     _assemble_pdf(objs, pdf)
     GT["separation.pdf"] = {
@@ -1173,6 +1185,10 @@ def gen_separation():
         "solid_tint_rgb": "#c6c6e0",
         "type4_coverage": {"0.2": "#cccccc", "0.75": "#404040"},
         "grey_level_misreadings": ["#1a1a1a", "#333333"],
+        # Page 4's spot IMAGE: what the tint transform makes of tints 0 / .5 / 1 …
+        "spot_image_px": {"0,0": [255, 255, 255], "2,0": [198, 198, 224]},
+        # … and what reading those samples as intensities would have given instead.
+        "spot_image_intensity_misreading": {"0,0": [0, 0, 0], "2,0": [255, 255, 255]},
     }
 
 

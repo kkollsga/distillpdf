@@ -95,7 +95,9 @@ fn parse_cs(doc: &Document, res: &Dictionary, o: &Object, depth: u32) -> Option<
                 // The alternate space reduces to a component count — and an `/Indexed`
                 // alternate is illegal, so it degrades rather than being read as gray.
                 let alt = crate::raster::cs_model(doc, res, a.get(2)?, depth + 1).and_then(|c| match c {
-                    crate::raster::Cs::Indexed { .. } => None,
+                    // An `/Indexed` or spot alternate is illegal (§8.6.6.4), so it degrades
+                    // rather than being read as gray or as another space's tint count.
+                    crate::raster::Cs::Indexed { .. } | crate::raster::Cs::Tint { .. } => None,
                     other => Some(other.components()),
                 });
                 // A transform whose output arity disagrees with the alternate space it
