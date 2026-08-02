@@ -27,7 +27,7 @@
 //! - Colour-space indirection is bounded by [`MAX_CS_DEPTH`], so a cyclic `/ColorSpace`
 //!   chain terminates.
 
-use crate::pdfobj::{content_bytes, deref, filters_of, sub_dict};
+use crate::pdfobj::{content_bytes, deref, filters_of, is_generic_filter, sub_dict};
 use lopdf::{Dictionary, Document, Object};
 use std::borrow::Cow;
 
@@ -509,15 +509,6 @@ pub(crate) fn png_bytes(img: image::DynamicImage) -> Option<Vec<u8>> {
     Some(out.into_inner())
 }
 
-/// Generic (non-codec) compression an image codec can be wrapped in, e.g.
-/// `[/FlateDecode /DCTDecode]` — a JPEG stored Flate-compressed.
-fn is_generic_filter(f: &[u8]) -> bool {
-    matches!(
-        f,
-        b"FlateDecode" | b"Fl" | b"LZWDecode" | b"LZW" | b"ASCII85Decode" | b"A85" | b"ASCIIHexDecode" | b"AHx"
-    )
-}
-
 /// The codec payload of a coded image (`jpeg`/`jpx`/`ccitt`/`jbig2`): the stream bytes
 /// with any leading generic compression peeled off, so a Flate-wrapped JPEG is handed
 /// back as a JPEG file and not as a blob nothing can open.
@@ -529,7 +520,10 @@ fn is_generic_filter(f: &[u8]) -> bool {
 /// **Not a decode of the generic layers lopdf cannot apply.** `ASCIIHexDecode`/`AHx` are
 /// in the set above, but lopdf 0.40 answers `Unimplemented` for them, so a chain that
 /// includes one degrades to the verbatim stream (pinned by
-/// `an_ascii_hex_wrapper_degrades_to_the_raw_bytes_because_lopdf_cannot_apply_it`).
+/// `an_ascii_hex_wrapper_degrades_to_the_raw_bytes_because_lopdf_cannot_apply_it`). That
+/// degradation is *reported*, not silent: `pdfobj::stream_issues` flags exactly this stream
+/// as `filter-unapplied`, and a truncated Flate wrapper — which lopdf reports as `Ok` —
+/// as `flate-truncated`.
 pub(crate) fn codec_payload(stream: &lopdf::Stream) -> Cow<'_, [u8]> {
     let lead: Vec<Object> = filters_of(&stream.dict)
         .iter()

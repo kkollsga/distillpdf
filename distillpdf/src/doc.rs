@@ -339,6 +339,22 @@ impl PdfDocument {
         (accepted, suppressed, pages)
     }
 
+    /// Every stream in this document whose encoded bytes did **not** decode cleanly.
+    ///
+    /// The answer to "is the page I just rendered the whole page?". Two decode failures in
+    /// lopdf 0.40 are invisible to the reader that suffers them: a **truncated** `FlateDecode`
+    /// stream is reported as `Ok` with the partial output (so a page renders short, silently),
+    /// and a filter chain lopdf cannot apply — `ASCIIHexDecode` is the live case — degrades to
+    /// the *encoded* bytes verbatim. Both are detected here independently of lopdf and
+    /// reported per stream ([`StreamIssue`]); an intact document returns an empty list.
+    ///
+    /// Deliberately **on demand**, not on the render path: the truncation check costs a second
+    /// full inflate per stream, a price no page should pay to answer a question almost every
+    /// document answers with "nothing wrong".
+    pub fn stream_integrity(&self) -> Vec<crate::pdfobj::StreamIssue> {
+        crate::pdfobj::stream_issues(&self.doc)
+    }
+
     /// Diagnostic for one 1-indexed page.
     pub fn debug_page(&self, page: u32) -> Result<String, Error> {
         let page_id = *self.doc.get_pages().get(&page).ok_or(Error::NoPage(Some(page)))?;

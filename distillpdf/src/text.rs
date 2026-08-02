@@ -1683,6 +1683,12 @@ pub fn debug_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> String {
             }
         }
     }
+    // Stream integrity for this page's OWN content streams. A truncated Flate stream is
+    // reported `Ok` by lopdf and renders short with no error at all, so the one page-level
+    // diagnostic in the crate is where "the ops below are all there were" has to be said.
+    for issue in crate::pdfobj::page_stream_issues(doc, page_id) {
+        s += &format!("stream {:?}: {} ({}), {} bytes recovered\n", issue.object, issue.kind, issue.filter, issue.recovered);
+    }
     match doc.get_and_decode_page_content(page_id) {
         Ok(c) => {
             s += &format!("ops={}\n", c.operations.len());

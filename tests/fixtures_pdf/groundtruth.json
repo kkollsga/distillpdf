@@ -1004,5 +1004,14 @@
     "page2_figures": 0,
     "page3_figures": 0,
     "page4_figures": 1
+  },
+  "damaged_streams.pdf": {
+    "pages": 3,
+    "issues": {
+      "6": "flate-truncated",
+      "7": "filter-unapplied"
+    },
+    "intact_object": 8,
+    "rects_authored": 10
   }
 }

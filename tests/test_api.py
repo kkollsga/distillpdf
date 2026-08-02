@@ -518,3 +518,25 @@ def test_toc_and_section_types():
     lvl, title, page, anchor = toc[0]
     assert isinstance(lvl, int) and isinstance(title, str) and isinstance(page, int)
     assert distillpdf.Pdf.open(HEADINGS).section("methods") is not None
+
+
+def test_stream_integrity_names_a_damaged_stream_and_is_silent_on_a_healthy_one():
+    """A decode failure is not always an error on lopdf 0.40: a TRUNCATED FlateDecode stream
+    is reported ``Ok`` with the partial output, so a page renders short with no signal at
+    all, and a filter chain lopdf cannot apply (``ASCIIHexDecode``) degrades to the encoded
+    bytes verbatim. ``stream_integrity()`` is the answer to "is the page I just rendered the
+    whole page?" — and it must stay quiet about intact streams, or it says nothing."""
+    g = GT["damaged_streams.pdf"]
+    d = distillpdf.Pdf.open(os.path.join(FIX, "damaged_streams.pdf"))
+    # Degrade LOUDLY, not differently: the document still opens and still renders.
+    assert d.page_count() == g["pages"]
+    assert "<html" in d.to_html(return_string=True)
+    issues = d.stream_integrity()
+    assert {str(i["object"][0]): i["kind"] for i in issues} == g["issues"], issues
+    for i in issues:
+        assert set(i) == {"object", "kind", "filter", "recovered"}
+        assert isinstance(i["recovered"], int) and i["recovered"] >= 0
+    objs = [i["object"][0] for i in issues]
+    assert g["intact_object"] not in objs, "an intact stream must not be reported"
+    # A healthy document reports nothing whatsoever.
+    assert distillpdf.Pdf.open(HEADINGS).stream_integrity() == []

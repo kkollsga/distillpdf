@@ -2567,6 +2567,59 @@ def _assemble_pdf(objs, path, info=None):
         f.write(bytes(body))
 
 
+def gen_damaged_streams():
+    """The two ways a stream can fail to decode **without anyone being told** on lopdf 0.40.
+
+    Both are upstream behaviours, not ours, and both were already pinned by unit tests — what
+    this fixture adds is a whole document to point ``stream_integrity()`` at, so the report
+    is verified end to end rather than at the helper.
+
+    * page 1 — a ``FlateDecode`` content stream **cut in half**. lopdf's zlib reader swallows
+      the decoder's error and returns the partial output, so ``decompressed_content()``
+      answers ``Ok`` and the page renders SHORT with no error anywhere. Both halves of the
+      page are drawn from the same generator, so what survives the cut is a prefix of what
+      was meant: the first rectangles paint, the last ones do not exist as far as any reader
+      can tell. Reported as ``flate-truncated``.
+    * page 2 — an ``ASCIIHexDecode`` content stream, which lopdf answers ``Unimplemented``
+      for, so ``pdfobj::content_bytes`` falls back to the **encoded** bytes verbatim and the
+      walk is handed hex digits where it expects operators. Reported as ``filter-unapplied``.
+    * page 3 — the control: an ordinary intact Flate stream drawing the same ink. It must
+      NOT appear in the report, which is what makes the other two mean something.
+
+    The document must still open, still report 3 pages and still render — degrading loudly is
+    the point, degrading *differently* is not.
+    """
+    pdf = os.path.join(OUT, "damaged_streams.pdf")
+    ink = b"\n".join(b"0.2 0.4 0.8 rg %d 400 20 %d re f" % (100 + i * 30, 30 + (i % 4) * 25)
+                     for i in range(10))
+    full = zlib.compress(ink)
+    cut = full[:len(full) // 2]
+    hexed = ink.hex().encode() + b">"
+
+    def stream(dict_extra, payload):
+        return b"<< %s /Length %d >>\nstream\n%s\nendstream" % (dict_extra, len(payload), payload)
+
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 /MediaBox [0 0 612 792] >>",
+        3: b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R /Resources << >> >>",
+        4: b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources << >> >>",
+        5: b"<< /Type /Page /Parent 2 0 R /Contents 8 0 R /Resources << >> >>",
+        6: stream(b"/Filter /FlateDecode", cut),
+        7: stream(b"/Filter /ASCIIHexDecode", hexed),
+        8: stream(b"/Filter /FlateDecode", full),
+    }
+    _assemble_pdf(objs, pdf)
+    GT["damaged_streams.pdf"] = {
+        "pages": 3,
+        # object number -> the `kind` stream_integrity() must report for it. Page 3's
+        # content stream (object 8) must not be reported at all.
+        "issues": {"6": "flate-truncated", "7": "filter-unapplied"},
+        "intact_object": 8,
+        "rects_authored": 10,
+    }
+
+
 def gen_mathfonts():
     """Hand-written PDF that exercises math glyph recovery (reportlab can't emit CM math
     fonts). Four show-ops, each in a different path:
@@ -3396,6 +3449,7 @@ def main():
     gen_dense_vector()
     gen_map_label_grid()
     gen_ink_gate()
+    gen_damaged_streams()
     gen_textstate_q()
     gen_caption_bleed()
     gen_inherited_mediabox()

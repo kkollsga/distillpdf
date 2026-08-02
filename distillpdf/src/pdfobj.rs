@@ -83,6 +83,12 @@ pub(crate) fn num_deref(doc: &Document, o: &Object) -> f32 {
 /// back short or empty rather than raw. That is lopdf's call, not ours — raw deflate bytes
 /// would not parse as a content stream either — and it is stated here so no caller assumes
 /// a non-empty result means an intact stream.
+///
+/// **Neither degradation is silent any more**: [`stream_issues`] detects both independently
+/// (`PdfDocument::stream_integrity`, and a line per content stream in
+/// `PdfDocument::debug_page`), so a caller can ask whether the page it just rendered is the
+/// whole page. The check stays *out* of this function on purpose — it costs a second full
+/// inflate, which no render should pay per stream.
 pub(crate) fn content_bytes(stream: &lopdf::Stream) -> Cow<'_, [u8]> {
     if stream.dict.get(b"Filter").is_err() {
         return Cow::Borrowed(&stream.content);
@@ -227,6 +233,169 @@ pub(crate) fn filters_of(dict: &Dictionary) -> Vec<Vec<u8>> {
     }
 }
 
+/// Generic (non-codec) compression a stream's real payload can be wrapped in, e.g.
+/// `[/FlateDecode /DCTDecode]` — a JPEG stored Flate-compressed.
+///
+/// The distinction the integrity check turns on: a *generic* layer is one every reader in
+/// this crate expects to be decoded away, while a *codec* (`DCTDecode`, `JPXDecode`,
+/// `JBIG2Decode`, `CCITTFaxDecode`) is the payload itself and is meant to arrive encoded —
+/// lopdf refusing to apply one is correct behaviour, not damage.
+pub(crate) fn is_generic_filter(f: &[u8]) -> bool {
+    matches!(
+        f,
+        b"FlateDecode" | b"Fl" | b"LZWDecode" | b"LZW" | b"ASCII85Decode" | b"A85" | b"ASCIIHexDecode" | b"AHx"
+    )
+}
+
+/// One stream whose encoded bytes did **not** decode cleanly, and what the reader did about
+/// it. Produced by [`stream_issues`] and surfaced as `PdfDocument::stream_integrity`.
+///
+/// This exists because a decode failure in lopdf 0.40 is not always an `Err`: see
+/// [`content_bytes`]. Every field is what a caller needs to decide whether the page it just
+/// rendered is the whole page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamIssue {
+    /// The stream's object id, `(number, generation)`.
+    pub object: (u32, u16),
+    /// What is wrong, as a stable identifier:
+    /// * `"flate-truncated"` — the `/FlateDecode` layer ends mid-stream. lopdf reports `Ok`
+    ///   and hands back the partial output, so **the page renders short with no error**.
+    /// * `"filter-unapplied"` — lopdf cannot apply the declared filter chain at all
+    ///   (`ASCIIHexDecode` is the live case), so the reader falls back to the **encoded**
+    ///   bytes verbatim. Nothing downstream can make sense of those.
+    pub kind: &'static str,
+    /// The `/Filter` chain as the document wrote it, e.g. `"ASCIIHexDecode,DCTDecode"`.
+    pub filter: String,
+    /// How many bytes the reader actually recovered — what the render sees.
+    pub recovered: usize,
+}
+
+/// Whether the stream's **leading** `FlateDecode` layer fails to inflate to its end, and how
+/// many bytes an inflater got before it gave up.
+///
+/// The one check lopdf does not make. Its zlib reader swallows the decoder's error and
+/// returns whatever partial output it managed, so `decompressed_content()` answers `Ok` for a
+/// truncated stream and every `unwrap_or_else(raw)` fallback in this crate is dead code on
+/// the commonest filter in PDF. Inflating the bytes ourselves is the only way to tell a
+/// stream that ended from one that was cut off.
+///
+/// Both framings are tried, because both are found in the wild and lopdf accepts both: the
+/// zlib wrapper the spec calls for, then a bare deflate stream. `None` means either the
+/// leading filter is not Flate (nothing to check) or the layer inflated cleanly.
+///
+/// **Not called on the render path.** It costs a second full inflate of every stream, which
+/// is why it lives behind the diagnostic API rather than inside [`content_bytes`]: the
+/// integrity question is worth answering on demand, not on every page of every document.
+pub(crate) fn flate_incomplete(stream: &lopdf::Stream) -> Option<usize> {
+    let first = filters_of(&stream.dict).into_iter().next()?;
+    if first != b"FlateDecode" && first != b"Fl" {
+        return None;
+    }
+    // NOT `read::ZlibDecoder::read_to_end`: that adapter stops at the input's EOF and
+    // returns `Ok`, which is the very blindness this function exists to end. Driving the
+    // decompressor directly is what makes the difference visible — a complete stream reaches
+    // `Status::StreamEnd`, a cut one runs out of input first.
+    let inflate = |zlib_header: bool| {
+        let mut d = flate2::Decompress::new(zlib_header);
+        let mut buf = vec![0u8; 32 * 1024];
+        let mut input: &[u8] = &stream.content;
+        loop {
+            let (was_in, was_out) = (d.total_in(), d.total_out());
+            // `FlushDecompress::None` while input remains: `Finish` promises the decompressor
+            // that the output buffer can hold the WHOLE stream, and a 32 KiB buffer against a
+            // 250 KiB page made every healthy stream in the corpus look truncated.
+            let flush = if input.is_empty() { flate2::FlushDecompress::Finish } else { flate2::FlushDecompress::None };
+            match d.decompress(input, &mut buf, flush) {
+                Ok(flate2::Status::StreamEnd) => return (true, d.total_out() as usize),
+                Ok(_) => {
+                    let (took, made) = (d.total_in() - was_in, d.total_out() - was_out);
+                    if took == 0 && made == 0 {
+                        return (false, d.total_out() as usize); // out of input, mid-stream
+                    }
+                    input = &input[took as usize..];
+                    // A decompression bomb must not be inflated for a diagnostic: past this
+                    // much output the stream is plainly not truncated, which is the question.
+                    if d.total_out() > 64 << 20 {
+                        return (true, d.total_out() as usize);
+                    }
+                }
+                Err(_) => return (false, d.total_out() as usize),
+            }
+        }
+    };
+    let (zlib_ok, zlib_len) = inflate(true);
+    if zlib_ok {
+        return None;
+    }
+    // A bare deflate stream (no zlib wrapper) is illegal by the spec, legal in the wild, and
+    // accepted by lopdf — so it is not damaged just because the header is missing.
+    let (raw_ok, raw_len) = inflate(false);
+    if raw_ok {
+        return None;
+    }
+    Some(zlib_len.max(raw_len))
+}
+
+/// Every stream in the document whose bytes did not decode cleanly, in object-id order.
+///
+/// Deterministic (lopdf stores objects in a `BTreeMap`) and total: a document with no
+/// damaged stream returns an empty list. See [`StreamIssue::kind`] for what is reported and
+/// [`flate_incomplete`] for why the truncation case needs an independent decode.
+pub(crate) fn stream_issues(doc: &Document) -> Vec<StreamIssue> {
+    doc.objects.iter().filter_map(|(id, obj)| stream_issue(*id, obj.as_stream().ok()?)).collect()
+}
+
+/// [`stream_issues`] for a single stream: `None` when its bytes decode cleanly (or it carries
+/// no `/Filter` at all, in which case there is nothing to decode).
+fn stream_issue(id: ObjectId, s: &lopdf::Stream) -> Option<StreamIssue> {
+    let filters = filters_of(&s.dict);
+    let filter = filters.iter().map(|f| String::from_utf8_lossy(f).into_owned()).collect::<Vec<_>>().join(",");
+    // Only the LEADING GENERIC layers are this check's business, and they are probed exactly
+    // as [`crate::raster::codec_payload`] peels them — a stream that is `[/DCTDecode]` is a
+    // JPEG, and lopdf declining to decode it is the whole point of the codec path, not a
+    // fault. Probing the full chain instead reported every JPEG in the corpus as damaged.
+    let lead: Vec<Object> = filters.iter().take_while(|f| is_generic_filter(f)).map(|f| Object::Name(f.clone())).collect();
+    if lead.is_empty() {
+        return None;
+    }
+    let mut probe = s.clone();
+    probe.dict.set("Filter", Object::Array(lead));
+    probe.dict.remove(b"DecodeParms"); // a codec's parms do not apply to the generic layers
+    probe.dict.remove(b"DP");
+    match probe.decompressed_content() {
+        // `Err` IS the honest signal here: it is what makes `content_bytes` and
+        // `codec_payload` fall back to the ENCODED bytes, so whatever consumes them is
+        // working from something it cannot read.
+        Err(_) => Some(StreamIssue { object: id, kind: "filter-unapplied", filter, recovered: s.content.len() }),
+        // `recovered` is what lopdf handed back, not what our own inflater managed: the
+        // former is what every reader in this crate actually works from.
+        Ok(bytes) if flate_incomplete(&probe).is_some() => {
+            Some(StreamIssue { object: id, kind: "flate-truncated", filter, recovered: bytes.len() })
+        }
+        Ok(_) => None,
+    }
+}
+
+/// [`stream_issues`] narrowed to one page's own `/Contents` stream(s).
+///
+/// `/Contents` is either one stream or an array of them (a writer may split a page's content
+/// at any byte boundary), and either form may be indirect — so both are followed here rather
+/// than at the two call sites.
+pub(crate) fn page_stream_issues(doc: &Document, page_id: ObjectId) -> Vec<StreamIssue> {
+    let Ok(dict) = doc.get_object(page_id).and_then(|o| o.as_dict()) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<ObjectId> = Vec::new();
+    match dict.get(b"Contents") {
+        Ok(Object::Reference(r)) => ids.push(*r),
+        Ok(Object::Array(a)) => ids.extend(a.iter().filter_map(|o| o.as_reference().ok())),
+        _ => {}
+    }
+    ids.into_iter()
+        .filter_map(|id| stream_issue(id, doc.get_object(id).ok()?.as_stream().ok()?))
+        .collect()
+}
+
 /// A sub-dictionary of `d` that may be written inline or as an indirect reference.
 ///
 /// Every `/Resources` child (`/XObject`, `/Font`, `/ColorSpace`, `/ExtGState`, …) may be
@@ -345,6 +514,89 @@ mod tests {
         let got = content_bytes(&truncated);
         assert_ne!(got.as_ref(), &truncated.content[..], "not the raw bytes");
         assert!(got.len() < raw.len(), "a truncated stream decodes short, got {} of {}", got.len(), raw.len());
+    }
+
+    #[test]
+    fn a_truncated_flate_stream_is_detected_although_lopdf_calls_it_ok() {
+        // The other half of the test above: lopdf's `Ok` is not evidence of an intact stream,
+        // so the reader needs a check of its own. Cut the SAME compressed stream at four
+        // lengths — the error must be found at every one of them, and never on the whole.
+        let raw = b"0 0 100 100 re f\n".repeat(8);
+        let mut s = Stream::new(dictionary! {}, raw.clone());
+        s.compress().expect("flate compress"); // sets /Filter itself
+        assert_eq!(flate_incomplete(&s), None, "an intact stream is not an issue");
+        for cut in [1usize, 4, 8, 16] {
+            let short = Stream::new(s.dict.clone(), s.content[..s.content.len() - cut].to_vec());
+            assert!(short.decompressed_content().is_ok(), "the premise: lopdf reports Ok at -{cut}");
+            let got = flate_incomplete(&short).unwrap_or_else(|| panic!("-{cut} bytes went undetected"));
+            assert!(got <= raw.len(), "-{cut}: inflate cannot produce MORE than was compressed");
+        }
+        // Losing a whole block, rather than the trailing checksum, also loses data.
+        let half = Stream::new(s.dict.clone(), s.content[..s.content.len() / 2].to_vec());
+        assert!(flate_incomplete(&half).expect("a half stream is incomplete") < raw.len());
+        // A bare deflate stream (no zlib wrapper) is legal in the wild and lopdf accepts it;
+        // it must not be reported as damaged just because the header is absent.
+        let mut bare = Vec::new();
+        {
+            use std::io::Write;
+            let mut e = flate2::write::DeflateEncoder::new(&mut bare, flate2::Compression::default());
+            e.write_all(&raw).expect("encode");
+            e.finish().expect("finish");
+        }
+        assert_eq!(flate_incomplete(&Stream::new(dictionary! { "Filter" => "FlateDecode" }, bare)), None);
+        // A stream whose leading filter is not Flate is not this check's business.
+        let jpeg = Stream::new(dictionary! { "Filter" => "DCTDecode" }, b"\xff\xd8not deflate".to_vec());
+        assert_eq!(flate_incomplete(&jpeg), None);
+    }
+
+    #[test]
+    fn stream_issues_names_both_silent_degradations_and_leaves_intact_streams_alone() {
+        // The document-level report (`PdfDocument::stream_integrity`). Three streams, one of
+        // each kind, so the test also pins that a healthy stream is NOT reported — a
+        // diagnostic that fires on everything says nothing.
+        let raw = b"0 0 100 100 re f\n".repeat(8);
+        let mut good = Stream::new(dictionary! {}, raw.clone());
+        good.compress().expect("flate compress"); // sets /Filter itself
+        let cut = Stream::new(good.dict.clone(), good.content[..good.content.len() / 2].to_vec());
+        let hex = Stream::new(dictionary! { "Filter" => "ASCIIHexDecode" }, b"3020300a>".to_vec());
+        let mut doc = Document::with_version("1.5");
+        let (a, b, c) = (doc.add_object(good), doc.add_object(cut), doc.add_object(hex));
+        let got = stream_issues(&doc);
+        assert_eq!(got.len(), 2, "only the damaged streams are reported: {got:?}");
+        let by = |id: ObjectId| got.iter().find(|i| i.object == id);
+        assert!(by(a).is_none(), "the intact stream must not be reported");
+        let t = by(b).expect("the truncated stream is reported");
+        assert_eq!((t.kind, t.filter.as_str()), ("flate-truncated", "FlateDecode"));
+        assert!(t.recovered < raw.len(), "and reports what the reader actually gets");
+        let u = by(c).expect("the unapplied filter is reported");
+        assert_eq!((u.kind, u.filter.as_str()), ("filter-unapplied", "ASCIIHexDecode"));
+        assert_eq!(u.recovered, 9, "the encoded bytes are what `content_bytes` hands on");
+    }
+
+    #[test]
+    fn a_damaged_page_still_renders_and_says_which_stream_was_damaged() {
+        // End to end over the owned fixture (`gen_fixtures.py::gen_damaged_streams`): a
+        // truncated page, an un-appliable page and an intact control in one document. The
+        // document must still OPEN and still render — degrade loudly, not differently.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/damaged_streams.pdf");
+        let doc = Document::load(path).expect("damaged_streams.pdf fixture must load");
+        assert_eq!(doc.get_pages().len(), 3, "a damaged stream is not a damaged document");
+        let got = stream_issues(&doc);
+        let kinds: Vec<(u32, &str)> = got.iter().map(|i| (i.object.0, i.kind)).collect();
+        assert_eq!(kinds, vec![(6, "flate-truncated"), (7, "filter-unapplied")], "got {got:?}");
+        // The truncated page renders SHORT, not empty and not raw — which is exactly why the
+        // report has to exist: nothing else about this page says anything is wrong.
+        let pages = doc.get_pages();
+        let short = content_bytes(doc.get_object(pages[&1]).and_then(|o| o.as_dict()).and_then(|d| d.get(b"Contents")).and_then(|o| o.as_reference()).and_then(|r| doc.get_object(r)).and_then(|o| o.as_stream()).expect("page 1 content stream"));
+        let whole = content_bytes(doc.get_object(pages[&3]).and_then(|o| o.as_dict()).and_then(|d| d.get(b"Contents")).and_then(|o| o.as_reference()).and_then(|r| doc.get_object(r)).and_then(|o| o.as_stream()).expect("page 3 content stream"));
+        assert!(!short.is_empty() && short.len() < whole.len(), "{} of {}", short.len(), whole.len());
+        assert!(whole.starts_with(&short[..]), "what survives a cut is a PREFIX of the page");
+        // And the per-page diagnostic names it, so the one page-level entry point in the
+        // crate does not report `ops=N` as though N were all there was.
+        let dbg = crate::text::debug_page(&doc, pages[&1], &std::fs::read(path).expect("fixture readable"));
+        assert!(dbg.contains("flate-truncated"), "debug_page must surface it: {dbg}");
+        let clean = crate::text::debug_page(&doc, pages[&3], &std::fs::read(path).expect("fixture readable"));
+        assert!(!clean.contains("truncated"), "the intact page reports nothing: {clean}");
     }
 
     #[test]

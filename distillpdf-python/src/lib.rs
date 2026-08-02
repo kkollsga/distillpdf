@@ -423,6 +423,26 @@ impl Pdf {
         Ok(self.inner.figure_gate_stats())
     }
 
+    /// Every stream whose encoded bytes did not decode cleanly — the answer to "is the page I
+    /// just rendered the whole page?".
+    ///
+    /// A list of `{object, kind, filter, recovered}` dicts; empty for an intact document.
+    /// `kind` is `"flate-truncated"` (lopdf reports `Ok` and hands back partial output, so the
+    /// page renders short with no error) or `"filter-unapplied"` (lopdf cannot apply the
+    /// declared chain — `ASCIIHexDecode` — so the reader falls back to the encoded bytes).
+    fn stream_integrity<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        for i in self.inner.stream_integrity() {
+            let d = PyDict::new(py);
+            d.set_item("object", i.object)?;
+            d.set_item("kind", i.kind)?;
+            d.set_item("filter", i.filter)?;
+            d.set_item("recovered", i.recovered)?;
+            list.append(d)?;
+        }
+        Ok(list)
+    }
+
     /// Diagnostic for one 1-indexed page.
     fn debug_page(&self, page: i64) -> PyResult<String> {
         self.inner.debug_page(page_arg(page)?).map_err(to_py)

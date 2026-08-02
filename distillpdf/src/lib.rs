@@ -139,6 +139,9 @@ pub use links::Link;
 /// Exported so the binding crate's OCR entry point states the same default as the core does
 /// instead of open-coding `612.0`/`792.0` a fifth time.
 pub use pdfobj::DEFAULT_PAGE_PTS;
+/// One damaged stream, as reported by `PdfDocument::stream_integrity`. Re-exported for the
+/// same reason as the extraction types: it is the return type of a public method.
+pub use pdfobj::StreamIssue;
 
 /// **The fortified standard, made greppable.**
 ///
