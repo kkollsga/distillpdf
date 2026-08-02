@@ -164,3 +164,27 @@ def test_a_page_with_no_resources_still_draws_its_paths():
             f"page {i}: expected {g['paths_per_page']} bars, got {svg.count('<path')}"
         assert "fill-opacity" not in svg, \
             f"page {i}: no /ExtGState anywhere, so the ink must paint at the default full opacity"
+
+
+def test_composited_figure_keeps_the_streams_paint_order():
+    """``composite_svg`` used to emit every raster first and all the vector ink after it —
+    a grouping that is right only when the stream painted that way. A figure that paints an
+    OPAQUE panel over a raster then rendered as a bare panel: the ``<image>`` was in the SVG
+    and covered by ink that, in the source, sat behind it.
+
+    ``paint_order.pdf`` is the controlled A/B: two geometrically identical figures, the sole
+    difference the order of two operators. The top one paints the raster then the grey panel
+    (panel must win); the bottom one paints the panel then the raster (raster must win)."""
+    g = GT["paint_order.pdf"]
+    h = html("paint_order.pdf")
+    svgs = re.findall(r"<svg\b.*?</svg>", h, re.DOTALL)
+    assert len(svgs) == g["figures"], f"expected {g['figures']} composited <svg>, got {len(svgs)}"
+    panel = f'fill="{g["panel_fill"]}"'
+    for i, svg in enumerate(svgs):
+        assert "<image " in svg, f"figure {i}: the raster must be composited into the <svg>"
+        assert panel in svg, f"figure {i}: the opaque panel must be in the <svg>"
+        img_at, panel_at = svg.index("<image "), svg.index(panel)
+        if i == 0:
+            assert img_at < panel_at, "raster painted FIRST must render behind the panel"
+        else:
+            assert img_at > panel_at, "raster painted LAST must render on top of the panel"

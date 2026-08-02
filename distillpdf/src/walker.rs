@@ -47,6 +47,39 @@ use std::collections::HashMap;
 /// point in the walk.
 pub(crate) type XMap = HashMap<Vec<u8>, ObjectId>;
 
+/// **Where** a paint happened in the page's content *tree*: the index of the operation in
+/// the page's content stream, then — for ink inside a Form XObject — the index of the
+/// operation inside that form, and so on down. Comparing two addresses lexicographically
+/// (the derived `Ord`) gives exactly the order the PDF painted them, which is the order a
+/// viewer composites them in: later paint covers earlier paint.
+///
+/// This exists because `img::walk` (rasters) and `vector::walk` (path ink) are two
+/// separate walks of the same page, and compositing them into one `<svg>`
+/// ([`crate::vector::PlacedSvg::composite_svg`]) has to interleave their output by paint
+/// order. A running per-walk counter cannot do that: the two walks skip different
+/// operators, descend on different conditions, and charge [`crate::WalkBudget`] at
+/// different rates, so their counters drift apart at the first form. An address is
+/// derived from the operation indices alone, so it is meaningful **without reference to
+/// the other walk** — the only property that makes the two orderings comparable.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PaintSeq(Vec<u32>);
+
+impl PaintSeq {
+    /// The address of operation `i` of the stream whose own address is `here` (the page's
+    /// content stream is the empty address).
+    pub(crate) fn at(here: &[u32], i: usize) -> Self {
+        let mut v = Vec::with_capacity(here.len() + 1);
+        v.extend_from_slice(here);
+        v.push(i as u32);
+        PaintSeq(v)
+    }
+
+    /// This address as the `here` of the stream it invokes.
+    pub(crate) fn as_slice(&self) -> &[u32] {
+        &self.0
+    }
+}
+
 /// Where a descending form's resource names resolve.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ScopePolicy {

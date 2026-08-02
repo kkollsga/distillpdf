@@ -1914,7 +1914,12 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                         let href = format!("\u{0}{idx}\u{0}");
                         let im = &images[*j];
                         let vi = img_overlays[*j][0];
-                        let svg = vectors[vi].composite_svg(&[(&href, (im.x_left, im.x_right, im.y_bottom, im.y_top), im.ctm)]);
+                        let svg = vectors[vi].composite_svg(&[vector::Raster {
+                            href: &href,
+                            rect: (im.x_left, im.x_right, im.y_bottom, im.y_top),
+                            ctm: im.ctm,
+                            seq: &im.seq,
+                        }]);
                         // Caption may have attached to the image OR its overlay vector.
                         let cap = img_cap[*j].as_ref().or(svg_cap[vi].as_ref());
                         let (html, id, caption) = match cap {
@@ -1986,16 +1991,27 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                     // are a raster within the axes): composite into ONE `<svg>` with each
                     // raster embedded as an `<image>` in the figure's coordinate space.
                     let svg = if !svg_rasters[*j].is_empty() {
-                        let rasters: Vec<(String, (f32, f32, f32, f32), Option<[f32; 6]>)> = svg_rasters[*j]
+                        let hrefs: Vec<String> = svg_rasters[*j]
                             .iter()
                             .map(|&ii| {
                                 let idx = img_uris.len();
                                 img_uris.push(std::mem::take(&mut images[ii].uri));
-                                let im = &images[ii];
-                                (format!("\u{0}{idx}\u{0}"), (im.x_left, im.x_right, im.y_bottom, im.y_top), im.ctm)
+                                format!("\u{0}{idx}\u{0}")
                             })
                             .collect();
-                        let refs: Vec<(&str, (f32, f32, f32, f32), Option<[f32; 6]>)> = rasters.iter().map(|(h, r, m)| (h.as_str(), *r, *m)).collect();
+                        let refs: Vec<vector::Raster<'_>> = svg_rasters[*j]
+                            .iter()
+                            .zip(&hrefs)
+                            .map(|(&ii, href)| {
+                                let im = &images[ii];
+                                vector::Raster {
+                                    href: href.as_str(),
+                                    rect: (im.x_left, im.x_right, im.y_bottom, im.y_top),
+                                    ctm: im.ctm,
+                                    seq: &im.seq,
+                                }
+                            })
+                            .collect();
                         vectors[*j].composite_svg(&refs)
                     } else {
                         vectors[*j].svg()

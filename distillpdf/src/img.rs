@@ -18,7 +18,7 @@ use crate::raster::{
     samples_decodable, MAX_IMAGE_PIXELS,
 };
 use crate::walker::{
-    descend_form, overlay_resources, page_resources, page_xobjects, subtype_of, xobject_at, Descend, ScopePolicy, XMap,
+    descend_form, overlay_resources, page_resources, page_xobjects, subtype_of, xobject_at, Descend, PaintSeq, ScopePolicy, XMap,
 };
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::rc::Rc;
@@ -353,6 +353,13 @@ pub struct Placed {
     /// alone places it). Used to emit a matching SVG transform instead of stretching the
     /// pixels into the axis-aligned box.
     pub ctm: Option<[f32; 6]>,
+    /// Where this raster was painted in the page's content tree ([`PaintSeq`]). Carried so
+    /// that a figure compositing this raster with vector ink can interleave the two by
+    /// paint order instead of assuming rasters always go behind — an opaque panel the
+    /// stream paints *after* an image covers it, and the reverse is just as common.
+    /// A stitched grid takes the address of its EARLIEST tile: the mosaic occupies the
+    /// span from its first paint onward, so anything painted before all of it is behind it.
+    pub(crate) seq: PaintSeq,
 }
 
 /// One placed image XObject before clustering: its object id, placed bbox (page points),
@@ -371,6 +378,8 @@ struct RawTile {
     /// an image may name its colour space (`/ColorSpace /CS0`) rather than declare one
     /// (§8.6.3), and the name resolves only here. Shared, not cloned, per tile.
     res: Rc<Dictionary>,
+    /// Paint position of this tile's `Do` in the page's content tree (see [`Placed::seq`]).
+    seq: PaintSeq,
 }
 
 /// Images smaller than this (rendered, points) are diagram tiles / rules /
@@ -402,7 +411,7 @@ pub fn positioned_images(doc: &Document, page_id: ObjectId, want_uris: bool) -> 
     let res = Rc::new(page_resources(doc, page_id));
     let mut raws: Vec<RawTile> = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
-    walk(doc, &content.operations, &xmap, &res, Mat::ID, &mut raws, 0, &mut budget);
+    walk(doc, &content.operations, &xmap, &res, Mat::ID, &mut raws, 0, &mut budget, &[]);
     finalize(doc, raws, want_uris)
 }
 
@@ -420,10 +429,13 @@ fn walk(
     out: &mut Vec<RawTile>,
     depth: u32,
     budget: &mut crate::WalkBudget,
+    // Address of the stream being walked (empty for the page's own content) — each
+    // operation's index is appended to it to stamp a raster's `PaintSeq`.
+    here: &[u32],
 ) {
     let mut ctm = base;
     let mut stack: Vec<Mat> = Vec::new();
-    for op in ops {
+    for (opi, op) in ops.iter().enumerate() {
         // Total-work budget (see `crate::WalkBudget`): the depth cap alone lets a
         // self-referential form branch 2x per level. Out of budget → stop and keep the
         // tiles found so far; a partial page beats a hang and beats an empty one.
@@ -471,7 +483,7 @@ fn walk(
                     // Record geometry + pixel dims; uri building / grid stitching happens
                     // in finalize() once the whole page's tiles are known.
                     let pw = stream.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0) as u32;
-                    out.push(RawTile { id, x0, x1, y0, y1, pw, ctm: rot_ctm, res: Rc::clone(res) });
+                    out.push(RawTile { id, x0, x1, y0, y1, pw, ctm: rot_ctm, res: Rc::clone(res), seq: PaintSeq::at(here, opi) });
                 } else {
                     // A form is descended with the page's XObject scope still in force
                     // (`OverlayParent`): a raster the page defines and the form invokes by
@@ -490,7 +502,7 @@ fn walk(
                                 }
                                 None => Rc::clone(res),
                             };
-                            walk(doc, &f.ops, &f.scope.xobjects, &child, f.matrix.mul(ctm), out, depth + 1, budget)
+                            walk(doc, &f.ops, &f.scope.xobjects, &child, f.matrix.mul(ctm), out, depth + 1, budget, PaintSeq::at(here, opi).as_slice())
                         }
                         Descend::Skip => continue,
                         Descend::Halt => return,
@@ -512,17 +524,19 @@ fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool) -> Vec<Placed> 
     for g in cluster(&raws) {
         let tiles: Vec<&RawTile> = g.iter().map(|&i| &raws[i]).collect();
         let (x0, x1, y0, y1) = union_bbox(&tiles);
+        // A merged mosaic paints where its FIRST tile did (see `Placed::seq`).
+        let grid_seq = || tiles.iter().map(|t| &t.seq).min().cloned().unwrap_or_default();
         if tiles.len() >= MIN_GRID_TILES && is_grid(&tiles) {
             // A stitched grid is composed axis-aligned, so it carries no rotation.
             if want_uris {
                 if let Some(uri) = stitch_grid(doc, &tiles, (x0, x1, y0, y1)) {
-                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri, ctm: None });
+                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri, ctm: None, seq: grid_seq() });
                     continue;
                 }
                 // stitch failed → fall through to per-tile emission
             } else {
                 if tiles.iter().any(|t| decodable(doc, &t.res, t.id)) {
-                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri: String::new(), ctm: None });
+                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri: String::new(), ctm: None, seq: grid_seq() });
                 }
                 continue;
             }
@@ -532,10 +546,10 @@ fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool) -> Vec<Placed> 
         for t in tiles {
             if want_uris {
                 if let Some(uri) = data_uri(doc, &t.res, t.id) {
-                    out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri, ctm: t.ctm });
+                    out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri, ctm: t.ctm, seq: t.seq.clone() });
                 }
             } else if decodable(doc, &t.res, t.id) {
-                out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri: String::new(), ctm: t.ctm });
+                out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri: String::new(), ctm: t.ctm, seq: t.seq.clone() });
             }
         }
     }
@@ -780,7 +794,7 @@ mod tests {
         let mut raws = Vec::new();
         let mut budget = crate::WalkBudget::new(700);
         let res = Rc::new(page_resources(&doc, page_id));
-        walk(&doc, &content.operations, &xmap, &res, Mat::ID, &mut raws, 0, &mut budget);
+        walk(&doc, &content.operations, &xmap, &res, Mat::ID, &mut raws, 0, &mut budget, &[]);
         assert!(!raws.is_empty(), "a tripped budget must not empty the page");
         assert!(raws.len() < 3, "the budget must really bite, got {} tiles", raws.len());
     }

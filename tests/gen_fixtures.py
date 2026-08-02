@@ -891,6 +891,68 @@ def gen_image_order():
     GT["image_order.pdf"] = {"images": len(colours), "renders_identical": 25}
 
 
+def gen_paint_order():
+    """The SAME raster + panel, painted in both orders — a controlled A/B for the z-order
+    of a composited figure.
+
+    ``composite_svg`` used to emit every raster first and all the vector ink after it,
+    which is correct only for streams that happen to paint in that order. Real figures
+    interleave, and when a figure paints an OPAQUE panel over a raster the grouped output
+    covered the raster completely: the ``<image>`` was in the SVG and contributed nothing
+    a reader could see.
+
+    Two figures, geometrically identical, differing only in the order of two operators:
+
+      TOP    (y 520-700): raster, then the opaque grey panel over it → the PANEL wins.
+      BOTTOM (y 120-300): the opaque grey panel, then the raster over it → the RASTER wins.
+
+    Each figure is a stroked outer frame + 5 tick marks + the panel (7 paths, clearing
+    ``MIN_PATHS``) spanning 300x180 pt, with the 160x120 pt raster wholly inside it — so
+    the raster is absorbed INTO the vector figure's ``<svg>`` (``overlap/imarea`` = 1.0,
+    ``overlap/varea`` = 0.36, i.e. the vector is the base) rather than the other way round.
+    The panel is mid grey (#808080), not near-white, so ``build_svg``'s plot-background
+    drop leaves it in place — the occlusion under test is real ink, not a viewBox artifact.
+    The 220 pt gap between the two bands is far over ``BAND_GAP``, so they cluster apart."""
+    pdf = os.path.join(OUT, "paint_order.pdf")
+    # 2x2 flat crimson raster — unmistakable against the grey panel if it survives.
+    img = _flate_image(5, 2, 2, b"/DeviceRGB", 8, bytes((220, 30, 40)) * 4)
+
+    def figure(y0, raster_first):
+        """One 300x180 figure with its origin at (72, y0); `raster_first` picks the order."""
+        raster = b"q 160 0 0 120 %d %d cm /Im0 Do Q" % (140, y0 + 30)
+        # Opaque mid-grey panel covering the raster, and only it.
+        panel = b"q 0.5 0.5 0.5 rg 130 %d 180 140 re f Q" % (y0 + 20)
+        frame = b"q 0 0 0 RG 1 w 72 %d 300 180 re S Q" % y0
+        ticks = b"\n".join(
+            b"q 0 0 0 RG 1 w %d %d m %d %d l S Q" % (72 + 20 * i, y0, 72 + 20 * i, y0 + 12)
+            for i in range(1, 6)
+        )
+        ink = [raster, panel] if raster_first else [panel, raster]
+        return b"\n".join([frame, ticks] + ink)
+
+    stream = b"\n".join([
+        b"BT /F1 12 Tf 72 720 Td (Paint order: the later operator must win.) Tj ET",
+        figure(520, raster_first=True),
+        figure(120, raster_first=False),
+    ])
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 6 0 R >> /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+        5: img,
+        6: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["paint_order.pdf"] = {
+        "figures": 2,
+        # The figure whose raster is painted FIRST must show the panel on top of it, and
+        # the one whose raster is painted LAST must show the raster on top of the panel.
+        "panel_fill": "#808080",
+    }
+
+
 def gen_cmyk_jpeg():
     """A DeviceCMYK JPEG — the one image kind whose bytes decode to a *silently wrong
     colour* rather than failing.
@@ -2299,6 +2361,7 @@ def main():
     gen_undrawn_image()
     gen_colorspace_images()
     gen_image_order()
+    gen_paint_order()
     gen_no_resources_paths()
     gen_render_samples()
     gen_cmyk_jpeg()

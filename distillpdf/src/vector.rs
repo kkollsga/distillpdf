@@ -12,7 +12,7 @@
 
 use crate::geom::{Mat, Rect};
 use crate::pdfobj::{deref, num, num_deref};
-use crate::walker::{descend_form, overlay_xobjects, page_resource_chain, Descend, ScopePolicy, XMap};
+use crate::walker::{descend_form, overlay_xobjects, page_resource_chain, Descend, PaintSeq, ScopePolicy, XMap};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -47,7 +47,7 @@ struct Painted {
     y0: f32,
     x1: f32,
     y1: f32,
-    seq: usize, // paint order in the content stream — preserved for correct z-order
+    seq: PaintSeq, // paint position in the content TREE — preserved for correct z-order
     // Active clip rect (page space) when this path was painted, if it actually crops it.
     // Rendered as an SVG <clipPath> so the visible ink matches the PDF (no overshoot).
     clip: Option<(f32, f32, f32, f32)>,
@@ -108,8 +108,16 @@ pub struct PlacedSvg {
     pub y_bottom: f32,
     pub x_left: f32,
     pub x_right: f32,
-    paths: String, // <path> elements, local coords: origin (x_left, y_top), y down
-    w: f32,        // vector-ink content extent
+    /// `<clipPath>` definitions the paths reference. Emitted before any ink; renders nothing
+    /// itself, so its position among the ink is free.
+    defs: String,
+    /// The `<path>` elements in local coords (origin `(x_left, y_top)`, y down), each kept
+    /// WITH the address of the operation that painted it. Held apart rather than
+    /// pre-concatenated because [`PlacedSvg::composite_svg`] has to slot raster `<image>`
+    /// elements between them at their own paint positions; the vector-only renderers just
+    /// concatenate in order ([`PlacedSvg::ink`]).
+    paths: Vec<(PaintSeq, String)>,
+    w: f32, // vector-ink content extent
     h: f32,
     page_w: f32, // page width — figure renders at its page-width share
     labels: Vec<Label>,
@@ -218,9 +226,20 @@ impl PlacedSvg {
             fmt(vbw),
             fmt(vbh),
             fmt(pct),
-            self.paths,
+            self.ink(),
             texts
         )
+    }
+
+    /// This figure's vector ink as SVG: the clip definitions followed by every `<path>` in
+    /// paint order. What every renderer here except [`PlacedSvg::composite_svg`] wants —
+    /// that one has rasters to slot in between the paths.
+    fn ink(&self) -> String {
+        let mut out = self.defs.clone();
+        for (_, p) in &self.paths {
+            out.push_str(p);
+        }
+        out
     }
 
     /// Render the `<text>` labels of this figure as SVG, in its local coords.
@@ -261,7 +280,7 @@ impl PlacedSvg {
             fmt(self.w + 2.0 * PAD),
             fmt(self.h + 2.0 * PAD),
             style,
-            self.paths,
+            self.ink(),
             self.label_texts()
         )
     }
@@ -272,13 +291,18 @@ impl PlacedSvg {
     /// ink, and every label, so nothing is clipped (axis labels in the margins included).
     /// Works in BOTH directions: a vector OVER a base raster (a location map: vector lines/
     /// labels over a base photo) and rasters INSIDE a larger vector frame (a plot whose
-    /// data points are a raster within the axes/legend). The raster sits behind the ink;
-    /// the vector's opaque plot-area background is dropped in `build_svg`, so the raster
-    /// shows and the grid/curves/axes overlay it. Each entry is
-    /// `(href, (x_left, x_right, y_bottom, y_top), ctm)`: the source, its PDF page rect (y up),
-    /// and an optional placement matrix `[a,b,c,d,e,f]` (page space) when the image is ROTATED
-    /// — then the pixels are mapped through that matrix instead of stretched into the rect.
-    pub fn composite_svg(&self, rasters: &[(&str, (f32, f32, f32, f32), Option<[f32; 6]>)]) -> String {
+    /// data points are a raster within the axes/legend).
+    ///
+    /// **Rasters and ink are interleaved by PAINT ORDER** ([`PaintSeq`]), not grouped by
+    /// kind. This function used to emit every raster first and all the ink after it, which
+    /// is right only when the stream painted them that way. Real figures interleave: a
+    /// panel, a photo dropped into it, then the annotation on top — and painting that photo
+    /// first put it *behind* the panel, i.e. deleted it from the output. (The reverse also
+    /// exists, which is why `build_svg` drops a near-white full-figure background: with paint
+    /// order honoured, a background that genuinely precedes the raster now stays behind it on
+    /// its own merits.) Sorting is stable, so equal addresses — impossible between two paints,
+    /// since an address IS an operation — keep the caller's order.
+    pub fn composite_svg(&self, rasters: &[Raster<'_>]) -> String {
         // viewBox base: the plot area if detected (crops overshooting reference curves).
         // When no plot box was found, start from an empty box and grow it from the rasters
         // + labels only (NOT the full ink): that still bounds the figure to its real content
@@ -291,8 +315,9 @@ impl PlacedSvg {
             .unwrap_or((f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY));
         // Raster rects in local coords (origin (x_left, y_top), y DOWN). The viewBox grows by
         // the axis-aligned placement bbox in both cases (a rotated image's bbox IS that box).
-        let mut images = String::new();
-        for (href, (ix0, ix1, iy0, iy1), ctm) in rasters {
+        let mut content: Vec<(&PaintSeq, String)> = Vec::with_capacity(rasters.len() + self.paths.len());
+        for r in rasters {
+            let (ix0, ix1, iy0, iy1) = r.rect;
             let img_lx = ix0 - self.x_left;
             let img_ly = self.y_top - iy1;
             let img_lw = (ix1 - ix0).max(0.1);
@@ -301,38 +326,39 @@ impl PlacedSvg {
             min_y = min_y.min(img_ly);
             max_x = max_x.max(img_lx + img_lw);
             max_y = max_y.max(img_ly + img_lh);
-            match ctm {
+            let el = match r.ctm {
                 // ROTATED: map the image's unit square [0,1]² through the placement matrix into
                 // figure-local coords. A PDF image's unit square has (0,0) bottom-left and its
                 // first pixel row at the top (v=1), so SVG image-space (su,sv) (y down, top-left
                 // origin) maps as u=su, v=1-sv. With page CTM (a,b,c,d,e,f) and figure origin
                 // (x_left, y_top) under the y-flip (ly = y_top - pagey), the SVG transform is
                 // matrix(a, -b, -c, d, c+e-x_left, y_top-d-f).
-                Some([a, b, c, d, e, f]) => {
-                    images.push_str(&format!(
-                        "<image href=\"{}\" x=\"0\" y=\"0\" width=\"1\" height=\"1\" preserveAspectRatio=\"none\" transform=\"matrix({} {} {} {} {} {})\"/>",
-                        href,
-                        fmt(*a),
-                        fmt(-b),
-                        fmt(-c),
-                        fmt(*d),
-                        fmt(c + e - self.x_left),
-                        fmt(self.y_top - d - f),
-                    ));
-                }
+                Some([a, b, c, d, e, f]) => format!(
+                    "<image href=\"{}\" x=\"0\" y=\"0\" width=\"1\" height=\"1\" preserveAspectRatio=\"none\" transform=\"matrix({} {} {} {} {} {})\"/>",
+                    r.href,
+                    fmt(a),
+                    fmt(-b),
+                    fmt(-c),
+                    fmt(d),
+                    fmt(c + e - self.x_left),
+                    fmt(self.y_top - d - f),
+                ),
                 // Axis-aligned (common case): place directly in the local rect (unchanged).
-                None => {
-                    images.push_str(&format!(
-                        "<image href=\"{}\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\"/>",
-                        href,
-                        fmt(img_lx),
-                        fmt(img_ly),
-                        fmt(img_lw),
-                        fmt(img_lh)
-                    ));
-                }
-            }
+                None => format!(
+                    "<image href=\"{}\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\"/>",
+                    r.href,
+                    fmt(img_lx),
+                    fmt(img_ly),
+                    fmt(img_lw),
+                    fmt(img_lh)
+                ),
+            };
+            content.push((r.seq, el));
         }
+        for (seq, el) in &self.paths {
+            content.push((seq, el.clone()));
+        }
+        content.sort_by(|a, b| a.0.cmp(b.0));
         // Grow to every (rotation-aware) label too.
         for l in &self.labels {
             let svg_rad = -l.angle;
@@ -361,21 +387,38 @@ impl PlacedSvg {
         max_y += PAD;
         let (vbw, vbh) = (max_x - min_x, max_y - min_y);
         let pct = if self.page_w > 1.0 { (vbw / self.page_w * 150.0).clamp(10.0, 100.0) } else { 100.0 };
-        // Rasters behind, then the vector ink, then the text labels on top.
+        // Clip definitions (render nothing), then rasters and vector ink interleaved in the
+        // order the page painted them, then the text labels on top. Labels stay last: they
+        // are the figure's own annotation and are the one thing that must never be occluded.
+        let mut body = self.defs.clone();
+        for (_, el) in &content {
+            body.push_str(el);
+        }
         format!(
             "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{} {} {} {}\" \
              style=\"display:block;width:{}%;height:auto;margin:0 auto\" \
-             font-family=\"sans-serif\" fill=\"#000\">{}{}{}</svg>",
+             font-family=\"sans-serif\" fill=\"#000\">{}{}</svg>",
             fmt(min_x),
             fmt(min_y),
             fmt(vbw),
             fmt(vbh),
             fmt(pct),
-            images,
-            self.paths,
+            body,
             self.label_texts()
         )
     }
+}
+
+/// One raster to composite into a figure's `<svg>` ([`PlacedSvg::composite_svg`]): the
+/// (deferred) href, its PDF page rect `(x_left, x_right, y_bottom, y_top)` in y-up page
+/// space, an optional placement matrix `[a,b,c,d,e,f]` when the image is ROTATED — then
+/// the pixels are mapped through it instead of stretched into the rect — and where the
+/// page painted it, which is what decides whether it lands above or below each path.
+pub struct Raster<'a> {
+    pub href: &'a str,
+    pub rect: (f32, f32, f32, f32),
+    pub ctm: Option<[f32; 6]>,
+    pub seq: &'a PaintSeq,
 }
 
 // Figure filter: a real vector figure is a cluster of ink at least this big with
@@ -422,7 +465,12 @@ fn extgstates_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, (Op
 /// A path with neither fill nor stroke (e.g. a fully transparent `ca 0` fill, or
 /// a clip-only path) carries no ink and is dropped — it must not inflate a
 /// figure cluster or paint a "hidden" black field.
-fn finish(cur: &mut Vec<Seg>, fill: Option<[u8; 3]>, stroke: Option<([u8; 3], f32)>, fill_op: f32, stroke_op: f32, clip: Option<(f32, f32, f32, f32)>, out: &mut Vec<Painted>) {
+// One more argument than clippy's default bar, for the same reason `walk` (below) and
+// `text::decode_spans` carry the `#[allow]`: this is an interpreter's flat state, and
+// bundling it into a struct would hide which parts a paint operator supplies fresh
+// (colour, alpha, clip) from the address/output it merely threads through.
+#[allow(clippy::too_many_arguments)]
+fn finish(cur: &mut Vec<Seg>, fill: Option<[u8; 3]>, stroke: Option<([u8; 3], f32)>, fill_op: f32, stroke_op: f32, clip: Option<(f32, f32, f32, f32)>, seq: PaintSeq, out: &mut Vec<Painted>) {
     if cur.is_empty() {
         return;
     }
@@ -469,7 +517,7 @@ fn finish(cur: &mut Vec<Seg>, fill: Option<[u8; 3]>, stroke: Option<([u8; 3], f3
             crop = clip;
         }
     }
-    out.push(Painted { segs: std::mem::take(cur), fill, stroke, fill_op, stroke_op, x0, y0, x1, y1, seq: 0, clip: crop });
+    out.push(Painted { segs: std::mem::take(cur), fill, stroke, fill_op, stroke_op, x0, y0, x1, y1, seq, clip: crop });
 }
 
 /// Page-space bounding box of a path under construction (a clip path is just a path
@@ -529,11 +577,11 @@ fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (
     }
     let mut painted = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
-    walk(doc, ops, &xmap, &egmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget);
-    // Stamp paint order before clustering reshuffles the vector for banding.
-    for (i, p) in painted.iter_mut().enumerate() {
-        p.seq = i;
-    }
+    walk(doc, ops, &xmap, &egmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget, &[]);
+    // Paint order is stamped by the walk itself (`PaintSeq`, the operation's address in the
+    // content tree) rather than re-derived from this vector's order here. The two are the
+    // same ordering, but only the address is comparable with `img::positioned_images`'s
+    // rasters, which is what lets a composited figure interleave the two.
     let page_w = page_width(doc, page_id);
     let (strong, weak) = cluster_figures(painted);
     let build = |cs: Vec<Vec<Painted>>| cs.iter().map(|c| build_svg(c, page_w)).collect();
@@ -575,6 +623,9 @@ fn walk(
     out: &mut Vec<Painted>,
     depth: u32,
     budget: &mut crate::WalkBudget,
+    // Address of the stream being walked (empty for the page's own content) — each
+    // operation's index is appended to it to stamp a path's `PaintSeq`.
+    here: &[u32],
 ) {
     let mut g = base;
     let mut stack: Vec<GState> = Vec::new();
@@ -588,7 +639,7 @@ fn walk(
     let eff_fill = |g: &GState| if g.fill_a >= ALPHA_HIDDEN { Some(g.fill) } else { None };
     let eff_stroke = |g: &GState| if g.stroke_a >= ALPHA_HIDDEN { Some((g.stroke, (g.lw * g.ctm.scale()).max(0.3))) } else { None };
 
-    for op in ops {
+    for (opi, op) in ops.iter().enumerate() {
         // Total-work budget (see `crate::WalkBudget`). `MAX_OPS` above truncates only the
         // page's TOP-LEVEL operator list; a self-referential form re-enters `walk` with a
         // fresh, tiny slice each time, so only a budget shared across all levels bounds it.
@@ -694,9 +745,9 @@ fn walk(
                     pending_clip = false;
                 }
                 match op.operator.as_str() {
-                    "f" | "F" | "f*" => finish(&mut cur, eff_fill(&g), None, g.fill_a, g.stroke_a, g.clip, out),
-                    "S" | "s" => finish(&mut cur, None, eff_stroke(&g), g.fill_a, g.stroke_a, g.clip, out),
-                    "B" | "B*" | "b" | "b*" => finish(&mut cur, eff_fill(&g), eff_stroke(&g), g.fill_a, g.stroke_a, g.clip, out),
+                    "f" | "F" | "f*" => finish(&mut cur, eff_fill(&g), None, g.fill_a, g.stroke_a, g.clip, PaintSeq::at(here, opi), out),
+                    "S" | "s" => finish(&mut cur, None, eff_stroke(&g), g.fill_a, g.stroke_a, g.clip, PaintSeq::at(here, opi), out),
+                    "B" | "B*" | "b" | "b*" => finish(&mut cur, eff_fill(&g), eff_stroke(&g), g.fill_a, g.stroke_a, g.clip, PaintSeq::at(here, opi), out),
                     _ => cur.clear(), // "n": clip-only path → no ink
                 }
             }
@@ -722,7 +773,7 @@ fn walk(
                 }
                 let mut sub = g;
                 sub.ctm = f.matrix.mul(g.ctm);
-                walk(doc, &f.ops, &f.scope.xobjects, &child_eg, sub, out, depth + 1, budget);
+                walk(doc, &f.ops, &f.scope.xobjects, &child_eg, sub, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice());
             }
             _ => {}
         }
@@ -782,7 +833,7 @@ fn cluster_figures(mut paths: Vec<Painted>) -> (Vec<Vec<Painted>>, Vec<Vec<Paint
     // Restore stream paint order within each cluster (banding sorted by y): a fill
     // drawn after an outline must paint on top of it, not be reordered by position.
     for c in strong.iter_mut().chain(weak.iter_mut()) {
-        c.sort_by_key(|p| p.seq);
+        c.sort_by(|a, b| a.seq.cmp(&b.seq));
     }
     (strong, weak)
 }
@@ -855,7 +906,7 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
         }
         id
     };
-    let mut paths = String::new();
+    let mut paths: Vec<(PaintSeq, String)> = Vec::new();
     for p in cluster {
         // Skip a near-white background fill that covers a large part of the figure:
         // invisible on the white page anyway, and in a raster+vector composite it would
@@ -903,10 +954,10 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
             Some(c) => format!(" clip-path=\"url(#{})\"", clip_id_for(c, &mut clip_defs)),
             None => String::new(),
         };
-        paths.push_str(&format!("<path d=\"{d}\" fill=\"{fill}\"{fop}{stroke}{clip_attr}/>"));
+        paths.push((p.seq.clone(), format!("<path d=\"{d}\" fill=\"{fill}\"{fop}{stroke}{clip_attr}/>")));
     }
-    let paths = if clip_defs.is_empty() { paths } else { format!("<defs>{clip_defs}</defs>{paths}") };
-    PlacedSvg { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, paths, w, h, page_w, labels: Vec::new(), plot }
+    let defs = if clip_defs.is_empty() { String::new() } else { format!("<defs>{clip_defs}</defs>") };
+    PlacedSvg { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, defs, paths, w, h, page_w, labels: Vec::new(), plot }
 }
 
 #[cfg(test)]
@@ -938,7 +989,7 @@ mod tests {
         }
         let mut painted = Vec::new();
         let mut budget = crate::WalkBudget::new(budget);
-        walk(doc, &content.operations, &xmap, &egmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget);
+        walk(doc, &content.operations, &xmap, &egmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget, &[]);
         painted
     }
 
@@ -1053,7 +1104,7 @@ mod tests {
         let (strong, _weak) = positioned_vectors_capped(&doc, page_id, 50);
         assert_eq!(strong.len(), 1, "the early-painted grid figure must survive a tripped cap");
         let grid = &strong[0];
-        let kept = grid.paths.matches("<path").count();
+        let kept = grid.ink().matches("<path").count();
         // The cap really does bite mid-figure (the fixture's grid is 12 rules), and what it
         // leaves behind still clears the figure bar.
         assert!((6..12).contains(&kept), "grid kept {kept} of 12 paths");
@@ -1070,7 +1121,7 @@ mod tests {
         let (strong, _weak) = positioned_vectors(&doc, page_id);
         assert_eq!(strong.len(), 2, "expected the grid AND the scatter field");
         let scatter = strong.iter().find(|f| f.y_bottom < 400.0).expect("scatter figure");
-        assert!(scatter.paths.matches("<path").count() > 200, "scatter kept {} paths", scatter.paths.matches("<path").count());
+        assert!(scatter.ink().matches("<path").count() > 200, "scatter kept {} paths", scatter.ink().matches("<path").count());
     }
 
     #[test]
@@ -1143,7 +1194,47 @@ mod tests {
         // The figure reaches the render as one placed <svg>, carrying the recovered opacity.
         let (strong, _weak) = positioned_vectors(&doc, page_id);
         assert_eq!(strong.len(), 1, "the bar chart must be one figure");
-        assert!(strong[0].paths.contains("fill-opacity=\"0.85\""), "{}", strong[0].paths);
+        assert!(strong[0].ink().contains("fill-opacity=\"0.85\""), "{}", strong[0].ink());
+    }
+
+    #[test]
+    fn a_composited_figure_paints_its_raster_where_the_stream_did() {
+        // `tests/gen_fixtures.py::gen_paint_order` is a controlled A/B in one file: two
+        // geometrically identical figures, the sole difference the order of two operators.
+        // The TOP one paints the raster then an opaque grey panel over it (the panel must
+        // win); the BOTTOM one paints the panel then the raster (the raster must win).
+        // Before the fix `composite_svg` emitted every raster first and all path ink after,
+        // so BOTH figures rendered as a bare grey panel — the top one correctly, the bottom
+        // one by accident of grouping, and the raster it carried was invisible.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/paint_order.pdf");
+        let doc = Document::load(path).expect("paint_order.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&1).expect("page 1");
+        let (strong, _weak) = positioned_vectors(&doc, page_id);
+        assert_eq!(strong.len(), 2, "the two bands must cluster as two figures");
+        let images = crate::img::positioned_images(&doc, page_id, true);
+        assert_eq!(images.len(), 2, "one raster per figure");
+
+        // Pair each figure with the raster inside it, exactly as html.rs's absorb does.
+        for (fi, fig) in strong.iter().enumerate() {
+            let im = images
+                .iter()
+                .find(|im| im.x_left >= fig.x_left && im.x_right <= fig.x_right && im.y_bottom >= fig.y_bottom && im.y_top <= fig.y_top)
+                .unwrap_or_else(|| panic!("figure {fi} must contain a raster"));
+            let svg = fig.composite_svg(&[Raster {
+                href: "IMG",
+                rect: (im.x_left, im.x_right, im.y_bottom, im.y_top),
+                ctm: im.ctm,
+                seq: &im.seq,
+            }]);
+            let image_at = svg.find("<image ").expect("the raster must be in the composite");
+            let panel_at = svg.find("fill=\"#808080\"").expect("the opaque panel must be in the composite");
+            // `strong` is ordered top-of-page first, and the top figure is the raster-first one.
+            if fi == 0 {
+                assert!(image_at < panel_at, "raster painted first must sit BEHIND the panel: {svg}");
+            } else {
+                assert!(image_at > panel_at, "raster painted last must sit ON TOP of the panel: {svg}");
+            }
+        }
     }
 
     #[test]
@@ -1191,6 +1282,7 @@ mod tests {
             &mut painted,
             0,
             &mut budget,
+            &[],
         );
         painted
     }
