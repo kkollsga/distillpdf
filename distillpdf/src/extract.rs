@@ -8,13 +8,21 @@ use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
 /// One extracted raster image. Mirrors the dict `Pdf.extract_images` returns:
-/// `{page, index, width, height, color_space, format, data}`.
+/// `{page, index, width, height, color_space, bits_per_component, format, data}`.
 pub struct ImageInfo {
     pub page: u32,
     pub index: usize,
     pub width: i64,
     pub height: i64,
+    /// The image's colour space **family**, resolved through indirect references and
+    /// through a name defined in the resource dictionary's `/ColorSpace` sub-dictionary:
+    /// `DeviceRGB`, `DeviceGray`, `DeviceCMYK`, `ICCBased`, `Indexed`, `Separation`, …
+    /// `None` only when the image genuinely declares no colour space (a `/ImageMask`
+    /// stencil, or a JPXDecode stream that carries it inside the codestream).
     pub color_space: Option<String>,
+    /// `/BitsPerComponent` — 1, 2, 4, 8 or 16. `None` when the image declares none and it
+    /// cannot be inferred (JPXDecode, where the codestream carries it).
+    pub bits_per_component: Option<i64>,
     pub format: &'static str,
     pub data: Vec<u8>,
 }
@@ -49,7 +57,7 @@ fn filter_to_format(filters: &Option<Vec<String>>) -> &'static str {
             } else if fs.iter().any(|f| f == "JBIG2Decode") {
                 "jbig2"
             } else {
-                "raw" // Flate/LZW/none -> needs PNG assembly from samples
+                "raw" // Flate/LZW/none: plain samples -> assemble_png turns most into "png"
             }
         }
         None => "raw",
@@ -236,14 +244,316 @@ fn drawn_images(doc: &Document, page_id: ObjectId) -> Option<HashSet<ObjectId>> 
     Some(out)
 }
 
-/// The `/ColorSpace` family name, as lopdf's `PdfImage` reports it: an array's first
-/// element (`/ICCBased`, `/Indexed`, …) or a bare name. Deeper resolution is Phase 6.
-fn image_color_space(dict: &Dictionary) -> Option<String> {
-    match dict.get(b"ColorSpace").ok()? {
-        Object::Array(a) => a.first()?.as_name().ok().map(|n| String::from_utf8_lossy(n).into_owned()),
-        Object::Name(n) => Some(String::from_utf8_lossy(n).into_owned()),
+/// Cap on colour-space indirection (`/CS0 → [/Indexed [/ICCBased …] …]`, and the cyclic
+/// resource dictionary a hostile file can write).
+const MAX_CS_DEPTH: u32 = 8;
+
+/// Resolve a `/ColorSpace` value to the object that actually describes the space.
+///
+/// Two things make the declared value not be that object already, and both were why
+/// `color_space` came back `None` for 971 of 2604 corpus images:
+///   * it is written as an **indirect reference** (`/ColorSpace 42 0 R`), and
+///   * per PDF 32000-1 §8.6.3 an image may name a space *defined in the resource
+///     dictionary's `/ColorSpace` sub-dictionary* (`/ColorSpace /CS0`) rather than a
+///     device space, so the name has to be looked up in `res` before it means anything.
+fn resolve_cs<'a>(doc: &'a Document, res: &'a Dictionary, o: &'a Object, depth: u32) -> Option<&'a Object> {
+    if depth > MAX_CS_DEPTH {
+        return None;
+    }
+    match o {
+        Object::Reference(r) => resolve_cs(doc, res, doc.get_object(*r).ok()?, depth + 1),
+        Object::Name(n) if !is_builtin_cs_name(n) => {
+            match sub_dict(doc, res, b"ColorSpace").and_then(|d| d.get(n.as_slice()).ok()) {
+                Some(v) => resolve_cs(doc, res, v, depth + 1),
+                None => Some(o), // no such resource: report the name verbatim, honestly
+            }
+        }
+        other => Some(other),
+    }
+}
+
+/// Names that mean a space in themselves (so they are never resource lookups).
+fn is_builtin_cs_name(n: &[u8]) -> bool {
+    matches!(
+        n,
+        b"DeviceGray" | b"DeviceRGB" | b"DeviceCMYK" | b"G" | b"RGB" | b"CMYK" | b"Pattern"
+    )
+}
+
+/// PDF's abbreviated inline-image colour-space names spelled out in full.
+fn canonical_cs_name(n: &[u8]) -> String {
+    match n {
+        b"G" => "DeviceGray".to_string(),
+        b"RGB" => "DeviceRGB".to_string(),
+        b"CMYK" => "DeviceCMYK".to_string(),
+        b"I" => "Indexed".to_string(),
+        other => String::from_utf8_lossy(other).into_owned(),
+    }
+}
+
+/// The image's colour-space **family** name (`DeviceRGB`, `ICCBased`, `Indexed`, …),
+/// after [`resolve_cs`]. The family is what pymupdf reports too; the component count an
+/// `ICCBased`/`Indexed` space implies is what [`cs_model`] derives for PNG assembly.
+fn image_color_space(doc: &Document, res: &Dictionary, dict: &Dictionary) -> Option<String> {
+    match resolve_cs(doc, res, dict.get(b"ColorSpace").ok()?, 0)? {
+        Object::Name(n) => Some(canonical_cs_name(n)),
+        Object::Array(a) => {
+            let head = resolve(doc, a.first()?)?.as_name().ok()?;
+            Some(canonical_cs_name(head))
+        }
         _ => None,
     }
+}
+
+/// A colour space reduced to what PNG assembly needs: how many samples make a pixel and
+/// how those samples become RGB. Spaces we cannot faithfully reduce (`Lab`, `Separation`,
+/// `DeviceN`, `Pattern`) are deliberately absent — their rows keep `format:"raw"` rather
+/// than being handed back as a plausible-looking wrong colour.
+enum Cs {
+    Gray,
+    Rgb,
+    Cmyk,
+    /// Palette space: one index sample per pixel into `lookup`, `base`-many bytes each.
+    Indexed { base: Box<Cs>, lookup: Vec<u8> },
+}
+
+impl Cs {
+    fn components(&self) -> usize {
+        match self {
+            Cs::Gray => 1,
+            Cs::Rgb => 3,
+            Cs::Cmyk => 4,
+            Cs::Indexed { .. } => 1,
+        }
+    }
+    /// True when the space is achromatic, so the PNG can be 8-bit grayscale.
+    fn is_gray(&self) -> bool {
+        match self {
+            Cs::Gray => true,
+            Cs::Indexed { base, .. } => base.is_gray(),
+            _ => false,
+        }
+    }
+}
+
+fn cs_model(doc: &Document, res: &Dictionary, o: &Object, depth: u32) -> Option<Cs> {
+    if depth > MAX_CS_DEPTH {
+        return None;
+    }
+    match resolve_cs(doc, res, o, 0)? {
+        Object::Name(n) => match n.as_slice() {
+            b"DeviceGray" | b"G" | b"CalGray" => Some(Cs::Gray),
+            b"DeviceRGB" | b"RGB" | b"CalRGB" => Some(Cs::Rgb),
+            b"DeviceCMYK" | b"CMYK" => Some(Cs::Cmyk),
+            _ => None,
+        },
+        Object::Array(a) => match resolve(doc, a.first()?)?.as_name().ok()? {
+            // An ICC profile's `/N` is the component count — the whole point of reading it.
+            b"ICCBased" => match resolve(doc, a.get(1)?)?.as_stream().ok()?.dict.get(b"N").ok()?.as_i64().ok()? {
+                1 => Some(Cs::Gray),
+                3 => Some(Cs::Rgb),
+                4 => Some(Cs::Cmyk),
+                _ => None,
+            },
+            b"CalGray" => Some(Cs::Gray),
+            b"CalRGB" => Some(Cs::Rgb),
+            b"Indexed" | b"I" => {
+                let base = cs_model(doc, res, a.get(1)?, depth + 1)?;
+                if matches!(base, Cs::Indexed { .. }) {
+                    return None; // an Indexed base is illegal (§8.6.6.3); don't guess
+                }
+                let lookup = match resolve(doc, a.get(3)?)? {
+                    Object::String(s, _) => s.clone(),
+                    Object::Stream(st) => st.decompressed_content().unwrap_or_else(|_| st.content.clone()),
+                    _ => return None,
+                };
+                Some(Cs::Indexed { base: Box::new(base), lookup })
+            }
+            _ => None, // Lab / Separation / DeviceN / Pattern: not reducible to RGB here
+        },
+        _ => None,
+    }
+}
+
+/// Per-dimension and total-pixel ceilings, mirroring `img.rs`: a malformed or hostile
+/// stream can declare an enormous `/Width`×`/Height`, and assembly allocates from those.
+const MAX_ASSEMBLE_DIM: i64 = 0x1FFFF;
+const MAX_ASSEMBLE_PIXELS: usize = 64 << 20;
+
+/// The `/Decode` array as floats, when it has the 2·n entries the sample layout needs.
+fn decode_array(doc: &Document, dict: &Dictionary, n: usize) -> Option<Vec<f32>> {
+    let a = resolve(doc, dict.get(b"Decode").ok()?)?.as_array().ok()?;
+    if a.len() != n * 2 {
+        return None;
+    }
+    a.iter()
+        .map(|o| match o {
+            Object::Integer(i) => Some(*i as f32),
+            Object::Real(r) => Some(*r),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Assemble a real PNG file from an image XObject's *samples* — the `format:"raw"` case
+/// (Flate/LZW/uncompressed), which is 1167 of 2604 corpus rows and none of which opened
+/// as an image file before: the caller got back compressed samples with no container.
+///
+/// Handles 1/2/4/8/16 bits per component, the `/Decode` array, `/ImageMask` stencils, and
+/// Gray/RGB/CMYK/ICCBased/Indexed colour spaces. Returns `None` — leaving the row at
+/// `format:"raw"` with its (now complete) metadata — for anything it cannot reduce
+/// faithfully, rather than emitting a confidently wrong picture.
+fn assemble_png(doc: &Document, res: &Dictionary, stream: &lopdf::Stream, w: i64, h: i64) -> Option<Vec<u8>> {
+    let dict = &stream.dict;
+    if w <= 0 || h <= 0 || w > MAX_ASSEMBLE_DIM || h > MAX_ASSEMBLE_DIM {
+        return None;
+    }
+    let (wu, hu) = (w as usize, h as usize);
+    if wu.checked_mul(hu)? > MAX_ASSEMBLE_PIXELS {
+        return None;
+    }
+    // A stencil mask has no colour space and exactly one 1-bit sample per pixel (§8.9.6.2).
+    let is_mask = dict.get(b"ImageMask").and_then(|o| o.as_bool()).unwrap_or(false);
+    let (cs, bpc) = if is_mask {
+        (Cs::Gray, 1i64)
+    } else {
+        let cs = cs_model(doc, res, dict.get(b"ColorSpace").ok()?, 0)?;
+        let bpc = image_bpc(doc, dict)?;
+        (cs, bpc)
+    };
+    if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
+        return None;
+    }
+    let (bpc, nc) = (bpc as usize, cs.components());
+
+    let samples = content_bytes(stream);
+    // Rows are padded to a byte boundary (§8.9.5.1).
+    let stride = (wu.checked_mul(nc)?.checked_mul(bpc)?).div_ceil(8);
+    if stride == 0 || samples.len() < stride.checked_mul(hu)? {
+        return None; // truncated stream: reassembling it would fabricate pixels
+    }
+
+    let maxval = ((1u32 << bpc) - 1) as f32;
+    let decode = decode_array(doc, dict, nc);
+    let gray_out = cs.is_gray();
+    let out_ch = if gray_out { 1 } else { 3 };
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(wu.checked_mul(hu)?.checked_mul(out_ch)?).ok()?;
+
+    // One pixel's colour-space samples, reused per pixel to avoid a per-pixel allocation.
+    let mut comp = vec![0u8; nc.max(4)];
+    for row in samples.chunks_exact(stride).take(hu) {
+        for x in 0..wu {
+            for (j, slot) in comp.iter_mut().enumerate().take(nc) {
+                let raw = sample_at(row, x * nc + j, bpc);
+                *slot = match &cs {
+                    // An index is an index: the default /Decode for Indexed is
+                    // [0 2^bpc-1], i.e. the raw value, and a non-default one remaps the
+                    // index range rather than a colour intensity.
+                    Cs::Indexed { .. } => match &decode {
+                        Some(d) => (d[0] + raw as f32 * (d[1] - d[0]) / maxval).round().clamp(0.0, 255.0) as u8,
+                        None => raw.min(255) as u8,
+                    },
+                    _ => {
+                        let v = match &decode {
+                            Some(d) => d[2 * j] + raw as f32 * (d[2 * j + 1] - d[2 * j]) / maxval,
+                            None => raw as f32 / maxval,
+                        };
+                        (v.clamp(0.0, 1.0) * 255.0).round() as u8
+                    }
+                };
+            }
+            let px: &[u8] = match &cs {
+                Cs::Indexed { base, lookup } => {
+                    let bn = base.components();
+                    let off = (comp[0] as usize) * bn;
+                    match lookup.get(off..off + bn) {
+                        Some(s) => s,
+                        None => &[0u8; 4][..bn], // index past the palette: black, per §8.6.6.3
+                    }
+                }
+                _ => &comp[..nc],
+            };
+            let base_cs: &Cs = match &cs {
+                Cs::Indexed { base, .. } => base,
+                other => other,
+            };
+            match base_cs {
+                Cs::Gray => out.push(px[0]),
+                Cs::Rgb => out.extend_from_slice(&px[..3]),
+                Cs::Cmyk => {
+                    let k = 255 - px[3] as u16;
+                    for c in &px[..3] {
+                        out.push(((255 - *c as u16) * k / 255) as u8);
+                    }
+                }
+                Cs::Indexed { .. } => return None, // excluded above
+            }
+        }
+    }
+
+    let img = if gray_out {
+        image::DynamicImage::ImageLuma8(image::GrayImage::from_raw(w as u32, h as u32, out)?)
+    } else {
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_raw(w as u32, h as u32, out)?)
+    };
+    png_bytes(img)
+}
+
+/// The `i`-th `bpc`-bit sample of a packed row.
+fn sample_at(row: &[u8], i: usize, bpc: usize) -> u32 {
+    match bpc {
+        8 => row[i] as u32,
+        16 => ((row[2 * i] as u32) << 8) | row[2 * i + 1] as u32,
+        _ => {
+            let bit = i * bpc;
+            let shift = 8 - bpc - (bit % 8);
+            ((row[bit / 8] >> shift) as u32) & ((1u32 << bpc) - 1)
+        }
+    }
+}
+
+/// Encode to a PNG file. Same writer `img.rs` uses for the HTML data URIs — the `image`
+/// crate — so an assembled `extract_images()` blob and an embedded `<img>` agree.
+fn png_bytes(img: image::DynamicImage) -> Option<Vec<u8>> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    Some(out.into_inner())
+}
+
+/// Generic (non-codec) compression an image codec can be wrapped in, e.g.
+/// `[/FlateDecode /DCTDecode]` — a JPEG stored Flate-compressed.
+fn is_generic_filter(f: &str) -> bool {
+    matches!(f, "FlateDecode" | "Fl" | "LZWDecode" | "LZW" | "ASCII85Decode" | "A85" | "ASCIIHexDecode" | "AHx")
+}
+
+/// The codec payload of a coded image (`jpeg`/`jpx`/`ccitt`/`jbig2`): the stream bytes
+/// with any leading generic compression peeled off, so a Flate-wrapped JPEG is handed
+/// back as a JPEG file and not as a blob nothing can open.
+fn codec_payload(stream: &lopdf::Stream, filters: &[String]) -> Vec<u8> {
+    let lead: Vec<Object> = filters
+        .iter()
+        .take_while(|f| is_generic_filter(f))
+        .map(|f| Object::Name(f.as_bytes().to_vec()))
+        .collect();
+    if lead.is_empty() {
+        return stream.content.clone();
+    }
+    let mut s = stream.clone();
+    s.dict.set("Filter", Object::Array(lead));
+    s.dict.remove(b"DecodeParms"); // codec parms don't apply to the generic layers
+    s.dict.remove(b"DP");
+    s.decompressed_content().unwrap_or_else(|_| stream.content.clone())
+}
+
+/// `/BitsPerComponent`, or the value the spec implies when the key is absent.
+fn image_bpc(doc: &Document, dict: &Dictionary) -> Option<i64> {
+    dict.get(b"BitsPerComponent")
+        .ok()
+        .and_then(|o| resolve(doc, o))
+        .and_then(|o| o.as_i64().ok())
+        // A stencil mask is 1-bit by definition and may omit the key (§8.9.6.2).
+        .or_else(|| dict.get(b"ImageMask").and_then(|o| o.as_bool()).unwrap_or(false).then_some(1))
 }
 
 /// The `/Filter` chain as names, in application order.
@@ -271,6 +581,13 @@ fn image_filters(dict: &Dictionary) -> Vec<String> {
 ///
 /// [`page_resource_dicts`] still drives enumeration, so the reported `(page, index)`
 /// ordering is unchanged wherever the drawn set equals the reachable set.
+///
+/// `data` is a blob the caller can open, not the verbatim stream: a coded image is peeled
+/// back to its codec payload (so a `[/FlateDecode /DCTDecode]` stream is a JPEG file, not
+/// a Flate blob) and a plain sample block is assembled into a PNG via [`assemble_png`]
+/// with `format` reported as `"png"`. Only samples we cannot faithfully reduce keep
+/// `format:"raw"` — and those now carry `color_space` and `bits_per_component`, which is
+/// what a caller needs to reassemble them by hand.
 pub fn extract_images(doc: &Document) -> Vec<ImageInfo> {
     let mut out = Vec::new();
     for (&pno, &page_id) in &doc.get_pages() {
@@ -309,14 +626,31 @@ pub fn extract_images(doc: &Document) -> Vec<ImageInfo> {
                     continue; // not a usable image row without dimensions
                 };
                 let filters = image_filters(dict);
+                let mut format = filter_to_format(&Some(filters.clone()));
+                // Hand back something a caller can actually open. A coded image gives up
+                // its codec payload (a Flate-wrapped JPEG becomes a JPEG file); a `raw`
+                // sample block is assembled into a PNG, and stays `raw` — with the
+                // metadata to reassemble it by hand — only when it cannot be.
+                let data = if format == "raw" {
+                    match assemble_png(doc, res, stream, width, height) {
+                        Some(png) => {
+                            format = "png";
+                            png
+                        }
+                        None => stream.content.clone(),
+                    }
+                } else {
+                    codec_payload(stream, &filters)
+                };
                 out.push(ImageInfo {
                     page: pno,
                     index,
                     width,
                     height,
-                    color_space: image_color_space(dict),
-                    format: filter_to_format(&Some(filters)),
-                    data: stream.content.clone(),
+                    color_space: image_color_space(doc, res, dict),
+                    bits_per_component: image_bpc(doc, dict),
+                    format,
+                    data,
                 });
                 index += 1;
                 from_this_dict.push(id);
@@ -1391,6 +1725,125 @@ mod tests {
             .map(|x| x.iter().count())
             .sum();
         assert_eq!(reachable, 5, "page + form resources list 3 + 2 XObject entries");
+    }
+
+    /// `tests/gen_fixtures.py::gen_colorspace_images` — Flate rasters in the four colour
+    /// spaces whose resolution steps the reporter used to skip.
+    fn colorspace_doc() -> Document {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/colorspace_images.pdf");
+        Document::load(path).expect("colorspace_images.pdf fixture must load")
+    }
+
+    /// Decode an assembled PNG blob back to RGB8 — the caller's side of the contract.
+    fn decode_png(data: &[u8]) -> image::RgbImage {
+        image::load_from_memory_with_format(data, image::ImageFormat::Png)
+            .expect("assembled bytes must be a readable PNG")
+            .to_rgb8()
+    }
+
+    #[test]
+    fn colorspaces_resolve_and_bits_per_component_is_reported() {
+        // 971 of 2604 corpus rows reported `color_space: None`: an indirect /ColorSpace,
+        // an ICC profile whose /N is the only component count, a palette, or a name that
+        // only means something in the resource dictionary's /ColorSpace sub-dictionary.
+        let doc = colorspace_doc();
+        let rows = extract_images(&doc);
+        let seen: Vec<(usize, Option<&str>, Option<i64>, &str)> = rows
+            .iter()
+            .map(|i| (i.index, i.color_space.as_deref(), i.bits_per_component, i.format))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (0, Some("Indexed"), Some(4), "png"),
+                (1, Some("ICCBased"), Some(8), "png"), // /ColorSpace written as `9 0 R`
+                (2, Some("DeviceCMYK"), Some(8), "png"),
+                (3, Some("ICCBased"), Some(8), "png"), // /ColorSpace /CS0, a named resource
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_samples_are_assembled_into_a_readable_png() {
+        // The bytes used to be the compressed samples with no container — nothing opened
+        // them. Each assembled PNG must carry the authored pixels back.
+        let doc = colorspace_doc();
+        let rows = extract_images(&doc);
+
+        // 4x2 @ 4bpc through a 4-entry palette: row 0 is red/green/blue/white, row 1 the
+        // reverse — sub-byte unpacking AND the palette lookup, in one image.
+        let ix = decode_png(&rows[0].data);
+        assert_eq!(ix.dimensions(), (4, 2));
+        assert_eq!(ix.get_pixel(0, 0).0, [255, 0, 0]);
+        assert_eq!(ix.get_pixel(3, 0).0, [255, 255, 255]);
+        assert_eq!(ix.get_pixel(0, 1).0, [255, 255, 255]);
+
+        // ICCBased /N 3 -> three 8-bit samples per pixel.
+        let icc = decode_png(&rows[1].data);
+        assert_eq!(icc.dimensions(), (2, 2));
+        assert_eq!(icc.get_pixel(0, 0).0, [10, 20, 30]);
+        assert_eq!(icc.get_pixel(1, 1).0, [100, 110, 120]);
+
+        // DeviceCMYK: (0,0,0,0) is white and (255,0,0,0) is pure cyan.
+        let cmyk = decode_png(&rows[2].data);
+        assert_eq!(cmyk.get_pixel(0, 0).0, [255, 255, 255]);
+        assert_eq!(cmyk.get_pixel(1, 0).0, [0, 255, 255]);
+
+        // ICCBased /N 1 reached through the named /CS0 resource -> grayscale.
+        let gray = decode_png(&rows[3].data);
+        assert_eq!(gray.get_pixel(0, 0).0, [0, 0, 0]);
+        assert_eq!(gray.get_pixel(1, 0).0, [255, 255, 255]);
+    }
+
+    #[test]
+    fn unfiltered_samples_assemble_too_and_metadata_is_complete() {
+        // The hand-written undrawn_image fixture stores its rasters with NO filter at all
+        // — lopdf errors on `decompressed_content()` there, which must not lose the row.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/undrawn_image.pdf");
+        let doc = Document::load(path).expect("undrawn_image.pdf fixture must load");
+        for r in extract_images(&doc) {
+            assert_eq!(r.format, "png", "unfiltered DeviceRGB samples must assemble");
+            assert_eq!(r.color_space.as_deref(), Some("DeviceRGB"));
+            assert_eq!(r.bits_per_component, Some(8));
+            let png = decode_png(&r.data);
+            assert_eq!(png.dimensions(), (r.width as u32, r.height as u32));
+        }
+    }
+
+    #[test]
+    fn a_truncated_sample_block_stays_raw_rather_than_fabricating_pixels() {
+        // The honest fallback: a row we cannot assemble keeps `format:"raw"` AND the new
+        // metadata, so the caller can still reassemble it by hand.
+        use lopdf::{dictionary, Stream};
+        let mut doc = Document::with_version("1.5");
+        let img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Image",
+                "Width" => 8i64, "Height" => 8i64,
+                "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8i64,
+            },
+            vec![7u8; 9], // 9 bytes where 8*8*3 are needed
+        ));
+        let pages_id = doc.new_object_id();
+        let contents_id = doc.add_object(Stream::new(dictionary! {}, b"q /Im0 Do Q".to_vec()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => img_id } },
+            "Contents" => contents_id,
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages", "Count" => 1i64, "Kids" => vec![page_id.into()],
+        });
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+
+        let rows = extract_images(&doc);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].format, "raw");
+        assert_eq!(rows[0].color_space.as_deref(), Some("DeviceRGB"));
+        assert_eq!(rows[0].bits_per_component, Some(8));
+        assert_eq!(rows[0].data, vec![7u8; 9], "the samples are still handed back verbatim");
     }
 
     #[test]

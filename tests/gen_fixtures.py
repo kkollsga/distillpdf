@@ -20,6 +20,7 @@ anchors, which reportlab does not emit).
 import json
 import os
 import re
+import zlib
 
 from PIL import Image, ImageDraw
 from reportlab.lib.pagesizes import letter
@@ -621,6 +622,84 @@ def gen_undrawn_image():
         "page1_images": [{"index": 0, "width": 40, "height": 30}],
         "page2_images": [{"index": 0, "width": 42, "height": 32}],
         "never_drawn": [{"width": 41, "height": 31}, {"width": 43, "height": 33}],
+    }
+
+
+def _flate_image(num, w, h, cs, bpc, samples, extra=b""):
+    """A FlateDecode image XObject: the shape almost every non-photographic PDF raster has,
+    and the one ``extract_images()`` used to hand back as compressed samples with no
+    container (``format='raw'``, unopenable)."""
+    data = zlib.compress(samples)
+    return (b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace %s "
+            b"/BitsPerComponent %d /Filter /FlateDecode %s/Length %d >>\nstream\n%s\nendstream"
+            % (w, h, cs, bpc, extra, len(data), data))
+
+
+def gen_colorspace_images():
+    """Flate-compressed rasters in the colour spaces that made ``color_space`` come back
+    ``None`` — and whose samples had no container at all.
+
+    Four images, each pinning one resolution step the reporter used to skip:
+
+      ``/ImIndexed``  ``[/Indexed /DeviceRGB 3 <palette>]`` at 4 bits per component —
+                      packed sub-byte samples plus a palette lookup;
+      ``/ImIcc``      ``/ColorSpace`` written as an **indirect reference** to an
+                      ``[/ICCBased …]`` array whose stream ``/N`` is the only statement of
+                      the component count (the exact shape of the corpus preprint image
+                      that reported ``None``);
+      ``/ImCmyk``     ``/DeviceCMYK`` samples, which need the CMYK→RGB reduction;
+      ``/ImNamedCs``  ``/ColorSpace /CS0``, a **name defined in the page's ``/Resources``
+                      ``/ColorSpace`` sub-dictionary** — meaningless without that lookup.
+
+    reportlab flattens every image it embeds to DeviceRGB/DeviceGray, so this is
+    hand-assembled; that also lets the pixel values be exact, which is what the tests
+    assert on the assembled PNGs."""
+    pdf = os.path.join(OUT, "colorspace_images.pdf")
+    # --- /ImIndexed: 4x2 @ 4bpc, palette red/green/blue/white -------------------
+    palette = bytes((255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255))
+    idx_samples = bytes((0x01, 0x23, 0x32, 0x10))  # row0: 0 1 2 3 · row1: 3 2 1 0
+    # --- /ImIcc: 2x2 RGB through an ICC profile with /N 3 -----------------------
+    icc_samples = bytes(range(10, 130, 10))  # (10,20,30) (40,50,60) (70,80,90) (100,110,120)
+    # --- /ImCmyk: 2x1, white then pure cyan --------------------------------------
+    cmyk_samples = bytes((0, 0, 0, 0, 255, 0, 0, 0))
+    # --- /ImNamedCs: 2x1 gray through /CS0 -> [/ICCBased (N 1)] ------------------
+    gray_samples = bytes((0, 255))
+    profile3 = zlib.compress(b"\x00" * 128)  # stand-in profile body; /N is what readers use
+    profile1 = zlib.compress(b"\x00" * 64)
+    content = (b"q 80 0 0 40 72 700 cm /ImIndexed Do Q\n"
+               b"q 80 0 0 40 72 640 cm /ImIcc Do Q\n"
+               b"q 80 0 0 40 72 580 cm /ImCmyk Do Q\n"
+               b"q 80 0 0 40 72 520 cm /ImNamedCs Do Q")
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/XObject << /ImIndexed 5 0 R /ImIcc 6 0 R /ImCmyk 7 0 R /ImNamedCs 8 0 R >> "
+            b"/ColorSpace << /CS0 11 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        5: _flate_image(5, 4, 2, b"[/Indexed /DeviceRGB 3 <%s>]" % palette.hex().encode(), 4, idx_samples),
+        6: _flate_image(6, 2, 2, b"9 0 R", 8, icc_samples),
+        7: _flate_image(7, 2, 1, b"/DeviceCMYK", 8, cmyk_samples),
+        8: _flate_image(8, 2, 1, b"/CS0", 8, gray_samples),
+        9: b"[/ICCBased 10 0 R]",
+        10: (b"<< /N 3 /Filter /FlateDecode /Length %d >>\nstream\n%s\nendstream"
+             % (len(profile3), profile3)),
+        11: b"[/ICCBased 12 0 R]",
+        12: (b"<< /N 1 /Filter /FlateDecode /Length %d >>\nstream\n%s\nendstream"
+             % (len(profile1), profile1)),
+    }
+    _assemble_pdf(objs, pdf)
+    GT["colorspace_images.pdf"] = {
+        "images": [
+            {"index": 0, "width": 4, "height": 2, "color_space": "Indexed", "bits_per_component": 4,
+             "format": "png", "px": {"0,0": [255, 0, 0], "3,0": [255, 255, 255], "0,1": [255, 255, 255]}},
+            {"index": 1, "width": 2, "height": 2, "color_space": "ICCBased", "bits_per_component": 8,
+             "format": "png", "px": {"0,0": [10, 20, 30], "1,1": [100, 110, 120]}},
+            {"index": 2, "width": 2, "height": 1, "color_space": "DeviceCMYK", "bits_per_component": 8,
+             "format": "png", "px": {"0,0": [255, 255, 255], "1,0": [0, 255, 255]}},
+            {"index": 3, "width": 2, "height": 1, "color_space": "ICCBased", "bits_per_component": 8,
+             "format": "png", "px": {"0,0": [0, 0, 0], "1,0": [255, 255, 255]}},
+        ],
     }
 
 
@@ -1543,6 +1622,7 @@ def main():
     gen_xobject_figure()
     gen_form_image()
     gen_undrawn_image()
+    gen_colorspace_images()
     gen_form_font()
     gen_no_spurious_figs()
     gen_links()

@@ -194,10 +194,13 @@ def test_save_rejects_missized_member(tmp_path):
 
 
 def _seed_container(path):
-    """A small real .dpdf to re-save from (save_dpdf reads the source container)."""
+    """A small real .dpdf to re-save from (save_dpdf reads the source container).
+
+    Pinned to a named prose fixture rather than "whatever sorts first": chunking is
+    derived from the model's text blocks, so seeding from a fixture that happens to
+    carry none (an image-only page) makes every space in this module read as stale."""
     fix = os.path.join(os.path.dirname(__file__), "fixtures_pdf")
-    pdf = next(f for f in sorted(os.listdir(fix)) if f.endswith(".pdf"))
-    distillpdf.Pdf.open(os.path.join(fix, pdf)).distill(path)
+    distillpdf.Pdf.open(os.path.join(fix, "headings.pdf")).distill(path)
 
 
 # ---- search math (cosine ranking; pure-python path too) ---------------------

@@ -102,18 +102,18 @@ tokens.
 doc.extract_images() -> list[dict]
 ```
 
-Every image XObject on every page, including the raw encoded bytes. Each image is one
-dict:
+Every image a page draws, including the image bytes. Each image is one dict:
 
-| Key           | Type    | Meaning                                                          |
-| ------------- | ------- | ---------------------------------------------------------------- |
-| `page`        | `int`   | 1-indexed page                                                   |
-| `index`       | `int`   | image index within that page, in page order                     |
-| `width`       | `int`   | pixel width                                                      |
-| `height`      | `int`   | pixel height                                                     |
-| `color_space` | `str`   | the image's PDF color space                                      |
-| `format`      | `str`   | one of `"jpeg"`, `"jpx"`, `"ccitt"`, `"jbig2"`, `"raw"`          |
-| `data`        | `bytes` | the raw image stream bytes (the content of the XObject)          |
+| Key                  | Type          | Meaning                                                             |
+| -------------------- | ------------- | ------------------------------------------------------------------- |
+| `page`               | `int`         | 1-indexed page                                                      |
+| `index`              | `int`         | image index within that page, in page order                        |
+| `width`              | `int`         | pixel width                                                         |
+| `height`             | `int`         | pixel height                                                        |
+| `color_space`        | `str \| None` | colour-space family: `"DeviceRGB"`, `"DeviceGray"`, `"DeviceCMYK"`, `"ICCBased"`, `"Indexed"`, `"Separation"`, … |
+| `bits_per_component` | `int \| None` | 1, 2, 4, 8 or 16                                                    |
+| `format`             | `str`         | one of `"png"`, `"jpeg"`, `"jpx"`, `"ccitt"`, `"jbig2"`, `"raw"`    |
+| `data`               | `bytes`       | the image bytes                                                     |
 
 ```python
 for im in doc.extract_images():
@@ -122,18 +122,25 @@ for im in doc.extract_images():
         f.write(im["data"])
 ```
 
-`format` is derived from the stream's filter: `DCTDecode` → `"jpeg"`, `JPXDecode` →
-`"jpx"`, `CCITTFaxDecode` → `"ccitt"`, `JBIG2Decode` → `"jbig2"`. Anything else
-(Flate/LZW or no filter) reports `"raw"`.
+For `"png"`, `"jpeg"` and `"jpx"` the bytes are a complete image file you can open
+directly (PIL, a browser, `file`). PDFs store most non-photographic rasters as plain
+compressed *samples* with no container; those are assembled into a real PNG and reported
+as `"png"`. Photographic images stay in their original codec, unwrapped from any
+Flate/LZW/ASCII85 layer the PDF added on top.
+
+`color_space` is resolved through indirect references, through an ICC profile's component
+count, and through a name defined in the page's `/ColorSpace` resources — so it tells you
+what the samples mean rather than being blank.
 
 !!! warning
-    `data` is the raw stream content as stored in the PDF, not a ready-to-open file.
-    For `"jpeg"` and `"jpx"` the bytes are a usable JPEG / JPEG 2000 file; for `"raw"`,
-    `"ccitt"`, and `"jbig2"` the bytes are still the encoded samples and need to be
-    assembled into an image (e.g. a PNG built from the samples plus `width`, `height`,
-    and `color_space`) before they will open. If you want render-ready images, use
-    `to_html(image_mode="external")` or `to_markdown()`, which extract figures into an
-    `img/` folder — see [Rendering HTML & Markdown](rendering.md).
+    `"raw"`, `"ccitt"` and `"jbig2"` are **not** ready-to-open files. `"ccitt"` and
+    `"jbig2"` are the codec bitstreams; `"raw"` is a sample block in a colour space we
+    will not reduce for you (`Lab`, `Separation`, `DeviceN`) or a stream that is
+    truncated. Those rows still carry `width`, `height`, `color_space` and
+    `bits_per_component`, which is everything you need to assemble them yourself. If you
+    want render-ready images without any of this, use `to_html(image_mode="external")` or
+    `to_markdown()`, which extract figures into an `img/` folder — see
+    [Rendering HTML & Markdown](rendering.md).
 
 ## extract_links
 

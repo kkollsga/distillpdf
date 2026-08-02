@@ -201,7 +201,20 @@ when the page does not exist.
 Pdf.extract_images() -> list[dict]
 ```
 
-Images from all pages as a list of dicts including the raw image bytes.
+Images from all pages as a list of dicts including the image bytes. Each dict:
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `page` | int | 1-based page number |
+| `index` | int | image index within that page |
+| `width` / `height` | int | pixel dimensions |
+| `color_space` | str \| None | resolved colour-space family (`"DeviceRGB"`, `"ICCBased"`, `"Indexed"`, …) |
+| `bits_per_component` | int \| None | 1, 2, 4, 8 or 16 |
+| `format` | str | `"png"`, `"jpeg"`, `"jpx"`, `"ccitt"`, `"jbig2"` or `"raw"` |
+| `data` | bytes | the image bytes — a complete file for `"png"`/`"jpeg"`/`"jpx"` |
+
+See [Raw extraction](../guide/extraction.md#extract_images) for what `"raw"` means and how
+to assemble one.
 
 ### Pdf.extract_fonts
 

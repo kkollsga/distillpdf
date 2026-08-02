@@ -158,6 +158,22 @@
     "caption": "Figure 1: A small diagram of the mapping between two objects.",
     "n_figures": 1
   },
+  "dense_vector.pdf": {
+    "n_figures": 2,
+    "grid_paths": 12,
+    "scatter_paths": 300,
+    "captions": [
+      "Figure 1: A reference grid drawn as twelve stroked rules.",
+      "Figure 2: A dense scatter field of three hundred marks."
+    ]
+  },
+  "inherited_mediabox.pdf": {
+    "page_width": 842,
+    "page_height": 595,
+    "figure_width": 300,
+    "caption": "Figure 1: A grid spanning 300 of the 842 point page.",
+    "n_figures": 1
+  },
   "xobject_figure.pdf": {
     "caption": "Figure 1: The model pipeline encodes images and text into logits.",
     "n_figures": 1,
@@ -215,6 +231,95 @@
       {
         "width": 43,
         "height": 33
+      }
+    ]
+  },
+  "colorspace_images.pdf": {
+    "images": [
+      {
+        "index": 0,
+        "width": 4,
+        "height": 2,
+        "color_space": "Indexed",
+        "bits_per_component": 4,
+        "format": "png",
+        "px": {
+          "0,0": [
+            255,
+            0,
+            0
+          ],
+          "3,0": [
+            255,
+            255,
+            255
+          ],
+          "0,1": [
+            255,
+            255,
+            255
+          ]
+        }
+      },
+      {
+        "index": 1,
+        "width": 2,
+        "height": 2,
+        "color_space": "ICCBased",
+        "bits_per_component": 8,
+        "format": "png",
+        "px": {
+          "0,0": [
+            10,
+            20,
+            30
+          ],
+          "1,1": [
+            100,
+            110,
+            120
+          ]
+        }
+      },
+      {
+        "index": 2,
+        "width": 2,
+        "height": 1,
+        "color_space": "DeviceCMYK",
+        "bits_per_component": 8,
+        "format": "png",
+        "px": {
+          "0,0": [
+            255,
+            255,
+            255
+          ],
+          "1,0": [
+            0,
+            255,
+            255
+          ]
+        }
+      },
+      {
+        "index": 3,
+        "width": 2,
+        "height": 1,
+        "color_space": "ICCBased",
+        "bits_per_component": 8,
+        "format": "png",
+        "px": {
+          "0,0": [
+            0,
+            0,
+            0
+          ],
+          "1,0": [
+            255,
+            255,
+            255
+          ]
+        }
       }
     ]
   },
@@ -421,21 +526,5 @@
       "inline_encrypt_userpw.pdf"
     ],
     "user_password": "secret"
-  },
-  "dense_vector.pdf": {
-    "n_figures": 2,
-    "grid_paths": 12,
-    "scatter_paths": 300,
-    "captions": [
-      "Figure 1: A reference grid drawn as twelve stroked rules.",
-      "Figure 2: A dense scatter field of three hundred marks."
-    ]
-  },
-  "inherited_mediabox.pdf": {
-    "page_width": 842,
-    "page_height": 595,
-    "figure_width": 300,
-    "caption": "Figure 1: A grid spanning 300 of the 842 point page.",
-    "n_figures": 1
   }
 }

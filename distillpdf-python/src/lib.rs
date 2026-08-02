@@ -75,7 +75,11 @@ impl Pdf {
         Ok(self.inner.extract_text())
     }
 
-    /// Extract images from all pages (list of dicts incl. raw bytes).
+    /// Extract images from all pages (list of dicts incl. the image bytes).
+    ///
+    /// `data` is a blob you can open: `"png"` for assembled samples, `"jpeg"`/`"jpx"` for
+    /// the codec payload. Only samples we cannot faithfully assemble stay `"raw"`, and
+    /// those carry `color_space` + `bits_per_component` so they can be reassembled.
     fn extract_images<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
         for im in self.inner.extract_images() {
@@ -85,6 +89,7 @@ impl Pdf {
             d.set_item("width", im.width)?;
             d.set_item("height", im.height)?;
             d.set_item("color_space", im.color_space)?;
+            d.set_item("bits_per_component", im.bits_per_component)?;
             d.set_item("format", im.format)?;
             d.set_item("data", pyo3::types::PyBytes::new(py, &im.data))?;
             list.append(d)?;

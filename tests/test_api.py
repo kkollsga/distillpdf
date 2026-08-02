@@ -2,6 +2,7 @@
 plain-text extraction (whole-doc + per-page), and the structured extractors
 (fonts/images/tables/links) plus the diagnostic span dumps — shapes, types, and basic
 invariants. Guards the API contract that downstream callers depend on."""
+import io
 import os
 import re
 
@@ -17,6 +18,7 @@ LINKS = os.path.join(FIX, "links.pdf")
 FORM_IMAGE = os.path.join(FIX, "form_image.pdf")
 FORM_FONT = os.path.join(FIX, "form_font.pdf")
 UNDRAWN_IMAGE = os.path.join(FIX, "undrawn_image.pdf")
+COLORSPACE_IMAGES = os.path.join(FIX, "colorspace_images.pdf")
 
 
 def test_open_and_page_count():
@@ -73,10 +75,54 @@ def test_extract_images():
     imgs = distillpdf.Pdf.open(FIGURES).extract_images()
     assert isinstance(imgs, list) and len(imgs) >= 1, "raster image not extracted"
     im = imgs[0]
-    for key in ("page", "index", "width", "height", "color_space", "format", "data"):
+    for key in ("page", "index", "width", "height", "color_space", "bits_per_component", "format", "data"):
         assert key in im, f"image dict missing {key!r}"
     assert im["width"] > 0 and im["height"] > 0
     assert isinstance(im["data"], (bytes, bytearray)) and len(im["data"]) > 0
+
+
+def test_extract_images_resolves_colorspace_and_assembles_a_png():
+    """The four colour-space resolution steps that used to leave `color_space` blank —
+    a palette, an ICC profile's /N, an indirect /ColorSpace reference, and a name only
+    the page's /ColorSpace resources define — plus the PNG assembly that turns a bare
+    sample block into a file. Pixel values are the ones the fixture authored."""
+    Image = pytest.importorskip("PIL.Image")
+    imgs = distillpdf.Pdf.open(COLORSPACE_IMAGES).extract_images()
+    assert [(i["color_space"], i["bits_per_component"], i["format"]) for i in imgs] == [
+        ("Indexed", 4, "png"),
+        ("ICCBased", 8, "png"),
+        ("DeviceCMYK", 8, "png"),
+        ("ICCBased", 8, "png"),
+    ]
+    px = [Image.open(io.BytesIO(i["data"])).convert("RGB") for i in imgs]
+    assert px[0].size == (4, 2)
+    assert px[0].getpixel((0, 0)) == (255, 0, 0) and px[0].getpixel((3, 0)) == (255, 255, 255)
+    assert px[1].getpixel((0, 0)) == (10, 20, 30) and px[1].getpixel((1, 1)) == (100, 110, 120)
+    assert px[2].getpixel((0, 0)) == (255, 255, 255) and px[2].getpixel((1, 0)) == (0, 255, 255)
+    assert px[3].getpixel((0, 0)) == (0, 0, 0) and px[3].getpixel((1, 0)) == (255, 255, 255)
+
+
+def test_every_extracted_image_across_the_fixtures_opens():
+    """The usability contract: on the owned corpus every returned blob is a file PIL can
+    open. Only 44% of corpus blobs did before the bytes were assembled/unwrapped; a row we
+    genuinely cannot assemble is allowed to stay `raw`, but must then say so AND carry the
+    metadata to reassemble it."""
+    Image = pytest.importorskip("PIL.Image")
+    checked = 0
+    for name in sorted(os.listdir(FIX)):
+        if not name.endswith(".pdf"):
+            continue
+        for im in distillpdf.Pdf.open(os.path.join(FIX, name)).extract_images():
+            where = f"{name} p{im['page']} #{im['index']} ({im['format']})"
+            if im["format"] in ("raw", "ccitt", "jbig2"):
+                assert im["color_space"] is not None or im["bits_per_component"] is not None, \
+                    f"{where}: unassembled row must carry reassembly metadata"
+                continue
+            img = Image.open(io.BytesIO(im["data"]))
+            img.load()
+            assert img.size == (im["width"], im["height"]), f"{where}: dims disagree"
+            checked += 1
+    assert checked >= 8, f"expected the fixture set to exercise several images, saw {checked}"
 
 
 def test_extract_fonts_recurses_into_form_xobjects():
