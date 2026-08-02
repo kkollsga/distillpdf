@@ -1160,5 +1160,11 @@
     "filter": "JPXDecode",
     "human": "JPEG 2000",
     "kind": "codec-unsupported"
+  },
+  "codec_basemap.pdf": {
+    "basemap_page": 1,
+    "control_page": 2,
+    "filter": "JPXDecode",
+    "human": "JPEG 2000"
   }
 }

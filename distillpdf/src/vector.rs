@@ -767,6 +767,30 @@ impl PlacedSvg {
             // its shapes into this figure under a translate+scale. Nothing else takes this
             // branch — no decoded raster is ever an `image/svg+xml` URI.
             if let Some(inner) = r.placeholder {
+                // A placeholder the figure paints ALL of its graphic ink over is a BASEMAP,
+                // and a basemap we cannot decode has to stay a hole. The frame and the two
+                // label lines are ours, not the document's: under a map's coastlines and
+                // county fills they do not read as "we could not decode this", they show
+                // through the gaps in the ink as a grey box with words across it — which on
+                // a map is indistinguishable from cartography. `geology_usgs_fs` p1 is the
+                // case: a JPX hillshade under the whole study-area map, whose "JPEG 2000
+                // image / not decoded (JPXDecode)" surfaced through the vector layer and a
+                // reviewer read it as a semi-transparent watermark the source does not have.
+                //
+                // The test is exact, not a coverage heuristic: the placeholder precedes
+                // EVERY path of a cluster that carries graphic ink (curves or diagonals —
+                // a map, not a frame). A figure that IS the undecodable image keeps its
+                // label, which is what the placeholder exists for: in the corpus every
+                // other composited placeholder (26 of 27, across
+                // `geology_usgs_volcanic_hazards_california`) is painted AFTER ink and is
+                // untouched. The decline itself is still reported by `stream_integrity()`
+                // and `extract_images()`, where a program looks for it.
+                //
+                // The viewBox still grows by the placement: the raster really did occupy
+                // that box, and cropping the figure to the ink alone could cut the map.
+                if self.graphic_ink && !self.paths.is_empty() && self.paths.iter().all(|(seq, _)| seq > r.seq) {
+                    continue;
+                }
                 let (sw, sh) = (img_lw / (ix1 - ix0).max(0.1), img_lh / (iy1 - iy0).max(0.1));
                 content.push((
                     r.seq,
@@ -1940,6 +1964,31 @@ mod tests {
         let (turned, tweak) = positioned_vectors(&doc, page_id);
         assert_eq!(turned.len(), 1, "a quarter-turned page keeps its figure");
         assert!(!tweak.iter().any(|v| v.demoted()), "and nothing was demoted on it");
+    }
+
+    #[test]
+    fn an_undecodable_basemap_paints_nothing_while_an_undecodable_top_layer_still_names_itself() {
+        // `tests/gen_fixtures.py::gen_codec_basemap`: the same `/JPXDecode` image and the same
+        // eight curves on two pages, differing only in paint order. The placeholder names the
+        // codec so a hole is not mistaken for a figure we chose not to emit — but under a
+        // BASEMAP that inverts. Its frame and label are ours, not the document's, and beneath
+        // a map's ink they do not read as "we could not decode this": they show through the
+        // gaps as a grey box with words across it, which on a map is indistinguishable from
+        // cartography. `geology_usgs_fs` p1's JPX hillshade did exactly that, and a reviewer
+        // read the label as a semi-transparent watermark the source does not have.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/codec_basemap.pdf");
+        let doc = lopdf::Document::load(path).expect("codec_basemap.pdf fixture must load");
+        let raw = std::fs::read(path).expect("fixture readable");
+        let html = crate::html::to_html(&doc, &raw, crate::html::Mode::Page, true, true);
+        let svgs: Vec<&str> = html.match_indices("<svg").map(|(i, _)| &html[i..html[i..].find("</svg>").map(|e| i + e).unwrap_or(html.len())]).collect();
+        assert_eq!(svgs.len(), 2, "one composited figure per page");
+        assert_eq!(svgs[0].matches("<path").count(), 8, "page 1 keeps every stroke of its ink");
+        assert!(!svgs[0].contains("not decoded"), "the basemap under all the ink paints nothing: {}", svgs[0]);
+        assert!(!svgs[0].contains("stroke-dasharray=\"6 4\""), "not even the frame: {}", svgs[0]);
+        // The control, and the case the placeholder exists for: the same image painted OVER
+        // the ink is the figure's top layer and must still say which codec it is.
+        assert!(svgs[1].contains("JPEG 2000 image"), "the top-layer placeholder is kept: {}", svgs[1]);
+        assert!(svgs[1].contains("not decoded (JPXDecode)"), "and names the filter: {}", svgs[1]);
     }
 
     /// One label span: `text` starting at `(x, y)`, `size`-tall, `w` wide, at `angle`.

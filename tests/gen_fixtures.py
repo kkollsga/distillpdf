@@ -2183,6 +2183,60 @@ def gen_undecodable_codec():
     }
 
 
+def gen_codec_basemap():
+    """The same undecodable image twice: once as a BASEMAP under the ink, once as the figure.
+
+    The codec placeholder (``gen_undecodable_codec``) names the codec so a hole is not
+    mistaken for a figure we chose not to emit. Under a *basemap* that inverts: the frame and
+    its two label lines are ours, not the document's, and beneath a map's coastlines they do
+    not read as "we could not decode this" — they show through the gaps in the ink as a grey
+    box with words across it, which on a map is indistinguishable from cartography.
+    ``geology_usgs_fs`` p1 is the real case: a JPX hillshade under the study-area map, whose
+    "JPEG 2000 image / not decoded (JPXDecode)" a reviewer read as a semi-transparent
+    watermark the source does not have.
+
+    Two pages, byte-identical ink and the same `/JPXDecode` image, differing ONLY in paint
+    order:
+
+      PAGE 1 — ``Do`` FIRST, then eight curves over it: a basemap. The composite must paste
+               nothing for it (no frame, no label); the map is what the reader gets.
+      PAGE 2 — the eight curves first, then the ``Do``: the image is the figure's own top
+               layer, so the placeholder stays and names the codec. This is the control, and
+               it is the case the placeholder exists for."""
+    pdf = os.path.join(OUT, "codec_basemap.pdf")
+    jpx = b"\x00\x00\x00\x0cjP  \r\n\x87\n" + b"\x00" * 64
+    # Eight stroked Beziers inside the placement — curves, so `has_graphic_ink` sees a map
+    # rather than a ruled frame, and eight clears MIN_PATHS.
+    ink = b"\n".join(
+        b"q 0.1 0.3 0.7 RG 1.2 w %d 520 m %d 600 %d 640 %d 690 c S Q" % (110 + 30 * i, 140 + 30 * i, 170 + 30 * i, 200 + 30 * i)
+        for i in range(8)
+    )
+    do = b"q 300 0 0 200 100 500 cm /ImJpx Do Q"
+    under = b"\n".join([do, ink, b"BT /F1 10 Tf 100 470 Td (Figure 1. Ink over an undecodable basemap.) Tj ET"])
+    over = b"\n".join([ink, do, b"BT /F1 10 Tf 100 470 Td (Figure 2. An undecodable image over the ink.) Tj ET"])
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R 7 0 R] /Count 2 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 6 0 R >> /XObject << /ImJpx 5 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(under), under),
+        5: (b"<< /Type /XObject /Subtype /Image /Width 400 /Height 300 /ColorSpace /DeviceRGB "
+            b"/BitsPerComponent 8 /Filter /JPXDecode /Length %d >>\nstream\n%s\nendstream"
+            % (len(jpx), jpx)),
+        6: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        7: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 6 0 R >> /XObject << /ImJpx 5 0 R >> >> /Contents 8 0 R >>"),
+        8: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(over), over),
+    }
+    _assemble_pdf(objs, pdf)
+    GT["codec_basemap.pdf"] = {
+        "basemap_page": 1,   # placeholder suppressed — the ink is painted over all of it
+        "control_page": 2,   # placeholder kept — the image is the top layer
+        "filter": "JPXDecode",
+        "human": "JPEG 2000",
+    }
+
+
 def gen_panel_table():
     """A boxed callout panel with a real ruled table inside it — each cell exactly ONCE.
 
@@ -4045,6 +4099,7 @@ def main():
     gen_glyph_table()
     gen_panel_table()
     gen_undecodable_codec()
+    gen_codec_basemap()
     gen_no_spurious_figs()
     gen_links()
     gen_pagelabels()
