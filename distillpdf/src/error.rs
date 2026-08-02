@@ -43,6 +43,13 @@ pub enum Error {
     /// A lower-layer message passed through verbatim (container / model / PDF-assembly and the
     /// `assets=` profile parse — these already carry their fully-formed message).
     Model(String),
+    /// An OCR-layer message passed through verbatim: engine construction, a recognition or
+    /// classification pass, or decoding the page image handed to one. The OCR modules return
+    /// `Result<_, String>` with a fully-formed message, and this is the honest place to put
+    /// it — [`Error::Model`] would file an engine failure under the document model, and a
+    /// raw `PyValueError` at the binding (what these used to be) loses the structure a
+    /// pure-Rust embedder needs to tell an OCR failure from bad input.
+    Ocr(String),
     /// A loaded `model.json` was not valid UTF-8.
     ModelNotUtf8(String),
     /// Parsing a supplied `model_json` string failed.
@@ -73,7 +80,7 @@ impl fmt::Display for Error {
             Error::OcrPoisoned => write!(f, "ocr cache poisoned"),
             Error::NoPage(None) => write!(f, "no page"),
             Error::NoPage(Some(n)) => write!(f, "no page {n}"),
-            Error::Model(s) => write!(f, "{s}"),
+            Error::Model(s) | Error::Ocr(s) => write!(f, "{s}"),
             Error::ModelNotUtf8(e) => write!(f, "model json not utf-8: {e}"),
             Error::ParseModelJson(e) => write!(f, "parse model_json: {e}"),
         }
@@ -105,6 +112,9 @@ mod tests {
         assert_eq!(Error::OcrPoisoned.to_string(), "ocr cache poisoned");
         assert_eq!(Error::NoSourcePath.to_string(), "no source path (opened from_bytes); pass an explicit path");
         assert_eq!(Error::Model("verbatim".into()).to_string(), "verbatim");
+        // The OCR layer's messages are already fully formed; the variant adds structure,
+        // not prose, so the string the Python API raises is unchanged.
+        assert_eq!(Error::Ocr("tesseract: no such language".into()).to_string(), "tesseract: no such language");
         assert_eq!(
             Error::Encrypted.to_string(),
             "encrypted PDF: needs a password, or uses an encryption scheme distillpdf cannot decrypt"

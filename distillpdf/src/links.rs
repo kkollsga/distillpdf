@@ -28,6 +28,26 @@ pub struct Link {
     pub remote_file: Option<String>,
 }
 
+impl Link {
+    /// Which of the three kinds this link is: `"uri"`, `"remote"` or `"internal"`.
+    ///
+    /// The discriminator is derived, not stored — the three fields are populated by
+    /// mutually exclusive branches of [`extract_links`] — and the ORDER of the tests is the
+    /// rule: a `/GoToR` carries a `remote_file` and may also carry a `dest_name`, so
+    /// `remote` must be decided before `internal` or a remote link reads as a jump inside
+    /// this document. It lived in the PyO3 binding, where no Rust consumer could reach it
+    /// and where the ordering rule was one edit away from being lost.
+    pub fn kind(&self) -> &'static str {
+        if self.uri.is_some() {
+            "uri"
+        } else if self.remote_file.is_some() {
+            "remote"
+        } else {
+            "internal"
+        }
+    }
+}
+
 fn pdf_string(o: &Object) -> Option<String> {
     match o {
         Object::String(b, _) => Some(String::from_utf8_lossy(b).into_owned()),
@@ -419,6 +439,36 @@ mod tests {
     fn indirect_doc() -> Document {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/indirect_numbers.pdf");
         Document::load(path).expect("indirect_numbers.pdf fixture must load")
+    }
+
+    fn link_of(uri: Option<&str>, dest_page: Option<u32>, dest_name: Option<&str>, remote: Option<&str>) -> Link {
+        Link {
+            page: 1,
+            rect: [0.0; 4],
+            uri: uri.map(String::from),
+            dest_page,
+            dest_name: dest_name.map(String::from),
+            remote_file: remote.map(String::from),
+        }
+    }
+
+    #[test]
+    fn link_kind_decides_remote_before_internal() {
+        assert_eq!(link_of(Some("https://x"), None, None, None).kind(), "uri");
+        assert_eq!(link_of(None, Some(3), None, None).kind(), "internal");
+        assert_eq!(link_of(None, None, Some("cite.devlin2018"), None).kind(), "internal");
+        // The ordering rule: a /GoToR carries a remote file AND a dest_name that addresses
+        // THAT file. Testing dest_name first would report it as a jump inside this document.
+        assert_eq!(link_of(None, None, Some("sec.2"), Some("other.pdf")).kind(), "remote");
+        assert_eq!(link_of(None, None, None, None).kind(), "internal", "a bare link degrades, it does not panic");
+    }
+
+    #[test]
+    fn every_extracted_link_reports_one_of_the_three_kinds() {
+        let doc = links_doc();
+        let links = extract_links(&doc);
+        assert!(!links.is_empty());
+        assert!(links.iter().all(|l| ["uri", "internal", "remote"].contains(&l.kind())));
     }
 
     #[test]
