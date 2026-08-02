@@ -703,6 +703,47 @@ def gen_colorspace_images():
     }
 
 
+def gen_image_order():
+    """Six standalone rasters on ONE horizontal row — the shape that exposed
+    nondeterministic render output.
+
+    ``img::cluster`` groups touching tiles with union-find and used to return the groups
+    out of a ``HashMap``, whose iteration order ``RandomState`` seeds per map INSTANCE —
+    so two renders in the same process saw the page's images in different orders. Every
+    downstream step preserves that order (the emitter's raster/vector absorption is
+    first-match-wins, and images sharing a y_top get identical sort boxes), so the HTML
+    itself differed run to run.
+
+    Six images, each its own cluster (a >2pt gap — ``cluster``'s tolerance — separates
+    them), all sharing the SAME top edge so nothing downstream can re-sort them, and each
+    a different flat colour so a swapped pair is visible in the emitted data URIs. Six
+    gives 720 possible orderings: a determinism assertion over ~25 renders effectively
+    cannot pass by luck."""
+    pdf = os.path.join(OUT, "image_order.pdf")
+    colours = [(220, 30, 40), (30, 160, 60), (40, 70, 210), (230, 170, 20), (150, 40, 190), (20, 180, 190)]
+    # Each image is 2x2 flat pixels; placed 60x60 pt (over MIN_DIM) with a 16 pt gap.
+    xobjs, objs = [], {}
+    content = []
+    for i, rgb in enumerate(colours):
+        num = 5 + i
+        samples = bytes(rgb) * 4
+        objs[num] = _flate_image(num, 2, 2, b"/DeviceRGB", 8, samples)
+        xobjs.append(b"/Im%d %d 0 R" % (i, num))
+        content.append(b"q 60 0 0 60 %d 600 cm /Im%d Do Q" % (72 + i * 76, i))
+    text = (b"BT /F1 12 Tf 72 700 Td (Six rasters share one row and one top edge.) Tj ET")
+    stream = text + b"\n" + b"\n".join(content)
+    objs.update({
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 11 0 R >> /XObject << " + b" ".join(xobjs) + b" >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+        11: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    })
+    _assemble_pdf(objs, pdf)
+    GT["image_order.pdf"] = {"images": len(colours), "renders_identical": 25}
+
+
 def gen_cmyk_jpeg():
     """A DeviceCMYK JPEG — the one image kind whose bytes decode to a *silently wrong
     colour* rather than failing.
@@ -1842,6 +1883,7 @@ def main():
     gen_form_image()
     gen_undrawn_image()
     gen_colorspace_images()
+    gen_image_order()
     gen_cmyk_jpeg()
     gen_form_font()
     gen_no_spurious_figs()

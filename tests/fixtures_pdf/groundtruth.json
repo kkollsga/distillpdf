@@ -323,6 +323,10 @@
       }
     ]
   },
+  "image_order.pdf": {
+    "images": 6,
+    "renders_identical": 25
+  },
   "cmyk_jpeg.pdf": {
     "caption": "Figure 1: Three flat CMYK bands.",
     "bands_rgb": [

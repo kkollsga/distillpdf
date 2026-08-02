@@ -18,7 +18,7 @@ use crate::text::{self, Span};
 use crate::vector;
 use lopdf::{Document, ObjectId};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 /// A PDF named-destination name (e.g. "cite.devlin2018", "section.3.1") → a valid,
 /// stable HTML id/fragment: keep [A-Za-z0-9._-], map anything else to '-'. Used for
@@ -975,7 +975,14 @@ fn build_doc_profile(page_spans: &[(u32, ObjectId, Vec<Span>)], body: f32, title
     }
     let body_i = body.round() as i32;
     let pages = page_spans.len().max(1);
-    let mut clusters: HashMap<(i32, bool, u32), Acc> = HashMap::new();
+    // BTreeMap, not HashMap: three consumers below read this map IN ITERATION ORDER —
+    // `max_by_key` for the body cluster and the title font (both return the LAST maximum),
+    // and the `cands` collect whose later `sort_by` is STABLE, so equal-ranking heading
+    // tiers keep iteration order and `take(4)` picks by it. `HashMap`'s order varies per
+    // map instance (`RandomState`), so any tie made the document's heading tiers — and the
+    // rendered HTML — differ run to run. Ordered by (size, bold, font), ties now resolve to
+    // the largest size / bold / highest font id, deterministically.
+    let mut clusters: BTreeMap<(i32, bool, u32), Acc> = BTreeMap::new();
     let mut numbered_hits = 0usize;
     for (pno, _id, spans) in page_spans {
         for s in spans {
@@ -1138,7 +1145,11 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         .collect();
     page_spans.sort_by_key(|(pno, _, _)| *pno);
     phase("01_spans", t);
-    let mut hist: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+    // BTreeMap: `max_by_key` below returns the LAST maximum in iteration order, so with a
+    // `HashMap` two equally-common body sizes picked a different winner run to run — and
+    // the body size drives every heading/paragraph decision downstream. Ascending key order
+    // makes the tie-break "the larger size wins", deterministically.
+    let mut hist: BTreeMap<i32, usize> = BTreeMap::new();
     for (_, _, spans) in &page_spans {
         for s in spans {
             if s.angle.abs() < 0.01 {

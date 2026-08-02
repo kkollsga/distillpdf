@@ -578,7 +578,10 @@ pub(crate) fn extract_front_matter(doc: &Document, raw: &[u8]) -> FrontMatter {
         None => return FrontMatter::default(),
     };
     let spans = text::extract_spans(doc, first, raw);
-    let mut hist: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+    // BTreeMap, for the same reason as `html::render`'s body histogram: `max_by_key`
+    // returns the LAST maximum in iteration order, and a `HashMap`'s order varies per map
+    // instance — so a tie between two equally-common sizes resolved differently run to run.
+    let mut hist: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
     for s in &spans {
         if s.angle.abs() < 0.01 {
             *hist.entry(s.size.round() as i32).or_insert(0) += 1;

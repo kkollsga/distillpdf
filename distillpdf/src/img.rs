@@ -791,6 +791,12 @@ fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool) -> Vec<Placed> 
 
 /// Union-find grouping of tiles whose placed bounding boxes touch/overlap (within a
 /// small tolerance). Returns index groups; isolated images form singleton groups.
+///
+/// **Invariant: the returned order is deterministic** — groups come out in the paint
+/// order of their first (lowest-index) tile, and each group's members ascend. Callers
+/// downstream (`finalize` → `positioned_images` → the HTML emitter) preserve this order
+/// for tiles that do not sort apart, so a nondeterministic order here reaches the
+/// rendered page. See the comment at the grouping loop for why that is not free.
 fn cluster(tiles: &[RawTile]) -> Vec<Vec<usize>> {
     fn find(parent: &mut [usize], mut i: usize) -> usize {
         while parent[i] != i {
@@ -815,12 +821,26 @@ fn cluster(tiles: &[RawTile]) -> Vec<Vec<usize>> {
             }
         }
     }
-    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+    // Collect each root's members in FIRST-APPEARANCE order. This used to be a
+    // `HashMap<usize, Vec<usize>>` drained with `into_values()`, but `RandomState` seeds
+    // every map instance separately, so the group order varied between two calls in the
+    // SAME process — and it reaches output: `finalize` emits `Placed` images in this
+    // order, and the emitter keeps it for images the reading-order sort leaves adjacent.
+    // The observable effect was a page whose composited figure picked a different tile
+    // cluster run to run (one real corpus document rendered 20 distinct HTML outputs in
+    // 40 renders, differing by ~37 KB of embedded image). The map below is only a
+    // root -> slot lookup; the ORDER lives in `out`, indexed by first appearance.
+    let mut slot_of: HashMap<usize, usize> = HashMap::new();
+    let mut out: Vec<Vec<usize>> = Vec::new();
     for i in 0..n {
         let r = find(&mut parent, i);
-        groups.entry(r).or_default().push(i);
+        let slot = *slot_of.entry(r).or_insert_with(|| {
+            out.push(Vec::new());
+            out.len() - 1
+        });
+        out[slot].push(i);
     }
-    groups.into_values().collect()
+    out
 }
 
 fn union_bbox(tiles: &[&RawTile]) -> (f32, f32, f32, f32) {
@@ -940,6 +960,34 @@ fn stitch_grid(doc: &Document, tiles: &[&RawTile], bbox: (f32, f32, f32, f32)) -
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_same_page_renders_byte_identical_html_every_time() {
+        // `img::cluster` returned its groups out of a `HashMap`, and `RandomState` seeds
+        // every map INSTANCE separately — so two renders in the SAME process saw a page's
+        // images in different orders, and the order reaches output (the emitter's
+        // raster/vector absorption is first-match-wins, and images sharing a y_top get
+        // identical sort boxes so nothing re-sorts them). One real 9-page document produced
+        // 20 distinct HTML outputs in 40 renders, two of them differing by a whole 37 KB
+        // embedded image. `tests/gen_fixtures.py::gen_image_order` is the owned repro: six
+        // separate single-tile clusters on one row, one top edge, six distinct colours.
+        // Pre-fix this failed on the 2nd or 3rd iteration; 25 renders over 720 possible
+        // orderings cannot pass by luck.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/image_order.pdf");
+        let doc = Document::load(path).expect("image_order.pdf fixture must load");
+        let raw = std::fs::read(path).expect("fixture readable");
+        let first = crate::html::to_html(&doc, &raw, crate::html::Mode::Page, true, true);
+        assert_eq!(first.matches("<img").count(), 6, "the fixture must place six separate rasters");
+        for i in 1..25 {
+            let again = crate::html::to_html(&doc, &raw, crate::html::Mode::Page, true, true);
+            assert!(
+                again == first,
+                "render {i} differs from render 0 ({} vs {} bytes) — to_html is not deterministic",
+                again.len(),
+                first.len()
+            );
+        }
+    }
+
     /// An adversarial fixture (`tests/gen_fixtures.py::gen_form_bomb`) and its first page.
     fn adversarial(name: &str) -> (Document, ObjectId) {
         let path = format!("{}/../tests/fixtures_pdf/adversarial/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -1047,3 +1095,4 @@ mod tests {
         assert!(got.iter().all(|v| v.abs_diff(160) <= 4), "gray JPEG round-trip: got {got:?}");
     }
 }
+
