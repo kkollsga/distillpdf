@@ -2082,6 +2082,107 @@ def gen_annot_appearance():
     }
 
 
+def gen_annot_render():
+    """A `/Stamp` whose appearance draws a raster, vector ink AND text at a `/BBox` that has
+    to be SCALED — non-uniformly — to reach its `/Rect`.
+
+    PDF 32000-1 §12.5.5: an annotation's normal appearance is a Form XObject a viewer paints
+    onto the page, reached from neither the content stream nor the page's `/Resources`. The
+    render path ignored `/Annots` entirely, because placing one is not a rewire: the
+    appearance algorithm maps the `/Matrix`-transformed `/BBox` onto `/Rect`, and nothing in
+    the crate computed that. A corpus stamp carries `/BBox [0 0 13.9 17.4]` against `/Rect
+    [344.9 456.1 348.9 461.1]` — drawn at its own coordinates its image lands ~345 pt adrift.
+
+    The mapping is pinned by making every factor different and none of them 1:
+
+      /Matrix [2 0 0 2 0 0]  x  /BBox [0 0 50 50]  ->  A = (0, 0, 100, 100)
+      /Rect [200 400 400 550]  ->  sx = 2, sy = 1.5   (NON-uniform: sx != sy)
+      total: x scales x4 and y scales x3 off an origin at (200, 400)
+
+    so form point (2, 2) lands at (208, 406) and form point (2, 40) at (208, 520). Nothing
+    but the full algorithm puts them there.
+
+    The other three annotations are the selection rules a RENDERER must apply, each carrying
+    a word that must never reach the output:
+      * a hidden `/Stamp` (`/F 2`) — §12.5.3 says do not display and do not print;
+      * a `/Widget` whose `/AS /On` selects one of two states — the other must not paint;
+      * a `/Widget` with a state dictionary and NO `/AS` — no state is current, so a renderer
+        draws nothing. (`extract_images`'s *collector* takes every state instead; the two
+        readings are deliberately different and `walker::StateRule` names both.)"""
+    pdf = os.path.join(OUT, "annot_render.pdf")
+    img = _flate_image(5, 2, 2, b"/DeviceRGB", 8,
+                       bytes((220, 30, 40, 30, 160, 60, 40, 60, 210, 230, 190, 40)))
+
+    # The stamp's appearance, in FORM space (0..50 square, before /Matrix doubles it).
+    stamp_ap = b"\n".join([
+        b"q 0.20 0.60 0.60 rg 0 0 50 50 re f Q",                      # panel
+        b"q 0 0 0 RG 0.4 w 0 0 50 50 re S Q",                         # frame
+        b"q 0 0 0 RG 0.4 w 2 2 m 48 48 l S Q",                        # a slanted line: graphic ink
+        b"q 0 0 0 RG 0.4 w 48 2 m 2 48 l S Q",
+        # the same three-swatch palette every owned figure fixture carries (see
+        # `gen_clipped_raster`) so the ink gate judges this a figure, not a ruled box
+        b"q 0.85 0.20 0.15 rg 3 44 3 3 re f Q",
+        b"q 0.20 0.55 0.80 rg 8 44 3 3 re f Q",
+        b"q 0.95 0.75 0.10 rg 13 44 3 3 re f Q",
+        b"q 10 0 0 10 2 2 cm /ImAp Do Q",                             # -> (208, 406) 40x30
+        b"BT /F1 4 Tf 2 40 Td (StampInkVisible) Tj ET",               # -> (208, 520) size 12
+    ])
+
+    def text_ap(word):
+        return b"BT /F1 10 Tf 2 4 Td (%s) Tj ET" % word
+
+    def form(num, res, content, bbox=b"[0 0 50 50]", matrix=b""):
+        return (b"<< /Type /XObject /Subtype /Form /FormType 1 /BBox %s %s"
+                b"/Resources %s /Length %d >>\nstream\n%s\nendstream"
+                % (bbox, matrix, res, len(content), content))
+
+    page_content = (
+        b"BT /F1 19 Tf 72 720 Td (Annotation Appearances Are Page Content) Tj ET\n"
+        b"BT /F1 10 Tf 72 700 Td (The panel below is drawn by a /Stamp annotation.) Tj ET"
+    )
+    font = b"<< /Font << /F1 6 0 R >> >>"
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 6 0 R >> >> /Contents 4 0 R "
+            b"/Annots [8 0 R 10 0 R 14 0 R 18 0 R] >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(page_content), page_content),
+        5: img,
+        6: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        # 1. the /Stamp whose appearance must land at (200,400)-(400,550), scaled 4x by 3x
+        7: form(7, b"<< /Font << /F1 6 0 R >> /XObject << /ImAp 5 0 R >> >>", stamp_ap,
+                matrix=b"/Matrix [2 0 0 2 0 0] "),
+        8: b"<< /Type /Annot /Subtype /Stamp /Rect [200 400 400 550] /F 4 /AP << /N 7 0 R >> >>",
+        # 2. HIDDEN (/F bit 2): a viewer neither displays nor prints it
+        9: form(9, font, text_ap(b"HiddenStampMustNotPaint")),
+        10: b"<< /Type /Annot /Subtype /Stamp /Rect [72 300 300 340] /F 2 /AP << /N 9 0 R >> >>",
+        # 3. /AS selects exactly one state
+        11: form(11, font, text_ap(b"SelectedStateOn")),
+        12: form(12, font, text_ap(b"UnselectedStateOff")),
+        14: (b"<< /Type /Annot /Subtype /Widget /Rect [72 250 300 290] /F 4 /AS /On "
+             b"/AP << /N << /On 11 0 R /Off 12 0 R >> >> >>"),
+        # 4. a state dictionary with NO /AS: no state is current, so a RENDERER paints nothing
+        15: form(15, font, text_ap(b"NoStateSelected")),
+        18: (b"<< /Type /Annot /Subtype /Widget /Rect [72 200 300 240] /F 4 "
+             b"/AP << /N << /S1 15 0 R >> >> >>"),
+        # /_assemble_pdf needs contiguous object numbers.
+        13: b"<< /Type /Null >>",
+        16: b"<< /Type /Null >>",
+        17: b"<< /Type /Null >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["annot_render.pdf"] = {
+        "rect": [200, 400, 400, 550],
+        "raster": [208, 406, 248, 436],   # x0 y0 x1 y1 of the appearance's raster, page space
+        "label": "StampInkVisible",
+        "label_xy": [208, 520],
+        "label_size": 12,
+        "must_not_paint": ["HiddenStampMustNotPaint", "UnselectedStateOff", "NoStateSelected"],
+        "must_paint": ["StampInkVisible", "SelectedStateOn"],
+    }
+
+
 def gen_no_spurious_figs():
     """Precision gate: a prose page with incidental tiny marks (a short underline rule, a
     small box) and NO figure caption anywhere. Weak vector candidates must NOT be promoted
@@ -3714,6 +3815,7 @@ def main():
     gen_form_font()
     gen_unfiltered_form()
     gen_annot_appearance()
+    gen_annot_render()
     gen_no_spurious_figs()
     gen_links()
     gen_pagelabels()

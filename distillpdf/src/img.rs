@@ -557,6 +557,24 @@ pub fn positioned_images(doc: &Document, page_id: ObjectId, want_uris: bool) -> 
     let mut raws: Vec<RawTile> = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
     walk(doc, &content.operations, &xmap, &res, Mat::ID, None, None, &mut raws, 0, &mut budget, &[]);
+    // §12.5.5: an annotation's appearance stream is page content a viewer paints ON TOP of
+    // the content stream — and it is reachable from neither that stream nor the page's
+    // `/Resources`. Addressed past the last page operation so paint order puts it there.
+    for (k, (_, ap, ctm)) in crate::walker::placed_appearances(doc, page_id).into_iter().enumerate() {
+        // The appearance's resources are its OWN (§12.5.5), so the scope it descends from is
+        // empty — this walk's `OverlayParent` against nothing, which is `OwnOnly` except it
+        // still runs an appearance that declares no `/Resources` (path ink needs none).
+        let f = match descend_form(doc, ap, &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0) {
+            Descend::Into(f) => f,
+            Descend::Skip => continue,
+            Descend::Halt => break,
+        };
+        let sub_ctm = f.matrix.mul(ctm);
+        let clip = crate::walker::form_bbox_clip(doc, ap, sub_ctm).map(|bb| (bb.x0, bb.y0, bb.x1, bb.y1));
+        let ares = Rc::new(f.scope.resources.clone().unwrap_or_default());
+        let here = PaintSeq::at(&[], content.operations.len() + k);
+        walk(doc, &f.ops, &f.scope.xobjects, &ares, sub_ctm, clip, None, &mut raws, 1, &mut budget, here.as_slice());
+    }
     // The page's `/Rotate` reaches only the emitted PIXELS and the matrix that places them
     // (see `turn_pixels`): every bbox this module hands out stays in page space, because every
     // cross-subsystem comparison in `html.rs` — captions, containment, reading order — is

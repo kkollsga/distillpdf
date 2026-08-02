@@ -1061,5 +1061,34 @@
       60,
       210
     ]
+  },
+  "annot_render.pdf": {
+    "rect": [
+      200,
+      400,
+      400,
+      550
+    ],
+    "raster": [
+      208,
+      406,
+      248,
+      436
+    ],
+    "label": "StampInkVisible",
+    "label_xy": [
+      208,
+      520
+    ],
+    "label_size": 12,
+    "must_not_paint": [
+      "HiddenStampMustNotPaint",
+      "UnselectedStateOff",
+      "NoStateSelected"
+    ],
+    "must_paint": [
+      "StampInkVisible",
+      "SelectedStateOn"
+    ]
   }
 }

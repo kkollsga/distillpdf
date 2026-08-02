@@ -982,6 +982,29 @@ fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (
     let mut painted = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
     walk(doc, ops, &xmap, &egmap, &csmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget, &[]);
+    // §12.5.5: an annotation's appearance is page content, painted on top of the content
+    // stream and reachable from neither it nor the page's `/Resources`. Its ink is this
+    // walk's business exactly as a form's is — see `walker::placed_appearances` for the
+    // `/BBox`→`/Rect` mapping that makes it land where a viewer puts it.
+    for (k, (_, ap, actm)) in crate::walker::placed_appearances(doc, page_id).into_iter().enumerate() {
+        // The appearance's resources are its OWN, so the scope it descends from is empty.
+        let f = match descend_form(doc, ap, &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0) {
+            Descend::Into(f) => f,
+            Descend::Skip => continue,
+            Descend::Halt => break,
+        };
+        let (mut aeg, mut acs) = (HashMap::new(), HashMap::new());
+        if let Some(fr) = &f.scope.resources {
+            aeg.extend(extgstates_of(doc, fr));
+            acs.extend(colorspaces_of(doc, fr));
+        }
+        let mut g = GState::new(f.matrix.mul(actm), [0; 3], [0; 3], 1.0, 1.0, 1.0);
+        if let Some(bb) = crate::walker::form_bbox_clip(doc, ap, g.ctm) {
+            g.clip = Some(intersect_clip(g.clip, (bb.x0, bb.y0, bb.x1, bb.y1)));
+        }
+        let here = PaintSeq::at(&[], content.operations.len() + k);
+        walk(doc, &f.ops, &f.scope.xobjects, &aeg, &acs, g, &mut painted, 1, &mut budget, here.as_slice());
+    }
     // Paint order is stamped by the walk itself (`PaintSeq`, the operation's address in the
     // content tree) rather than re-derived from this vector's order here. The two are the
     // same ordering, but only the address is comparable with `img::positioned_images`'s

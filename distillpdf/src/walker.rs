@@ -444,13 +444,14 @@ fn annotation_hidden(annot: &Dictionary) -> bool {
     annot.get(b"F").and_then(|o| o.as_i64()).unwrap_or(0) & 2 != 0
 }
 
-/// Push the appearance stream `val` resolves to, if it is one.
-fn push_appearance<'a>(doc: &'a Document, val: &Object, out: &mut Vec<(ObjectId, &'a lopdf::Stream)>) {
+/// Push the appearance stream `val` resolves to, if it is one, with the annotation it
+/// belongs to (whose `/Rect` places it — see [`appearance_ctm`]).
+fn push_appearance<'a>(doc: &'a Document, annot: &'a Dictionary, val: &Object, out: &mut Vec<(&'a Dictionary, ObjectId, &'a lopdf::Stream)>) {
     let Ok(id) = val.as_reference() else {
         return; // a stream is always an indirect object (§7.3.8); nothing else is one
     };
     if let Ok(stream) = doc.get_object(id).and_then(|o| o.as_stream()) {
-        out.push((id, stream));
+        out.push((annot, id, stream));
     }
 }
 
@@ -478,19 +479,32 @@ fn push_appearance<'a>(doc: &'a Document, val: &Object, out: &mut Vec<(ObjectId,
 /// semantics of a Form XObject whose `/Resources` are the ones it declares; it does not
 /// inherit the page's. A consumer walking one uses [`ScopePolicy::OwnOnly`].
 ///
-/// **Who consumes this, and who deliberately does not.** `extract::extract_images` does:
-/// an image that exists only inside a stamp's appearance is one of the page's images and
-/// nobody was reporting it. `extract::extract_fonts` does not (parity verdict recorded at
-/// that function). The three **render** walks (`img`, `vector`, `text`) do not, and that is
-/// a placement problem rather than an enumeration one: §12.5.5's appearance algorithm maps
-/// the transformed `/BBox` onto the annotation's `/Rect`, and nothing in this crate
-/// computes that mapping. The corpus stamp this gap was found on has `/BBox [0 0 13.9
-/// 17.4]` against `/Rect [344.9 456.1 348.9 461.1]` — painted without the mapping its image
-/// lands ~345pt from where a viewer puts it, and ink in the wrong place is a worse answer
-/// than no ink. Adopting rasters alone would also draw a widget's image while its own
-/// vector ink and text stayed invisible. Both are real work, not a rewire, and belong in a
-/// phase that owns the `/Rect` mapping.
+/// **Who consumes this.** `extract::extract_images` does: an image that exists only inside
+/// a stamp's appearance is one of the page's images and nobody was reporting it.
+/// `extract::extract_fonts` does not (parity verdict recorded at that function). The three
+/// **render** walks (`img`, `vector`, `text`) consume [`placed_appearances`] instead — the
+/// same enumeration under the `Current` state rule, carrying the §12.5.5 placement matrix an
+/// enumerator has no use for.
 pub(crate) fn appearance_streams(doc: &Document, page_id: ObjectId) -> Vec<(ObjectId, &lopdf::Stream)> {
+    annot_appearances(doc, page_id, StateRule::All).into_iter().map(|(_, id, s)| (id, s)).collect()
+}
+
+/// Which appearance state a walk takes when `/N` is a state dictionary and `/AS` is absent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StateRule {
+    /// **Every** state — what a *collector* wants: a state-keyed appearance with no `/AS` is
+    /// a malformed annotation whose states are all equally plausible, and the question being
+    /// asked is "what resources does this page carry".
+    All,
+    /// **No** state, i.e. nothing. What a *renderer* must do: §12.5.5 leaves the appearance
+    /// undefined when no state is current, and painting all of them stacks a checkbox's
+    /// `/Off` on top of its `/Yes` — ink the page does not have.
+    Current,
+}
+
+/// The `/Annots` → `/AP` → `/N` walk both public enumerators share, with the annotation
+/// dictionary each stream came from (the renderer needs its `/Rect`).
+fn annot_appearances(doc: &Document, page_id: ObjectId, rule: StateRule) -> Vec<(&Dictionary, ObjectId, &lopdf::Stream)> {
     let mut out = Vec::new();
     let Ok(page) = doc.get_dictionary(page_id) else {
         return out;
@@ -515,24 +529,88 @@ pub(crate) fn appearance_streams(doc: &Document, page_id: ObjectId) -> Vec<(Obje
         };
         let Ok(n) = ap.get(b"N") else { continue };
         match deref(doc, n) {
-            Some(Object::Stream(_)) => push_appearance(doc, n, &mut out),
+            Some(Object::Stream(_)) => push_appearance(doc, annot, n, &mut out),
             Some(Object::Dictionary(states)) => match annot.get(b"AS").ok().and_then(|o| o.as_name().ok()) {
                 // `/AS` selects one state; naming an absent one displays nothing.
                 Some(state) => {
                     if let Ok(v) = states.get(state) {
-                        push_appearance(doc, v, &mut out);
+                        push_appearance(doc, annot, v, &mut out);
                     }
                 }
-                None => {
+                None if rule == StateRule::All => {
                     for (_, v) in states.iter() {
-                        push_appearance(doc, v, &mut out);
+                        push_appearance(doc, annot, v, &mut out);
                     }
                 }
+                None => {}
             },
             _ => {}
         }
     }
     out
+}
+
+/// The appearance streams a page's annotations **paint**, each with the matrix that puts it
+/// where a viewer puts it — what the `img`, `vector` and `text` walks consume.
+///
+/// Same enumeration as [`appearance_streams`] under [`StateRule::Current`], plus the piece
+/// that kept the render path out of annotations until now: the §12.5.5 mapping
+/// ([`appearance_ctm`]). An appearance whose `/Rect` or `/BBox` cannot be read, or which
+/// maps onto nothing, is skipped — ink in the wrong place is a worse answer than no ink.
+///
+/// The returned matrix is the CTM the appearance's **invocation** sits under, i.e. it is
+/// composed with the form's own `/Matrix` by the same `f.matrix.mul(ctm)` every `Do` uses.
+pub(crate) fn placed_appearances(doc: &Document, page_id: ObjectId) -> Vec<(ObjectId, &lopdf::Stream, Mat)> {
+    annot_appearances(doc, page_id, StateRule::Current)
+        .into_iter()
+        .filter_map(|(annot, id, s)| appearance_ctm(doc, annot, s).map(|m| (id, s, m)))
+        .collect()
+}
+
+/// A 4-number rectangle from a dictionary key, normalized. Every element is dereferenced:
+/// a `/Rect [344.9 456.1 348.9 5 0 R]` is legal and a direct-only read turns it into 0.
+fn rect_key(doc: &Document, d: &Dictionary, key: &[u8]) -> Option<crate::geom::Rect> {
+    let a = d.get(key).ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_array().ok())?;
+    if a.len() < 4 {
+        return None;
+    }
+    let v: Vec<f32> = a.iter().take(4).map(|o| num_deref(doc, o)).collect();
+    Some(crate::geom::Rect::new(v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])))
+}
+
+/// PDF 32000-1 §12.5.5, the **appearance algorithm**: the matrix that maps an annotation's
+/// appearance stream onto its `/Rect`.
+///
+/// This is the mapping whose absence kept the three render walks out of annotations. The
+/// corpus stamp that surfaced the gap carries `/BBox [0 0 13.9 17.4]` against `/Rect [344.9
+/// 456.1 348.9 461.1]`: painted at the form's own coordinates its image lands ~345 pt from
+/// where a viewer puts it.
+///
+/// The algorithm, verbatim: transform the `/BBox` corners by the form's `/Matrix`; take the
+/// axis-aligned box **A** of the result; compute the matrix that maps A onto `/Rect`
+/// (translate + non-uniform scale); the appearance is then drawn under that matrix composed
+/// with `/Matrix`. Returning the *first* factor alone is deliberate — every caller composes
+/// `/Matrix` itself via [`descend_form`], so this must not pre-apply it.
+///
+/// `None` when either rectangle is missing or degenerate. A zero-extent `/Rect` is an
+/// annotation with nowhere to paint, and a zero-extent transformed `/BBox` has no scale that
+/// reaches one.
+fn appearance_ctm(doc: &Document, annot: &Dictionary, stream: &lopdf::Stream) -> Option<Mat> {
+    let rect = rect_key(doc, annot, b"Rect")?;
+    let bbox = rect_key(doc, &stream.dict, b"BBox")?;
+    let m = form_matrix(doc, stream);
+    let mut a = crate::geom::Rect::EMPTY;
+    for (u, v) in [(bbox.x0, bbox.y0), (bbox.x1, bbox.y0), (bbox.x1, bbox.y1), (bbox.x0, bbox.y1)] {
+        let (x, y) = m.apply(u, v);
+        a.include(x, y);
+    }
+    let (aw, ah) = (a.x1 - a.x0, a.y1 - a.y0);
+    let (rw, rh) = (rect.x1 - rect.x0, rect.y1 - rect.y0);
+    if aw <= 1e-6 || ah <= 1e-6 || rw <= 1e-6 || rh <= 1e-6 {
+        return None;
+    }
+    let (sx, sy) = (rw / aw, rh / ah);
+    Some(Mat { a: sx, b: 0.0, c: 0.0, d: sy, e: rect.x0 - a.x0 * sx, f: rect.y0 - a.y0 * sy })
 }
 
 /// Descend into a Form XObject: the whole mechanic, in the one order, with the caps
@@ -678,6 +756,69 @@ mod tests {
             0,
         );
         assert!(matches!(under, Descend::Into(_)), "one level under the cap still descends");
+    }
+
+    /// `annot_render.pdf`, page 1 — see `tests/gen_fixtures.py::gen_annot_render`.
+    fn annot_render() -> (Document, ObjectId) {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/annot_render.pdf");
+        let doc = Document::load(path).expect("annot_render.pdf fixture must load");
+        let page = *doc.get_pages().get(&1).expect("page 1");
+        (doc, page)
+    }
+
+    #[test]
+    fn an_annotation_appearance_paints_its_raster_vector_ink_and_text_onto_the_page() {
+        // §12.5.5's appearance algorithm, which nothing in the crate computed: the render
+        // walks ignored `/Annots` outright, so a stamp's content was invisible to `to_html`
+        // while `extract_images` reported it. The fixture makes every factor of the mapping
+        // different and none of them 1 — `/Matrix [2 0 0 2 0 0]` x `/BBox [0 0 50 50]` onto
+        // `/Rect [200 400 400 550]` is a 4x horizontal and 3x VERTICAL scale off (200, 400)
+        // — so nothing short of the full algorithm lands the ink where these assertions say.
+        let (doc, page) = annot_render();
+
+        // 1. the raster. Form (2,2)+10x10 -> page (208, 406) 40x30.
+        let tiles = crate::img::positioned_images(&doc, page, true);
+        assert_eq!(tiles.len(), 1, "the page's only raster lives in the stamp's appearance");
+        let t = &tiles[0];
+        for (got, want, what) in [
+            (t.x_left, 208.0, "x0"), (t.y_bottom, 406.0, "y0"),
+            (t.x_right, 248.0, "x1"), (t.y_top, 436.0, "y1"),
+        ] {
+            assert!((got - want).abs() < 0.5, "raster {what}: {got} != {want}");
+        }
+
+        // 2. the vector ink — the appearance's panel and frame fill the whole `/Rect`.
+        let (strong, _) = crate::vector::positioned_vectors(&doc, page);
+        let fig = strong.iter().find(|f| f.x_left < 205.0 && f.x_right > 395.0).unwrap_or_else(|| {
+            panic!("no figure spans the stamp's /Rect; got {:?}", strong.iter().map(|f| (f.x_left, f.x_right)).collect::<Vec<_>>())
+        });
+        assert!((fig.y_bottom - 400.0).abs() < 2.0 && (fig.y_top - 550.0).abs() < 2.0, "figure y {} .. {}", fig.y_bottom, fig.y_top);
+
+        // 3. the text. Form (2,40) at 4 pt -> page (208, 520) at 12 pt (the vertical scale).
+        let raw = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/annot_render.pdf")).expect("readable");
+        let spans = crate::text::extract_spans(&doc, page, &raw);
+        let label = spans.iter().find(|s| s.text.contains("StampInkVisible")).expect("the stamp's text must reach the span set");
+        assert!((label.x - 208.0).abs() < 1.0 && (label.y - 520.0).abs() < 1.0, "label at ({}, {})", label.x, label.y);
+        assert!((label.size - 12.0).abs() < 0.5, "label size {} — the /Rect's VERTICAL scale", label.size);
+
+        // 4. the selection rules a renderer must apply, and the one it must not borrow from
+        // the collector: no `/AS` over a state dictionary means no state is current.
+        let all: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(all.contains("SelectedStateOn"), "/AS names the state that paints");
+        for absent in ["HiddenStampMustNotPaint", "UnselectedStateOff", "NoStateSelected"] {
+            assert!(!all.contains(absent), "{absent} must never reach the page");
+        }
+    }
+
+    #[test]
+    fn a_collector_takes_every_unselected_state_where_a_renderer_takes_none() {
+        // The one place the two enumerations disagree, kept honest in both directions:
+        // `annot_render.pdf`'s fourth annotation is a state dictionary with no `/AS`.
+        let (doc, page) = annot_render();
+        let collected = appearance_streams(&doc, page).len();
+        let rendered = placed_appearances(&doc, page).len();
+        assert_eq!(collected, 3, "a collector takes the stamp, the /AS state and the state with no /AS");
+        assert_eq!(rendered, 2, "a renderer draws only the stamp and the /AS-selected state");
     }
 
     #[test]

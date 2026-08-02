@@ -1042,6 +1042,20 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
     let mut spans = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
     decode_spans(doc, &content.operations, &fonts, &xmap, Mat::ID, raw, 0, &mut spans, &mut budget);
+    // §12.5.5: an annotation's appearance stream is page content — a filled form field's
+    // value, a stamp's caption — reachable from neither the content stream nor the page's
+    // `/Resources`. `walker::placed_appearances` carries the `/BBox`→`/Rect` mapping that
+    // puts it where a viewer puts it; its fonts are its own, exactly as a form's are.
+    for (_, ap, actm) in crate::walker::placed_appearances(doc, page_id) {
+        let f = match descend_form(doc, ap, &XMap::new(), ScopePolicy::OwnOnly, 0, &mut budget, fonts.len()) {
+            Descend::Into(f) => f,
+            Descend::Skip => continue,
+            Descend::Halt => break,
+        };
+        let Some(fr) = &f.scope.resources else { continue };
+        let ff = build_fonts_from_resources(doc, fr, raw);
+        decode_spans(doc, &f.ops, &ff, &f.scope.xobjects, f.matrix.mul(actm), raw, 1, &mut spans, &mut budget);
+    }
     dedup_coincident(&mut spans);
     spans
 }
