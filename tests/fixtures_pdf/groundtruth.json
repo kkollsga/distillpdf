@@ -346,9 +346,19 @@
       "rc4_40.pdf",
       "rc4_128.pdf",
       "aes_128.pdf",
-      "aes_256.pdf"
+      "aes_256.pdf",
+      "inline_encrypt_aes_128.pdf",
+      "inline_encrypt_rc4_128.pdf"
     ],
-    "user_password_file": "userpw.pdf",
+    "inline_encrypt": [
+      "inline_encrypt_aes_128.pdf",
+      "inline_encrypt_rc4_128.pdf",
+      "inline_encrypt_userpw.pdf"
+    ],
+    "user_password_files": [
+      "userpw.pdf",
+      "inline_encrypt_userpw.pdf"
+    ],
     "user_password": "secret"
   }
 }

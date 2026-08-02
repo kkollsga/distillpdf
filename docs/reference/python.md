@@ -1017,8 +1017,9 @@ Raised by [`open`](#open) / [`from_bytes`](#from_bytes) / [`Pdf.open`](#pdfopen)
 user password — it needs a real password, or it uses an encryption scheme distillpdf cannot
 decrypt. Owner-password-only files (empty user password — the common "protected" PDF that
 readers open without prompting) are decrypted transparently and never raise this; RC4-40,
-RC4-128, AES-128 and AES-256 are all supported. Subclass of `ValueError`, so existing
-`except ValueError` handling keeps working.
+RC4-128, AES-128 and AES-256 are all supported, in both the usual `/Encrypt 9 0 R` trailer
+form and the inline `/Encrypt<<…>>` dictionary MuPDF/PyMuPDF writes. Subclass of `ValueError`,
+so existing `except ValueError` handling keeps working.
 
 ---
 

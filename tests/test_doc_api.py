@@ -371,10 +371,12 @@ def test_pagelabels_cli_find_shows_label_suffix(tmp_path):
 
 
 # ---- encrypted PDFs ---------------------------------------------------------
-# lopdf decrypts an owner-password-only file (empty user password) on load, so those open
-# and extract normally; a real user password is undecryptable and must RAISE rather than
-# hand back the blank document such a file parses into (0 pages, empty text, a ~184-byte
-# HTML shell) — the silent-blank defect this pins.
+# An owner-password-only file (empty user password) must open and extract normally in BOTH
+# trailer shapes: `/Encrypt 9 0 R`, and the MuPDF/PyMuPDF `/Encrypt<<…>>` inline dictionary
+# that lopdf does not recognise (the `inline_encrypt_*` fixtures — those used to load as a
+# document with no objects at all). A real user password is undecryptable either way and must
+# RAISE rather than hand back the blank document such a file parses into (0 pages, empty text,
+# a ~184-byte HTML shell) — the silent-blank defect this pins.
 ENC = os.path.join(FIX, "encrypted")
 ENC_GT = GT["encrypted"]
 
@@ -387,8 +389,9 @@ def test_owner_password_only_pdf_opens_and_extracts(name):
     assert ENC_GT["sentence"] in doc.to_html(return_string=True)
 
 
-def test_user_password_pdf_raises_instead_of_blank_document():
-    path = os.path.join(ENC, ENC_GT["user_password_file"])
+@pytest.mark.parametrize("name", ENC_GT["user_password_files"])
+def test_user_password_pdf_raises_instead_of_blank_document(name):
+    path = os.path.join(ENC, name)
     with pytest.raises(distillpdf.EncryptedPdfError) as exc:
         distillpdf.Pdf.open(path)
     assert "encrypted PDF" in str(exc.value)

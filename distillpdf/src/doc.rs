@@ -107,22 +107,129 @@ pub struct PdfDocument {
     pub(crate) ocr_cache: Mutex<HashMap<u32, String>>,
 }
 
-/// Make sure a loaded document is actually readable, encryption-wise.
+/// The trailer key whose value is the encryption dictionary.
+const ENCRYPT_KEY: &[u8] = b"Encrypt";
+/// Same length as `/Encrypt`, so swapping it in leaves every byte offset in the file (and
+/// therefore the whole cross-reference table) valid. See [`load_inline_encrypted`].
+const ENCRYPT_KEY_MASKED: &[u8] = b"/Encrypx";
+
+/// The encryption dictionary written **directly** in the trailer, if that is this file's
+/// shape.
 ///
-/// lopdf's loader already decrypts transparently with the empty user password, so every
-/// owner-password-only file (the common "protected" PDF that readers open without
-/// prompting) arrives here decrypted: RC4-40 (R2), RC4-128 (R3/R4), AES-128 (R4/AESV2) and
-/// AES-256 (R6/AESV3) all verified against `tests/fixtures_pdf/encrypted/`. When it could
-/// *not* decrypt — a real user password, or a revision lopdf doesn't implement — it hands
-/// back a document that still carries `/Encrypt` and holds no objects, which used to sail
-/// through as a "successfully opened" PDF with 0 pages, empty text and an empty HTML shell.
-/// Retry the empty password explicitly (so a scheme the loader skipped still gets a chance)
-/// and, failing that, say so: [`Error::Encrypted`], never silent blank output.
-fn ensure_decrypted(doc: &mut Document) -> Result<(), Error> {
-    if !doc.is_encrypted() {
-        return Ok(());
+/// Most producers write `/Encrypt 9 0 R`; MuPDF (and therefore PyMuPDF, a very common
+/// producer) writes the dictionary inline: `/Encrypt<</Filter/Standard/R 4 …>>`. lopdf's
+/// `is_encrypted()` only recognises the indirect form — `get_encrypted()` insists on
+/// `as_reference()` — so its loader never authenticates, bails out of
+/// `load_encrypted_document` with **zero objects parsed**, and hands back a document that
+/// reports `is_encrypted() == false` while holding nothing at all. That is the silent blank:
+/// 0 pages, empty text, an empty HTML shell, no error.
+fn inline_encrypt_dict(doc: &Document) -> Option<lopdf::Dictionary> {
+    match doc.trailer.get(ENCRYPT_KEY) {
+        Ok(lopdf::Object::Dictionary(d)) => Some(d.clone()),
+        _ => None,
     }
-    doc.decrypt("").map_err(|_| Error::Encrypted)
+}
+
+/// Rewrite every `/Encrypt<<…` trailer key to an inert same-length name.
+///
+/// Only a *direct* dictionary value can follow, so the `<<` lookahead cannot match the
+/// ordinary `/Encrypt 9 0 R` form (nor, realistically, ciphertext). The replacement is
+/// byte-for-byte the same length, so all xref offsets survive.
+fn mask_inline_encrypt_keys(raw: &[u8]) -> Vec<u8> {
+    let mut out = raw.to_vec();
+    let key = b"/Encrypt";
+    let mut i = 0;
+    while let Some(hit) = out[i..].windows(key.len()).position(|w| w == key) {
+        let at = i + hit;
+        let mut j = at + key.len();
+        while out.get(j).is_some_and(|b| b.is_ascii_whitespace()) {
+            j += 1;
+        }
+        if out[j..].starts_with(b"<<") {
+            out[at..at + key.len()].copy_from_slice(ENCRYPT_KEY_MASKED);
+        }
+        i = at + key.len();
+    }
+    out
+}
+
+/// Load and decrypt a file whose encryption dictionary sits inline in the trailer.
+///
+/// lopdf gives us no way to point it at a direct `/Encrypt` dictionary, so we hand it the
+/// shape it does understand: mask the trailer key (offset-preserving, so the file still
+/// parses) and reload, which takes the plain path and yields the full object graph with its
+/// strings and streams still ciphertext; then re-attach the dictionary we already parsed as a
+/// real indirect object and run lopdf's own authentication and per-object decryption over it
+/// ([`decrypt_leniently`]). No re-implemented crypto, no lopdf version bump.
+fn load_inline_encrypted(raw: &[u8], encrypt: lopdf::Dictionary) -> Result<Document, Error> {
+    let mut doc = Document::load_mem(&mask_inline_encrypt_keys(raw)).map_err(|_| Error::Encrypted)?;
+    let id = doc.add_object(lopdf::Object::Dictionary(encrypt));
+    doc.trailer.set(ENCRYPT_KEY.to_vec(), lopdf::Object::Reference(id));
+    decrypt_leniently(&mut doc, id)?;
+    Ok(doc)
+}
+
+/// Decrypt every object with the empty user password, skipping the ones that will not
+/// decrypt instead of failing the whole document.
+///
+/// This is `Document::decrypt` with lopdf's *loader* semantics rather than its API
+/// semantics: `decrypt()` propagates the first per-object failure, while the loader
+/// (`reader.rs::load_encrypted_document`) ignores them. Leniency is the correct behaviour
+/// here — a file saved with `/EncryptMetadata false` legitimately contains an object that is
+/// **not** encrypted, and blanket-decrypting it fails on padding. Authentication itself stays
+/// strict: a password we cannot satisfy is still [`Error::Encrypted`].
+fn decrypt_leniently(doc: &mut Document, encrypt_id: lopdf::ObjectId) -> Result<(), Error> {
+    doc.authenticate_password("").map_err(|_| Error::Encrypted)?;
+    let state = lopdf::EncryptionState::decode(&*doc, "").map_err(|_| Error::Encrypted)?;
+    for (&id, obj) in doc.objects.iter_mut() {
+        if id != encrypt_id {
+            let _ = lopdf::encryption::decrypt_object(&state, id, obj);
+        }
+    }
+    // Object streams are themselves encrypted, so their contents could not be read during the
+    // load; harvest them now that the containers are plaintext.
+    let mut nested = Vec::new();
+    for obj in doc.objects.values_mut() {
+        if let Ok(stream) = obj.as_stream_mut() {
+            if stream.dict.has_type(b"ObjStm") {
+                if let Ok(os) = lopdf::ObjectStream::new(stream) {
+                    nested.extend(os.objects);
+                }
+            }
+        }
+    }
+    for (id, obj) in nested {
+        doc.objects.entry(id).or_insert(obj);
+    }
+    doc.trailer.remove(ENCRYPT_KEY);
+    doc.objects.remove(&encrypt_id);
+    Ok(())
+}
+
+/// Make sure a loaded document is actually readable, encryption-wise — the one place the
+/// "protected PDF" cases are resolved, for both `open` and `from_bytes`.
+///
+/// Three outcomes, and none of them is the blank document this used to return:
+/// * The loader already decrypted it. lopdf tries the empty user password itself, so every
+///   owner-password-only file (the common "protected" PDF a reader opens without prompting)
+///   arrives decrypted — RC4-40 (R2), RC4-128 (R3/R4), AES-128 (R4/AESV2), AES-256 (R6/AESV3).
+/// * `/Encrypt` is still there. Either it is an indirect dictionary the loader could not use
+///   (real user password, or a revision lopdf does not implement) — retry the empty password
+///   explicitly and report [`Error::Encrypted`] if that fails — or it is the inline dictionary
+///   of [`inline_encrypt_dict`], which [`load_inline_encrypted`] decrypts properly.
+/// * Belt and braces: whatever the shape, a file that carried `/Encrypt` and still has no
+///   readable page tree is exactly the silent-blank symptom, so it is an error too.
+fn ensure_decrypted(raw: &[u8], doc: &mut Document) -> Result<(), Error> {
+    let had_encrypt = doc.trailer.has(ENCRYPT_KEY);
+    if doc.is_encrypted() {
+        doc.decrypt("").map_err(|_| Error::Encrypted)?;
+    } else if let Some(encrypt) = inline_encrypt_dict(doc) {
+        *doc = load_inline_encrypted(raw, encrypt)?;
+    }
+    if had_encrypt && doc.get_pages().is_empty() {
+        return Err(Error::Encrypted);
+    }
+    Ok(())
 }
 
 impl PdfDocument {
@@ -130,7 +237,7 @@ impl PdfDocument {
     pub fn open(path: &str) -> Result<Self, Error> {
         let raw = std::fs::read(path).map_err(Error::Read)?;
         let mut doc = Document::load_mem(&raw).map_err(|e| Error::Open(e.to_string()))?;
-        ensure_decrypted(&mut doc)?;
+        ensure_decrypted(&raw, &mut doc)?;
         Ok(PdfDocument { doc, raw, source: Some(PathBuf::from(path)), ocr_cache: Default::default() })
     }
 
@@ -138,7 +245,7 @@ impl PdfDocument {
     pub fn from_bytes(data: &[u8]) -> Result<Self, Error> {
         let raw = data.to_vec();
         let mut doc = Document::load_mem(&raw).map_err(|e| Error::Parse(e.to_string()))?;
-        ensure_decrypted(&mut doc)?;
+        ensure_decrypted(&raw, &mut doc)?;
         Ok(PdfDocument { doc, raw, source: None, ocr_cache: Default::default() })
     }
 
@@ -464,8 +571,17 @@ mod tests {
     #[test]
     fn owner_password_only_files_open_and_extract() {
         // Empty user password + an owner password — the "protected" PDF every reader opens
-        // without prompting. One file per scheme lopdf 0.40 supports.
-        for name in ["rc4_40.pdf", "rc4_128.pdf", "aes_128.pdf", "aes_256.pdf"] {
+        // without prompting. One file per scheme lopdf 0.40 supports, in BOTH trailer shapes:
+        // `/Encrypt 9 0 R` and the MuPDF/PyMuPDF `/Encrypt<<…>>` inline dictionary, which used
+        // to load as a document with no objects at all.
+        for name in [
+            "rc4_40.pdf",
+            "rc4_128.pdf",
+            "aes_128.pdf",
+            "aes_256.pdf",
+            "inline_encrypt_aes_128.pdf",
+            "inline_encrypt_rc4_128.pdf",
+        ] {
             let path = enc_fixture(name);
             let doc = PdfDocument::open(&path).unwrap_or_else(|e| panic!("{name} must open: {e}"));
             assert!(doc.page_count() > 0, "{name}: no pages");
@@ -480,16 +596,35 @@ mod tests {
 
     #[test]
     fn user_password_file_errors_instead_of_returning_blank() {
-        let path = enc_fixture("userpw.pdf");
-        let err = PdfDocument::open(&path).err().expect("a user-password PDF must not open");
-        assert!(matches!(err, Error::Encrypted), "got {err:?}");
-        assert_eq!(
-            err.to_string(),
-            "encrypted PDF: needs a password, or uses an encryption scheme distillpdf cannot decrypt"
-        );
-        let bytes = std::fs::read(&path).unwrap();
-        let err = PdfDocument::from_bytes(&bytes).err().expect("from_bytes must not open it either");
-        assert!(matches!(err, Error::Encrypted), "got {err:?}");
+        // Both trailer shapes: the indirect `/Encrypt 7 0 R` file and the inline-dictionary
+        // one. Neither may come back as a readable-looking, empty document.
+        for name in ["userpw.pdf", "inline_encrypt_userpw.pdf"] {
+            let path = enc_fixture(name);
+            let err = PdfDocument::open(&path).err().unwrap_or_else(|| panic!("{name} must not open"));
+            assert!(matches!(err, Error::Encrypted), "{name}: got {err:?}");
+            assert_eq!(
+                err.to_string(),
+                "encrypted PDF: needs a password, or uses an encryption scheme distillpdf cannot decrypt"
+            );
+            let bytes = std::fs::read(&path).unwrap();
+            let err = PdfDocument::from_bytes(&bytes).err().unwrap_or_else(|| panic!("{name} from_bytes must fail"));
+            assert!(matches!(err, Error::Encrypted), "{name}: got {err:?}");
+        }
+    }
+
+    #[test]
+    fn masking_only_touches_a_direct_encrypt_dictionary() {
+        // The indirect form must survive untouched — masking it would strip a file's
+        // encryption dictionary out of the trailer for no reason.
+        let indirect = b"trailer << /Root 1 0 R /Encrypt 9 0 R >>".to_vec();
+        assert_eq!(mask_inline_encrypt_keys(&indirect), indirect);
+        let inline = b"trailer << /Root 1 0 R /Encrypt<< /Filter /Standard >> >>";
+        let masked = mask_inline_encrypt_keys(inline);
+        assert_eq!(masked.len(), inline.len(), "masking must preserve every byte offset");
+        assert!(masked.windows(8).all(|w| w != b"/Encrypt"));
+        assert!(masked.windows(8).any(|w| w == b"/Encrypx"));
+        // Whitespace between the key and the dictionary is still the direct form.
+        assert!(mask_inline_encrypt_keys(b"/Encrypt\n<< /R 4 >>").starts_with(b"/Encrypx"));
     }
 
     #[test]
@@ -533,4 +668,6 @@ mod tests {
         assert_eq!(DistillOptions::from_assets("none").unwrap().profile, AssetProfile::None);
     }
 }
+
+
 

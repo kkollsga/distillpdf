@@ -19,6 +19,7 @@ anchors, which reportlab does not emit).
 """
 import json
 import os
+import re
 
 from PIL import Image, ImageDraw
 from reportlab.lib.pagesizes import letter
@@ -580,7 +581,7 @@ def gen_figures_onepage():
 # Encrypted fixtures live in their own subfolder so the whole-fixture-set structural
 # sweeps (`_htmlcheck.owned_pdfs()`, which globs `fixtures_pdf/*.pdf` non-recursively)
 # keep ignoring them: they are single-sentence probes for the container-open path, not
-# document-fidelity fixtures, and one of them cannot be opened at all by design.
+# document-fidelity fixtures, and two of them cannot be opened at all by design.
 ENC_OUT = os.path.join(OUT, "encrypted")
 ENC_SENTENCE = "Encrypted fixture sentinel phrase for distillPDF."
 ENC_USER_PW = "secret"
@@ -595,14 +596,48 @@ def _enc_page(c):
     c.save()
 
 
+def _inline_encrypt_dict(path, out_name):
+    """Rewrite an encrypted PDF so its `/Encrypt` dictionary sits DIRECTLY in the trailer.
+
+    The producer shape MuPDF/PyMuPDF emits — `/Encrypt<</Filter/Standard/R 4 …>>` instead of
+    `/Encrypt 9 0 R` — and the one lopdf's `is_encrypted()` does not recognise, so it silently
+    yields a document with no objects at all. Self-generated on purpose: rather than commit a
+    PyMuPDF-written file (or take a pymupdf dev dependency) we splice the shape ourselves.
+
+    The splice is byte-safe: the encryption dictionary is written in full, in plaintext,
+    between `N 0 obj` and `endobj` (only strings and stream payloads are ever encrypted), so
+    it can be lifted verbatim; object N is then overwritten with a same-length `null` so the
+    file has exactly one encryption dictionary, in the trailer, like a MuPDF-written file; and
+    the trailer sits AFTER the cross-reference table, so growing it moves no offset the xref
+    or `startxref` records.
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+    ref = re.search(rb"/Encrypt (\d+) 0 R", data)
+    obj = re.search(rb"\n%d 0 obj\n(.*?)\nendobj" % int(ref.group(1)), data, re.S)
+    body = obj.group(1).strip()
+    data = data[: obj.start(1)] + b"null".ljust(len(obj.group(1))) + data[obj.end(1) :]
+    spliced = data[: ref.start()] + b"/Encrypt" + body + data[ref.end() :]
+    with open(os.path.join(ENC_OUT, out_name), "wb") as f:
+        f.write(spliced)
+    return out_name
+
+
 def gen_encrypted():
     """Encryption fixtures for the `PdfDocument::open` decrypt path.
 
-    Four OWNER-password-only files (empty user password — what every reader opens without
-    prompting), one per scheme lopdf 0.40 supports, plus one real USER-password file that
-    nothing can decrypt without the password. The contract they pin: an owner-only file
-    opens and extracts normally; the user-password file raises `Error::Encrypted` instead
-    of silently yielding 0 pages / empty text / an empty HTML shell.
+    Two shapes, because they fail differently:
+
+    * `/Encrypt 9 0 R` (nearly every producer) — lopdf's loader decrypts these itself with
+      the empty user password, so an owner-password-only file just works.
+    * `/Encrypt<<…>>` inline in the trailer (MuPDF/PyMuPDF) — lopdf's `is_encrypted()` only
+      recognises the indirect form, so it skipped decryption entirely and handed back a
+      document with ZERO objects: 0 pages, empty text, an empty HTML shell, no error. This
+      is the silent-blank defect; `load_inline_encrypted` in `doc.rs` handles it.
+
+    Owner-password-only files (empty user password — what every reader opens without
+    prompting) cover both shapes and every scheme lopdf supports; the two USER-password
+    files (one per shape) pin the honest-error floor: `Error::Encrypted`, never blank output.
 
     reportlab's `pdfencrypt` covers RC4-40/128 (its `strength=256` needs the optional
     `pyaes` package, so AES comes from pikepdf); pikepdf writes AES-128 (R4/AESV2) and
@@ -630,17 +665,33 @@ def gen_encrypted():
     plain = buf.getvalue()
 
     def pikepdf_enc(name, **kw):
+        path = os.path.join(ENC_OUT, name)
         with pikepdf.open(io.BytesIO(plain)) as p:
-            p.save(os.path.join(ENC_OUT, name), encryption=pikepdf.Encryption(**kw))
-        return name
+            p.save(path, encryption=pikepdf.Encryption(**kw))
+        return path
 
-    pikepdf_enc("aes_128.pdf", R=4, aes=True, user="", owner="owner")
+    aes_128 = pikepdf_enc("aes_128.pdf", R=4, aes=True, user="", owner="owner")
     pikepdf_enc("aes_256.pdf", R=6, aes=True, user="", owner="owner")
+    # RC4 through pikepdf needs metadata=False (it refuses to leave metadata unencrypted
+    # without AES); the reportlab RC4 files above cover the encrypted-metadata variant.
+    rc4_128 = pikepdf_enc("rc4_128_pk.pdf", R=4, aes=False, user="", owner="owner", metadata=False)
+    userpw_aes = pikepdf_enc("userpw_aes_128.pdf", R=4, aes=True, user=ENC_USER_PW, owner="owner")
+
+    inline = [
+        _inline_encrypt_dict(aes_128, "inline_encrypt_aes_128.pdf"),
+        _inline_encrypt_dict(rc4_128, "inline_encrypt_rc4_128.pdf"),
+    ]
+    inline_userpw = _inline_encrypt_dict(userpw_aes, "inline_encrypt_userpw.pdf")
+    # The two files the inline shape was spliced from are only intermediates; the indirect
+    # shape is already covered by the reportlab/pikepdf originals above.
+    for tmp in (rc4_128, userpw_aes):
+        os.remove(tmp)
 
     GT["encrypted"] = {
         "sentence": ENC_SENTENCE,
-        "owner_only": ["rc4_40.pdf", "rc4_128.pdf", "aes_128.pdf", "aes_256.pdf"],
-        "user_password_file": "userpw.pdf",
+        "owner_only": ["rc4_40.pdf", "rc4_128.pdf", "aes_128.pdf", "aes_256.pdf"] + inline,
+        "inline_encrypt": inline + [inline_userpw],
+        "user_password_files": ["userpw.pdf", inline_userpw],
         "user_password": ENC_USER_PW,
     }
 
