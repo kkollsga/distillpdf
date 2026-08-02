@@ -404,5 +404,12 @@
       "Figure 1: A reference grid drawn as twelve stroked rules.",
       "Figure 2: A dense scatter field of three hundred marks."
     ]
+  },
+  "inherited_mediabox.pdf": {
+    "page_width": 842,
+    "page_height": 595,
+    "figure_width": 300,
+    "caption": "Figure 1: A grid spanning 300 of the 842 point page.",
+    "n_figures": 1
   }
 }

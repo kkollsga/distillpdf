@@ -601,21 +601,46 @@ fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (
 }
 
 /// Page width from the MediaBox (used to size each figure as a share of the page).
+///
+/// `/MediaBox` is an INHERITABLE page attribute (PDF 32000-1 §7.7.3.4): a writer may state it
+/// once on the `/Pages` node and omit it from every page. Reading only the page dict made such
+/// files fall back to a guessed 612pt, so every figure on them was sized as the wrong share of
+/// the page. Walk up `/Parent` when the page itself doesn't carry the key.
 fn page_width(doc: &Document, page_id: ObjectId) -> f32 {
-    doc.get_object(page_id)
-        .ok()
-        .and_then(|o| o.as_dict().ok())
-        .and_then(|d| {
-            d.get(b"MediaBox")
-                .ok()
-                .or_else(|| d.get(b"CropBox").ok())
-                .and_then(|o| deref(doc, o))
-                .and_then(|o| o.as_array().ok())
-        })
+    inherited_box(doc, page_id)
         .filter(|a| a.len() >= 4)
         .map(|a| (num(&a[2]) - num(&a[0])).abs())
         .filter(|w| *w > 1.0)
         .unwrap_or(612.0)
+}
+
+/// The page's effective `/MediaBox` (falling back to `/CropBox`), inherited from the page tree
+/// when absent on the page node itself. Bounded by [`crate::MAX_FORM_DEPTH`] and a visited set
+/// so a malformed file with a cyclic or absurdly deep `/Parent` chain cannot hang the walk.
+fn inherited_box(doc: &Document, page_id: ObjectId) -> Option<Vec<Object>> {
+    let mut node = page_id;
+    let mut seen = Vec::new();
+    for _ in 0..crate::MAX_FORM_DEPTH {
+        if seen.contains(&node) {
+            return None; // cyclic /Parent chain
+        }
+        seen.push(node);
+        let dict = doc.get_object(node).ok()?.as_dict().ok()?;
+        let found = dict
+            .get(b"MediaBox")
+            .ok()
+            .or_else(|| dict.get(b"CropBox").ok())
+            .and_then(|o| deref(doc, o))
+            .and_then(|o| o.as_array().ok());
+        if let Some(a) = found {
+            return Some(a.clone());
+        }
+        node = match dict.get(b"Parent") {
+            Ok(Object::Reference(r)) => *r,
+            _ => return None,
+        };
+    }
+    None
 }
 
 /// Distribute form-internal text labels among the figures on a page (each label
@@ -981,6 +1006,30 @@ mod tests {
         let doc = Document::load(path).expect("dense_vector.pdf fixture must load");
         let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
         (doc, page_id)
+    }
+
+    #[test]
+    fn page_width_inherits_media_box_from_the_page_tree() {
+        // `/MediaBox` is inheritable, and the fixture states it only on the /Pages node.
+        // Reading the page dict alone fell through to the 612pt letter guess, which sized
+        // every figure on such a file as the wrong share of its page.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/inherited_mediabox.pdf");
+        let doc = Document::load(path).expect("inherited_mediabox.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        // The page really does lack the key — otherwise this test proves nothing.
+        let page = doc.get_object(page_id).unwrap().as_dict().unwrap();
+        assert!(page.get(b"MediaBox").is_err() && page.get(b"CropBox").is_err());
+        assert_eq!(page_width(&doc, page_id), 842.0, "must inherit A4 landscape, not guess 612");
+    }
+
+    #[test]
+    fn page_width_falls_back_when_no_ancestor_carries_a_box() {
+        // A page dict with no /MediaBox anywhere up the chain still gets the letter default
+        // rather than a zero-width figure scale.
+        let (doc, page_id) = dense_page();
+        assert_eq!(page_width(&doc, page_id), 612.0, "letter fixture is 612pt wide");
+        // A dangling page id resolves to nothing at all.
+        assert_eq!(page_width(&doc, (9_999, 0)), 612.0);
     }
 
     #[test]

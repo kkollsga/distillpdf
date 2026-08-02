@@ -689,6 +689,46 @@ def gen_dense_vector():
     }
 
 
+def gen_inherited_mediabox():
+    """Hand-written PDF whose ``/MediaBox`` lives ONLY on the ``/Pages`` node (A4 landscape,
+    842pt wide — deliberately not letter's 612). ``/MediaBox`` is an inheritable page attribute
+    (PDF 32000-1 §7.7.3.4) and reportlab always writes it per-page, so this shape needs a
+    hand-written file. A reader that looks only at the page dict falls back to a guessed 612pt
+    and sizes every figure as the wrong share of the page; the grid figure below spans 300 of
+    the 842pt, i.e. 36% of the page, not the 49% a 612pt guess implies."""
+    pdf = os.path.join(OUT, "inherited_mediabox.pdf")
+    page_w, page_h = 842, 595
+    fx, fy, fw, fh = 60, 240, 300, 150
+    lines = []
+    for i in range(8):  # horizontal rules
+        yy = fy + fh * i / 7.0
+        lines.append(b"%.1f %.1f m %.1f %.1f l S" % (fx, yy, fx + fw, yy))
+    for i in range(8):  # vertical rules
+        xx = fx + fw * i / 7.0
+        lines.append(b"%.1f %.1f m %.1f %.1f l S" % (xx, fy, xx, fy + fh))
+    content = (b"BT /F1 16 Tf 60 %d Td (An Inherited MediaBox) Tj ET\n" % (page_h - 60)
+               + b"0.8 w\n" + b"\n".join(lines) + b"\n"
+               + b"BT /F1 9 Tf 60 %d Td (Figure 1: A grid spanning 300 of the 842 point page.) Tj ET"
+               % (fy - 18))
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        # The MediaBox is stated ONCE, here, and inherited by the page below.
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 %d %d] >>" % (page_w, page_h),
+        3: (b"<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> >> "
+            b"/Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        5: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["inherited_mediabox.pdf"] = {
+        "page_width": page_w,
+        "page_height": page_h,
+        "figure_width": fw,
+        "caption": "Figure 1: A grid spanning 300 of the 842 point page.",
+        "n_figures": 1,
+    }
+
+
 def gen_figures_onepage():
     """Both figures (raster ABOVE, vector BELOW), each with its own caption directly
     beneath it, on ONE page. Regression guard for caption→figure anchoring: the captions
@@ -1447,6 +1487,7 @@ def main():
     gen_lof_dotleader()
     gen_small_vector_fig()
     gen_dense_vector()
+    gen_inherited_mediabox()
     gen_xobject_figure()
     gen_form_image()
     gen_form_font()
