@@ -153,6 +153,47 @@ pub(crate) fn page_xobjects(doc: &Document, page_id: ObjectId) -> XMap {
     map
 }
 
+/// Overlay one resource dictionary onto another, merging the per-kind sub-dictionaries
+/// **one level deep**: `/ColorSpace`, `/Font`, `/XObject` and friends are name → resource
+/// maps, so an inner dictionary that defines `/CS1` must not delete the `/CS0` an outer one
+/// defined. Within a kind, the inner name wins — the same nearest-wins precedence
+/// [`overlay_xobjects`] applies.
+///
+/// The sub-dictionaries are dereferenced on the way in (they are usually written as
+/// indirect objects) so the merged result is self-contained: a consumer can read it with a
+/// plain `get`, and it stays valid after the scope that produced it is gone.
+pub(crate) fn overlay_resources(doc: &Document, base: &mut Dictionary, inner: &Dictionary) {
+    for (key, val) in inner.iter() {
+        let Some(kind) = deref(doc, val).and_then(|o| o.as_dict().ok()) else {
+            base.set(key.clone(), val.clone()); // /ProcSet and friends: not a name map
+            continue;
+        };
+        match base.get(key).ok().and_then(|o| o.as_dict().ok()).cloned() {
+            Some(mut merged) => {
+                for (name, res) in kind.iter() {
+                    merged.set(name.clone(), res.clone());
+                }
+                base.set(key.clone(), Object::Dictionary(merged));
+            }
+            None => base.set(key.clone(), Object::Dictionary(kind.clone())),
+        }
+    }
+}
+
+/// A page's effective resource dictionary: its whole [`page_resource_chain`] folded
+/// outermost-first through [`overlay_resources`], so every name the page can name resolves
+/// in one dictionary.
+///
+/// This is what a `/ColorSpace /CS0` on one of the page's images has to be looked up in
+/// (§8.6.3) — the name alone describes nothing.
+pub(crate) fn page_resources(doc: &Document, page_id: ObjectId) -> Dictionary {
+    let mut out = Dictionary::new();
+    for res in page_resource_chain(doc, page_id) {
+        overlay_resources(doc, &mut out, &res);
+    }
+    out
+}
+
 /// Resolve a `Do` operand to the XObject stream it names, in the scope in force.
 /// `None` when the operand is not a name, the name is not in scope (a dangling reference
 /// — nothing to draw), or the object is not a stream.

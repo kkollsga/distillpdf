@@ -7,11 +7,14 @@
 //! the strong stack a home is what lets those render-path defects be fixed ONCE, at the
 //! helper, in the phases that follow — rather than by copying a fifth variant.
 //!
-//! `img.rs` now consumes the JPEG half of this stack too ([`decode_dct_rgb`],
-//! [`decode_inverts`], [`codec_payload`]), which is what makes the render path honour an
-//! inverting `/Decode` on a gray or RGB JPEG — its own copies applied that only to CMYK.
-//! Its `decode_rgb` / `cs_channels` (the raw-sample half) are still weaker than
-//! [`assemble_png`] below; rewiring those is a behaviour change of its own.
+//! `img.rs` now consumes the whole stack. The JPEG half ([`decode_dct_rgb`],
+//! [`decode_inverts`], [`codec_payload`]) is what makes the render path honour an inverting
+//! `/Decode` on a gray or RGB JPEG — its own copies applied that only to CMYK. The sample
+//! half ([`decode_samples`], and [`samples_decodable`] for the no-decode placeholder gate)
+//! replaced a decoder that read 8 bpc only and *guessed* the channel count from
+//! `len(samples) / (w·h)`, so an Indexed image rendered its palette indices as gray levels.
+//! Extract and render now decode the same bytes the same way, by construction rather than
+//! by two teams keeping two copies in step.
 //!
 //! **Invariants callers may rely on and must not re-check:**
 //! - Nothing here panics or fabricates pixels. A stream that cannot be reduced faithfully
@@ -206,16 +209,26 @@ fn decode_array(doc: &Document, dict: &Dictionary, n: usize) -> Option<Vec<f32>>
         .collect()
 }
 
-/// Assemble a real PNG file from an image XObject's *samples* — the `format:"raw"` case
-/// (Flate/LZW/uncompressed), which is 1167 of 2604 corpus rows and none of which opened
-/// as an image file before: the caller got back compressed samples with no container.
+/// Everything about a sampled image that is decidable from its *dictionary* alone: the
+/// colour model, the bit depth, and the pixel dimensions, all already bounds-checked.
 ///
-/// Handles 1/2/4/8/16 bits per component, the `/Decode` array, `/ImageMask` stencils, and
-/// Gray/RGB/CMYK/ICCBased/Indexed colour spaces. Returns `None` — leaving the row at
-/// `format:"raw"` with its (now complete) metadata — for anything it cannot reduce
-/// faithfully, rather than emitting a confidently wrong picture.
-pub(crate) fn assemble_png(doc: &Document, res: &Dictionary, stream: &lopdf::Stream, w: i64, h: i64) -> Option<Vec<u8>> {
-    let dict = &stream.dict;
+/// Split out of [`decode_samples`] so the cheap "could this be decoded?" question and the
+/// decode itself answer from ONE gate. `img.rs`'s placeholder mode asked it separately
+/// (`bpc == 8` and nothing else), which both over-counted images the decoder then refused
+/// and under-counted the sub-byte depths it can in fact render.
+struct SamplePlan {
+    cs: Cs,
+    /// Bits per component; one of 1, 2, 4, 8, 16.
+    bpc: usize,
+    w: usize,
+    h: usize,
+}
+
+/// The dictionary-only half of the decode gate — see [`SamplePlan`]. Touches no stream
+/// bytes, so a caller may ask it about every image on a page for free.
+fn sample_plan(doc: &Document, res: &Dictionary, dict: &Dictionary) -> Option<SamplePlan> {
+    let w = deref(doc, dict.get(b"Width").ok()?)?.as_i64().ok()?;
+    let h = deref(doc, dict.get(b"Height").ok()?)?.as_i64().ok()?;
     if w <= 0 || h <= 0 || w > MAX_IMAGE_DIM || h > MAX_IMAGE_DIM {
         return None;
     }
@@ -235,7 +248,66 @@ pub(crate) fn assemble_png(doc: &Document, res: &Dictionary, stream: &lopdf::Str
     if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
         return None;
     }
-    let (bpc, nc) = (bpc as usize, cs.components());
+    Some(SamplePlan { cs, bpc: bpc as usize, w: wu, h: hu })
+}
+
+/// Can this image's *samples* be decoded, judged from its dictionary alone (no stream
+/// bytes read, no pixels allocated)? The exact gate [`decode_samples`] applies, minus the
+/// one thing that needs the bytes: whether the stream is long enough.
+///
+/// Only ever over-reports (a truncated stream still says `true`), never under-reports —
+/// which is the direction a placeholder count can afford to be wrong in.
+pub(crate) fn samples_decodable(doc: &Document, res: &Dictionary, dict: &Dictionary) -> bool {
+    sample_plan(doc, res, dict).is_some()
+}
+
+/// A decoded sample block, in the narrowest form that holds it without loss: an achromatic
+/// space (including an `/Indexed` palette whose base is achromatic, and an `/ImageMask`
+/// stencil) stays 8-bit gray, everything else is RGB8.
+pub(crate) enum Samples {
+    Gray(image::GrayImage),
+    Rgb(image::RgbImage),
+}
+
+impl Samples {
+    pub(crate) fn into_dynamic(self) -> image::DynamicImage {
+        match self {
+            Samples::Gray(g) => image::DynamicImage::ImageLuma8(g),
+            Samples::Rgb(r) => image::DynamicImage::ImageRgb8(r),
+        }
+    }
+    /// Widen to RGB8 — what the render path composites and encodes in.
+    pub(crate) fn into_rgb8(self) -> image::RgbImage {
+        match self {
+            Samples::Gray(g) => image::DynamicImage::ImageLuma8(g).to_rgb8(),
+            Samples::Rgb(r) => r,
+        }
+    }
+    /// Narrow to 8-bit gray — what a soft mask (`/SMask`) is, by definition (§8.9.5.4).
+    pub(crate) fn into_luma8(self) -> image::GrayImage {
+        match self {
+            Samples::Gray(g) => g,
+            Samples::Rgb(r) => image::DynamicImage::ImageRgb8(r).to_luma8(),
+        }
+    }
+}
+
+/// Decode an image XObject's *samples* — the `format:"raw"` case (Flate/LZW/uncompressed),
+/// which is 1167 of 2604 corpus rows.
+///
+/// Handles 1/2/4/8/16 bits per component, the `/Decode` array, `/ImageMask` stencils, and
+/// Gray/RGB/CMYK/ICCBased/Indexed colour spaces — including a space *named* in `res`
+/// (`/ColorSpace /CS0`). Returns `None` for anything it cannot reduce faithfully, rather
+/// than emitting a confidently wrong picture; a caller then reports the image honestly
+/// (`format:"raw"` on the extract path, no `<img>` on the render path).
+///
+/// Reads the stream through [`crate::pdfobj::content_bytes`], so an **unfiltered** raster
+/// keeps its bytes — `decompressed_content()` alone errors when a stream has no `/Filter`,
+/// which is how the render path's own copy silently lost every uncompressed image.
+pub(crate) fn decode_samples(doc: &Document, res: &Dictionary, stream: &lopdf::Stream) -> Option<Samples> {
+    let dict = &stream.dict;
+    let SamplePlan { cs, bpc, w: wu, h: hu } = sample_plan(doc, res, dict)?;
+    let nc = cs.components();
 
     let samples = content_bytes(stream);
     // Rows are padded to a byte boundary (§8.9.5.1).
@@ -303,12 +375,21 @@ pub(crate) fn assemble_png(doc: &Document, res: &Dictionary, stream: &lopdf::Str
         }
     }
 
-    let img = if gray_out {
-        image::DynamicImage::ImageLuma8(image::GrayImage::from_raw(w as u32, h as u32, out)?)
+    let (w, h) = (wu as u32, hu as u32);
+    if gray_out {
+        Some(Samples::Gray(image::GrayImage::from_raw(w, h, out)?))
     } else {
-        image::DynamicImage::ImageRgb8(image::RgbImage::from_raw(w as u32, h as u32, out)?)
-    };
-    png_bytes(img)
+        Some(Samples::Rgb(image::RgbImage::from_raw(w, h, out)?))
+    }
+}
+
+/// A real PNG file from an image XObject's samples: [`decode_samples`] plus the encoder.
+///
+/// The extract path's container for `format:"png"` — 1167 of 2604 corpus rows, none of
+/// which opened as an image file before (the caller got back compressed samples with no
+/// container at all).
+pub(crate) fn assemble_png(doc: &Document, res: &Dictionary, stream: &lopdf::Stream) -> Option<Vec<u8>> {
+    png_bytes(decode_samples(doc, res, stream)?.into_dynamic())
 }
 
 /// The `i`-th `bpc`-bit sample of a packed row.
@@ -691,23 +772,97 @@ mod tests {
     fn assemble_png_refuses_absurd_dimensions_and_truncated_samples() {
         let doc = Document::with_version("1.5");
         let res = Dictionary::new();
-        let d = dictionary! { "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8i64 };
-        let s = Stream::new(d, vec![0u8; 3 * 4]);
+        let rgb8 = |w: i64, h: i64, n: usize| {
+            let d = dictionary! { "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8i64, "Width" => w, "Height" => h };
+            Stream::new(d, vec![0u8; n])
+        };
         // 2x2 RGB8 needs 12 bytes and it has them.
-        assert!(assemble_png(&doc, &res, &s, 2, 2).is_some());
+        assert!(assemble_png(&doc, &res, &rgb8(2, 2, 12)).is_some());
         // Non-positive and over-cap dimensions never reach an allocation.
-        assert!(assemble_png(&doc, &res, &s, 0, 2).is_none());
-        assert!(assemble_png(&doc, &res, &s, 2, -1).is_none());
-        assert!(assemble_png(&doc, &res, &s, MAX_IMAGE_DIM + 1, 1).is_none());
-        assert!(assemble_png(&doc, &res, &s, 65536, 65536).is_none());
+        assert!(assemble_png(&doc, &res, &rgb8(0, 2, 12)).is_none());
+        assert!(assemble_png(&doc, &res, &rgb8(2, -1, 12)).is_none());
+        assert!(assemble_png(&doc, &res, &rgb8(MAX_IMAGE_DIM + 1, 1, 12)).is_none());
+        assert!(assemble_png(&doc, &res, &rgb8(65536, 65536, 12)).is_none());
         // Truncated samples: reassembling them would fabricate pixels, so it declines.
-        assert!(assemble_png(&doc, &res, &s, 4, 4).is_none());
+        assert!(assemble_png(&doc, &res, &rgb8(4, 4, 12)).is_none());
+        // ...but the truncation is invisible from the dictionary alone, so the CHEAP gate
+        // still says yes. It may over-report; it must never under-report.
+        assert!(samples_decodable(&doc, &res, &rgb8(4, 4, 12).dict));
         // An unsupported bit depth declines too, rather than guessing a layout.
-        let d5 = dictionary! { "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 5i64 };
-        assert!(assemble_png(&doc, &res, &Stream::new(d5, vec![0u8; 64]), 2, 2).is_none());
+        let d5 = dictionary! { "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 5i64, "Width" => 2, "Height" => 2 };
+        assert!(assemble_png(&doc, &res, &Stream::new(d5.clone(), vec![0u8; 64])).is_none());
+        assert!(!samples_decodable(&doc, &res, &d5));
         // …and so does a colour space that cannot be reduced to RGB faithfully.
-        let sep = dictionary! { "ColorSpace" => "Separation", "BitsPerComponent" => 8i64 };
-        assert!(assemble_png(&doc, &res, &Stream::new(sep, vec![0u8; 64]), 2, 2).is_none());
+        let sep = dictionary! { "ColorSpace" => "Separation", "BitsPerComponent" => 8i64, "Width" => 2, "Height" => 2 };
+        assert!(assemble_png(&doc, &res, &Stream::new(sep.clone(), vec![0u8; 64])).is_none());
+        assert!(!samples_decodable(&doc, &res, &sep), "the cheap gate refuses what the decoder refuses");
+    }
+
+    #[test]
+    fn an_unfiltered_raster_keeps_its_samples() {
+        // `decompressed_content()` ERRORS on a stream with no `/Filter`, and the render
+        // path's own sample reader used `.ok()?` — so an uncompressed image decoded to
+        // nothing and simply never appeared in `to_html`
+        // (`tests/fixtures_pdf/undrawn_image.pdf`). Reading through `content_bytes` is what
+        // makes the shared decoder immune.
+        let doc = Document::with_version("1.5");
+        let d = dictionary! { "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8i64, "Width" => 2, "Height" => 1 };
+        let s = Stream::new(d, vec![10, 20, 30, 40, 50, 60]);
+        assert!(s.decompressed_content().is_err(), "lopdf refuses an unfiltered stream — the whole point");
+        let px = decode_samples(&doc, &Dictionary::new(), &s).expect("unfiltered samples decode").into_rgb8();
+        assert_eq!(px.get_pixel(0, 0).0, [10, 20, 30]);
+        assert_eq!(px.get_pixel(1, 0).0, [40, 50, 60]);
+    }
+
+    #[test]
+    fn an_indexed_palette_decodes_to_its_colours_not_its_indices() {
+        // The render path's own decoder had no palette support at all: it guessed the
+        // channel count from `samples.len() / (w*h)`, which for a 1-byte-per-pixel Indexed
+        // image is 1 — so the palette INDICES were rendered as gray levels.
+        let doc = Document::with_version("1.5");
+        let cs = Object::Array(vec![
+            Object::Name(b"Indexed".to_vec()),
+            Object::Name(b"DeviceRGB".to_vec()),
+            Object::Integer(2),
+            Object::String(vec![255, 0, 0, 0, 0, 255], StringFormat::Literal),
+        ]);
+        let d = dictionary! { "ColorSpace" => cs, "BitsPerComponent" => 8i64, "Width" => 2, "Height" => 1 };
+        let px = decode_samples(&doc, &Dictionary::new(), &Stream::new(d, vec![0, 1]))
+            .expect("indexed decodes")
+            .into_rgb8();
+        assert_eq!(px.get_pixel(0, 0).0, [255, 0, 0], "index 0 is the palette's red, not gray level 0");
+        assert_eq!(px.get_pixel(1, 0).0, [0, 0, 255], "index 1 is the palette's blue, not gray level 1");
+    }
+
+    #[test]
+    fn a_colour_space_named_in_the_resource_dictionary_resolves() {
+        // `/ColorSpace /CS0` is the spelling 971 of 2604 corpus images use. The name means
+        // nothing without `res`, which is why the decoder takes one.
+        let doc = Document::with_version("1.5");
+        let res = dictionary! { "ColorSpace" => dictionary! { "CS0" => Object::Name(b"DeviceGray".to_vec()) } };
+        let d = dictionary! { "ColorSpace" => Object::Name(b"CS0".to_vec()), "BitsPerComponent" => 8i64, "Width" => 2, "Height" => 1 };
+        let s = Stream::new(d, vec![7, 200]);
+        assert!(matches!(decode_samples(&doc, &res, &s), Some(Samples::Gray(_))));
+        assert!(decode_samples(&doc, &Dictionary::new(), &s).is_none(), "without the scope the name means nothing");
+    }
+
+    #[test]
+    fn a_sub_byte_depth_and_a_stencil_mask_both_decode() {
+        let doc = Document::with_version("1.5");
+        // 4-bpc gray, two pixels packed into one byte.
+        let d4 = dictionary! { "ColorSpace" => "DeviceGray", "BitsPerComponent" => 4i64, "Width" => 2, "Height" => 1 };
+        let g = decode_samples(&doc, &Dictionary::new(), &Stream::new(d4, vec![0x0F]))
+            .expect("4-bpc decodes")
+            .into_luma8();
+        assert_eq!(g.get_pixel(0, 0).0, [0], "high nibble 0");
+        assert_eq!(g.get_pixel(1, 0).0, [255], "low nibble 15 -> full white");
+        // An /ImageMask stencil has no /ColorSpace and no /BitsPerComponent at all.
+        let m = dictionary! { "ImageMask" => true, "Width" => 8, "Height" => 1 };
+        let s = Stream::new(m, vec![0b1010_1010]);
+        assert!(samples_decodable(&doc, &Dictionary::new(), &s.dict));
+        let px = decode_samples(&doc, &Dictionary::new(), &s).expect("stencil decodes").into_luma8();
+        assert_eq!(px.get_pixel(0, 0).0, [255]);
+        assert_eq!(px.get_pixel(1, 0).0, [0]);
     }
 
     #[test]

@@ -1,41 +1,27 @@
 //! Positioned image extraction for HTML: track the content-stream `Do` operator
 //! and CTM to locate each image, then emit a base64 data URI (JPEG passthrough;
-//! PNG assembly for Flate-encoded raster samples).
+//! PNG assembly for sampled raster data).
+//!
+//! **Pixels are decoded by [`crate::raster`], not here.** This module owns *placement* —
+//! the CTM walk, tile clustering, grid stitching, soft-mask compositing and the data-URI
+//! container choice — and nothing about what a sample means. It used to carry its own,
+//! weaker copy of the decode stack, which is how the render path came to drop or corrupt
+//! images `extract_images()` handled correctly. The only decoders left here are the two
+//! `raster` does not model: CCITT fax (lopdf cannot apply the filter) and the `/SMask`
+//! composite.
 
 use base64::Engine;
 use crate::geom::{Mat, Rect};
 use crate::pdfobj::{deref, filters_of, num};
 use crate::raster::{
-    codec_payload, decode_dct_rgb, decode_inverts, dims_sane, jpeg_components, png_bytes, MAX_IMAGE_PIXELS,
+    codec_payload, decode_dct_rgb, decode_inverts, decode_samples, dims_sane, jpeg_components, png_bytes,
+    samples_decodable, MAX_IMAGE_PIXELS,
 };
-use crate::walker::{descend_form, page_xobjects, subtype_of, xobject_at, Descend, ScopePolicy, XMap};
+use crate::walker::{
+    descend_form, overlay_resources, page_resources, page_xobjects, subtype_of, xobject_at, Descend, ScopePolicy, XMap,
+};
 use lopdf::{Dictionary, Document, Object, ObjectId};
-
-fn cs_channels(dict: &Dictionary, doc: &Document) -> Option<usize> {
-    let cs = dict.get(b"ColorSpace").ok().and_then(|o| deref(doc, o))?;
-    match cs {
-        Object::Name(n) => match n.as_slice() {
-            b"DeviceRGB" | b"RGB" | b"CalRGB" => Some(3),
-            b"DeviceGray" | b"G" | b"CalGray" => Some(1),
-            b"DeviceCMYK" | b"CMYK" => Some(4),
-            _ => None,
-        },
-        Object::Array(a) => {
-            // ICCBased -> /N components
-            if a.first().and_then(|o| o.as_name().ok()) == Some(&b"ICCBased"[..]) {
-                a.get(1)
-                    .and_then(|o| deref(doc, o))
-                    .and_then(|o| o.as_stream().ok())
-                    .and_then(|s| s.dict.get(b"N").ok())
-                    .and_then(|o| o.as_i64().ok())
-                    .map(|n| n as usize)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
+use std::rc::Rc;
 
 /// True if a DCTDecode stream is a 4-component (CMYK) JPEG — these cannot be passed
 /// through to the browser as `image/jpeg` (Adobe CMYK renders inverted/black).
@@ -127,9 +113,14 @@ fn decode_ccitt(doc: &Document, dict: &Dictionary, content: &[u8]) -> Option<ima
     image::GrayImage::from_raw(cols, h, buf)
 }
 
-/// Decode an image stream to RGB8, handling JPEG (DCTDecode) and Flate/raw
-/// samples (gray/rgb). Returns None for formats we don't assemble.
-fn decode_rgb(doc: &Document, id: ObjectId) -> Option<image::RgbImage> {
+/// Decode an image stream to RGB8: JPEG (DCTDecode) and CCITT fax through their codecs,
+/// everything else through the shared sample decoder ([`decode_samples`]). Returns `None`
+/// for a format we cannot reduce faithfully — the image is then reported by nobody rather
+/// than rendered wrong.
+///
+/// `res` is the resource scope the image was drawn in; a `/ColorSpace /CS0` names an entry
+/// there and describes nothing without it (§8.6.3).
+fn decode_rgb(doc: &Document, res: &Dictionary, id: ObjectId) -> Option<image::RgbImage> {
     let stream = doc.get_object(id).ok()?.as_stream().ok()?;
     let dict = &stream.dict;
     let filters = filters_of(dict);
@@ -144,27 +135,16 @@ fn decode_rgb(doc: &Document, id: ObjectId) -> Option<image::RgbImage> {
     if filters.iter().any(|f| f == b"JPXDecode" || f == b"JBIG2Decode") {
         return None;
     }
-    let w = dict.get(b"Width").ok().and_then(|o| o.as_i64().ok())? as u32;
-    let h = dict.get(b"Height").ok().and_then(|o| o.as_i64().ok())? as u32;
-    let bpc = dict.get(b"BitsPerComponent").ok().and_then(|o| o.as_i64().ok()).unwrap_or(8);
-    if bpc != 8 || !dims_sane(w, h) {
-        return None;
-    }
-    let raw = stream.decompressed_content().ok()?;
-    let total = (w as usize) * (h as usize);
-    let ch = cs_channels(dict, doc).unwrap_or_else(|| if total > 0 && raw.len() % total == 0 { raw.len() / total } else { 0 });
-    match ch {
-        1 if raw.len() >= total => {
-            let g = image::GrayImage::from_raw(w, h, raw[..total].to_vec())?;
-            Some(image::DynamicImage::ImageLuma8(g).to_rgb8())
-        }
-        3 if raw.len() >= total * 3 => image::RgbImage::from_raw(w, h, raw[..total * 3].to_vec()),
-        _ => None,
-    }
+    // Plain samples. This used to be a private, weaker decoder: 8 bpc only, no palette, no
+    // `/Decode`, no stencil, and — when the colour space was anything it did not model — a
+    // channel count GUESSED from `raw.len() / (w*h)`, which renders an Indexed image's
+    // palette indices as gray levels. It also read the bytes with `decompressed_content()`,
+    // which errors on an unfiltered stream, so every uncompressed raster vanished.
+    Some(decode_samples(doc, res, stream)?.into_rgb8())
 }
 
 /// Decode the soft mask (`/SMask`) of an image to a grayscale alpha channel.
-fn decode_smask(doc: &Document, dict: &Dictionary) -> Option<image::GrayImage> {
+fn decode_smask(doc: &Document, res: &Dictionary, dict: &Dictionary) -> Option<image::GrayImage> {
     let sid = dict.get(b"SMask").ok().and_then(|o| o.as_reference().ok())?;
     let stream = doc.get_object(sid).ok()?.as_stream().ok()?;
     let sd = &stream.dict;
@@ -185,25 +165,20 @@ fn decode_smask(doc: &Document, dict: &Dictionary) -> Option<image::GrayImage> {
     if filters.iter().any(|f| f == b"JPXDecode" || f == b"CCITTFaxDecode" || f == b"JBIG2Decode") {
         return None;
     }
-    let w = sd.get(b"Width").ok().and_then(|o| o.as_i64().ok())? as u32;
-    let h = sd.get(b"Height").ok().and_then(|o| o.as_i64().ok())? as u32;
-    let bpc = sd.get(b"BitsPerComponent").ok().and_then(|o| o.as_i64().ok()).unwrap_or(8);
-    if bpc != 8 || !dims_sane(w, h) {
-        return None;
-    }
-    let raw = stream.decompressed_content().ok()?;
-    let total = (w as usize) * (h as usize);
-    if raw.len() < total {
-        return None;
-    }
-    image::GrayImage::from_raw(w, h, raw[..total].to_vec())
+    // The shared decoder applies the mask's own `/Decode` on this path too, and handles the
+    // sub-byte depths a soft mask is often written at (a 1-bpc knockout mask).
+    Some(decode_samples(doc, res, stream)?.into_luma8())
 }
 
 /// Cheap (no-decode) test that an image XObject is a format we can render — used in
 /// placeholder mode so a `<image N>` stands in only for an image that inline mode would
-/// actually emit. Mirrors `data_uri`'s format gate without decoding pixels (so it can
-/// slightly over-count the rare SMask content-free overlay that inline mode drops).
-fn decodable(doc: &Document, id: ObjectId) -> bool {
+/// actually emit.
+///
+/// The sample half is [`samples_decodable`], the very gate the decoder applies minus the
+/// one thing that needs the bytes (whether the stream is long enough). It used to be an
+/// independently-written `bpc == 8` guess that disagreed with the decoder in both
+/// directions.
+fn decodable(doc: &Document, res: &Dictionary, id: ObjectId) -> bool {
     let stream = match doc.get_object(id).ok().and_then(|o| o.as_stream().ok()) {
         Some(s) => s,
         None => return false,
@@ -216,10 +191,7 @@ fn decodable(doc: &Document, id: ObjectId) -> bool {
     if filters.iter().any(|f| f == b"DCTDecode" || f == b"CCITTFaxDecode") {
         return true; // JPEG / CCITT fax: renderable (fax via decode_ccitt)
     }
-    let w = dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0);
-    let h = dict.get(b"Height").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0);
-    let bpc = dict.get(b"BitsPerComponent").ok().and_then(|o| o.as_i64().ok()).unwrap_or(8);
-    bpc == 8 && w > 0 && h > 0 && dims_sane(w as u32, h as u32)
+    samples_decodable(doc, res, dict)
 }
 
 /// Build a base64 data URI for an image stream, or None if unsupported.
@@ -227,7 +199,7 @@ fn decodable(doc: &Document, id: ObjectId) -> bool {
 /// Images with a soft mask (`/SMask`) are alpha-composited so transparency is
 /// preserved — without this, masked figures (whose visible content lives in the
 /// mask, over a flat-colour/black base) render as solid black boxes.
-fn data_uri(doc: &Document, id: ObjectId) -> Option<String> {
+fn data_uri(doc: &Document, res: &Dictionary, id: ObjectId) -> Option<String> {
     let stream = doc.get_object(id).ok()?.as_stream().ok()?;
     let dict = stream.dict.clone();
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -260,15 +232,15 @@ fn data_uri(doc: &Document, id: ObjectId) -> Option<String> {
             return None;
         }
         // CCITTFax falls through to decode_rgb (which decodes it via decode_ccitt) → PNG.
-        let rgb = decode_rgb(doc, id)?;
+        let rgb = decode_rgb(doc, res, id)?;
         let png = png_bytes(image::DynamicImage::ImageRgb8(rgb))?;
         return Some(format!("data:image/png;base64,{}", b64.encode(&png)));
     }
 
     // Soft mask present: decode base + mask, composite to RGBA, emit PNG.
-    let base = decode_rgb(doc, id)?;
+    let base = decode_rgb(doc, res, id)?;
     let (w, h) = (base.width(), base.height());
-    let mask = decode_smask(doc, &dict);
+    let mask = decode_smask(doc, res, &dict);
     let mut rgba = image::RgbaImage::new(w, h);
     let resized;
     let mask_ref = match &mask {
@@ -394,6 +366,11 @@ struct RawTile {
     y1: f32,
     pw: u32,
     ctm: Option<[f32; 6]>, // placement matrix when rotated (see Placed::ctm)
+    /// The resource scope in force where this tile was drawn — the page's merged
+    /// dictionary, or a form's own `/Resources` overlaid on it. Decoding needs it because
+    /// an image may name its colour space (`/ColorSpace /CS0`) rather than declare one
+    /// (§8.6.3), and the name resolves only here. Shared, not cloned, per tile.
+    res: Rc<Dictionary>,
 }
 
 /// Images smaller than this (rendered, points) are diagram tiles / rules /
@@ -420,16 +397,25 @@ pub fn positioned_images(doc: &Document, page_id: ObjectId, want_uris: bool) -> 
     // (see `walker::page_resource_chain`) — a raster a producer left on an outer node of
     // the page tree used to resolve to nothing and simply not appear.
     let xmap = page_xobjects(doc, page_id);
+    // The same chain, folded into one dictionary: what a `/ColorSpace /CS0` on any of this
+    // page's images has to be looked up in.
+    let res = Rc::new(page_resources(doc, page_id));
     let mut raws: Vec<RawTile> = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
-    walk(doc, &content.operations, &xmap, Mat::ID, &mut raws, 0, &mut budget);
+    walk(doc, &content.operations, &xmap, &res, Mat::ID, &mut raws, 0, &mut budget);
     finalize(doc, raws, want_uris)
 }
 
+// The interpreter state is a flat argument list here exactly as it is in `vector::walk` and
+// `text::decode_spans`: bundling it into a struct would hide which parts the recursion
+// REPLACES per form (scope, matrix, depth) and which it threads through (the output vector,
+// the shared budget).
+#[allow(clippy::too_many_arguments)]
 fn walk(
     doc: &Document,
     ops: &[lopdf::content::Operation],
     xmap: &XMap,
+    res: &Rc<Dictionary>,
     base: Mat,
     out: &mut Vec<RawTile>,
     depth: u32,
@@ -485,13 +471,27 @@ fn walk(
                     // Record geometry + pixel dims; uri building / grid stitching happens
                     // in finalize() once the whole page's tiles are known.
                     let pw = stream.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0) as u32;
-                    out.push(RawTile { id, x0, x1, y0, y1, pw, ctm: rot_ctm });
+                    out.push(RawTile { id, x0, x1, y0, y1, pw, ctm: rot_ctm, res: Rc::clone(res) });
                 } else {
                     // A form is descended with the page's XObject scope still in force
                     // (`OverlayParent`): a raster the page defines and the form invokes by
                     // an unqualified name must still be found.
                     match descend_form(doc, stream, xmap, ScopePolicy::OverlayParent, depth, budget, 0) {
-                        Descend::Into(f) => walk(doc, &f.ops, &f.scope.xobjects, f.matrix.mul(ctm), out, depth + 1, budget),
+                        Descend::Into(f) => {
+                            // The colour-space scope follows the same `OverlayParent` rule
+                            // as the XObject scope: the form's own resources shadow the
+                            // inherited ones name by name. A form that declares none draws
+                            // in the scope it was invoked from, and shares it — no clone.
+                            let child = match &f.scope.resources {
+                                Some(fr) => {
+                                    let mut merged = (**res).clone();
+                                    overlay_resources(doc, &mut merged, fr);
+                                    Rc::new(merged)
+                                }
+                                None => Rc::clone(res),
+                            };
+                            walk(doc, &f.ops, &f.scope.xobjects, &child, f.matrix.mul(ctm), out, depth + 1, budget)
+                        }
                         Descend::Skip => continue,
                         Descend::Halt => return,
                     }
@@ -521,7 +521,7 @@ fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool) -> Vec<Placed> 
                 }
                 // stitch failed → fall through to per-tile emission
             } else {
-                if tiles.iter().any(|t| decodable(doc, t.id)) {
+                if tiles.iter().any(|t| decodable(doc, &t.res, t.id)) {
                     out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri: String::new(), ctm: None });
                 }
                 continue;
@@ -531,10 +531,10 @@ fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool) -> Vec<Placed> 
         // carrying its rotation matrix if any.
         for t in tiles {
             if want_uris {
-                if let Some(uri) = data_uri(doc, t.id) {
+                if let Some(uri) = data_uri(doc, &t.res, t.id) {
                     out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri, ctm: t.ctm });
                 }
-            } else if decodable(doc, t.id) {
+            } else if decodable(doc, &t.res, t.id) {
                 out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri: String::new(), ctm: t.ctm });
             }
         }
@@ -634,11 +634,11 @@ fn is_grid(tiles: &[&RawTile]) -> bool {
 
 /// Decode an image XObject to RGBA, compositing its soft mask (`/SMask`) into the alpha
 /// channel when present. Used by the grid stitcher.
-fn decode_rgba(doc: &Document, id: ObjectId) -> Option<image::RgbaImage> {
-    let base = decode_rgb(doc, id)?;
+fn decode_rgba(doc: &Document, res: &Dictionary, id: ObjectId) -> Option<image::RgbaImage> {
+    let base = decode_rgb(doc, res, id)?;
     let (w, h) = (base.width(), base.height());
     let dict = doc.get_object(id).ok()?.as_stream().ok()?.dict.clone();
-    match decode_smask(doc, &dict) {
+    match decode_smask(doc, res, &dict) {
         Some(mask) => {
             let resized;
             let m = if mask.width() == w && mask.height() == h {
@@ -688,7 +688,7 @@ fn stitch_grid(doc: &Document, tiles: &[&RawTile], bbox: (f32, f32, f32, f32)) -
     let mut canvas = image::RgbaImage::from_pixel(cw, ch, image::Rgba([255, 255, 255, 255]));
     let mut placed_any = false;
     for t in tiles {
-        let tile = match decode_rgba(doc, t.id) {
+        let tile = match decode_rgba(doc, &t.res, t.id) {
             Some(im) => im,
             None => continue,
         };
@@ -779,7 +779,8 @@ mod tests {
         let xmap = page_xobjects(&doc, page_id);
         let mut raws = Vec::new();
         let mut budget = crate::WalkBudget::new(700);
-        walk(&doc, &content.operations, &xmap, Mat::ID, &mut raws, 0, &mut budget);
+        let res = Rc::new(page_resources(&doc, page_id));
+        walk(&doc, &content.operations, &xmap, &res, Mat::ID, &mut raws, 0, &mut budget);
         assert!(!raws.is_empty(), "a tripped budget must not empty the page");
         assert!(raws.len() < 3, "the budget must really bite, got {} tiles", raws.len());
     }
@@ -909,6 +910,69 @@ mod tests {
             let got = img.get_pixel(img.width() / 2, img.height() / 2).0;
             let d = (0..3).map(|i| got[i].abs_diff(want[i])).max().unwrap();
             assert!(d <= 8, "expected ~{want:?}, got {got:?}");
+        }
+    }
+
+    /// The fixture's page, and its placed images sorted top-to-bottom.
+    fn placed_top_down(name: &str, page: u32) -> Vec<Placed> {
+        let path = format!("{}/../tests/fixtures_pdf/{name}", env!("CARGO_MANIFEST_DIR"));
+        let doc = Document::load(&path).unwrap_or_else(|e| panic!("{name} fixture must load: {e}"));
+        let page_id = *doc.get_pages().get(&page).expect("fixture has that page");
+        let mut placed = positioned_images(&doc, page_id, true);
+        placed.sort_by(|a, b| b.y_top.partial_cmp(&a.y_top).expect("finite"));
+        placed
+    }
+
+    #[test]
+    fn an_indexed_raster_renders_its_palette_colours_and_a_4bpc_one_renders_at_all() {
+        // `tests/gen_fixtures.py::gen_render_samples`. The render path's own sample decoder
+        // guessed the channel count from `samples.len() / (w*h)` whenever the colour space
+        // was not a device name or ICCBased — which for a 1-byte-per-pixel Indexed image is
+        // 1, so the palette INDICES were rendered as gray levels and the authored red/blue
+        // came out (0,0,0)/(1,1,1). Sub-byte depths it refused outright, so the 4-bpc gray
+        // image was simply absent. Verified failing before the fix: reverting `decode_rgb`'s
+        // sample branch to the old body gives [0,0,0]/[1,1,1] for the first image and drops
+        // the second entirely (`placed.len() == 1`).
+        let placed = placed_top_down("render_samples.pdf", 1);
+        assert_eq!(placed.len(), 2, "both sampled rasters must be placed");
+        let idx = uri_rgb(&placed[0].uri);
+        assert_eq!(idx.dimensions(), (2, 1));
+        assert_eq!(idx.get_pixel(0, 0).0, [255, 0, 0], "palette entry 0 is red, not gray level 0");
+        assert_eq!(idx.get_pixel(1, 0).0, [0, 0, 255], "palette entry 1 is blue, not gray level 1");
+        let g4 = uri_rgb(&placed[1].uri);
+        assert_eq!(g4.dimensions(), (2, 1));
+        assert_eq!(g4.get_pixel(0, 0).0, [0, 0, 0]);
+        assert_eq!(g4.get_pixel(1, 0).0, [255, 255, 255], "4-bpc nibble 15 is full white");
+    }
+
+    #[test]
+    fn an_unfiltered_raster_is_placed_instead_of_vanishing() {
+        // The filed bug, on a fixture that has been committed the whole time:
+        // `undrawn_image.pdf` stores its rasters with NO `/Filter` at all, and
+        // `decompressed_content()` ERRORS on such a stream — so `extract_images()` returned
+        // two valid PNGs while `to_html` emitted zero `<img>`. Reading through
+        // `pdfobj::content_bytes` (which `raster::decode_samples` does) is what fixes it.
+        for (page, want_w) in [(1u32, 40u32), (2, 42)] {
+            let placed = placed_top_down("undrawn_image.pdf", page);
+            assert_eq!(placed.len(), 1, "page {page} paints exactly one raster");
+            assert_eq!(uri_rgb(&placed[0].uri).width(), want_w);
+        }
+    }
+
+    #[test]
+    fn the_placeholder_gate_agrees_with_the_decoder_image_for_image() {
+        // `decodable` used to be an independently-written `bpc == 8` guess, so placeholder
+        // mode disagreed with inline mode in BOTH directions on the same page:
+        // `colorspace_images.pdf` emitted 3 `<image N>` placeholders for 2 embedded images.
+        // Rederiving it from `raster::samples_decodable` makes the two agree by construction.
+        for name in ["colorspace_images.pdf", "render_samples.pdf", "undrawn_image.pdf"] {
+            let path = format!("{}/../tests/fixtures_pdf/{name}", env!("CARGO_MANIFEST_DIR"));
+            let doc = Document::load(&path).unwrap_or_else(|e| panic!("{name} must load: {e}"));
+            for page_id in doc.get_pages().values() {
+                let inline = positioned_images(&doc, *page_id, true).len();
+                let placeholders = positioned_images(&doc, *page_id, false).len();
+                assert_eq!(placeholders, inline, "{name}: placeholder count must match the embedded count");
+            }
         }
     }
 }

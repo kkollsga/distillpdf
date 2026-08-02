@@ -938,6 +938,47 @@ def gen_cmyk_jpeg():
     }
 
 
+def gen_render_samples():
+    """Sampled rasters the RENDER path used to get wrong, each one *drawn* on the page so
+    ``to_html`` has to decode it (``extract_images()`` already handled all of them).
+
+    The render path carried its own, weaker sample decoder: 8 bits per component only, and
+    a channel count *guessed* from ``len(samples) / (w*h)`` whenever the colour space was
+    not a device name or ``ICCBased``. Two consequences, one image each:
+
+      ``/ImIdx8``   ``[/Indexed /DeviceRGB 1 <ff0000 0000ff>]`` at 8 bpc — one index byte
+                    per pixel, so the guess said "1 channel, grayscale" and the palette
+                    INDICES were rendered as gray levels: authored red/blue came out
+                    ``(0,0,0)`` / ``(1,1,1)``, i.e. a black box.
+      ``/ImGray4``  4-bpc ``/DeviceGray`` — refused outright by the ``bpc == 8`` gate, so
+                    the image was silently absent from the HTML.
+
+    Both are placed 80x40 pt (over ``img::MIN_DIM``) and 20 pt apart, so each is its own
+    cluster and emits its own ``<img>``. Hand-assembled: reportlab flattens every image it
+    embeds to 8-bpc DeviceRGB/DeviceGray, which is exactly the case that already worked."""
+    pdf = os.path.join(OUT, "render_samples.pdf")
+    palette = bytes((255, 0, 0, 0, 0, 255))
+    content = (b"q 80 0 0 40 72 700 cm /ImIdx8 Do Q\n"
+               b"q 80 0 0 40 72 640 cm /ImGray4 Do Q")
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/XObject << /ImIdx8 5 0 R /ImGray4 6 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        # 2x1, one index byte per pixel: palette entry 0 (red) then 1 (blue).
+        5: _flate_image(5, 2, 1, b"[/Indexed /DeviceRGB 1 <%s>]" % palette.hex().encode(), 8, bytes((0, 1))),
+        # 2x1 @ 4bpc: both pixels packed into one byte -> black, then full white.
+        6: _flate_image(6, 2, 1, b"/DeviceGray", 4, bytes((0x0F,))),
+    }
+    _assemble_pdf(objs, pdf)
+    GT["render_samples.pdf"] = {
+        "html_images": 2,
+        "indexed_px": {"0,0": [255, 0, 0], "1,0": [0, 0, 255]},
+        "gray4_px": {"0,0": [0, 0, 0], "1,0": [255, 255, 255]},
+    }
+
+
 def gen_decode_jpeg():
     """Gray and RGB JPEGs carrying an INVERTING ``/Decode`` — the polarity a JPEG file
     cannot express, and the one the render path used to apply to CMYK images only.
@@ -2222,6 +2263,7 @@ def main():
     gen_undrawn_image()
     gen_colorspace_images()
     gen_image_order()
+    gen_render_samples()
     gen_cmyk_jpeg()
     gen_decode_jpeg()
     gen_form_inherit()

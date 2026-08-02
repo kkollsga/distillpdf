@@ -154,6 +154,51 @@ def test_gray_and_rgb_jpegs_honour_an_inverting_decode_in_html():
         assert max(abs(a - b) for a, b in zip(got, want)) <= 8, f"{got} vs {want}"
 
 
+def _html_image_pixels(path, expect):
+    """The RGB pixels of every image `to_html(image_mode="embed")` inlines, in page order."""
+    Image = pytest.importorskip("PIL.Image")
+    import base64
+    h = distillpdf.Pdf.open(path).to_html(mode="page", return_string=True, image_mode="embed")
+    uris = re.findall(r"data:image/\w+;base64,([A-Za-z0-9+/=]+)", h)
+    assert len(uris) == expect, f"{os.path.basename(path)}: expected {expect} inline images, got {len(uris)}"
+    assert len(re.findall(r"<img\b", h)) == expect, "one <img> per inlined image"
+    return [Image.open(io.BytesIO(base64.b64decode(u))).convert("RGB") for u in uris]
+
+
+def test_the_render_path_decodes_the_samples_extract_can_decode():
+    """`to_html` carried its own, weaker sample decoder than `extract_images()`: 8 bpc only,
+    and a channel count guessed from `len(samples) / (w*h)` for any colour space it did not
+    model. An Indexed image's palette INDICES therefore rendered as gray levels (authored
+    red/blue came out (0,0,0)/(1,1,1)) and a 4-bpc image was dropped outright."""
+    idx, gray4 = _html_image_pixels(os.path.join(FIX, "render_samples.pdf"), 2)
+    assert idx.size == (2, 1)
+    assert idx.getpixel((0, 0)) == (255, 0, 0), "palette entry 0, not gray level 0"
+    assert idx.getpixel((1, 0)) == (0, 0, 255), "palette entry 1, not gray level 1"
+    assert gray4.getpixel((0, 0)) == (0, 0, 0) and gray4.getpixel((1, 0)) == (255, 255, 255)
+    # The colour-space fixture is drawn on its page too, so all four of its rasters — the
+    # 4-bpc Indexed one, the raw DeviceCMYK one, and the two that already worked — appear.
+    assert len(_html_image_pixels(COLORSPACE_IMAGES, 4)) == 4
+
+
+def test_an_unfiltered_raster_reaches_the_html():
+    """A stream with NO `/Filter` makes lopdf's `decompressed_content()` error, and the
+    render path read its samples with `.ok()?` — so `extract_images()` returned two valid
+    PNGs for this fixture while `to_html` emitted zero `<img>`."""
+    pages = _html_image_pixels(UNDRAWN_IMAGE, 2)
+    assert [p.size for p in pages] == [(40, 30), (42, 32)], "one per page: the drawn ones only"
+
+
+def test_placeholder_mode_counts_the_images_embed_mode_emits():
+    """`<image N>` stands in for an image inline mode would actually emit, so the two counts
+    must agree. The placeholder gate used to be an independently-written `bpc == 8` guess:
+    colorspace_images.pdf emitted 3 placeholders for 2 embedded images."""
+    for name in ("colorspace_images.pdf", "render_samples.pdf", "undrawn_image.pdf", "figures.pdf"):
+        doc = distillpdf.Pdf.open(os.path.join(FIX, name))
+        embed = len(re.findall(r"<img\b", doc.to_html(mode="page", return_string=True, image_mode="embed")))
+        drop = len(re.findall(r"<image\b", doc.to_html(mode="page", return_string=True, image_mode="drop")))
+        assert drop == embed, f"{name}: {drop} placeholders vs {embed} embedded images"
+
+
 def test_every_extracted_image_across_the_fixtures_opens():
     """The usability contract: on the owned corpus every returned blob is a file PIL can
     open. Only 44% of corpus blobs did before the bytes were assembled/unwrapped; a row we

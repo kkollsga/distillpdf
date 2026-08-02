@@ -270,7 +270,7 @@ pub fn extract_images(doc: &Document) -> Vec<ImageInfo> {
                 // sample block is assembled into a PNG, and stays `raw` — with the
                 // metadata to reassemble it by hand — only when it cannot be.
                 let mut data = if format == "raw" {
-                    match assemble_png(doc, res, stream, width, height) {
+                    match assemble_png(doc, res, stream) {
                         Some(png) => {
                             format = "png";
                             png
