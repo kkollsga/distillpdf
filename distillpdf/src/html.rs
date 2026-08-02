@@ -649,7 +649,7 @@ fn box_of_lines(lines: &[&Line]) -> Option<Bbox> {
 /// [`PageElement`] per emitted construct (a heading, a paragraph, a list, a code block, a
 /// footnote aside). Headings carry NO id here — ids are minted later by the `assemble` tail,
 /// matching the legacy bare-`<hN>` emit.
-fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], profile: &DocProfile, plan: &HeadingPlan, out: &mut Vec<PageElement>) {
+fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[(String, u8)], profile: &DocProfile, plan: &HeadingPlan, out: &mut Vec<PageElement>) {
     let mut i = 0;
     // The currently-open paragraph. It is NOT flushed at a column-wrap block
     // boundary — a paragraph that wraps from the bottom of one column to the top
@@ -714,16 +714,22 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[String], pro
         // title by the author's own bookmark — promote it even when it carries no visual
         // heading cue (some docs set abstract/section titles at body size). Page-scoped,
         // so the contents page's TOC entries (different page) are never affected.
-        // A forced match is an author-declared SECTION title — emit it at section level
-        // (so it lands in the TOC and the outline link resolves), overriding any lower
-        // level `detect_header` would infer from its (often body-size) styling.
+        // A forced match is an author-declared title — emit it at the level the AUTHOR
+        // nested it at (so it lands in the TOC and the outline link resolves), overriding
+        // any level `detect_header` would infer from its (often body-size) styling. The
+        // outline's `level` is 0-based nesting depth; the logical scale here starts at 1
+        // for a section (rendered <h2> via `(lvl + 1)` below), so depth d → logical d + 1.
+        // Clamped at 5 so the tag stays within <h6>.
         // Cap at 12 words: a longer match is a multi-line/sentence-like title — promoting
         // it would read as a sentence heading. Those stay plain text in the outline nav.
-        let forced = !promote.is_empty()
-            && txt.split_whitespace().count() <= 12
-            && promote.iter().any(|k| *k == title_key(&txt));
+        let forced: Option<u8> = if promote.is_empty() || txt.split_whitespace().count() > 12 {
+            None
+        } else {
+            let key = title_key(&txt);
+            promote.iter().find(|(k, _)| *k == key).map(|(_, d)| d.saturating_add(1).min(5))
+        };
         if !in_enumerated_run(lines, i) && !colon_introduced_list(lines, i) {
-        if let Some((lvl, k)) = if forced { Some((1, ln.runs.len())) } else { header_at(lines, i, body, profile, plan) } {
+        if let Some((lvl, k)) = if let Some(flvl) = forced { Some((flvl, ln.runs.len())) } else { header_at(lines, i, body, profile, plan) } {
             // HTML heading tag: reserve <h1> for the document title (the largest
             // text). Sections (logical level 1) become <h2>, subsections <h3>,
             // etc., so the outline nests under a single <h1>.
@@ -1176,10 +1182,13 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
     // page — to promote matching lines to headings (so body-size section titles the
     // visual cues miss are still recognised, and the outline TOC links resolve).
     let outline = links::outline(doc);
-    let mut promote_by_page: std::collections::HashMap<u32, Vec<String>> = std::collections::HashMap::new();
+    // Each entry carries the author's own nesting depth (`OutlineEntry::level`, 0-based)
+    // alongside the match key, so a promoted line lands at the level the author declared
+    // instead of being flattened to a top-level section.
+    let mut promote_by_page: std::collections::HashMap<u32, Vec<(String, u8)>> = std::collections::HashMap::new();
     for e in &outline {
         if e.page > 0 {
-            promote_by_page.entry(e.page).or_default().push(title_key(&e.title));
+            promote_by_page.entry(e.page).or_default().push((title_key(&e.title), e.level));
         }
     }
 
@@ -1856,7 +1865,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         // Emit, grouping consecutive lines into text blocks. `page_promote` lists the
         // PDF-outline titles whose target page is this one, so body-size section titles
         // still become headings.
-        let page_promote: &[String] = promote_by_page.get(pno).map(|v| v.as_slice()).unwrap_or(&[]);
+        let page_promote: &[(String, u8)] = promote_by_page.get(pno).map(|v| v.as_slice()).unwrap_or(&[]);
         let mut run: Vec<&Line> = Vec::new();
         let flush = |run: &mut Vec<&Line>, out: &mut Vec<PageElement>| {
             if !run.is_empty() {
@@ -2132,3 +2141,66 @@ pub(crate) fn clone_span(s: &Span) -> Span {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(text: &str, y: f32) -> Line {
+        Line {
+            y,
+            x0: 72.0,
+            x1: 300.0,
+            size: 10.0,
+            mono: false,
+            mono_w: 0,
+            tot_w: text.chars().count(),
+            runs: vec![Run { text: text.to_string(), bold: false, italic: false, href: None, script: 0 }],
+            font: 1,
+        }
+    }
+
+    /// Emit `texts` as one run of body-size lines with `promote` as the page's outline
+    /// entries, and report the `<hN>` tag of every heading emitted.
+    fn heading_tags(promote: &[(String, u8)], texts: &[&str]) -> Vec<u8> {
+        let lines: Vec<Line> = texts.iter().enumerate().map(|(i, t)| line(t, 700.0 - 20.0 * i as f32)).collect();
+        let refs: Vec<&Line> = lines.iter().collect();
+        let mut out: Vec<PageElement> = Vec::new();
+        emit_lines(&refs, 10.0, 10.0, promote, &DocProfile::default(), &HeadingPlan::default(), &mut out);
+        out.iter()
+            .filter_map(|e| match &e.kind {
+                ElKind::Heading { level, .. } => Some(*level),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn outline_promoted_lines_keep_the_authors_nesting_depth() {
+        // Every outline-matched line used to be forced to logical level 1 (<h2>), which
+        // flattened a nested bookmark tree and cost header-level accuracy. The 0-based
+        // outline depth maps to logical depth+1, i.e. <h(depth+2)>.
+        let promote: Vec<(String, u8)> = vec![
+            (title_key("Methods"), 0),
+            (title_key("Data collection"), 1),
+            (title_key("Instrument calibration"), 2),
+            (title_key("Very deep note"), 9),
+        ];
+        let tags = heading_tags(&promote, &["Methods", "Data collection", "Instrument calibration", "Very deep note"]);
+        // depth 0 → <h2> (section), 1 → <h3>, 2 → <h4>; depth is clamped so the tag never
+        // exceeds <h6>.
+        assert_eq!(tags, vec![2, 3, 4, 6]);
+    }
+
+    #[test]
+    fn a_line_absent_from_the_outline_is_not_promoted() {
+        // Body-size prose with no outline entry stays a paragraph — the promotion is
+        // page-scoped to the author's own bookmarks.
+        let promote: Vec<(String, u8)> = vec![(title_key("Methods"), 1)];
+        assert!(heading_tags(&promote, &["Some ordinary body sentence here."]).is_empty());
+        // …and a match longer than the 12-word cap is still rejected.
+        let long = "One two three four five six seven eight nine ten eleven twelve thirteen";
+        let promote_long: Vec<(String, u8)> = vec![(title_key(long), 1)];
+        assert!(heading_tags(&promote_long, &[long]).is_empty());
+    }
+}
