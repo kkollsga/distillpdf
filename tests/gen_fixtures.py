@@ -576,6 +576,75 @@ def gen_figures_onepage():
     }
 
 
+# -------------------------------------------------------------------------- encrypted
+# Encrypted fixtures live in their own subfolder so the whole-fixture-set structural
+# sweeps (`_htmlcheck.owned_pdfs()`, which globs `fixtures_pdf/*.pdf` non-recursively)
+# keep ignoring them: they are single-sentence probes for the container-open path, not
+# document-fidelity fixtures, and one of them cannot be opened at all by design.
+ENC_OUT = os.path.join(OUT, "encrypted")
+ENC_SENTENCE = "Encrypted fixture sentinel phrase for distillPDF."
+ENC_USER_PW = "secret"
+
+
+def _enc_page(c):
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(LM, PAGE_H - 90, "Protected Document")
+    c.setFont(BODY_F, BODY_S)
+    c.drawString(LM, PAGE_H - 120, ENC_SENTENCE)
+    c.showPage()
+    c.save()
+
+
+def gen_encrypted():
+    """Encryption fixtures for the `PdfDocument::open` decrypt path.
+
+    Four OWNER-password-only files (empty user password — what every reader opens without
+    prompting), one per scheme lopdf 0.40 supports, plus one real USER-password file that
+    nothing can decrypt without the password. The contract they pin: an owner-only file
+    opens and extracts normally; the user-password file raises `Error::Encrypted` instead
+    of silently yielding 0 pages / empty text / an empty HTML shell.
+
+    reportlab's `pdfencrypt` covers RC4-40/128 (its `strength=256` needs the optional
+    `pyaes` package, so AES comes from pikepdf); pikepdf writes AES-128 (R4/AESV2) and
+    AES-256 (R6/AESV3). Both are dev-only deps (tests/requirements-dev.txt).
+    """
+    import io
+
+    from reportlab.lib import pdfencrypt
+
+    os.makedirs(ENC_OUT, exist_ok=True)
+
+    def reportlab_enc(name, **kw):
+        path = os.path.join(ENC_OUT, name)
+        _enc_page(canvas.Canvas(path, pagesize=letter, encrypt=pdfencrypt.StandardEncryption(**kw)))
+        return name
+
+    reportlab_enc("rc4_40.pdf", userPassword="", ownerPassword="owner", strength=40)
+    reportlab_enc("rc4_128.pdf", userPassword="", ownerPassword="owner", strength=128)
+    reportlab_enc("userpw.pdf", userPassword=ENC_USER_PW, ownerPassword="owner", strength=128)
+
+    import pikepdf
+
+    buf = io.BytesIO()
+    _enc_page(canvas.Canvas(buf, pagesize=letter))
+    plain = buf.getvalue()
+
+    def pikepdf_enc(name, **kw):
+        with pikepdf.open(io.BytesIO(plain)) as p:
+            p.save(os.path.join(ENC_OUT, name), encryption=pikepdf.Encryption(**kw))
+        return name
+
+    pikepdf_enc("aes_128.pdf", R=4, aes=True, user="", owner="owner")
+    pikepdf_enc("aes_256.pdf", R=6, aes=True, user="", owner="owner")
+
+    GT["encrypted"] = {
+        "sentence": ENC_SENTENCE,
+        "owner_only": ["rc4_40.pdf", "rc4_128.pdf", "aes_128.pdf", "aes_256.pdf"],
+        "user_password_file": "userpw.pdf",
+        "user_password": ENC_USER_PW,
+    }
+
+
 # ------------------------------------------------------------------------------ links
 def _assemble_pdf(objs, path):
     """Write a minimal PDF from {objnum: bytes} (numbers contiguous from 1)."""
@@ -1162,9 +1231,10 @@ def main():
     gen_numeric()
     gen_frontmatter()
     gen_profile_heads()
+    gen_encrypted()
     with open(os.path.join(OUT, "groundtruth.json"), "w") as f:
         json.dump(GT, f, indent=2)
-    print(f"generated {len(GT)} fixture PDFs + groundtruth.json -> {OUT}")
+    print(f"generated {len(GT)} fixture entries + groundtruth.json -> {OUT}")
 
 
 if __name__ == "__main__":

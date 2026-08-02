@@ -1,5 +1,6 @@
 """distillpdf — pure-Rust PDF extraction on lopdf."""
 from ._distillpdf import (
+    EncryptedPdfError,
     Pdf,
     __version__,
     from_bytes as _from_bytes_raw,
@@ -52,6 +53,7 @@ __all__ = [
     "render_markdown",
     "render_text",
     "DpdfError",
+    "EncryptedPdfError",
     "FindResult",
     "__version__",
     "ocr",

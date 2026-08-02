@@ -27,7 +27,7 @@ import pytest
 import distillpdf
 from distillpdf import cli
 from distillpdf.dpdf import DpdfError
-from _fixtures import FIX
+from _fixtures import FIX, GT
 
 SEC_STRUCT = os.path.join(FIX, "sec_structure.pdf")
 HEADINGS = os.path.join(FIX, "headings.pdf")
@@ -368,6 +368,39 @@ def test_pagelabels_cli_find_shows_label_suffix(tmp_path):
     d = _dpdf(PAGELABELS, tmp_path)
     _, out = _capture_cli([d, "find", "roman page ii"])
     assert "(ii)" in out  # the label is shown next to the physical page
+
+
+# ---- encrypted PDFs ---------------------------------------------------------
+# lopdf decrypts an owner-password-only file (empty user password) on load, so those open
+# and extract normally; a real user password is undecryptable and must RAISE rather than
+# hand back the blank document such a file parses into (0 pages, empty text, a ~184-byte
+# HTML shell) — the silent-blank defect this pins.
+ENC = os.path.join(FIX, "encrypted")
+ENC_GT = GT["encrypted"]
+
+
+@pytest.mark.parametrize("name", ENC_GT["owner_only"])
+def test_owner_password_only_pdf_opens_and_extracts(name):
+    doc = distillpdf.Pdf.open(os.path.join(ENC, name))
+    assert doc.page_count() == 1
+    assert ENC_GT["sentence"] in doc.extract_text()
+    assert ENC_GT["sentence"] in doc.to_html(return_string=True)
+
+
+def test_user_password_pdf_raises_instead_of_blank_document():
+    path = os.path.join(ENC, ENC_GT["user_password_file"])
+    with pytest.raises(distillpdf.EncryptedPdfError) as exc:
+        distillpdf.Pdf.open(path)
+    assert "encrypted PDF" in str(exc.value)
+    # a subclass of ValueError, so existing `except ValueError` callers still catch it
+    assert issubclass(distillpdf.EncryptedPdfError, ValueError)
+    with open(path, "rb") as f:
+        data = f.read()
+    with pytest.raises(distillpdf.EncryptedPdfError):
+        distillpdf.Pdf.from_bytes(data)
+    # and through the public wrappers, not just the raw core class
+    with pytest.raises(distillpdf.EncryptedPdfError):
+        distillpdf.open(path)
 
 
 # ---- the convert CLI distills a .dpdf output --------------------------------

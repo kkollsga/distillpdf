@@ -107,18 +107,38 @@ pub struct PdfDocument {
     pub(crate) ocr_cache: Mutex<HashMap<u32, String>>,
 }
 
+/// Make sure a loaded document is actually readable, encryption-wise.
+///
+/// lopdf's loader already decrypts transparently with the empty user password, so every
+/// owner-password-only file (the common "protected" PDF that readers open without
+/// prompting) arrives here decrypted: RC4-40 (R2), RC4-128 (R3/R4), AES-128 (R4/AESV2) and
+/// AES-256 (R6/AESV3) all verified against `tests/fixtures_pdf/encrypted/`. When it could
+/// *not* decrypt — a real user password, or a revision lopdf doesn't implement — it hands
+/// back a document that still carries `/Encrypt` and holds no objects, which used to sail
+/// through as a "successfully opened" PDF with 0 pages, empty text and an empty HTML shell.
+/// Retry the empty password explicitly (so a scheme the loader skipped still gets a chance)
+/// and, failing that, say so: [`Error::Encrypted`], never silent blank output.
+fn ensure_decrypted(doc: &mut Document) -> Result<(), Error> {
+    if !doc.is_encrypted() {
+        return Ok(());
+    }
+    doc.decrypt("").map_err(|_| Error::Encrypted)
+}
+
 impl PdfDocument {
     /// Open a PDF from a filesystem path. Only loads/parses the container.
     pub fn open(path: &str) -> Result<Self, Error> {
         let raw = std::fs::read(path).map_err(Error::Read)?;
-        let doc = Document::load_mem(&raw).map_err(|e| Error::Open(e.to_string()))?;
+        let mut doc = Document::load_mem(&raw).map_err(|e| Error::Open(e.to_string()))?;
+        ensure_decrypted(&mut doc)?;
         Ok(PdfDocument { doc, raw, source: Some(PathBuf::from(path)), ocr_cache: Default::default() })
     }
 
     /// Open a PDF from raw bytes. There is no source path.
     pub fn from_bytes(data: &[u8]) -> Result<Self, Error> {
         let raw = data.to_vec();
-        let doc = Document::load_mem(&raw).map_err(|e| Error::Parse(e.to_string()))?;
+        let mut doc = Document::load_mem(&raw).map_err(|e| Error::Parse(e.to_string()))?;
+        ensure_decrypted(&mut doc)?;
         Ok(PdfDocument { doc, raw, source: None, ocr_cache: Default::default() })
     }
 
@@ -433,6 +453,45 @@ fn iso8601_now() -> String {
 mod tests {
     use super::*;
 
+    /// The owned encrypted fixtures (`tests/gen_fixtures.py::gen_encrypted`). They live in
+    /// their own subfolder so the Python whole-fixture-set sweeps skip them.
+    fn enc_fixture(name: &str) -> String {
+        format!("{}/../tests/fixtures_pdf/encrypted/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    const ENC_SENTENCE: &str = "Encrypted fixture sentinel phrase for distillPDF.";
+
+    #[test]
+    fn owner_password_only_files_open_and_extract() {
+        // Empty user password + an owner password — the "protected" PDF every reader opens
+        // without prompting. One file per scheme lopdf 0.40 supports.
+        for name in ["rc4_40.pdf", "rc4_128.pdf", "aes_128.pdf", "aes_256.pdf"] {
+            let path = enc_fixture(name);
+            let doc = PdfDocument::open(&path).unwrap_or_else(|e| panic!("{name} must open: {e}"));
+            assert!(doc.page_count() > 0, "{name}: no pages");
+            let text = doc.extract_text();
+            assert!(text.contains(ENC_SENTENCE), "{name}: text was {text:?}");
+            // The same file through the bytes path.
+            let bytes = std::fs::read(&path).unwrap();
+            let from_bytes = PdfDocument::from_bytes(&bytes).unwrap_or_else(|e| panic!("{name} from_bytes: {e}"));
+            assert!(from_bytes.extract_text().contains(ENC_SENTENCE), "{name}: from_bytes text mismatch");
+        }
+    }
+
+    #[test]
+    fn user_password_file_errors_instead_of_returning_blank() {
+        let path = enc_fixture("userpw.pdf");
+        let err = PdfDocument::open(&path).err().expect("a user-password PDF must not open");
+        assert!(matches!(err, Error::Encrypted), "got {err:?}");
+        assert_eq!(
+            err.to_string(),
+            "encrypted PDF: needs a password, or uses an encryption scheme distillpdf cannot decrypt"
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        let err = PdfDocument::from_bytes(&bytes).err().expect("from_bytes must not open it either");
+        assert!(matches!(err, Error::Encrypted), "got {err:?}");
+    }
+
     #[test]
     fn parse_mode_conveniences() {
         // Mode/ImgMode don't derive Debug, so assert on matches! + the error string.
@@ -474,3 +533,4 @@ mod tests {
         assert_eq!(DistillOptions::from_assets("none").unwrap().profile, AssetProfile::None);
     }
 }
+

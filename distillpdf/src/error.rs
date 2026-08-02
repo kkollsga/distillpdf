@@ -23,6 +23,11 @@ pub enum Error {
     Open(String),
     /// Parsing the PDF container from bytes failed.
     Parse(String),
+    /// The PDF is encrypted and could not be opened with the empty user password — either it
+    /// needs a real password, or it uses an encryption scheme we cannot decrypt. Raised
+    /// instead of handing back the blank document such a file otherwise parses into (0 pages,
+    /// empty text). Owner-password-only files (empty user password) decrypt and never see this.
+    Encrypted,
     /// An unknown render `mode` string (carries the offending value).
     InvalidMode(String),
     /// An unknown `image_mode` string (carries the offending value).
@@ -52,6 +57,10 @@ impl fmt::Display for Error {
             Error::Mkdir(e) => write!(f, "mkdir failed: {e}"),
             Error::Open(e) => write!(f, "open failed: {e}"),
             Error::Parse(e) => write!(f, "parse failed: {e}"),
+            Error::Encrypted => write!(
+                f,
+                "encrypted PDF: needs a password, or uses an encryption scheme distillpdf cannot decrypt"
+            ),
             Error::InvalidMode(m) => write!(f, "invalid mode {m:?}: expected \"section\" or \"page\""),
             Error::InvalidImageMode(m) => {
                 write!(f, "invalid image_mode {m:?}: expected \"embed\", \"external\", or \"drop\"")
@@ -96,6 +105,10 @@ mod tests {
         assert_eq!(Error::OcrPoisoned.to_string(), "ocr cache poisoned");
         assert_eq!(Error::NoSourcePath.to_string(), "no source path (opened from_bytes); pass an explicit path");
         assert_eq!(Error::Model("verbatim".into()).to_string(), "verbatim");
+        assert_eq!(
+            Error::Encrypted.to_string(),
+            "encrypted PDF: needs a password, or uses an encryption scheme distillpdf cannot decrypt"
+        );
     }
 
     #[test]

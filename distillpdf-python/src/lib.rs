@@ -12,10 +12,24 @@ use pyo3::types::{PyDict, PyList};
 
 use distillpdf::{doc, markdown, model, ocr, Error, PdfDocument};
 
+pyo3::create_exception!(
+    _distillpdf,
+    EncryptedPdfError,
+    PyValueError,
+    "The PDF is encrypted and cannot be opened without a password (or uses an encryption \
+     scheme distillpdf cannot decrypt). A subclass of `ValueError`, so callers that already \
+     catch `ValueError` keep working."
+);
+
 /// Map a core [`Error`] to the `ValueError` the Python API has always raised. `Display` on
 /// `Error` reproduces the exact message strings, so pytest assertions stay green.
+/// [`Error::Encrypted`] gets the dedicated `EncryptedPdfError` subclass so callers can tell a
+/// password-protected file apart from any other bad input without matching on the message.
 fn to_py(e: Error) -> PyErr {
-    PyValueError::new_err(e.to_string())
+    match e {
+        Error::Encrypted => EncryptedPdfError::new_err(e.to_string()),
+        _ => PyValueError::new_err(e.to_string()),
+    }
 }
 
 /// The success sentinel returned by the file-writing methods: Python `int` 1.
@@ -653,6 +667,7 @@ fn detect_language(text: &str) -> Option<String> {
 #[pymodule]
 fn _distillpdf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Pdf>()?;
+    m.add("EncryptedPdfError", m.py().get_type::<EncryptedPdfError>())?;
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(from_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(load_model, m)?)?;

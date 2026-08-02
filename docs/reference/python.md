@@ -29,7 +29,7 @@ distillpdf.open(path: str) -> Document
 
 Open a PDF from a filesystem path and return a [`Document`](#document). Equivalent to
 `Document.open(path)`. Raises `ValueError` (`open failed: …`) when the file cannot be read or
-parsed.
+parsed, and [`EncryptedPdfError`](#encryptedpdferror) when it is password-protected.
 
 ```python
 import distillpdf
@@ -156,7 +156,8 @@ Pdf.open(path: str) -> Pdf          # staticmethod
 ```
 
 Load and parse a PDF container from a path. Rendering/extraction happens lazily in the output
-methods. Raises `ValueError` on a read/parse failure.
+methods. Raises `ValueError` on a read/parse failure, or
+[`EncryptedPdfError`](#encryptedpdferror) when the PDF needs a password.
 
 ### Pdf.from_bytes
 
@@ -1004,6 +1005,20 @@ class distillpdf.DpdfError(ValueError)
 Raised when a `.dpdf` could not be read as a model (not a container, wrong shape) or a lookup
 fails (unknown section/block id, unresolvable page spec, semantic search with no embedding
 space). Subclass of `ValueError`.
+
+### EncryptedPdfError
+
+```python
+class distillpdf.EncryptedPdfError(ValueError)
+```
+
+Raised by [`open`](#open) / [`from_bytes`](#from_bytes) / [`Pdf.open`](#pdfopen) /
+[`Pdf.from_bytes`](#pdffrom_bytes) when a PDF is encrypted and cannot be opened with the empty
+user password — it needs a real password, or it uses an encryption scheme distillpdf cannot
+decrypt. Owner-password-only files (empty user password — the common "protected" PDF that
+readers open without prompting) are decrypted transparently and never raise this; RC4-40,
+RC4-128, AES-128 and AES-256 are all supported. Subclass of `ValueError`, so existing
+`except ValueError` handling keeps working.
 
 ---
 

@@ -1,3 +1,6 @@
 pytest
 reportlab
 pillow
+# fixture generation only (tests/gen_fixtures.py): writes the AES-128/AES-256 encrypted
+# fixtures reportlab's pdfencrypt cannot emit without the optional pyaes package.
+pikepdf
