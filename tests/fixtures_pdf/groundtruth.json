@@ -952,5 +952,30 @@
         ]
       ]
     }
+  },
+  "partial_tounicode.pdf": {
+    "winansi_line": "Redding Sacramento EXPLANATION KILOMETERS 42\u00b0",
+    "winansi_words": [
+      "Redding",
+      "Sacramento",
+      "EXPLANATION",
+      "KILOMETERS",
+      "42\u00b0"
+    ],
+    "symbolic_mapped": [
+      "\u2206",
+      "\u2248"
+    ],
+    "symbolic_forbidden": [
+      "a",
+      "^"
+    ],
+    "macroman_text": "\u2022\u2026\u2013\u2019",
+    "macroman_forbidden": [
+      "\u00a5",
+      "\u00c9",
+      "\u00d0",
+      "\u00d5"
+    ]
   }
 }

@@ -115,6 +115,47 @@ def test_subset_cid_font_does_not_invent_text_from_glyph_indices():
     assert "A" not in t, f"an unmapped glyph index was invented as text: {t!r}"
 
 
+def test_partial_tounicode_recovers_dropped_letters():
+    """A simple font's ToUnicode is routinely *incomplete* — Distiller emits one `bfchar`
+    per subsetted glyph and omits the rest. An omitted code used to decode to nothing, so
+    letters vanished mid-word ("Redding" → "edding", "EXPLANATION" → "E P A ATIO" on the
+    USGS map sheets). The font's declared `/Encoding` carries exactly that information."""
+    gt = GT["partial_tounicode.pdf"]
+    t = doc("partial_tounicode.pdf").extract_page_text(1)
+    for word in gt["winansi_words"]:
+        assert word in t, f"word lost to a ToUnicode hole: {word!r} not in {t!r}"
+    assert gt["winansi_line"] in t, f"line not extracted whole: {t!r}"
+    # …and through the HTML render, not only the raw text extractor.
+    assert gt["winansi_line"] in text(html("partial_tounicode.pdf"))
+
+
+def test_symbolic_font_without_encoding_never_becomes_latin():
+    """The guard on the fix above, and the one that matters more.
+
+    A symbolic font with **no** `/Encoding` is read through its font program's built-in
+    cmap, whose codes a subsetter re-packs arbitrarily. Falling back to a Latin table there
+    prints `a` for θ and `^` for π — confident nonsense, strictly worse than a gap, and
+    unrecoverable downstream. The unmapped codes must stay dropped."""
+    gt = GT["partial_tounicode.pdf"]
+    t = doc("partial_tounicode.pdf").extract_page_text(2)
+    for sym in gt["symbolic_mapped"]:
+        assert sym in t, f"a mapped symbol was lost: {sym!r} not in {t!r}"
+    for bad in gt["symbolic_forbidden"]:
+        assert bad not in t, f"an unmapped symbolic code was invented as {bad!r}: {t!r}"
+    assert not any(c.isalpha() for c in t), f"Latin substituted for a symbol font: {t!r}"
+
+
+def test_macroman_font_high_bytes_are_not_latin1():
+    """A font declaring `/MacRomanEncoding` and no ToUnicode: its high bytes are MacRoman,
+    so `A5 C9 D0 D5` is `• … – ’`. Read as raw Latin-1 they came out `¥ É Ð Õ` — the
+    mojibake that littered a real arXiv paper's quotes, dashes and degree signs."""
+    gt = GT["partial_tounicode.pdf"]
+    t = doc("partial_tounicode.pdf").extract_page_text(3)
+    assert gt["macroman_text"] in t, f"MacRoman high bytes mis-decoded: {t!r}"
+    for bad in gt["macroman_forbidden"]:
+        assert bad not in t, f"MacRoman byte read as Latin-1 {bad!r}: {t!r}"
+
+
 def test_unfiltered_form_text_survives():
     """A Form XObject whose stream carries NO /Filter must still yield its glyphs.
 

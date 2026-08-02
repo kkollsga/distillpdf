@@ -2370,6 +2370,124 @@ def gen_identity_cid_font():
     }
 
 
+def gen_partial_tounicode():
+    """Hand-written PDF for the *partial* ToUnicode defect and its safety guard.
+
+    A simple font's ToUnicode CMap is routinely incomplete — Distiller writes one
+    ``bfchar`` per glyph it happened to subset and omits the rest. A code the table omits
+    used to decode to nothing, so letters vanished mid-word (the USGS map sheets read
+    "edding" for "Redding", "Sa ramento" for "Sacramento", "E P A ATIO" for
+    "EXPLANATION"). The recovery is the font's *declared* ``/Encoding``.
+
+    Three pages, one per decode path:
+
+    ``p1`` **F1** — ``/TrueType`` + ``/Encoding /WinAnsiEncoding``, nonsymbolic descriptor,
+    and a ToUnicode that deliberately omits ``R c X L N I`` and ``°`` (exactly the real
+    file's dropped set). Every word must come out whole.
+
+    ``p2`` **F2** — the guard, and the reason the fix cannot be "always fall back to a
+    Latin table": a **symbolic** font (``/Flags 4``) with **no ``/Encoding`` at all**, whose
+    codes its subsetter re-packed. Such a font is read through its font program's built-in
+    cmap, which we do not parse — so its two unmapped codes must stay dropped. Under a naive
+    WinAnsi fallback they would print ``a`` and ``^``, which is what turns a real paper's
+    ``θ`` and ``π`` into confident nonsense. Dropping is recoverable; substituting is not.
+
+    ``p3`` **F3** — ``/Encoding /MacRomanEncoding`` with **no** ToUnicode. Its high bytes
+    are MacRoman, not Latin-1: ``A5 C9 D0 D5`` is ``• … – ’`` and must not read ``¥ É Ð Õ``.
+    """
+    pdf = os.path.join(OUT, "partial_tounicode.pdf")
+
+    # -- p1: partial ToUnicode over a declared WinAnsi encoding -------------------
+    win_line = "Redding Sacramento EXPLANATION KILOMETERS 42°"
+    win_bytes = win_line.encode("cp1252")
+    # The codes the producer "forgot" — the real file's dropped set.
+    omitted = {ord(c) for c in "RcXLNI"} | {0xB0}
+    mapped = sorted(set(win_bytes) - omitted)
+    win_body = b"".join(b"<%02X> <%04X>\n" % (b, b) for b in mapped)
+    win_cmap = (b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n"
+                b"/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n"
+                b"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n"
+                b"%d beginbfchar\n%sendbfchar\nendcmap\nCMapName currentdict /CMap "
+                b"defineresource pop\nend\nend" % (len(mapped), win_body))
+
+    # -- p2: symbolic font, no /Encoding, two codes the tiny table omits ----------
+    sym_mapped = {0x21: "∆", 0x22: "≈"}   # ∆ ≈ — the only two it declares
+    sym_codes = [0x21, 0x22, 0x61, 0x5E]            # 0x61/0x5E are WinAnsi 'a' and '^'
+    sym_body = b"".join(b"<%02X> <%04X>\n" % (c, ord(t)) for c, t in sorted(sym_mapped.items()))
+    sym_cmap = (b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n"
+                b"/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n"
+                b"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n"
+                b"%d beginbfchar\n%sendbfchar\nendcmap\nCMapName currentdict /CMap "
+                b"defineresource pop\nend\nend" % (len(sym_mapped), sym_body))
+
+    # -- p3: MacRomanEncoding, no ToUnicode at all --------------------------------
+    mac_codes = [0xA5, 0xC9, 0xD0, 0xD5]
+    mac_text = "•…–’"
+
+    def hexstr(bs):
+        return b"<" + bytes(bs).hex().encode("ascii") + b">"
+
+    c1 = b"BT /F1 14 Tf 50 700 Td " + hexstr(win_bytes) + b" Tj ET"
+    c2 = b"BT /F2 14 Tf 50 700 Td " + hexstr(sym_codes) + b" Tj ET"
+    c3 = b"BT /F3 14 Tf 50 700 Td " + hexstr(mac_codes) + b" Tj ET"
+
+    def stream(data):
+        return b"<< /Length %d >>\nstream\n%s\nendstream" % (len(data), data)
+
+    def page(num, contents, font_obj, font_name):
+        return (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font "
+                b"<< /%s %d 0 R >> >> /Contents %d 0 R >>" % (font_name, font_obj, contents))
+
+    widths = lambda lo, hi, w: (b"/FirstChar %d /LastChar %d /Widths [%s]"
+                                % (lo, hi, b" ".join(b"%d" % w for _ in range(lo, hi + 1))))
+
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>",
+        3: page(1, 6, 9, b"F1"),
+        4: page(2, 7, 12, b"F2"),
+        5: page(3, 8, 14, b"F3"),
+        6: stream(c1),
+        7: stream(c2),
+        8: stream(c3),
+        # F1: declares WinAnsi, descriptor says nonsymbolic (0x20) + serif (0x2).
+        9: (b"<< /Type /Font /Subtype /TrueType /BaseFont /AAAAAA+PartialSerif "
+            b"/Encoding /WinAnsiEncoding /FontDescriptor 10 0 R /ToUnicode 11 0 R "
+            + widths(32, 122, 500) + b" >>"),
+        10: (b"<< /Type /FontDescriptor /FontName /AAAAAA+PartialSerif /Flags 34 "
+             b"/ItalicAngle 0 /Ascent 750 /Descent -250 /CapHeight 700 /StemV 80 "
+             b"/FontBBox [-200 -250 1200 900] >>"),
+        11: stream(win_cmap),
+        # F2: NO /Encoding, descriptor says symbolic (0x4) — built-in cmap territory.
+        12: (b"<< /Type /Font /Subtype /TrueType /BaseFont /BBBBBB+GlyphOnly "
+             b"/FontDescriptor 13 0 R /ToUnicode 15 0 R " + widths(33, 97, 600) + b" >>"),
+        13: (b"<< /Type /FontDescriptor /FontName /BBBBBB+GlyphOnly /Flags 4 "
+             b"/ItalicAngle 0 /Ascent 750 /Descent -250 /CapHeight 700 /StemV 80 "
+             b"/FontBBox [-200 -250 1200 900] >>"),
+        # F3: MacRoman, no ToUnicode.
+        14: (b"<< /Type /Font /Subtype /TrueType /BaseFont /CCCCCC+PartialMac "
+             b"/Encoding /MacRomanEncoding /FontDescriptor 16 0 R "
+             + widths(160, 213, 500) + b" >>"),
+        15: stream(sym_cmap),
+        16: (b"<< /Type /FontDescriptor /FontName /CCCCCC+PartialMac /Flags 34 "
+             b"/ItalicAngle 0 /Ascent 750 /Descent -250 /CapHeight 700 /StemV 80 "
+             b"/FontBBox [-200 -250 1200 900] >>"),
+    }
+    _assemble_pdf(objs, pdf)
+    GT["partial_tounicode.pdf"] = {
+        # p1 — every word whole, including the ones whose letters the table omits.
+        "winansi_line": win_line,
+        "winansi_words": ["Redding", "Sacramento", "EXPLANATION", "KILOMETERS", "42°"],
+        # p2 — the two codes the tiny table DOES map must survive…
+        "symbolic_mapped": ["∆", "≈"],
+        # …and the two it omits must NOT become these WinAnsi letters.
+        "symbolic_forbidden": ["a", "^"],
+        # p3 — MacRoman high bytes, and the Latin-1 misreadings they must never be.
+        "macroman_text": mac_text,
+        "macroman_forbidden": ["¥", "É", "Ð", "Õ"],
+    }
+
+
 def _utf16be_hex(s):
     """A PDF hex string carrying the UTF-16BE form of ``s`` (BOM + big-endian units),
     which is how hyperref/pdfTeX writes any outline title that isn't pure ASCII."""
@@ -2991,6 +3109,7 @@ def main():
     gen_math()
     gen_mathfonts()
     gen_identity_cid_font()
+    gen_partial_tounicode()
     gen_numeric()
     gen_frontmatter()
     gen_profile_heads()

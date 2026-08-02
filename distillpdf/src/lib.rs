@@ -20,6 +20,7 @@ pub mod ocr;
 mod afm;
 mod captions;
 mod elem_passes;
+mod encoding;
 mod extract;
 mod frontmatter;
 mod function;

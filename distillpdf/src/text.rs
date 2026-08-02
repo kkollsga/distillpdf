@@ -25,6 +25,19 @@ struct FontInfo {
     /// ToUnicode — e.g. f-ligatures encoded as code 2/3 (`/fi`,`/fl`) that would
     /// otherwise surface as control chars.
     differences: Option<HashMap<u32, String>>,
+    /// The font's **declared** base encoding (`/Encoding /WinAnsiEncoding`, or an
+    /// `/Encoding` dict's `/BaseEncoding`) as a code → Unicode table. Used as a
+    /// *per-code* fallback when the ToUnicode CMap omits the code — a partial
+    /// ToUnicode is common (Distiller writes one `bfchar` per subsetted glyph) and
+    /// without this every omitted code decodes to nothing, dropping letters out of
+    /// mid-word ("Redding" → "edding").
+    ///
+    /// `None` whenever the font does **not** declare one. That is deliberate and is
+    /// the whole safety property: a symbolic font with no `/Encoding` uses its font
+    /// program's built-in cmap, whose codes a subsetter re-packs arbitrarily, so a
+    /// Latin table would render `θ` as `a` and `π` as `^`. Dropping an unmappable
+    /// code is recoverable; silently substituting a plausible wrong letter is not.
+    base_encoding: Option<&'static [u16; 256]>,
     /// Computer-Modern *text* font (CMR/CMBX/CMSS/CMTI/CMTT/SFRM…) with no
     /// ToUnicode: decode its low codes through the OT1 (TeX text) encoding so
     /// f-ligatures (0x0b-0x0f) and accents/specials (0x10-0x1f) aren't emitted as
@@ -352,8 +365,31 @@ fn font_info(doc: &Document, dict: &Dictionary, raw: &[u8]) -> FontInfo {
         } else {
             0
         };
+        // The declared base encoding, resolved to a code → Unicode table. This is the
+        // per-code fallback for a ToUnicode CMap that omits codes (see the field doc).
+        // Three gates, each of which exists to prevent a confidently-wrong substitution:
+        //  * simple fonts only — a Type0 `/Encoding` names a CMap, not a Latin table;
+        //  * only when the producer actually *declared* one — no `/Encoding` means "use
+        //    the font program's built-in cmap", which a subsetter re-packs arbitrarily;
+        //  * not for a font the descriptor flags symbolic (and not also nonsymbolic):
+        //    its built-in cmap wins over any `/Encoding` it spuriously also carries.
+        // CM text/math fonts are excluded too — their built-in TeX encoding, decoded by
+        // `ot1_text`/`cm_math` further down, is the right table for them.
+        let symbolic = (flags & 0x4) != 0 && (flags & 0x20) == 0;
+        let base_encoding = (!two_byte && !symbolic && !ot1_text && cm_math == 0)
+            .then(|| {
+                let enc = dict.get(b"Encoding").ok().and_then(|o| deref(doc, o))?;
+                let name: &[u8] = match enc {
+                    Object::Name(n) => n,
+                    Object::Dictionary(d) => d.get(b"BaseEncoding").ok().and_then(|o| o.as_name().ok())?,
+                    _ => return None,
+                };
+                crate::encoding::base_encoding_table(name)
+            })
+            .flatten();
+
         let font_id = font_id_of(&basefont);
-        FontInfo { two_byte, to_unicode, identity_unicode, differences, ot1_text, cm_math, widths, default_width, bold, italic, mono, font_id }
+        FontInfo { two_byte, to_unicode, identity_unicode, differences, base_encoding, ot1_text, cm_math, widths, default_width, bold, italic, mono, font_id }
     }
 }
 
@@ -895,6 +931,23 @@ fn decode_words(elems: &[Show], font: Option<&FontInfo>, size: f32, tc: f32, tw:
                                     for ch in t.chars() {
                                         push_norm(&mut s, ch);
                                     }
+                                    got = true;
+                                }
+                            }
+                        }
+                        // The font's DECLARED base encoding (`/WinAnsiEncoding` &c) — the
+                        // per-code fallback for a ToUnicode CMap that simply omits codes.
+                        // Distiller routinely writes one `bfchar` per subsetted glyph and
+                        // leaves the rest out; without this, "Redding" decodes to "edding".
+                        // Only ever set when the producer declared an encoding, so a symbolic
+                        // font with no `/Encoding` still emits nothing rather than a wrong
+                        // Latin letter (see `FontInfo::base_encoding`).
+                        if !got {
+                            if let Some(enc) = fi.base_encoding {
+                                if let Some(ch) =
+                                    enc.get(code as usize).copied().filter(|&u| u != 0).and_then(|u| char::from_u32(u as u32))
+                                {
+                                    push_norm(&mut s, ch);
                                     got = true;
                                 }
                             }
@@ -1727,6 +1780,52 @@ mod tests {
         assert!(out.contains("Hello"), "subset font text lost: {out:?}");
         assert!(!out.contains("HelloA"), "unmapped CID 0x41 invented an 'A': {out:?}");
         assert!(!out.contains('A'), "no 'A' is drawn anywhere on this page: {out:?}");
+    }
+
+    /// `tests/gen_fixtures.py::gen_partial_tounicode`, page by page.
+    fn partial_tounicode_page(n: u32) -> String {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/partial_tounicode.pdf");
+        let raw = std::fs::read(path).unwrap();
+        let doc = Document::load_mem(&raw).unwrap();
+        let pid = *doc.get_pages().get(&n).unwrap();
+        extract_page(&doc, pid, &raw).unwrap()
+    }
+
+    /// An *incomplete* ToUnicode (the common case — one `bfchar` per subsetted glyph) left
+    /// every omitted code decoding to nothing, so letters vanished mid-word. The declared
+    /// `/Encoding` is where that information was, unused.
+    #[test]
+    fn a_partial_tounicode_falls_back_to_the_declared_encoding() {
+        let out = partial_tounicode_page(1);
+        for word in ["Redding", "Sacramento", "EXPLANATION", "KILOMETERS", "42\u{b0}"] {
+            assert!(out.contains(word), "word lost to a ToUnicode hole: {word:?} not in {out:?}");
+        }
+    }
+
+    /// The guard, and the one that matters more: a symbolic font with NO `/Encoding` is read
+    /// through its font program's built-in cmap, whose codes a subsetter re-packs. A Latin
+    /// fallback there prints `a` for θ and `^` for π — confident nonsense that no downstream
+    /// consumer can undo, unlike a gap.
+    #[test]
+    fn a_symbolic_font_with_no_encoding_never_substitutes_latin() {
+        let out = partial_tounicode_page(2);
+        for sym in ["\u{2206}", "\u{2248}"] {
+            assert!(out.contains(sym), "a mapped symbol was lost: {sym:?} from {out:?}");
+        }
+        assert!(!out.contains('a'), "unmapped code 0x61 invented a WinAnsi 'a': {out:?}");
+        assert!(!out.contains('^'), "unmapped code 0x5e invented a WinAnsi '^': {out:?}");
+        assert!(!out.chars().any(|c| c.is_alphabetic()), "Latin substituted for a symbol font: {out:?}");
+    }
+
+    /// `/MacRomanEncoding` with no ToUnicode: the high bytes are MacRoman, not Latin-1.
+    /// Read raw they came out `¥ É Ð Õ` — the mojibake that littered a real paper's quotes.
+    #[test]
+    fn a_macroman_font_with_no_tounicode_is_not_read_as_latin1() {
+        let out = partial_tounicode_page(3);
+        assert!(out.contains("\u{2022}\u{2026}\u{2013}\u{2019}"), "MacRoman mis-decoded: {out:?}");
+        for bad in ['\u{a5}', '\u{c9}', '\u{d0}', '\u{d5}'] {
+            assert!(!out.contains(bad), "MacRoman byte read as Latin-1 {bad:?}: {out:?}");
+        }
     }
 
     #[test]
