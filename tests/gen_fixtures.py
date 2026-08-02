@@ -2200,6 +2200,80 @@ def gen_map_label_grid():
     GT["map_label_grid.pdf"] = {"page1_figures": 1, "page2_figures": 0}
 
 
+def gen_glyph_run_labels():
+    """A figure whose labels are drawn ONE GLYPH PER ``Tj`` — the shape a cartographic
+    exporter emits, and the shape that made a decoded label unreadable.
+
+    ``geology_usgs_fs.pdf`` p1 draws its map's place names a glyph at a time. Every glyph was
+    claimed by the figure, mapped into its local space and emitted — as ten ``<text>``
+    elements reading ``C`` ``l`` ``o`` ``v`` ``e`` ``r`` ``d`` ``a`` ``l`` ``e``. The map
+    LOOKED right, but the word did not exist in the output: not searchable, not selectable,
+    invisible to any token-level check. (It was filed as "decoded but never rendered"; it was
+    in fact never *assembled* — the body path assembles spans into runs, the figure-label
+    path never did.)
+
+    One page, one uncaptioned map figure (Béziers, so the ink gate keeps it), carrying:
+
+      * ``Cloverdale`` — one ``Tj`` per glyph at natural advances. Must come back as ONE
+        ``<text>``; this is the defect.
+      * ``Healdsburg`` — the same word length drawn as a single ``Tj``. The control: joining
+        must not disturb a label that was already whole.
+      * ``Santa Rosa`` — glyph by glyph, with the word space drawn as a real GAP (no space
+        glyph). Must stay TWO elements: the join closes gaps the reader cannot see, and never
+        invents a space.
+      * ``Sonoma`` — one ``Tj`` at 90 deg. A rotated label must come through the join pass
+        untouched. (The rotated *glyph run* — adjacency measured along the baseline rather
+        than along x — is pinned in `vector::tests` instead: the TEXT pillar does not assemble
+        a rotated glyph run either, so an end-to-end fixture for it could not also carry the
+        "every extracted word is rendered" invariant this file asserts.)
+      * ``Napa`` — on ``Cloverdale``'s baseline but far to the right. A shared baseline is not
+        a shared word.
+    """
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    pdf = os.path.join(OUT, "glyph_run_labels.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    FONT, SZ = "Helvetica", 7.5
+
+    def glyphs(x, y, s):
+        """Draw `s` one `Tj` per glyph at its natural advances; a space becomes a real gap."""
+        for ch in s:
+            if ch != " ":
+                c.drawString(x, y, ch)
+            x += stringWidth(ch, FONT, SZ)
+
+    mx, my, mw, mh = float(LM), 300.0, 400.0, 400.0
+    c.setStrokeColorRGB(0.1, 0.3, 0.6)
+    c.setLineWidth(0.9)
+    for k in range(6):  # a curved coastline: graphic ink no ruled table can draw
+        off = k * 12.0
+        pth = c.beginPath()
+        pth.moveTo(mx + 20 + off, my + 30)
+        pth.curveTo(mx + 90 + off, my + 140, mx + 40 + off, my + 250, mx + 130 + off, mh + my - 40)
+        c.drawPath(pth, stroke=1, fill=0)
+    for k in range(6):
+        c.line(mx + 200, my + 40 + k * 55, mx + 380, my + 90 + k * 55)
+    c.setStrokeColorRGB(0, 0, 0)
+    c.setFont(FONT, SZ)
+    glyphs(mx + 30, my + 320, "Cloverdale")
+    glyphs(mx + 220, my + 320, "Napa")
+    c.drawString(mx + 30, my + 280, "Healdsburg")
+    glyphs(mx + 30, my + 240, "Santa Rosa")
+    c.saveState()
+    c.translate(mx + 300, my + 120)
+    c.rotate(90)
+    c.drawString(0, 0, "Sonoma")
+    c.restoreState()
+    c.setFont(BODY_F, BODY_S)
+    c.drawString(LM, my - 40, "The map above is uncaptioned; its place names are its own labels.")
+    c.showPage()
+    c.save()
+    GT["glyph_run_labels.pdf"] = {
+        "joined": ["Cloverdale", "Sonoma"],
+        "whole_already": ["Healdsburg"],
+        "must_stay_apart": ["Santa", "Rosa", "Napa"],
+    }
+
+
 def gen_ink_gate():
     """The three cases the figure-ink gate has to tell apart, all rects-only.
 
@@ -3527,6 +3601,7 @@ def main():
     gen_small_vector_fig()
     gen_dense_vector()
     gen_map_label_grid()
+    gen_glyph_run_labels()
     gen_ink_gate()
     gen_damaged_streams()
     gen_textstate_q()

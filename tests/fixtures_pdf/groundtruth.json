@@ -996,6 +996,20 @@
     "page1_figures": 1,
     "page2_figures": 0
   },
+  "glyph_run_labels.pdf": {
+    "joined": [
+      "Cloverdale"
+    ],
+    "whole_already": [
+      "Healdsburg",
+      "Sonoma"
+    ],
+    "must_stay_apart": [
+      "Santa",
+      "Rosa",
+      "Napa"
+    ]
+  },
   "textstate_q.pdf": {
     "word": "Cloverdale",
     "occurrences": 2

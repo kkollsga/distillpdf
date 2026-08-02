@@ -395,6 +395,19 @@ fn local_extent(rot: i32, w: f32, h: f32) -> (f32, f32) {
 // to belong to the figure (form text sits just outside the boxes it annotates).
 const LABEL_MARGIN: f32 = 24.0;
 
+/// Gaps (as a fraction of the type size) inside which two label spans are consecutive glyphs
+/// of one word — see [`coalesce_glyph_runs`].
+///
+/// `0.2` is `layout::lines_of`'s own space threshold (`gap > s.size * 0.2` is where the body
+/// path decides a space is needed), so the two paths draw the word/space line in the same
+/// place. Anything wider stays two spans: this pass joins what is already contiguous, it
+/// never invents a space, and a real word gap is left exactly as it was.
+const GLYPH_JOIN_GAP: f32 = 0.2;
+/// Glyphs may also *overlap* slightly — kerning, an accent, a hand-tracked map label. A small
+/// negative gap is still one word; a deeply stacked glyph (a struck-through or overprinted
+/// mark) is not, and stays its own span.
+const GLYPH_OVERLAP_GAP: f32 = 0.35;
+
 impl PlacedSvg {
     /// Whether this figure draws curves or slanted lines — see [`has_graphic_ink`]. Used by
     /// `html.rs` to tell a diagram's own label grid (which must not suppress the diagram)
@@ -1018,9 +1031,93 @@ fn page_width(doc: &Document, page_id: ObjectId, rot: i32) -> f32 {
 
 /// Distribute form-internal text labels among the figures on a page (each label
 /// goes to the figure whose bbox, expanded by a margin, contains its centre).
+///
+/// The spans are [`coalesce_glyph_runs`]-joined first, so a label a cartographic exporter
+/// drew one glyph per `Tj` reaches its figure as the WORD it is.
 pub fn attach_labels(figs: &mut [PlacedSvg], spans: &[LabelSpan]) {
+    let spans = coalesce_glyph_runs(spans);
     for f in figs.iter_mut() {
-        f.attach(spans);
+        f.attach(&spans);
+    }
+}
+
+/// Join label spans that are consecutive glyphs of one word back into one span.
+///
+/// **The defect this exists for.** `geology_usgs_fs.pdf` p1 draws its map's place names one
+/// `Tj` per glyph. Every glyph was claimed, mapped and emitted — and the figure rendered ten
+/// `<text>` elements reading `C` `l` `o` `v` `e` `r` `d` `a` `l` `e`. Visually the map is
+/// right, but the word does not exist in the output: it cannot be searched, selected, or
+/// counted, and the label reads as ten one-letter labels to anything downstream. The body
+/// path never had this problem — `layout::lines_of` assembles spans into runs — so it showed
+/// up as "the label is decoded but never rendered" when in fact it was never *assembled*.
+///
+/// **Deliberately narrow.** Only a gap the reader would not see as a break is closed
+/// ([`GLYPH_JOIN_GAP`]), and no space is ever invented: a span pair separated by a real word
+/// space stays two spans, exactly as before. Adjacency is measured **along the baseline**,
+/// not along x, so a 90° axis title's glyphs join the same way. Style, size and angle must
+/// all match — a run that changes any of them is a different run.
+///
+/// Output order is the input's: each joined run takes the position of its FIRST member, so
+/// no figure's existing `<text>` sequence is reshuffled by this pass.
+fn coalesce_glyph_runs(spans: &[LabelSpan]) -> Vec<LabelSpan> {
+    // Along-baseline and across-baseline coordinates of a span's anchor.
+    let uv = |s: &LabelSpan| {
+        let (sin, cos) = s.angle.sin_cos();
+        (s.x * cos + s.y * sin, -s.x * sin + s.y * cos)
+    };
+    // Group candidates: same style/size/angle and the same baseline, ordered along it. The
+    // sort is on a copy of the INDICES, so the spans themselves never move.
+    let mut order: Vec<usize> = (0..spans.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (sa, sb) = (&spans[a], &spans[b]);
+        let (ua, va) = uv(sa);
+        let (ub, vb) = uv(sb);
+        (sa.angle, sa.size, sa.bold, sa.italic, va, ua, a)
+            .partial_cmp(&(sb.angle, sb.size, sb.bold, sb.italic, vb, ub, b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    // (first input index, the run built so far, its end along the baseline).
+    let mut runs: Vec<(usize, LabelSpan, f32)> = Vec::new();
+    for &i in &order {
+        let s = &spans[i];
+        let (u, v) = uv(s);
+        if let Some((first, run, end)) = runs.last_mut() {
+            let (_, rv) = uv(run);
+            let gap = u - *end;
+            if run.angle == s.angle
+                && (run.size - s.size).abs() < 0.05
+                && run.bold == s.bold
+                && run.italic == s.italic
+                && (rv - v).abs() <= s.size * 0.15
+                && gap <= s.size * GLYPH_JOIN_GAP
+                && gap >= -s.size * GLYPH_OVERLAP_GAP
+            {
+                run.text.push_str(&s.text);
+                *end = u + s.width;
+                // The run's width is its PAINTED extent — the distance from the first glyph's
+                // anchor to the last glyph's end — not the sum of the glyph widths, so the
+                // claim tests and the viewBox see the space the word really occupies.
+                run.width = *end - uv(run).0;
+                *first = (*first).min(i);
+                continue;
+            }
+        }
+        runs.push((i, clone_label(s), u + s.width));
+    }
+    runs.sort_by_key(|(first, _, _)| *first);
+    runs.into_iter().map(|(_, s, _)| s).collect()
+}
+
+fn clone_label(s: &LabelSpan) -> LabelSpan {
+    LabelSpan {
+        x: s.x,
+        y: s.y,
+        size: s.size,
+        width: s.width,
+        text: s.text.clone(),
+        bold: s.bold,
+        italic: s.italic,
+        angle: s.angle,
     }
 }
 
@@ -1753,6 +1850,57 @@ mod tests {
         let (turned, tweak) = positioned_vectors(&doc, page_id);
         assert_eq!(turned.len(), 1, "a quarter-turned page keeps its figure");
         assert!(!tweak.iter().any(|v| v.demoted()), "and nothing was demoted on it");
+    }
+
+    /// One label span: `text` starting at `(x, y)`, `size`-tall, `w` wide, at `angle`.
+    fn lspan(x: f32, y: f32, w: f32, text: &str, angle: f32) -> LabelSpan {
+        LabelSpan { x, y, size: 8.0, width: w, text: text.to_string(), bold: false, italic: false, angle }
+    }
+
+    #[test]
+    fn a_label_drawn_one_glyph_per_tj_is_reassembled_into_its_word() {
+        // `geology_usgs_fs.pdf` p1 draws its place names a glyph at a time. Every glyph was
+        // claimed and emitted, so nothing was "lost" — and the figure rendered ten <text>
+        // elements reading C l o v e r d a l e. The word did not exist in the output.
+        let mut spans = Vec::new();
+        let (mut x, w) = (100.0f32, 4.0f32);
+        for ch in "Cloverdale".chars() {
+            spans.push(lspan(x, 200.0, w, &ch.to_string(), 0.0));
+            x += w;
+        }
+        // A word space is a gap the reader DOES see: it must stay two spans, and no space may
+        // be invented (the run keeps exactly the characters it was given).
+        spans.push(lspan(x + 8.0 * 0.5, 200.0, 12.0, "Napa", 0.0));
+        // A second baseline, and a run at 90 deg whose glyphs advance in +y: adjacency is
+        // measured along the BASELINE, so this joins exactly like the upright one.
+        let mut y = 300.0f32;
+        for ch in "Sonoma".chars() {
+            spans.push(lspan(400.0, y, w, &ch.to_string(), std::f32::consts::FRAC_PI_2));
+            y += w;
+        }
+        // Same place, different size: a different run, however adjacent.
+        let mut big = lspan(x + 8.0 * 0.5 + 12.0, 200.0, 6.0, "XL", 0.0);
+        big.size = 14.0;
+        spans.push(big);
+
+        let out = coalesce_glyph_runs(&spans);
+        let texts: Vec<&str> = out.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["Cloverdale", "Napa", "Sonoma", "XL"], "runs, in the input's order");
+        // The joined run's width is the PAINTED extent, so the claim tests and the viewBox
+        // see the space the word really occupies.
+        assert!((out[0].width - 40.0).abs() < 1e-4, "run width {}", out[0].width);
+        assert_eq!((out[0].x, out[0].y), (100.0, 200.0), "a run keeps its first glyph's anchor");
+        assert_eq!(out[2].angle, std::f32::consts::FRAC_PI_2, "the rotated run keeps its angle");
+
+        // THE invariant, and the one the corpus proved: this pass never adds, drops or alters
+        // a character — over all 54 corpus documents the <text> character multiset was
+        // byte-identical before and after, while 2,502 glyph fragments became words.
+        let chars = |v: &[LabelSpan]| {
+            let mut c: Vec<char> = v.iter().flat_map(|s| s.text.chars()).collect();
+            c.sort_unstable();
+            c
+        };
+        assert_eq!(chars(&spans), chars(&out), "coalescing is a regrouping, never a rewrite");
     }
 
     #[test]

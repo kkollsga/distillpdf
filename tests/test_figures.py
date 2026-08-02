@@ -393,3 +393,70 @@ def test_a_turned_page_emits_its_body_prose():
             assert i >= 0, f"/Rotate {rot}: paragraph missing — {body!r}"
         assert at == sorted(at), f"/Rotate {rot}: paragraphs out of reading order"
     assert g["spine_label"] not in h, "text set sideways to the reader is not body prose"
+
+
+def test_a_label_drawn_one_glyph_per_tj_renders_as_its_word():
+    """``glyph_run_labels.pdf`` — a map whose place names are drawn a glyph at a time.
+
+    Every glyph was claimed by the figure, mapped into its local space and emitted, so
+    nothing was ever *lost* — and the map rendered ten ``<text>`` elements reading ``C`` ``l``
+    ``o`` ``v`` ``e`` ``r`` ``d`` ``a`` ``l`` ``e``. The picture looked right; the word did
+    not exist in the output (``geology_usgs_fs.pdf`` p1, filed as a label "decoded but never
+    rendered" — it was never *assembled*).
+
+    Joining closes only gaps a reader cannot see: a real word space still separates two
+    labels, and a label that was already one ``Tj`` is untouched.
+    """
+    from _fixtures import GT as _GT
+    g = _GT["glyph_run_labels.pdf"]
+    h = html("glyph_run_labels.pdf")
+    texts = re.findall(r"<text[^>]*>(.*?)</text>", h)
+    for word in g["joined"] + g["whole_already"]:
+        assert word in texts, f"{word!r} is not a label of its own — got {texts}"
+    for word in g["must_stay_apart"]:
+        assert word in texts, f"{word!r} must stay its own label — got {texts}"
+    assert all(len(t.strip()) > 1 for t in texts), f"a label is still one glyph wide: {texts}"
+
+
+# Figure-bearing owned fixtures whose every extracted word must reach the render. Kept as an
+# explicit list, not a glob: the fixtures deliberately excluded are excluded for reasons that
+# are not this invariant — list markers the HTML turns into <ol> (lists, twolists), an e-mail
+# address the source splits (frontmatter), and text set sideways to the reader (rotated_body).
+_RECALL_FIXTURES = [
+    "figures.pdf", "figures_onepage.pdf", "xobject_figure.pdf", "dense_vector.pdf",
+    "small_vector_fig.pdf", "map_label_grid.pdf", "glyph_run_labels.pdf", "ink_gate.pdf",
+    "caption_bleed.pdf", "separation.pdf", "textstate_q.pdf", "rotated_pages.pdf",
+    "dashes.pdf",
+]
+
+
+def test_no_word_the_text_pillar_extracts_is_missing_from_the_render():
+    """The "emitted at least once" half of the exactly-once invariant, as a test.
+
+    P10 pinned "a span is emitted exactly once — figure or body, never neither" for the
+    claiming heuristics. It could not see a span that IS emitted and still leaves no word:
+    ``geology_usgs_fs.pdf`` p1's ``Cloverdale`` was on the map as ten one-glyph ``<text>``
+    elements, and no string- or token-level check could find it.
+
+    So the invariant is asked of the TOKENS, over the figure-bearing owned fixtures: every
+    word ``extract_text`` finds must appear somewhere in ``to_html``, at least as often.
+    Hyphenation is normalised first — the HTML correctly rejoins ``Applica``+``tion`` that the
+    text splits across a line break, and an un-normalised sweep drowns in that one difference.
+    """
+    from collections import Counter
+    import html as _html
+    from _fixtures import doc as _doc
+
+    def tokens(s):
+        s = s.replace("­", "")
+        s = re.sub(r"-\s*\n\s*", "", s)          # de-hyphenate across a line break
+        return Counter(w.lower() for w in re.findall(r"[0-9A-Za-zÀ-ÿ]+", s))
+
+    missing = {}
+    for name in _RECALL_FIXTURES:
+        p = _doc(name)
+        rendered = _html.unescape(re.sub(r"<[^>]+>", " ", p.to_html(mode="page", return_string=True)))
+        gone = tokens(p.extract_text()) - tokens(rendered)
+        if gone:
+            missing[name] = sorted(gone.elements())
+    assert not missing, f"words extracted but never rendered: {missing}"
