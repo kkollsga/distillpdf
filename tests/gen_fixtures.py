@@ -1036,6 +1036,82 @@ def gen_no_resources_paths():
     GT["no_resources_paths.pdf"] = {"svgs_per_page": [1, 1], "paths_per_page": 8}
 
 
+def gen_alpha_groups():
+    """Per-element alpha carried through nested **transparency groups** — the shape every
+    matplotlib/plotly figure with an alpha channel has, and the one that lost its alpha.
+
+    A form XObject with ``/Group << /S /Transparency >>`` is composited as a unit: the
+    ``ca``/``CA`` in force at its ``Do`` applies to the group's RESULT, and the group's own
+    initial state starts opaque (PDF 32000-1 §11.4.7.2, §11.6.6). The walk instead inherited
+    the caller's alpha into the child's graphics state, where the child's own first ``gs`` —
+    routinely ``ca 1 CA 1``, because inside a group that IS the initial value — overwrote it.
+    Net effect: every element painted fully opaque. On ``attention_1706.03762`` p13 that
+    turned 615 weighted cells into flat colour, including 561 whose authored ``ca`` is
+    exactly 0, i.e. that must not appear at all.
+
+    Two levels of nesting, one page, one figure:
+
+      ``/Fm0``      the outer transparency group, invoked once from the page.
+      ``/FmN``      six inner transparency groups, each one filled rect. Before each ``Do``
+                    the outer stream selects the element's alpha with ``gs``; each inner
+                    stream then opens with its OWN ``gs`` at ``ca 1 CA 1``, which is the
+                    trap. Alphas: 0.0039 / 0.02 / 0.04 / 0.5 / 0.98 — spanning the old
+                    ``ALPHA_HIDDEN`` 0.04 bar, below which a paint used to be DELETED, so
+                    three of the five carried no ink at all — plus one at ``ca 0``, which
+                    must still be absent (transparent is not faint).
+      ``/FmPlain``  the control: a form with NO ``/Group``, whose own ``gs`` legitimately
+                    sets ``ca 0.25``. An ordinary form inherits and may overwrite the
+                    graphics state; only a group may not. Its rect must come out at 0.25.
+
+    Eight paths in one 200x300 pt box, clear of every clustering threshold.
+    Hand-assembled: reportlab emits no transparency groups."""
+    pdf = os.path.join(OUT, "alpha_groups.pdf")
+    alphas = [b"0.0039", b"0.02", b"0.04", b"0.5", b"0.98", b"0"]
+    # One inner group per alpha, laid out left to right so no two overlap.
+    inner = {}
+    calls = []
+    for i, _a in enumerate(alphas):
+        x = 110 + i * 30
+        body = b"/GS0 gs 0.2 0.4 0.8 rg %d 210 20 80 re f" % x
+        inner[i] = (b"<< /Type /XObject /Subtype /Form /BBox [0 0 400 600] /Group << /S "
+                    b"/Transparency /CS /DeviceRGB >> /Resources << /ExtGState << /GS0 "
+                    b"<< /ca 1 /CA 1 >> >> >> /Length %d >>\nstream\n%s\nendstream"
+                    % (len(body), body))
+        calls.append(b"/GA%d gs /Fm%d Do" % (i, i))
+    # The outer group: pick an alpha, invoke the element that must wear it.
+    outer_body = b"\n".join([b"2 w 0 G 100 200 200 300 re S"] + calls + [b"/FmPlain Do"])
+    outer_eg = b" ".join(b"/GA%d << /ca %s /CA %s >>" % (i, a, a) for i, a in enumerate(alphas))
+    outer_xo = b" ".join(b"/Fm%d %d 0 R" % (i, 6 + i) for i in range(len(alphas)))
+    outer = (b"<< /Type /XObject /Subtype /Form /BBox [0 0 400 600] /Group << /S "
+             b"/Transparency /CS /DeviceRGB >> /Resources << /ExtGState << %s >> /XObject "
+             b"<< %s /FmPlain 12 0 R >> >> /Length %d >>\nstream\n%s\nendstream"
+             % (outer_eg, outer_xo, len(outer_body), outer_body))
+    # The control: no /Group, so its own `gs` is authoritative.
+    plain_body = b"/GP gs 0.8 0.2 0.2 rg 110 440 160 40 re f"
+    plain = (b"<< /Type /XObject /Subtype /Form /BBox [0 0 400 600] /Resources << /ExtGState "
+             b"<< /GP << /ca 0.25 /CA 0.25 >> >> >> /Length %d >>\nstream\n%s\nendstream"
+             % (len(plain_body), plain_body))
+    content = b"q /Fm0Outer Do Q"
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 400 600] >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /XObject "
+            b"<< /Fm0Outer 5 0 R >> >> >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        5: outer,
+        12: plain,
+    }
+    objs.update({6 + i: inner[i] for i in range(len(alphas))})
+    _assemble_pdf(objs, pdf)
+    GT["alpha_groups.pdf"] = {
+        # The opacity each element must carry in the emitted <svg>, in paint order.
+        "group_opacities": ["0.0039", "0.02", "0.04", "0.5", "0.98"],
+        # `ca 0` is not faint, it is absent — 5 group rects + the control + the frame.
+        "paths": 7,
+        "plain_form_opacity": "0.25",
+    }
+
+
 def gen_rotated_pages():
     """The same figure on four pages whose ONLY difference is ``/Rotate`` 0/90/180/270.
 
@@ -2615,6 +2691,7 @@ def main():
     gen_image_order()
     gen_paint_order()
     gen_no_resources_paths()
+    gen_alpha_groups()
     gen_rotated_pages()
     gen_separation()
     gen_render_samples()

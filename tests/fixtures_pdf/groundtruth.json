@@ -814,5 +814,16 @@
         255
       ]
     }
+  },
+  "alpha_groups.pdf": {
+    "group_opacities": [
+      "0.0039",
+      "0.02",
+      "0.04",
+      "0.5",
+      "0.98"
+    ],
+    "paths": 7,
+    "plain_form_opacity": "0.25"
   }
 }

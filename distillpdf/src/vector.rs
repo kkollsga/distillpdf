@@ -177,8 +177,13 @@ struct GState {
     fill: [u8; 3],
     stroke: [u8; 3],
     lw: f32,
-    fill_a: f32,   // ExtGState `ca` — fill alpha
-    stroke_a: f32, // ExtGState `CA` — stroke alpha
+    fill_a: f32,   // ExtGState `ca` — fill alpha, as set by `gs` in THIS stream
+    stroke_a: f32, // ExtGState `CA` — stroke alpha, likewise
+    // The product of the alphas of every enclosing TRANSPARENCY GROUP (§11.6.6). A group's
+    // own initial state starts at `ca`/`CA` = 1.0 (§11.4.7.2) and the alpha in force at its
+    // `Do` applies to the group's composited result — so the caller's alpha must be carried
+    // beside `fill_a`/`stroke_a`, never inside them, or the group's own first `gs` erases it.
+    group_a: (f32, f32),
     // Active clipping rectangle in PAGE space (x0, y0, x1, y1), the intersection of every
     // `W`/`W*` clip seen so far on the q/Q stack. `None` = unclipped (page bounds). A plot
     // clips its reference curves to the axes box; honouring it crops the curve overshoot.
@@ -193,11 +198,17 @@ struct GState {
 }
 impl GState {
     fn new(ctm: Mat, fill: [u8; 3], stroke: [u8; 3], lw: f32, fill_a: f32, stroke_a: f32) -> GState {
-        GState { ctm, fill, stroke, lw, fill_a, stroke_a, clip: None, fill_cs: None, stroke_cs: None }
+        GState { ctm, fill, stroke, lw, fill_a, stroke_a, group_a: (1.0, 1.0), clip: None, fill_cs: None, stroke_cs: None }
+    }
+    /// The alpha a paint made right now actually reaches the page with: this stream's `ca`
+    /// scaled by every enclosing transparency group's.
+    fn fill_alpha(&self) -> f32 {
+        self.fill_a * self.group_a.0
+    }
+    fn stroke_alpha(&self) -> f32 {
+        self.stroke_a * self.group_a.1
     }
 }
-
-const ALPHA_HIDDEN: f32 = 0.04; // below this, a paint is effectively invisible — drop it
 
 /// A form-internal text label (page space, y up) destined for a figure's SVG.
 pub struct LabelSpan {
@@ -897,10 +908,13 @@ fn walk(
     // painting operator. Defer it: set this flag on `W`/`W*`, fold it into `g.clip` when the
     // path is painted/ended.
     let mut pending_clip = false;
-    // Effective fill/stroke for a paint op, after applying ExtGState alpha: a
-    // ~zero alpha means the paint is invisible (so it is dropped, not blacked in).
-    let eff_fill = |g: &GState| if g.fill_a >= ALPHA_HIDDEN { Some(g.fill) } else { None };
-    let eff_stroke = |g: &GState| if g.stroke_a >= ALPHA_HIDDEN { Some((g.stroke, (g.lw * g.ctm.scale()).max(0.3))) } else { None };
+    // Effective fill/stroke for a paint op, after applying ExtGState alpha. Only a paint
+    // that is EXACTLY invisible (`ca 0`) is dropped; everything else renders at its own
+    // opacity, however faint. The old bar — drop anything under 0.04 — deleted the data
+    // itself in the figures where alpha IS the quantity: an attention map's weights arrive
+    // as 0.0039..0.98, so three quarters of every such figure was thresholded away.
+    let eff_fill = |g: &GState| if g.fill_alpha() > 0.0 { Some(g.fill) } else { None };
+    let eff_stroke = |g: &GState| if g.stroke_alpha() > 0.0 { Some((g.stroke, (g.lw * g.ctm.scale()).max(0.3))) } else { None };
 
     for (opi, op) in ops.iter().enumerate() {
         // Total-work budget (see `crate::WalkBudget`). `MAX_OPS` above truncates only the
@@ -1012,9 +1026,9 @@ fn walk(
                     pending_clip = false;
                 }
                 match op.operator.as_str() {
-                    "f" | "F" | "f*" => finish(&mut cur, eff_fill(&g), None, g.fill_a, g.stroke_a, g.clip, PaintSeq::at(here, opi), out),
-                    "S" | "s" => finish(&mut cur, None, eff_stroke(&g), g.fill_a, g.stroke_a, g.clip, PaintSeq::at(here, opi), out),
-                    "B" | "B*" | "b" | "b*" => finish(&mut cur, eff_fill(&g), eff_stroke(&g), g.fill_a, g.stroke_a, g.clip, PaintSeq::at(here, opi), out),
+                    "f" | "F" | "f*" => finish(&mut cur, eff_fill(&g), None, g.fill_alpha(), g.stroke_alpha(), g.clip, PaintSeq::at(here, opi), out),
+                    "S" | "s" => finish(&mut cur, None, eff_stroke(&g), g.fill_alpha(), g.stroke_alpha(), g.clip, PaintSeq::at(here, opi), out),
+                    "B" | "B*" | "b" | "b*" => finish(&mut cur, eff_fill(&g), eff_stroke(&g), g.fill_alpha(), g.stroke_alpha(), g.clip, PaintSeq::at(here, opi), out),
                     _ => cur.clear(), // "n": clip-only path → no ink
                 }
             }
@@ -1044,6 +1058,15 @@ fn walk(
                     }
                 }
                 let mut sub = g.clone();
+                // A TRANSPARENCY GROUP's alpha applies to its composited result, and the
+                // group's own state starts opaque (§11.4.7.2/§11.6.6). Carrying the caller's
+                // alpha into `fill_a` instead is what let a group's first `gs` — routinely
+                // `ca 1 CA 1`, since inside the group that IS the initial value — erase it.
+                if crate::walker::is_transparency_group(doc, stream) {
+                    sub.group_a = (g.fill_alpha(), g.stroke_alpha());
+                    sub.fill_a = 1.0;
+                    sub.stroke_a = 1.0;
+                }
                 sub.ctm = f.matrix.mul(g.ctm);
                 walk(doc, &f.ops, &f.scope.xobjects, &child_eg, &child_cs, sub, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice());
             }
@@ -1135,6 +1158,15 @@ fn cluster_figures(mut paths: Vec<Painted>) -> (Vec<Vec<Painted>>, Vec<Vec<Paint
 fn fmt(v: f32) -> String {
     // compact: 2 decimals, trim trailing zeros
     let s = format!("{v:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s.is_empty() || s == "-0" { "0".into() } else { s.into() }
+}
+
+/// An opacity, at the precision opacity needs. [`fmt`]'s two decimals are right for
+/// coordinates and wrong here: an attention weight of `0.0039` rounds to `"0"`, which is
+/// SVG for "delete this element" — the very paint the alpha fix exists to keep.
+fn fmt_alpha(v: f32) -> String {
+    let s = format!("{v:.4}");
     let s = s.trim_end_matches('0').trim_end_matches('.');
     if s.is_empty() || s == "-0" { "0".into() } else { s.into() }
 }
@@ -1252,10 +1284,10 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32, rot: i32) -> PlacedSvg {
             }
         }
         let fill = p.fill.map(hex).unwrap_or_else(|| "none".into());
-        let fop = if p.fill.is_some() && p.fill_op < 0.999 { format!(" fill-opacity=\"{}\"", fmt(p.fill_op)) } else { String::new() };
+        let fop = if p.fill.is_some() && p.fill_op < 0.999 { format!(" fill-opacity=\"{}\"", fmt_alpha(p.fill_op)) } else { String::new() };
         let stroke = match p.stroke {
             Some((c, lw)) => {
-                let sop = if p.stroke_op < 0.999 { format!(" stroke-opacity=\"{}\"", fmt(p.stroke_op)) } else { String::new() };
+                let sop = if p.stroke_op < 0.999 { format!(" stroke-opacity=\"{}\"", fmt_alpha(p.stroke_op)) } else { String::new() };
                 format!(" stroke=\"{}\" stroke-width=\"{}\"{sop}", hex(c), fmt(lw.max(0.3)))
             }
             None => String::new(),
@@ -1507,6 +1539,46 @@ mod tests {
         let (strong, _weak) = positioned_vectors(&doc, page_id);
         assert_eq!(strong.len(), 1, "the bar chart must be one figure");
         assert!(strong[0].ink().contains("fill-opacity=\"0.85\""), "{}", strong[0].ink());
+    }
+
+    #[test]
+    fn a_transparency_groups_own_gs_does_not_erase_the_alpha_it_was_invoked_with() {
+        // THE defect. A `/Group << /S /Transparency >>` form is composited as a unit: the
+        // `ca`/`CA` at its `Do` applies to the group's RESULT, and the group's own state
+        // starts opaque (§11.4.7.2, §11.6.6). The walk inherited the caller's alpha into the
+        // child state instead, where the child's first `gs` — `ca 1 CA 1`, which inside a
+        // group is simply the initial value spelled out — overwrote it. Every element then
+        // painted fully opaque: `attention_1706.03762` p13's 615 weighted cells emitted ZERO
+        // opacity attributes, and its 561 `ca 0` cells, which must be invisible, painted
+        // solid.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/alpha_groups.pdf");
+        let doc = Document::load(path).expect("alpha_groups.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        let painted = walk_page(&doc, page_id, crate::MAX_FORM_WORK);
+        // 5 group rects + the non-group control + the frame. The `ca 0` element is ABSENT:
+        // transparent is not faint, and the no-ink rule still deletes it.
+        assert_eq!(painted.len(), 7, "got {:?}", painted.iter().map(|p| p.fill_op).collect::<Vec<_>>());
+        let fills: Vec<f32> = painted.iter().filter(|p| p.fill.is_some()).map(|p| p.fill_op).collect();
+        for want in [0.0039, 0.02, 0.04, 0.5, 0.98] {
+            assert!(fills.iter().any(|a| (a - want).abs() < 1e-4), "alpha {want} lost; got {fills:?}");
+        }
+        // The control: an ORDINARY form inherits the graphics state, so its own `gs` is
+        // authoritative. Only a group may not overwrite what it was invoked with.
+        assert!(fills.iter().any(|a| (a - 0.25).abs() < 1e-4), "a plain form's own gs must still win: {fills:?}");
+        assert!(fills.iter().all(|a| *a > 0.0), "a `ca 0` paint must not reach the output");
+
+        // …and every one of them reaches the SVG at its own opacity. Sub-0.04 paints used to
+        // be dropped outright by `ALPHA_HIDDEN`, which in an attention or density figure
+        // deletes the data itself — alpha IS the quantity there.
+        let (strong, _weak) = positioned_vectors(&doc, page_id);
+        assert_eq!(strong.len(), 1, "the box is one figure");
+        let ink = strong[0].ink();
+        for want in ["0.0039", "0.02", "0.04", "0.5", "0.98", "0.25"] {
+            assert!(ink.contains(&format!("fill-opacity=\"{want}\"")), "opacity {want} missing from {ink}");
+        }
+        // Two decimals would have printed the faintest weight as `fill-opacity="0"`, which
+        // is SVG for "delete this element" — the exact paint the fix exists to keep.
+        assert!(!ink.contains("fill-opacity=\"0\""), "a faint paint was rounded to invisible: {ink}");
     }
 
     #[test]

@@ -246,6 +246,28 @@ pub(crate) fn subtype_of(stream: &lopdf::Stream) -> &[u8] {
     stream.dict.get(b"Subtype").and_then(|o| o.as_name()).unwrap_or(b"")
 }
 
+/// Is this form XObject a **transparency group** (`/Group << /S /Transparency >>`,
+/// §11.6.6)?
+///
+/// The distinction decides what the constant alpha in force at the `Do` means. For an
+/// ordinary form the graphics state is simply inherited, and a `gs` inside it legitimately
+/// changes the alpha. For a transparency group the alpha at the `Do` applies to the group's
+/// **composited result**, and the group's own initial state starts at `ca`/`CA` = 1.0
+/// (§11.4.7.2) — so inheriting the alpha into the group instead lets the group's first
+/// `gs` overwrite it, silently discarding the caller's transparency.
+pub(crate) fn is_transparency_group(doc: &Document, stream: &lopdf::Stream) -> bool {
+    stream
+        .dict
+        .get(b"Group")
+        .ok()
+        .and_then(|o| deref(doc, o))
+        .and_then(|o| o.as_dict().ok())
+        .and_then(|d| d.get(b"S").ok())
+        .and_then(|o| deref(doc, o))
+        .and_then(|o| o.as_name().ok())
+        .is_some_and(|n| n == b"Transparency")
+}
+
 /// The one depth convention: a descent is refused **at** [`crate::MAX_FORM_DEPTH`], so a
 /// page's own content (depth 0) may nest that many form levels below it.
 ///

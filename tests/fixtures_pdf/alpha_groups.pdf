@@ -1,0 +1,92 @@
+%PDF-1.5
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 400 600] >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /XObject << /Fm0Outer 5 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 16 >>
+stream
+q /Fm0Outer Do Q
+endstream
+endobj
+5 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 400 600] /Group << /S /Transparency /CS /DeviceRGB >> /Resources << /ExtGState << /GA0 << /ca 0.0039 /CA 0.0039 >> /GA1 << /ca 0.02 /CA 0.02 >> /GA2 << /ca 0.04 /CA 0.04 >> /GA3 << /ca 0.5 /CA 0.5 >> /GA4 << /ca 0.98 /CA 0.98 >> /GA5 << /ca 0 /CA 0 >> >> /XObject << /Fm0 6 0 R /Fm1 7 0 R /Fm2 8 0 R /Fm3 9 0 R /Fm4 10 0 R /Fm5 11 0 R /FmPlain 12 0 R >> >> /Length 136 >>
+stream
+2 w 0 G 100 200 200 300 re S
+/GA0 gs /Fm0 Do
+/GA1 gs /Fm1 Do
+/GA2 gs /Fm2 Do
+/GA3 gs /Fm3 Do
+/GA4 gs /Fm4 Do
+/GA5 gs /Fm5 Do
+/FmPlain Do
+endstream
+endobj
+6 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 400 600] /Group << /S /Transparency /CS /DeviceRGB >> /Resources << /ExtGState << /GS0 << /ca 1 /CA 1 >> >> >> /Length 41 >>
+stream
+/GS0 gs 0.2 0.4 0.8 rg 110 210 20 80 re f
+endstream
+endobj
+7 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 400 600] /Group << /S /Transparency /CS /DeviceRGB >> /Resources << /ExtGState << /GS0 << /ca 1 /CA 1 >> >> >> /Length 41 >>
+stream
+/GS0 gs 0.2 0.4 0.8 rg 140 210 20 80 re f
+endstream
+endobj
+8 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 400 600] /Group << /S /Transparency /CS /DeviceRGB >> /Resources << /ExtGState << /GS0 << /ca 1 /CA 1 >> >> >> /Length 41 >>
+stream
+/GS0 gs 0.2 0.4 0.8 rg 170 210 20 80 re f
+endstream
+endobj
+9 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 400 600] /Group << /S /Transparency /CS /DeviceRGB >> /Resources << /ExtGState << /GS0 << /ca 1 /CA 1 >> >> >> /Length 41 >>
+stream
+/GS0 gs 0.2 0.4 0.8 rg 200 210 20 80 re f
+endstream
+endobj
+10 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 400 600] /Group << /S /Transparency /CS /DeviceRGB >> /Resources << /ExtGState << /GS0 << /ca 1 /CA 1 >> >> >> /Length 41 >>
+stream
+/GS0 gs 0.2 0.4 0.8 rg 230 210 20 80 re f
+endstream
+endobj
+11 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 400 600] /Group << /S /Transparency /CS /DeviceRGB >> /Resources << /ExtGState << /GS0 << /ca 1 /CA 1 >> >> >> /Length 41 >>
+stream
+/GS0 gs 0.2 0.4 0.8 rg 260 210 20 80 re f
+endstream
+endobj
+12 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 400 600] /Resources << /ExtGState << /GP << /ca 0.25 /CA 0.25 >> >> >> /Length 41 >>
+stream
+/GP gs 0.8 0.2 0.2 rg 110 440 160 40 re f
+endstream
+endobj
+xref
+0 13
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000145 00000 n 
+0000000256 00000 n 
+0000000322 00000 n 
+0000000907 00000 n 
+0000001150 00000 n 
+0000001393 00000 n 
+0000001636 00000 n 
+0000001879 00000 n 
+0000002123 00000 n 
+0000002367 00000 n 
+trailer
+<< /Size 13 /Root 1 0 R >>
+startxref
+2571
+%%EOF

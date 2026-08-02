@@ -273,3 +273,27 @@ def test_separation_tints_render_as_colours_not_as_grey_levels():
     for wrong in g["grey_level_misreadings"]:
         assert wrong not in sep and wrong not in type4, \
             f"the grey-level misreading {wrong} is still emitted"
+
+
+def test_a_transparency_groups_alpha_survives_into_the_svg():
+    """A form XObject with ``/Group << /S /Transparency >>`` is composited as a unit: the
+    ``ca``/``CA`` in force at its ``Do`` applies to the group's RESULT, and the group's own
+    state starts opaque (§11.4.7.2, §11.6.6). The walk inherited the caller's alpha into the
+    child state instead, where the child's own first ``gs`` — ``ca 1 CA 1``, which inside a
+    group is just the initial value spelled out — overwrote it, so every element painted
+    fully opaque. ``attention_1706.03762`` p13 emitted **zero** opacity attributes for 615
+    weighted cells, and its 561 ``ca 0`` cells painted solid instead of vanishing.
+
+    The second half: a paint below the old ``ALPHA_HIDDEN`` 0.04 bar is now rendered FAINT,
+    not deleted. In an attention or density figure the alpha *is* the quantity, so
+    thresholding it away removes the data."""
+    g = GT["alpha_groups.pdf"]
+    h = html("alpha_groups.pdf")
+    svgs = re.findall(r"<svg\b.*?</svg>", h, re.DOTALL)
+    assert len(svgs) == 1, f"the box is one figure, got {len(svgs)}"
+    svg = svgs[0]
+    for want in g["group_opacities"] + [g["plain_form_opacity"]]:
+        assert f'fill-opacity="{want}"' in svg, f"opacity {want} missing from {svg}"
+    # `ca 0` is not faint, it is absent — and no faint paint is rounded away to it either.
+    assert 'fill-opacity="0"' not in svg, "a transparent or faint paint reached the output as 0"
+    assert len(re.findall(r"<path\b", svg)) == g["paths"], f"expected {g['paths']} paths in {svg}"
