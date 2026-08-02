@@ -237,12 +237,7 @@ fn parse_tag(inner: &str) -> (String, Vec<(String, String)>) {
     (name, attrs)
 }
 
-fn unescape(s: &str) -> String {
-    if !s.contains('&') {
-        return s.to_string();
-    }
-    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&amp;", "&")
-}
+use crate::textutil::unescape_entities as unescape;
 
 // --------------------------------------------------------------------------- rendering
 
@@ -635,25 +630,7 @@ fn caption_slug(caption: &str) -> String {
     slug.trim_matches('-').to_string()
 }
 
-/// Decode a `data:image/<fmt>;base64,…` URI into raw bytes + a file extension.
-fn decode_data_uri(uri: &str) -> Option<(Vec<u8>, String)> {
-    let rest = uri.strip_prefix("data:")?;
-    let (meta, data) = rest.split_once(',')?;
-    if !meta.contains("base64") {
-        return None;
-    }
-    let mime = meta.split(';').next().unwrap_or("");
-    let ext = match mime {
-        "image/png" => "png",
-        "image/jpeg" | "image/jpg" => "jpg",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        "image/svg+xml" => "svg",
-        _ => "bin",
-    };
-    let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).ok()?;
-    Some((bytes, ext.to_string()))
-}
+use crate::textutil::decode_data_uri;
 
 // ------------------------------------------------------------- HTML image externalisation
 
@@ -771,9 +748,7 @@ fn figcaption_text(nodes: &[Node]) -> String {
     String::new()
 }
 
-fn esc_attr(s: &str) -> String {
-    s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;")
-}
+use crate::textutil::esc_attr;
 
 // -------------------------------------------------------------------------------- utils
 
@@ -809,22 +784,7 @@ fn plain_text(nodes: &[Node]) -> String {
     s
 }
 
-fn collapse_ws(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut prev_space = false;
-    for c in s.chars() {
-        if c.is_whitespace() {
-            if !prev_space {
-                out.push(' ');
-            }
-            prev_space = true;
-        } else {
-            out.push(c);
-            prev_space = false;
-        }
-    }
-    out
-}
+use crate::textutil::collapse_ws;
 
 /// Append a block, ensuring exactly one blank line before it.
 fn push_block(out: &mut String, block: &str) {

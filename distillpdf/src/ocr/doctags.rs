@@ -446,9 +446,7 @@ fn take_text(toks: &[Tok], i: &mut usize, label: Option<&str>) -> String {
     normalize_ws(&out)
 }
 
-fn normalize_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
+use crate::textutil::normalize_ws;
 
 fn make_text_block(label: &str, tb: TextBlock) -> Block {
     if let Some(n) = label.strip_prefix("section_header_level_") {

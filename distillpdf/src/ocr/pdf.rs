@@ -652,18 +652,8 @@ mod tests {
     }
 
     fn visible_text(html: &str) -> String {
-        // crude tag strip for comparing content
-        let mut out = String::new();
-        let mut in_tag = false;
-        for c in html.chars() {
-            match c {
-                '<' => in_tag = true,
-                '>' => in_tag = false,
-                c if !in_tag => out.push(c),
-                _ => {}
-            }
-        }
-        out.split_whitespace().collect::<Vec<_>>().join(" ")
+        use crate::textutil::{normalize_ws, strip_tags, TagBreak};
+        normalize_ws(&strip_tags(html, TagBreak::Join))
     }
 
     #[test]
@@ -697,7 +687,7 @@ mod tests {
         let doc = Document::load_mem(&bytes).unwrap();
         let page_id = *doc.get_pages().values().next().unwrap();
         let got = crate::text::extract_page(&doc, page_id, &bytes).unwrap_or_default();
-        let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let norm = crate::textutil::normalize_ws;
         let got = norm(&got);
         for w in ["TERMO", "DECLARACOES", "outubro", "dezenove"] {
             assert!(got.contains(w), "extracted text missing {w:?}: {got:?}");

@@ -93,17 +93,8 @@ pub(crate) fn balanced_section(html: &str, open: usize) -> String {
 
 /// Plain text of a fragment of inline HTML (drop tags, unescape the basic entities).
 pub(crate) fn strip_inline(html: &str) -> String {
-    let mut s = String::with_capacity(html.len());
-    let mut intag = false;
-    for c in html.chars() {
-        match c {
-            '<' => intag = true,
-            '>' => intag = false,
-            _ if !intag => s.push(c),
-            _ => {}
-        }
-    }
-    s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'")
+    use crate::textutil::{strip_tags, unescape_entities, TagBreak};
+    unescape_entities(&strip_tags(html, TagBreak::Join))
 }
 
 /// Mint a heading's stable `sec-*` anchor id from its (already inline-stripped, trimmed)
@@ -428,4 +419,20 @@ pub(crate) fn build_sections(html: String, include_nav: bool) -> String {
         return out;
     }
     insert_nav(out, &build_nav(&entries, false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_escaped_entity_in_a_label_stops_being_double_unescaped() {
+        // `strip_inline` ran `&amp;` FIRST, so `&amp;lt;` — the literal text `&lt;`,
+        // correctly escaped — came back as `<`: escaped markup in a heading turned back
+        // into markup, and the anchor id minted from it drifted with it.
+        assert_eq!(strip_inline("<b>&amp;lt;</b>"), "&lt;");
+        assert_eq!(strip_inline("A &amp; B"), "A & B");
+        assert_eq!(strip_inline("<i>a</i>b"), "ab", "tags join, they do not break");
+        assert_eq!(strip_inline("&lt;tag&gt; &quot;q&quot; &#39;s&#39;"), "<tag> \"q\" 's'");
+    }
 }

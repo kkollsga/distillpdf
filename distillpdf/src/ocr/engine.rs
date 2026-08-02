@@ -34,25 +34,9 @@ pub trait OcrEngine: Sync {
 /// char count). A "word" is a whitespace token with >= 2 alphanumeric chars, so stray
 /// specks/punctuation don't inflate it.
 pub(crate) fn doctags_text_stats(doctags: &str) -> (usize, usize) {
-    let mut text = String::with_capacity(doctags.len());
-    let mut in_tag = false;
-    for c in doctags.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => {
-                in_tag = false;
-                text.push(' ');
-            }
-            _ if !in_tag => text.push(c),
-            _ => {}
-        }
-    }
-    let words = text
-        .split_whitespace()
-        .filter(|w| w.chars().filter(|c| c.is_alphanumeric()).count() >= 2)
-        .count();
-    let chars = text.chars().filter(|c| !c.is_whitespace()).count();
-    (words, chars)
+    use crate::textutil::{strip_tags, word_like_count, TagBreak};
+    let text = strip_tags(doctags, TagBreak::SpaceAtClose);
+    (word_like_count(&text), text.chars().filter(|c| !c.is_whitespace()).count())
 }
 
 /// Engine-agnostic options parsed from the Python side (a plain dict crosses the PyO3

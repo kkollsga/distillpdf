@@ -849,18 +849,7 @@ fn hex(c: [u8; 3]) -> String {
     format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
 }
 
-fn esc(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
+use crate::textutil::esc_text as esc;
 
 /// Enclosing page-space box of a cluster of painted paths.
 fn cluster_bbox(cluster: &[Painted]) -> Rect {

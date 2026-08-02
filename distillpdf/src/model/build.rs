@@ -390,25 +390,7 @@ fn first_img_data_uri(html: &str) -> Option<(Vec<u8>, String)> {
     decode_data_uri(&html[start..end])
 }
 
-/// Decode a `data:image/<fmt>;base64,…` URI into raw bytes + a file extension. (A small,
-/// dependency-light mirror of `markdown::decode_data_uri`, scoped to the figure-capture path.)
-fn decode_data_uri(uri: &str) -> Option<(Vec<u8>, String)> {
-    use base64::Engine;
-    let rest = uri.strip_prefix("data:")?;
-    let (meta, data) = rest.split_once(',')?;
-    if !meta.contains("base64") {
-        return None;
-    }
-    let ext = match meta.split(';').next().unwrap_or("") {
-        "image/png" => "png",
-        "image/jpeg" | "image/jpg" => "jpg",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        _ => "bin",
-    };
-    let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).ok()?;
-    Some((bytes, ext.to_string()))
-}
+use crate::textutil::decode_data_uri;
 
 /// Pixel dimensions of an encoded image, via the `image` crate's cheap header probe. `None` if
 /// the format can't be sniffed (the asset still embeds with a hash; dims are an honest absence).

@@ -22,7 +22,6 @@ pub(crate) mod tess_synth;
 #[cfg(feature = "tesseract")]
 pub mod tesseract;
 
-use base64::Engine as _;
 use lopdf::{Document, ObjectId};
 
 /// The page's main raster (largest placed image): standard image bytes (PNG/JPEG) plus
@@ -44,8 +43,7 @@ pub(crate) fn page_main_image(doc: &Document, page_id: ObjectId) -> Option<(Vec<
 
 /// Decode the base64 payload of a `data:...;base64,XXXX` URI.
 fn data_uri_bytes(uri: &str) -> Option<Vec<u8>> {
-    let comma = uri.find(',')?;
-    base64::engine::general_purpose::STANDARD.decode(uri[comma + 1..].as_bytes()).ok()
+    crate::textutil::decode_data_uri(uri).map(|(bytes, _)| bytes)
 }
 
 /// Page size in PDF points, from the one page-box walker ([`crate::pdfobj::page_box`]):

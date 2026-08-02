@@ -39,19 +39,7 @@ fn num_id<S: AsRef<str>>(num: S) -> String {
     num.as_ref().chars().map(|c| if c == '.' { '-' } else { c.to_ascii_lowercase() }).collect()
 }
 
-pub(crate) fn esc(s: &str) -> String {
-    let mut o = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => o.push_str("&amp;"),
-            '<' => o.push_str("&lt;"),
-            '>' => o.push_str("&gt;"),
-            '"' => o.push_str("&quot;"),
-            _ => o.push(c),
-        }
-    }
-    o
-}
+pub(crate) use crate::textutil::esc;
 
 // Unambiguous bullet glyphs. Includes U+0095 / U+0085: some embedded fonts map
 // their LaTeX-itemize bullet to those C1 control code points.
@@ -887,17 +875,7 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[(String, u8)
 /// join with no space so "Rad-" + "ford et al." reads "Radford et al."
 /// First non-whitespace character of a fragment, skipping any leading HTML tags.
 fn first_visible(s: &str) -> Option<char> {
-    let mut intag = false;
-    for c in s.chars() {
-        match c {
-            '<' => intag = true,
-            '>' => intag = false,
-            _ if intag => {}
-            c if !c.is_whitespace() => return Some(c),
-            _ => {}
-        }
-    }
-    None
+    crate::textutil::visible_chars(s, crate::textutil::TagBreak::Join).find(|c| !c.is_whitespace())
 }
 
 pub(crate) fn append_piece(para: &mut String, piece: &str) {

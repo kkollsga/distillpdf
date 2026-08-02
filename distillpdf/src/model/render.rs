@@ -268,40 +268,8 @@ pub fn extract_text(model: &DocModel) -> String {
 /// tag boundary MUST become a token boundary so adjacent table cells / blocks
 /// (`<td>A</td><td>B</td>`) read as separate words `A B`, matching `extract_text`'s tokens.
 fn visible_text(html: &str) -> String {
-    let mut s = String::with_capacity(html.len());
-    let mut intag = false;
-    for c in html.chars() {
-        match c {
-            '<' => {
-                intag = true;
-                s.push(' ');
-            }
-            '>' => intag = false,
-            _ if !intag => s.push(c),
-            _ => {}
-        }
-    }
-    let s = s
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'");
-    // collapse runs of whitespace to single spaces.
-    let mut out = String::with_capacity(s.len());
-    let mut prev_ws = false;
-    for c in s.chars() {
-        if c.is_whitespace() {
-            if !prev_ws {
-                out.push(' ');
-            }
-            prev_ws = true;
-        } else {
-            out.push(c);
-            prev_ws = false;
-        }
-    }
-    out
+    use crate::textutil::{collapse_ws, strip_tags, unescape_entities, TagBreak};
+    collapse_ws(&unescape_entities(&strip_tags(html, TagBreak::SpaceAtOpen)))
 }
 
 /// Remove `<svg>…</svg>` subtrees (verbatim, balanced) from a body fragment.
@@ -327,6 +295,15 @@ mod tests {
     use super::*;
     use crate::model::{Block, BlockKind, Coverage, Indexes, Metadata, Page, Source, NATIVE_CONFIDENCE, SCHEMA_VERSION};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn an_escaped_entity_in_extracted_text_stops_being_double_unescaped() {
+        // `visible_text` ran `&amp;` FIRST, so `&amp;lt;` decoded to `<` — `extract_text`
+        // handed back markup where the document held the literal text `&lt;`.
+        assert_eq!(visible_text("<p>&amp;lt;</p>"), " &lt; ");
+        assert_eq!(visible_text("<td>A</td><td>B</td>"), " A B ", "a tag boundary is a token boundary");
+        assert_eq!(visible_text("<p>A &amp; B</p>"), " A & B ");
+    }
 
     /// A model built from BLOCKS (the render source of truth, post-`body_html`). Pages carry
     /// geometry only; render rebuilds the page-element IR from the per-page blocks.

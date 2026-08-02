@@ -34,6 +34,7 @@ mod postprocess;
 mod profile;
 mod raster;
 mod text;
+mod textutil;
 mod vector;
 mod walker;
 
