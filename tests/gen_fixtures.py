@@ -572,6 +572,42 @@ def gen_form_image():
     }
 
 
+def gen_form_font():
+    """Hand-written PDF where the page's own ``/Font`` dictionary is EMPTY and the only
+    font lives in a Form XObject's own ``/Resources`` — the ``/TPL*`` template layout an
+    astro-ph preprint in the corpus uses on all 166 of its pages, which made
+    ``extract_fonts()`` return zero rows for the whole document.
+
+    reportlab cannot emit this (it hoists every font into one document-wide ``/Font`` dict
+    that the page also references), so the file is assembled by hand. The form is invoked
+    twice, under two names, to pin that the row is de-duplicated per page."""
+    pdf = os.path.join(OUT, "form_font.pdf")
+    form_content = b"BT /FF1 12 Tf 72 700 Td (Text drawn inside a form XObject.) Tj ET"
+    page_content = b"q 1 0 0 1 0 0 cm /TPL1 Do Q\nq 1 0 0 1 0 -40 cm /TPL1alias Do Q"
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        # The page carries a real but EMPTY /Font dict, exactly like the corpus file.
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << >> /XObject << /TPL1 5 0 R /TPL1alias 5 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(page_content), page_content),
+        5: (b"<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 612 792] "
+            b"/Resources << /Font << /FF1 6 0 R >> >> /Length %d >>\nstream\n%s\nendstream"
+            % (len(form_content), form_content)),
+        6: (b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+            b"/Encoding /WinAnsiEncoding >>"),
+    }
+    _assemble_pdf(objs, pdf)
+    GT["form_font.pdf"] = {
+        "font_name": "FF1",
+        "base_font": "Helvetica",
+        "subtype": "Type1",
+        "encoding": "WinAnsiEncoding",
+        "n_font_rows": 1,
+        "text": "Text drawn inside a form XObject.",
+    }
+
+
 def gen_no_spurious_figs():
     """Precision gate: a prose page with incidental tiny marks (a short underline rule, a
     small box) and NO figure caption anywhere. Weak vector candidates must NOT be promoted
@@ -1365,6 +1401,7 @@ def main():
     gen_small_vector_fig()
     gen_xobject_figure()
     gen_form_image()
+    gen_form_font()
     gen_no_spurious_figs()
     gen_links()
     gen_pagelabels()

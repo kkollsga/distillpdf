@@ -192,6 +192,14 @@
       }
     ]
   },
+  "form_font.pdf": {
+    "font_name": "FF1",
+    "base_font": "Helvetica",
+    "subtype": "Type1",
+    "encoding": "WinAnsiEncoding",
+    "n_font_rows": 1,
+    "text": "Text drawn inside a form XObject."
+  },
   "no_spurious_figs.pdf": {
     "page1_figures": 0,
     "total_figures": 1

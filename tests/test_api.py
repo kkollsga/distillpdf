@@ -15,6 +15,7 @@ FIGURES = os.path.join(FIX, "figures.pdf")
 NUMERIC = os.path.join(FIX, "numeric.pdf")
 LINKS = os.path.join(FIX, "links.pdf")
 FORM_IMAGE = os.path.join(FIX, "form_image.pdf")
+FORM_FONT = os.path.join(FIX, "form_font.pdf")
 
 
 def test_open_and_page_count():
@@ -75,6 +76,18 @@ def test_extract_images():
         assert key in im, f"image dict missing {key!r}"
     assert im["width"] > 0 and im["height"] > 0
     assert isinstance(im["data"], (bytes, bytearray)) and len(im["data"]) > 0
+
+
+def test_extract_fonts_recurses_into_form_xobjects():
+    """The page's own /Font dict is empty and the only font lives in a form's /Resources —
+    the template layout that made a 166-page corpus preprint report no fonts at all. The
+    form is invoked under two names, so the row must be de-duplicated to exactly one."""
+    fonts = distillpdf.Pdf.open(FORM_FONT).extract_fonts()
+    assert len(fonts) == 1, f"form-nested font missing or duplicated: {fonts}"
+    f = fonts[0]
+    assert (f["page"], f["name"], f["subtype"], f["base_font"]) == (1, "FF1", "Type1", "Helvetica")
+    assert f["encoding"] == "WinAnsiEncoding"
+    assert f["embedded"] is False and f["has_tounicode"] is False
 
 
 def test_extract_images_recurses_into_form_xobjects():

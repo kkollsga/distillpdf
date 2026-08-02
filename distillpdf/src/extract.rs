@@ -5,7 +5,7 @@
 
 use crate::text::{self, Span};
 use lopdf::{Dictionary, Document, Object, ObjectId};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 
 /// One extracted raster image. Mirrors the dict `Pdf.extract_images` returns:
 /// `{page, index, width, height, color_space, format, data}`.
@@ -1072,14 +1072,34 @@ fn font_embedded(doc: &Document, dict: &Dictionary) -> bool {
 
 /// Extract per-page font info as owned [`FontInfo`] rows: `{page, name, subtype, base_font,
 /// encoding, embedded, has_tounicode}`.
+///
+/// Enumerates `/Font` dictionaries through [`page_resource_dicts`], so a font used only by
+/// text inside a Form XObject is reported. lopdf's `get_page_fonts()` reads the page's own
+/// (and inherited) `/Resources` and stops there: an astro-ph preprint in the corpus whose
+/// page `/Resources` carries an empty `/Font <<>>` and puts all content in `/TPL*` forms
+/// returned zero rows for all 166 pages, and ~22 of 54 documents missed fonts partially.
 pub fn extract_fonts(doc: &Document) -> Vec<FontInfo> {
     let mut out = Vec::new();
     for (&pno, &page_id) in &doc.get_pages() {
-        let fonts = match doc.get_page_fonts(page_id) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        for (name, dict) in fonts {
+        // De-duplicated per page by (resource name, font object id): one font shared by
+        // several forms is one row, while the same name bound to different objects in the
+        // page and in a form is two. `BTreeMap` keeps rows in resource-name order, which
+        // is the order the non-recursive accessor produced them in.
+        let mut fonts: BTreeMap<(Vec<u8>, Option<ObjectId>), &Dictionary> = BTreeMap::new();
+        for res in page_resource_dicts(doc, page_id) {
+            // A form's fonts live in its OWN /Resources (PDF 32000-1 §8.10.2) — the same
+            // rule text.rs:1213 follows when it decodes a form's content.
+            let Some(fdict) = sub_dict(doc, res, b"Font") else {
+                continue;
+            };
+            for (name, v) in fdict.iter() {
+                let Some(dict) = resolve(doc, v).and_then(|o| o.as_dict().ok()) else {
+                    continue;
+                };
+                fonts.entry((name.clone(), v.as_reference().ok())).or_insert(dict);
+            }
+        }
+        for ((name, _), dict) in fonts {
             let subtype = dict
                 .get(b"Subtype")
                 .and_then(|o| o.as_name())
@@ -1224,6 +1244,38 @@ mod tests {
         let rows = extract_images(&doc);
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].page, rows[0].index, rows[0].width, rows[0].height), (1, 0, 7, 5));
+    }
+
+    #[test]
+    fn fonts_nested_in_a_form_xobject_are_found_and_deduped() {
+        // The hand-written fixture (`gen_fixtures.py::gen_form_font`) mirrors the corpus
+        // astro-ph preprint: the page's own /Font dict is EMPTY and the only font lives in
+        // a form's /Resources. That returned zero rows for all 166 of its pages. The form
+        // is invoked under two names, so the row must appear exactly once.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/form_font.pdf");
+        let doc = Document::load(path).expect("form_font.pdf fixture must load");
+        let fonts = extract_fonts(&doc);
+        assert_eq!(fonts.len(), 1, "expected one de-duplicated form-nested font, got {fonts:?}",
+                   fonts = fonts.iter().map(|f| (f.page, f.name.clone())).collect::<Vec<_>>());
+        let f = &fonts[0];
+        assert_eq!(f.page, 1);
+        assert_eq!(f.name, "FF1");
+        assert_eq!(f.subtype, "Type1");
+        assert_eq!(f.base_font, "Helvetica");
+        assert_eq!(f.encoding, "WinAnsiEncoding");
+        assert!(!f.embedded);
+        assert!(!f.has_tounicode);
+    }
+
+    #[test]
+    fn page_level_fonts_still_reported_in_resource_name_order() {
+        // Regression guard on the rewire: the hand-written mathfonts fixture keeps all
+        // four fonts in the page's own /Resources, so the walker must reproduce exactly
+        // what the non-recursive accessor produced, in the same name order.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/mathfonts.pdf");
+        let doc = Document::load(path).expect("mathfonts.pdf fixture must load");
+        let names: Vec<String> = extract_fonts(&doc).into_iter().map(|f| f.name).collect();
+        assert_eq!(names, vec!["F1", "F2", "F3", "F4"]);
     }
 
     fn grid(rows: &[&[&str]]) -> Vec<Vec<String>> {
