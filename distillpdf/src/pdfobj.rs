@@ -187,6 +187,14 @@ pub(crate) fn filters_of(dict: &Dictionary) -> Vec<Vec<u8>> {
     }
 }
 
+/// A sub-dictionary of `d` that may be written inline or as an indirect reference.
+///
+/// Every `/Resources` child (`/XObject`, `/Font`, `/ColorSpace`, `/ExtGState`, …) may be
+/// either, so reading one with `as_dict()` alone silently misses the indirect half.
+pub(crate) fn sub_dict<'a>(doc: &'a Document, d: &'a Dictionary, key: &[u8]) -> Option<&'a Dictionary> {
+    d.get(key).ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

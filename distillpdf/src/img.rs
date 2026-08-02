@@ -5,6 +5,7 @@
 use base64::Engine;
 use crate::geom::{Mat, Rect};
 use crate::pdfobj::{content_bytes, deref, filters_of, num};
+use crate::raster::{dims_sane, jpeg_components, png_bytes, MAX_IMAGE_PIXELS};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -90,35 +91,6 @@ fn image_payload(stream: &lopdf::Stream) -> std::borrow::Cow<'_, [u8]> {
         Ok(b) => std::borrow::Cow::Owned(b),
         Err(_) => std::borrow::Cow::Borrowed(&stream.content),
     }
-}
-
-/// Component count from the JPEG SOF (start-of-frame) marker, without a full decode.
-/// 4 => CMYK; 3 => RGB/YCbCr; 1 => grayscale.
-fn jpeg_components(buf: &[u8]) -> Option<u8> {
-    let mut i = 2;
-    while i + 4 <= buf.len() {
-        if buf[i] != 0xFF {
-            i += 1;
-            continue;
-        }
-        let marker = buf[i + 1];
-        if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
-            i += 2;
-            continue;
-        }
-        let len = ((buf[i + 2] as usize) << 8) | buf[i + 3] as usize;
-        // SOF0/1/2/3, 5/6/7, 9/10/11, 13/14/15 carry the frame header; skip DHT/DAC tables.
-        let is_sof = matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
-        if is_sof && i + 9 < buf.len() {
-            // marker(2) len(2) precision(1) height(2) width(2) Nf(1)
-            return Some(buf[i + 9]);
-        }
-        if marker == 0xDA {
-            break;
-        }
-        i += 2 + len;
-    }
-    None
 }
 
 /// True if a DCTDecode stream is a 4-component (CMYK) JPEG — these cannot be passed
@@ -279,16 +251,6 @@ fn decode_ccitt(doc: &Document, dict: &Dictionary, content: &[u8]) -> Option<ima
 
 /// Decode an image stream to RGB8, handling JPEG (DCTDecode) and Flate/raw
 /// samples (gray/rgb). Returns None for formats we don't assemble.
-/// Per-dimension sanity cap and a total-pixel ceiling. A malformed/hostile stream can declare
-/// enormous `/Width`×`/Height`; refusing them before allocating the raw buffer prevents a
-/// decompression-bomb OOM.
-const MAX_IMAGE_DIM: u32 = 0x1FFFF; // 131071 px per side
-const MAX_IMAGE_PIXELS: usize = 64 << 20; // 64 M px
-
-fn dims_sane(w: u32, h: u32) -> bool {
-    w > 0 && h > 0 && w <= MAX_IMAGE_DIM && h <= MAX_IMAGE_DIM && (w as usize).saturating_mul(h as usize) <= MAX_IMAGE_PIXELS
-}
-
 fn decode_rgb(doc: &Document, id: ObjectId) -> Option<image::RgbImage> {
     let stream = doc.get_object(id).ok()?.as_stream().ok()?;
     let dict = &stream.dict;
@@ -466,12 +428,6 @@ fn data_uri(doc: &Document, id: ObjectId) -> Option<String> {
     // Match the source format: a JPEG base with a trivial (all-opaque) mask becomes a
     // compact JPEG; a mask with real transparency stays a lossless PNG.
     rgba_uri(rgba, filters.iter().any(|f| f == b"DCTDecode"))
-}
-
-fn png_bytes(img: image::DynamicImage) -> Option<Vec<u8>> {
-    let mut out = std::io::Cursor::new(Vec::new());
-    img.write_to(&mut out, image::ImageFormat::Png).ok()?;
-    Some(out.into_inner())
 }
 
 /// True if the image XObject is DCTDecode (a JPEG) at source.

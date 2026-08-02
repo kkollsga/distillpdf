@@ -32,6 +32,7 @@ mod nav;
 mod pdfobj;
 mod postprocess;
 mod profile;
+mod raster;
 mod text;
 mod vector;
 
