@@ -124,18 +124,28 @@ impl Pdf {
     }
 
     /// Extract hyperlinks from all pages. Each dict:
-    /// {page, rect:[x0,y0,x1,y1], kind:"uri"|"internal",
-    ///  uri:str|None, dest_page:int|None, dest_name:str|None}.
+    /// {page, rect:[x0,y0,x1,y1], kind:"uri"|"internal"|"remote",
+    ///  uri:str|None, dest_page:int|None, dest_name:str|None, remote_file:str|None}.
+    /// `kind="remote"` is a `/GoToR` or `/Launch` link: `remote_file` is the target
+    /// document and `dest_name` (when set) names a destination INSIDE it, not in this PDF.
     fn extract_links<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
         for lk in self.inner.extract_links() {
             let d = PyDict::new(py);
             d.set_item("page", lk.page)?;
             d.set_item("rect", lk.rect.to_vec())?;
-            d.set_item("kind", if lk.uri.is_some() { "uri" } else { "internal" })?;
+            let kind = if lk.uri.is_some() {
+                "uri"
+            } else if lk.remote_file.is_some() {
+                "remote"
+            } else {
+                "internal"
+            };
+            d.set_item("kind", kind)?;
             d.set_item("uri", lk.uri)?;
             d.set_item("dest_page", lk.dest_page)?;
             d.set_item("dest_name", lk.dest_name)?;
+            d.set_item("remote_file", lk.remote_file)?;
             list.append(d)?;
         }
         Ok(list)

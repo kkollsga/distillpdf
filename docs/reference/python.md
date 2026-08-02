@@ -231,10 +231,11 @@ Hyperlinks from all pages. Each dict:
 | --- | --- | --- |
 | `page` | int | 1-based page number |
 | `rect` | list[float] | `[x0, y0, x1, y1]` link rectangle |
-| `kind` | str | `"uri"` or `"internal"` |
+| `kind` | str | `"uri"`, `"internal"`, or `"remote"` |
 | `uri` | str \| None | target URL (URI links) |
 | `dest_page` | int \| None | target page (internal links) |
-| `dest_name` | str \| None | named destination (internal links) |
+| `dest_name` | str \| None | named destination (internal links; for `"remote"`, a destination inside the target file) |
+| `remote_file` | str \| None | target document of a `/GoToR` or `/Launch` link (`kind="remote"`) |
 
 ### Pdf.to_html
 

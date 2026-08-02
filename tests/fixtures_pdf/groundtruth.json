@@ -184,7 +184,9 @@
     "outline_indirect_title": "M\u00e9todos y An\u00e1lisis \u00a72",
     "outline_indirect_page": 2,
     "outline_direct_title": "Appendix A Notation",
-    "outline_direct_page": 1
+    "outline_direct_page": 1,
+    "remote_file": "appendix_other.pdf",
+    "launch_file": "datasheet_launch.pdf"
   },
   "pagelabels.pdf": {
     "labels": {

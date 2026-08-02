@@ -31,6 +31,20 @@ def test_external_link_wired_in_html():
         "external URI not wired as <a href> in HTML"
 
 
+def test_remote_links_report_their_target_file():
+    """/GoToR and /Launch links point at ANOTHER document, so nothing resolves in this
+    one and the rows used to be dropped. They now survive as kind="remote" carrying the
+    target file; the destination is not resolved against this PDF's pages."""
+    links = doc(NAME).extract_links()
+    remote = [lk for lk in links if lk["kind"] == "remote"]
+    assert [lk["remote_file"] for lk in remote] == [G["remote_file"], G["launch_file"]], remote
+    for lk in remote:
+        assert lk["dest_page"] is None and lk["uri"] is None
+    # Additive key: every link dict carries it, None for non-remote links.
+    assert all("remote_file" in x for x in links)
+    assert all(x["remote_file"] is None for x in links if x["kind"] != "remote")
+
+
 def test_outline_keeps_indirect_utf16be_title():
     """The fixture's first bookmark has ``/Title 14 0 R`` (an indirect UTF-16BE string),
     the hyperref/pdfTeX shape. Matching only a direct string decoded it to "" and dropped

@@ -141,29 +141,34 @@ for im in doc.extract_images():
 doc.extract_links() -> list[dict]
 ```
 
-Link annotations across all pages — both external URI links and internal jumps. Each
-link is one dict:
+Link annotations across all pages — external URI links, internal jumps, and links into
+another document. Each link is one dict:
 
-| Key         | Type           | Meaning                                                        |
-| ----------- | -------------- | -------------------------------------------------------------- |
-| `page`      | `int`          | 1-indexed page the clickable rectangle sits on                 |
-| `rect`      | `list[float]`  | clickable rectangle `[x0, y0, x1, y1]` in PDF user space (y up) |
-| `kind`      | `str`          | `"uri"` for external links, `"internal"` for in-document jumps |
-| `uri`       | `str` or `None`| the target URL for `"uri"` links, else `None`                  |
-| `dest_page` | `int` or `None`| 1-indexed destination page for internal links, when resolvable |
-| `dest_name` | `str` or `None`| the raw named destination (e.g. `"cite.devlin2018"`, `"section.3.1"`) when present |
+| Key           | Type           | Meaning                                                        |
+| ------------- | -------------- | -------------------------------------------------------------- |
+| `page`        | `int`          | 1-indexed page the clickable rectangle sits on                 |
+| `rect`        | `list[float]`  | clickable rectangle `[x0, y0, x1, y1]` in PDF user space (y up) |
+| `kind`        | `str`          | `"uri"` external, `"internal"` in-document, `"remote"` another file |
+| `uri`         | `str` or `None`| the target URL for `"uri"` links, else `None`                  |
+| `dest_page`   | `int` or `None`| 1-indexed destination page for internal links, when resolvable |
+| `dest_name`   | `str` or `None`| the raw named destination (e.g. `"cite.devlin2018"`, `"section.3.1"`) when present |
+| `remote_file` | `str` or `None`| the target document of a `"remote"` (`/GoToR` or `/Launch`) link |
 
 ```python
 for lk in doc.extract_links():
     if lk["kind"] == "uri":
         print(lk["page"], "->", lk["uri"])
+    elif lk["kind"] == "remote":
+        print(lk["page"], "->", lk["remote_file"], lk["dest_name"])
     else:
         print(lk["page"], "-> page", lk["dest_page"], lk["dest_name"])
 ```
 
 `kind` is `"uri"` exactly when `uri` is not `None`. For internal links the destination
 is resolved to a page number where possible; a named destination keeps its name in
-`dest_name` even after the page is resolved, which is useful as an anchor id.
+`dest_name` even after the page is resolved, which is useful as an anchor id. For
+`"remote"` links the destination lives in `remote_file`, so `dest_page` is always `None`
+and `dest_name` — when present — names a destination *inside that other file*.
 
 ## extract_fonts
 

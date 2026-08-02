@@ -92,7 +92,13 @@ pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: 
     // Links, named destinations, TOC — straight from the existing extractors.
     let links: Vec<Link> = links::extract_links(doc)
         .into_iter()
-        .map(|l| Link { page: l.page, uri: l.uri, dest_page: l.dest_page, dest_name: l.dest_name })
+        .map(|l| Link {
+            page: l.page,
+            uri: l.uri,
+            dest_page: l.dest_page,
+            dest_name: l.dest_name,
+            remote_file: l.remote_file,
+        })
         .collect();
     let named_dests: Vec<NamedDest> = links::named_destinations(doc)
         .into_iter()

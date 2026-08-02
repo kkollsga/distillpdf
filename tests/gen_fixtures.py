@@ -755,7 +755,10 @@ def gen_links():
     """Hand-written PDF carrying a real /Names /Dests name tree: an external URI link
     and an internal GoTo to a NAMED destination ("cite.smith2020") on page 2. This is
     the citation-anchor path reportlab can't emit — the internal link must resolve to a
-    #slug anchor, never #page-N.
+    #slug anchor, never #page-N. A third annotation is a /GoToR link into another
+    document (``/F (appendix_other.pdf)``) and a fourth is a /Launch with a filespec
+    dictionary: nothing about either resolves in THIS file, so a reader that only looks
+    for an in-document destination drops them silently.
 
     It also carries an /Outlines tree in the hyperref/pdfTeX shape: the first bookmark's
     ``/Title`` is an INDIRECT REFERENCE to a UTF-16BE string object (``/Title 14 0 R``),
@@ -772,7 +775,7 @@ def gen_links():
         1: b"<< /Type /Catalog /Pages 2 0 R /Names << /Dests 8 0 R >> /Outlines 11 0 R >>",
         2: b"<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>",
         3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-            b"/Resources << /Font << /F1 7 0 R >> >> /Contents 4 0 R /Annots [9 0 R 10 0 R] >>"),
+            b"/Resources << /Font << /F1 7 0 R >> >> /Contents 4 0 R /Annots [9 0 R 10 0 R 15 0 R 16 0 R] >>"),
         4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c1), c1),
         5: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
             b"/Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>"),
@@ -791,6 +794,14 @@ def gen_links():
         13: (b"<< /Title (%s) /Parent 11 0 R /Prev 12 0 R "
              b"/A << /S /GoTo /D [3 0 R /XYZ 72 750 0] >> >>" % direct_title.encode("ascii")),
         14: _utf16be_hex(indirect_title),
+        # A /GoToR link into ANOTHER document: the destination addresses that file, so
+        # nothing resolves in this one — such rows used to be dropped entirely.
+        15: (b"<< /Type /Annot /Subtype /Link /Rect [72 652 420 670] /Border [0 0 0] "
+             b"/A << /S /GoToR /F (appendix_other.pdf) /D [0 /Fit] >> >>"),
+        # /Launch with a filespec DICTIONARY — the shape real producers emit for a
+        # "open this other thing" link; pymupdf reports it as the same remote kind.
+        16: (b"<< /Type /Annot /Subtype /Link /Rect [72 630 420 648] /Border [0 0 0] "
+             b"/A << /S /Launch /F << /Type /Filespec /F (datasheet_launch.pdf) >> >> >>"),
     }
     _assemble_pdf(objs, pdf)
     GT["links.pdf"] = {
@@ -803,6 +814,8 @@ def gen_links():
         "outline_indirect_page": 2,
         "outline_direct_title": direct_title,
         "outline_direct_page": 1,
+        "remote_file": "appendix_other.pdf",
+        "launch_file": "datasheet_launch.pdf",
     }
 
 

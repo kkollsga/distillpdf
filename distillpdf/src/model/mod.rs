@@ -484,7 +484,7 @@ pub struct Regen {
     pub dpi: Option<u32>,
 }
 
-/// A hyperlink (external URI or internal destination).
+/// A hyperlink (external URI, internal destination, or a `/GoToR` remote file).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Link {
     pub page: u32,
@@ -494,6 +494,9 @@ pub struct Link {
     pub dest_page: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dest_name: Option<String>,
+    /// `/GoToR` or `/Launch`: the target file; `dest_name` then names a destination in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_file: Option<String>,
 }
 
 /// A PDF named destination (a label that resolves to a page/position).

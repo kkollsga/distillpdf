@@ -7,7 +7,7 @@ endobj
 << /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>
 endobj
 3 0 obj
-<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 4 0 R /Annots [9 0 R 10 0 R] >>
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 4 0 R /Annots [9 0 R 10 0 R 15 0 R 16 0 R] >>
 endobj
 4 0 obj
 << /Length 155 >>
@@ -48,25 +48,33 @@ endobj
 14 0 obj
 <feff004d00e90074006f0064006f00730020007900200041006e00e1006c0069007300690073002000a70032>
 endobj
+15 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 652 420 670] /Border [0 0 0] /A << /S /GoToR /F (appendix_other.pdf) /D [0 /Fit] >> >>
+endobj
+16 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 630 420 648] /Border [0 0 0] /A << /S /Launch /F << /Type /Filespec /F (datasheet_launch.pdf) >> >> >>
+endobj
 xref
-0 15
+0 17
 0000000000 65535 f 
 0000000015 00000 n 
 0000000107 00000 n 
 0000000170 00000 n 
-0000000319 00000 n 
-0000000525 00000 n 
-0000000651 00000 n 
-0000000844 00000 n 
-0000000914 00000 n 
-0000000985 00000 n 
-0000001128 00000 n 
-0000001255 00000 n 
-0000001329 00000 n 
-0000001421 00000 n 
-0000001543 00000 n 
+0000000333 00000 n 
+0000000539 00000 n 
+0000000665 00000 n 
+0000000858 00000 n 
+0000000928 00000 n 
+0000000999 00000 n 
+0000001142 00000 n 
+0000001269 00000 n 
+0000001343 00000 n 
+0000001435 00000 n 
+0000001557 00000 n 
+0000001664 00000 n 
+0000001808 00000 n 
 trailer
-<< /Size 15 /Root 1 0 R >>
+<< /Size 17 /Root 1 0 R >>
 startxref
-1650
+1968
 %%EOF

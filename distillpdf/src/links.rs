@@ -1,10 +1,14 @@
 //! Hyperlink extraction from `/Annots` Link annotations.
 //!
-//! Two kinds, both recorded with the clickable rectangle (PDF user space):
+//! Three kinds, all recorded with the clickable rectangle (PDF user space):
 //!   - external: a `/URI` action  -> `uri`
 //!   - internal: a `/GoTo` action or `/Dest` (explicit array or named destination)
 //!     -> resolved to a 1-indexed `dest_page` where possible, else the raw
 //!     `dest_name` (e.g. "cite.devlin2018", "section.3.1") is kept.
+//!   - remote: a `/GoToR` or `/Launch` action -> the target file from `/F` lands
+//!     in `remote_file`, and a `/GoToR` `/D` (which addresses the REMOTE
+//!     document, so it must never be resolved against this one) keeps its name in
+//!     `dest_name`.
 //! Named destinations are resolved via the catalog `/Dests` dict and the
 //! `/Names /Dests` name tree.
 
@@ -18,6 +22,9 @@ pub struct Link {
     pub uri: Option<String>,
     pub dest_page: Option<u32>,
     pub dest_name: Option<String>,
+    /// `/GoToR` and `/Launch` only: the target file from the action's `/F` file
+    /// specification. A `dest_name` set alongside it addresses THAT file, not this one.
+    pub remote_file: Option<String>,
 }
 
 fn deref<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Object> {
@@ -40,6 +47,23 @@ fn pdf_string(o: &Object) -> Option<String> {
         Object::String(b, _) => Some(String::from_utf8_lossy(b).into_owned()),
         _ => None,
     }
+}
+
+/// Read a PDF file specification (`/GoToR`'s `/F`): either a bare string, or a filespec
+/// dictionary whose path lives under `/UF` (Unicode, preferred), `/F`, or one of the
+/// legacy platform keys. Decoded as PDF text so UTF-16BE `/UF` values come out readable.
+fn file_spec(doc: &Document, o: &Object) -> Option<String> {
+    match deref(doc, o)? {
+        Object::String(b, _) => Some(decode_pdf_text(b)),
+        Object::Dictionary(d) => [&b"UF"[..], b"F", b"DOS", b"Mac", b"Unix"].iter().find_map(|k| {
+            d.get(k).ok().and_then(|v| deref(doc, v)).and_then(|v| match v {
+                Object::String(b, _) => Some(decode_pdf_text(b)),
+                _ => None,
+            })
+        }),
+        _ => None,
+    }
+    .filter(|s| !s.trim().is_empty())
 }
 
 /// A single PDFDocEncoding high byte (0x80–0xFF) → char. This is the encoding PDF text
@@ -364,17 +388,37 @@ pub fn extract_links(doc: &Document) -> Vec<Link> {
                 _ => continue,
             };
 
-            let (mut uri, mut dest_page, mut dest_name) = (None, None, None);
+            let (mut uri, mut dest_page, mut dest_name, mut remote_file) = (None, None, None, None);
             if let Some(act) = ad.get(b"A").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
                 let s = act.get(b"S").and_then(|o| o.as_name()).unwrap_or(b"");
                 if s == b"URI" {
                     uri = act.get(b"URI").ok().and_then(|o| deref(doc, o)).and_then(pdf_string);
-                } else if s == b"GoTo" || s == b"GoToR" {
+                } else if s == b"GoTo" {
                     if let Ok(d) = act.get(b"D") {
                         let (p, n) = resolve_dest(doc, d, &page_no, &named);
                         dest_page = p;
                         dest_name = n;
                     }
+                } else if s == b"GoToR" || s == b"Launch" {
+                    // Both carry a `/F` file specification. `/Launch` additionally allows
+                    // per-platform launch dictionaries whose own `/F` holds the path.
+                    remote_file = act
+                        .get(b"F")
+                        .ok()
+                        .and_then(|o| file_spec(doc, o))
+                        .or_else(|| {
+                            [&b"Win"[..], b"Mac", b"Unix"].iter().find_map(|k| {
+                                act.get(k).ok().and_then(|o| deref(doc, o)).and_then(|o| file_spec(doc, o))
+                            })
+                        });
+                    // A `/GoToR` destination addresses the REMOTE file: never resolve it
+                    // against this document's pages or named-destination map.
+                    dest_name = match act.get(b"D").ok().and_then(|o| deref(doc, o)) {
+                        Some(Object::Name(n)) | Some(Object::String(n, _)) => {
+                            Some(String::from_utf8_lossy(n).into_owned())
+                        }
+                        _ => None,
+                    };
                 }
             } else if let Ok(d) = ad.get(b"Dest") {
                 let (p, n) = resolve_dest(doc, d, &page_no, &named);
@@ -382,10 +426,10 @@ pub fn extract_links(doc: &Document) -> Vec<Link> {
                 dest_name = n;
             }
 
-            if uri.is_some() || dest_page.is_some() || dest_name.is_some() {
+            if uri.is_some() || dest_page.is_some() || dest_name.is_some() || remote_file.is_some() {
                 // Normalise rect to x0<=x1, y0<=y1.
                 let r = [rect[0].min(rect[2]), rect[1].min(rect[3]), rect[0].max(rect[2]), rect[1].max(rect[3])];
-                out.push(Link { page: pno, rect: r, uri, dest_page, dest_name });
+                out.push(Link { page: pno, rect: r, uri, dest_page, dest_name, remote_file });
             }
         }
     }
@@ -414,5 +458,53 @@ mod tests {
         assert_eq!(entries[0].page, 2, "indirect-title entry must still resolve its /Dest");
         assert_eq!(entries[1].page, 1);
         assert!(entries.iter().all(|e| e.level == 0));
+    }
+
+    #[test]
+    fn gotor_and_launch_links_survive_with_their_target_file() {
+        // Both actions address another document, so nothing resolved in this one and the
+        // rows were dropped by the keep-condition — the links vanished entirely.
+        let doc = links_doc();
+        let links = extract_links(&doc);
+        let remote: Vec<&Link> = links.iter().filter(|l| l.remote_file.is_some()).collect();
+        assert_eq!(remote.len(), 2, "expected the /GoToR + /Launch rows among {} links", links.len());
+
+        // /GoToR with a bare-string /F.
+        let gotor = remote[0];
+        assert_eq!(gotor.remote_file.as_deref(), Some("appendix_other.pdf"));
+        assert_eq!(gotor.page, 1);
+        assert_eq!(gotor.rect, [72.0, 652.0, 420.0, 670.0]);
+        // `/D [0 /Fit]` points into the OTHER file: it must not be resolved here.
+        assert_eq!(gotor.dest_page, None);
+        assert_eq!(gotor.dest_name, None);
+
+        // /Launch with a filespec dictionary.
+        let launch = remote[1];
+        assert_eq!(launch.remote_file.as_deref(), Some("datasheet_launch.pdf"));
+        assert_eq!(launch.rect, [72.0, 630.0, 420.0, 648.0]);
+
+        // The URI and in-document GoTo rows are untouched.
+        assert_eq!(links.len(), 4);
+        assert!(links.iter().any(|l| l.uri.as_deref() == Some("https://example.com/distillpdf")));
+        assert!(links.iter().any(|l| l.dest_name.as_deref() == Some("cite.smith2020") && l.dest_page == Some(2)));
+    }
+
+    #[test]
+    fn file_spec_reads_both_bare_strings_and_filespec_dictionaries() {
+        let doc = Document::new();
+        let bare = Object::String(b"other.pdf".to_vec(), lopdf::StringFormat::Literal);
+        assert_eq!(file_spec(&doc, &bare).as_deref(), Some("other.pdf"));
+        // A filespec dict prefers /UF (Unicode) over /F.
+        let mut d = Dictionary::new();
+        d.set("F", Object::String(b"legacy.pdf".to_vec(), lopdf::StringFormat::Literal));
+        let uf = [&b"\xfe\xff"[..], &"rapport-år.pdf".encode_utf16().flat_map(u16::to_be_bytes).collect::<Vec<u8>>()].concat();
+        d.set("UF", Object::String(uf, lopdf::StringFormat::Literal));
+        assert_eq!(file_spec(&doc, &Object::Dictionary(d.clone())).as_deref(), Some("rapport-år.pdf"));
+        d.remove(b"UF");
+        assert_eq!(file_spec(&doc, &Object::Dictionary(d)).as_deref(), Some("legacy.pdf"));
+        // Empty / non-string specs yield nothing rather than a blank target.
+        let empty = Object::String(Vec::new(), lopdf::StringFormat::Literal);
+        assert_eq!(file_spec(&doc, &empty), None);
+        assert_eq!(file_spec(&doc, &Object::Null), None);
     }
 }

@@ -90,9 +90,9 @@ def test_extract_links_shapes():
     links = distillpdf.Pdf.open(LINKS).extract_links()
     assert len(links) >= 2
     for lk in links:
-        for key in ("page", "rect", "kind", "uri", "dest_page", "dest_name"):
+        for key in ("page", "rect", "kind", "uri", "dest_page", "dest_name", "remote_file"):
             assert key in lk, f"link dict missing {key!r}"
-        assert lk["kind"] in ("uri", "internal")
+        assert lk["kind"] in ("uri", "internal", "remote")
         assert len(lk["rect"]) == 4
 
 
