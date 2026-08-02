@@ -427,7 +427,13 @@ const WEAK_MIN_W: f32 = 36.0;
 const WEAK_MIN_H: f32 = 24.0;
 const WEAK_MIN_PATHS: usize = 2;
 const BAND_GAP: f32 = 24.0; // vertical gap that separates two figures
-const MAX_OPS: usize = 60_000; // bail on pathologically dense pages
+// Operation budget for one page's vector walk. Not a parse budget — the content stream is
+// already decoded before this applies — so it only bounds the interpret+cluster pass, which
+// measures in the low milliseconds per 100k ops. 60_000 was far tighter than that cost
+// justified: the densest page in the local corpus is ~500k ops and the next-densest DOCUMENT
+// peaks at ~34k, so the old value cut real figures (a USGS cover map) out of the middle of the
+// distribution. A page over budget is truncated, never dropped (see `positioned_vectors_capped`).
+const MAX_OPS: usize = 600_000;
 
 fn deref<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Object> {
     match o {
@@ -560,6 +566,13 @@ fn path_bbox(cur: &[Seg]) -> Option<(f32, f32, f32, f32)> {
 /// Returns `(strong, weak)` placed vector figures. STRONG are emitted unconditionally; WEAK
 /// are sub-threshold candidates html.rs promotes only when a figure caption anchors to one.
 pub fn positioned_vectors(doc: &Document, page_id: ObjectId) -> (Vec<PlacedSvg>, Vec<PlacedSvg>) {
+    positioned_vectors_capped(doc, page_id, MAX_OPS)
+}
+
+/// [`positioned_vectors`] with an explicit operation budget (the public entry point passes
+/// [`MAX_OPS`]). Exposed internally so the truncation behaviour is unit-testable with a tiny
+/// cap instead of a half-million-operation fixture.
+fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (Vec<PlacedSvg>, Vec<PlacedSvg>) {
     let resources = match page_resources(doc, page_id) {
         Some(r) => r,
         None => return (Vec::new(), Vec::new()),
@@ -568,13 +581,15 @@ pub fn positioned_vectors(doc: &Document, page_id: ObjectId) -> (Vec<PlacedSvg>,
         Ok(c) => c,
         Err(_) => return (Vec::new(), Vec::new()),
     };
-    if content.operations.len() > MAX_OPS {
-        return (Vec::new(), Vec::new());
-    }
+    // Over-budget pages DEGRADE, they do not vanish: interpret the first `cap` operations and
+    // keep whatever was painted by then. Returning empty here made a dense page look like a page
+    // with no figures at all (a whole cover map disappeared), which is strictly worse than a
+    // partial one — the ops are already parsed by this point, so the cap only bounds the walk.
+    let ops = &content.operations[..content.operations.len().min(cap)];
     let xmap = xobjects_of(doc, &resources);
     let egmap = extgstates_of(doc, &resources);
     let mut painted = Vec::new();
-    walk(doc, &content.operations, &xmap, &egmap, GState::new(M::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0);
+    walk(doc, ops, &xmap, &egmap, GState::new(M::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0);
     // Stamp paint order before clustering reshuffles the vector for banding.
     for (i, p) in painted.iter_mut().enumerate() {
         p.seq = i;
@@ -953,4 +968,47 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
     }
     let paths = if clip_defs.is_empty() { paths } else { format!("<defs>{clip_defs}</defs>{paths}") };
     PlacedSvg { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, paths, w, h, page_w, labels: Vec::new(), plot }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The owned dense-vector fixture (`tests/gen_fixtures.py::gen_dense_vector`): a grid
+    /// figure painted in the first ~54 operators, then ~300 scatter rects, then all text.
+    fn dense_page() -> (Document, ObjectId) {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/dense_vector.pdf");
+        let doc = Document::load(path).expect("dense_vector.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        (doc, page_id)
+    }
+
+    #[test]
+    fn over_budget_pages_degrade_to_the_early_figures_instead_of_vanishing() {
+        // The defect: a page above the operation budget returned `(vec![], vec![])`, which is
+        // indistinguishable from "this page has no figures" — a whole USGS cover map
+        // disappeared. Truncating the walk instead keeps everything painted before the cap.
+        let (doc, page_id) = dense_page();
+        let (strong, _weak) = positioned_vectors_capped(&doc, page_id, 50);
+        assert_eq!(strong.len(), 1, "the early-painted grid figure must survive a tripped cap");
+        let grid = &strong[0];
+        let kept = grid.paths.matches("<path").count();
+        // The cap really does bite mid-figure (the fixture's grid is 12 rules), and what it
+        // leaves behind still clears the figure bar.
+        assert!((6..12).contains(&kept), "grid kept {kept} of 12 paths");
+        // The grid spans 200x100pt; the scatter field (drawn after the cap) must be absent.
+        assert!((grid.x_right - grid.x_left - 200.0).abs() < 2.0, "grid width {}", grid.x_right - grid.x_left);
+        assert!(grid.y_bottom > 400.0, "only the top figure may survive, got y_bottom {}", grid.y_bottom);
+    }
+
+    #[test]
+    fn a_dense_page_under_the_default_budget_returns_every_figure() {
+        // 600_000 ops is far above this fixture, so nothing is truncated: both the grid and
+        // the scatter field come back. Locks the default cap against silently re-tightening.
+        let (doc, page_id) = dense_page();
+        let (strong, _weak) = positioned_vectors(&doc, page_id);
+        assert_eq!(strong.len(), 2, "expected the grid AND the scatter field");
+        let scatter = strong.iter().find(|f| f.y_bottom < 400.0).expect("scatter figure");
+        assert!(scatter.paths.matches("<path").count() > 200, "scatter kept {} paths", scatter.paths.matches("<path").count());
+    }
 }

@@ -73,3 +73,15 @@ def test_inline_xref_not_a_caption():
     assert not any(G["inline_xref"][:20] in c for c in caps), \
         "inline 'As shown in Figure 1' cross-reference captured as a caption"
     assert G["inline_xref"][:20] in text(h), "inline cross-reference text lost"
+
+
+def test_dense_vector_page_emits_both_figures():
+    """A dense vector page (a 12-rule grid plus ~300 scatter marks, ~700 content-stream
+    operators) must render both figures as inline <svg>. Under the old 60k operation cap
+    such a page could be dropped whole — the walk returned no figures at all rather than
+    the figures it had already painted."""
+    g = GT["dense_vector.pdf"]
+    h = html("dense_vector.pdf")
+    svgs = re.findall(r"<svg\b.*?</svg>", h, re.DOTALL)
+    assert len(svgs) == g["n_figures"], f"expected {g['n_figures']} <svg>, got {len(svgs)}"
+    assert sum(s.count("<path") for s in svgs) > g["scatter_paths"], "scatter marks missing from the svg"

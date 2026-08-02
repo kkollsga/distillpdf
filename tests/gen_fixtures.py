@@ -642,6 +642,53 @@ def gen_no_spurious_figs():
     GT["no_spurious_figs.pdf"] = {"page1_figures": 0, "total_figures": 1}
 
 
+def gen_dense_vector():
+    """A DENSE vector page: two well-separated strong figures, the second built from a few
+    hundred tiny filled rectangles, for a page content stream in the high hundreds of ops.
+
+    Two things ride on the drawing ORDER here. The grid figure is emitted FIRST, inside the
+    first few dozen operators; the dense scatter and all page text come after. That lets the
+    Rust unit test run the walk with a deliberately tiny operation budget and assert the
+    early-painted figure still comes back (degrade), where the old over-budget behaviour
+    returned an empty figure list for the whole page (drop) — a dense page was
+    indistinguishable from a page with no figures at all."""
+    pdf = os.path.join(OUT, "dense_vector.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    # ---- figure A, drawn FIRST and cheaply: a 6x6 grid, 12 stroked paths, 200x100pt.
+    ax, ay, aw, ah = LM, PAGE_H - 200, 200.0, 100.0
+    c.setLineWidth(0.8)
+    for i in range(6):
+        yy = ay + ah * i / 5.0
+        c.line(ax, yy, ax + aw, yy)
+    for i in range(6):
+        xx = ax + aw * i / 5.0
+        c.line(xx, ay, xx, ay + ah)
+    # ---- figure B, well below the band gap: ~300 tiny filled rects over 250x150pt.
+    bx, by, bw, bh = LM, 300.0, 250.0, 150.0
+    c.setFillColorRGB(0.15, 0.35, 0.75)
+    n_rects = 300
+    for i in range(n_rects):
+        col, row = i % 20, i // 20
+        c.rect(bx + col * (bw / 20.0), by + row * (bh / 15.0), 8, 5, stroke=0, fill=1)
+    c.setFillColorRGB(0, 0, 0)
+    # ---- text last, so it never competes with figure A for the head of the stream.
+    title(c, "A Dense Vector Page")
+    c.setFont("Helvetica", 9.5)
+    c.drawString(LM, ay - 18, "Figure 1: A reference grid drawn as twelve stroked rules.")
+    c.drawString(LM, by - 18, "Figure 2: A dense scatter field of three hundred marks.")
+    c.showPage()
+    c.save()
+    GT["dense_vector.pdf"] = {
+        "n_figures": 2,
+        "grid_paths": 12,
+        "scatter_paths": n_rects,
+        "captions": [
+            "Figure 1: A reference grid drawn as twelve stroked rules.",
+            "Figure 2: A dense scatter field of three hundred marks.",
+        ],
+    }
+
+
 def gen_figures_onepage():
     """Both figures (raster ABOVE, vector BELOW), each with its own caption directly
     beneath it, on ONE page. Regression guard for caption→figure anchoring: the captions
@@ -1399,6 +1446,7 @@ def main():
     gen_figure_nodot()
     gen_lof_dotleader()
     gen_small_vector_fig()
+    gen_dense_vector()
     gen_xobject_figure()
     gen_form_image()
     gen_form_font()

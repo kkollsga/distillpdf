@@ -395,5 +395,14 @@
       "inline_encrypt_userpw.pdf"
     ],
     "user_password": "secret"
+  },
+  "dense_vector.pdf": {
+    "n_figures": 2,
+    "grid_paths": 12,
+    "scatter_paths": 300,
+    "captions": [
+      "Figure 1: A reference grid drawn as twelve stroked rules.",
+      "Figure 2: A dense scatter field of three hundred marks."
+    ]
   }
 }
