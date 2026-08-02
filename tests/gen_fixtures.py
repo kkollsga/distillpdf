@@ -745,18 +745,31 @@ def gen_mathfonts():
     }
 
 
+def _utf16be_hex(s):
+    """A PDF hex string carrying the UTF-16BE form of ``s`` (BOM + big-endian units),
+    which is how hyperref/pdfTeX writes any outline title that isn't pure ASCII."""
+    return b"<" + (b"\xfe\xff" + s.encode("utf-16-be")).hex().encode("ascii") + b">"
+
+
 def gen_links():
     """Hand-written PDF carrying a real /Names /Dests name tree: an external URI link
     and an internal GoTo to a NAMED destination ("cite.smith2020") on page 2. This is
     the citation-anchor path reportlab can't emit — the internal link must resolve to a
-    #slug anchor, never #page-N."""
+    #slug anchor, never #page-N.
+
+    It also carries an /Outlines tree in the hyperref/pdfTeX shape: the first bookmark's
+    ``/Title`` is an INDIRECT REFERENCE to a UTF-16BE string object (``/Title 14 0 R``),
+    the second's is a direct string. Readers that match only a direct ``Object::String``
+    decode the first title to "" and silently drop the entry — the defect this pins."""
     pdf = os.path.join(OUT, "links.pdf")
     c1 = (b"BT /F1 12 Tf 72 700 Td (Visit our project homepage for downloads and docs.) Tj "
           b"0 -22 Td (See the Smith 2020 reference and the Methods section below.) Tj ET")
     c2 = (b"BT /F1 14 Tf 72 720 Td (Methods) Tj /F1 12 Tf 72 690 Td "
           b"(This destination section is where the cite anchor resolves, not a page number.) Tj ET")
+    indirect_title = "Métodos y Análisis §2"
+    direct_title = "Appendix A Notation"
     objs = {
-        1: b"<< /Type /Catalog /Pages 2 0 R /Names << /Dests 8 0 R >> >>",
+        1: b"<< /Type /Catalog /Pages 2 0 R /Names << /Dests 8 0 R >> /Outlines 11 0 R >>",
         2: b"<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>",
         3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
             b"/Resources << /Font << /F1 7 0 R >> >> /Contents 4 0 R /Annots [9 0 R 10 0 R] >>"),
@@ -770,6 +783,14 @@ def gen_links():
             b"/A << /S /URI /URI (https://example.com/distillpdf) >> >>"),
         10: (b"<< /Type /Annot /Subtype /Link /Rect [72 674 420 692] /Border [0 0 0] "
              b"/A << /S /GoTo /D (cite.smith2020) >> >>"),
+        # /Outlines: two top-level bookmarks. 12's title is INDIRECT (14 0 R, UTF-16BE),
+        # 13's is a direct string — both must survive with their text decoded.
+        11: b"<< /Type /Outlines /First 12 0 R /Last 13 0 R /Count 2 >>",
+        12: (b"<< /Title 14 0 R /Parent 11 0 R /Next 13 0 R "
+             b"/Dest [5 0 R /XYZ 72 730 0] >>"),
+        13: (b"<< /Title (%s) /Parent 11 0 R /Prev 12 0 R "
+             b"/A << /S /GoTo /D [3 0 R /XYZ 72 750 0] >> >>" % direct_title.encode("ascii")),
+        14: _utf16be_hex(indirect_title),
     }
     _assemble_pdf(objs, pdf)
     GT["links.pdf"] = {
@@ -778,6 +799,10 @@ def gen_links():
         "dest_page": 2,
         "uri_text": "Visit our project homepage",
         "internal_text": "Methods section",
+        "outline_indirect_title": indirect_title,
+        "outline_indirect_page": 2,
+        "outline_direct_title": direct_title,
+        "outline_direct_page": 1,
     }
 
 

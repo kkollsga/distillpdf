@@ -31,6 +31,17 @@ def test_external_link_wired_in_html():
         "external URI not wired as <a href> in HTML"
 
 
+def test_outline_keeps_indirect_utf16be_title():
+    """The fixture's first bookmark has ``/Title 14 0 R`` (an indirect UTF-16BE string),
+    the hyperref/pdfTeX shape. Matching only a direct string decoded it to "" and dropped
+    the entry, so whole outlines came back empty."""
+    entries = doc(NAME).outline()
+    titles = [e[1] for e in entries]
+    assert titles == [G["outline_indirect_title"], G["outline_direct_title"]], titles
+    assert entries[0][2] == G["outline_indirect_page"]
+    assert entries[1][2] == G["outline_direct_page"]
+
+
 def test_internal_link_uses_named_anchor_not_page():
     """The citation-anchor guarantee: the internal link resolves to the destination's
     #slug, and a matching id anchor exists — never the coarse #page-N fallback."""

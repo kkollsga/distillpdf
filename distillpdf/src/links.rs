@@ -307,7 +307,10 @@ fn walk_outline(
             Ok(d) => d.clone(),
             Err(_) => break,
         };
-        let title = match item.get(b"Title").ok() {
+        // `/Title` is frequently an indirect reference (hyperref/pdfTeX writes
+        // `/Title 5 0 R` pointing at a UTF-16BE string), so deref before matching —
+        // without this the title decodes empty and the entry is dropped below.
+        let title = match item.get(b"Title").ok().and_then(|o| deref(doc, o)) {
             Some(Object::String(b, _)) => decode_pdf_text(b),
             _ => String::new(),
         };
@@ -387,4 +390,29 @@ pub fn extract_links(doc: &Document) -> Vec<Link> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The owned hand-written links fixture (`tests/gen_fixtures.py::gen_links`).
+    fn links_doc() -> Document {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/links.pdf");
+        Document::load(path).expect("links.pdf fixture must load")
+    }
+
+    #[test]
+    fn outline_keeps_entries_whose_title_is_an_indirect_utf16be_string() {
+        // hyperref/pdfTeX writes `/Title 14 0 R`. Matching only a direct `Object::String`
+        // decoded such titles to "" and dropped the whole entry (20 of 54 corpus docs
+        // returned an empty outline).
+        let doc = links_doc();
+        let entries = outline(&doc);
+        let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(titles, vec!["Métodos y Análisis §2", "Appendix A Notation"]);
+        assert_eq!(entries[0].page, 2, "indirect-title entry must still resolve its /Dest");
+        assert_eq!(entries[1].page, 1);
+        assert!(entries.iter().all(|e| e.level == 0));
+    }
 }

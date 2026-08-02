@@ -180,7 +180,29 @@
     "dest_name": "cite.smith2020",
     "dest_page": 2,
     "uri_text": "Visit our project homepage",
-    "internal_text": "Methods section"
+    "internal_text": "Methods section",
+    "outline_indirect_title": "M\u00e9todos y An\u00e1lisis \u00a72",
+    "outline_indirect_page": 2,
+    "outline_direct_title": "Appendix A Notation",
+    "outline_direct_page": 1
+  },
+  "pagelabels.pdf": {
+    "labels": {
+      "1": "i",
+      "2": "ii",
+      "3": "1",
+      "4": "2"
+    },
+    "roman_pages": [
+      "i",
+      "ii"
+    ],
+    "arabic_pages": [
+      "1",
+      "2"
+    ],
+    "page_ii_text": "front matter on roman page ii",
+    "page_arabic1_text": "opens the body on arabic page 1"
   },
   "typography.pdf": {
     "accents": [
@@ -321,24 +343,6 @@
       "Results and Discussion"
     ],
     "body_snippet": "ordinary Helvetica prose at the body size"
-  },
-  "pagelabels.pdf": {
-    "labels": {
-      "1": "i",
-      "2": "ii",
-      "3": "1",
-      "4": "2"
-    },
-    "roman_pages": [
-      "i",
-      "ii"
-    ],
-    "arabic_pages": [
-      "1",
-      "2"
-    ],
-    "page_ii_text": "front matter on roman page ii",
-    "page_arabic1_text": "opens the body on arabic page 1"
   },
   "encrypted": {
     "sentence": "Encrypted fixture sentinel phrase for distillPDF.",
