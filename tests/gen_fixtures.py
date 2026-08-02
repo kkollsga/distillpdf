@@ -1104,6 +1104,100 @@ def gen_mathfonts():
     }
 
 
+def gen_identity_cid_font():
+    """Hand-written PDF reproducing the "BMP symbol comes out as a space" defect.
+
+    Some producers ship a Type0/Identity-H font whose CIDs simply ARE Unicode code points,
+    paired with a big machine-generated ToUnicode CMap that identity-maps whole Unicode blocks
+    (``<2200> <22FF> <2200>``). Such a table always has holes — it stops short of the newer
+    blocks — and a code that falls in a hole still carries its text in the code itself. The
+    glyph is genuinely absent from the embedded font (it paints as .notdef), so the code is
+    the ONLY place the character survives.
+
+    ``F1`` is that shape: an identity ToUnicode covering ASCII, Arrows, Mathematical Operators
+    and Geometric Shapes, but NOT Supplemental Arrows-A (U+27Fx) or Geometric Shapes Extended
+    (U+2B0x–2B2x). The two show-ops mix covered symbols with uncovered ones on the same line,
+    in the same font, exactly as the failing real-world page does.
+
+    ``F2`` is the negative control and the reason the fix cannot be "always fall back to the
+    code": a normal SUBSET font, whose CIDs are glyph indices and whose small ToUnicode is not
+    identity. Its show-op ends in CID 0x41 — unmapped, and NOT the letter "A". A decoder that
+    fell back to the code here would invent text out of glyph numbering.
+    """
+    pdf = os.path.join(OUT, "identity_cid_font.pdf")
+
+    def cid_hex(s):
+        return b"<" + "".join(f"{ord(c):04X}" for c in s).encode("ascii") + b">"
+
+    covered = "Geometry: ∠ ∟ ⊥ ∥ △ □ ○"
+    line1 = covered + " ⬟ ⬢ ⬡"          # 3 uncovered shapes
+    line2 = "Chemistry: ⇌ ⇄ ↑ ↓ ⟶ ⟵ ⟷"  # 3 uncovered arrows
+    subset_text = "Hello"
+
+    content = (b"BT /F1 14 Tf 50 700 Td " + cid_hex(line1) + b" Tj ET\n"
+               b"BT /F1 14 Tf 50 670 Td " + cid_hex(line2) + b" Tj ET\n"
+               # CIDs 1..5 -> "Hello", then CID 0x41 which the table does not map.
+               b"BT /F2 14 Tf 50 640 Td <000100020003000400050041> Tj ET")
+
+    # An identity ToUnicode over four whole blocks; the gaps are deliberate.
+    id_ranges = [(0x0020, 0x007E), (0x2190, 0x21FF), (0x2200, 0x22FF), (0x25A0, 0x25FF)]
+    id_body = b"".join(b"<%04X> <%04X> <%04X>\n" % (lo, hi, lo) for lo, hi in id_ranges)
+    id_cmap = (b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n"
+               b"/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n"
+               b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n"
+               b"%d beginbfrange\n%sendbfrange\nendcmap\nCMapName currentdict /CMap "
+               b"defineresource pop\nend\nend" % (len(id_ranges), id_body))
+    # The subset font's table: five glyph indices -> five letters. Nothing identity about it.
+    sub_body = b"".join(b"<%04X> <%04X>\n" % (i + 1, ord(c)) for i, c in enumerate(subset_text))
+    sub_cmap = (b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n"
+                b"/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n"
+                b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n"
+                b"%d beginbfchar\n%sendbfchar\nendcmap\nCMapName currentdict /CMap "
+                b"defineresource pop\nend\nend" % (len(subset_text), sub_body))
+
+    def stream(data):
+        return b"<< /Length %d >>\nstream\n%s\nendstream" % (len(data), data)
+
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << "
+            b"/F1 5 0 R /F2 9 0 R >> >> /Contents 4 0 R >>"),
+        4: stream(content),
+        5: (b"<< /Type /Font /Subtype /Type0 /BaseFont /UnicodeCID /Encoding /Identity-H "
+            b"/DescendantFonts [6 0 R] /ToUnicode 8 0 R >>"),
+        6: (b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /UnicodeCID /CIDSystemInfo << "
+            b"/Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 7 0 R "
+            b"/DW 600 >>"),
+        7: (b"<< /Type /FontDescriptor /FontName /UnicodeCID /Flags 4 /ItalicAngle 0 "
+            b"/Ascent 750 /Descent -250 /CapHeight 700 /StemV 80 "
+            b"/FontBBox [-200 -250 1200 900] >>"),
+        8: stream(id_cmap),
+        9: (b"<< /Type /Font /Subtype /Type0 /BaseFont /ABCDEF+SubsetCID /Encoding /Identity-H "
+            b"/DescendantFonts [10 0 R] /ToUnicode 12 0 R >>"),
+        10: (b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+SubsetCID /CIDSystemInfo "
+             b"<< /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 11 0 R "
+             b"/DW 600 >>"),
+        11: (b"<< /Type /FontDescriptor /FontName /ABCDEF+SubsetCID /Flags 4 /ItalicAngle 0 "
+             b"/Ascent 750 /Descent -250 /CapHeight 700 /StemV 80 "
+             b"/FontBBox [-200 -250 1200 900] >>"),
+        12: stream(sub_cmap),
+    }
+    _assemble_pdf(objs, pdf)
+    GT["identity_cid_font.pdf"] = {
+        # Every symbol the page shows, whether or not the ToUnicode table covers it.
+        "symbols": ["∠", "∟", "⊥", "∥", "△", "□", "○",
+                    "⬟", "⬢", "⬡",
+                    "⇌", "⇄", "↑", "↓",
+                    "⟶", "⟵", "⟷"],
+        # The six the identity table omits — the ones that used to come out as spaces.
+        "uncovered": ["⬟", "⬢", "⬡", "⟶", "⟵", "⟷"],
+        "lines": [line1, line2],
+        # The subset font must yield exactly this and must NOT invent an "A" from CID 0x41.
+        "subset_text": subset_text,
+    }
+
+
 def _utf16be_hex(s):
     """A PDF hex string carrying the UTF-16BE form of ``s`` (BOM + big-endian units),
     which is how hyperref/pdfTeX writes any outline title that isn't pure ASCII."""
@@ -1683,6 +1777,7 @@ def main():
     gen_yflip_page()
     gen_math()
     gen_mathfonts()
+    gen_identity_cid_font()
     gen_numeric()
     gen_frontmatter()
     gen_profile_heads()

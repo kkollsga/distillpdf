@@ -11,6 +11,12 @@ use std::collections::HashMap;
 struct FontInfo {
     two_byte: bool,
     to_unicode: Option<HashMap<u32, String>>,
+    /// The ToUnicode CMap of this (Type0) font is an *identity* table — it maps each code to
+    /// the character with that same scalar value. That proves the font's CID space IS Unicode
+    /// (a subset font's CIDs are glyph indices, so its ToUnicode is never identity), which in
+    /// turn means a code the table omits is a **gap in the producer's table**, not "this font
+    /// has no glyph here": the code itself still carries the text. See [`is_identity_cmap`].
+    identity_unicode: bool,
     /// `/Encoding /Differences` map: code -> decoded text (glyph names already
     /// resolved to Unicode). Fills the gap for simple fonts that have no
     /// ToUnicode — e.g. f-ligatures encoded as code 2/3 (`/fi`,`/fl`) that would
@@ -186,6 +192,8 @@ fn font_info(doc: &Document, dict: &Dictionary, raw: &[u8]) -> FontInfo {
                 Some(parse_tounicode(&bytes))
             });
 
+        let identity_unicode = two_byte && to_unicode.as_ref().is_some_and(is_identity_cmap);
+
         // /Encoding /Differences: code -> glyph name -> text. Only kept for simple
         // (non-Type0) fonts; resolves f-ligatures and named punctuation that have
         // no ToUnicode mapping.
@@ -342,7 +350,7 @@ fn font_info(doc: &Document, dict: &Dictionary, raw: &[u8]) -> FontInfo {
             0
         };
         let font_id = font_id_of(&basefont);
-        FontInfo { two_byte, to_unicode, differences, ot1_text, cm_math, widths, default_width, bold, italic, mono, font_id }
+        FontInfo { two_byte, to_unicode, identity_unicode, differences, ot1_text, cm_math, widths, default_width, bold, italic, mono, font_id }
     }
 }
 
@@ -524,6 +532,43 @@ fn parse_tounicode(data: &[u8]) -> HashMap<u32, String> {
         }
     }
     map
+}
+
+/// A ToUnicode table this small proves nothing — a handful of accidentally-identity entries
+/// (`<0041> -> A` in a subset font that happens to keep the Latin glyph order) must not be
+/// read as "the CID space is Unicode". The real thing is a producer-wide table covering whole
+/// Unicode blocks.
+const IDENTITY_CMAP_MIN_ENTRIES: usize = 256;
+/// Near-total, not total: a real identity table may still normalise a few code points
+/// (variant Greek letters, presentation forms) through explicit `bfchar` entries.
+const IDENTITY_CMAP_MIN_RATIO: f32 = 0.95;
+
+/// Is this ToUnicode CMap an *identity* table — code N -> the character U+N?
+///
+/// Only meaningful for a Type0 font. Two shapes exist in the wild:
+/// * a **subset** font, where the CIDs are glyph indices (1, 2, 3…) and ToUnicode is the only
+///   thing that recovers the text. Its table is small and never identity.
+/// * a font whose CIDs *are* Unicode code points, shipped with a big machine-generated
+///   identity ToUnicode. `unicode_showcase.pdf`'s `/MainFont` is one: 38 917 entries, 100 %
+///   identity, covering most of the BMP.
+///
+/// The distinction matters because the second kind has **gaps** — its table simply stops
+/// short of some blocks (Supplemental Arrows-A, Geometric Shapes Extended…), and a code in a
+/// gap still carries its text in the code itself. Recognising the shape lets the decoder fall
+/// back to the code for exactly those fonts, without ever emitting a subset font's glyph
+/// indices as if they were characters.
+fn is_identity_cmap(map: &HashMap<u32, String>) -> bool {
+    if map.len() < IDENTITY_CMAP_MIN_ENTRIES {
+        return false;
+    }
+    let identity = map
+        .iter()
+        .filter(|(&code, text)| {
+            let mut it = text.chars();
+            it.next().map(|c| c as u32) == Some(code) && it.next().is_none()
+        })
+        .count();
+    identity as f32 >= map.len() as f32 * IDENTITY_CMAP_MIN_RATIO
 }
 
 /// Resolve a PostScript / Adobe-Glyph-List glyph name to its text. Returns None
@@ -859,11 +904,13 @@ fn decode_words(elems: &[Show], font: Option<&FontInfo>, size: f32, tc: f32, tw:
                                 }
                             }
                         }
-                        // Raw fallback ONLY when there is no ToUnicode at all: a
-                        // font that HAS ToUnicode but omits a code means "no glyph"
-                        // (dropping it is correct — raw-falling-back would emit the
-                        // CID as a control char).
-                        if !got && fi.to_unicode.is_none() {
+                        // Raw fallback when there is no ToUnicode at all — a font that HAS
+                        // ToUnicode but omits a code normally means "no glyph" (dropping it is
+                        // correct; raw-falling-back would emit the CID as a control char).
+                        // The exception is an *identity* ToUnicode (`identity_unicode`): there
+                        // the CID space is Unicode, so an omitted code is a hole in the
+                        // producer's table and the code itself is the text.
+                        if !got && (fi.to_unicode.is_none() || fi.identity_unicode) {
                             if !fi.two_byte {
                                 let b = bytes[i];
                                 // CM text (OT1) → CM math (CMMI/CMSY) → Windows-1252 C1 →
@@ -1650,6 +1697,69 @@ pub fn extract_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Option<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// The identity-ToUnicode gap: a Type0 font whose CIDs are Unicode code points, with a
+    /// machine-generated identity table that stops short of two blocks. The six symbols in
+    /// those gaps used to come out as spaces — the glyph is .notdef in the embedded font, so
+    /// the CID is the only place the character survives.
+    #[test]
+    fn identity_tounicode_gaps_keep_the_symbol_instead_of_a_space() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/identity_cid_font.pdf");
+        let raw = std::fs::read(path).unwrap();
+        let doc = Document::load_mem(&raw).unwrap();
+        let pid = *doc.get_pages().get(&1).unwrap();
+        let out = extract_page(&doc, pid, &raw).unwrap();
+        // The six the table omits (this is the defect) …
+        for sym in ["\u{2B1F}", "\u{2B22}", "\u{2B21}", "\u{27F6}", "\u{27F5}", "\u{27F7}"] {
+            assert!(out.contains(sym), "uncovered symbol {sym:?} lost from {out:?}");
+        }
+        // … and their same-line, same-font neighbours the table does cover.
+        for sym in ["\u{2220}", "\u{221F}", "\u{22A5}", "\u{2225}", "\u{25B3}", "\u{25A1}",
+                    "\u{25CB}", "\u{21CC}", "\u{21C4}", "\u{2191}", "\u{2193}"] {
+            assert!(out.contains(sym), "covered symbol {sym:?} lost from {out:?}");
+        }
+        assert!(out.contains("Geometry: \u{2220} \u{221F} \u{22A5} \u{2225} \u{25B3} \u{25A1} \u{25CB} \u{2B1F} \u{2B22} \u{2B21}"),
+                "line 1 not whole: {out:?}");
+        assert!(out.contains("Chemistry: \u{21CC} \u{21C4} \u{2191} \u{2193} \u{27F6} \u{27F5} \u{27F7}"),
+                "line 2 not whole: {out:?}");
+    }
+
+    /// The guard on the above: the same fixture's SUBSET font shows CID 0x41, which its
+    /// (non-identity) table does not map. Falling back to the code there would invent an "A"
+    /// out of a glyph index — the reason the fallback is gated on an identity table.
+    #[test]
+    fn a_subset_cid_font_never_invents_text_from_a_glyph_index() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/identity_cid_font.pdf");
+        let raw = std::fs::read(path).unwrap();
+        let doc = Document::load_mem(&raw).unwrap();
+        let pid = *doc.get_pages().get(&1).unwrap();
+        let out = extract_page(&doc, pid, &raw).unwrap();
+        assert!(out.contains("Hello"), "subset font text lost: {out:?}");
+        assert!(!out.contains("HelloA"), "unmapped CID 0x41 invented an 'A': {out:?}");
+        assert!(!out.contains('A'), "no 'A' is drawn anywhere on this page: {out:?}");
+    }
+
+    #[test]
+    fn is_identity_cmap_needs_a_big_and_near_total_identity_table() {
+        let ident = |lo: u32, n: u32| -> HashMap<u32, String> {
+            (lo..lo + n).map(|c| (c, char::from_u32(c).unwrap().to_string())).collect()
+        };
+        // A real machine-generated identity table.
+        assert!(is_identity_cmap(&ident(0x20, 1000)));
+        // Too small to prove anything — a subset font can be accidentally identity.
+        assert!(!is_identity_cmap(&ident(0x41, 26)));
+        // Big, but the CIDs are glyph indices: not identity.
+        let subset: HashMap<u32, String> =
+            (1..1000u32).map(|g| (g, char::from_u32(0x400 + g).unwrap().to_string())).collect();
+        assert!(!is_identity_cmap(&subset));
+        // A few explicit normalisations inside an otherwise identity table are still identity.
+        let mut mostly = ident(0x20, 1000);
+        for c in 0x20..0x40u32 {
+            mostly.insert(c, "?".to_string());
+        }
+        assert!(is_identity_cmap(&mostly));
+    }
 
     #[test]
     fn widest_gap_finds_interior_lane() {

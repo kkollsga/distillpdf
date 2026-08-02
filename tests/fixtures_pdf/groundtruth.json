@@ -459,6 +459,40 @@
     "diff_names": "\u2211\u222b\u03b1\u2264",
     "c1": "\u2014\u2019"
   },
+  "identity_cid_font.pdf": {
+    "symbols": [
+      "\u2220",
+      "\u221f",
+      "\u22a5",
+      "\u2225",
+      "\u25b3",
+      "\u25a1",
+      "\u25cb",
+      "\u2b1f",
+      "\u2b22",
+      "\u2b21",
+      "\u21cc",
+      "\u21c4",
+      "\u2191",
+      "\u2193",
+      "\u27f6",
+      "\u27f5",
+      "\u27f7"
+    ],
+    "uncovered": [
+      "\u2b1f",
+      "\u2b22",
+      "\u2b21",
+      "\u27f6",
+      "\u27f5",
+      "\u27f7"
+    ],
+    "lines": [
+      "Geometry: \u2220 \u221f \u22a5 \u2225 \u25b3 \u25a1 \u25cb \u2b1f \u2b22 \u2b21",
+      "Chemistry: \u21cc \u21c4 \u2191 \u2193 \u27f6 \u27f5 \u27f7"
+    ],
+    "subset_text": "Hello"
+  },
   "numeric.pdf": {
     "header": [
       "System",

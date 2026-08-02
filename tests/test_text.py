@@ -85,3 +85,31 @@ def test_numeric_table_decimals_intact():
     # a decimal must never render as ' : ' between digits
     tbl = " ".join(re.findall(r"<table\b.*?</table>", h, re.DOTALL))
     assert not re.search(r"\d\s:\s\d", text(tbl)), "decimal rendered as ' : ' (glyph-map defect)"
+
+
+def test_identity_cid_font_gaps_keep_their_symbols():
+    """A Type0 font whose CIDs are Unicode code points ships a machine-generated identity
+    ToUnicode that stops short of the newer blocks. A code in one of those gaps still carries
+    its text; it used to be extracted as a space (`unicode_showcase.pdf` p2 lost ⬟⬢⬡ ⟶⟵⟷).
+    Both the covered symbols and the uncovered ones must survive, through the Python API."""
+    gt = GT["identity_cid_font.pdf"]
+    d = doc("identity_cid_font.pdf")
+    t = d.extract_page_text(1)
+    for sym in gt["symbols"]:
+        assert sym in t, f"symbol {sym!r} lost from extracted text: {t!r}"
+    for line in gt["lines"]:
+        assert line in t, f"line not extracted whole: {line!r} not in {t!r}"
+    # and through the HTML render, not only the raw text extractor
+    h = text(html("identity_cid_font.pdf"))
+    for sym in gt["uncovered"]:
+        assert sym in h, f"symbol {sym!r} lost from HTML: {h!r}"
+
+
+def test_subset_cid_font_does_not_invent_text_from_glyph_indices():
+    """The guard on the fix above: the same fixture's SUBSET font (CIDs are glyph indices,
+    non-identity ToUnicode) shows an unmapped CID 0x41. It must stay dropped — falling back to
+    the code there would print an 'A' that the page never contained."""
+    gt = GT["identity_cid_font.pdf"]
+    t = doc("identity_cid_font.pdf").extract_page_text(1)
+    assert gt["subset_text"] in t, f"subset font text lost: {t!r}"
+    assert "A" not in t, f"an unmapped glyph index was invented as text: {t!r}"
