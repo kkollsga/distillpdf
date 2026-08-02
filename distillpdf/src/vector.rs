@@ -10,39 +10,10 @@
 //! Shadings / patterns / soft masks are out of scope here (skipped); text inside
 //! a figure stays in the normal text flow (it is extracted as spans elsewhere).
 
+use crate::geom::{Mat, Rect};
 use crate::pdfobj::{content_bytes, deref, num, num_deref};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
-
-#[derive(Clone, Copy)]
-struct M {
-    a: f32,
-    b: f32,
-    c: f32,
-    d: f32,
-    e: f32,
-    f: f32,
-}
-impl M {
-    const ID: M = M { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
-    fn mul(self, r: M) -> M {
-        M {
-            a: self.a * r.a + self.b * r.c,
-            b: self.a * r.b + self.b * r.d,
-            c: self.c * r.a + self.d * r.c,
-            d: self.c * r.b + self.d * r.d,
-            e: self.e * r.a + self.f * r.c + r.e,
-            f: self.e * r.b + self.f * r.d + r.f,
-        }
-    }
-    fn apply(self, x: f32, y: f32) -> (f32, f32) {
-        (x * self.a + y * self.c + self.e, x * self.b + y * self.d + self.f)
-    }
-    /// Average linear scale factor (for converting line widths to device space).
-    fn scale(self) -> f32 {
-        (self.a * self.d - self.b * self.c).abs().sqrt()
-    }
-}
 
 fn gray(g: f32) -> [u8; 3] {
     let v = (g.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -84,7 +55,7 @@ struct Painted {
 /// Graphics state carried through the walk and the q/Q stack.
 #[derive(Clone, Copy)]
 struct GState {
-    ctm: M,
+    ctm: Mat,
     fill: [u8; 3],
     stroke: [u8; 3],
     lw: f32,
@@ -96,7 +67,7 @@ struct GState {
     clip: Option<(f32, f32, f32, f32)>,
 }
 impl GState {
-    fn new(ctm: M, fill: [u8; 3], stroke: [u8; 3], lw: f32, fill_a: f32, stroke_a: f32) -> GState {
+    fn new(ctm: Mat, fill: [u8; 3], stroke: [u8; 3], lw: f32, fill_a: f32, stroke_a: f32) -> GState {
         GState { ctm, fill, stroke, lw, fill_a, stroke_a, clip: None }
     }
 }
@@ -479,26 +450,20 @@ fn finish(cur: &mut Vec<Seg>, fill: Option<[u8; 3]>, stroke: Option<([u8; 3], f3
         cur.clear();
         return;
     }
-    let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
-    for s in cur.iter() {
-        let pts: &[(f32, f32)] = match s {
-            Seg::M(x, y) | Seg::L(x, y) => &[(*x, *y)],
-            Seg::C(a, b, c, d, e, f) => &[(*a, *b), (*c, *d), (*e, *f)],
-            Seg::Z => &[],
-        };
-        for &(x, y) in pts {
-            x0 = x0.min(x);
-            y0 = y0.min(y);
-            x1 = x1.max(x);
-            y1 = y1.max(y);
+    // `path_bbox` is `None` for exactly the point-free path this used to detect as `x1 < x0`.
+    let (mut x0, mut y0, mut x1, mut y1) = match path_bbox(cur) {
+        Some(bb) => bb,
+        None => {
+            cur.clear();
+            return;
         }
-    }
+    };
     // Drop paths whose extent is implausibly large. A real figure element never exceeds
     // page size (~800 pt); a span of thousands+ means a coordinate was left in the wrong
     // space (page coords leaking into a figure-local frame, a mis-applied matrix), which
     // otherwise draws a line shooting off the figure or collapses its viewBox.
     const MAX_EXTENT: f32 = 2000.0;
-    if x1 < x0 || (x1 - x0).max(y1 - y0) > MAX_EXTENT {
+    if (x1 - x0).max(y1 - y0) > MAX_EXTENT {
         cur.clear();
         return;
     }
@@ -512,15 +477,15 @@ fn finish(cur: &mut Vec<Seg>, fill: Option<[u8; 3]>, stroke: Option<([u8; 3], f3
     if let Some((cx0, cy0, cx1, cy1)) = clip {
         let crops = cx0 > x0 + 0.5 || cy0 > y0 + 0.5 || cx1 < x1 - 0.5 || cy1 < y1 - 0.5;
         if crops {
-            let (nx0, ny0, nx1, ny1) = (x0.max(cx0), y0.max(cy0), x1.min(cx1), y1.min(cy1));
-            if nx1 <= nx0 || ny1 <= ny0 {
+            let n = Rect::new(x0, y0, x1, y1).intersect(Rect::new(cx0, cy0, cx1, cy1));
+            if n.x1 <= n.x0 || n.y1 <= n.y0 {
                 cur.clear(); // path lies entirely outside its clip — invisible
                 return;
             }
-            x0 = nx0;
-            y0 = ny0;
-            x1 = nx1;
-            y1 = ny1;
+            x0 = n.x0;
+            y0 = n.y0;
+            x1 = n.x1;
+            y1 = n.y1;
             crop = clip;
         }
     }
@@ -530,7 +495,7 @@ fn finish(cur: &mut Vec<Seg>, fill: Option<[u8; 3]>, stroke: Option<([u8; 3], f3
 /// Page-space bounding box of a path under construction (a clip path is just a path
 /// followed by `W`/`W*`); `None` if it has no points.
 fn path_bbox(cur: &[Seg]) -> Option<(f32, f32, f32, f32)> {
-    let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let mut bb = Rect::EMPTY;
     for s in cur {
         let pts: &[(f32, f32)] = match s {
             Seg::M(x, y) | Seg::L(x, y) => &[(*x, *y)],
@@ -538,17 +503,10 @@ fn path_bbox(cur: &[Seg]) -> Option<(f32, f32, f32, f32)> {
             Seg::Z => &[],
         };
         for &(x, y) in pts {
-            x0 = x0.min(x);
-            y0 = y0.min(y);
-            x1 = x1.max(x);
-            y1 = y1.max(y);
+            bb.include(x, y);
         }
     }
-    if x1 >= x0 {
-        Some((x0, y0, x1, y1))
-    } else {
-        None
-    }
+    bb.is_valid().then_some((bb.x0, bb.y0, bb.x1, bb.y1))
 }
 
 /// Vector figures on a page, top-to-bottom.
@@ -579,7 +537,7 @@ fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (
     let egmap = extgstates_of(doc, &resources);
     let mut painted = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
-    walk(doc, ops, &xmap, &egmap, GState::new(M::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget);
+    walk(doc, ops, &xmap, &egmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget);
     // Stamp paint order before clustering reshuffles the vector for banding.
     for (i, p) in painted.iter_mut().enumerate() {
         p.seq = i;
@@ -661,7 +619,7 @@ fn walk(
                 }
             }
             "cm" if o.len() >= 6 => {
-                g.ctm = M { a: num(&o[0]), b: num(&o[1]), c: num(&o[2]), d: num(&o[3]), e: num(&o[4]), f: num(&o[5]) }.mul(g.ctm);
+                g.ctm = Mat { a: num(&o[0]), b: num(&o[1]), c: num(&o[2]), d: num(&o[3]), e: num(&o[4]), f: num(&o[5]) }.mul(g.ctm);
             }
             "gs" => {
                 if let Some(&(ca, big)) = o.first().and_then(|x| x.as_name().ok()).and_then(|n| egmap.get(n)) {
@@ -737,7 +695,10 @@ fn walk(
                 if pending_clip {
                     if let Some(bb) = path_bbox(&cur) {
                         g.clip = Some(match g.clip {
-                            Some((x0, y0, x1, y1)) => (x0.max(bb.0), y0.max(bb.1), x1.min(bb.2), y1.min(bb.3)),
+                            Some(cl) => {
+                                let n = Rect::new(cl.0, cl.1, cl.2, cl.3).intersect(Rect::new(bb.0, bb.1, bb.2, bb.3));
+                                (n.x0, n.y0, n.x1, n.y1)
+                            }
                             None => bb,
                         });
                     }
@@ -774,8 +735,8 @@ fn walk(
                     .ok()
                     .and_then(|x| x.as_array().ok())
                     .filter(|a| a.len() >= 6)
-                    .map(|a| M { a: num(&a[0]), b: num(&a[1]), c: num(&a[2]), d: num(&a[3]), e: num(&a[4]), f: num(&a[5]) })
-                    .unwrap_or(M::ID);
+                    .map(|a| Mat { a: num(&a[0]), b: num(&a[1]), c: num(&a[2]), d: num(&a[3]), e: num(&a[4]), f: num(&a[5]) })
+                    .unwrap_or(Mat::ID);
                 let (mut child_x, mut child_eg) = (xmap.clone(), egmap.clone());
                 if let Some(fr) = stream.dict.get(b"Resources").ok().and_then(|x| deref(doc, x)).and_then(|x| x.as_dict().ok()) {
                     for (k, v) in xobjects_of(doc, fr) {
@@ -834,11 +795,8 @@ fn cluster_figures(mut paths: Vec<Painted>) -> (Vec<Vec<Painted>>, Vec<Vec<Paint
         clusters.push(vec![p]);
     }
     let extent = |c: &[Painted]| {
-        let x0 = c.iter().map(|p| p.x0).fold(f32::INFINITY, f32::min);
-        let x1 = c.iter().map(|p| p.x1).fold(f32::NEG_INFINITY, f32::max);
-        let y0 = c.iter().map(|p| p.y0).fold(f32::INFINITY, f32::min);
-        let y1 = c.iter().map(|p| p.y1).fold(f32::NEG_INFINITY, f32::max);
-        (x1 - x0, y1 - y0)
+        let bb = cluster_bbox(c);
+        (bb.width(), bb.height())
     };
     let (mut strong, mut weak): (Vec<Vec<Painted>>, Vec<Vec<Painted>>) = (Vec::new(), Vec::new());
     for c in clusters {
@@ -881,14 +839,18 @@ fn esc(s: &str) -> String {
     out
 }
 
+/// Enclosing page-space box of a cluster of painted paths.
+fn cluster_bbox(cluster: &[Painted]) -> Rect {
+    cluster
+        .iter()
+        .fold(Rect::EMPTY, |acc, p| acc.union(Rect::new(p.x0, p.y0, p.x1, p.y1)))
+}
+
 /// Transcode one figure cluster into the path geometry of a [`PlacedSvg`]
 /// (paths in stream order, y flipped). The `<svg>` wrapper + any text labels are
 /// emitted later by [`PlacedSvg::svg`].
 fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
-    let x0 = cluster.iter().map(|p| p.x0).fold(f32::INFINITY, f32::min);
-    let x1 = cluster.iter().map(|p| p.x1).fold(f32::NEG_INFINITY, f32::max);
-    let y0 = cluster.iter().map(|p| p.y0).fold(f32::INFINITY, f32::min);
-    let y1 = cluster.iter().map(|p| p.y1).fold(f32::NEG_INFINITY, f32::max);
+    let Rect { x0, y0, x1, y1 } = cluster_bbox(cluster);
     let (w, h) = (x1 - x0, y1 - y0);
     // page space (y up) -> local SVG space (y down): lx = x-x0, ly = y1-y. A stray point
     // (one coordinate left in the wrong space, surviving the per-path extent gate) is
@@ -935,7 +897,10 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
                 if r >= 248 && g >= 248 && b >= 248 && pa >= area * 0.3 {
                     let (bx0, bx1, by0, by1) = (p.x0 - x0, p.x1 - x0, y1 - p.y1, y1 - p.y0);
                     plot = Some(match plot {
-                        Some((mx0, my0, mx1, my1)) => (mx0.min(bx0), my0.min(by0), mx1.max(bx1), my1.max(by1)),
+                        Some(m) => {
+                            let u = Rect::new(m.0, m.1, m.2, m.3).union(Rect::new(bx0, by0, bx1, by1));
+                            (u.x0, u.y0, u.x1, u.y1)
+                        }
                         None => (bx0, by0, bx1, by1),
                     });
                     continue;
@@ -993,7 +958,7 @@ mod tests {
         let egmap = extgstates_of(doc, &resources);
         let mut painted = Vec::new();
         let mut budget = crate::WalkBudget::new(budget);
-        walk(doc, &content.operations, &xmap, &egmap, GState::new(M::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget);
+        walk(doc, &content.operations, &xmap, &egmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget);
         painted
     }
 

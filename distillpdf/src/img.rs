@@ -3,32 +3,10 @@
 //! PNG assembly for Flate-encoded raster samples).
 
 use base64::Engine;
+use crate::geom::{Mat, Rect};
 use crate::pdfobj::{content_bytes, deref, filters_of, num};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
-
-#[derive(Clone, Copy)]
-struct M {
-    a: f32,
-    b: f32,
-    c: f32,
-    d: f32,
-    e: f32,
-    f: f32,
-}
-impl M {
-    const ID: M = M { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
-    fn mul(self, r: M) -> M {
-        M {
-            a: self.a * r.a + self.b * r.c,
-            b: self.a * r.b + self.b * r.d,
-            c: self.c * r.a + self.d * r.c,
-            d: self.c * r.b + self.d * r.d,
-            e: self.e * r.a + self.f * r.c + r.e,
-            f: self.e * r.b + self.f * r.d + r.f,
-        }
-    }
-}
 
 /// All XObject entries (images AND forms) in a resources dict: name -> object id.
 fn xobjects_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, ObjectId> {
@@ -595,7 +573,7 @@ pub fn positioned_images(doc: &Document, page_id: ObjectId, want_uris: bool) -> 
     let xmap = xobjects_of(doc, &resources);
     let mut raws: Vec<RawTile> = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
-    walk(doc, &content.operations, &xmap, M::ID, &mut raws, 0, &mut budget);
+    walk(doc, &content.operations, &xmap, Mat::ID, &mut raws, 0, &mut budget);
     finalize(doc, raws, want_uris)
 }
 
@@ -603,7 +581,7 @@ fn walk(
     doc: &Document,
     ops: &[lopdf::content::Operation],
     xmap: &HashMap<Vec<u8>, ObjectId>,
-    base: M,
+    base: Mat,
     out: &mut Vec<RawTile>,
     depth: u32,
     budget: &mut crate::WalkBudget,
@@ -612,7 +590,7 @@ fn walk(
         return;
     }
     let mut ctm = base;
-    let mut stack: Vec<M> = Vec::new();
+    let mut stack: Vec<Mat> = Vec::new();
     for op in ops {
         // Total-work budget (see `crate::WalkBudget`): the depth cap alone lets a
         // self-referential form branch 2x per level. Out of budget → stop and keep the
@@ -629,7 +607,7 @@ fn walk(
                 }
             }
             "cm" if o.len() >= 6 => {
-                let m = M { a: num(&o[0]), b: num(&o[1]), c: num(&o[2]), d: num(&o[3]), e: num(&o[4]), f: num(&o[5]) };
+                let m = Mat { a: num(&o[0]), b: num(&o[1]), c: num(&o[2]), d: num(&o[3]), e: num(&o[4]), f: num(&o[5]) };
                 ctm = m.mul(ctm);
             }
             "Do" => {
@@ -649,14 +627,13 @@ fn walk(
                 if subtype == b"Image" {
                     // Placed bbox = image unit square [0,1]^2 through the CTM.
                     let corners = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
-                    let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+                    let mut bb = Rect::EMPTY;
                     for (u, v) in corners {
-                        let px = u * ctm.a + v * ctm.c + ctm.e;
-                        let py = u * ctm.b + v * ctm.d + ctm.f;
-                        x0 = x0.min(px); x1 = x1.max(px);
-                        y0 = y0.min(py); y1 = y1.max(py);
+                        let (px, py) = ctm.apply(u, v);
+                        bb.include(px, py);
                     }
-                    let (w, h) = (x1 - x0, y1 - y0);
+                    let Rect { x0, y0, x1, y1 } = bb;
+                    let (w, h) = (bb.width(), bb.height());
                     if w < MIN_DIM || h < MIN_DIM {
                         continue; // diagram tile / rule / icon — not a figure
                     }
@@ -687,8 +664,8 @@ fn walk(
                         .ok()
                         .and_then(|x| x.as_array().ok())
                         .filter(|a| a.len() >= 6)
-                        .map(|a| M { a: num(&a[0]), b: num(&a[1]), c: num(&a[2]), d: num(&a[3]), e: num(&a[4]), f: num(&a[5]) })
-                        .unwrap_or(M::ID);
+                        .map(|a| Mat { a: num(&a[0]), b: num(&a[1]), c: num(&a[2]), d: num(&a[3]), e: num(&a[4]), f: num(&a[5]) })
+                        .unwrap_or(Mat::ID);
                     let form_ctm = fm.mul(ctm);
                     let form_res = stream
                         .dict
@@ -807,15 +784,12 @@ fn cluster(tiles: &[RawTile]) -> Vec<Vec<usize>> {
     out
 }
 
+/// Enclosing box of a tile cluster, in this module's `(x0, x1, y0, y1)` order.
 fn union_bbox(tiles: &[&RawTile]) -> (f32, f32, f32, f32) {
-    let (mut x0, mut x1, mut y0, mut y1) = (f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY);
-    for t in tiles {
-        x0 = x0.min(t.x0);
-        x1 = x1.max(t.x1);
-        y0 = y0.min(t.y0);
-        y1 = y1.max(t.y1);
-    }
-    (x0, x1, y0, y1)
+    let bb = tiles
+        .iter()
+        .fold(Rect::EMPTY, |acc, t| acc.union(Rect::new(t.x0, t.y0, t.x1, t.y1)));
+    (bb.x0, bb.x1, bb.y0, bb.y1)
 }
 
 /// Count distinct cluster positions: sorted centers separated by more than `gap` start a
@@ -994,7 +968,7 @@ mod tests {
         let xmap = xobjects_of(&doc, &resources);
         let mut raws = Vec::new();
         let mut budget = crate::WalkBudget::new(700);
-        walk(&doc, &content.operations, &xmap, M::ID, &mut raws, 0, &mut budget);
+        walk(&doc, &content.operations, &xmap, Mat::ID, &mut raws, 0, &mut budget);
         assert!(!raws.is_empty(), "a tripped budget must not empty the page");
         assert!(raws.len() < 3, "the budget must really bite, got {} tiles", raws.len());
     }

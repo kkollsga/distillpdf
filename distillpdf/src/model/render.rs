@@ -26,7 +26,7 @@
 //! an `el_group` so they regroup into the single `<ul>/<ol>` / `<aside>` they came from; and
 //! `block.text` is the element's minimal inline HTML. One structure, two faces.
 
-use crate::html::{self, Bbox, ElKind, Mode, PageElement, PageIR};
+use crate::html::{self, ElKind, Mode, PageElement, PageIR};
 use crate::links::OutlineEntry;
 use crate::markdown::{self, ImgMode};
 
@@ -101,7 +101,7 @@ fn elements_from_blocks(blocks: &[&Block]) -> Vec<PageElement> {
                     && blocks[i].el_group == group
                 {
                     items.push(blocks[i].text.clone());
-                    bbox = bbox_union(bbox, blocks[i].bbox);
+                    bbox = html::bbox_union(bbox, blocks[i].bbox);
                     i += 1;
                 }
                 out.push(PageElement::at(ElKind::List { ordered, items }, bbox));
@@ -115,7 +115,7 @@ fn elements_from_blocks(blocks: &[&Block]) -> Vec<PageElement> {
                     && blocks[i].el_group == group
                 {
                     notes.push(blocks[i].text.clone());
-                    bbox = bbox_union(bbox, blocks[i].bbox);
+                    bbox = html::bbox_union(bbox, blocks[i].bbox);
                     i += 1;
                 }
                 out.push(PageElement::at(ElKind::Footnotes { notes }, bbox));
@@ -162,11 +162,6 @@ fn elements_from_blocks(blocks: &[&Block]) -> Vec<PageElement> {
         }
     }
     out
-}
-
-/// Union two bboxes (re-exported shape of `html::bbox_union`, used by the list/footnote regroup).
-fn bbox_union(a: Option<Bbox>, b: Option<Bbox>) -> Option<Bbox> {
-    html::bbox_union(a, b)
 }
 
 /// Reconstruct the PDF's own outline (`/Outlines`) from the model's `toc`, for the `assemble`

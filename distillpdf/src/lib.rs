@@ -22,6 +22,7 @@ mod captions;
 mod elem_passes;
 mod extract;
 mod frontmatter;
+mod geom;
 mod headings;
 mod html;
 mod img;

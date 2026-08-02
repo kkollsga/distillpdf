@@ -5,6 +5,7 @@
 //! ourselves, decode show-text operators through each font's ToUnicode CMap, and
 //! recover real Unicode — including 2-byte CID codes and diacritics.
 
+use crate::geom::Mat;
 use crate::pdfobj::{content_bytes, deref, num};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
@@ -952,32 +953,6 @@ fn decode_words(elems: &[Show], font: Option<&FontInfo>, size: f32, tc: f32, tw:
 }
 
 /// 2x3 affine matrix (PDF row-vector convention): [a b c d e f].
-#[derive(Clone, Copy)]
-struct Mat {
-    a: f32,
-    b: f32,
-    c: f32,
-    d: f32,
-    e: f32,
-    f: f32,
-}
-impl Mat {
-    const ID: Mat = Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
-    fn mul(self, r: Mat) -> Mat {
-        Mat {
-            a: self.a * r.a + self.b * r.c,
-            b: self.a * r.b + self.b * r.d,
-            c: self.c * r.a + self.d * r.c,
-            d: self.c * r.b + self.d * r.d,
-            e: self.e * r.a + self.f * r.c + r.e,
-            f: self.e * r.b + self.f * r.d + r.f,
-        }
-    }
-    fn translate(tx: f32, ty: f32) -> Mat {
-        Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: tx, f: ty }
-    }
-}
-
 /// A positioned run of text (origin in PDF user space, y increases upward).
 #[derive(Clone)]
 pub struct Span {
