@@ -150,11 +150,27 @@ enum Seg {
     Z,
 }
 
+/// A stroke as the SVG needs it: colour, width, and the dash pattern — all in PAGE space,
+/// the line width and the dash lengths having been through the same `ctm.scale()`.
+///
+/// A struct rather than the `([u8; 3], f32)` pair it replaced because a dash is not
+/// decoration: `econ_EM_2606_02234`'s six DAGs state in their captions that dashed nodes are
+/// *unobserved variables*, so rendering them solid does not degrade the figure, it changes
+/// what it says.
+#[derive(Clone)]
+struct Stroke {
+    color: [u8; 3],
+    width: f32,
+    /// `(pattern, phase)` from the `d` operator, scaled. `None` = solid, which is both the
+    /// PDF default and what an empty or invalid array means (§8.4.3.6).
+    dash: Option<(Vec<f32>, f32)>,
+}
+
 /// A painted path with its colours, opacities and page-space bounding box.
 struct Painted {
     segs: Vec<Seg>,
     fill: Option<[u8; 3]>,
-    stroke: Option<([u8; 3], f32)>,
+    stroke: Option<Stroke>,
     fill_op: f32,
     stroke_op: f32,
     x0: f32,
@@ -184,6 +200,9 @@ struct GState {
     // `Do` applies to the group's composited result — so the caller's alpha must be carried
     // beside `fill_a`/`stroke_a`, never inside them, or the group's own first `gs` erases it.
     group_a: (f32, f32),
+    // The `d` operator's dash pattern and phase, in USER space — scaled by `ctm.scale()`
+    // at paint time exactly as `lw` is. `None` = solid, the PDF default.
+    dash: Option<(Vec<f32>, f32)>,
     // Active clipping rectangle in PAGE space (x0, y0, x1, y1), the intersection of every
     // `W`/`W*` clip seen so far on the q/Q stack. `None` = unclipped (page bounds). A plot
     // clips its reference curves to the axes box; honouring it crops the curve overshoot.
@@ -198,7 +217,7 @@ struct GState {
 }
 impl GState {
     fn new(ctm: Mat, fill: [u8; 3], stroke: [u8; 3], lw: f32, fill_a: f32, stroke_a: f32) -> GState {
-        GState { ctm, fill, stroke, lw, fill_a, stroke_a, group_a: (1.0, 1.0), clip: None, fill_cs: None, stroke_cs: None }
+        GState { ctm, fill, stroke, lw, fill_a, stroke_a, group_a: (1.0, 1.0), dash: None, clip: None, fill_cs: None, stroke_cs: None }
     }
     /// The alpha a paint made right now actually reaches the page with: this stream's `ca`
     /// scaled by every enclosing transparency group's.
@@ -725,7 +744,7 @@ fn extgstates_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, (Op
 // bundling it into a struct would hide which parts a paint operator supplies fresh
 // (colour, alpha, clip) from the address/output it merely threads through.
 #[allow(clippy::too_many_arguments)]
-fn finish(cur: &mut Vec<Seg>, fill: Option<[u8; 3]>, stroke: Option<([u8; 3], f32)>, fill_op: f32, stroke_op: f32, clip: Option<(f32, f32, f32, f32)>, seq: PaintSeq, out: &mut Vec<Painted>) {
+fn finish(cur: &mut Vec<Seg>, fill: Option<[u8; 3]>, stroke: Option<Stroke>, fill_op: f32, stroke_op: f32, clip: Option<(f32, f32, f32, f32)>, seq: PaintSeq, out: &mut Vec<Painted>) {
     if cur.is_empty() {
         return;
     }
@@ -914,7 +933,17 @@ fn walk(
     // itself in the figures where alpha IS the quantity: an attention map's weights arrive
     // as 0.0039..0.98, so three quarters of every such figure was thresholded away.
     let eff_fill = |g: &GState| if g.fill_alpha() > 0.0 { Some(g.fill) } else { None };
-    let eff_stroke = |g: &GState| if g.stroke_alpha() > 0.0 { Some((g.stroke, (g.lw * g.ctm.scale()).max(0.3))) } else { None };
+    let eff_stroke = |g: &GState| {
+        if g.stroke_alpha() <= 0.0 {
+            return None;
+        }
+        let s = g.ctm.scale();
+        // The dash lengths live in user space and follow the CTM exactly as the line width
+        // does — one scale factor, applied to both, so a scaled-down figure's dashes stay in
+        // proportion to its strokes.
+        let dash = g.dash.as_ref().map(|(pat, phase)| (pat.iter().map(|v| (v * s).max(0.01)).collect(), phase * s));
+        Some(Stroke { color: g.stroke, width: (g.lw * s).max(0.3), dash })
+    };
 
     for (opi, op) in ops.iter().enumerate() {
         // Total-work budget (see `crate::WalkBudget`). `MAX_OPS` above truncates only the
@@ -949,6 +978,17 @@ fn walk(
                 }
             }
             "w" if !o.is_empty() => g.lw = num(&o[0]),
+            // `d` — the dash pattern. The walk had no arm for it at all, so every dashed
+            // stroke rendered SOLID: in `econ_EM_2606_02234`'s DAGs, whose captions say
+            // dashed nodes are unobserved variables, that erases the distinction the figure
+            // exists to draw. An empty array is the spec's own "solid", and so is a pattern
+            // that is invalid (negative, or all zeros) — §8.4.3.6 calls those an error, and
+            // solid is the reading that cannot invent a dash the file never asked for.
+            "d" => {
+                let pat: Vec<f32> = o.first().and_then(|x| x.as_array().ok()).map(|a| a.iter().map(num).collect()).unwrap_or_default();
+                let ok = !pat.is_empty() && pat.iter().all(|v| *v >= 0.0 && v.is_finite()) && pat.iter().any(|v| *v > 0.0);
+                g.dash = ok.then(|| (pat, o.get(1).map(num).filter(|p| p.is_finite() && *p >= 0.0).unwrap_or(0.0)));
+            }
             "g" if !o.is_empty() => g.fill = gray(num(&o[0])),
             "G" if !o.is_empty() => g.stroke = gray(num(&o[0])),
             "rg" if o.len() >= 3 => g.fill = rgb(num(&o[0]), num(&o[1]), num(&o[2])),
@@ -1285,10 +1325,20 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32, rot: i32) -> PlacedSvg {
         }
         let fill = p.fill.map(hex).unwrap_or_else(|| "none".into());
         let fop = if p.fill.is_some() && p.fill_op < 0.999 { format!(" fill-opacity=\"{}\"", fmt_alpha(p.fill_op)) } else { String::new() };
-        let stroke = match p.stroke {
-            Some((c, lw)) => {
+        let stroke = match &p.stroke {
+            Some(s) => {
                 let sop = if p.stroke_op < 0.999 { format!(" stroke-opacity=\"{}\"", fmt_alpha(p.stroke_op)) } else { String::new() };
-                format!(" stroke=\"{}\" stroke-width=\"{}\"{sop}", hex(c), fmt(lw.max(0.3)))
+                // A dash pattern is content, not styling — see [`Stroke`]. `stroke-dashoffset`
+                // is only emitted when the phase is nonzero, so an ordinary dash stays terse.
+                let dash = match &s.dash {
+                    Some((pat, phase)) => {
+                        let arr = pat.iter().map(|v| fmt(*v)).collect::<Vec<_>>().join(" ");
+                        let off = if *phase > 0.005 { format!(" stroke-dashoffset=\"{}\"", fmt(*phase)) } else { String::new() };
+                        format!(" stroke-dasharray=\"{arr}\"{off}")
+                    }
+                    None => String::new(),
+                };
+                format!(" stroke=\"{}\" stroke-width=\"{}\"{sop}{dash}", hex(s.color), fmt(s.width.max(0.3)))
             }
             None => String::new(),
         };
@@ -1539,6 +1589,30 @@ mod tests {
         let (strong, _weak) = positioned_vectors(&doc, page_id);
         assert_eq!(strong.len(), 1, "the bar chart must be one figure");
         assert!(strong[0].ink().contains("fill-opacity=\"0.85\""), "{}", strong[0].ink());
+    }
+
+    #[test]
+    fn a_dashed_stroke_reaches_the_svg_dashed() {
+        // `d` had no arm in the walk, so the dash state was never read and every dashed
+        // stroke rendered SOLID. Destructive, not cosmetic: `econ_EM_2606_02234`'s six DAGs
+        // dash the nodes that are UNOBSERVED variables and say so in their captions, and
+        // `cs_DS_2606_02492` p24 describes "edges shown in dashed light blue" — solid
+        // strokes silently assert the opposite.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/dashes.pdf");
+        let doc = Document::load(path).expect("dashes.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        let (strong, _weak) = positioned_vectors(&doc, page_id);
+        assert_eq!(strong.len(), 1, "the five rules and their frame are one figure");
+        let ink = strong[0].ink();
+        // The five strokes differ ONLY in dash state, so every difference below is `d`'s.
+        assert!(ink.contains("stroke-dasharray=\"3 2\""), "[3 2] must survive: {ink}");
+        assert!(ink.contains("stroke-dasharray=\"6 3\" stroke-dashoffset=\"2\""), "a nonzero phase is an offset: {ink}");
+        // Solid, reset (`[] d`) and invalid (`[0 0] d`) all carry no dash at all: 6 paths,
+        // exactly 2 dashed. `stroke-dasharray="0 0"` renders as NOTHING in a browser, so the
+        // invalid case degrades visibly rather than being deleted.
+        assert_eq!(ink.matches("<path").count(), 6);
+        assert_eq!(ink.matches("stroke-dasharray").count(), 2, "only the two valid patterns dash: {ink}");
+        assert!(!ink.contains("stroke-dasharray=\"0"), "an all-zero pattern must not reach the SVG: {ink}");
     }
 
     #[test]

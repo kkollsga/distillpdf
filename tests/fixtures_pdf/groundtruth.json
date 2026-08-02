@@ -825,5 +825,22 @@
     ],
     "paths": 7,
     "plain_form_opacity": "0.25"
+  },
+  "dashes.pdf": {
+    "dasharrays": [
+      null,
+      "3 2",
+      "6 3",
+      null,
+      null
+    ],
+    "dashoffsets": [
+      null,
+      null,
+      "2",
+      null,
+      null
+    ],
+    "paths": 6
   }
 }

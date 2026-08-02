@@ -297,3 +297,25 @@ def test_a_transparency_groups_alpha_survives_into_the_svg():
     # `ca 0` is not faint, it is absent — and no faint paint is rounded away to it either.
     assert 'fill-opacity="0"' not in svg, "a transparent or faint paint reached the output as 0"
     assert len(re.findall(r"<path\b", svg)) == g["paths"], f"expected {g['paths']} paths in {svg}"
+
+
+def test_dashed_strokes_render_dashed():
+    """The ``d`` operator had no arm in the vector walk, so dash state was never read and
+    every dashed stroke came out SOLID. That is destructive, not cosmetic: all six DAG
+    figures in ``econ_EM_2606_02234`` mark **unobserved** variables by dashing the node, and
+    say so in their captions; ``cs_DS_2606_02492`` p24 describes "edges shown in dashed light
+    blue". A solid stroke silently asserts the opposite of what the figure means.
+
+    ``dashes.pdf``'s five rules differ only in dash state, so every difference is ``d``'s."""
+    g = GT["dashes.pdf"]
+    svgs = re.findall(r"<svg\b.*?</svg>", html("dashes.pdf"), re.DOTALL)
+    assert len(svgs) == 1, f"the rules and their frame are one figure, got {len(svgs)}"
+    svg = svgs[0]
+    assert len(re.findall(r"<path\b", svg)) == g["paths"]
+    for want in (d for d in g["dasharrays"] if d):
+        assert f'stroke-dasharray="{want}"' in svg, f"pattern {want} missing from {svg}"
+    for want in (o for o in g["dashoffsets"] if o):
+        assert f'stroke-dashoffset="{want}"' in svg, f"phase {want} missing from {svg}"
+    # Solid, `[] d` (reset) and `[0 0] d` (invalid) all carry no dash whatsoever.
+    n = sum(1 for d in g["dasharrays"] if d)
+    assert len(re.findall(r"stroke-dasharray", svg)) == n, f"only {n} strokes may dash: {svg}"

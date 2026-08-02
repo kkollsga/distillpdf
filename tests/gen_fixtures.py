@@ -1036,6 +1036,55 @@ def gen_no_resources_paths():
     GT["no_resources_paths.pdf"] = {"svgs_per_page": [1, 1], "paths_per_page": 8}
 
 
+def gen_dashes():
+    """The ``d`` (dash-pattern) operator, which the vector walk had no arm for at all — so
+    every dashed stroke rendered SOLID.
+
+    That is semantically destructive, not cosmetic: all six DAG figures in
+    ``econ_EM_2606_02234`` distinguish observed from **unobserved** variables by dashing the
+    node, and their captions say so; ``cs_DS_2606_02492`` p24 describes "edges shown in
+    dashed light blue". Rendering them solid does not degrade the figure, it changes what it
+    claims.
+
+    One page, one figure, four strokes that differ ONLY in dash state, so any difference in
+    the emitted ``<svg>`` is attributable to ``d`` alone:
+
+      1. no ``d`` at all         — solid, and must carry NO ``stroke-dasharray``;
+      2. ``[3 2] 0 d``           — ``stroke-dasharray="3 2"``, no offset;
+      3. ``[6 3] 2 d``           — a nonzero phase, so ``stroke-dashoffset="2"`` too;
+      4. ``[] 0 d``              — the spec's own way to say solid again (§8.4.3.6); the
+                                   dash state must RESET, not persist from stroke 3.
+
+    A fifth, ``[0 0] 0 d``, is invalid (all-zero, §8.4.3.6 calls it an error) and reads as
+    solid here. Note this DIVERGES from mupdf, which draws that stroke not at all — a
+    deliberate choice: passing the array through would emit ``stroke-dasharray="0 0"``, which
+    a browser also renders as nothing, so the alternative to "solid" is not "faithful", it is
+    "silently deleted". Degrade visibly.
+
+    Under ``q``/``Q`` throughout, so the dash is also shown to be part of the saved
+    graphics state.
+    Hand-assembled: reportlab's ``setDash`` cannot express all five in one controlled row."""
+    pdf = os.path.join(OUT, "dashes.pdf")
+    rows = [b"2 w 0 0 0.8 RG", b"100 200 200 300 re S"]
+    for i, d in enumerate([None, b"[3 2] 0 d", b"[6 3] 2 d", b"[] 0 d", b"[0 0] 0 d"]):
+        y = 230 + i * 55
+        rows.append(b"q %s 110 %d m 290 %d l S Q" % (d or b"", y, y))
+    content = b"\n".join(rows)
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 400 600] >>",
+        3: b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << >> >>",
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+    }
+    _assemble_pdf(objs, pdf)
+    GT["dashes.pdf"] = {
+        # In paint order after the frame: solid, [3 2], [6 3] phase 2, reset, invalid.
+        "dasharrays": [None, "3 2", "6 3", None, None],
+        "dashoffsets": [None, None, "2", None, None],
+        "paths": 6,
+    }
+
+
 def gen_alpha_groups():
     """Per-element alpha carried through nested **transparency groups** — the shape every
     matplotlib/plotly figure with an alpha channel has, and the one that lost its alpha.
@@ -2691,6 +2740,7 @@ def main():
     gen_image_order()
     gen_paint_order()
     gen_no_resources_paths()
+    gen_dashes()
     gen_alpha_groups()
     gen_rotated_pages()
     gen_separation()
