@@ -148,8 +148,8 @@ fn walk_drawn(
                 out.insert(id);
             }
             b"Form" => {
-                if depth >= crate::MAX_FORM_DEPTH {
-                    continue; // nesting cap
+                if crate::walker::too_deep(depth) {
+                    continue; // the one nesting cap
                 }
                 if !seen.insert(id) {
                     continue; // a form already walked on this page: cycle / repeat guard

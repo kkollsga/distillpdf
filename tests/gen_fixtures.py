@@ -991,6 +991,62 @@ def gen_decode_jpeg():
     }
 
 
+def gen_form_inherit():
+    """Resources split ACROSS the page tree, plus an INDIRECT ``/Matrix`` — the two
+    recoveries the shared form-descent normalization brings.
+
+    The page carries no ``/Resources`` of its own. Its parent defines the form ``/F`` it
+    draws; its *grandparent* defines the image ``/Im`` that form paints and the
+    ``/ExtGState /GA`` the form's rectangle is painted through. The strict reading of
+    §7.7.3.4 takes the NEAREST ancestor's dictionary whole, so the walkers saw only the
+    parent's: the image resolved to nothing and vanished, and the alpha resolved to
+    nothing and the panel painted fully opaque. Folding the whole chain (nearest still
+    wins every name it defines) recovers both.
+
+    The form's ``/Matrix`` is written as an indirect reference to ``[1 0 0 1 100 0]``.
+    Read directly — ``as_array()`` on a ``Reference`` fails — it degraded to the identity,
+    so everything the form paints landed 100 pt to the LEFT of where the page puts it.
+    Every element below therefore has a ground-truth x of 172 (72 from the page's ``cm``
+    plus 100 from the matrix), which is 72 when the matrix is missed.
+
+    Hand-assembled: reportlab writes a page's resources onto the page."""
+    pdf = os.path.join(OUT, "form_inherit.pdf")
+    page_content = b"q 1 0 0 1 72 500 cm /F Do Q"
+    form_content = (b"q /GA gs 0 0 1 rg 0 0 90 50 re f Q\n"
+                    b"q 120 0 0 90 0 60 cm /Im Do Q\n"
+                    b"BT /F1 12 Tf 0 160 Td (INHERIT) Tj ET")
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        # Grandparent: owns the image and the ExtGState.
+        2: (b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] "
+            b"/Resources 6 0 R >>"),
+        # Parent: owns the form. This is the NEAREST dictionary the page inherits.
+        3: b"<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 /Resources 7 0 R >>",
+        4: b"<< /Type /Page /Parent 3 0 R /Contents 5 0 R >>",  # no /Resources at all
+        5: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(page_content), page_content),
+        6: b"<< /XObject << /Im 8 0 R >> /ExtGState << /GA 11 0 R >> >>",
+        7: b"<< /XObject << /F 9 0 R >> >>",
+        # Flate-compressed on purpose: an UNFILTERED sample block is a separate,
+        # already-known render-path gap (`img::decode_rgb` reads samples with
+        # `decompressed_content()`, which errors without a `/Filter`), and this fixture is
+        # about inheritance and the matrix, not about that.
+        8: _flate_image(8, 40, 30, b"/DeviceRGB", 8, bytes(0x20 + ((i * 7) % 0x5F) for i in range(40 * 30 * 3))),
+        9: (b"<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 300 300] "
+            b"/Matrix 10 0 R /Resources << /Font << /F1 12 0 R >> >> "
+            b"/Length %d >>\nstream\n%s\nendstream" % (len(form_content), form_content)),
+        10: b"[1 0 0 1 100 0]",
+        11: b"<< /Type /ExtGState /ca 0.5 /CA 0.5 >>",
+        12: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["form_inherit.pdf"] = {
+        "word": "INHERIT",
+        "x": 172,          # 72 (page cm) + 100 (indirect /Matrix); 72 if the matrix is lost
+        "image": {"width": 40, "height": 30, "x_left": 172, "y_bottom": 560},
+        "panel_opacity": 0.5,
+    }
+
+
 def gen_form_font():
     """Hand-written PDF where the page's own ``/Font`` dictionary is EMPTY and the only
     font lives in a Form XObject's own ``/Resources`` — the ``/TPL*`` template layout an
@@ -2168,6 +2224,7 @@ def main():
     gen_image_order()
     gen_cmyk_jpeg()
     gen_decode_jpeg()
+    gen_form_inherit()
     gen_form_font()
     gen_unfiltered_form()
     gen_no_spurious_figs()

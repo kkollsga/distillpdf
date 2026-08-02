@@ -12,7 +12,7 @@
 
 use crate::geom::{Mat, Rect};
 use crate::pdfobj::{deref, num, num_deref};
-use crate::walker::{descend_form, nearest_resources, xobjects_of, Descend, ScopePolicy, XMap};
+use crate::walker::{descend_form, overlay_xobjects, page_resource_chain, Descend, ScopePolicy, XMap};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -500,10 +500,13 @@ pub fn positioned_vectors(doc: &Document, page_id: ObjectId) -> (Vec<PlacedSvg>,
 /// [`MAX_OPS`]). Exposed internally so the truncation behaviour is unit-testable with a tiny
 /// cap instead of a half-million-operation fixture.
 fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (Vec<PlacedSvg>, Vec<PlacedSvg>) {
-    let resources = match nearest_resources(doc, page_id) {
-        Some(r) => r,
-        None => return (Vec::new(), Vec::new()),
-    };
+    // A page with no `/Resources` anywhere in its tree is skipped entirely, as it always
+    // has been. (Its direct path ink goes with it — a separate defect from this one, and
+    // not this phase's to change.)
+    let chain = page_resource_chain(doc, page_id);
+    if chain.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
     let content = match doc.get_and_decode_page_content(page_id) {
         Ok(c) => c,
         Err(_) => return (Vec::new(), Vec::new()),
@@ -513,8 +516,15 @@ fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (
     // with no figures at all (a whole cover map disappeared), which is strictly worse than a
     // partial one — the ops are already parsed by this point, so the cap only bounds the walk.
     let ops = &content.operations[..content.operations.len().min(cap)];
-    let xmap = xobjects_of(doc, &resources);
-    let egmap = extgstates_of(doc, &resources);
+    // Both maps are folded over the WHOLE resource chain, outermost first, so the page's
+    // own dictionary still shadows an ancestor's entry of the same name while a name only
+    // an ancestor defines finally resolves (see `walker::page_resource_chain`).
+    let mut xmap = XMap::new();
+    let mut egmap: HashMap<Vec<u8>, (Option<f32>, Option<f32>)> = HashMap::new();
+    for res in &chain {
+        overlay_xobjects(doc, res, &mut xmap);
+        egmap.extend(extgstates_of(doc, res));
+    }
     let mut painted = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
     walk(doc, ops, &xmap, &egmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget);
@@ -564,9 +574,6 @@ fn walk(
     depth: u32,
     budget: &mut crate::WalkBudget,
 ) {
-    if depth > crate::MAX_FORM_DEPTH {
-        return;
-    }
     let mut g = base;
     let mut stack: Vec<GState> = Vec::new();
     let mut cur: Vec<Seg> = Vec::new();
@@ -698,7 +705,7 @@ fn walk(
                 let Some((_, stream)) = crate::walker::xobject_at(doc, xmap, o) else {
                     continue;
                 };
-                let f = match descend_form(doc, stream, xmap, ScopePolicy::OverlayParent, budget, egmap.len()) {
+                let f = match descend_form(doc, stream, xmap, ScopePolicy::OverlayParent, depth, budget, egmap.len()) {
                     Descend::Into(f) => f,
                     Descend::Skip => continue,
                     Descend::Halt => return,
@@ -914,11 +921,19 @@ mod tests {
         (doc, page_id)
     }
 
+    /// The page's own (nearest) resource dictionary — the last entry of the overlay chain.
+    fn page_res(doc: &Document, page_id: ObjectId) -> Dictionary {
+        page_resource_chain(doc, page_id).pop().expect("fixture page has resources")
+    }
+
     fn walk_page(doc: &Document, page_id: ObjectId, budget: usize) -> Vec<Painted> {
-        let resources = nearest_resources(doc, page_id).expect("fixture page has resources");
         let content = doc.get_and_decode_page_content(page_id).expect("fixture page has content");
-        let xmap = xobjects_of(doc, &resources);
-        let egmap = extgstates_of(doc, &resources);
+        let mut xmap = XMap::new();
+        let mut egmap: HashMap<Vec<u8>, (Option<f32>, Option<f32>)> = HashMap::new();
+        for res in &page_resource_chain(doc, page_id) {
+            overlay_xobjects(doc, res, &mut xmap);
+            egmap.extend(extgstates_of(doc, res));
+        }
         let mut painted = Vec::new();
         let mut budget = crate::WalkBudget::new(budget);
         walk(doc, &content.operations, &xmap, &egmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget);
@@ -1067,8 +1082,8 @@ mod tests {
         let doc = Document::load(path).expect("unfiltered_form.pdf fixture must load");
         let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
         // The premise, asserted rather than assumed: the form really is unfiltered.
-        let res = nearest_resources(&doc, page_id).expect("fixture page has resources");
-        let form_id = xobjects_of(&doc, &res).get(b"UF".as_slice()).copied().expect("/UF form");
+        let res = page_res(&doc, page_id);
+        let form_id = crate::walker::xobjects_of(&doc, &res).get(b"UF".as_slice()).copied().expect("/UF form");
         let form = doc.get_object(form_id).unwrap().as_stream().unwrap();
         assert!(form.dict.get(b"Filter").is_err(), "the fixture's form must carry no /Filter");
         assert!(form.decompressed_content().is_err(), "the premise: lopdf errors without /Filter");
@@ -1083,6 +1098,23 @@ mod tests {
     }
 
     #[test]
+    fn an_extgstate_defined_two_ancestors_up_still_governs_the_ink() {
+        // `tests/gen_fixtures.py::gen_form_inherit`. The page has NO /Resources; the
+        // /ExtGState /GA the form paints its panel through lives on the GRANDPARENT node.
+        // A nearest-only read of the inherited resources left `gs` resolving to nothing, so
+        // the panel painted fully opaque; and the form's indirect /Matrix, read directly,
+        // degraded to the identity and put the panel 100 pt to the left.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/form_inherit.pdf");
+        let doc = Document::load(path).expect("form_inherit.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        let painted = walk_page(&doc, page_id, crate::MAX_FORM_WORK);
+        assert_eq!(painted.len(), 1, "the form paints exactly one panel");
+        let p = &painted[0];
+        assert!((p.fill_op - 0.5).abs() < 1e-6, "fill opacity {} (1.0 means /GA never resolved)", p.fill_op);
+        assert!((p.x0 - 172.0).abs() < 0.5, "x0 {} (72 means the indirect /Matrix was lost)", p.x0);
+    }
+
+    #[test]
     fn an_extgstate_alpha_written_indirectly_does_not_hide_the_figure() {
         // `indirect_numbers.pdf`: `/GA` is `<< /ca 10 0 R /CA 11 0 R >>`. A dictionary value
         // may legally be an indirect reference, but the direct-only `num` reader returned 0.0
@@ -1092,7 +1124,7 @@ mod tests {
         let doc = Document::load(path).expect("indirect_numbers.pdf fixture must load");
         let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
         // The premise: the alphas really are indirect.
-        let res = nearest_resources(&doc, page_id).expect("fixture page has resources");
+        let res = page_res(&doc, page_id);
         let eg = res.get(b"ExtGState").unwrap().as_dict().unwrap().get(b"GA").unwrap();
         let eg = deref(&doc, eg).unwrap().as_dict().unwrap();
         assert!(matches!(eg.get(b"ca").unwrap(), Object::Reference(_)));

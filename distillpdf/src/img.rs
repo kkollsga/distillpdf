@@ -8,7 +8,7 @@ use crate::pdfobj::{deref, filters_of, num};
 use crate::raster::{
     codec_payload, decode_dct_rgb, decode_inverts, dims_sane, jpeg_components, png_bytes, MAX_IMAGE_PIXELS,
 };
-use crate::walker::{descend_form, nearest_resources, subtype_of, xobject_at, xobjects_of, Descend, ScopePolicy, XMap};
+use crate::walker::{descend_form, page_xobjects, subtype_of, xobject_at, Descend, ScopePolicy, XMap};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
 fn cs_channels(dict: &Dictionary, doc: &Document) -> Option<usize> {
@@ -412,15 +412,14 @@ const MIN_GRID_TILES: usize = 4;
 /// or base64-encoded — `uri` is left empty. Decoding/encoding the raster is by far the
 /// dominant cost on image-heavy PDFs, so this makes `images=False` near-free.
 pub fn positioned_images(doc: &Document, page_id: ObjectId, want_uris: bool) -> Vec<Placed> {
-    let resources = match nearest_resources(doc, page_id) {
-        Some(r) => r,
-        None => return Vec::new(),
-    };
     let content = match doc.get_and_decode_page_content(page_id) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    let xmap = xobjects_of(doc, &resources);
+    // The page's XObjects over its WHOLE resource chain, not just the nearest dictionary
+    // (see `walker::page_resource_chain`) — a raster a producer left on an outer node of
+    // the page tree used to resolve to nothing and simply not appear.
+    let xmap = page_xobjects(doc, page_id);
     let mut raws: Vec<RawTile> = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
     walk(doc, &content.operations, &xmap, Mat::ID, &mut raws, 0, &mut budget);
@@ -436,9 +435,6 @@ fn walk(
     depth: u32,
     budget: &mut crate::WalkBudget,
 ) {
-    if depth > crate::MAX_FORM_DEPTH {
-        return;
-    }
     let mut ctm = base;
     let mut stack: Vec<Mat> = Vec::new();
     for op in ops {
@@ -494,7 +490,7 @@ fn walk(
                     // A form is descended with the page's XObject scope still in force
                     // (`OverlayParent`): a raster the page defines and the form invokes by
                     // an unqualified name must still be found.
-                    match descend_form(doc, stream, xmap, ScopePolicy::OverlayParent, budget, 0) {
+                    match descend_form(doc, stream, xmap, ScopePolicy::OverlayParent, depth, budget, 0) {
                         Descend::Into(f) => walk(doc, &f.ops, &f.scope.xobjects, f.matrix.mul(ctm), out, depth + 1, budget),
                         Descend::Skip => continue,
                         Descend::Halt => return,
@@ -779,9 +775,8 @@ mod tests {
     fn an_exhausted_work_budget_degrades_a_repeated_form_instead_of_emptying_it() {
         // Degrade, don't vanish: a walk that runs out mid-page keeps the tiles it found.
         let (doc, page_id) = adversarial("form_repeat.pdf");
-        let resources = nearest_resources(&doc, page_id).expect("fixture page has resources");
         let content = doc.get_and_decode_page_content(page_id).expect("fixture page has content");
-        let xmap = xobjects_of(&doc, &resources);
+        let xmap = page_xobjects(&doc, page_id);
         let mut raws = Vec::new();
         let mut budget = crate::WalkBudget::new(700);
         walk(&doc, &content.operations, &xmap, Mat::ID, &mut raws, 0, &mut budget);
@@ -875,6 +870,25 @@ mod tests {
     }
 
     #[test]
+    fn a_raster_defined_two_ancestors_up_is_still_placed_and_lands_where_the_matrix_says() {
+        // `tests/gen_fixtures.py::gen_form_inherit`. The page has NO /Resources; its parent
+        // defines the form it draws, its GRANDPARENT defines the image that form paints.
+        // Reading only the nearest inherited dictionary (what this walker did) left `/Im`
+        // unresolved and the raster simply absent. The form's /Matrix is INDIRECT, which a
+        // direct-only read degraded to the identity — placing everything 100 pt left of
+        // where the page puts it. Both are asserted at once: 0 images before, 1 at x=172.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/form_inherit.pdf");
+        let doc = Document::load(path).expect("form_inherit.pdf fixture must load");
+        let page_id = *doc.get_pages().values().next().expect("fixture has a page");
+        let placed = positioned_images(&doc, page_id, true);
+        assert_eq!(placed.len(), 1, "the grandparent's image must resolve and be placed");
+        let p = &placed[0];
+        assert!((p.x_left - 172.0).abs() < 0.5, "x_left {} (72 means the indirect /Matrix was lost)", p.x_left);
+        assert!((p.y_bottom - 560.0).abs() < 0.5, "y_bottom {}", p.y_bottom);
+        assert!((p.x_right - 292.0).abs() < 0.5, "x_right {}", p.x_right);
+    }
+
+    #[test]
     fn the_render_path_honours_an_inverting_decode_on_a_gray_and_an_rgb_jpeg() {
         // `tests/gen_fixtures.py::gen_decode_jpeg` — a gray and an RGB DCTDecode image, each
         // with an inverting `/Decode` (the RGB one written as an INDIRECT array, which
@@ -898,4 +912,5 @@ mod tests {
         }
     }
 }
+
 

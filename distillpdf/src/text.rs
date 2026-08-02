@@ -7,7 +7,7 @@
 
 use crate::geom::Mat;
 use crate::pdfobj::{deref, num};
-use crate::walker::{descend_form, nearest_resources, xobject_at, xobjects_of, Descend, ScopePolicy, XMap};
+use crate::walker::{descend_form, xobject_at, Descend, ScopePolicy, XMap};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -985,7 +985,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
         Err(_) => return Vec::new(),
     };
     let fonts = build_fonts(doc, page_id, raw);
-    let xmap = page_xobjects(doc, page_id);
+    let xmap = crate::walker::page_xobjects(doc, page_id);
     let mut spans = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
     decode_spans(doc, &content.operations, &fonts, &xmap, Mat::ID, raw, 0, &mut spans, &mut budget);
@@ -993,13 +993,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
     spans
 }
 
-/// XObject name -> object id from a page's resources (the forms/images the page may `Do`).
-fn page_xobjects(doc: &Document, page_id: ObjectId) -> XMap {
-    match nearest_resources(doc, page_id) {
-        Some(res) => xobjects_of(doc, &res),
-        None => XMap::new(),
-    }
-}
+
 
 /// Emit one positioned text span from a decoded word, resolving its device position
 /// from the text matrix and the graphics CTM (pure-translate / Y-flip / rotation
@@ -1199,7 +1193,7 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
             // through a template/overlay form is captured (placed under the form's
             // /Matrix and the CTM in effect at the `Do`). Inline images / non-Form
             // XObjects carry no text and are skipped.
-            "Do" if depth < crate::MAX_FORM_DEPTH => {
+            "Do" => {
                 let Some((_, stream)) = xobject_at(doc, xmap, o) else {
                     continue;
                 };
@@ -1208,7 +1202,7 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
                 // a form without one is skipped rather than decoded through some other
                 // scope's encoding. That is a deliberate policy difference from the raster
                 // and vector walks, which overlay the parent scope; see `walker::ScopePolicy`.
-                let f = match descend_form(doc, stream, xmap, ScopePolicy::OwnOnly, budget, fonts.len()) {
+                let f = match descend_form(doc, stream, xmap, ScopePolicy::OwnOnly, depth, budget, fonts.len()) {
                     Descend::Into(f) => f,
                     Descend::Skip => continue,
                     Descend::Halt => return,
@@ -1678,7 +1672,7 @@ mod tests {
         let (raw, doc, page_id) = adversarial("form_repeat.pdf");
         let content = doc.get_and_decode_page_content(page_id).expect("fixture page has content");
         let fonts = build_fonts(&doc, page_id, &raw);
-        let xmap = page_xobjects(&doc, page_id);
+        let xmap = crate::walker::page_xobjects(&doc, page_id);
         let mut spans = Vec::new();
         let mut budget = crate::WalkBudget::new(700);
         decode_spans(&doc, &content.operations, &fonts, &xmap, Mat::ID, &raw, 0, &mut spans, &mut budget);
@@ -1728,6 +1722,22 @@ mod tests {
     }
 
     #[test]
+    fn a_forms_indirect_matrix_places_its_text_where_the_page_puts_it() {
+        // `tests/gen_fixtures.py::gen_form_inherit`. The form's `/Matrix` is written as an
+        // indirect reference; read directly (`as_array()` on a `Reference` fails) it
+        // degraded to the identity, so every glyph inside the form landed 100 pt to the
+        // LEFT of its authored position — text that is present but in the wrong column,
+        // which reading order and figure attachment both then get wrong.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/form_inherit.pdf");
+        let raw = std::fs::read(path).expect("form_inherit.pdf fixture must exist");
+        let doc = Document::load_mem(&raw).expect("form_inherit.pdf fixture must load");
+        let pid = *doc.get_pages().get(&1).expect("fixture has page 1");
+        let spans = extract_spans(&doc, pid, &raw);
+        let s = spans.iter().find(|s| s.text.contains("INHERIT")).expect("the form's label");
+        assert!((s.x - 172.0).abs() < 1.0, "x {} (72 means the indirect /Matrix was lost)", s.x);
+    }
+
+    #[test]
     fn a_form_stream_with_no_filter_still_shows_its_text() {
         // `unfiltered_form.pdf` (`gen_fixtures.py::gen_unfiltered_form`): a label drawn inside
         // a Form XObject whose stream carries NO /Filter. lopdf *errors* on
@@ -1739,7 +1749,7 @@ mod tests {
         let doc = Document::load_mem(&raw).expect("unfiltered_form.pdf fixture must load");
         let pid = *doc.get_pages().get(&1).expect("fixture has page 1");
         // The premise, asserted rather than assumed: the form really is unfiltered.
-        let form_id = page_xobjects(&doc, pid).get(b"UF".as_slice()).copied().expect("/UF form");
+        let form_id = crate::walker::page_xobjects(&doc, pid).get(b"UF".as_slice()).copied().expect("/UF form");
         let form = doc.get_object(form_id).unwrap().as_stream().unwrap();
         assert!(form.dict.get(b"Filter").is_err(), "the fixture's form must carry no /Filter");
         assert!(form.decompressed_content().is_err(), "the premise: lopdf errors without /Filter");

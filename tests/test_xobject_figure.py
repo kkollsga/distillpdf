@@ -67,3 +67,20 @@ def test_figure_labels_do_not_leak_into_prose_or_headings():
     heads = _headings(h)
     for lab in FIG_LABELS:
         assert not any(lab in hd for hd in heads), f"figure label {lab!r} promoted to a heading: {heads}"
+
+
+def test_resources_split_across_the_page_tree_still_render():
+    """`form_inherit.pdf`: the page carries no /Resources at all — its parent defines the
+    form it draws and its GRANDPARENT defines the image that form paints. The interpreters
+    read only the nearest inherited dictionary, so the raster resolved to nothing and never
+    appeared in the HTML. (The form's /Matrix is indirect too; read directly it degraded to
+    the identity and put everything 100 pt left of where the page puts it.)"""
+    import distillpdf
+    from _fixtures import FIX
+    import os
+
+    h = distillpdf.Pdf.open(os.path.join(FIX, "form_inherit.pdf")).to_html(
+        mode="page", return_string=True, image_mode="embed"
+    )
+    assert h.count("data:image") == 1, "the grandparent's image must reach the HTML"
+    assert "INHERIT" in h, "the form's own text must still be there"

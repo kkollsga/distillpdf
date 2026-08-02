@@ -661,5 +661,16 @@
     ],
     "width": 64,
     "height": 48
+  },
+  "form_inherit.pdf": {
+    "word": "INHERIT",
+    "x": 172,
+    "image": {
+      "width": 40,
+      "height": 30,
+      "x_left": 172,
+      "y_bottom": 560
+    },
+    "panel_opacity": 0.5
   }
 }

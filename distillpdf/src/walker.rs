@@ -9,7 +9,8 @@
 //! form's content stream, and charge the recursion caps. Every axis of that list had
 //! already drifted between the copies — one decoded unfiltered form streams and another
 //! silently read them as empty, the depth cap was spelled `>=` in one file, `>` in two and
-//! `<` in a fourth, and none of them followed an indirect `/Matrix`.
+//! `<` in a fourth, and none of them followed an indirect `/Matrix`. Those three are
+//! settled here: one decode, one comparison ([`too_deep`]), one dereferencing read.
 //!
 //! **What is deliberately NOT unified.** The resource-inheritance *choice* is a real
 //! semantic disagreement, not drift: `img`/`vector`/`extract` overlay a form's own
@@ -21,10 +22,12 @@
 //! accident.
 //!
 //! **Invariants callers may rely on and must not re-check:**
-//! - **Termination.** [`descend_form`] charges [`crate::WalkBudget`] *before* the descent
-//!   happens, so a self-referential form terminates on the budget however deep the depth
-//!   cap is. [`Descend::Halt`] means the budget is gone and the walk must stop; a caller
-//!   that treats it as "skip this operator" reopens the DoS.
+//! - **Termination.** [`descend_form`] refuses a descent at or beyond
+//!   [`crate::MAX_FORM_DEPTH`] ([`too_deep`] — the one comparison, previously spelled four
+//!   different ways) and charges [`crate::WalkBudget`] *before* the descent happens, so a
+//!   self-referential form terminates on the budget long before the depth cap.
+//!   [`Descend::Halt`] means the budget is gone and the walk must stop; a caller that
+//!   treats it as "skip this operator" reopens the DoS.
 //! - **No dedupe.** A form legitimately drawn three times descends three times. The
 //!   renderers must repaint it (`tests/fixtures_pdf/adversarial/form_repeat.pdf`); only a
 //!   *collector* may keep a visited set, which is why `extract::walk_drawn` composes
@@ -35,7 +38,7 @@
 //!   continues with the operators around it. Nothing here panics.
 
 use crate::geom::Mat;
-use crate::pdfobj::{content_bytes, deref, num, sub_dict};
+use crate::pdfobj::{content_bytes, deref, num_deref, sub_dict};
 use lopdf::content::Operation;
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
@@ -84,8 +87,8 @@ pub(crate) struct FormDescent {
 pub(crate) enum Descend {
     /// Run this form's content.
     Into(Box<FormDescent>),
-    /// Not a descent — wrong subtype, undecodable content, or no `/Resources` under
-    /// [`ScopePolicy::OwnOnly`]. Skip the operator, keep walking.
+    /// Not a descent — wrong subtype, the depth cap, undecodable content, or no
+    /// `/Resources` under [`ScopePolicy::OwnOnly`]. Skip the operator, keep walking.
     Skip,
     /// The shared work budget is exhausted. The walk must **stop** and return what it has
     /// (pages degrade, they do not vanish). Continuing would reopen the form-bomb DoS.
@@ -113,14 +116,41 @@ pub(crate) fn overlay_xobjects(doc: &Document, resources: &Dictionary, map: &mut
     }
 }
 
-/// The resource dictionary in force for a page: its own if it has one, else the nearest
-/// ancestor's (`/Resources` is an inheritable page attribute, §7.7.3.4).
-pub(crate) fn nearest_resources(doc: &Document, page_id: ObjectId) -> Option<Dictionary> {
-    match doc.get_page_resources(page_id) {
-        Ok((Some(d), _)) => Some(d.clone()),
-        Ok((None, ids)) => ids.first().and_then(|id| doc.get_dictionary(*id).ok()).cloned(),
-        Err(_) => None,
+/// Every resource dictionary that governs a page, in **overlay order**: the outermost
+/// ancestor first, the page's own dictionary last, so a later overlay shadows an earlier
+/// one. Empty when the page has no `/Resources` anywhere in its tree (or the `/Parent`
+/// chain is cyclic, which lopdf reports as an error).
+///
+/// `/Resources` is an inheritable attribute (§7.7.3.4) and the strict reading takes the
+/// *nearest* ancestor's dictionary whole. Real files break that: producers that assemble
+/// pages from templates split what a page draws across two levels of the page tree, and a
+/// nearest-only read makes those `Do`s resolve to nothing and the ink disappear. Folding
+/// the whole chain can only ever ADD names — the nearest dictionary is applied last and
+/// still wins every name it defines. `extract::drawn_images` has read the chain this way
+/// since it was written; this is the three interpreters catching up.
+pub(crate) fn page_resource_chain(doc: &Document, page_id: ObjectId) -> Vec<Dictionary> {
+    let Ok((own, inherited)) = doc.get_page_resources(page_id) else {
+        return Vec::new();
+    };
+    // `inherited` runs page -> parent -> ...; reverse it so the outermost is applied first.
+    let mut out: Vec<Dictionary> = inherited
+        .iter()
+        .rev()
+        .filter_map(|id| doc.get_dictionary(*id).ok().cloned())
+        .collect();
+    if let Some(d) = own {
+        out.push(d.clone());
     }
+    out
+}
+
+/// The XObjects a page can `Do`, resolved over its whole resource chain.
+pub(crate) fn page_xobjects(doc: &Document, page_id: ObjectId) -> XMap {
+    let mut map = XMap::new();
+    for res in page_resource_chain(doc, page_id) {
+        overlay_xobjects(doc, &res, &mut map);
+    }
+    map
 }
 
 /// Resolve a `Do` operand to the XObject stream it names, in the scope in force.
@@ -140,6 +170,16 @@ pub(crate) fn xobject_at<'a>(
 /// A stream's `/Subtype`, or `b""` when it has none.
 pub(crate) fn subtype_of(stream: &lopdf::Stream) -> &[u8] {
     stream.dict.get(b"Subtype").and_then(|o| o.as_name()).unwrap_or(b"")
+}
+
+/// The one depth convention: a descent is refused **at** [`crate::MAX_FORM_DEPTH`], so a
+/// page's own content (depth 0) may nest that many form levels below it.
+///
+/// Spelled once here because the four walkers previously spelled it `>=` (extract), `>`
+/// (raster, vector) and `<` (text), which made the effective ceiling differ by one between
+/// files for no reason anybody chose.
+pub(crate) fn too_deep(depth: u32) -> bool {
+    depth >= crate::MAX_FORM_DEPTH
 }
 
 /// The child resource scope for a form, per `policy`. `None` under
@@ -181,20 +221,26 @@ pub(crate) fn form_ops(stream: &lopdf::Stream) -> Option<Vec<Operation>> {
 }
 
 /// A form's `/Matrix`, identity when absent or malformed.
-pub(crate) fn form_matrix(stream: &lopdf::Stream) -> Mat {
+///
+/// The array and its elements are read through `deref`/`num_deref`: `/Matrix` is a
+/// dictionary value, not a content-stream operand, so any part of it may legally be an
+/// indirect reference. A direct-only read turned `[1 0 0 1 0 5 0 R]` into a matrix with a
+/// zero component — which collapses the whole form onto a point or a line, silently.
+pub(crate) fn form_matrix(doc: &Document, stream: &lopdf::Stream) -> Mat {
     stream
         .dict
         .get(b"Matrix")
         .ok()
+        .and_then(|o| deref(doc, o))
         .and_then(|o| o.as_array().ok())
         .filter(|a| a.len() >= 6)
         .map(|a| Mat {
-            a: num(&a[0]),
-            b: num(&a[1]),
-            c: num(&a[2]),
-            d: num(&a[3]),
-            e: num(&a[4]),
-            f: num(&a[5]),
+            a: num_deref(doc, &a[0]),
+            b: num_deref(doc, &a[1]),
+            c: num_deref(doc, &a[2]),
+            d: num_deref(doc, &a[3]),
+            e: num_deref(doc, &a[4]),
+            f: num_deref(doc, &a[5]),
         })
         .unwrap_or(Mat::ID)
 }
@@ -202,8 +248,9 @@ pub(crate) fn form_matrix(stream: &lopdf::Stream) -> Mat {
 /// Descend into a Form XObject: the whole mechanic, in the one order, with the caps
 /// charged before any work is done.
 ///
-/// `parent` is the scope in force at the `Do`, and `sibling_cost` the size of any *other*
-/// per-scope map the caller is about to clone (`vector`'s ExtGState map, `text`'s font
+/// `parent` is the scope in force at the `Do`, `depth` the current nesting level (a page's
+/// own content is 0), and `sibling_cost` the size of any *other* per-scope map the caller
+/// is about to clone (`vector`'s ExtGState map, `text`'s font
 /// map) — the budget bills the clone the caller will perform, not just the one this
 /// function performs.
 ///
@@ -214,10 +261,11 @@ pub(crate) fn descend_form(
     stream: &lopdf::Stream,
     parent: &XMap,
     policy: ScopePolicy,
+    depth: u32,
     budget: &mut crate::WalkBudget,
     sibling_cost: usize,
 ) -> Descend {
-    if subtype_of(stream) != b"Form" {
+    if subtype_of(stream) != b"Form" || too_deep(depth) {
         return Descend::Skip;
     }
     // Bill the descent before doing it: cloning the inherited resource maps and decoding
@@ -229,7 +277,7 @@ pub(crate) fn descend_form(
     let Some(scope) = form_scope(doc, stream, parent, policy) else {
         return Descend::Skip;
     };
-    let matrix = form_matrix(stream);
+    let matrix = form_matrix(doc, stream);
     match form_ops(stream) {
         Some(ops) => Descend::Into(Box::new(FormDescent { ops, scope, matrix })),
         None => Descend::Skip,
@@ -275,20 +323,71 @@ mod tests {
     #[test]
     fn a_missing_or_malformed_matrix_is_the_identity() {
         let (doc, id) = doc_with_form(form_dict(Dictionary::new()), b"");
-        let m = form_matrix(stream_of(&doc, id));
+        let m = form_matrix(&doc, stream_of(&doc, id));
         assert_eq!((m.a, m.b, m.c, m.d, m.e, m.f), (1.0, 0.0, 0.0, 1.0, 0.0, 0.0));
 
         let short = form_dict(dictionary! { "Matrix" => vec![2.into(), 0.into()] });
         let (doc2, id2) = doc_with_form(short, b"");
-        assert_eq!(form_matrix(stream_of(&doc2, id2)).a, 1.0, "a too-short /Matrix is not read partially");
+        assert_eq!(form_matrix(&doc2, stream_of(&doc2, id2)).a, 1.0, "a too-short /Matrix is not read partially");
     }
 
     #[test]
     fn the_matrix_is_read_in_operand_order() {
         let d = form_dict(dictionary! { "Matrix" => vec![2.into(), 3.into(), 4.into(), 5.into(), 6.into(), 7.into()] });
         let (doc, id) = doc_with_form(d, b"");
-        let m = form_matrix(stream_of(&doc, id));
+        let m = form_matrix(&doc, stream_of(&doc, id));
         assert_eq!((m.a, m.b, m.c, m.d, m.e, m.f), (2.0, 3.0, 4.0, 5.0, 6.0, 7.0));
+    }
+
+    #[test]
+    fn the_matrix_resolves_indirect_parts_instead_of_reading_zero() {
+        // `/Matrix` is a dictionary value, so any part of it may be a reference. Read
+        // directly, `5 0 R` becomes 0.0 — a matrix that collapses the form onto a line.
+        let mut doc = Document::with_version("1.5");
+        let six = doc.add_object(Object::Real(6.0));
+        let d = form_dict(dictionary! {
+            "Matrix" => vec![2.into(), 0.into(), 0.into(), 2.into(), Object::Reference(six), 7.into()]
+        });
+        let id = doc.add_object(Object::Stream(Stream::new(d, b"".to_vec())));
+        let m = form_matrix(&doc, stream_of(&doc, id));
+        assert_eq!((m.a, m.d, m.f), (2.0, 2.0, 7.0));
+        assert_eq!(m.e, 6.0, "an INDIRECT /Matrix element used to read as 0.0");
+
+        // The whole array written indirectly, which used to yield the identity.
+        let mut doc = Document::with_version("1.5");
+        let arr = doc.add_object(Object::Array(vec![3.into(), 0.into(), 0.into(), 3.into(), 0.into(), 0.into()]));
+        let d = form_dict(dictionary! { "Matrix" => Object::Reference(arr) });
+        let id = doc.add_object(Object::Stream(Stream::new(d, b"".to_vec())));
+        assert_eq!(form_matrix(&doc, stream_of(&doc, id)).a, 3.0);
+    }
+
+    #[test]
+    fn the_depth_cap_is_spelled_once_and_refuses_at_the_limit() {
+        assert!(!too_deep(0));
+        assert!(!too_deep(crate::MAX_FORM_DEPTH - 1));
+        assert!(too_deep(crate::MAX_FORM_DEPTH), "a descent is refused AT the cap, not one past it");
+        let (doc, id) = doc_with_form(form_dict(Dictionary::new()), b"0 0 10 10 re f");
+        let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
+        let at_cap = descend_form(
+            &doc,
+            stream_of(&doc, id),
+            &XMap::new(),
+            ScopePolicy::OverlayParent,
+            crate::MAX_FORM_DEPTH,
+            &mut budget,
+            0,
+        );
+        assert!(matches!(at_cap, Descend::Skip));
+        let under = descend_form(
+            &doc,
+            stream_of(&doc, id),
+            &XMap::new(),
+            ScopePolicy::OverlayParent,
+            crate::MAX_FORM_DEPTH - 1,
+            &mut budget,
+            0,
+        );
+        assert!(matches!(under, Descend::Into(_)), "one level under the cap still descends");
     }
 
     #[test]
@@ -359,7 +458,7 @@ mod tests {
         let (doc, id) = doc_with_form(d, b"junk");
         let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
         assert!(matches!(
-            descend_form(&doc, stream_of(&doc, id), &XMap::new(), ScopePolicy::OverlayParent, &mut budget, 0),
+            descend_form(&doc, stream_of(&doc, id), &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0),
             Descend::Skip
         ));
     }
@@ -371,7 +470,7 @@ mod tests {
         let (doc, id) = doc_with_form(form_dict(Dictionary::new()), b"0 0 10 10 re f");
         let mut budget = crate::WalkBudget::new(10); // less than FORM_DESCENT_COST
         assert!(matches!(
-            descend_form(&doc, stream_of(&doc, id), &XMap::new(), ScopePolicy::OverlayParent, &mut budget, 0),
+            descend_form(&doc, stream_of(&doc, id), &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0),
             Descend::Halt
         ));
     }
@@ -386,7 +485,7 @@ mod tests {
         // Exactly enough for one descent charged FORM_DESCENT_COST + 7 (scope) + 3 (sibling).
         let mut budget = crate::WalkBudget::new(crate::FORM_DESCENT_COST + 10);
         assert!(matches!(
-            descend_form(&doc, stream_of(&doc, id), &parent, ScopePolicy::OverlayParent, &mut budget, 3),
+            descend_form(&doc, stream_of(&doc, id), &parent, ScopePolicy::OverlayParent, 0, &mut budget, 3),
             Descend::Into(_)
         ));
         assert!(!budget.spend(1), "the descent must have charged the sibling map too");
@@ -400,7 +499,7 @@ mod tests {
         let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
         for _ in 0..3 {
             assert!(matches!(
-                descend_form(&doc, stream_of(&doc, id), &XMap::new(), ScopePolicy::OverlayParent, &mut budget, 0),
+                descend_form(&doc, stream_of(&doc, id), &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0),
                 Descend::Into(_)
             ));
         }
