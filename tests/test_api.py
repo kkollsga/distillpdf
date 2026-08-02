@@ -14,6 +14,7 @@ HEADINGS = os.path.join(FIX, "headings.pdf")
 FIGURES = os.path.join(FIX, "figures.pdf")
 NUMERIC = os.path.join(FIX, "numeric.pdf")
 LINKS = os.path.join(FIX, "links.pdf")
+FORM_IMAGE = os.path.join(FIX, "form_image.pdf")
 
 
 def test_open_and_page_count():
@@ -74,6 +75,20 @@ def test_extract_images():
         assert key in im, f"image dict missing {key!r}"
     assert im["width"] > 0 and im["height"] > 0
     assert isinstance(im["data"], (bytes, bytearray)) and len(im["data"]) > 0
+
+
+def test_extract_images_recurses_into_form_xobjects():
+    """A raster whose only reference is inside a Form XObject must still be reported: the
+    page's own /Resources names the form, not the image. Page 2 pins the ordering contract
+    — a directly-referenced image keeps index 0 and the nested one is appended."""
+    imgs = distillpdf.Pdf.open(FORM_IMAGE).extract_images()
+    page1 = [i for i in imgs if i["page"] == 1]
+    assert len(page1) == 1, f"form-nested image missing (got {page1})"
+    assert (page1[0]["width"], page1[0]["height"]) == (240, 160)
+    assert len(page1[0]["data"]) > 0
+
+    page2 = [i for i in imgs if i["page"] == 2]
+    assert [(i["index"], i["width"], i["height"]) for i in page2] == [(0, 120, 90), (1, 240, 160)]
 
 
 def test_extract_tables():

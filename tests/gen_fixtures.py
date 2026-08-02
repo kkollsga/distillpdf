@@ -514,6 +514,64 @@ def gen_xobject_figure():
     }
 
 
+def gen_form_image():
+    """Raster images that live inside a Form XObject — the shape every LaTeX/e-filing
+    producer emits, and the one lopdf's non-recursive ``get_page_images()`` is blind to
+    (13 of 54 corpus documents reported *no* images at all).
+
+    Page 1 is the clean case: the page's own ``/XObject`` holds only the form, and the
+    single image XObject lives in the FORM's ``/Resources``. ``extract_images()`` must
+    return exactly one row for it. (This page is also the render-path seed: one captioned
+    figure, one placed raster.)
+
+    Page 2 pins the ordering contract: a raster drawn DIRECTLY on the page, then a second
+    one nested in a form. The direct image must keep index 0 — the index it had before the
+    resource walk existed — and the form-nested one is appended at index 1."""
+    pdf = os.path.join(OUT, "form_image.pdf")
+    png_a = os.path.join(OUT, "_form_a.png")
+    png_b = os.path.join(OUT, "_form_b.png")
+    # Two distinguishable sizes so a test can tell the nested row from the direct one.
+    for path, (w, h), fill in ((png_a, (240, 160), (60, 110, 200)), (png_b, (120, 90), (200, 90, 70))):
+        im = Image.new("RGB", (w, h), "white")
+        d = ImageDraw.Draw(im)
+        d.rectangle([4, 4, w - 5, h - 5], outline="black", width=2)
+        d.rectangle([w // 4, h // 3, w * 3 // 4, h - 12], fill=fill)
+        im.save(path)
+
+    c = canvas.Canvas(pdf, pagesize=letter)
+    # --- page 1: the ONLY image is inside a form ---------------------------------
+    title(c, "Form XObject Raster")
+    y = PAGE_H - 120
+    y = para(c, "The bar chart in Figure 1 is drawn inside a form XObject, so it is reachable "
+                "only through the form's own resource dictionary.", y)
+    c.beginForm("rasterform")
+    c.drawImage(png_a, LM, y - 150, width=240, height=150)
+    c.endForm()
+    c.doForm("rasterform")
+    y -= 164
+    c.setFont("Helvetica", 9.5)
+    c.drawString(LM, y, "Figure 1: A raster bar chart drawn inside a form XObject.")
+    c.showPage()
+    # --- page 2: direct image first, then a form-nested one ----------------------
+    y = PAGE_H - 100
+    c.drawImage(png_b, LM, y - 90, width=120, height=90)   # direct -> index 0
+    c.beginForm("nestedform")
+    c.drawImage(png_a, LM + 200, y - 150, width=240, height=150)  # nested -> index 1
+    c.endForm()
+    c.doForm("nestedform")
+    c.showPage()
+    c.save()
+    os.remove(png_a)
+    os.remove(png_b)
+    GT["form_image.pdf"] = {
+        "caption": "Figure 1: A raster bar chart drawn inside a form XObject.",
+        "page1_images": [{"width": 240, "height": 160}],
+        # page 2: the DIRECT image keeps index 0, the form-nested one is appended.
+        "page2_images": [{"index": 0, "width": 120, "height": 90},
+                         {"index": 1, "width": 240, "height": 160}],
+    }
+
+
 def gen_no_spurious_figs():
     """Precision gate: a prose page with incidental tiny marks (a short underline rule, a
     small box) and NO figure caption anywhere. Weak vector candidates must NOT be promoted
@@ -1306,6 +1364,7 @@ def main():
     gen_lof_dotleader()
     gen_small_vector_fig()
     gen_xobject_figure()
+    gen_form_image()
     gen_no_spurious_figs()
     gen_links()
     gen_pagelabels()

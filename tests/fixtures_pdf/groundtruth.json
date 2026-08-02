@@ -171,6 +171,27 @@
       "Output Layer"
     ]
   },
+  "form_image.pdf": {
+    "caption": "Figure 1: A raster bar chart drawn inside a form XObject.",
+    "page1_images": [
+      {
+        "width": 240,
+        "height": 160
+      }
+    ],
+    "page2_images": [
+      {
+        "index": 0,
+        "width": 120,
+        "height": 90
+      },
+      {
+        "index": 1,
+        "width": 240,
+        "height": 160
+      }
+    ]
+  },
   "no_spurious_figs.pdf": {
     "page1_figures": 0,
     "total_figures": 1

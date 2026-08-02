@@ -4,7 +4,8 @@
 //! Python dicts/lists from them — no pyo3 types appear in this module.
 
 use crate::text::{self, Span};
-use lopdf::{Dictionary, Document, Object};
+use lopdf::{Dictionary, Document, Object, ObjectId};
+use std::collections::{HashSet, VecDeque};
 
 /// One extracted raster image. Mirrors the dict `Pdf.extract_images` returns:
 /// `{page, index, width, height, color_space, format, data}`.
@@ -55,24 +56,152 @@ fn filter_to_format(filters: &Option<Vec<String>>) -> &'static str {
     }
 }
 
+/// A sub-dictionary of `d` that may be written inline or as an indirect reference.
+fn sub_dict<'a>(doc: &'a Document, d: &'a Dictionary, key: &[u8]) -> Option<&'a Dictionary> {
+    d.get(key).ok().and_then(|o| resolve(doc, o)).and_then(|o| o.as_dict().ok())
+}
+
+/// Every resource dictionary a page can reach: its own `/Resources` (plus whatever it
+/// inherits from the page tree) and then, transitively, the `/Resources` of every
+/// `/Subtype /Form` XObject it references.
+///
+/// This is deliberately *not* what `img.rs` / `text.rs` do. Those are content-stream
+/// interpreters: they decode operators because they need placement (the CTM, the form's
+/// `/Matrix`, graphics state), and they disagree on resource-inheritance semantics for
+/// good reasons of their own. The extract API needs neither placement nor content
+/// decoding — only "what does this page's resource tree reach", which is the same
+/// resource-walk semantics pymupdf reports images and fonts under. So no operator is
+/// parsed here and no stream is decompressed.
+///
+/// Ordering is stable and deterministic: the page's own dictionaries come first (so
+/// directly-referenced resources keep the index they had before recursion existed) and
+/// nested forms are appended breadth-first in `/XObject` dictionary order. A visited-
+/// `ObjectId` set cuts reference cycles; `crate::MAX_FORM_DEPTH` caps nesting.
+fn page_resource_dicts(doc: &Document, page_id: ObjectId) -> Vec<&Dictionary> {
+    let mut out: Vec<&Dictionary> = Vec::new();
+    let mut queue: VecDeque<(&Dictionary, u32)> = VecDeque::new();
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+
+    if let Ok((own, inherited)) = doc.get_page_resources(page_id) {
+        if let Some(d) = own {
+            queue.push_back((d, 0));
+        }
+        // `inherited` is ordered page → parent → …, so the page's own resources (when
+        // written as a reference rather than inline) still lead.
+        for id in inherited {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Ok(d) = doc.get_dictionary(id) {
+                queue.push_back((d, 0));
+            }
+        }
+    }
+
+    while let Some((res, depth)) = queue.pop_front() {
+        out.push(res);
+        if depth >= crate::MAX_FORM_DEPTH {
+            continue; // nesting cap (a self-referential form is already cut by `seen`)
+        }
+        let Some(xobjects) = sub_dict(doc, res, b"XObject") else {
+            continue;
+        };
+        for (_, v) in xobjects.iter() {
+            let Ok(id) = v.as_reference() else { continue };
+            if !seen.insert(id) {
+                continue; // already walked: a shared or self-referential form
+            }
+            let Ok(stream) = doc.get_object(id).and_then(|o| o.as_stream()) else {
+                continue;
+            };
+            if stream.dict.get(b"Subtype").and_then(|o| o.as_name()).unwrap_or(b"") != b"Form" {
+                continue;
+            }
+            // A form's resources live in its OWN /Resources (PDF 32000-1 §8.10.2); a form
+            // without one contributes nothing we could resolve.
+            if let Some(fr) = sub_dict(doc, &stream.dict, b"Resources") {
+                queue.push_back((fr, depth + 1));
+            }
+        }
+    }
+    out
+}
+
+/// The `/ColorSpace` family name, as lopdf's `PdfImage` reports it: an array's first
+/// element (`/ICCBased`, `/Indexed`, …) or a bare name. Deeper resolution is Phase 6.
+fn image_color_space(dict: &Dictionary) -> Option<String> {
+    match dict.get(b"ColorSpace").ok()? {
+        Object::Array(a) => a.first()?.as_name().ok().map(|n| String::from_utf8_lossy(n).into_owned()),
+        Object::Name(n) => Some(String::from_utf8_lossy(n).into_owned()),
+        _ => None,
+    }
+}
+
+/// The `/Filter` chain as names, in application order.
+fn image_filters(dict: &Dictionary) -> Vec<String> {
+    match dict.get(b"Filter") {
+        Ok(Object::Array(a)) => a
+            .iter()
+            .filter_map(|o| o.as_name().ok())
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .collect(),
+        Ok(Object::Name(n)) => vec![String::from_utf8_lossy(n).into_owned()],
+        _ => Vec::new(),
+    }
+}
+
 /// Extract images from all pages as owned [`ImageInfo`] rows.
+///
+/// Enumerates image XObjects through [`page_resource_dicts`], so images referenced only
+/// from inside a Form XObject are found. lopdf's `get_page_images()` reads the page's own
+/// `/Resources` and stops there, which left 13 of 54 corpus documents (every LaTeX/e-filing
+/// producer that wraps its page body in a form) reporting no images at all.
 pub fn extract_images(doc: &Document) -> Vec<ImageInfo> {
     let mut out = Vec::new();
     for (&pno, &page_id) in &doc.get_pages() {
-        let imgs = match doc.get_page_images(page_id) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        for (idx, im) in imgs.iter().enumerate() {
-            out.push(ImageInfo {
-                page: pno,
-                index: idx,
-                width: im.width,
-                height: im.height,
-                color_space: im.color_space.clone(),
-                format: filter_to_format(&im.filters),
-                data: im.content.to_vec(),
-            });
+        let mut index = 0usize;
+        // Dedup is across resource dictionaries only: an image the page's own /XObject
+        // already listed is not re-reported when a nested form points at it too. Repeats
+        // *within* one dictionary are kept, so the `index` a directly-referenced image had
+        // before this walk existed is unchanged.
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        let mut from_this_dict: Vec<ObjectId> = Vec::new();
+        for res in page_resource_dicts(doc, page_id) {
+            seen.extend(from_this_dict.drain(..));
+            let Some(xobjects) = sub_dict(doc, res, b"XObject") else {
+                continue;
+            };
+            for (_, v) in xobjects.iter() {
+                let Ok(id) = v.as_reference() else { continue };
+                if seen.contains(&id) {
+                    continue; // already reported from an outer resource dictionary
+                }
+                let Ok(stream) = doc.get_object(id).and_then(|o| o.as_stream()) else {
+                    continue;
+                };
+                let dict = &stream.dict;
+                if dict.get(b"Subtype").and_then(|o| o.as_name()).unwrap_or(b"") != b"Image" {
+                    continue;
+                }
+                let (Ok(width), Ok(height)) = (
+                    dict.get(b"Width").and_then(|o| o.as_i64()),
+                    dict.get(b"Height").and_then(|o| o.as_i64()),
+                ) else {
+                    continue; // not a usable image row without dimensions
+                };
+                let filters = image_filters(dict);
+                out.push(ImageInfo {
+                    page: pno,
+                    index,
+                    width,
+                    height,
+                    color_space: image_color_space(dict),
+                    format: filter_to_format(&Some(filters)),
+                    data: stream.content.clone(),
+                });
+                index += 1;
+                from_this_dict.push(id);
+            }
         }
     }
     out
@@ -984,6 +1113,118 @@ pub fn extract_fonts(doc: &Document) -> Vec<FontInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The owned form-XObject raster fixture (`tests/gen_fixtures.py::gen_form_image`).
+    fn form_image_doc() -> Document {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/form_image.pdf");
+        Document::load(path).expect("form_image.pdf fixture must load")
+    }
+
+    #[test]
+    fn images_nested_in_a_form_xobject_are_found() {
+        // The page's own /XObject holds only the form; the image is in the FORM's
+        // /Resources. lopdf's get_page_images() stops at the page, so this returned
+        // nothing — 13 of 54 corpus documents reported no images at all.
+        let doc = form_image_doc();
+        let rows = extract_images(&doc);
+        let page1: Vec<&ImageInfo> = rows.iter().filter(|i| i.page == 1).collect();
+        assert_eq!(page1.len(), 1, "exactly one form-nested image on page 1");
+        assert_eq!((page1[0].width, page1[0].height), (240, 160));
+        assert_eq!(page1[0].index, 0);
+        assert_eq!(page1[0].color_space.as_deref(), Some("DeviceRGB"));
+        assert!(!page1[0].data.is_empty());
+    }
+
+    #[test]
+    fn direct_images_keep_their_index_and_nested_ones_are_appended() {
+        // The ordering contract: recursing must not renumber images that were already
+        // reported. Page 2 draws one raster directly and a second inside a form.
+        let doc = form_image_doc();
+        let rows = extract_images(&doc);
+        let page2: Vec<&ImageInfo> = rows.iter().filter(|i| i.page == 2).collect();
+        assert_eq!(page2.len(), 2);
+        assert_eq!((page2[0].index, page2[0].width, page2[0].height), (0, 120, 90), "direct image keeps index 0");
+        assert_eq!((page2[1].index, page2[1].width, page2[1].height), (1, 240, 160), "nested image appended");
+    }
+
+    /// A hand-built document whose form XObject lists ITSELF in its own `/Resources`
+    /// `/XObject` dict — the cycle a naive recursion follows forever.
+    fn cyclic_form_doc() -> (Document, ObjectId) {
+        use lopdf::{dictionary, Stream};
+        let mut doc = Document::with_version("1.5");
+        let img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Image",
+                "Width" => 7i64, "Height" => 5i64,
+                "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8i64,
+            },
+            vec![0u8; 35],
+        ));
+        let form_id = doc.new_object_id();
+        let inner_id = doc.new_object_id();
+        // form -> inner -> form: a two-step cycle, plus a direct self-reference.
+        doc.set_object(
+            form_id,
+            Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Form", "FormType" => 1i64,
+                    "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                    "Resources" => dictionary! {
+                        "XObject" => dictionary! {
+                            "Fm0" => form_id, "Fm1" => inner_id, "Im0" => img_id,
+                        },
+                    },
+                },
+                b"q Q".to_vec(),
+            ),
+        );
+        doc.set_object(
+            inner_id,
+            Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Form", "FormType" => 1i64,
+                    "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                    "Resources" => dictionary! {
+                        "XObject" => dictionary! { "Fm0" => form_id },
+                    },
+                },
+                b"q Q".to_vec(),
+            ),
+        );
+        let pages_id = doc.new_object_id();
+        let contents_id = doc.add_object(Stream::new(dictionary! {}, b"q Q".to_vec()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "XObject" => dictionary! { "Fm0" => form_id },
+            },
+            "Contents" => contents_id,
+        });
+        doc.set_object(pages_id, dictionary! {
+            "Type" => "Pages", "Count" => 1i64, "Kids" => vec![page_id.into()],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog", "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+        (doc, page_id)
+    }
+
+    #[test]
+    fn resource_walk_terminates_on_a_self_referential_form() {
+        // Without the visited-ObjectId set this recurses until the depth cap (or forever,
+        // for a mutual cycle). Each form's /Resources must be visited exactly once.
+        let (doc, page_id) = cyclic_form_doc();
+        let dicts = page_resource_dicts(&doc, page_id);
+        assert_eq!(dicts.len(), 3, "page + the two form resource dicts, each once");
+
+        // …and the image inside the cyclic form is still reported, exactly once.
+        let rows = extract_images(&doc);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].page, rows[0].index, rows[0].width, rows[0].height), (1, 0, 7, 5));
+    }
 
     fn grid(rows: &[&[&str]]) -> Vec<Vec<String>> {
         rows.iter().map(|r| r.iter().map(|s| s.to_string()).collect()).collect()
