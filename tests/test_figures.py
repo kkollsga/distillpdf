@@ -129,3 +129,18 @@ def test_cropbox_only_page_still_extracts():
     must read normally rather than being measured as US-Letter."""
     g = GT["indirect_mediabox.pdf"]
     assert g["crop_page_text"] in text(html("indirect_mediabox.pdf"))
+
+
+def test_indirect_extgstate_alpha_does_not_hide_the_figure():
+    """``/GA`` is ``<< /ca 10 0 R /CA 11 0 R >>``. Read with the direct-only number reader
+    both alphas came back 0.0 — below the "effectively invisible" threshold — so every bar
+    and axis rule painted under ``/GA gs`` was dropped and the whole bar chart vanished from
+    the render (0 <svg>, 0 <path>). The authored opacities must survive to the SVG."""
+    g = GT["indirect_numbers.pdf"]
+    h = html("indirect_numbers.pdf")
+    svgs = re.findall(r"<svg\b.*?</svg>", h, re.DOTALL)
+    assert len(svgs) == g["n_figures"], f"expected {g['n_figures']} <svg>, got {len(svgs)}"
+    assert svgs[0].count("<path") == g["n_paths"], \
+        f"expected {g['n_paths']} paths, got {svgs[0].count('<path')}"
+    assert f'fill-opacity="{g["fill_alpha"]}"' in svgs[0], "the indirect /ca did not reach the render"
+    assert f'stroke-opacity="{g["stroke_alpha"]}"' in svgs[0], "the indirect /CA did not reach the render"

@@ -441,6 +441,88 @@ def gen_small_vector_fig():
     }
 
 
+def gen_indirect_numbers():
+    """Hand-written PDF whose LINK and ALPHA numbers are written as indirect references.
+
+    Same defect class as ``indirect_mediabox.pdf``, at the two sites the page-box fix did not
+    reach. An array or dictionary VALUE may legally be an indirect reference (PDF 32000-1
+    §7.3.10 — only content-stream operands may not be), but the direct-only number reader
+    returns 0.0 for one, so the value is lost silently rather than failing:
+
+      * ``/Rect [72 696 13 0 R 14 0 R]`` on the Link annotation — the clickable rectangle
+        collapsed to ``[72, 696, 0, 0]``, i.e. an inverted zero-area box at the page corner.
+      * ``/XYZ 72 15 0 R 0`` and ``/FitH 16 0 R`` on the two named destinations — the target
+        y became 0.0, so the anchor landed at the page BOTTOM instead of at its section.
+      * ``/ca 10 0 R`` / ``/CA 11 0 R`` on the ExtGState — both alphas read 0.0, which is
+        below the "effectively invisible" threshold, so every bar and axis rule painted
+        under ``/GA gs`` was DROPPED and the figure disappeared from the page entirely.
+
+    The alphas are 0.85/0.6 rather than 1.0 so the recovered values are visible in the
+    rendered SVG (``fill-opacity``/``stroke-opacity``) and cannot be confused with defaults.
+    reportlab writes every one of these directly, so this is assembled by hand."""
+    pdf = os.path.join(OUT, "indirect_numbers.pdf")
+    rect = [72, 696, 420, 714]  # x1 and y1 written indirect
+    xyz_top, fith_top = 700, 640
+    fill_a, stroke_a = 0.85, 0.6
+    bx, by, bw, bh = 90, 430, 300, 170  # the figure's extent
+    bars = []
+    for i in range(8):
+        h = bh * (0.25 + 0.09 * ((i * 5) % 7))
+        bars.append(b"%.1f %.1f %.1f %.1f re f" % (bx + 6 + i * 36, by, 24, h))
+    axes = [b"%.1f %.1f m %.1f %.1f l S" % (bx, by, bx + bw, by),
+            b"%.1f %.1f m %.1f %.1f l S" % (bx, by, bx, by + bh)]
+    c1 = (b"BT /F1 16 Tf 72 730 Td (An Indirect Alpha) Tj ET\n"
+          b"q\n/GA gs\n0.2 0.4 0.8 rg\n0 0 0 RG\n1.2 w\n"
+          + b"\n".join(bars + axes) + b"\nQ\n"
+          b"BT /F1 9 Tf 72 %d Td "
+          b"(Figure 1: Bars painted under an indirect alpha.) Tj ET\n"
+          b"BT /F1 11 Tf 72 380 Td "
+          b"(The link above and the bars beside it both read numbers stored indirectly.) Tj ET"
+          % (by - 20))
+    c2 = (b"BT /F1 14 Tf 72 %d Td (Indirect Destinations) Tj ET\n"
+          b"BT /F1 11 Tf 72 %d Td "
+          b"(This target page is where both named destinations resolve to.) Tj ET"
+          % (xyz_top, fith_top))
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R /Names << /Dests 12 0 R >> >>",
+        2: b"<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 /MediaBox [0 0 612 792] >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Annots [9 0 R] "
+            b"/Resources << /Font << /F1 7 0 R >> /ExtGState << /GA 8 0 R >> >> >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c1), c1),
+        5: (b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R "
+            b"/Resources << /Font << /F1 7 0 R >> >> >>"),
+        6: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c2), c2),
+        7: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        # Both alphas indirect: pre-fix each read 0.0 and hid everything drawn under /GA.
+        8: b"<< /Type /ExtGState /ca 10 0 R /CA 11 0 R >>",
+        # /Rect's x1 and y1 indirect: pre-fix the clickable box collapsed to zero area.
+        9: (b"<< /Type /Annot /Subtype /Link /Rect [%d %d 13 0 R 14 0 R] /Border [0 0 0] "
+            b"/A << /S /URI /URI (https://example.com/indirect) >> >>" % (rect[0], rect[1])),
+        10: b"%.2f" % fill_a,
+        11: b"%.2f" % stroke_a,
+        # Named destinations whose /XYZ top and /FitH top are indirect.
+        12: (b"<< /Names [ (fig.indirect) [5 0 R /XYZ 72 15 0 R 0] "
+             b"(sec.indirect) [5 0 R /FitH 16 0 R] ] >>"),
+        13: b"%d" % rect[2],
+        14: b"%d" % rect[3],
+        15: b"%d" % xyz_top,
+        16: b"%d" % fith_top,
+    }
+    _assemble_pdf(objs, pdf)
+    GT["indirect_numbers.pdf"] = {
+        "uri": "https://example.com/indirect",
+        "rect": rect,
+        "fill_alpha": fill_a,
+        "stroke_alpha": stroke_a,
+        "dest_xyz": {"name": "fig.indirect", "page": 2, "y": xyz_top},
+        "dest_fith": {"name": "sec.indirect", "page": 2, "y": fith_top},
+        "n_bars": len(bars),
+        "n_paths": len(bars) + len(axes),
+        "caption": "Figure 1: Bars painted under an indirect alpha.",
+        "n_figures": 1,
+    }
+
+
 def gen_indirect_mediabox():
     """Hand-written PDF whose page boxes are written the two ways the box walker used to miss.
 
@@ -2025,6 +2107,7 @@ def main():
     gen_dense_vector()
     gen_inherited_mediabox()
     gen_indirect_mediabox()
+    gen_indirect_numbers()
     gen_xobject_figure()
     gen_form_image()
     gen_undrawn_image()

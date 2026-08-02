@@ -622,5 +622,30 @@
     "caption": "Figure 1: A grid spanning 504 of the 1008 point page.",
     "n_figures": 1,
     "crop_page_text": "This page states no MediaBox anywhere up the tree, only a CropBox."
+  },
+  "indirect_numbers.pdf": {
+    "uri": "https://example.com/indirect",
+    "rect": [
+      72,
+      696,
+      420,
+      714
+    ],
+    "fill_alpha": 0.85,
+    "stroke_alpha": 0.6,
+    "dest_xyz": {
+      "name": "fig.indirect",
+      "page": 2,
+      "y": 700
+    },
+    "dest_fith": {
+      "name": "sec.indirect",
+      "page": 2,
+      "y": 640
+    },
+    "n_bars": 8,
+    "n_paths": 10,
+    "caption": "Figure 1: Bars painted under an indirect alpha.",
+    "n_figures": 1
   }
 }

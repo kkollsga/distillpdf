@@ -12,7 +12,7 @@
 //! Named destinations are resolved via the catalog `/Dests` dict and the
 //! `/Names /Dests` name tree.
 
-use crate::pdfobj::{decode_text_string, deref, num};
+use crate::pdfobj::{decode_text_string, deref, num_deref};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -63,8 +63,10 @@ fn dest_to_pos(doc: &Document, v: &Object, page_no: &HashMap<ObjectId, u32>) -> 
                 _ => return None,
             };
             let y = match a.get(1).and_then(|o| o.as_name().ok()) {
-                Some(b"XYZ") if a.len() >= 4 => Some(num(&a[3])),
-                Some(b"FitH") | Some(b"FitBH") if a.len() >= 3 => Some(num(&a[2])),
+                // Array VALUES, so `num_deref`: `/XYZ 72 15 0 R 0` is legal, and reading it
+                // with the direct-only `num` puts the anchor at y=0 (the page bottom).
+                Some(b"XYZ") if a.len() >= 4 => Some(num_deref(doc, &a[3])),
+                Some(b"FitH") | Some(b"FitBH") if a.len() >= 3 => Some(num_deref(doc, &a[2])),
                 _ => None,
             };
             Some((p, y))
@@ -344,7 +346,11 @@ pub fn extract_links(doc: &Document) -> Vec<Link> {
             }
             let rect = ad.get(b"Rect").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_array().ok());
             let rect = match rect {
-                Some(r) if r.len() >= 4 => [num(&r[0]), num(&r[1]), num(&r[2]), num(&r[3])],
+                // Ditto: an annotation `/Rect` entry may be an indirect number, and reading
+                // one as 0.0 collapses the clickable box to the page corner.
+                Some(r) if r.len() >= 4 => {
+                    [num_deref(doc, &r[0]), num_deref(doc, &r[1]), num_deref(doc, &r[2]), num_deref(doc, &r[3])]
+                }
                 _ => continue,
             };
 
@@ -406,6 +412,46 @@ mod tests {
     fn links_doc() -> Document {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/links.pdf");
         Document::load(path).expect("links.pdf fixture must load")
+    }
+
+    /// `tests/gen_fixtures.py::gen_indirect_numbers` — a `/Rect` and two destination tops
+    /// written as indirect references.
+    fn indirect_doc() -> Document {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/indirect_numbers.pdf");
+        Document::load(path).expect("indirect_numbers.pdf fixture must load")
+    }
+
+    #[test]
+    fn an_annotation_rect_with_indirect_entries_keeps_its_area() {
+        // `/Rect [72 696 13 0 R 14 0 R]`. A dictionary value may legally be indirect, but the
+        // direct-only `num` reader returned 0.0 for one, collapsing the clickable box to
+        // `[72, 696, 0, 0]` — an inverted, zero-area rectangle at the page corner.
+        let doc = indirect_doc();
+        // The premise: the fixture's rect really is written with indirect entries.
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        let annots = doc.get_dictionary(page_id).unwrap().get(b"Annots").unwrap().as_array().unwrap();
+        let annot = deref(&doc, &annots[0]).unwrap().as_dict().unwrap();
+        let r = annot.get(b"Rect").unwrap().as_array().unwrap();
+        assert!(matches!(r[2], Object::Reference(_)) && matches!(r[3], Object::Reference(_)));
+
+        let links = extract_links(&doc);
+        assert_eq!(links.len(), 1, "the fixture carries exactly one link");
+        assert_eq!(links[0].uri.as_deref(), Some("https://example.com/indirect"));
+        assert_eq!(links[0].rect, [72.0, 696.0, 420.0, 714.0], "indirect /Rect entries must resolve, not read 0");
+    }
+
+    #[test]
+    fn a_destination_top_written_indirectly_still_points_at_its_target() {
+        // `/XYZ 72 15 0 R 0` and `/FitH 16 0 R`: the anchor y is what places the target id on
+        // the rendered page. Read as 0.0 it lands at the page BOTTOM, not at the section.
+        let doc = indirect_doc();
+        let mut dests = named_destinations(&doc);
+        dests.sort_by(|a, b| a.name.cmp(&b.name));
+        let names: Vec<&str> = dests.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["fig.indirect", "sec.indirect"]);
+        assert!(dests.iter().all(|d| d.page == 2), "both resolve to page 2");
+        assert_eq!(dests[0].y, Some(700.0), "/XYZ top read indirectly");
+        assert_eq!(dests[1].y, Some(640.0), "/FitH top read indirectly");
     }
 
     #[test]

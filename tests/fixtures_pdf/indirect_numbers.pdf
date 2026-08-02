@@ -1,0 +1,99 @@
+%PDF-1.5
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /Names << /Dests 12 0 R >> >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 /MediaBox [0 0 612 792] >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Annots [9 0 R] /Resources << /Font << /F1 7 0 R >> /ExtGState << /GA 8 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 548 >>
+stream
+BT /F1 16 Tf 72 730 Td (An Indirect Alpha) Tj ET
+q
+/GA gs
+0.2 0.4 0.8 rg
+0 0 0 RG
+1.2 w
+96.0 430.0 24.0 42.5 re f
+132.0 430.0 24.0 119.0 re f
+168.0 430.0 24.0 88.4 re f
+204.0 430.0 24.0 57.8 re f
+240.0 430.0 24.0 134.3 re f
+276.0 430.0 24.0 103.7 re f
+312.0 430.0 24.0 73.1 re f
+348.0 430.0 24.0 42.5 re f
+90.0 430.0 m 390.0 430.0 l S
+90.0 430.0 m 90.0 600.0 l S
+Q
+BT /F1 9 Tf 72 410 Td (Figure 1: Bars painted under an indirect alpha.) Tj ET
+BT /F1 11 Tf 72 380 Td (The link above and the bars beside it both read numbers stored indirectly.) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /Contents 6 0 R /Resources << /Font << /F1 7 0 R >> >> >>
+endobj
+6 0 obj
+<< /Length 145 >>
+stream
+BT /F1 14 Tf 72 700 Td (Indirect Destinations) Tj ET
+BT /F1 11 Tf 72 640 Td (This target page is where both named destinations resolve to.) Tj ET
+endstream
+endobj
+7 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+8 0 obj
+<< /Type /ExtGState /ca 10 0 R /CA 11 0 R >>
+endobj
+9 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 696 13 0 R 14 0 R] /Border [0 0 0] /A << /S /URI /URI (https://example.com/indirect) >> >>
+endobj
+10 0 obj
+0.85
+endobj
+11 0 obj
+0.60
+endobj
+12 0 obj
+<< /Names [ (fig.indirect) [5 0 R /XYZ 72 15 0 R 0] (sec.indirect) [5 0 R /FitH 16 0 R] ] >>
+endobj
+13 0 obj
+420
+endobj
+14 0 obj
+714
+endobj
+15 0 obj
+700
+endobj
+16 0 obj
+640
+endobj
+xref
+0 17
+0000000000 65535 f 
+0000000015 00000 n 
+0000000091 00000 n 
+0000000178 00000 n 
+0000000323 00000 n 
+0000000922 00000 n 
+0000001024 00000 n 
+0000001220 00000 n 
+0000001290 00000 n 
+0000001350 00000 n 
+0000001497 00000 n 
+0000001518 00000 n 
+0000001539 00000 n 
+0000001648 00000 n 
+0000001668 00000 n 
+0000001688 00000 n 
+0000001708 00000 n 
+trailer
+<< /Size 17 /Root 1 0 R >>
+startxref
+1728
+%%EOF

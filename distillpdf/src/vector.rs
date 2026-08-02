@@ -10,7 +10,7 @@
 //! Shadings / patterns / soft masks are out of scope here (skipped); text inside
 //! a figure stays in the normal text flow (it is extracted as spans elsewhere).
 
-use crate::pdfobj::{content_bytes, deref, num};
+use crate::pdfobj::{content_bytes, deref, num, num_deref};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -455,8 +455,11 @@ fn extgstates_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, (Op
     if let Some(eg) = resources.get(b"ExtGState").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
         for (name, val) in eg.iter() {
             if let Some(d) = deref(doc, val).and_then(|o| o.as_dict().ok()) {
-                let ca = d.get(b"ca").ok().map(num);
-                let big = d.get(b"CA").ok().map(num);
+                // Dictionary VALUES, so `num_deref` — a writer that hoists a shared alpha into
+                // an indirect object is legal, and the direct-only `num` read it as 0.0, i.e.
+                // fully transparent, which silently deletes every paint made under this state.
+                let ca = d.get(b"ca").ok().map(|o| num_deref(doc, o));
+                let big = d.get(b"CA").ok().map(|o| num_deref(doc, o));
                 map.insert(name.clone(), (ca, big));
             }
         }
@@ -1149,5 +1152,35 @@ mod tests {
         xs.sort_unstable();
         xs.dedup();
         assert_eq!(xs.len(), 5, "the bars must land at five offsets, got {xs:?}");
+    }
+
+    #[test]
+    fn an_extgstate_alpha_written_indirectly_does_not_hide_the_figure() {
+        // `indirect_numbers.pdf`: `/GA` is `<< /ca 10 0 R /CA 11 0 R >>`. A dictionary value
+        // may legally be an indirect reference, but the direct-only `num` reader returned 0.0
+        // for one — below `ALPHA_HIDDEN` — so `eff_fill`/`eff_stroke` reported "no ink" and
+        // every bar and axis rule drawn under `/GA gs` was DROPPED. The figure disappeared.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/indirect_numbers.pdf");
+        let doc = Document::load(path).expect("indirect_numbers.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        // The premise: the alphas really are indirect.
+        let res = page_resources(&doc, page_id).expect("fixture page has resources");
+        let eg = res.get(b"ExtGState").unwrap().as_dict().unwrap().get(b"GA").unwrap();
+        let eg = deref(&doc, eg).unwrap().as_dict().unwrap();
+        assert!(matches!(eg.get(b"ca").unwrap(), Object::Reference(_)));
+        assert!(matches!(eg.get(b"CA").unwrap(), Object::Reference(_)));
+
+        // The alphas resolve to the authored values, not 0.0 …
+        let egmap = extgstates_of(&doc, &res);
+        assert_eq!(egmap.get(b"GA".as_slice()).copied(), Some((Some(0.85), Some(0.6))));
+        // … and the ink they gate survives the walk: 8 filled bars + 2 stroked axis rules.
+        let painted = walk_page(&doc, page_id, crate::MAX_FORM_WORK);
+        assert_eq!(painted.len(), 10, "8 bars + 2 axes must paint under a resolved alpha");
+        assert_eq!(painted.iter().filter(|p| p.fill.is_some()).count(), 8);
+        assert!(painted.iter().all(|p| (p.fill_op - 0.85).abs() < 1e-6 && (p.stroke_op - 0.6).abs() < 1e-6));
+        // The figure reaches the render as one placed <svg>, carrying the recovered opacity.
+        let (strong, _weak) = positioned_vectors(&doc, page_id);
+        assert_eq!(strong.len(), 1, "the bar chart must be one figure");
+        assert!(strong[0].paths.contains("fill-opacity=\"0.85\""), "{}", strong[0].paths);
     }
 }
