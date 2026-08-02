@@ -1036,6 +1036,77 @@ def gen_no_resources_paths():
     GT["no_resources_paths.pdf"] = {"svgs_per_page": [1, 1], "paths_per_page": 8}
 
 
+def gen_rotated_pages():
+    """The same figure on four pages whose ONLY difference is ``/Rotate`` 0/90/180/270.
+
+    A ``/Rotate`` page is turned CLOCKWISE by that many degrees before it is shown, and
+    nothing in the crate read the key at all — so a landscape table authored on a
+    ``/Rotate 90`` page emitted a sideways ``<svg>`` with its text running vertically.
+
+    Every page shares one byte-identical content stream, so any difference in the emitted
+    ``<svg>`` is attributable to ``/Rotate`` alone:
+
+      * a stroked frame + 8 filled rects, bbox exactly x 100..300, y 200..500 (200x300 pt,
+        9 paths — clear of ``MIN_PATHS`` 6 / ``MIN_W`` 72 / ``MIN_H`` 54 with room to
+        spare, so no clustering threshold can be mistaken for the rotation);
+      * a **corner marker** — the one 20x20 rect at the figure's page-space BOTTOM-LEFT.
+        Its local position in the SVG identifies the rotation unambiguously, which a
+        symmetric figure could not: bottom-left at 0 deg, top-left at 90, top-right at 180,
+        bottom-right at 270;
+      * two labels: ``Alpha`` drawn horizontally and ``Beta`` drawn at 90 deg in page space.
+        The second is the double-rotation guard — a page turn must COMPOSE with a span's
+        own baseline angle, so on the ``/Rotate 90`` page ``Beta`` comes out upright (no
+        ``rotate(...)`` at all) while ``Alpha`` picks the quarter turn up;
+      * one 2x2 raster inside the figure box, whose PIXELS turn with the page even though
+        its placement rect stays axis-aligned.
+
+    reportlab cannot set ``/Rotate`` per page, so this is hand-assembled."""
+    pdf = os.path.join(OUT, "rotated_pages.pdf")
+    # The corner marker FIRST in page-space terms but painted after the frame, so paint
+    # order and geometry are independent.
+    rects = [
+        (100, 200, 20, 20),  # <- the corner marker (page bottom-left of the figure box)
+        (140, 260, 30, 20),
+        (180, 320, 30, 20),
+        (220, 380, 30, 20),
+        (260, 440, 40, 60),
+        (120, 460, 30, 20),
+        (200, 240, 40, 20),
+        (280, 200, 20, 40),
+    ]
+    ink = b"\n".join(
+        [b"2 w 0 G 100 200 200 300 re S", b"0.2 0.4 0.8 rg"]
+        + [b"%d %d %d %d re f" % r for r in rects]
+    )
+    # `Alpha` upright in page space; `Beta` at +90 deg (a y-axis title's shape).
+    text = (b"BT /F1 12 Tf 1 0 0 1 150 300 Tm (Alpha) Tj ET\n"
+            b"BT /F1 12 Tf 0 1 -1 0 130 340 Tm (Beta) Tj ET")
+    raster = b"q 40 0 0 30 120 420 cm /Im Do Q"
+    content = b"\n".join([ink, raster, text])
+    stream = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content)
+    # 2x2 RGB: red, green / blue, white — asymmetric in BOTH axes, so a turned raster is
+    # distinguishable from an untouched one.
+    samples = bytes((255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255))
+    res = (b"<< /XObject << /Im 8 0 R >> /Font << /F1 9 0 R >> >>")
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] /Count 4 /MediaBox [0 0 400 600] >>",
+        3: b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources %s /Rotate 0 >>" % res,
+        4: b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources %s /Rotate 90 >>" % res,
+        5: b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources %s /Rotate 180 >>" % res,
+        6: b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources %s /Rotate 270 >>" % res,
+        7: stream,
+        8: _flate_image(8, 2, 2, b"/DeviceRGB", 8, samples),
+        9: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["rotated_pages.pdf"] = {
+        "rotations": [0, 90, 180, 270],
+        "figure_page_bbox": [100, 200, 300, 500],
+        "labels": ["Alpha", "Beta"],
+    }
+
+
 def gen_render_samples():
     """Sampled rasters the RENDER path used to get wrong, each one *drawn* on the page so
     ``to_html`` has to decode it (``extract_images()`` already handled all of them).
@@ -2459,6 +2530,7 @@ def main():
     gen_image_order()
     gen_paint_order()
     gen_no_resources_paths()
+    gen_rotated_pages()
     gen_render_samples()
     gen_cmyk_jpeg()
     gen_decode_jpeg()

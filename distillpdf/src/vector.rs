@@ -126,6 +126,39 @@ pub struct PlacedSvg {
     // — reference curves the PDF clips to the axes box — is cropped by the SVG viewport
     // instead of trailing far past the figure.
     plot: Option<(f32, f32, f32, f32)>,
+    /// The page's `/Rotate` (0/90/180/270). The bbox above stays in **page space** — every
+    /// cross-subsystem comparison in `html.rs` (captions, raster containment, reading order)
+    /// is page-space and must not move — while the local geometry below is in **display
+    /// orientation**, so the emitted `<svg>` reads the way a viewer shows the page.
+    rot: i32,
+}
+
+/// Page space (y up) → figure-local SVG space (y down) for a figure whose page-space bbox is
+/// `(x0, y0, x1, y1)`, honouring the page's `/Rotate`.
+///
+/// `/Rotate` turns the page CLOCKWISE for display, so this is the unrotated local mapping
+/// (`x - x0`, `y1 - y`) with the resulting `w × h` image turned clockwise by `rot`: a point
+/// at unrotated local `(u, v)` lands at `(h - v, u)` for 90°, `(w - u, h - v)` for 180° and
+/// `(v, w - u)` for 270°. Substituting `u`/`v` gives the closed forms below, which is why no
+/// intermediate is computed: `rot == 0` is *literally* the expression this replaced, so an
+/// upright page's output is byte-identical, not merely equal.
+fn to_local(rot: i32, x0: f32, y0: f32, x1: f32, y1: f32, x: f32, y: f32) -> (f32, f32) {
+    match rot {
+        90 => (y - y0, x - x0),
+        180 => (x1 - x, y - y0),
+        270 => (y1 - y, x1 - x),
+        _ => (x - x0, y1 - y),
+    }
+}
+
+/// Local extents of a figure whose page-space extents are `w × h` — transposed by a
+/// quarter turn.
+fn local_extent(rot: i32, w: f32, h: f32) -> (f32, f32) {
+    if rot % 180 == 0 {
+        (w, h)
+    } else {
+        (h, w)
+    }
 }
 
 // A label whose centre is within this margin (pt) of the vector-ink bbox is taken
@@ -136,6 +169,10 @@ impl PlacedSvg {
     /// Attach form-internal text spans that belong to this figure, mapping each
     /// into local SVG coords. A span is claimed when its centre lies within the
     /// bbox expanded by [`LABEL_MARGIN`].
+    ///
+    /// The *claim* stays in page space — spans arrive in page space and so does the bbox, so
+    /// which figure owns a label is decided exactly as it was before `/Rotate` existed here.
+    /// Only the label's **local placement** is turned into display orientation.
     fn attach(&mut self, spans: &[LabelSpan]) {
         for s in spans {
             let cx = s.x + s.width * 0.5;
@@ -145,18 +182,71 @@ impl PlacedSvg {
                 && cy >= self.y_bottom - LABEL_MARGIN
                 && cy <= self.y_top + LABEL_MARGIN
             {
+                let (lx, ly) = self.to_local(s.x, s.y);
                 self.labels.push(Label {
-                    lx: s.x - self.x_left,
-                    ly: self.y_top - s.y,
+                    lx,
+                    ly,
                     size: s.size,
                     w: s.width,
                     text: s.text.clone(),
                     bold: s.bold,
                     italic: s.italic,
-                    angle: s.angle,
+                    // COMPOSE, never overwrite: a 90° y-axis title on a `/Rotate 90` page is
+                    // upright on screen, and a label already upright in page space reads
+                    // sideways there. `angle` is CCW-positive (`text.rs` takes `atan2(b, a)`)
+                    // while `/Rotate` turns the page clockwise, so the page's turn SUBTRACTS.
+                    angle: self.rot_label_angle(s.angle),
                 });
             }
         }
+    }
+
+    /// This figure's page-space → local-SVG mapping (see [`to_local`]).
+    fn to_local(&self, x: f32, y: f32) -> (f32, f32) {
+        to_local(self.rot, self.x_left, self.y_bottom, self.x_right, self.y_top, x, y)
+    }
+
+    /// A page-space baseline angle in this figure's display orientation. Exactly the input
+    /// for an upright page, so no upright figure's `<text>` moves by a rounding step.
+    fn rot_label_angle(&self, angle: f32) -> f32 {
+        if self.rot == 0 {
+            angle
+        } else {
+            angle - (self.rot as f32).to_radians()
+        }
+    }
+
+    /// The SVG `transform` matrix that places one raster's unit square in this figure's local
+    /// coords, or `None` when the plain `x/y/width/height` rect form says the same thing.
+    ///
+    /// A PDF image's unit square has `(0,0)` bottom-left with its FIRST pixel row at the top
+    /// (`v = 1`), so SVG image space `(su, sv)` (y down, top-left origin) maps as `u = su`,
+    /// `v = 1 - sv`. Mapping that through the page CTM and then this figure's page→local
+    /// turn gives the matrix below.
+    ///
+    /// Two cases need it: a rotated *placement* (the pre-existing one, whose closed form is
+    /// kept verbatim so an upright page's output is byte-identical), and a rotated *page* —
+    /// where the pixels turn with the page even though the placement rect stays axis-aligned,
+    /// so an axis-aligned image needs a matrix it never needed before.
+    fn rot_image_matrix(&self, r: &Raster<'_>) -> Option<[f32; 6]> {
+        if self.rot == 0 {
+            // Upright: exactly the expressions this replaced (`matrix(a, -b, -c, d,
+            // c+e-x_left, y_top-d-f)`), association included.
+            let [a, b, c, d, e, f] = r.ctm?;
+            return Some([a, -b, -c, d, c + e - self.x_left, self.y_top - d - f]);
+        }
+        // A rotated page. Without a placement matrix the image's own is the implicit
+        // `[w 0 0 h x0 y0]` that stretches its unit square over the page-space rect.
+        let (ix0, ix1, iy0, iy1) = r.rect;
+        let [a, b, c, d, e, f] = r.ctm.unwrap_or([ix1 - ix0, 0.0, 0.0, iy1 - iy0, ix0, iy0]);
+        // Page-space image of the three unit-square points SVG's matrix is defined by.
+        let origin = (c + e, d + f); // (su,sv) = (0,0) -> (u,v) = (0,1)
+        let du = (a + c + e, b + d + f); // (1,0) -> (1,1)
+        let dv = (e, f); // (0,1) -> (0,0)
+        let (ox, oy) = self.to_local(origin.0, origin.1);
+        let (ux, uy) = self.to_local(du.0, du.1);
+        let (vx, vy) = self.to_local(dv.0, dv.1);
+        Some([ux - ox, uy - oy, vx - ox, vy - oy, ox, oy])
     }
 
     /// Render the self-contained `<svg>`. The viewBox spans the union of the
@@ -270,19 +360,46 @@ impl PlacedSvg {
     /// viewport. `style` (caller-supplied) positions it over the image; `preserveAspect
     /// Ratio="none"` makes the ink fill the positioned box exactly, so the polygons line
     /// up with the raster (both are in page coordinates).
+    /// The one renderer that stays in PAGE orientation. `html.rs` positions this box with
+    /// percentages of the raster's page-space rect, over an `<img>` the raster path emits
+    /// **unturned** — so on a `/Rotate` page the overlay must register with that unturned
+    /// image, not with the display. `un_rotate` maps the display-oriented ink back; for an
+    /// upright page it is `None` and the output is byte-identical.
     pub fn overlay_svg(&self, style: &str) -> String {
         const PAD: f32 = 1.0;
+        // Page-space extents: the local ones transposed back by the same quarter turn.
+        let (pw, ph) = local_extent(self.rot, self.w, self.h);
+        let (open, close) = match self.un_rotate() {
+            Some(m) => (format!("<g transform=\"matrix({})\">", m), "</g>"),
+            None => (String::new(), ""),
+        };
         format!(
             "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{} {} {} {}\" \
-             preserveAspectRatio=\"none\" style=\"{}\" font-family=\"sans-serif\" fill=\"#000\">{}{}</svg>",
+             preserveAspectRatio=\"none\" style=\"{}\" font-family=\"sans-serif\" fill=\"#000\">{}{}{}{}</svg>",
             fmt(-PAD),
             fmt(-PAD),
-            fmt(self.w + 2.0 * PAD),
-            fmt(self.h + 2.0 * PAD),
+            fmt(pw + 2.0 * PAD),
+            fmt(ph + 2.0 * PAD),
             style,
+            open,
             self.ink(),
-            self.label_texts()
+            self.label_texts(),
+            close
         )
+    }
+
+    /// SVG matrix mapping this figure's display-oriented local coords back to page-oriented
+    /// local coords, or `None` for an upright page. The inverse of [`to_local`]'s quarter
+    /// turn, expressed about the local box: with local extents `w × h`, `90°` sends
+    /// `(lx, ly)` to `(ly, w - lx)`, `180°` to `(w - lx, h - ly)` and `270°` to `(h - ly, lx)`.
+    fn un_rotate(&self) -> Option<String> {
+        let m = match self.rot {
+            90 => [0.0, -1.0, 1.0, 0.0, 0.0, self.w],
+            180 => [-1.0, 0.0, 0.0, -1.0, self.w, self.h],
+            270 => [0.0, 1.0, -1.0, 0.0, self.h, 0.0],
+            _ => return None,
+        };
+        Some(m.iter().map(|v| fmt(*v)).collect::<Vec<_>>().join(" "))
     }
 
     /// Render ONE self-contained `<svg>` that composites one or more raster images WITH
@@ -318,32 +435,35 @@ impl PlacedSvg {
         let mut content: Vec<(&PaintSeq, String)> = Vec::with_capacity(rasters.len() + self.paths.len());
         for r in rasters {
             let (ix0, ix1, iy0, iy1) = r.rect;
-            let img_lx = ix0 - self.x_left;
-            let img_ly = self.y_top - iy1;
-            let img_lw = (ix1 - ix0).max(0.1);
-            let img_lh = (iy1 - iy0).max(0.1);
+            // The raster arrives in PAGE space (that is the space `html.rs` pairs it with this
+            // figure in); a quarter turn maps its rect to a rect, so the two opposite corners
+            // re-ordered give the local box exactly. Upright, this is `ix0 - x_left` etc.
+            let (ax, ay) = self.to_local(ix0, iy1);
+            let (bx, by) = self.to_local(ix1, iy0);
+            let img_lx = ax.min(bx);
+            let img_ly = ay.min(by);
+            // Extents are the page-space spans transposed, NOT a difference of mapped corners
+            // — the latter reassociates the subtraction and moves an upright raster by a
+            // rounding step (same reason as `clip_id_for`).
+            let (img_lw, img_lh) = local_extent(self.rot, (ix1 - ix0).max(0.1), (iy1 - iy0).max(0.1));
             min_x = min_x.min(img_lx);
             min_y = min_y.min(img_ly);
             max_x = max_x.max(img_lx + img_lw);
             max_y = max_y.max(img_ly + img_lh);
-            let el = match r.ctm {
-                // ROTATED: map the image's unit square [0,1]² through the placement matrix into
-                // figure-local coords. A PDF image's unit square has (0,0) bottom-left and its
-                // first pixel row at the top (v=1), so SVG image-space (su,sv) (y down, top-left
-                // origin) maps as u=su, v=1-sv. With page CTM (a,b,c,d,e,f) and figure origin
-                // (x_left, y_top) under the y-flip (ly = y_top - pagey), the SVG transform is
-                // matrix(a, -b, -c, d, c+e-x_left, y_top-d-f).
+            // On a ROTATED page the image's PIXELS turn with the page even when its placement
+            // rect is axis-aligned, so the plain-rect form below cannot express it — every
+            // raster on such a page goes through the matrix path.
+            let el = match self.rot_image_matrix(r) {
                 Some([a, b, c, d, e, f]) => format!(
                     "<image href=\"{}\" x=\"0\" y=\"0\" width=\"1\" height=\"1\" preserveAspectRatio=\"none\" transform=\"matrix({} {} {} {} {} {})\"/>",
                     r.href,
                     fmt(a),
-                    fmt(-b),
-                    fmt(-c),
+                    fmt(b),
+                    fmt(c),
                     fmt(d),
-                    fmt(c + e - self.x_left),
-                    fmt(self.y_top - d - f),
+                    fmt(e),
+                    fmt(f),
                 ),
-                // Axis-aligned (common case): place directly in the local rect (unchanged).
                 None => format!(
                     "<image href=\"{}\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\"/>",
                     r.href,
@@ -582,21 +702,37 @@ fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (
     // content tree) rather than re-derived from this vector's order here. The two are the
     // same ordering, but only the address is comparable with `img::positioned_images`'s
     // rasters, which is what lets a composited figure interleave the two.
-    let page_w = page_width(doc, page_id);
+    // The page's `/Rotate` reaches only the FIGURE geometry (`build_svg`'s local mapping and
+    // the label/raster plumbing that shares it). Everything upstream of this line — the walk,
+    // the clip crop, `cluster_figures`'s banding and its size bars — deliberately stays in
+    // page space: those thresholds (`BAND_GAP`, `MIN_W`/`MIN_H`, the 400×600 full-page-fill
+    // filter) are orientation-sensitive, so folding the turn into the base CTM would silently
+    // change which clusters become figures on a rotated page for reasons unrelated to this
+    // defect. Turning at the page→SVG-local boundary fixes the orientation and leaves every
+    // selection rule — and every page-space comparison `html.rs` makes against these boxes —
+    // exactly as it was.
+    let rot = crate::pdfobj::page_rotation(doc, page_id);
+    let page_w = page_width(doc, page_id, rot);
     let (strong, weak) = cluster_figures(painted);
-    let build = |cs: Vec<Vec<Painted>>| cs.iter().map(|c| build_svg(c, page_w)).collect();
+    let build = |cs: Vec<Vec<Painted>>| cs.iter().map(|c| build_svg(c, page_w, rot)).collect();
     (build(strong), build(weak))
 }
 
-/// Page width from the page box (used to size each figure as a share of the page).
+/// **Displayed** page width from the page box (used to size each figure as a share of the
+/// page).
 ///
 /// The box itself — `/MediaBox` then `/CropBox`, inherited up `/Parent`, extents resolved
 /// through indirect references — comes from [`crate::pdfobj::page_box`]. A width of zero or
 /// one point is not a page, so it degrades to the letter default rather than scaling every
 /// figure on the page by a garbage denominator.
-fn page_width(doc: &Document, page_id: ObjectId) -> f32 {
+///
+/// A quarter-turn `/Rotate` makes the page's HEIGHT its displayed width. The figure's own
+/// extent is likewise measured in display orientation, so both sides of the share must be —
+/// otherwise a landscape table is sized against a portrait denominator and renders at half
+/// the width it occupies.
+fn page_width(doc: &Document, page_id: ObjectId, rot: i32) -> f32 {
     crate::pdfobj::page_box(doc, page_id)
-        .map(|b| (b[2] - b[0]).abs())
+        .map(|b| if rot % 180 == 0 { (b[2] - b[0]).abs() } else { (b[3] - b[1]).abs() })
         .filter(|w| *w > 1.0)
         .unwrap_or(crate::pdfobj::DEFAULT_PAGE_PTS.0)
 }
@@ -861,14 +997,26 @@ fn cluster_bbox(cluster: &[Painted]) -> Rect {
 /// Transcode one figure cluster into the path geometry of a [`PlacedSvg`]
 /// (paths in stream order, y flipped). The `<svg>` wrapper + any text labels are
 /// emitted later by [`PlacedSvg::svg`].
-fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
+fn build_svg(cluster: &Vec<Painted>, page_w: f32, rot: i32) -> PlacedSvg {
     let Rect { x0, y0, x1, y1 } = cluster_bbox(cluster);
     let (w, h) = (x1 - x0, y1 - y0);
-    // page space (y up) -> local SVG space (y down): lx = x-x0, ly = y1-y. A stray point
-    // (one coordinate left in the wrong space, surviving the per-path extent gate) is
-    // clamped to within one figure-extent of the box, so it can never draw a huge line.
-    let tx = |x: f32| fmt((x - x0).clamp(-w, 2.0 * w));
-    let ty = |y: f32| fmt((y1 - y).clamp(-h, 2.0 * h));
+    // Local extents are the page-space ones transposed by a quarter turn.
+    let (lw, lh) = local_extent(rot, w, h);
+    // page space (y up) -> local SVG space (y down), turned by the page's `/Rotate` (see
+    // `to_local`; the upright form is lx = x-x0, ly = y1-y). A stray point (one coordinate
+    // left in the wrong space, surviving the per-path extent gate) is clamped to within one
+    // figure-extent of the box, so it can never draw a huge line.
+    let pt = |x: f32, y: f32| {
+        let (lx, ly) = to_local(rot, x0, y0, x1, y1, x, y);
+        (fmt(lx.clamp(-lw, 2.0 * lw)), fmt(ly.clamp(-lh, 2.0 * lh)))
+    };
+    // The local axis-aligned box of a page-space rect: a quarter turn maps a rect to a rect,
+    // so mapping the two opposite corners and re-ordering is exact.
+    let lrect = |rx0: f32, ry0: f32, rx1: f32, ry1: f32| {
+        let (ax, ay) = to_local(rot, x0, y0, x1, y1, rx0, ry1);
+        let (bx, by) = to_local(rot, x0, y0, x1, y1, rx1, ry0);
+        (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by))
+    };
 
     let area = (w * h).max(1.0);
     let mut plot: Option<(f32, f32, f32, f32)> = None;
@@ -884,9 +1032,15 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
     let mut clip_defs = String::new();
     let mut clip_ids: Vec<(i32, i32, i32, i32)> = Vec::new();
     let mut clip_id_for = |c: (f32, f32, f32, f32), defs: &mut String| -> String {
-        // page space -> figure-local (y flipped): a clip rect (cx0,cy0,cx1,cy1).
-        let (lx, lw_) = (c.0 - x0, (c.2 - c.0).max(0.0));
-        let (ly, lh_) = (y1 - c.3, (c.3 - c.1).max(0.0));
+        // page space -> figure-local (y flipped, turned by /Rotate): a clip rect (cx0,cy0,cx1,cy1).
+        // The ORIGIN comes from the corner map; the EXTENTS are the page-space spans merely
+        // transposed — taking them as a difference of two mapped corners instead would
+        // reassociate the subtraction (`(c.2-x0)-(c.0-x0)` is not `c.2-c.0` in f32) and move
+        // an upright figure's clip by a rounding step.
+        let (cl0, cl1, _, _) = lrect(c.0, c.1, c.2, c.3);
+        let (cw, ch) = local_extent(rot, (c.2 - c.0).max(0.0), (c.3 - c.1).max(0.0));
+        let (lx, lw_) = (cl0, cw);
+        let (ly, lh_) = (cl1, ch);
         let key = ((lx * 4.0) as i32, (ly * 4.0) as i32, (lw_ * 4.0) as i32, (lh_ * 4.0) as i32);
         let id = format!("clip_{}_{}_{}_{}", key.0, key.1, key.2, key.3);
         if !clip_ids.contains(&key) {
@@ -907,7 +1061,7 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
             if let Some([r, g, b]) = p.fill {
                 let pa = (p.x1 - p.x0).max(0.0) * (p.y1 - p.y0).max(0.0);
                 if r >= 248 && g >= 248 && b >= 248 && pa >= area * 0.3 {
-                    let (bx0, bx1, by0, by1) = (p.x0 - x0, p.x1 - x0, y1 - p.y1, y1 - p.y0);
+                    let (bx0, by0, bx1, by1) = lrect(p.x0, p.y0, p.x1, p.y1);
                     plot = Some(match plot {
                         Some(m) => {
                             let u = Rect::new(m.0, m.1, m.2, m.3).union(Rect::new(bx0, by0, bx1, by1));
@@ -922,10 +1076,19 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
         let mut d = String::new();
         for s in &p.segs {
             match *s {
-                Seg::M(x, y) => d.push_str(&format!("M{} {}", tx(x), ty(y))),
-                Seg::L(x, y) => d.push_str(&format!("L{} {}", tx(x), ty(y))),
+                Seg::M(x, y) => {
+                    let (lx, ly) = pt(x, y);
+                    d.push_str(&format!("M{lx} {ly}"))
+                }
+                Seg::L(x, y) => {
+                    let (lx, ly) = pt(x, y);
+                    d.push_str(&format!("L{lx} {ly}"))
+                }
                 Seg::C(a, b, c, dd, e, f) => {
-                    d.push_str(&format!("C{} {} {} {} {} {}", tx(a), ty(b), tx(c), ty(dd), tx(e), ty(f)))
+                    let (p1x, p1y) = pt(a, b);
+                    let (p2x, p2y) = pt(c, dd);
+                    let (p3x, p3y) = pt(e, f);
+                    d.push_str(&format!("C{p1x} {p1y} {p2x} {p2y} {p3x} {p3y}"))
                 }
                 Seg::Z => d.push('Z'),
             }
@@ -946,7 +1109,7 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
         paths.push((p.seq.clone(), format!("<path d=\"{d}\" fill=\"{fill}\"{fop}{stroke}{clip_attr}/>")));
     }
     let defs = if clip_defs.is_empty() { String::new() } else { format!("<defs>{clip_defs}</defs>") };
-    PlacedSvg { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, defs, paths, w, h, page_w, labels: Vec::new(), plot }
+    PlacedSvg { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, defs, paths, w: lw, h: lh, page_w, labels: Vec::new(), plot, rot }
 }
 
 #[cfg(test)]
@@ -1042,7 +1205,7 @@ mod tests {
         // The page really does lack the key — otherwise this test proves nothing.
         let page = doc.get_object(page_id).unwrap().as_dict().unwrap();
         assert!(page.get(b"MediaBox").is_err() && page.get(b"CropBox").is_err());
-        assert_eq!(page_width(&doc, page_id), 842.0, "must inherit A4 landscape, not guess 612");
+        assert_eq!(page_width(&doc, page_id, 0), 842.0, "must inherit A4 landscape, not guess 612");
     }
 
     #[test]
@@ -1062,7 +1225,7 @@ mod tests {
         let parent = page.get(b"Parent").unwrap().as_reference().unwrap();
         let mb = doc.get_object(parent).unwrap().as_dict().unwrap().get(b"MediaBox").unwrap().as_array().unwrap();
         assert!(matches!(mb[2], Object::Reference(_)), "the fixture's box extents must be indirect");
-        assert_eq!(page_width(&doc, page_id), 1008.0, "an indirect /MediaBox width must resolve, not read 0");
+        assert_eq!(page_width(&doc, page_id, 0), 1008.0, "an indirect /MediaBox width must resolve, not read 0");
     }
 
     #[test]
@@ -1071,7 +1234,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/indirect_mediabox.pdf");
         let doc = Document::load(path).expect("indirect_mediabox.pdf fixture must load");
         let page_id = *doc.get_pages().get(&2).expect("fixture has page 2");
-        assert_eq!(page_width(&doc, page_id), 400.0, "the /CropBox is the fallback page box");
+        assert_eq!(page_width(&doc, page_id, 0), 400.0, "the /CropBox is the fallback page box");
     }
 
     #[test]
@@ -1079,9 +1242,9 @@ mod tests {
         // A page dict with no /MediaBox anywhere up the chain still gets the letter default
         // rather than a zero-width figure scale.
         let (doc, page_id) = dense_page();
-        assert_eq!(page_width(&doc, page_id), 612.0, "letter fixture is 612pt wide");
+        assert_eq!(page_width(&doc, page_id, 0), 612.0, "letter fixture is 612pt wide");
         // A dangling page id resolves to nothing at all.
-        assert_eq!(page_width(&doc, (9_999, 0)), 612.0);
+        assert_eq!(page_width(&doc, (9_999, 0), 0), 612.0);
     }
 
     #[test]
@@ -1252,6 +1415,143 @@ mod tests {
             );
             let (strong, _weak) = positioned_vectors(&doc, page_id);
             assert_eq!(strong.len(), 1, "{label}: the bars must reach the render as one figure");
+        }
+    }
+
+    /// `tests/gen_fixtures.py::gen_rotated_pages` — four pages, one byte-identical content
+    /// stream, `/Rotate` 0/90/180/270. Returns the doc and the four page ids in order.
+    fn rotated_pages() -> (Document, Vec<ObjectId>) {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/rotated_pages.pdf");
+        let doc = Document::load(path).expect("rotated_pages.pdf fixture must load");
+        let pages = doc.get_pages();
+        let ids = (1..=4).map(|n| *pages.get(&n).unwrap_or_else(|| panic!("fixture has page {n}"))).collect();
+        (doc, ids)
+    }
+
+    #[test]
+    fn a_rotated_page_turns_its_figure_into_display_orientation() {
+        // THE defect: `/Rotate` was read nowhere in the crate, so a landscape table on a
+        // `/Rotate 90` page emitted a sideways `<svg>` — text running bottom-to-top.
+        //
+        // The fixture is a controlled A/B: four pages, ONE content stream, only `/Rotate`
+        // differs. The 20x20 corner marker (the figure's page-space BOTTOM-LEFT rect) is
+        // what makes each turn provable — a symmetric figure could not tell 90 from 270.
+        let (doc, ids) = rotated_pages();
+        // Local `d` of the marker at each rotation, derived from `to_local`'s closed forms.
+        let want = [
+            (0, "M0 300L20 300L20 280L0 280Z", (200.0, 300.0)),   // bottom-left
+            (90, "M0 0L0 20L20 20L20 0Z", (300.0, 200.0)),        // top-left
+            (180, "M200 0L180 0L180 20L200 20Z", (200.0, 300.0)), // top-right
+            (270, "M300 200L300 180L280 180L280 200Z", (300.0, 200.0)), // bottom-right
+        ];
+        for (i, &page_id) in ids.iter().enumerate() {
+            let (rot, marker_d, (lw, lh)) = want[i];
+            assert_eq!(crate::pdfobj::page_rotation(&doc, page_id), rot);
+            let (strong, _weak) = positioned_vectors(&doc, page_id);
+            assert_eq!(strong.len(), 1, "/Rotate {rot}: the 9 paths must cluster as one figure");
+            let f = &strong[0];
+            // The PAGE-space bbox is the SAME on all four pages. `html.rs` compares these
+            // boxes against rasters, captions and reading order in page space, and the turn
+            // must not move them — only the figure's own local geometry turns.
+            for (got, expect, what) in [(f.x_left, 100.0, "x_left"), (f.x_right, 300.0, "x_right"), (f.y_bottom, 200.0, "y_bottom"), (f.y_top, 500.0, "y_top")] {
+                assert!((got - expect).abs() < 0.5, "/Rotate {rot}: {what} {got} moved out of page space");
+            }
+            // Local extents transpose on a quarter turn.
+            assert!((f.w - lw).abs() < 0.5 && (f.h - lh).abs() < 0.5, "/Rotate {rot}: local extent {}x{} want {lw}x{lh}", f.w, f.h);
+            // …and the marker lands in the corner the turn puts it in.
+            let ink = f.ink();
+            assert!(ink.contains(marker_d), "/Rotate {rot}: marker path {marker_d} absent from {ink}");
+        }
+    }
+
+    #[test]
+    fn a_page_turn_composes_with_a_label_angle_instead_of_overwriting_it() {
+        // The failure mode the turn invites: a span already carries its own baseline angle
+        // (a 90° y-axis title), so applying the page's turn by ASSIGNMENT double-rotates one
+        // of them. The fixture draws `Alpha` upright and `Beta` at +90° in page space; on the
+        // `/Rotate 90` page they must swap roles — `Beta` upright, `Alpha` turned.
+        let (doc, ids) = rotated_pages();
+        let raw = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/rotated_pages.pdf")).expect("fixture bytes");
+        // Emitted `rotate(...)` degrees per label, per page rotation (SVG's y-down frame
+        // negates the PDF angle, so an upright label emits no transform at all).
+        let want: [(&str, [f32; 4]); 2] = [("Alpha", [0.0, 90.0, 180.0, 270.0]), ("Beta", [-90.0, 0.0, 90.0, 180.0])];
+        for (i, &page_id) in ids.iter().enumerate() {
+            let rot = crate::pdfobj::page_rotation(&doc, page_id);
+            let spans = crate::text::extract_spans(&doc, page_id, &raw);
+            // The premise, asserted not assumed: the two labels really are drawn at 0° and
+            // +90° in PAGE space, identically on every page.
+            for (t, a) in [("Alpha", 0.0f32), ("Beta", std::f32::consts::FRAC_PI_2)] {
+                let s = spans.iter().find(|s| s.text.contains(t)).unwrap_or_else(|| panic!("/Rotate {rot}: span {t} missing"));
+                assert!((s.angle - a).abs() < 0.01, "/Rotate {rot}: {t} page angle {} want {a}", s.angle);
+            }
+            let (mut strong, _weak) = positioned_vectors(&doc, page_id);
+            let labels: Vec<LabelSpan> = spans
+                .iter()
+                .map(|s| LabelSpan { x: s.x, y: s.y, size: s.size, width: s.width, text: s.text.clone(), bold: s.bold, italic: s.italic, angle: s.angle })
+                .collect();
+            attach_labels(&mut strong, &labels);
+            let svg = strong[0].svg();
+            for (text, degs) in &want {
+                let deg = degs[i];
+                let el = svg
+                    .split("<text ")
+                    .find(|c| c.contains(&format!(">{text}<")))
+                    .unwrap_or_else(|| panic!("/Rotate {rot}: no <text> for {text} in {svg}"));
+                if deg == 0.0 {
+                    assert!(!el.contains("rotate("), "/Rotate {rot}: {text} must be upright, got {el}");
+                } else {
+                    let marker = format!("rotate({} ", fmt(deg));
+                    assert!(el.contains(&marker), "/Rotate {rot}: {text} wants {marker} got {el}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_composited_raster_turns_with_the_page_it_sits_on() {
+        // An axis-aligned raster's placement RECT survives a quarter turn as a rect, but its
+        // PIXELS turn with the page — so the plain `x/y/width/height` form (which cannot
+        // express a turn) is only correct upright. On a turned page every raster must take
+        // the matrix path, or the figure's ink comes out turned and the photo inside it does
+        // not.
+        let (doc, ids) = rotated_pages();
+        // Upright: the exact rect the raster occupies in local coords, plain form.
+        let (strong, _) = positioned_vectors(&doc, ids[0]);
+        let images = crate::img::positioned_images(&doc, ids[0], true);
+        assert_eq!(images.len(), 1, "one raster per page");
+        assert!(images[0].ctm.is_none(), "the fixture's placement is axis-aligned");
+        fn raster(im: &crate::img::Placed) -> Raster<'_> {
+            Raster { href: "IMG", rect: (im.x_left, im.x_right, im.y_bottom, im.y_top), ctm: im.ctm, seq: &im.seq }
+        }
+        let up = strong[0].composite_svg(&[raster(&images[0])]);
+        assert!(up.contains("<image href=\"IMG\" x=\"20\" y=\"50\" width=\"40\" height=\"30\""), "upright: {up}");
+        assert!(!up.contains("matrix"), "upright must keep the plain rect form: {up}");
+
+        // /Rotate 90: unit square (0,0)->(250,20), (1,0)->(250,60), (0,1)->(220,20), i.e.
+        // matrix(0 40 -30 0 250 20) — a 40x30pt rect standing up as 30x40.
+        let (strong, _) = positioned_vectors(&doc, ids[1]);
+        let images = crate::img::positioned_images(&doc, ids[1], true);
+        let turned = strong[0].composite_svg(&[raster(&images[0])]);
+        assert!(turned.contains("transform=\"matrix(0 40 -30 0 250 20)\""), "/Rotate 90: {turned}");
+    }
+
+    #[test]
+    fn a_css_overlay_stays_in_page_orientation_so_it_registers_with_its_unturned_image() {
+        // `overlay_svg` is the ONE renderer that must not turn: `html.rs` positions it with
+        // percentages of the raster's PAGE-space rect, over an `<img>` the raster path emits
+        // unturned. Turning the ink there would slide every polygon off the photo it
+        // annotates. Upright pages must be byte-identical (no wrapper at all).
+        let (doc, ids) = rotated_pages();
+        let (upright, _) = positioned_vectors(&doc, ids[0]);
+        let up = upright[0].overlay_svg("width:100%");
+        assert!(!up.contains("<g transform"), "an upright page must gain no wrapper: {up}");
+        assert!(up.contains("viewBox=\"-1 -1 202 302\""), "upright viewBox is the page-space box: {up}");
+        for (i, m) in [(1, "matrix(0 -1 1 0 0 300)"), (2, "matrix(-1 0 0 -1 200 300)"), (3, "matrix(0 1 -1 0 200 0)")] {
+            let (figs, _) = positioned_vectors(&doc, ids[i]);
+            let ov = figs[0].overlay_svg("width:100%");
+            assert!(ov.contains(&format!("<g transform=\"{m}\">")), "page {}: want {m}, got {ov}", i + 1);
+            // The viewBox is the PAGE-space box on every page — that is what the CSS box is.
+            assert!(ov.contains("viewBox=\"-1 -1 202 302\""), "page {}: {ov}", i + 1);
         }
     }
 

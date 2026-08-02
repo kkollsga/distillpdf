@@ -136,6 +136,46 @@ pub(crate) fn page_box(doc: &Document, page_id: ObjectId) -> Option<[f32; 4]> {
     None
 }
 
+/// The page's `/Rotate` — the degrees a viewer turns the page CLOCKWISE before showing it —
+/// normalized to exactly one of `0`, `90`, `180`, `270`.
+///
+/// **Invariants callers may rely on and must not re-check:**
+/// - `/Rotate` is an **inheritable** page attribute (PDF 32000-1 §7.7.3.3), exactly like the
+///   page box: a writer may state it once on a `/Pages` node. The walk climbs `/Parent`
+///   until a node states one and takes the *nearest*, so [`page_box`] is the model here.
+/// - A stated `/Rotate` **stops the climb even when it is unusable** — an explicitly stated
+///   attribute shadows its ancestor's, and inheriting a different rotation past a broken one
+///   would silently turn a page the file never asked to turn.
+/// - The spec requires a multiple of 90 and permits a negative one (`-90` is common):
+///   the result is `rem_euclid(360)`, so `-90` is `270`. Anything else — a non-multiple, a
+///   non-number, a dangling reference — is **`0`**: a page we cannot turn squarely is left
+///   alone rather than skewed.
+/// - Never panics, never loops (visited set + [`crate::MAX_FORM_DEPTH`]).
+pub(crate) fn page_rotation(doc: &Document, page_id: ObjectId) -> i32 {
+    let mut node = page_id;
+    let mut seen: Vec<ObjectId> = Vec::new();
+    for _ in 0..crate::MAX_FORM_DEPTH {
+        if seen.contains(&node) {
+            return 0; // cyclic /Parent chain
+        }
+        seen.push(node);
+        let dict = match doc.get_object(node).ok().and_then(|o| o.as_dict().ok()) {
+            Some(d) => d,
+            None => return 0,
+        };
+        if let Ok(o) = dict.get(b"Rotate") {
+            // A dictionary value may legally be indirect, so `num_deref`, not `num`.
+            let deg = num_deref(doc, o).round() as i32;
+            return if deg % 90 == 0 { deg.rem_euclid(360) } else { 0 };
+        }
+        node = match dict.get(b"Parent") {
+            Ok(Object::Reference(r)) => *r,
+            _ => return 0,
+        };
+    }
+    0
+}
+
 /// A single PDFDocEncoding high byte (0x80–0xFF) → char. This is the encoding PDF text
 /// strings use when they are not UTF-16BE (PDF spec Annex D.2). NOTE it is NOT cp1252:
 /// e.g. 0x85 is EN DASH here (ellipsis in cp1252), 0x84 EM DASH, 0x8D/0x8E curly double
@@ -437,6 +477,74 @@ mod tests {
         let (doc, _) = doc_with(vec![Object::Null]);
         assert_eq!(page_box(&doc, (9_999, 0)), None);
         assert_eq!(DEFAULT_PAGE_PTS, (612.0, 792.0), "the one home for the letter default");
+    }
+
+    fn rot(v: Object) -> Dictionary {
+        dictionary! { "Rotate" => v }
+    }
+
+    #[test]
+    fn page_rotation_inherits_from_the_nearest_ancestor_that_states_one() {
+        // `/Rotate` is inheritable like the page box, and a landscape section states it once
+        // on its `/Pages` node. Reading only the page dict left every such page upright.
+        let (doc, page) = page_tree(3, &[(2, rot(Object::Integer(90)))]);
+        assert_eq!(page_rotation(&doc, page), 90);
+        // The nearest ancestor wins, and the page's own value beats every ancestor's.
+        let (doc, page) = page_tree(3, &[(1, rot(Object::Integer(180))), (2, rot(Object::Integer(90)))]);
+        assert_eq!(page_rotation(&doc, page), 180);
+        let (doc, page) = page_tree(2, &[(0, rot(Object::Integer(270))), (1, rot(Object::Integer(90)))]);
+        assert_eq!(page_rotation(&doc, page), 270);
+        // Nothing anywhere: upright.
+        let (doc, page) = page_tree(3, &[]);
+        assert_eq!(page_rotation(&doc, page), 0);
+    }
+
+    #[test]
+    fn page_rotation_normalizes_negative_and_over_full_turns() {
+        // `-90` is what a great many writers emit, and it is legal; it is 270, not "no
+        // rotation" and not a negative index into a 4-way match.
+        for (stated, want) in [(-90, 270), (-180, 180), (-270, 90), (360, 0), (450, 90), (720, 0), (0, 0)] {
+            let (doc, page) = page_tree(1, &[(0, rot(Object::Integer(stated)))]);
+            assert_eq!(page_rotation(&doc, page), want, "/Rotate {stated}");
+        }
+        // A real is rounded, not truncated to zero.
+        let (doc, page) = page_tree(1, &[(0, rot(Object::Real(90.0)))]);
+        assert_eq!(page_rotation(&doc, page), 90);
+    }
+
+    #[test]
+    fn page_rotation_resolves_an_indirect_value() {
+        // The same trap `/MediaBox` has: a dictionary value may be written indirectly, and
+        // the direct-only `num` reader turns it into 0 — a landscape page silently upright.
+        let mut doc = Document::with_version("1.5");
+        let r = doc.add_object(Object::Integer(90));
+        let page = doc.add_object(dictionary! { "Type" => "Page", "Rotate" => Object::Reference(r) });
+        assert_eq!(page_rotation(&doc, page), 90);
+    }
+
+    #[test]
+    fn page_rotation_degrades_an_unusable_value_to_upright_without_inheriting_past_it() {
+        // Not a multiple of 90, not a number, dangling: 0. And a STATED-but-broken value
+        // shadows the ancestor's — inheriting past it would turn a page the file did not.
+        for junk in [Object::Integer(45), Object::Name(b"Ninety".to_vec()), Object::Null, Object::Reference((9_999, 0))] {
+            let (doc, page) = page_tree(2, &[(0, rot(junk.clone())), (1, rot(Object::Integer(90)))]);
+            assert_eq!(page_rotation(&doc, page), 0, "junk {junk:?} must not inherit 90");
+        }
+    }
+
+    #[test]
+    fn page_rotation_terminates_on_a_cyclic_or_absurdly_deep_parent_chain() {
+        let mut doc = Document::with_version("1.5");
+        let a = doc.add_object(Object::Null);
+        let b = doc.add_object(dictionary! { "Type" => "Pages", "Parent" => Object::Reference(a) });
+        doc.set_object(a, Object::Dictionary(dictionary! { "Type" => "Page", "Parent" => Object::Reference(b) }));
+        let t = std::time::Instant::now();
+        assert_eq!(page_rotation(&doc, a), 0);
+        assert!(t.elapsed().as_secs() < 5, "the cycle guard is not bounding the walk");
+        let deep = crate::MAX_FORM_DEPTH as usize + 5;
+        let (doc, page) = page_tree(deep, &[(deep - 1, rot(Object::Integer(90)))]);
+        assert_eq!(page_rotation(&doc, page), 0, "out of reach is upright, not a hang");
+        assert_eq!(page_rotation(&doc, (9_999, 0)), 0, "a dangling page id is upright");
     }
 
     #[test]

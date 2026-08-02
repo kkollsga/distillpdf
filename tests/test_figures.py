@@ -188,3 +188,46 @@ def test_composited_figure_keeps_the_streams_paint_order():
             assert img_at < panel_at, "raster painted FIRST must render behind the panel"
         else:
             assert img_at > panel_at, "raster painted LAST must render on top of the panel"
+
+
+def test_a_rotated_page_emits_its_figure_in_display_orientation():
+    """``/Rotate`` — the degrees a viewer turns a page CLOCKWISE before showing it — was read
+    nowhere in the crate, so a landscape table authored on a ``/Rotate 90`` page emitted a
+    sideways ``<svg>`` with its text running bottom-to-top.
+
+    ``rotated_pages.pdf`` is the controlled A/B: four pages, ONE byte-identical content
+    stream, only ``/Rotate`` differs (0/90/180/270). End to end, that must show up as:
+
+      * the viewBox transposing on a quarter turn (200x300 upright, 300x200 turned);
+      * the 20x20 corner marker moving to the corner the turn puts it in;
+      * both labels surviving, with the page's turn COMPOSED onto each span's own baseline
+        angle — ``Alpha`` (drawn upright) turns, ``Beta`` (drawn at 90 deg) comes out upright
+        on the ``/Rotate 90`` page. Overwriting instead of composing double-rotates one.
+    """
+    g = GT["rotated_pages.pdf"]
+    h = html("rotated_pages.pdf")
+    svgs = re.findall(r"<svg\b.*?</svg>", h, re.DOTALL)
+    assert len(svgs) == len(g["rotations"]), f"one <svg> per page, got {len(svgs)}"
+    # Local `d` of the corner marker, and the emitted rotate() degrees per label.
+    want = [
+        (0, "M0 300L20 300L20 280L0 280Z", (200, 300), {"Alpha": None, "Beta": "rotate(-90 "}),
+        (90, "M0 0L0 20L20 20L20 0Z", (300, 200), {"Alpha": "rotate(90 ", "Beta": None}),
+        (180, "M200 0L180 0L180 20L200 20Z", (200, 300), {"Alpha": "rotate(180 ", "Beta": "rotate(90 "}),
+        (270, "M300 200L300 180L280 180L280 200Z", (300, 200), {"Alpha": "rotate(270 ", "Beta": "rotate(180 "}),
+    ]
+    for svg, (rot, marker, (w, h_), labels) in zip(svgs, want):
+        vb = re.search(r'viewBox="([-\d. ]+)"', svg)
+        assert vb, f"/Rotate {rot}: no viewBox"
+        _, _, vw, vh = (float(v) for v in vb.group(1).split())
+        # The viewBox pads the content box by 4pt on every side and grows to the labels,
+        # so assert the ORIENTATION, which is what the turn decides.
+        assert (vw > vh) == (w > h_), \
+            f"/Rotate {rot}: viewBox {vw}x{vh} is not oriented like the displayed {w}x{h_} figure"
+        assert marker in svg, f"/Rotate {rot}: corner marker {marker} absent"
+        for text, want_rot in labels.items():
+            el = next((c for c in svg.split("<text ") if f">{text}<" in c), None)
+            assert el, f"/Rotate {rot}: label {text} lost"
+            if want_rot is None:
+                assert "rotate(" not in el, f"/Rotate {rot}: {text} must be upright, got {el}"
+            else:
+                assert want_rot in el, f"/Rotate {rot}: {text} wants {want_rot}, got {el}"

@@ -756,5 +756,23 @@
         "why": "a hidden (/F bit 2) annotation"
       }
     ]
+  },
+  "rotated_pages.pdf": {
+    "rotations": [
+      0,
+      90,
+      180,
+      270
+    ],
+    "figure_page_bbox": [
+      100,
+      200,
+      300,
+      500
+    ],
+    "labels": [
+      "Alpha",
+      "Beta"
+    ]
   }
 }
