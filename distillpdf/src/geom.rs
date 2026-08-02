@@ -65,6 +65,99 @@ impl Mat {
     }
 }
 
+/// The page's `/Rotate`, as the **page space → display space** map: where a point drawn at
+/// page-space `(x, y)` lands once a viewer has turned the page.
+///
+/// Both spaces have **y up**, so every "top is larger y", "reading order is descending y"
+/// rule downstream reads the same on a turned page as on an upright one — only the axes have
+/// swapped. `/Rotate` turns the page CLOCKWISE, so for `90` the page's bottom edge becomes
+/// the display's left edge and its left edge becomes the display's top:
+///
+/// ```text
+///   90 : (dx, dy) = (y - y0, x1 - x)      display box = h × w
+///  180 : (dx, dy) = (x1 - x, y1 - y)      display box = w × h
+///  270 : (dx, dy) = (y1 - y, x - x0)      display box = h × w
+/// ```
+///
+/// A baseline that runs `+y` in page space (`angle = +90°`) therefore runs `+x` in display
+/// space under `/Rotate 90` — which is exactly why a turned page's body text reads as
+/// upright once mapped, and why [`PageTurn::angle`] subtracts the turn.
+///
+/// **`rot == 0` is the identity, by construction and not by arithmetic:** every method
+/// returns its input unchanged, so an upright page's geometry is byte-identical rather than
+/// merely equal. (The same reason [`crate::vector`]'s `to_local` spells out its four closed
+/// forms: `(c.2 - x0) - (c.0 - x0)` is not `c.2 - c.0` in f32, and a mapped-corner difference
+/// moves an upright figure by a rounding step.)
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PageTurn {
+    rot: i32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+}
+
+impl PageTurn {
+    /// `rot` is [`crate::pdfobj::page_rotation`]'s normalized 0/90/180/270; `page_box` is
+    /// [`crate::pdfobj::page_box`] as authored (it may be inverted, so the corners are
+    /// sorted here — a turn about an inverted box would mirror the page).
+    pub(crate) fn new(rot: i32, page_box: [f32; 4]) -> PageTurn {
+        PageTurn {
+            rot,
+            x0: page_box[0].min(page_box[2]),
+            y0: page_box[1].min(page_box[3]),
+            x1: page_box[0].max(page_box[2]),
+            y1: page_box[1].max(page_box[3]),
+        }
+    }
+
+    /// `true` when this turn maps every input to itself — an upright page.
+    pub(crate) fn is_identity(self) -> bool {
+        self.rot == 0
+    }
+
+    /// A page-space point in display space.
+    pub(crate) fn pt(self, x: f32, y: f32) -> (f32, f32) {
+        match self.rot {
+            90 => (y - self.y0, self.x1 - x),
+            180 => (self.x1 - x, self.y1 - y),
+            270 => (self.y1 - y, x - self.x0),
+            _ => (x, y),
+        }
+    }
+
+    /// A page-space box `(x_left, x_right, y_bottom, y_top)` in display space, in the same
+    /// left/right/bottom/top form (the quarter turns transpose the two axes).
+    pub(crate) fn rect(self, xl: f32, xr: f32, yb: f32, yt: f32) -> (f32, f32, f32, f32) {
+        match self.rot {
+            90 => (yb - self.y0, yt - self.y0, self.x1 - xr, self.x1 - xl),
+            180 => (self.x1 - xr, self.x1 - xl, self.y1 - yt, self.y1 - yb),
+            270 => (self.y1 - yt, self.y1 - yb, xl - self.x0, xr - self.x0),
+            _ => (xl, xr, yb, yt),
+        }
+    }
+
+    /// A page-space baseline angle (radians, PDF CCW-positive) in display orientation,
+    /// **wrapped into `(-π, π]`**.
+    ///
+    /// The wrap is not cosmetic: every consumer asks `angle.abs() < ε` for "upright", and a
+    /// `/Rotate 270` page's body text is authored at `-90°`, which turns into `-90 - 270 =
+    /// -360°` — the same direction as upright and nothing like it under that test. Unwrapped,
+    /// exactly the quarter turn this fix exists for kept emitting an empty page.
+    pub(crate) fn angle(self, angle: f32) -> f32 {
+        if self.rot == 0 {
+            return angle;
+        }
+        let tau = std::f32::consts::TAU;
+        let a = (angle - (self.rot as f32).to_radians()).rem_euclid(tau);
+        if a > std::f32::consts::PI {
+            a - tau
+        } else {
+            a
+        }
+    }
+}
+
 /// An axis-aligned rectangle `[x0, y0, x1, y1]`, in whatever space the caller is working in
 /// (PDF user space with y up, or a figure-local space with y down — the operations are
 /// space-agnostic).
@@ -188,6 +281,86 @@ mod tests {
 
     fn approx(a: f32, b: f32) {
         assert!((a - b).abs() < 1e-6, "{a} != {b}");
+    }
+
+    /// The page box every turn test below uses: 400 wide, 600 tall, origin at 0.
+    fn turn(rot: i32) -> PageTurn {
+        PageTurn::new(rot, [0.0, 0.0, 400.0, 600.0])
+    }
+
+    #[test]
+    fn an_upright_page_turn_returns_its_input_untouched() {
+        // Not "equal to within a rounding step" — IDENTICAL. Every upright page in every
+        // document goes through this, and a mapped-corner round trip would move output by a
+        // ULP (the reason `vector::to_local` spells its four forms out).
+        let t = turn(0);
+        assert!(t.is_identity());
+        assert_eq!(t.pt(137.25, 612.5), (137.25, 612.5));
+        assert_eq!(t.rect(1.5, 2.5, 3.5, 4.5), (1.5, 2.5, 3.5, 4.5));
+        assert_eq!(t.angle(0.75), 0.75);
+    }
+
+    #[test]
+    fn a_quarter_turn_puts_the_page_where_the_reader_sees_it() {
+        // `/Rotate` turns the page CLOCKWISE. At 90 the page's BOTTOM-left corner is what the
+        // reader finds at the TOP-left, and the displayed page is 600 x 400 — the check that
+        // tells 90 from 270, which a symmetric assertion could not.
+        let (w, h) = (400.0, 600.0);
+        for (rot, corner) in [(90, (0.0, w)), (180, (w, h)), (270, (h, 0.0))] {
+            assert_eq!(turn(rot).pt(0.0, 0.0), corner, "/Rotate {rot}: page origin");
+        }
+        // Every corner of the page box lands inside the displayed box, and the four corners
+        // stay four distinct corners (a turn is rigid, not a projection).
+        for rot in [90, 180, 270] {
+            let (dw, dh) = if rot % 180 == 0 { (w, h) } else { (h, w) };
+            let mut seen = Vec::new();
+            for (x, y) in [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)] {
+                let p = turn(rot).pt(x, y);
+                assert!(p.0 >= 0.0 && p.0 <= dw && p.1 >= 0.0 && p.1 <= dh, "/Rotate {rot}: {p:?} outside {dw}x{dh}");
+                seen.push((p.0 as i32, p.1 as i32));
+            }
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), 4, "/Rotate {rot} collapsed two corners");
+        }
+    }
+
+    #[test]
+    fn a_turned_box_keeps_its_extents_and_its_corner_order() {
+        // A box comes back left<=right, bottom<=top (the form every consumer indexes), with
+        // the two extents TRANSPOSED at a quarter turn rather than recomputed from mapped
+        // corners.
+        let (xl, xr, yb, yt) = (100.0, 300.0, 200.0, 500.0);
+        for rot in [0, 90, 180, 270] {
+            let (l, r, b, t) = turn(rot).rect(xl, xr, yb, yt);
+            assert!(l <= r && b <= t, "/Rotate {rot}: inverted {:?}", (l, r, b, t));
+            let (want_w, want_h) = if rot % 180 == 0 { (200.0, 300.0) } else { (300.0, 200.0) };
+            approx(r - l, want_w);
+            approx(t - b, want_h);
+        }
+        // The box's corners agree with the point map — one geometry, two entry points.
+        let (l, r, b, t) = turn(90).rect(xl, xr, yb, yt);
+        assert_eq!(turn(90).pt(xl, yb), (l, t));
+        assert_eq!(turn(90).pt(xr, yt), (r, b));
+    }
+
+    #[test]
+    fn a_turned_baseline_angle_is_wrapped_not_merely_subtracted() {
+        // THE bug this test exists for: a `/Rotate 270` page's body text is authored at -90
+        // deg, and `-90 - 270` is -360 — the same direction as upright, and nothing like it
+        // under the `angle.abs() < eps` test every consumer makes. Unwrapped, the 270 page of
+        // `rotated_body.pdf` rendered EMPTY while 90 and 180 were already fixed.
+        let quarter = std::f32::consts::FRAC_PI_2;
+        approx(turn(90).angle(quarter), 0.0);
+        approx(turn(180).angle(std::f32::consts::PI), 0.0);
+        approx(turn(270).angle(-quarter), 0.0);
+        // …and text that is upright IN PAGE SPACE on a turned page is sideways to the reader,
+        // which is exactly what the body pipeline must keep refusing.
+        for rot in [90, 180, 270] {
+            let a = turn(rot).angle(0.0);
+            assert!(a.abs() > 0.01, "/Rotate {rot}: page-upright text must not read as display-upright");
+            assert!(a > -std::f32::consts::PI - 1e-6 && a <= std::f32::consts::PI + 1e-6, "/Rotate {rot}: {a} outside (-pi, pi]");
+        }
     }
 
     #[test]

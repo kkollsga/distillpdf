@@ -1461,6 +1461,85 @@ def gen_rotated_pages():
     }
 
 
+def gen_rotated_body():
+    """Ordinary BODY PROSE on four ``/Rotate`` pages — no figure, no raster, no table.
+
+    ``gen_rotated_pages`` / ``gen_rotated_raster`` cover the figure and the raster on a turned
+    page. Neither covers the case that mattered most: a turned page whose content is just
+    *text*. ``layout::lines_of`` opened with ``spans.retain(|s| s.angle.abs() < 0.01)``, and on
+    a ``/Rotate 90``/``270`` page **every** span is rotated in page space — so the whole body
+    was discarded and such a page emitted no prose at all. It stayed invisible only because
+    the one corpus document with turned pages happens to draw a full-page ruled table, whose
+    vector figure carried the text as SVG labels.
+
+    Four pages, one per rotation, each carrying the SAME displayed page: a heading, a
+    three-line paragraph and a second paragraph, drawn at the page-space angle that makes them
+    read upright once the viewer has turned the page (``angle == /Rotate``), positioned so
+    every page shows them at the same DISPLAY coordinates. Whatever the turn, the reader sees
+    one identical page — so the extracted body must be identical too.
+
+    Each page also carries one string drawn a further quarter turn on (``/Rotate + 90``),
+    i.e. sideways *to the reader*: a spine label. That is the case the retain rule is actually
+    for, and it must still stay out of the body flow — the rule is "not upright in the space
+    the reader sees", which is the whole correction."""
+    pdf = os.path.join(OUT, "rotated_body.pdf")
+    W, H = 400, 600  # the page box; the DISPLAYED box is (H, W) at 90/270
+
+    def to_page(rot, dx, dy):
+        """Display point -> page point: the inverse of `geom::PageTurn::pt`."""
+        return {0: (dx, dy), 90: (W - dy, dx), 180: (W - dx, H - dy), 270: (dy, H - dx)}[rot]
+
+    def show(rot, dx, dy, text, extra_turn=0, size=12):
+        """One `Tj` at DISPLAY position (dx, dy), reading left-to-right for the viewer."""
+        deg = (rot + extra_turn) % 360
+        cos, sin = {0: (1, 0), 90: (0, 1), 180: (-1, 0), 270: (0, -1)}[deg]
+        x, y = to_page(rot, dx, dy)
+        return b"BT /F1 %d Tf %d %d %d %d %d %d Tm (%s) Tj ET" % (
+            size, cos, sin, -sin, cos, x, y, text.encode("ascii"))
+
+    # Written once, drawn on all four pages at the same DISPLAY coordinates.
+    heading = "Turning the page"
+    para1 = ["A page that carries a Rotate key is turned clockwise before it",
+             "is shown, and its text is authored at the matching angle so that",
+             "the reader sees ordinary upright prose on an ordinary page."]
+    para2 = ["Nothing about that page is a figure, so nothing else can carry",
+             "its words into the output."]
+    spine = "SPINE LABEL"
+    lines = {}
+    for rot in (0, 90, 180, 270):
+        dw, dh = (W, H) if rot % 180 == 0 else (H, W)
+        ops = [show(rot, 0.10 * dw, 0.88 * dh, heading, size=16)]
+        y = 0.80 * dh
+        for ln in para1:
+            ops.append(show(rot, 0.10 * dw, y, ln))
+            y -= 18
+        y -= 24
+        for ln in para2:
+            ops.append(show(rot, 0.10 * dw, y, ln))
+            y -= 18
+        # Sideways to the reader (a spine label), inside the displayed page.
+        ops.append(show(rot, 0.94 * dw, 0.30 * dh, spine, extra_turn=90, size=9))
+        lines[rot] = b"\n".join(ops)
+
+    res = b"<< /Font << /F1 7 0 R >> >>"
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] /Count 4 /MediaBox [0 0 %d %d] >>" % (W, H),
+        7: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    }
+    for i, rot in enumerate((0, 90, 180, 270)):
+        body = lines[rot]
+        objs[3 + i] = b"<< /Type /Page /Parent 2 0 R /Contents %d 0 R /Resources %s /Rotate %d >>" % (8 + i, res, rot)
+        objs[8 + i] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(body), body)
+    _assemble_pdf(objs, pdf)
+    GT["rotated_body.pdf"] = {
+        "rotations": [0, 90, 180, 270],
+        "heading": heading,
+        "paragraphs": [" ".join(para1), " ".join(para2)],
+        "spine_label": spine,
+    }
+
+
 def gen_rotated_raster():
     """A STANDALONE raster (no vector figure anywhere) on four ``/Rotate`` pages.
 
@@ -3465,6 +3544,7 @@ def main():
     gen_dashes()
     gen_alpha_groups()
     gen_rotated_pages()
+    gen_rotated_body()
     gen_rotated_raster()
     gen_separation()
     gen_render_samples()

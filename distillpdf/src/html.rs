@@ -7,7 +7,7 @@
 use crate::captions::*;
 use crate::extract;
 use crate::frontmatter::*;
-use crate::geom::Rect;
+use crate::geom::{self, Rect};
 use crate::headings::*;
 use crate::img;
 use crate::layout::*;
@@ -1217,7 +1217,36 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
             anchors.push('\n');
             els.push(PageElement::new(ElKind::DestAnchors(anchors)));
         }
-        let mut tables = extract::detect_tables_pos(spans);
+        // The page's `/Rotate`, as the page→display map. EVERYTHING this closure reasons
+        // about geometrically — spans, lines, tables, figure boxes, link rects, the reading
+        // order — is expressed in DISPLAY space from here on, i.e. the way a viewer sees the
+        // page. On an upright page (`is_identity`) that is literally the page space it always
+        // was, unchanged value for value.
+        //
+        // This is the boundary the turn belongs at, and it is not the one `vector.rs` chose
+        // for the figure path. There, the walk and its clustering thresholds stay page-space
+        // and the turn happens at the page→SVG-local emit, because those thresholds are
+        // orientation-sensitive and folding the turn in earlier would change which clusters
+        // become figures. Here the orientation-sensitivity is the POINT: `lines_of` bands by
+        // y and orders by x, so a quarter-turned page's body only groups into lines at all
+        // once it is read in display orientation — and every consumer of a `Line` compares it
+        // against a table/figure/image box, so those must be turned with it or the two
+        // spaces meet. Hence: one turn, applied to every page-space quantity this closure
+        // touches, and the page-space originals kept only for the SVG emitters (which do
+        // their own turn from page space — see `PlacedSvg::rot`).
+        let turn = geom::PageTurn::new(
+            crate::pdfobj::page_rotation(doc, *_pid),
+            crate::pdfobj::page_box(doc, *_pid).unwrap_or([0.0, 0.0, crate::pdfobj::DEFAULT_PAGE_PTS.0, crate::pdfobj::DEFAULT_PAGE_PTS.1]),
+        );
+        // Display-space spans. `turned` owns them only on a turned page; upright, `dspans` IS
+        // `spans`, so no page in any upright document allocates or copies anything here.
+        let turned: Option<Vec<Span>> = (!turn.is_identity()).then(|| spans.iter().map(|s| turn_span(turn, s)).collect());
+        let dspans: &[Span] = turned.as_deref().unwrap_or(spans.as_slice());
+        // A vector figure's / raster's box in display space. Every layout comparison below
+        // goes through these; `v.x_left`/`im.x_left` stay page-space for the SVG emitters.
+        let dvbox = |v: &vector::PlacedSvg| turn.rect(v.x_left, v.x_right, v.y_bottom, v.y_top);
+        let dibox = |im: &img::Placed| turn.rect(im.x_left, im.x_right, im.y_bottom, im.y_top);
+        let mut tables = extract::detect_tables_pos(dspans);
         let mut images = img::positioned_images(doc, *_pid, inline_images);
         let (raw_vectors, weak_vectors) = vector::positioned_vectors(doc, *_pid);
         // Vector figures that carry a "Figure N" caption — their *internal* text (a diagram's
@@ -1231,20 +1260,20 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         // form's table cells sit inside a large border vector too, but that vector carries no
         // figure caption (it's a "Table N"/uncaptioned form region), so its table survives.
         let captioned_fig_boxes: Vec<(f32, f32, f32, f32)> = {
-            let cap_lines = lines_of(spans.iter().map(clone_span).collect(), &no_links);
+            let cap_lines = lines_of(dspans.iter().map(clone_span).collect(), &no_links);
             raw_vectors
                 .iter()
-                .filter(|v| {
+                .map(&dvbox)
+                .filter(|&(xl, xr, yb, yt)| {
                     cap_lines.iter().any(|l| {
                         let cx = (l.x0 + l.x1) * 0.5;
                         opens_figure_caption(&l.text())
                             && !caption_is_continued(&l.text())
-                            && (l.y - v.y_bottom).abs().min((l.y - v.y_top).abs()) < body * 4.0
-                            && cx >= v.x_left - 40.0
-                            && cx <= v.x_right + 40.0
+                            && (l.y - yb).abs().min((l.y - yt).abs()) < body * 4.0
+                            && cx >= xl - 40.0
+                            && cx <= xr + 40.0
                     })
                 })
-                .map(|v| (v.x_left, v.x_right, v.y_bottom, v.y_top))
                 .collect()
         };
         // Drop FALSE tables — a "table" that is really a figure's own structure, not a data
@@ -1267,19 +1296,22 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
             let tr = Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
             let ta = tr.area().max(1.0);
             let raster_covered = images.iter().any(|im| {
-                let ir = Rect::new(im.x_left, im.y_bottom, im.x_right, im.y_top);
+                let (ixl, ixr, iyb, iyt) = dibox(im);
+                let ir = Rect::new(ixl, iyb, ixr, iyt);
                 let ia = ir.area().max(1.0);
                 ia >= ta * 0.15 && tr.overlap_area(ir) >= ia * 0.5
             });
             let strip_in_plot = raw_vectors.iter().any(|v| {
-                let vr = Rect::new(v.x_left, v.y_bottom, v.x_right, v.y_top);
+                let (vxl, vxr, vyb, vyt) = dvbox(v);
+                let vr = Rect::new(vxl, vyb, vxr, vyt);
                 let va = vr.area().max(1.0);
                 if !(vr.overlap_area(tr) >= ta * 0.6 && ta < va * 0.5) {
                     return false;
                 }
                 // …and the vector is a composite plot: it contains a substantial raster.
                 images.iter().any(|im| {
-                    let ir = Rect::new(im.x_left, im.y_bottom, im.x_right, im.y_top);
+                    let (ixl, ixr, iyb, iyt) = dibox(im);
+                    let ir = Rect::new(ixl, iyb, ixr, iyt);
                     vr.overlap_area(ir) >= ir.area().max(1.0) * 0.5
                 })
             });
@@ -1314,8 +1346,20 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
             });
             !(raster_covered || strip_in_plot || label_grid_in_fig)
         });
-        let plinks = links_by_page.get(pno).unwrap_or(&no_links);
-        let mut lines = lines_of(spans.iter().map(clone_span).collect(), plinks);
+        // Link rectangles are page-space too, and they are hit-tested against the spans in
+        // `lines_of` — so they take the same turn, or a turned page's links land nowhere.
+        let page_links = links_by_page.get(pno).unwrap_or(&no_links);
+        let turned_links: Option<Vec<LinkBox>> = (!turn.is_identity()).then(|| {
+            page_links
+                .iter()
+                .map(|l| {
+                    let (x0, x1, y0, y1) = turn.rect(l.rect[0], l.rect[2], l.rect[1], l.rect[3]);
+                    LinkBox { rect: [x0, y0, x1, y1], href: l.href.clone() }
+                })
+                .collect()
+        });
+        let plinks: &[LinkBox] = turned_links.as_deref().unwrap_or(page_links.as_slice());
+        let mut lines = lines_of(dspans.iter().map(clone_span).collect(), plinks);
         // Drop running page numbers: a line that is just a 1–4 digit number sitting
         // in the top or bottom margin band of the page (a running footer/header
         // number). Structural — keyed on position + lone-number shape, not per-doc.
@@ -1398,10 +1442,11 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         // and a fraction of a large diagram is still not that diagram's ink; the conjunction
         // with graphic ink is what carries the rule, not the size of the share.
         let not_in_table = |v: &vector::PlacedSvg| {
-            let vr = Rect::new(v.x_left, v.y_bottom, v.x_right, v.y_top);
+            let (vxl, vxr, vyb, vyt) = dvbox(v);
+            let vr = Rect::new(vxl, vyb, vxr, vyt);
             let va = vr.area().max(1.0);
             !tables.iter().any(|t| {
-                if !(v.x_left < t.x_right && v.x_right > t.x_left && v.y_bottom < t.y_top && v.y_top > t.y_bottom) {
+                if !(vxl < t.x_right && vxr > t.x_left && vyb < t.y_top && vyt > t.y_bottom) {
                     return false;
                 }
                 let tr = Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
@@ -1431,8 +1476,14 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                 let edge = |yb: f32, yt: f32| if cy < yb { yb - cy } else if cy > yt { cy - yt } else { 0.0 };
                 let strong_near = images
                     .iter()
-                    .map(|im| edge(im.y_bottom, im.y_top))
-                    .chain(vectors.iter().map(|v| edge(v.y_bottom, v.y_top)))
+                    .map(|im| {
+                        let (_, _, yb, yt) = dibox(im);
+                        edge(yb, yt)
+                    })
+                    .chain(vectors.iter().map(|v| {
+                        let (_, _, yb, yt) = dvbox(v);
+                        edge(yb, yt)
+                    }))
                     .fold(f32::INFINITY, f32::min);
                 if strong_near <= gap {
                     continue; // caption already has a (strong) graphic
@@ -1442,8 +1493,9 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                     if claimed[j] {
                         continue;
                     }
-                    let e = edge(v.y_bottom, v.y_top);
-                    let x_overlap = v.x_right > l.x0 - body && v.x_left < l.x1 + body;
+                    let (vxl, vxr, vyb, vyt) = dvbox(v);
+                    let e = edge(vyb, vyt);
+                    let x_overlap = vxr > l.x0 - body && vxl < l.x1 + body;
                     if e <= gap && x_overlap && best.is_none_or(|(_, be)| e < be) {
                         best = Some((j, e));
                     }
@@ -1470,7 +1522,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         };
         // A vector figure's bbox — used to attach its labels and to keep that text
         // out of the body flow (it belongs to the figure, not the prose).
-        let fig_boxes: Vec<(f32, f32, f32, f32)> = vectors.iter().map(|v| (v.x_left, v.x_right, v.y_bottom, v.y_top)).collect();
+        let fig_boxes: Vec<(f32, f32, f32, f32)> = vectors.iter().map(&dvbox).collect();
         let in_figure = |x: f32, y: f32| fig_boxes.iter().any(|&(xl, xr, yb, yt)| x >= xl - 4.0 && x <= xr + 4.0 && y >= yb - 4.0 && y <= yt + 4.0);
         // A vector region that is really a FRAMED TEXT BLOCK — a bordered certificate / form
         // whose frame and rules are vector ink but whose content is a wall of body text — must
@@ -1699,8 +1751,12 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                     .any(|&(xl, xr, yb, yt)| x >= xl - cap_m && x <= xr + cap_m && y >= yb - cap_m && y <= yt + cap_m)
             };
             let mut labels: Vec<vector::LabelSpan> = Vec::new();
-            for s in spans {
-                let (cx, cy) = (s.x + s.width * 0.5, s.y + s.size * 0.5);
+            // Which spans a figure claims is decided in DISPLAY space (`ds`), against the
+            // display-space figure boxes; what is HANDED to the figure is the PAGE-space span
+            // (`s`), because `PlacedSvg` maps page space to its own turned local space itself
+            // (`to_local`) — turning a label here as well would turn it twice.
+            for (s, ds) in spans.iter().zip(dspans) {
+                let (cx, cy) = (ds.x + ds.width * 0.5, ds.y + ds.size * 0.5);
                 // Inside a CAPTIONED figure, all interior text is the diagram's labels — render
                 // it on the SVG even if the in-figure "prose" gate flagged it (that gate guards
                 // an UNcaptioned framed block). This keeps the labels visible (figure_text) while
@@ -1824,11 +1880,17 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                 let edge = |yb: f32, yt: f32| if cy < yb { yb - cy } else if cy > yt { cy - yt } else { 0.0 };
                 let img_best = images.iter().enumerate()
                     .filter(|(j, _)| img_cap[*j].is_none())
-                    .map(|(j, im)| (j, edge(im.y_bottom, im.y_top)))
+                    .map(|(j, im)| {
+                        let (_, _, yb, yt) = dibox(im);
+                        (j, edge(yb, yt))
+                    })
                     .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                 let svg_best = vectors.iter().enumerate()
                     .filter(|(j, _)| svg_cap[*j].is_none())
-                    .map(|(j, v)| (j, edge(v.y_bottom, v.y_top)))
+                    .map(|(j, v)| {
+                        let (_, _, yb, yt) = dvbox(v);
+                        (j, edge(yb, yt))
+                    })
                     .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                 match (img_best, svg_best) {
                     (Some((j, di)), Some((k, ds))) => {
@@ -1950,13 +2012,15 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         let mut svg_rasters: Vec<Vec<usize>> = vec![Vec::new(); vectors.len()]; // vector → embedded images
         if inline_images {
             for (vi, v) in vectors.iter().enumerate() {
-                let vr = Rect::new(v.x_left, v.y_bottom, v.x_right, v.y_top);
+                let (vxl, vxr, vyb, vyt) = dvbox(v);
+                let vr = Rect::new(vxl, vyb, vxr, vyt);
                 let varea = vr.area().max(1.0);
                 for (ii, im) in images.iter().enumerate() {
                     if vec_owner[vi].is_some() || img_owner[ii].is_some() {
                         continue;
                     }
-                    let ir = Rect::new(im.x_left, im.y_bottom, im.x_right, im.y_top);
+                    let (ixl, ixr, iyb, iyt) = dibox(im);
+                    let ir = Rect::new(ixl, iyb, ixr, iyt);
                     let overlap = vr.overlap_area(ir);
                     let imarea = ir.area().max(1.0);
                     if overlap / varea > 0.6 {
@@ -1970,15 +2034,17 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
             }
         }
         for (j, im) in images.iter().enumerate() {
+            let (_, _, _, iyt) = dibox(im);
             items.push(Item::Img(j));
-            boxes.push((px0, px1, im.y_top - 1.0, im.y_top + 1.0)); // full-width separator
+            boxes.push((px0, px1, iyt - 1.0, iyt + 1.0)); // full-width separator
         }
         for (j, v) in vectors.iter().enumerate() {
             if vec_owner[j].is_some() {
                 continue; // overlaid onto its image, not emitted separately
             }
+            let (vxl, vxr, vyb, vyt) = dvbox(v);
             items.push(Item::Svg(j));
-            boxes.push((v.x_left, v.x_right.max(v.x_left + 0.1), v.y_bottom, v.y_top));
+            boxes.push((vxl, vxr.max(vxl + 0.1), vyb, vyt));
         }
         for (j, (cx0, cy, _)) in standalone.iter().enumerate() {
             items.push(Item::Cap(j));
@@ -2270,6 +2336,18 @@ pub(crate) const DOC_SHELL_HEAD: &str = "<!doctype html>\n<html>\n<head>\n<meta 
      <style>\nbody{max-width:48rem;margin:auto;padding:1rem}\n\
      img,svg{max-width:100%;height:auto}\n</style>\n</head>\n<body>\n";
 
+/// A page-space span in DISPLAY space — the same run of text, where a viewer sees it.
+///
+/// The anchor moves through [`geom::PageTurn::pt`] and the baseline angle through
+/// [`geom::PageTurn::angle`]; `size` and `width` are lengths along/across that baseline, so a
+/// rigid quarter turn leaves them alone. On a `/Rotate 90` page the body's `angle = +90°`
+/// spans come back upright, which is what puts them back in the reading order
+/// ([`crate::layout::lines_of`] keeps only what is upright *in the space it is handed*).
+pub(crate) fn turn_span(turn: geom::PageTurn, s: &Span) -> Span {
+    let (x, y) = turn.pt(s.x, s.y);
+    Span { x, y, angle: turn.angle(s.angle), ..clone_span(s) }
+}
+
 pub(crate) fn clone_span(s: &Span) -> Span {
     Span {
         x: s.x,
@@ -2346,5 +2424,42 @@ mod tests {
         let long = "One two three four five six seven eight nine ten eleven twelve thirteen";
         let promote_long: Vec<(String, u8)> = vec![(title_key(long), 1)];
         assert!(heading_tags(&promote_long, &[long]).is_empty());
+    }
+
+    /// `tests/gen_fixtures.py::gen_rotated_body` — the same displayed page at `/Rotate`
+    /// 0/90/180/270: a heading, two paragraphs, and a spine label set sideways to the reader.
+    /// No figure, no raster, no table — text is the only thing on it.
+    #[test]
+    fn a_turned_page_reads_its_body_the_way_the_reader_sees_it() {
+        // THE defect: `lines_of` dropped every span with a non-zero angle, which is EVERY
+        // span on a quarter-turned page — so such a page emitted no prose at all. It hid
+        // behind the one corpus document that turns pages, whose turned pages are a full-page
+        // ruled table: the table's vector figure carried the words as SVG labels, so the loss
+        // never showed up as an empty page.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/rotated_body.pdf");
+        let raw = std::fs::read(path).expect("rotated_body.pdf fixture must exist");
+        let doc = Document::load(path).expect("rotated_body.pdf fixture must load");
+        let html = to_html(&doc, &raw, Mode::Page, false, false);
+        let pages: Vec<&str> = html.split("<section data-page=").skip(1).collect();
+        assert_eq!(pages.len(), 4, "fixture has one page per rotation");
+        let want = [
+            "A page that carries a Rotate key is turned clockwise before it is shown, and its text is authored \
+             at the matching angle so that the reader sees ordinary upright prose on an ordinary page.",
+            "Nothing about that page is a figure, so nothing else can carry its words into the output.",
+        ];
+        for (i, page) in pages.iter().enumerate() {
+            let rot = [0, 90, 180, 270][i];
+            assert!(page.contains("Turning the page"), "/Rotate {rot}: the heading is missing");
+            for w in want {
+                assert!(page.contains(w), "/Rotate {rot}: paragraph missing from\n{page}");
+            }
+            // Reading order, not merely presence: the second paragraph follows the first.
+            let (a, b) = (page.find(want[0]), page.find(want[1]));
+            assert!(a < b, "/Rotate {rot}: paragraphs out of reading order");
+        }
+        // The spine label is upright in PAGE space on the turned pages and sideways to the
+        // READER — which is precisely what the "rotated text is not body text" rule is for.
+        // The rule is kept; what changed is the space it is asked in.
+        assert!(!html.contains("SPINE"), "a label set sideways to the reader is not body prose");
     }
 }

@@ -366,3 +366,30 @@ def test_char_spacing_inside_q_does_not_leak():
     g = _GT["textstate_q.pdf"]
     t = _doc("textstate_q.pdf").extract_text()
     assert t.count(g["word"]) == g["occurrences"], f"expected {g['word']!r} twice, got {t!r}"
+
+
+def test_a_turned_page_emits_its_body_prose():
+    """``rotated_body.pdf`` — a ``/Rotate`` page whose content is TEXT, nothing else.
+
+    ``layout::lines_of`` opened by discarding every rotated span, which on a ``/Rotate
+    90``/``270`` page is *every* span: such a page emitted no prose at all. It stayed hidden
+    because the one corpus document with turned pages fills them with a ruled table, whose
+    vector figure carried the words into the output as SVG labels — so no count could see it.
+
+    Four pages, one per rotation, showing the READER the identical page. The extracted body
+    must therefore be identical too, in reading order — and the spine label, which is upright
+    in page space but sideways to the reader, must still stay out of it.
+    """
+    from _fixtures import GT as _GT
+    g = _GT["rotated_body.pdf"]
+    h = html("rotated_body.pdf")
+    pages = re.findall(r'<section data-page="(\d+)"[^>]*>(.*?)</section>', h, re.DOTALL)
+    assert len(pages) == len(g["rotations"]), f"one page per rotation, got {len(pages)}"
+    for (_, page), rot in zip(pages, g["rotations"]):
+        body = text(page)
+        assert g["heading"] in body, f"/Rotate {rot}: the heading is missing from {body!r}"
+        at = [body.find(p) for p in g["paragraphs"]]
+        for p, i in zip(g["paragraphs"], at):
+            assert i >= 0, f"/Rotate {rot}: paragraph missing — {body!r}"
+        assert at == sorted(at), f"/Rotate {rot}: paragraphs out of reading order"
+    assert g["spine_label"] not in h, "text set sideways to the reader is not body prose"

@@ -775,6 +775,20 @@
       "Beta"
     ]
   },
+  "rotated_body.pdf": {
+    "rotations": [
+      0,
+      90,
+      180,
+      270
+    ],
+    "heading": "Turning the page",
+    "paragraphs": [
+      "A page that carries a Rotate key is turned clockwise before it is shown, and its text is authored at the matching angle so that the reader sees ordinary upright prose on an ordinary page.",
+      "Nothing about that page is a figure, so nothing else can carry its words into the output."
+    ],
+    "spine_label": "SPINE LABEL"
+  },
   "separation.pdf": {
     "pages": [
       "Separation/Type2",
