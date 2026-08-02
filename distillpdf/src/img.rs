@@ -630,7 +630,8 @@ pub fn positioned_images(doc: &Document, page_id: ObjectId, want_uris: bool) -> 
     };
     let xmap = xobjects_of(doc, &resources);
     let mut raws: Vec<RawTile> = Vec::new();
-    walk(doc, &content.operations, &xmap, M::ID, &mut raws, 0);
+    let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
+    walk(doc, &content.operations, &xmap, M::ID, &mut raws, 0, &mut budget);
     finalize(doc, raws, want_uris)
 }
 
@@ -641,6 +642,7 @@ fn walk(
     base: M,
     out: &mut Vec<RawTile>,
     depth: u32,
+    budget: &mut crate::WalkBudget,
 ) {
     if depth > crate::MAX_FORM_DEPTH {
         return;
@@ -648,6 +650,12 @@ fn walk(
     let mut ctm = base;
     let mut stack: Vec<M> = Vec::new();
     for op in ops {
+        // Total-work budget (see `crate::WalkBudget`): the depth cap alone lets a
+        // self-referential form branch 2x per level. Out of budget → stop and keep the
+        // tiles found so far; a partial page beats a hang and beats an empty one.
+        if !budget.spend(1) {
+            return;
+        }
         let o = &op.operands;
         match op.operator.as_str() {
             "q" => stack.push(ctm),
@@ -702,6 +710,12 @@ fn walk(
                     let pw = stream.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0) as u32;
                     out.push(RawTile { id, x0, x1, y0, y1, pw, ctm: rot_ctm });
                 } else if subtype == b"Form" {
+                    // Bill the descent before doing it: cloning the inherited XObject map
+                    // and decoding the form stream dwarf a single operator's cost, and a
+                    // form bomb pays exactly this per branch.
+                    if !budget.spend(crate::FORM_DESCENT_COST + xmap.len()) {
+                        return;
+                    }
                     // Form: descend with its /Matrix and own resources.
                     let fm = stream
                         .dict
@@ -726,7 +740,7 @@ fn walk(
                         }
                     }
                     if let Ok(content) = lopdf::content::Content::decode(&stream_content(&stream)) {
-                        walk(doc, &content.operations, &child, form_ctm, out, depth + 1);
+                        walk(doc, &content.operations, &child, form_ctm, out, depth + 1, budget);
                     }
                 }
             }
@@ -925,6 +939,53 @@ fn stitch_grid(doc: &Document, tiles: &[&RawTile], bbox: (f32, f32, f32, f32)) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An adversarial fixture (`tests/gen_fixtures.py::gen_form_bomb`) and its first page.
+    fn adversarial(name: &str) -> (Document, ObjectId) {
+        let path = format!("{}/../tests/fixtures_pdf/adversarial/{name}", env!("CARGO_MANIFEST_DIR"));
+        let doc = Document::load(&path).unwrap_or_else(|e| panic!("{name} fixture must load: {e}"));
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        (doc, page_id)
+    }
+
+    #[test]
+    fn a_self_referential_form_cannot_hang_the_image_walk() {
+        // `form_bomb.pdf`: form /X invokes /X twice, so the walk branches 2x per level and
+        // `MAX_FORM_DEPTH` alone allowed ~2^40 descents. This call never returned.
+        let (doc, page_id) = adversarial("form_bomb.pdf");
+        let t = std::time::Instant::now();
+        let placed = positioned_images(&doc, page_id, true);
+        assert!(t.elapsed().as_secs() < 10, "form bomb ran for {:?} — the budget is not bounding it", t.elapsed());
+        assert!(placed.is_empty(), "the bomb draws no image, so none may be invented for it");
+    }
+
+    #[test]
+    fn a_form_drawn_three_times_places_three_tiles() {
+        // The control, and the reason this fix is a BUDGET and not a visited set: one form
+        // holding one image, invoked at three offsets, is three placed rasters. An
+        // `ObjectId` dedupe would return 1 and silently drop two real figures.
+        let (doc, page_id) = adversarial("form_repeat.pdf");
+        let placed = positioned_images(&doc, page_id, false);
+        assert_eq!(placed.len(), 3, "a repeated form must place one tile per invocation");
+        let mut ys: Vec<i32> = placed.iter().map(|p| p.y_top.round() as i32).collect();
+        ys.sort_unstable();
+        ys.dedup();
+        assert_eq!(ys.len(), 3, "the three occurrences must land at three offsets, got {ys:?}");
+    }
+
+    #[test]
+    fn an_exhausted_work_budget_degrades_a_repeated_form_instead_of_emptying_it() {
+        // Degrade, don't vanish: a walk that runs out mid-page keeps the tiles it found.
+        let (doc, page_id) = adversarial("form_repeat.pdf");
+        let resources = page_resources(&doc, page_id).expect("fixture page has resources");
+        let content = doc.get_and_decode_page_content(page_id).expect("fixture page has content");
+        let xmap = xobjects_of(&doc, &resources);
+        let mut raws = Vec::new();
+        let mut budget = crate::WalkBudget::new(700);
+        walk(&doc, &content.operations, &xmap, M::ID, &mut raws, 0, &mut budget);
+        assert!(!raws.is_empty(), "a tripped budget must not empty the page");
+        assert!(raws.len() < 3, "the budget must really bite, got {} tiles", raws.len());
+    }
 
     /// Decode the base64 payload of a `data:` URI into an RGB image.
     fn uri_rgb(uri: &str) -> image::RgbImage {

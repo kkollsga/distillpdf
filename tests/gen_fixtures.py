@@ -1055,6 +1055,84 @@ def gen_encrypted():
     }
 
 
+# ------------------------------------------------------------------ adversarial forms
+# Adversarial fixtures get their own subfolder for the same reason the encrypted ones do:
+# the whole-fixture-set structural sweeps glob ``fixtures_pdf/*.pdf`` non-recursively, and
+# a form bomb is a hardening probe — it has no layout whose fidelity means anything.
+ADV_OUT = os.path.join(OUT, "adversarial")
+
+
+def gen_form_bomb():
+    """Self-referential Form XObjects — the DoS the three content walkers were blind to.
+
+    ``form_bomb.pdf`` — form ``/X`` invokes ``/X`` **twice**, so a walk branches 2x per
+    level. A depth cap alone bounds *nesting* (40) but not *work*: 2^40 ~ 1.1e12 descents,
+    which hung ``to_html`` indefinitely on a ~1 KB file. With the total-work budget
+    (``crate::MAX_FORM_WORK``) the walk must terminate promptly on all three walkers.
+
+    ``form_repeat.pdf`` — the CONTROL that pins why the fix is a budget and NOT a visited
+    set. One form is invoked three times at three separated offsets, and each invocation
+    paints a vector rect, a raster tile and a text run. Deduplicating by ``ObjectId``
+    would collapse the three into one and silently lose real content; the budget keeps
+    all three, so each walker still sees 3.
+    """
+    import pikepdf
+
+    os.makedirs(ADV_OUT, exist_ok=True)
+
+    # -- the bomb: /X draws /X twice ------------------------------------------------
+    pdf = pikepdf.new()
+    form = pikepdf.Stream(pdf, b"q 1 0 0 1 0 0 cm /X Do Q q 1 0 0 1 5 0 cm /X Do Q")
+    form.Type = pikepdf.Name.XObject
+    form.Subtype = pikepdf.Name.Form
+    form.BBox = [0, 0, 100, 100]
+    form.FormType = 1
+    form.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(X=form))  # self-reference
+    page = pdf.add_blank_page(page_size=(200, 200))
+    page.Contents = pikepdf.Stream(pdf, b"q /X Do Q")
+    page.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(X=form))
+    pdf.save(os.path.join(ADV_OUT, "form_bomb.pdf"))
+
+    # -- the control: one form legitimately drawn three times ------------------------
+    pdf = pikepdf.new()
+    # A 40x30 raw DeviceRGB tile (no filter — keeps the fixture byte-inspectable).
+    w, h = 40, 30
+    tile = pikepdf.Stream(pdf, bytes(0x20 + ((i * 7) % 0x5F) for i in range(w * h * 3)))
+    tile.Type = pikepdf.Name.XObject
+    tile.Subtype = pikepdf.Name.Image
+    tile.Width, tile.Height = w, h
+    tile.ColorSpace = pikepdf.Name.DeviceRGB
+    tile.BitsPerComponent = 8
+    font = pikepdf.Dictionary(Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1,
+                              BaseFont=pikepdf.Name.Helvetica)
+    # Rendered size of the tile is 50x40 pt — above img.rs's MIN_DIM, so it is a figure
+    # tile and not filtered out as an icon.
+    rep = pikepdf.Stream(pdf, b"q 0 0 1 rg 5 5 90 50 re f Q\n"
+                              b"q 50 0 0 40 5 8 cm /Im Do Q\n"
+                              b"BT /F1 12 Tf 8 62 Td (REPEAT) Tj ET\n")
+    rep.Type = pikepdf.Name.XObject
+    rep.Subtype = pikepdf.Name.Form
+    rep.BBox = [0, 0, 100, 80]
+    rep.FormType = 1
+    rep.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im=tile),
+                                       Font=pikepdf.Dictionary(F1=font))
+    page = pdf.add_blank_page(page_size=(300, 400))
+    # Three invocations, 130 pt apart — further than vector.rs's BAND_GAP, so they stay
+    # three distinct paint sites rather than merging into one cluster.
+    page.Contents = pikepdf.Stream(pdf, b"q 1 0 0 1 20 290 cm /R Do Q\n"
+                                        b"q 1 0 0 1 20 160 cm /R Do Q\n"
+                                        b"q 1 0 0 1 20 30 cm /R Do Q\n")
+    page.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(R=rep))
+    pdf.save(os.path.join(ADV_OUT, "form_repeat.pdf"))
+
+    GT["adversarial"] = {
+        "bomb": "form_bomb.pdf",
+        "control": "form_repeat.pdf",
+        "control_repeats": 3,
+        "control_word": "REPEAT",
+    }
+
+
 # ------------------------------------------------------------------------------ links
 def _assemble_pdf(objs, path):
     """Write a minimal PDF from {objnum: bytes} (numbers contiguous from 1)."""
@@ -1782,6 +1860,7 @@ def main():
     gen_frontmatter()
     gen_profile_heads()
     gen_encrypted()
+    gen_form_bomb()
     with open(os.path.join(OUT, "groundtruth.json"), "w") as f:
         json.dump(GT, f, indent=2)
     print(f"generated {len(GT)} fixture entries + groundtruth.json -> {OUT}")

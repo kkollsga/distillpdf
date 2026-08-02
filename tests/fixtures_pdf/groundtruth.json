@@ -588,5 +588,11 @@
       "inline_encrypt_userpw.pdf"
     ],
     "user_password": "secret"
+  },
+  "adversarial": {
+    "bomb": "form_bomb.pdf",
+    "control": "form_repeat.pdf",
+    "control_repeats": 3,
+    "control_word": "REPEAT"
   }
 }

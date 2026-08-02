@@ -589,7 +589,8 @@ fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (
     let xmap = xobjects_of(doc, &resources);
     let egmap = extgstates_of(doc, &resources);
     let mut painted = Vec::new();
-    walk(doc, ops, &xmap, &egmap, GState::new(M::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0);
+    let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
+    walk(doc, ops, &xmap, &egmap, GState::new(M::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget);
     // Stamp paint order before clustering reshuffles the vector for banding.
     for (i, p) in painted.iter_mut().enumerate() {
         p.seq = i;
@@ -664,6 +665,7 @@ fn walk(
     base: GState,
     out: &mut Vec<Painted>,
     depth: u32,
+    budget: &mut crate::WalkBudget,
 ) {
     if depth > crate::MAX_FORM_DEPTH {
         return;
@@ -681,6 +683,16 @@ fn walk(
     let eff_stroke = |g: &GState| if g.stroke_a >= ALPHA_HIDDEN { Some((g.stroke, (g.lw * g.ctm.scale()).max(0.3))) } else { None };
 
     for op in ops {
+        // Total-work budget (see `crate::WalkBudget`). `MAX_OPS` above truncates only the
+        // page's TOP-LEVEL operator list; a self-referential form re-enters `walk` with a
+        // fresh, tiny slice each time, so only a budget shared across all levels bounds it.
+        // Out of budget → return what has been painted, exactly as the `MAX_OPS` truncation
+        // does. A dense page degrades; it never comes back looking empty. The in-flight
+        // subpath in `cur` is dropped rather than flushed: it has not reached its painting
+        // operator, so painting it here would fabricate ink the page never showed.
+        if !budget.spend(1) {
+            return;
+        }
         let o = &op.operands;
         match op.operator.as_str() {
             "q" => stack.push(g),
@@ -791,6 +803,12 @@ fn walk(
                 if stream.dict.get(b"Subtype").and_then(|x| x.as_name()).unwrap_or(b"") != b"Form" {
                     continue; // images handled by crate::img
                 }
+                // Bill the descent before doing it: cloning the inherited resource maps and
+                // decoding the form stream dwarf a single operator's cost, and a form bomb
+                // pays exactly this per branch.
+                if !budget.spend(crate::FORM_DESCENT_COST + xmap.len() + egmap.len()) {
+                    return;
+                }
                 let fm = stream
                     .dict
                     .get(b"Matrix")
@@ -811,7 +829,7 @@ fn walk(
                 if let Ok(content) = lopdf::content::Content::decode(&stream.decompressed_content().unwrap_or_default()) {
                     let mut sub = g;
                     sub.ctm = fm.mul(g.ctm);
-                    walk(doc, &content.operations, &child_x, &child_eg, sub, out, depth + 1);
+                    walk(doc, &content.operations, &child_x, &child_eg, sub, out, depth + 1, budget);
                 }
             }
             _ => {}
@@ -998,6 +1016,67 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Load an adversarial fixture (`tests/gen_fixtures.py::gen_form_bomb`) and set up the
+    /// exact state `positioned_vectors_capped` hands to [`walk`], so a test can drive the
+    /// walker with its own budget.
+    fn adversarial(name: &str) -> (Document, ObjectId) {
+        let path = format!("{}/../tests/fixtures_pdf/adversarial/{name}", env!("CARGO_MANIFEST_DIR"));
+        let doc = Document::load(&path).unwrap_or_else(|e| panic!("{name} fixture must load: {e}"));
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        (doc, page_id)
+    }
+
+    fn walk_page(doc: &Document, page_id: ObjectId, budget: usize) -> Vec<Painted> {
+        let resources = page_resources(doc, page_id).expect("fixture page has resources");
+        let content = doc.get_and_decode_page_content(page_id).expect("fixture page has content");
+        let xmap = xobjects_of(doc, &resources);
+        let egmap = extgstates_of(doc, &resources);
+        let mut painted = Vec::new();
+        let mut budget = crate::WalkBudget::new(budget);
+        walk(doc, &content.operations, &xmap, &egmap, GState::new(M::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget);
+        painted
+    }
+
+    #[test]
+    fn a_self_referential_form_cannot_hang_the_vector_walk() {
+        // `form_bomb.pdf`: form /X invokes /X twice, so the walk branches 2x per level.
+        // `MAX_FORM_DEPTH` alone allowed ~2^40 descents — this call never returned.
+        let (doc, page_id) = adversarial("form_bomb.pdf");
+        let t = std::time::Instant::now();
+        let painted = walk_page(&doc, page_id, crate::MAX_FORM_WORK);
+        assert!(t.elapsed().as_secs() < 10, "form bomb ran for {:?} — the budget is not bounding it", t.elapsed());
+        assert!(painted.is_empty(), "the bomb paints no ink, so nothing may be invented for it");
+        // The full render entry point must be bounded too, not just the raw walker.
+        let t = std::time::Instant::now();
+        let _ = positioned_vectors(&doc, page_id);
+        assert!(t.elapsed().as_secs() < 10, "positioned_vectors ran for {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn a_form_drawn_three_times_is_painted_three_times() {
+        // The control, and the reason this fix is a BUDGET and not a visited set: one form
+        // invoked at three offsets is three real paint sites. An `ObjectId` dedupe would
+        // return 1 here and silently drop two thirds of the page's ink.
+        let (doc, page_id) = adversarial("form_repeat.pdf");
+        let painted = walk_page(&doc, page_id, crate::MAX_FORM_WORK);
+        assert_eq!(painted.len(), 3, "a repeated form must paint once per invocation");
+        // …and at three DISTINCT positions, so this cannot pass on three copies of one rect.
+        let mut ys: Vec<i32> = painted.iter().map(|p| p.y0.round() as i32).collect();
+        ys.sort_unstable();
+        ys.dedup();
+        assert_eq!(ys.len(), 3, "the three occurrences must land at three offsets, got {ys:?}");
+    }
+
+    #[test]
+    fn an_exhausted_work_budget_degrades_a_repeated_form_instead_of_emptying_it() {
+        // Degrade, don't vanish (the precedent `MAX_OPS` set): a walk that runs out mid-page
+        // returns what it painted, never an empty page that reads as "nothing here".
+        let (doc, page_id) = adversarial("form_repeat.pdf");
+        let painted = walk_page(&doc, page_id, 700);
+        assert!(!painted.is_empty(), "a tripped budget must not empty the page");
+        assert!(painted.len() < 3, "the budget must really bite, got {} paths", painted.len());
+    }
 
     /// The owned dense-vector fixture (`tests/gen_fixtures.py::gen_dense_vector`): a grid
     /// figure painted in the first ~54 operators, then ~300 scatter rects, then all text.

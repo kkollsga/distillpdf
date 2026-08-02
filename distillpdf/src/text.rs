@@ -1026,7 +1026,8 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
     let fonts = build_fonts(doc, page_id, raw);
     let xmap = page_xobjects(doc, page_id);
     let mut spans = Vec::new();
-    decode_spans(doc, &content.operations, &fonts, &xmap, Mat::ID, raw, 0, &mut spans);
+    let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
+    decode_spans(doc, &content.operations, &fonts, &xmap, Mat::ID, raw, 0, &mut spans, &mut budget);
     dedup_coincident(&mut spans);
     spans
 }
@@ -1120,7 +1121,7 @@ fn push_positioned_span(spans: &mut Vec<Span>, wtm: &Mat, ctm: &Mat, base_size: 
 /// Form XObjects on `Do`. `base` is the graphics CTM the stream is placed under
 /// (identity for the page; the form `/Matrix` × the invoking CTM for a nested form).
 #[allow(clippy::too_many_arguments)]
-fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashMap<Vec<u8>, FontInfo>, xmap: &HashMap<Vec<u8>, ObjectId>, base: Mat, raw: &[u8], depth: u32, spans: &mut Vec<Span>) {
+fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashMap<Vec<u8>, FontInfo>, xmap: &HashMap<Vec<u8>, ObjectId>, base: Mat, raw: &[u8], depth: u32, spans: &mut Vec<Span>, budget: &mut crate::WalkBudget) {
     let mut tm = Mat::ID;
     let mut tlm = Mat::ID;
     let mut leading = 0.0f32;
@@ -1133,6 +1134,12 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
     let mut cstack: Vec<Mat> = Vec::new();
 
     for op in ops {
+        // Total-work budget (see `crate::WalkBudget`): the depth cap alone lets a
+        // self-referential form branch 2x per level. Out of budget → return the spans
+        // decoded so far; a page degrades, it never comes back looking blank.
+        if !budget.spend(1) {
+            return;
+        }
         let o = &op.operands;
         match op.operator.as_str() {
             "q" => cstack.push(ctm),
@@ -1249,6 +1256,12 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
                 if stream.dict.get(b"Subtype").and_then(|x| x.as_name()).unwrap_or(b"") != b"Form" {
                     continue;
                 }
+                // Bill the descent before doing it: building the form's font map and
+                // decoding its stream dwarf a single operator's cost, and a form bomb pays
+                // exactly this per branch.
+                if !budget.spend(crate::FORM_DESCENT_COST + xmap.len() + fonts.len()) {
+                    return;
+                }
                 let fm = stream
                     .dict
                     .get(b"Matrix")
@@ -1264,7 +1277,7 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
                     let ff = build_fonts_from_resources(doc, &fr, raw);
                     let fx = xobjects_of(doc, &fr);
                     if let Ok(content) = lopdf::content::Content::decode(&stream.decompressed_content().unwrap_or_default()) {
-                        decode_spans(doc, &content.operations, &ff, &fx, fm.mul(ctm), raw, depth + 1, spans);
+                        decode_spans(doc, &content.operations, &ff, &fx, fm.mul(ctm), raw, depth + 1, spans, budget);
                     }
                 }
             }
@@ -1698,6 +1711,55 @@ pub fn extract_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Option<Str
 mod tests {
     use super::*;
 
+    /// An adversarial fixture (`tests/gen_fixtures.py::gen_form_bomb`), its bytes and page.
+    fn adversarial(name: &str) -> (Vec<u8>, Document, ObjectId) {
+        let path = format!("{}/../tests/fixtures_pdf/adversarial/{name}", env!("CARGO_MANIFEST_DIR"));
+        let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("{name} fixture must exist: {e}"));
+        let doc = Document::load_mem(&raw).unwrap_or_else(|e| panic!("{name} fixture must load: {e}"));
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        (raw, doc, page_id)
+    }
+
+    #[test]
+    fn a_self_referential_form_cannot_hang_the_text_walk() {
+        // `form_bomb.pdf`: form /X invokes /X twice, so the walk branches 2x per level and
+        // `MAX_FORM_DEPTH` alone allowed ~2^40 descents. This call never returned.
+        let (raw, doc, page_id) = adversarial("form_bomb.pdf");
+        let t = std::time::Instant::now();
+        let spans = extract_spans(&doc, page_id, &raw);
+        assert!(t.elapsed().as_secs() < 10, "form bomb ran for {:?} — the budget is not bounding it", t.elapsed());
+        assert!(spans.is_empty(), "the bomb shows no text, so none may be invented for it");
+    }
+
+    #[test]
+    fn a_form_drawn_three_times_yields_three_text_runs() {
+        // The control, and the reason this fix is a BUDGET and not a visited set: one form
+        // showing one word, invoked at three offsets, is three real runs on the page. An
+        // `ObjectId` dedupe would return 1 and silently drop two thirds of the text.
+        let (raw, doc, page_id) = adversarial("form_repeat.pdf");
+        let spans = extract_spans(&doc, page_id, &raw);
+        let hits: Vec<&Span> = spans.iter().filter(|s| s.text.contains("REPEAT")).collect();
+        let seen: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(hits.len(), 3, "a repeated form must show its text once per invocation, got {seen:?}");
+        let mut ys: Vec<i32> = hits.iter().map(|s| s.y.round() as i32).collect();
+        ys.sort_unstable();
+        ys.dedup();
+        assert_eq!(ys.len(), 3, "the three occurrences must land at three offsets, got {ys:?}");
+    }
+
+    #[test]
+    fn an_exhausted_work_budget_degrades_a_repeated_form_instead_of_emptying_it() {
+        // Degrade, don't vanish: a walk that runs out mid-page keeps the spans it decoded.
+        let (raw, doc, page_id) = adversarial("form_repeat.pdf");
+        let content = doc.get_and_decode_page_content(page_id).expect("fixture page has content");
+        let fonts = build_fonts(&doc, page_id, &raw);
+        let xmap = page_xobjects(&doc, page_id);
+        let mut spans = Vec::new();
+        let mut budget = crate::WalkBudget::new(700);
+        decode_spans(&doc, &content.operations, &fonts, &xmap, Mat::ID, &raw, 0, &mut spans, &mut budget);
+        assert!(!spans.is_empty(), "a tripped budget must not empty the page");
+        assert!(spans.len() < 3, "the budget must really bite, got {} spans", spans.len());
+    }
 
     /// The identity-ToUnicode gap: a Type0 font whose CIDs are Unicode code points, with a
     /// machine-generated identity table that stops short of two blocks. The six symbols in
