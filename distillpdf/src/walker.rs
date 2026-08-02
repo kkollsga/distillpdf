@@ -319,6 +319,108 @@ pub(crate) fn form_matrix(doc: &Document, stream: &lopdf::Stream) -> Mat {
         .unwrap_or(Mat::ID)
 }
 
+/// Is this annotation one a viewer does not draw? PDF 32000-1 §12.5.3 `/F` bit 2
+/// (**Hidden**, value 2): "do not display the annotation … and do not print it". Its ink
+/// is not on the page and its resources are not the page's.
+///
+/// Only Hidden is applied. `NoView` (bit 6) suppresses *screen* display but still prints,
+/// so an appearance behind it is real page content; treating it as absent would drop
+/// resources a printed page carries.
+fn annotation_hidden(annot: &Dictionary) -> bool {
+    annot.get(b"F").and_then(|o| o.as_i64()).unwrap_or(0) & 2 != 0
+}
+
+/// Push the appearance stream `val` resolves to, if it is one.
+fn push_appearance<'a>(doc: &'a Document, val: &Object, out: &mut Vec<(ObjectId, &'a lopdf::Stream)>) {
+    let Ok(id) = val.as_reference() else {
+        return; // a stream is always an indirect object (§7.3.8); nothing else is one
+    };
+    if let Ok(stream) = doc.get_object(id).and_then(|o| o.as_stream()) {
+        out.push((id, stream));
+    }
+}
+
+/// The **normal appearance streams** of a page's annotations: `/Annots` → `/AP` → `/N`.
+///
+/// An appearance stream is a Form XObject that is not reached from the page's content
+/// stream or its `/Resources` at all — it hangs off the annotation. Nothing in this crate
+/// used to walk it, so an image or a font that lived only inside a stamp's or a widget's
+/// appearance was reported by nobody.
+///
+/// The selection rules, in the order a viewer applies them (§12.5.5):
+/// - a **hidden** annotation ([`annotation_hidden`]) contributes nothing;
+/// - `/N` may be the appearance stream itself, or a **sub-dictionary keyed by appearance
+///   state** (a checkbox's `/Off` and `/Yes`, say). With `/AS` present exactly the named
+///   state is current — and if `/AS` names a state the dictionary does not define, nothing
+///   is displayed and nothing is returned. Without `/AS` no state is selected, so **every**
+///   state is returned: this is a collector's enumeration ("what resources does this page
+///   carry"), and a state-keyed appearance with no `/AS` is a malformed annotation whose
+///   states are all equally plausible.
+///
+/// Ordering is `/Annots` array order, then `/N` sub-dictionary order — both are stable
+/// document order, so the enumeration is deterministic.
+///
+/// **The appearance's resources are its own.** §12.5.5 gives the appearance stream the
+/// semantics of a Form XObject whose `/Resources` are the ones it declares; it does not
+/// inherit the page's. A consumer walking one uses [`ScopePolicy::OwnOnly`].
+///
+/// **Who consumes this, and who deliberately does not.** `extract::extract_images` does:
+/// an image that exists only inside a stamp's appearance is one of the page's images and
+/// nobody was reporting it. `extract::extract_fonts` does not (parity verdict recorded at
+/// that function). The three **render** walks (`img`, `vector`, `text`) do not, and that is
+/// a placement problem rather than an enumeration one: §12.5.5's appearance algorithm maps
+/// the transformed `/BBox` onto the annotation's `/Rect`, and nothing in this crate
+/// computes that mapping. The corpus stamp this gap was found on has `/BBox [0 0 13.9
+/// 17.4]` against `/Rect [344.9 456.1 348.9 461.1]` — painted without the mapping its image
+/// lands ~345pt from where a viewer puts it, and ink in the wrong place is a worse answer
+/// than no ink. Adopting rasters alone would also draw a widget's image while its own
+/// vector ink and text stayed invisible. Both are real work, not a rewire, and belong in a
+/// phase that owns the `/Rect` mapping.
+pub(crate) fn appearance_streams(doc: &Document, page_id: ObjectId) -> Vec<(ObjectId, &lopdf::Stream)> {
+    let mut out = Vec::new();
+    let Ok(page) = doc.get_dictionary(page_id) else {
+        return out;
+    };
+    let Some(annots) = page
+        .get(b"Annots")
+        .ok()
+        .and_then(|o| deref(doc, o))
+        .and_then(|o| o.as_array().ok())
+    else {
+        return out;
+    };
+    for a in annots {
+        let Some(annot) = deref(doc, a).and_then(|o| o.as_dict().ok()) else {
+            continue;
+        };
+        if annotation_hidden(annot) {
+            continue;
+        }
+        let Some(ap) = annot.get(b"AP").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) else {
+            continue;
+        };
+        let Ok(n) = ap.get(b"N") else { continue };
+        match deref(doc, n) {
+            Some(Object::Stream(_)) => push_appearance(doc, n, &mut out),
+            Some(Object::Dictionary(states)) => match annot.get(b"AS").ok().and_then(|o| o.as_name().ok()) {
+                // `/AS` selects one state; naming an absent one displays nothing.
+                Some(state) => {
+                    if let Ok(v) = states.get(state) {
+                        push_appearance(doc, v, &mut out);
+                    }
+                }
+                None => {
+                    for (_, v) in states.iter() {
+                        push_appearance(doc, v, &mut out);
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Descend into a Form XObject: the whole mechanic, in the one order, with the caps
 /// charged before any work is done.
 ///
@@ -577,6 +679,123 @@ mod tests {
                 Descend::Into(_)
             ));
         }
+    }
+
+    /// A page carrying `annots`, whose ids are already in `doc`.
+    fn page_with_annots(doc: &mut Document, annots: Vec<Object>) -> ObjectId {
+        doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Page", "Annots" => Object::Array(annots)
+        }))
+    }
+
+    /// An appearance stream (a Form XObject) whose content is `content`.
+    fn ap_stream(doc: &mut Document, content: &[u8]) -> ObjectId {
+        doc.add_object(Object::Stream(Stream::new(form_dict(Dictionary::new()), content.to_vec())))
+    }
+
+    #[test]
+    fn an_annotations_appearance_stream_is_found() {
+        let mut doc = Document::with_version("1.5");
+        let ap = ap_stream(&mut doc, b"/Im0 Do");
+        let annot = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Stamp",
+            "AP" => dictionary! { "N" => Object::Reference(ap) }
+        }));
+        let page = page_with_annots(&mut doc, vec![Object::Reference(annot)]);
+        let found = appearance_streams(&doc, page);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, ap, "the /AP /N stream nothing used to walk");
+    }
+
+    #[test]
+    fn a_hidden_annotation_contributes_no_appearance() {
+        let mut doc = Document::with_version("1.5");
+        let ap = ap_stream(&mut doc, b"/Im0 Do");
+        // /F bit 2 = Hidden: not displayed, not printed.
+        let annot = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Stamp", "F" => 2,
+            "AP" => dictionary! { "N" => Object::Reference(ap) }
+        }));
+        let page = page_with_annots(&mut doc, vec![Object::Reference(annot)]);
+        assert!(appearance_streams(&doc, page).is_empty());
+
+        // A neighbouring flag (Print, bit 3) must not read as Hidden.
+        let annot2 = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Stamp", "F" => 4,
+            "AP" => dictionary! { "N" => Object::Reference(ap) }
+        }));
+        let page2 = page_with_annots(&mut doc, vec![Object::Reference(annot2)]);
+        assert_eq!(appearance_streams(&doc, page2).len(), 1);
+    }
+
+    #[test]
+    fn a_state_keyed_appearance_follows_slash_as() {
+        let mut doc = Document::with_version("1.5");
+        let off = ap_stream(&mut doc, b"");
+        let on = ap_stream(&mut doc, b"/Im0 Do");
+        let states = dictionary! { "Off" => Object::Reference(off), "On" => Object::Reference(on) };
+
+        // /AS names the current state: exactly that one.
+        let sel = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "AS" => "On",
+            "AP" => dictionary! { "N" => states.clone() }
+        }));
+        let page = page_with_annots(&mut doc, vec![Object::Reference(sel)]);
+        let found = appearance_streams(&doc, page);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, on);
+
+        // /AS names a state the dictionary does not define: nothing is displayed.
+        let missing = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "AS" => "Nope",
+            "AP" => dictionary! { "N" => states.clone() }
+        }));
+        let page = page_with_annots(&mut doc, vec![Object::Reference(missing)]);
+        assert!(appearance_streams(&doc, page).is_empty());
+
+        // No /AS at all: no state is current, so a collector takes every state.
+        let none = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget",
+            "AP" => dictionary! { "N" => states }
+        }));
+        let page = page_with_annots(&mut doc, vec![Object::Reference(none)]);
+        let mut ids: Vec<ObjectId> = appearance_streams(&doc, page).into_iter().map(|(id, _)| id).collect();
+        ids.sort();
+        assert_eq!(ids, {
+            let mut v = vec![off, on];
+            v.sort();
+            v
+        });
+    }
+
+    #[test]
+    fn a_page_without_annots_or_appearances_yields_nothing() {
+        let mut doc = Document::with_version("1.5");
+        let bare = doc.add_object(Object::Dictionary(dictionary! { "Type" => "Page" }));
+        assert!(appearance_streams(&doc, bare).is_empty());
+        // An annotation with no /AP, and one whose /AP has no /N.
+        let a1 = doc.add_object(Object::Dictionary(dictionary! { "Type" => "Annot", "Subtype" => "Link" }));
+        let a2 = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Link", "AP" => dictionary! { "D" => Object::Null }
+        }));
+        let page = page_with_annots(&mut doc, vec![Object::Reference(a1), Object::Reference(a2)]);
+        assert!(appearance_streams(&doc, page).is_empty());
+    }
+
+    #[test]
+    fn an_indirect_annots_array_and_annot_dict_are_followed() {
+        // `/Annots 5 0 R` with `5 0 obj [6 0 R]` is the common spelling.
+        let mut doc = Document::with_version("1.5");
+        let ap = ap_stream(&mut doc, b"/Im0 Do");
+        let annot = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Stamp",
+            "AP" => dictionary! { "N" => Object::Reference(ap) }
+        }));
+        let arr = doc.add_object(Object::Array(vec![Object::Reference(annot)]));
+        let page = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Page", "Annots" => Object::Reference(arr)
+        }));
+        assert_eq!(appearance_streams(&doc, page).len(), 1);
     }
 
     #[test]

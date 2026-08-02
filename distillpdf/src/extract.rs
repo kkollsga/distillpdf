@@ -49,7 +49,9 @@ pub struct TableInfo {
 
 /// Every resource dictionary a page can reach: its own `/Resources` (plus whatever it
 /// inherits from the page tree) and then, transitively, the `/Resources` of every
-/// `/Subtype /Form` XObject it references.
+/// `/Subtype /Form` XObject it references. Annotation appearance streams are **not**
+/// reached from here — they hang off `/Annots`, and [`appearance_resource_dicts`] is the
+/// walk that finds them.
 ///
 /// This is deliberately *not* what `img.rs` / `text.rs` do. Those are content-stream
 /// interpreters: they decode operators because they need placement (the CTM, the form's
@@ -64,7 +66,6 @@ pub struct TableInfo {
 /// nested forms are appended breadth-first in `/XObject` dictionary order. A visited-
 /// `ObjectId` set cuts reference cycles; `crate::MAX_FORM_DEPTH` caps nesting.
 fn page_resource_dicts(doc: &Document, page_id: ObjectId) -> Vec<&Dictionary> {
-    let mut out: Vec<&Dictionary> = Vec::new();
     let mut queue: VecDeque<(&Dictionary, u32)> = VecDeque::new();
     let mut seen: HashSet<ObjectId> = HashSet::new();
 
@@ -83,7 +84,45 @@ fn page_resource_dicts(doc: &Document, page_id: ObjectId) -> Vec<&Dictionary> {
             }
         }
     }
+    resource_bfs(doc, queue, &mut seen)
+}
 
+/// Every resource dictionary reachable from an annotation's **appearance stream**
+/// (`/Annots` → `/AP` → `/N`), transitively through the Form XObjects it references.
+///
+/// An appearance stream hangs off the annotation, not off the page's `/Resources` — so
+/// nothing [`page_resource_dicts`] reaches can ever name an image that lives only in a
+/// stamp's or a widget's appearance. `extract_images` appends these dictionaries **after**
+/// the page's own, which is why every `(page, index)` a page already reported is unchanged
+/// and appearance rows land at the end.
+///
+/// `extract_fonts` deliberately does **not** consume this — see its doc comment.
+fn appearance_resource_dicts(doc: &Document, page_id: ObjectId) -> Vec<&Dictionary> {
+    let mut queue: VecDeque<(&Dictionary, u32)> = VecDeque::new();
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    for (id, stream) in crate::walker::appearance_streams(doc, page_id) {
+        if !seen.insert(id) {
+            continue; // one appearance stream shared by several annotations
+        }
+        // §12.5.5: an appearance stream's resources are its OWN — it inherits nothing from
+        // the page, the same rule the nested-form step below applies.
+        if let Some(fr) = sub_dict(doc, &stream.dict, b"Resources") {
+            queue.push_back((fr, 0));
+        }
+    }
+    resource_bfs(doc, queue, &mut seen)
+}
+
+/// The shared body of both resource walks: drain `queue` breadth-first, appending each
+/// dictionary and then queueing the own-`/Resources` of every `/Subtype /Form` XObject it
+/// names. `seen` cuts reference cycles (and is pre-seeded by the caller with whatever it
+/// has already visited); [`crate::MAX_FORM_DEPTH`] caps nesting.
+fn resource_bfs<'a>(
+    doc: &'a Document,
+    mut queue: VecDeque<(&'a Dictionary, u32)>,
+    seen: &mut HashSet<ObjectId>,
+) -> Vec<&'a Dictionary> {
+    let mut out: Vec<&Dictionary> = Vec::new();
     while let Some((res, depth)) = queue.pop_front() {
         out.push(res);
         if depth >= crate::MAX_FORM_DEPTH {
@@ -177,6 +216,11 @@ fn walk_drawn(
 /// `Do` operands decide membership and [`page_resource_dicts`] is left to do what it is
 /// good at: resolving a name to an object and fixing the report order.
 ///
+/// A page's **annotation appearances** are walked too, each as a form in its own right:
+/// `/Annots → /AP /N` is a content stream a viewer paints onto the page, and it is not
+/// reachable from the page's content stream or its `/Resources`. Its names resolve in its
+/// own `/Resources` alone ([`crate::walker::ScopePolicy::OwnOnly`], §12.5.5).
+///
 /// `None` when the page's content stream can't be read or parsed at all — the caller then
 /// falls back to plain reachability rather than silently reporting an image-less page.
 fn drawn_images(doc: &Document, page_id: ObjectId) -> Option<HashSet<ObjectId>> {
@@ -198,6 +242,19 @@ fn drawn_images(doc: &Document, page_id: ObjectId) -> Option<HashSet<ObjectId>> 
     let mut out = HashSet::new();
     let mut seen = HashSet::new();
     walk_drawn(doc, &ops.operations, &xmap, 0, &mut seen, &mut out);
+    for (id, ap) in crate::walker::appearance_streams(doc, page_id) {
+        if !seen.insert(id) {
+            continue; // shared between annotations, or already reached from the content
+        }
+        let Some(scope) = crate::walker::form_scope(doc, ap, &crate::walker::XMap::new(), crate::walker::ScopePolicy::OwnOnly)
+        else {
+            continue; // no /Resources: nothing its names could resolve against
+        };
+        if let Some(ops) = crate::walker::form_ops(ap) {
+            // The appearance stream is itself one form level below the page's content.
+            walk_drawn(doc, &ops, &scope.xobjects, 1, &mut seen, &mut out);
+        }
+    }
     Some(out)
 }
 
@@ -218,7 +275,14 @@ fn image_filters(dict: &Dictionary) -> Vec<String> {
 /// image in the document on every page.
 ///
 /// [`page_resource_dicts`] still drives enumeration, so the reported `(page, index)`
-/// ordering is unchanged wherever the drawn set equals the reachable set.
+/// ordering is unchanged wherever the drawn set equals the reachable set; the annotation
+/// appearances ([`appearance_resource_dicts`]) are enumerated after it, so an image that
+/// exists only inside a stamp's or a widget's `/AP /N` stream is reported at the end.
+/// An appearance image that the page's resource tree *also* reaches (a producer sharing one
+/// `/Resources` across the file) is reported from there instead, at its ordinary place in
+/// resource-dictionary order — an annotation appearance widens the **drawn set**, and a
+/// newly-drawn image takes the index its enumeration position gives it, exactly like any
+/// other.
 ///
 /// `data` is a blob the caller can open, not the verbatim stream: a coded image is peeled
 /// back to its codec payload (so a `[/FlateDecode /DCTDecode]` stream is a JPEG file, not
@@ -237,7 +301,11 @@ pub fn extract_images(doc: &Document) -> Vec<ImageInfo> {
         // before this walk existed is unchanged.
         let mut seen: HashSet<ObjectId> = HashSet::new();
         let mut from_this_dict: Vec<ObjectId> = Vec::new();
-        for res in page_resource_dicts(doc, page_id) {
+        // The page's own resource tree first, so every `(page, index)` a page already
+        // reported keeps it; the annotation appearances are appended after.
+        let mut dicts = page_resource_dicts(doc, page_id);
+        dicts.extend(appearance_resource_dicts(doc, page_id));
+        for res in dicts {
             seen.extend(from_this_dict.drain(..));
             let Some(xobjects) = sub_dict(doc, res, b"XObject") else {
                 continue;
@@ -1169,6 +1237,15 @@ fn font_embedded(doc: &Document, dict: &Dictionary) -> bool {
 /// (and inherited) `/Resources` and stops there: an astro-ph preprint in the corpus whose
 /// page `/Resources` carries an empty `/Font <<>>` and puts all content in `/TPL*` forms
 /// returned zero rows for all 166 pages, and ~22 of 54 documents missed fonts partially.
+///
+/// **Annotation appearance streams are deliberately not enumerated here**, unlike
+/// [`extract_images`]. The reference this pillar is measured against does not report them
+/// either: `fw9_form.pdf` in the corpus has eight `/Widget` annotations whose appearance
+/// streams set `/ZaDb` (ZapfDingbats, the checkbox tick) from their own `/Resources`, and
+/// pymupdf's `get_fonts()` returns the same six page fonts we do — not seven. A font a
+/// widget uses to draw its own tick is a property of the form field, not of the page's
+/// text, and adding it would put this pillar *ahead* of the parity target rather than at
+/// it. [`appearance_resource_dicts`] exists and is one call away if that verdict changes.
 pub fn extract_fonts(doc: &Document) -> Vec<FontInfo> {
     let mut out = Vec::new();
     for (&pno, &page_id) in &doc.get_pages() {
@@ -1363,6 +1440,47 @@ mod tests {
             .map(|x| x.iter().count())
             .sum();
         assert_eq!(reachable, 5, "page + form resources list 3 + 2 XObject entries");
+    }
+
+    #[test]
+    fn images_that_exist_only_in_an_annotation_appearance_are_reported() {
+        // `/Annots -> /AP /N` is a content stream nothing in this crate used to walk, so an
+        // image inside a stamp's or a widget's appearance was reported by nobody.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/annot_appearance.pdf");
+        let doc = Document::load(path).expect("annot_appearance.pdf fixture must load");
+        let dims: Vec<(u32, usize, i64, i64)> =
+            extract_images(&doc).iter().map(|i| (i.page, i.index, i.width, i.height)).collect();
+        assert_eq!(
+            dims,
+            vec![(1, 0, 40, 30), (1, 1, 10, 10), (1, 2, 12, 12), (1, 3, 15, 15), (1, 4, 16, 16)],
+            "the page's own image keeps index 0; the appearances are appended after it"
+        );
+        // What must NOT be there, and why each would be a different bug:
+        let sizes: Vec<i64> = extract_images(&doc).iter().map(|i| i.width).collect();
+        assert!(!sizes.contains(&11), "11x11 sits in the appearance's /Resources but is never drawn");
+        assert!(!sizes.contains(&13), "13x13 is the appearance state /AS did NOT select");
+        assert!(!sizes.contains(&14), "14x14 belongs to a HIDDEN (/F bit 2) annotation");
+    }
+
+    #[test]
+    fn appearance_stream_fonts_stay_out_of_the_font_report() {
+        // The deliberate asymmetry with `extract_images`, pinned so it cannot drift: a
+        // widget's own tick font is a property of the form field, and the parity reference
+        // (pymupdf `get_fonts()`) does not report it either. `annot_appearance.pdf` has no
+        // appearance fonts, so this checks the mechanism on the resource walk instead.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/annot_appearance.pdf");
+        let doc = Document::load(path).expect("annot_appearance.pdf fixture must load");
+        let page1 = *doc.get_pages().get(&1).expect("page 1");
+        assert_eq!(
+            page_resource_dicts(&doc, page1).len(),
+            1,
+            "extract_fonts sees the page's own /Resources only — no appearance dictionary"
+        );
+        assert_eq!(
+            appearance_resource_dicts(&doc, page1).len(),
+            4,
+            "stamp + /AS-selected state + both un-selected-/AS states; the hidden annot contributes none"
+        );
     }
 
     /// `tests/gen_fixtures.py::gen_colorspace_images` — Flate rasters in the four colour

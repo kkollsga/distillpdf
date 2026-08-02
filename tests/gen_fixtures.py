@@ -1274,6 +1274,102 @@ def gen_unfiltered_form():
     }
 
 
+def gen_annot_appearance():
+    """Hand-written PDF whose images live ONLY in annotation appearance streams.
+
+    ``/Annots -> /AP /N`` is a content stream a viewer paints onto the page, and it is
+    reachable neither from the page's content stream nor from its ``/Resources``. Nothing
+    used to walk it, so an image inside a stamp's or a widget's appearance was reported by
+    nobody. A corpus preprint has exactly this: a 10x10 raster drawn by a ``/Stamp``
+    annotation's appearance and invisible to ``extract_images()``.
+
+    The page's own content paints ONE image (``/ImPage``) so the ordering rule stays
+    checkable, then four annotations exercise the selection rules:
+
+      1. ``/Stamp``           -> ``/AP /N`` is the stream itself; its form draws ``/ImStamp``
+         from its own ``/Resources`` (and lists ``/ImNever``, which it does not draw).
+      2. ``/Widget``          -> ``/AP /N`` is a STATE dictionary and ``/AS /On`` selects
+         one: only ``/ImOn`` counts, never ``/ImOff``.
+      3. ``/Stamp`` ``/F 2``  -> Hidden: contributes nothing at all.
+      4. ``/Widget``          -> a state dictionary with NO ``/AS``: no state is current, so
+         a collector takes every state (``/ImS1`` and ``/ImS2``).
+
+    reportlab has no way to attach an appearance stream carrying an image, so this is
+    assembled by hand."""
+    pdf = os.path.join(OUT, "annot_appearance.pdf")
+    page_content = (
+        b"BT /F1 19 Tf 72 712 Td (Images Inside Annotation Appearances) Tj ET\n"
+        b"q 120 0 0 90 72 560 cm /ImPage Do Q\n"
+        b"BT /F1 10.5 Tf 72 520 Td "
+        b"(The rasters below this line exist only inside annotation appearance streams.) Tj ET"
+    )
+    stamp_ap = b"q 40 0 0 40 4 4 cm /ImStamp Do Q"
+    on_ap = b"q 8 0 0 8 0 0 cm /ImOn Do Q"
+    off_ap = b"q 8 0 0 8 0 0 cm /ImOff Do Q"
+    hidden_ap = b"q 8 0 0 8 0 0 cm /ImHidden Do Q"
+    s1_ap = b"q 8 0 0 8 0 0 cm /ImS1 Do Q"
+    s2_ap = b"q 8 0 0 8 0 0 cm /ImS2 Do Q"
+
+    def _form(num, res, content):
+        return (b"<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 48 48] "
+                b"/Resources %s /Length %d >>\nstream\n%s\nendstream"
+                % (res, len(content), content))
+
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 6 0 R >> /XObject << /ImPage 5 0 R >> >> /Contents 4 0 R "
+            b"/Annots [10 0 R 12 0 R 16 0 R 18 0 R] >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(page_content), page_content),
+        5: _raw_rgb_image(40, 30),    # painted by the page itself -> index 0
+        6: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        # 1. a /Stamp whose appearance draws one image and lists another it never draws
+        7: _raw_rgb_image(10, 10),    # /ImStamp  -> reported
+        8: _raw_rgb_image(11, 11),    # /ImNever  -> in the appearance's resources, undrawn
+        9: _form(9, b"<< /XObject << /ImStamp 7 0 R /ImNever 8 0 R >> >>", stamp_ap),
+        10: (b"<< /Type /Annot /Subtype /Stamp /Rect [72 420 120 468] /F 4 "
+             b"/AP << /N 9 0 R >> >>"),
+        # 2. a /Widget with a state dictionary and /AS selecting one state
+        11: _raw_rgb_image(12, 12),   # /ImOn   -> reported (the selected state)
+        13: _raw_rgb_image(13, 13),   # /ImOff  -> the unselected state
+        14: _form(14, b"<< /XObject << /ImOn 11 0 R >> >>", on_ap),
+        15: _form(15, b"<< /XObject << /ImOff 13 0 R >> >>", off_ap),
+        12: (b"<< /Type /Annot /Subtype /Widget /Rect [140 420 156 436] /F 4 /AS /On "
+             b"/AP << /N << /On 14 0 R /Off 15 0 R >> >> >>"),
+        # 3. a HIDDEN annotation (/F bit 2): nothing it references is on the page
+        19: _raw_rgb_image(14, 14),   # /ImHidden -> must NEVER be reported
+        20: _form(20, b"<< /XObject << /ImHidden 19 0 R >> >>", hidden_ap),
+        16: (b"<< /Type /Annot /Subtype /Stamp /Rect [180 420 196 436] /F 2 "
+             b"/AP << /N 20 0 R >> >>"),
+        # 4. a state dictionary with NO /AS: no state is current -> every state counts
+        21: _raw_rgb_image(15, 15),   # /ImS1 -> reported
+        22: _raw_rgb_image(16, 16),   # /ImS2 -> reported
+        23: _form(23, b"<< /XObject << /ImS1 21 0 R >> >>", s1_ap),
+        24: _form(24, b"<< /XObject << /ImS2 22 0 R >> >>", s2_ap),
+        18: (b"<< /Type /Annot /Subtype /Widget /Rect [220 420 236 436] /F 4 "
+             b"/AP << /N << /S1 23 0 R /S2 24 0 R >> >> >>"),
+        # 17 is unused: /_assemble_pdf needs contiguous object numbers.
+        17: b"<< /Type /Null >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["annot_appearance.pdf"] = {
+        # (page, index) order: the page's own content first, appearances appended after.
+        "images": [
+            {"index": 0, "width": 40, "height": 30},   # painted by the page
+            {"index": 1, "width": 10, "height": 10},   # /Stamp appearance
+            {"index": 2, "width": 12, "height": 12},   # /Widget, /AS-selected state
+            {"index": 3, "width": 15, "height": 15},   # no /AS: first state
+            {"index": 4, "width": 16, "height": 16},   # no /AS: second state
+        ],
+        "never_reported": [
+            {"width": 11, "height": 11, "why": "in the appearance's resources, never drawn"},
+            {"width": 13, "height": 13, "why": "the state /AS did not select"},
+            {"width": 14, "height": 14, "why": "a hidden (/F bit 2) annotation"},
+        ],
+    }
+
+
 def gen_no_spurious_figs():
     """Precision gate: a prose page with incidental tiny marks (a short underline rule, a
     small box) and NO figure caption anywhere. Weak vector candidates must NOT be promoted
@@ -2369,6 +2465,7 @@ def main():
     gen_form_inherit()
     gen_form_font()
     gen_unfiltered_form()
+    gen_annot_appearance()
     gen_no_spurious_figs()
     gen_links()
     gen_pagelabels()

@@ -21,6 +21,7 @@ UNDRAWN_IMAGE = os.path.join(FIX, "undrawn_image.pdf")
 COLORSPACE_IMAGES = os.path.join(FIX, "colorspace_images.pdf")
 CMYK_JPEG = os.path.join(FIX, "cmyk_jpeg.pdf")
 DECODE_JPEG = os.path.join(FIX, "decode_jpeg.pdf")
+ANNOT_APPEARANCE = os.path.join(FIX, "annot_appearance.pdf")
 
 
 def test_open_and_page_count():
@@ -262,6 +263,33 @@ def test_extract_images_reports_only_what_the_page_draws():
     # dictionaries but painted by nobody.
     assert all((i["width"], i["height"]) not in {(41, 31), (43, 33)} for i in imgs)
     assert all(len(i["data"]) > 0 for i in imgs)
+
+
+def test_extract_images_finds_annotation_appearance_streams():
+    """``/Annots -> /AP /N`` is a content stream a viewer paints onto the page and that
+    nothing in the pipeline used to walk, so an image living only inside a stamp's or a
+    widget's appearance was reported by nobody. The fixture pins the selection rules with
+    one distractor per rule."""
+    imgs = distillpdf.Pdf.open(ANNOT_APPEARANCE).extract_images()
+    assert [(i["page"], i["index"], i["width"], i["height"]) for i in imgs] == [
+        (1, 0, 40, 30),   # painted by the page's own content: keeps index 0
+        (1, 1, 10, 10),   # a /Stamp annotation's appearance stream
+        (1, 2, 12, 12),   # a /Widget whose /AS selects this appearance state
+        (1, 3, 15, 15),   # a state dictionary with no /AS: every state counts
+        (1, 4, 16, 16),
+    ]
+    sizes = {(i["width"], i["height"]) for i in imgs}
+    assert (11, 11) not in sizes, "in the appearance's /Resources but never drawn"
+    assert (13, 13) not in sizes, "the appearance state /AS did not select"
+    assert (14, 14) not in sizes, "a hidden (/F bit 2) annotation draws nothing"
+    assert all(len(i["data"]) > 0 for i in imgs)
+
+
+def test_extract_fonts_ignores_annotation_appearances():
+    """The deliberate asymmetry with images: a widget's own tick font is a property of the
+    form field, not of the page's text, and the parity reference does not report it."""
+    fonts = distillpdf.Pdf.open(ANNOT_APPEARANCE).extract_fonts()
+    assert [f["name"] for f in fonts] == ["F1"]
 
 
 def test_extract_tables():

@@ -710,5 +710,51 @@
       1
     ],
     "paths_per_page": 8
+  },
+  "annot_appearance.pdf": {
+    "images": [
+      {
+        "index": 0,
+        "width": 40,
+        "height": 30
+      },
+      {
+        "index": 1,
+        "width": 10,
+        "height": 10
+      },
+      {
+        "index": 2,
+        "width": 12,
+        "height": 12
+      },
+      {
+        "index": 3,
+        "width": 15,
+        "height": 15
+      },
+      {
+        "index": 4,
+        "width": 16,
+        "height": 16
+      }
+    ],
+    "never_reported": [
+      {
+        "width": 11,
+        "height": 11,
+        "why": "in the appearance's resources, never drawn"
+      },
+      {
+        "width": 13,
+        "height": 13,
+        "why": "the state /AS did not select"
+      },
+      {
+        "width": 14,
+        "height": 14,
+        "why": "a hidden (/F bit 2) annotation"
+      }
+    ]
   }
 }
