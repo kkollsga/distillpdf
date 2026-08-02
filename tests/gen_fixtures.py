@@ -17,6 +17,7 @@ anchors, which reportlab does not emit).
 
     python tests/gen_fixtures.py        # needs reportlab + pillow (dev only)
 """
+import io
 import json
 import os
 import re
@@ -950,6 +951,60 @@ def gen_paint_order():
         # The figure whose raster is painted FIRST must show the panel on top of it, and
         # the one whose raster is painted LAST must show the raster on top of the panel.
         "panel_fill": "#808080",
+    }
+
+
+def gen_smask_panel():
+    """A JPEG cut-out over a coloured panel: the ``/SMask``'s transparency IS the figure.
+
+    ``img.rs::rgba_uri`` composited the soft mask and then, whenever the source was
+    ``DCTDecode``, flattened the RGBA onto **white** and re-encoded as JPEG — justified by
+    "the HTML render background, so any edge/feather transparency looks identical". That
+    premise holds for a raster laid on the page and fails inside a figure's ``<svg>``, where
+    what sits behind the raster is the figure's own coloured panel: the flattening painted
+    over it, and the panel vanished from the output.
+
+    One 300x180 figure (stroked frame + 5 ticks + the panel = 7 paths, clearing
+    ``MIN_PATHS``), painted panel-then-raster so the raster is on top, with a 160x120 pt
+    ``DCTDecode`` raster wholly inside a teal panel. The mask is a hard split — the LEFT
+    half fully opaque, the RIGHT half fully transparent — so the panel must show through
+    exactly the right half and nothing about the assertion depends on feathering. (The mask
+    is deliberately BINARY: the corpus case that surfaced this is a cut-out, not a soft
+    edge, and a fix keyed on "is the mask soft" would leave it broken.)"""
+    pdf = os.path.join(OUT, "smask_panel.pdf")
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 64), (220, 30, 40)).save(buf, "JPEG", quality=95, subsampling=0)
+    jpeg = buf.getvalue()
+    # 64x64 gray mask: columns 0..31 opaque, 32..63 transparent.
+    mask = bytes(255 if x < 32 else 0 for _ in range(64) for x in range(64))
+
+    frame = b"q 0 0 0 RG 1 w 72 500 300 180 re S Q"
+    ticks = b"\n".join(b"q 0 0 0 RG 1 w %d 500 m %d 512 l S Q" % (72 + 20 * i, 72 + 20 * i)
+                       for i in range(1, 6))
+    panel = b"q 0.2 0.6 0.6 rg 130 520 180 140 re f Q"
+    raster = b"q 160 0 0 120 140 530 cm /Im0 Do Q"
+    stream = b"\n".join([
+        b"BT /F1 12 Tf 72 720 Td (A JPEG cut-out must not erase the panel behind it.) Tj ET",
+        frame, ticks, panel, raster,
+    ])
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 7 0 R >> /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+        5: (b"<< /Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceRGB "
+            b"/BitsPerComponent 8 /Filter /DCTDecode /SMask 6 0 R /Length %d >>\nstream\n%s\nendstream"
+            % (len(jpeg), jpeg)),
+        6: _flate_image(6, 64, 64, b"/DeviceGray", 8, mask),
+        7: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["smask_panel.pdf"] = {
+        "panel_fill": "#339999",
+        "image_rgb": [220, 30, 40],
+        # The composited <image> must be a lossless PNG carrying alpha, not an opaque JPEG.
+        "expect_format": "png",
     }
 
 
@@ -2746,6 +2801,7 @@ def main():
     gen_separation()
     gen_render_samples()
     gen_cmyk_jpeg()
+    gen_smask_panel()
     gen_decode_jpeg()
     gen_form_inherit()
     gen_form_font()

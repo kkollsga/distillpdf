@@ -842,5 +842,14 @@
       null
     ],
     "paths": 6
+  },
+  "smask_panel.pdf": {
+    "panel_fill": "#339999",
+    "image_rgb": [
+      220,
+      30,
+      40
+    ],
+    "expect_format": "png"
   }
 }

@@ -313,14 +313,37 @@ fn jpeg_uri(rgb: image::RgbImage) -> Option<String> {
     Some(format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(out.into_inner())))
 }
 
+/// True when a composited raster's alpha carries no information — every pixel is opaque
+/// (within JPEG/resample noise), so flattening it onto any background is a no-op.
+///
+/// This is the ONLY condition under which a soft-masked raster may be flattened. The test
+/// this replaced was "is the source a JPEG", which discards the mask outright; a test on
+/// whether the mask is *soft* would be just as wrong — the corpus case
+/// (`cs_CV_2606_02580` p9, `/Im1` = obj 715) is a cut-out mask that is 85% fully
+/// transparent, 14% fully opaque and 0.7% anything else, i.e. as BINARY as a mask gets, and
+/// it is precisely those 85% that must stay transparent for the panel behind them to show.
+fn alpha_is_opaque(img: &image::RgbaImage) -> bool {
+    let raw: &[u8] = img.as_raw();
+    // 250, not 255: a mask decoded from a DCT stream or resampled to the base's dimensions
+    // carries a few LSBs of noise, and re-encoding a photograph as PNG to honour that is
+    // pure size for no visible transparency.
+    !raw.chunks_exact(4).any(|p| p[3] < 250)
+}
+
 /// Encode a (possibly composited) RGBA raster to a data URI, matching the SOURCE format.
-/// JPEG-sourced content is flattened onto WHITE (the HTML render background, so any
-/// edge/feather transparency from a soft mask looks identical) and re-encoded as JPEG —
-/// far smaller than lossless PNG for photographic content, and adds no new quality loss
-/// over the already-lossy source. Flate/line-art (lossless source) keeps its alpha in a
-/// lossless PNG.
+/// JPEG-sourced content whose mask leaves it fully opaque is flattened and re-encoded as
+/// JPEG — far smaller than lossless PNG for photographic content, and it adds no new
+/// quality loss over the already-lossy source. Anything with real transparency keeps its
+/// alpha in a lossless PNG, whatever the source format.
+///
+/// The white-flatten this replaced was justified by "the HTML render background, so any
+/// edge/feather transparency from a soft mask looks identical". That premise holds for a
+/// raster laid on the page and fails inside a figure's `<svg>`, where what sits behind the
+/// raster is the figure's own coloured panel — and the flattening paints over it. The
+/// transparency is the *authored* compositing, so it is kept in both places rather than
+/// decided per emission site: the two paths must not disagree about the same image.
 fn rgba_uri(img: image::RgbaImage, jpeg_src: bool) -> Option<String> {
-    if jpeg_src {
+    if jpeg_src && alpha_is_opaque(&img) {
         let (w, h) = (img.width(), img.height());
         let mut rgb = image::RgbImage::new(w, h);
         let src: &[u8] = img.as_raw();
@@ -971,6 +994,61 @@ mod tests {
             assert_eq!(placed.len(), 1, "page {page} paints exactly one raster");
             assert_eq!(uri_rgb(&placed[0].uri).width(), want_w);
         }
+    }
+
+    #[test]
+    fn a_jpeg_cut_out_keeps_the_alpha_that_lets_the_panel_behind_it_show() {
+        // `tests/gen_fixtures.py::gen_smask_panel`: a flat crimson DCTDecode raster whose
+        // `/SMask` is opaque over its left half and transparent over its right, drawn over a
+        // teal panel inside a vector figure. `rgba_uri` flattened any JPEG-sourced RGBA onto
+        // WHITE and re-encoded as JPEG, so the composited `<image>` came out fully opaque and
+        // the panel it was supposed to sit on was erased. Verified failing before the fix:
+        // the emitted href is `data:image/jpeg` and every pixel of the right half is white.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/smask_panel.pdf");
+        let doc = Document::load(path).expect("smask_panel.pdf fixture must load");
+        let raw = std::fs::read(path).expect("fixture readable");
+        let html = crate::html::to_html(&doc, &raw, crate::html::Mode::Page, true, true);
+        let href = html
+            .split("<image href=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("the figure must composite the raster as an <svg> <image>");
+        assert!(href.starts_with("data:image/png;base64,"), "composited raster is not lossless: {}", &href[..30.min(href.len())]);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(href.split_once(";base64,").expect("base64 payload").1)
+            .expect("valid base64");
+        let im = image::load_from_memory(&bytes).expect("payload decodes").to_rgba8();
+        let (w, h) = im.dimensions();
+        let left = im.get_pixel(w / 4, h / 2).0;
+        let right = im.get_pixel(w * 3 / 4, h / 2).0;
+        assert_eq!(left[3], 255, "the masked-in half must stay opaque");
+        for (g, want) in left[..3].iter().zip([220u8, 30, 40]) {
+            assert!(g.abs_diff(want) <= 8, "masked-in colour {left:?}");
+        }
+        assert_eq!(right[3], 0, "the masked-out half must stay transparent, got {right:?}");
+        // And the panel is still painted, so there is something for that transparency to reveal.
+        assert!(html.contains("#339999"), "the teal panel must survive alongside the raster");
+    }
+
+    #[test]
+    fn an_opaque_mask_leaves_a_jpeg_a_jpeg() {
+        // The size half of the same rule: `alpha_is_opaque` is what keeps the 792 embedded
+        // JPEGs of the corpus from all becoming PNG. A mask that masks nothing must not cost
+        // a re-encode — `cmyk_jpeg.pdf` carries no `/SMask` at all, so it takes the
+        // passthrough/re-encode branch and must stay `image/jpeg`.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/cmyk_jpeg.pdf");
+        let doc = Document::load(path).expect("cmyk_jpeg.pdf fixture must load");
+        let page_id = *doc.get_pages().values().next().expect("fixture has a page");
+        let placed = positioned_images(&doc, page_id, true);
+        assert!(placed[0].uri.starts_with("data:image/jpeg;"), "an unmasked JPEG must not become a PNG");
+        // Unit-level: the predicate itself, at the 250 noise floor it is written to.
+        let opaque = image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]));
+        assert!(alpha_is_opaque(&opaque));
+        let noisy = image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 251]));
+        assert!(alpha_is_opaque(&noisy), "resample/DCT noise in the mask is not transparency");
+        let mut holed = image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]));
+        holed.put_pixel(0, 0, image::Rgba([1, 2, 3, 0]));
+        assert!(!alpha_is_opaque(&holed), "one genuinely transparent pixel is transparency");
     }
 
     #[test]
