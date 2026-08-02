@@ -546,6 +546,131 @@ fn codec_payload(stream: &lopdf::Stream, filters: &[String]) -> Vec<u8> {
     s.decompressed_content().unwrap_or_else(|_| stream.content.clone())
 }
 
+/// True when the image dict carries an inverting `/Decode` array (`[1 0 …]`).
+fn decode_inverts(doc: &Document, dict: &Dictionary) -> bool {
+    match dict.get(b"Decode").ok().and_then(|o| resolve(doc, o)) {
+        Some(Object::Array(a)) if a.len() >= 2 => {
+            let n = |o: &Object| match o {
+                Object::Integer(i) => *i as f32,
+                Object::Real(r) => *r,
+                _ => 0.0,
+            };
+            n(&a[0]) > n(&a[1])
+        }
+        _ => false,
+    }
+}
+
+/// Component count from a JPEG's SOF (start-of-frame) marker, without decoding pixels.
+/// `4` => CMYK/YCCK, `3` => RGB/YCbCr, `1` => grayscale.
+fn jpeg_components(buf: &[u8]) -> Option<u8> {
+    let mut i = 2; // skip SOI
+    while i + 4 <= buf.len() {
+        if buf[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = buf[i + 1];
+        if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
+            i += 2; // standalone marker, no length field
+            continue;
+        }
+        let len = ((buf[i + 2] as usize) << 8) | buf[i + 3] as usize;
+        // SOF0/1/2/3, 5/6/7, 9/10/11, 13/14/15 carry the frame header; DHT/DAC/DNL don't.
+        if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) && i + 9 < buf.len() {
+            return Some(buf[i + 9]); // marker(2) len(2) precision(1) height(2) width(2) Nf(1)
+        }
+        if marker == 0xDA {
+            break; // SOS
+        }
+        i += 2 + len;
+    }
+    None
+}
+
+/// Decode a `DCTDecode` payload to RGB8 under **PDF** semantics, which are not the
+/// standalone-JPEG-file semantics every general-purpose decoder implements.
+///
+/// A JPEG file that carries an Adobe APP14 marker and four components is, by the
+/// standalone convention, stored with inverted CMYK — so libjpeg-derived decoders (PIL,
+/// `jpeg-decoder`) complement all four channels on the way out. PDF says something else:
+/// §7.4.8 makes the filter's output the *sample values*, with the APP14 transform byte
+/// selecting only the colour transform (0 none, 1 YCbCr, 2 YCCK), and polarity handled
+/// explicitly by the image dict's `/Decode` array — which is exactly why Distiller writes
+/// `/Decode [1 0 1 0 1 0 1 0]` next to a Photoshop CMYK JPEG.
+///
+/// So the decoder's complement has to be undone before `/Decode` is applied, and a
+/// document that omits `/Decode` (as `med_crispr_sicklecell_pmc.pdf` does) is the case
+/// where handing the raw stream to a consumer silently produced the wrong colour: its
+/// 873×116 image read as RGB `(110,116,52)` at (0,0) where the page renders `(17,12,75)`,
+/// and its 138×54 logo read black on a white corner.
+///
+/// `jpeg-decoder` complements both of its 4-component paths (`color_convert_line_cmyk`
+/// and the `255 - k` in `color_convert_line_ycck`), so one rule covers CMYK and YCCK.
+/// The 1- and 3-component paths do not complement, hence the opposite sense there.
+fn decode_dct_rgb(buf: &[u8], decode_inv: bool) -> Option<image::RgbImage> {
+    let mut dec = jpeg_decoder::Decoder::new(std::io::Cursor::new(buf));
+    // Read the frame header and reject absurd dimensions BEFORE decoding pixels: a hostile
+    // JPEG can declare a huge frame and force a giant allocation.
+    dec.read_info().ok()?;
+    let info = dec.info()?;
+    let (w, h) = (info.width as usize, info.height as usize);
+    if w == 0 || h == 0 || w > MAX_ASSEMBLE_DIM as usize || h > MAX_ASSEMBLE_DIM as usize || w * h > MAX_ASSEMBLE_PIXELS {
+        return None;
+    }
+    let px = dec.decode().ok()?;
+    let (w, h) = (w as u32, h as u32);
+    use jpeg_decoder::PixelFormat::*;
+    match dec.info()?.pixel_format {
+        L8 => {
+            let g = image::GrayImage::from_raw(w, h, maybe_invert(px, decode_inv))?;
+            Some(image::DynamicImage::ImageLuma8(g).to_rgb8())
+        }
+        L16 => None,
+        RGB24 => image::RgbImage::from_raw(w, h, maybe_invert(px, decode_inv)),
+        CMYK32 => {
+            let n = (w as usize) * (h as usize);
+            let mut rgb = Vec::new();
+            rgb.try_reserve_exact(n * 3).ok()?;
+            for i in 0..n {
+                let c = |j: usize| {
+                    let v = px[i * 4 + j];
+                    if decode_inv {
+                        v
+                    } else {
+                        255 - v
+                    }
+                };
+                let k = 255 - c(3) as u16;
+                for j in 0..3 {
+                    rgb.push(((255 - c(j) as u16) * k / 255) as u8);
+                }
+            }
+            image::RgbImage::from_raw(w, h, rgb)
+        }
+    }
+}
+
+fn maybe_invert(mut px: Vec<u8>, invert: bool) -> Vec<u8> {
+    if invert {
+        for v in &mut px {
+            *v = 255 - *v;
+        }
+    }
+    px
+}
+
+/// A normalized PNG for a JPEG whose bytes a consumer would decode to the wrong colour:
+/// a 4-component (CMYK/YCCK) stream, or any stream with an inverting `/Decode` the JPEG
+/// file itself cannot express. Everything else keeps its lossless JPEG passthrough.
+fn normalized_jpeg_png(doc: &Document, dict: &Dictionary, jpeg: &[u8]) -> Option<Vec<u8>> {
+    let decode_inv = decode_inverts(doc, dict);
+    if jpeg_components(jpeg) != Some(4) && !decode_inv {
+        return None;
+    }
+    png_bytes(image::DynamicImage::ImageRgb8(decode_dct_rgb(jpeg, decode_inv)?))
+}
+
 /// `/BitsPerComponent`, or the value the spec implies when the key is absent.
 fn image_bpc(doc: &Document, dict: &Dictionary) -> Option<i64> {
     dict.get(b"BitsPerComponent")
@@ -631,7 +756,7 @@ pub fn extract_images(doc: &Document) -> Vec<ImageInfo> {
                 // its codec payload (a Flate-wrapped JPEG becomes a JPEG file); a `raw`
                 // sample block is assembled into a PNG, and stays `raw` — with the
                 // metadata to reassemble it by hand — only when it cannot be.
-                let data = if format == "raw" {
+                let mut data = if format == "raw" {
                     match assemble_png(doc, res, stream, width, height) {
                         Some(png) => {
                             format = "png";
@@ -642,6 +767,14 @@ pub fn extract_images(doc: &Document) -> Vec<ImageInfo> {
                 } else {
                     codec_payload(stream, &filters)
                 };
+                // A CMYK JPEG is decoded to the wrong colours by every consumer that reads
+                // it as a standalone file, so it is normalized rather than passed through.
+                if format == "jpeg" {
+                    if let Some(png) = normalized_jpeg_png(doc, dict, &data) {
+                        format = "png";
+                        data = png;
+                    }
+                }
                 out.push(ImageInfo {
                     page: pno,
                     index,
@@ -1807,6 +1940,27 @@ mod tests {
             assert_eq!(r.bits_per_component, Some(8));
             let png = decode_png(&r.data);
             assert_eq!(png.dimensions(), (r.width as u32, r.height as u32));
+        }
+    }
+
+    #[test]
+    fn a_cmyk_jpeg_decodes_to_the_authored_colour_not_its_inverse() {
+        // `tests/gen_fixtures.py::gen_cmyk_jpeg` — three flat CMYK bands behind an Adobe
+        // APP14 marker and `/Decode [1 0 1 0 1 0 1 0]`, wrapped in ASCII85 by reportlab.
+        // Handing the raw DCT stream back made every consumer read the complement: the
+        // white band came out black. K is 0 in all three bands, so RGB is just 255 - ink.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/cmyk_jpeg.pdf");
+        let doc = Document::load(path).expect("cmyk_jpeg.pdf fixture must load");
+        let rows = extract_images(&doc);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].color_space.as_deref(), Some("DeviceCMYK"));
+        assert_eq!(rows[0].format, "png", "a CMYK JPEG is normalized, not passed through");
+        let img = decode_png(&rows[0].data);
+        assert_eq!(img.dimensions(), (96, 48));
+        for (x, want) in [(15u32, [255u8, 255, 255]), (47, [0, 255, 255]), (79, [255, 75, 255])] {
+            let got = img.get_pixel(x, 24).0;
+            let d = (0..3).map(|i| got[i].abs_diff(want[i])).max().unwrap();
+            assert!(d <= 8, "band at x={x}: expected ~{want:?}, got {got:?}");
         }
     }
 

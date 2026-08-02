@@ -323,6 +323,34 @@
       }
     ]
   },
+  "cmyk_jpeg.pdf": {
+    "caption": "Figure 1: Three flat CMYK bands.",
+    "bands_rgb": [
+      [
+        255,
+        255,
+        255
+      ],
+      [
+        0,
+        255,
+        255
+      ],
+      [
+        255,
+        75,
+        255
+      ]
+    ],
+    "sample_x": [
+      15,
+      47,
+      79
+    ],
+    "sample_y": 24,
+    "width": 96,
+    "height": 48
+  },
   "form_font.pdf": {
     "font_name": "FF1",
     "base_font": "Helvetica",

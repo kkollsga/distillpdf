@@ -703,6 +703,53 @@ def gen_colorspace_images():
     }
 
 
+def gen_cmyk_jpeg():
+    """A DeviceCMYK JPEG — the one image kind whose bytes decode to a *silently wrong
+    colour* rather than failing.
+
+    PIL writes CMYK JPEGs the Adobe way (an APP14 marker, all four channels complemented),
+    and reportlab passes the file straight through as ``DCTDecode`` with the matching
+    ``/Decode [1 0 1 0 1 0 1 0]``. Any consumer that opens those bytes as a standalone
+    JPEG applies the Adobe complement *and* never sees ``/Decode``, so it lands on the
+    inverse of the authored colour: the white band reads as black.
+
+    Three flat vertical bands with ``K=0``, so the authored CMYK maps to RGB identically
+    under both the additive and the multiplicative conversion and the expected pixels are
+    unambiguous. The ASCII85 layer reportlab adds also pins that the codec payload is
+    unwrapped before the JPEG is read."""
+    pdf = os.path.join(OUT, "cmyk_jpeg.pdf")
+    jpg = os.path.join(OUT, "_cmyk.jpg")
+    bands = [(0, 0, 0, 0), (255, 0, 0, 0), (0, 180, 0, 0)]  # white, cyan, magenta-ish
+    im = Image.new("CMYK", (96, 48))
+    px = im.load()
+    for x in range(96):
+        for y in range(48):
+            px[x, y] = bands[min(x // 32, 2)]
+    im.save(jpg, quality=95, subsampling=0)
+
+    c = canvas.Canvas(pdf, pagesize=letter)
+    title(c, "DeviceCMYK JPEG")
+    y = PAGE_H - 130
+    y = para(c, "The three flat bands below are a CMYK JPEG with an Adobe marker: white, "
+                "cyan, and magenta. Read as a standalone JPEG they invert.", y)
+    c.drawImage(jpg, LM, y - 100, width=192, height=96)
+    y -= 116
+    c.setFont("Helvetica", 9.5)
+    c.drawString(LM, y, "Figure 1: Three flat CMYK bands.")
+    c.showPage()
+    c.save()
+    os.remove(jpg)
+    GT["cmyk_jpeg.pdf"] = {
+        "caption": "Figure 1: Three flat CMYK bands.",
+        # sampled at each band's centre; K=0 so RGB = 255 - ink
+        "bands_rgb": [[255, 255, 255], [0, 255, 255], [255, 75, 255]],
+        "sample_x": [15, 47, 79],
+        "sample_y": 24,
+        "width": 96,
+        "height": 48,
+    }
+
+
 def gen_form_font():
     """Hand-written PDF where the page's own ``/Font`` dictionary is EMPTY and the only
     font lives in a Form XObject's own ``/Resources`` — the ``/TPL*`` template layout an
@@ -1623,6 +1670,7 @@ def main():
     gen_form_image()
     gen_undrawn_image()
     gen_colorspace_images()
+    gen_cmyk_jpeg()
     gen_form_font()
     gen_no_spurious_figs()
     gen_links()

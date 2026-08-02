@@ -126,7 +126,10 @@ For `"png"`, `"jpeg"` and `"jpx"` the bytes are a complete image file you can op
 directly (PIL, a browser, `file`). PDFs store most non-photographic rasters as plain
 compressed *samples* with no container; those are assembled into a real PNG and reported
 as `"png"`. Photographic images stay in their original codec, unwrapped from any
-Flate/LZW/ASCII85 layer the PDF added on top.
+Flate/LZW/ASCII85 layer the PDF added on top — except CMYK JPEGs, which are normalized to
+PNG. A CMYK JPEG cannot be handed over untouched: a standalone JPEG reader applies the
+Adobe polarity convention and never sees the PDF's `/Decode` array, so the raw stream
+decodes to the *inverse* of the authored colour — silently, with no error.
 
 `color_space` is resolved through indirect references, through an ICC profile's component
 count, and through a name defined in the page's `/ColorSpace` resources — so it tells you

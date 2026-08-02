@@ -19,6 +19,7 @@ FORM_IMAGE = os.path.join(FIX, "form_image.pdf")
 FORM_FONT = os.path.join(FIX, "form_font.pdf")
 UNDRAWN_IMAGE = os.path.join(FIX, "undrawn_image.pdf")
 COLORSPACE_IMAGES = os.path.join(FIX, "colorspace_images.pdf")
+CMYK_JPEG = os.path.join(FIX, "cmyk_jpeg.pdf")
 
 
 def test_open_and_page_count():
@@ -100,6 +101,21 @@ def test_extract_images_resolves_colorspace_and_assembles_a_png():
     assert px[1].getpixel((0, 0)) == (10, 20, 30) and px[1].getpixel((1, 1)) == (100, 110, 120)
     assert px[2].getpixel((0, 0)) == (255, 255, 255) and px[2].getpixel((1, 0)) == (0, 255, 255)
     assert px[3].getpixel((0, 0)) == (0, 0, 0) and px[3].getpixel((1, 0)) == (255, 255, 255)
+
+
+def test_cmyk_jpeg_is_normalized_to_the_authored_colour():
+    """A DeviceCMYK JPEG is the one image whose bytes fail *silently*: PIL applies the
+    Adobe complement and never sees the PDF's `/Decode`, so the raw stream reads as the
+    inverse of the authored colour — the white band came back black."""
+    Image = pytest.importorskip("PIL.Image")
+    imgs = distillpdf.Pdf.open(CMYK_JPEG).extract_images()
+    assert len(imgs) == 1 and imgs[0]["color_space"] == "DeviceCMYK"
+    assert imgs[0]["format"] == "png", "CMYK JPEG must be normalized, not passed through"
+    im = Image.open(io.BytesIO(imgs[0]["data"])).convert("RGB")
+    assert im.size == (96, 48)
+    for x, want in ((15, (255, 255, 255)), (47, (0, 255, 255)), (79, (255, 75, 255))):
+        got = im.getpixel((x, 24))
+        assert max(abs(a - b) for a, b in zip(got, want)) <= 8, f"band x={x}: {got} vs {want}"
 
 
 def test_every_extracted_image_across_the_fixtures_opens():
