@@ -35,6 +35,7 @@ mod profile;
 mod raster;
 mod text;
 mod vector;
+mod walker;
 
 /// Maximum Form-XObject / content-stream recursion depth. Bounds runaway recursion and
 /// cyclic Form references while allowing legitimately deep nesting.

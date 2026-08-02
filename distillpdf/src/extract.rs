@@ -3,10 +3,10 @@
 //! Pure Rust: these return plain owned structs. The PyO3 layer (`src/lib.rs`) assembles the
 //! Python dicts/lists from them — no pyo3 types appear in this module.
 
-use crate::pdfobj::{content_bytes, deref, filters_of, sub_dict};
+use crate::pdfobj::{deref, filters_of, sub_dict};
 use crate::raster::{assemble_png, codec_payload, filter_to_format, image_bpc, image_color_space, normalized_jpeg_png};
 use crate::text::{self, Span};
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use lopdf::{Dictionary, Document, ObjectId};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
 /// One extracted raster image. Mirrors the dict `Pdf.extract_images` returns:
@@ -113,29 +113,25 @@ fn page_resource_dicts(doc: &Document, page_id: ObjectId) -> Vec<&Dictionary> {
     out
 }
 
-/// Overlay one resource dictionary's `/XObject` entries onto a name → object-id map.
-/// Later overlays win, so a nearer scope (the form's own resources, the page's own
-/// dictionary) shadows an outer one — the same precedence the renderer uses.
-fn overlay_xobjects(doc: &Document, res: &Dictionary, map: &mut std::collections::HashMap<Vec<u8>, ObjectId>) {
-    let Some(xd) = sub_dict(doc, res, b"XObject") else {
-        return;
-    };
-    for (name, val) in xd.iter() {
-        if let Ok(id) = val.as_reference() {
-            map.insert(name.clone(), id);
-        }
-    }
-}
-
 /// Collect the image XObjects invoked by `Do` in this operator list, descending into the
 /// `/Subtype /Form` XObjects the stream actually invokes (a form's content can `Do`
 /// further XObjects). `xmap` is the resource scope in force: a form starts from its
-/// parent's map with its own `/Resources` overlaid, so an unqualified `/Im0` resolves to
+/// parent's map with its own `/Resources` overlaid
+/// ([`crate::walker::ScopePolicy::OverlayParent`]), so an unqualified `/Im0` resolves to
 /// *that* form's `/Im0` and not a sibling's.
+///
+/// This is the one walk that is a **collector**, not a renderer, and the difference is
+/// load-bearing. It answers "which images exist on this page", so a form already walked
+/// contributes nothing new and is skipped by `seen` — which also bounds the recursion, and
+/// is why this walk takes no [`crate::WalkBudget`]: with a visited set the work is bounded
+/// by the number of distinct forms, so the budget the three renderers need (they must
+/// repaint a repeated form and therefore cannot dedupe) would only risk truncating a
+/// legitimately huge document. It composes `walker`'s descent pieces rather than calling
+/// `walker::descend_form`, which is the budgeted composition.
 fn walk_drawn(
     doc: &Document,
     ops: &[lopdf::content::Operation],
-    xmap: &std::collections::HashMap<Vec<u8>, ObjectId>,
+    xmap: &crate::walker::XMap,
     depth: u32,
     seen: &mut HashSet<ObjectId>,
     out: &mut HashSet<ObjectId>,
@@ -144,16 +140,10 @@ fn walk_drawn(
         if op.operator != "Do" {
             continue;
         }
-        let Some(Object::Name(name)) = op.operands.first() else {
-            continue;
+        let Some((id, stream)) = crate::walker::xobject_at(doc, xmap, &op.operands) else {
+            continue; // not a name, a dangling name, or not a stream: nothing to draw
         };
-        let Some(&id) = xmap.get(name.as_slice()) else {
-            continue; // dangling name: nothing in scope to draw
-        };
-        let Ok(stream) = doc.get_object(id).and_then(|o| o.as_stream()) else {
-            continue;
-        };
-        match stream.dict.get(b"Subtype").and_then(|o| o.as_name()).unwrap_or(b"") {
+        match crate::walker::subtype_of(stream) {
             b"Image" => {
                 out.insert(id);
             }
@@ -164,12 +154,12 @@ fn walk_drawn(
                 if !seen.insert(id) {
                     continue; // a form already walked on this page: cycle / repeat guard
                 }
-                let mut child = xmap.clone();
-                if let Some(fr) = sub_dict(doc, &stream.dict, b"Resources") {
-                    overlay_xobjects(doc, fr, &mut child);
-                }
-                if let Ok(c) = lopdf::content::Content::decode(&content_bytes(stream)) {
-                    walk_drawn(doc, &c.operations, &child, depth + 1, seen, out);
+                let Some(scope) = crate::walker::form_scope(doc, stream, xmap, crate::walker::ScopePolicy::OverlayParent)
+                else {
+                    continue;
+                };
+                if let Some(ops) = crate::walker::form_ops(stream) {
+                    walk_drawn(doc, &ops, &scope.xobjects, depth + 1, seen, out);
                 }
             }
             _ => {}
@@ -190,17 +180,17 @@ fn walk_drawn(
 /// `None` when the page's content stream can't be read or parsed at all — the caller then
 /// falls back to plain reachability rather than silently reporting an image-less page.
 fn drawn_images(doc: &Document, page_id: ObjectId) -> Option<HashSet<ObjectId>> {
-    let mut xmap: std::collections::HashMap<Vec<u8>, ObjectId> = std::collections::HashMap::new();
+    let mut xmap = crate::walker::XMap::new();
     if let Ok((own, inherited)) = doc.get_page_resources(page_id) {
         // `inherited` runs page → parent → …; apply it outermost-first so the nearest
         // scope wins, then the page's own inline dictionary last of all.
         for id in inherited.iter().rev() {
             if let Ok(d) = doc.get_dictionary(*id) {
-                overlay_xobjects(doc, d, &mut xmap);
+                crate::walker::overlay_xobjects(doc, d, &mut xmap);
             }
         }
         if let Some(d) = own {
-            overlay_xobjects(doc, d, &mut xmap);
+            crate::walker::overlay_xobjects(doc, d, &mut xmap);
         }
     }
     let content = doc.get_page_content(page_id).ok()?;

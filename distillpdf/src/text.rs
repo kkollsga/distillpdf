@@ -6,7 +6,8 @@
 //! recover real Unicode — including 2-byte CID codes and diacritics.
 
 use crate::geom::Mat;
-use crate::pdfobj::{content_bytes, deref, num};
+use crate::pdfobj::{deref, num};
+use crate::walker::{descend_form, nearest_resources, xobject_at, xobjects_of, Descend, ScopePolicy, XMap};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -992,18 +993,12 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
     spans
 }
 
-/// XObject name -> object id from a page's resources (the forms/images the page may
-/// `Do`). Mirrors `xobjects_of` but resolves the page's resource dict first.
-fn page_xobjects(doc: &Document, page_id: ObjectId) -> HashMap<Vec<u8>, ObjectId> {
-    let resources = match doc.get_page_resources(page_id) {
-        Ok((Some(d), _)) => d.clone(),
-        Ok((None, ids)) => match ids.first().and_then(|id| doc.get_dictionary(*id).ok()).cloned() {
-            Some(d) => d,
-            None => return HashMap::new(),
-        },
-        Err(_) => return HashMap::new(),
-    };
-    xobjects_of(doc, &resources)
+/// XObject name -> object id from a page's resources (the forms/images the page may `Do`).
+fn page_xobjects(doc: &Document, page_id: ObjectId) -> XMap {
+    match nearest_resources(doc, page_id) {
+        Some(res) => xobjects_of(doc, &res),
+        None => XMap::new(),
+    }
 }
 
 /// Emit one positioned text span from a decoded word, resolving its device position
@@ -1081,7 +1076,7 @@ fn push_positioned_span(spans: &mut Vec<Span>, wtm: &Mat, ctm: &Mat, base_size: 
 /// Form XObjects on `Do`. `base` is the graphics CTM the stream is placed under
 /// (identity for the page; the form `/Matrix` × the invoking CTM for a nested form).
 #[allow(clippy::too_many_arguments)]
-fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashMap<Vec<u8>, FontInfo>, xmap: &HashMap<Vec<u8>, ObjectId>, base: Mat, raw: &[u8], depth: u32, spans: &mut Vec<Span>, budget: &mut crate::WalkBudget) {
+fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashMap<Vec<u8>, FontInfo>, xmap: &XMap, base: Mat, raw: &[u8], depth: u32, spans: &mut Vec<Span>, budget: &mut crate::WalkBudget) {
     let mut tm = Mat::ID;
     let mut tlm = Mat::ID;
     let mut leading = 0.0f32;
@@ -1205,41 +1200,24 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
             // /Matrix and the CTM in effect at the `Do`). Inline images / non-Form
             // XObjects carry no text and are skipped.
             "Do" if depth < crate::MAX_FORM_DEPTH => {
-                let id = match o.first().and_then(|x| x.as_name().ok()).and_then(|n| xmap.get(n)) {
-                    Some(&id) => id,
-                    None => continue,
-                };
-                let stream = match doc.get_object(id).and_then(|x| x.as_stream().cloned()) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                if stream.dict.get(b"Subtype").and_then(|x| x.as_name()).unwrap_or(b"") != b"Form" {
+                let Some((_, stream)) = xobject_at(doc, xmap, o) else {
                     continue;
-                }
-                // Bill the descent before doing it: building the form's font map and
-                // decoding its stream dwarf a single operator's cost, and a form bomb pays
-                // exactly this per branch.
-                if !budget.spend(crate::FORM_DESCENT_COST + xmap.len() + fonts.len()) {
-                    return;
-                }
-                let fm = stream
-                    .dict
-                    .get(b"Matrix")
-                    .ok()
-                    .and_then(|x| x.as_array().ok())
-                    .filter(|a| a.len() >= 6)
-                    .map(|a| Mat { a: num(&a[0]), b: num(&a[1]), c: num(&a[2]), d: num(&a[3]), e: num(&a[4]), f: num(&a[5]) })
-                    .unwrap_or(Mat::ID);
-                // A form's fonts/XObjects live in its OWN /Resources (PDF spec: a form
-                // inherits the page's, never the invoking form's). Without Resources we
-                // can't resolve its fonts, so skip rather than mis-decode.
-                if let Some(fr) = stream.dict.get(b"Resources").ok().and_then(|x| deref(doc, x)).and_then(|x| x.as_dict().ok()).cloned() {
-                    let ff = build_fonts_from_resources(doc, &fr, raw);
-                    let fx = xobjects_of(doc, &fr);
-                    if let Ok(content) = lopdf::content::Content::decode(&content_bytes(&stream)) {
-                        decode_spans(doc, &content.operations, &ff, &fx, fm.mul(ctm), raw, depth + 1, spans, budget);
-                    }
-                }
+                };
+                // `OwnOnly`: a form's fonts and XObjects live in its OWN /Resources (PDF
+                // 32000-1 §8.10.2 — it inherits the page's, never the invoking form's), and
+                // a form without one is skipped rather than decoded through some other
+                // scope's encoding. That is a deliberate policy difference from the raster
+                // and vector walks, which overlay the parent scope; see `walker::ScopePolicy`.
+                let f = match descend_form(doc, stream, xmap, ScopePolicy::OwnOnly, budget, fonts.len()) {
+                    Descend::Into(f) => f,
+                    Descend::Skip => continue,
+                    Descend::Halt => return,
+                };
+                let ff = match &f.scope.resources {
+                    Some(fr) => build_fonts_from_resources(doc, fr, raw),
+                    None => continue, // unreachable under OwnOnly, which refuses a form without /Resources
+                };
+                decode_spans(doc, &f.ops, &ff, &f.scope.xobjects, f.matrix.mul(ctm), raw, depth + 1, spans, budget);
             }
             _ => {}
         }
@@ -1255,19 +1233,6 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
 fn dedup_coincident(spans: &mut Vec<Span>) {
     let mut seen = std::collections::HashSet::new();
     spans.retain(|s| seen.insert((s.x.round() as i32, s.y.round() as i32, s.text.clone())));
-}
-
-/// XObject name -> object id from a resources dict.
-fn xobjects_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, ObjectId> {
-    let mut map = HashMap::new();
-    if let Some(xd) = resources.get(b"XObject").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
-        for (name, val) in xd.iter() {
-            if let Ok(id) = val.as_reference() {
-                map.insert(name.clone(), id);
-            }
-        }
-    }
-    map
 }
 
 /// Effective span width (fall back to a char estimate if widths were absent).

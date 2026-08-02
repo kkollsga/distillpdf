@@ -4,38 +4,12 @@
 
 use base64::Engine;
 use crate::geom::{Mat, Rect};
-use crate::pdfobj::{content_bytes, deref, filters_of, num};
+use crate::pdfobj::{deref, filters_of, num};
 use crate::raster::{
     codec_payload, decode_dct_rgb, decode_inverts, dims_sane, jpeg_components, png_bytes, MAX_IMAGE_PIXELS,
 };
+use crate::walker::{descend_form, nearest_resources, subtype_of, xobject_at, xobjects_of, Descend, ScopePolicy, XMap};
 use lopdf::{Dictionary, Document, Object, ObjectId};
-use std::collections::HashMap;
-
-/// All XObject entries (images AND forms) in a resources dict: name -> object id.
-fn xobjects_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, ObjectId> {
-    let mut map = HashMap::new();
-    let xdict = resources
-        .get(b"XObject")
-        .ok()
-        .and_then(|o| deref(doc, o))
-        .and_then(|o| o.as_dict().ok());
-    if let Some(xd) = xdict {
-        for (name, val) in xd.iter() {
-            if let Ok(id) = val.as_reference() {
-                map.insert(name.clone(), id);
-            }
-        }
-    }
-    map
-}
-
-fn page_resources(doc: &Document, page_id: ObjectId) -> Option<Dictionary> {
-    match doc.get_page_resources(page_id) {
-        Ok((Some(d), _)) => Some(d.clone()),
-        Ok((None, ids)) => ids.first().and_then(|id| doc.get_dictionary(*id).ok()).cloned(),
-        Err(_) => None,
-    }
-}
 
 fn cs_channels(dict: &Dictionary, doc: &Document) -> Option<usize> {
     let cs = dict.get(b"ColorSpace").ok().and_then(|o| deref(doc, o))?;
@@ -438,7 +412,7 @@ const MIN_GRID_TILES: usize = 4;
 /// or base64-encoded — `uri` is left empty. Decoding/encoding the raster is by far the
 /// dominant cost on image-heavy PDFs, so this makes `images=False` near-free.
 pub fn positioned_images(doc: &Document, page_id: ObjectId, want_uris: bool) -> Vec<Placed> {
-    let resources = match page_resources(doc, page_id) {
+    let resources = match nearest_resources(doc, page_id) {
         Some(r) => r,
         None => return Vec::new(),
     };
@@ -456,7 +430,7 @@ pub fn positioned_images(doc: &Document, page_id: ObjectId, want_uris: bool) -> 
 fn walk(
     doc: &Document,
     ops: &[lopdf::content::Operation],
-    xmap: &HashMap<Vec<u8>, ObjectId>,
+    xmap: &XMap,
     base: Mat,
     out: &mut Vec<RawTile>,
     depth: u32,
@@ -487,20 +461,10 @@ fn walk(
                 ctm = m.mul(ctm);
             }
             "Do" => {
-                let name = match o.first() {
-                    Some(Object::Name(n)) => n,
-                    _ => continue,
+                let Some((id, stream)) = xobject_at(doc, xmap, o) else {
+                    continue;
                 };
-                let id = match xmap.get(name) {
-                    Some(&id) => id,
-                    None => continue,
-                };
-                let stream = match doc.get_object(id).and_then(|x| x.as_stream().cloned()) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                let subtype = stream.dict.get(b"Subtype").and_then(|x| x.as_name()).unwrap_or(b"");
-                if subtype == b"Image" {
+                if subtype_of(stream) == b"Image" {
                     // Placed bbox = image unit square [0,1]^2 through the CTM.
                     let corners = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
                     let mut bb = Rect::EMPTY;
@@ -526,38 +490,14 @@ fn walk(
                     // in finalize() once the whole page's tiles are known.
                     let pw = stream.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0) as u32;
                     out.push(RawTile { id, x0, x1, y0, y1, pw, ctm: rot_ctm });
-                } else if subtype == b"Form" {
-                    // Bill the descent before doing it: cloning the inherited XObject map
-                    // and decoding the form stream dwarf a single operator's cost, and a
-                    // form bomb pays exactly this per branch.
-                    if !budget.spend(crate::FORM_DESCENT_COST + xmap.len()) {
-                        return;
-                    }
-                    // Form: descend with its /Matrix and own resources.
-                    let fm = stream
-                        .dict
-                        .get(b"Matrix")
-                        .ok()
-                        .and_then(|x| x.as_array().ok())
-                        .filter(|a| a.len() >= 6)
-                        .map(|a| Mat { a: num(&a[0]), b: num(&a[1]), c: num(&a[2]), d: num(&a[3]), e: num(&a[4]), f: num(&a[5]) })
-                        .unwrap_or(Mat::ID);
-                    let form_ctm = fm.mul(ctm);
-                    let form_res = stream
-                        .dict
-                        .get(b"Resources")
-                        .ok()
-                        .and_then(|x| deref(doc, x))
-                        .and_then(|x| x.as_dict().ok())
-                        .cloned();
-                    let mut child = xmap.clone(); // inherit, then overlay form's own
-                    if let Some(fr) = &form_res {
-                        for (k, v) in xobjects_of(doc, fr) {
-                            child.insert(k, v);
-                        }
-                    }
-                    if let Ok(content) = lopdf::content::Content::decode(&content_bytes(&stream)) {
-                        walk(doc, &content.operations, &child, form_ctm, out, depth + 1, budget);
+                } else {
+                    // A form is descended with the page's XObject scope still in force
+                    // (`OverlayParent`): a raster the page defines and the form invokes by
+                    // an unqualified name must still be found.
+                    match descend_form(doc, stream, xmap, ScopePolicy::OverlayParent, budget, 0) {
+                        Descend::Into(f) => walk(doc, &f.ops, &f.scope.xobjects, f.matrix.mul(ctm), out, depth + 1, budget),
+                        Descend::Skip => continue,
+                        Descend::Halt => return,
                     }
                 }
             }
@@ -647,7 +587,7 @@ fn cluster(tiles: &[RawTile]) -> Vec<Vec<usize>> {
     // cluster run to run (one real corpus document rendered 20 distinct HTML outputs in
     // 40 renders, differing by ~37 KB of embedded image). The map below is only a
     // root -> slot lookup; the ORDER lives in `out`, indexed by first appearance.
-    let mut slot_of: HashMap<usize, usize> = HashMap::new();
+    let mut slot_of: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     let mut out: Vec<Vec<usize>> = Vec::new();
     for i in 0..n {
         let r = find(&mut parent, i);
@@ -839,7 +779,7 @@ mod tests {
     fn an_exhausted_work_budget_degrades_a_repeated_form_instead_of_emptying_it() {
         // Degrade, don't vanish: a walk that runs out mid-page keeps the tiles it found.
         let (doc, page_id) = adversarial("form_repeat.pdf");
-        let resources = page_resources(&doc, page_id).expect("fixture page has resources");
+        let resources = nearest_resources(&doc, page_id).expect("fixture page has resources");
         let content = doc.get_and_decode_page_content(page_id).expect("fixture page has content");
         let xmap = xobjects_of(&doc, &resources);
         let mut raws = Vec::new();

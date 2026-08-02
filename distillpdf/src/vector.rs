@@ -11,7 +11,8 @@
 //! a figure stays in the normal text flow (it is extracted as spans elsewhere).
 
 use crate::geom::{Mat, Rect};
-use crate::pdfobj::{content_bytes, deref, num, num_deref};
+use crate::pdfobj::{deref, num, num_deref};
+use crate::walker::{descend_form, nearest_resources, xobjects_of, Descend, ScopePolicy, XMap};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -399,27 +400,6 @@ const BAND_GAP: f32 = 24.0; // vertical gap that separates two figures
 // distribution. A page over budget is truncated, never dropped (see `positioned_vectors_capped`).
 const MAX_OPS: usize = 600_000;
 
-/// XObject name -> object id (images AND forms) from a resources dict.
-fn xobjects_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, ObjectId> {
-    let mut map = HashMap::new();
-    if let Some(xd) = resources.get(b"XObject").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
-        for (name, val) in xd.iter() {
-            if let Ok(id) = val.as_reference() {
-                map.insert(name.clone(), id);
-            }
-        }
-    }
-    map
-}
-
-fn page_resources(doc: &Document, page_id: ObjectId) -> Option<Dictionary> {
-    match doc.get_page_resources(page_id) {
-        Ok((Some(d), _)) => Some(d.clone()),
-        Ok((None, ids)) => ids.first().and_then(|id| doc.get_dictionary(*id).ok()).cloned(),
-        Err(_) => None,
-    }
-}
-
 /// ExtGState name -> (fill alpha `ca`, stroke alpha `CA`) where defined.
 fn extgstates_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, (Option<f32>, Option<f32>)> {
     let mut map = HashMap::new();
@@ -520,7 +500,7 @@ pub fn positioned_vectors(doc: &Document, page_id: ObjectId) -> (Vec<PlacedSvg>,
 /// [`MAX_OPS`]). Exposed internally so the truncation behaviour is unit-testable with a tiny
 /// cap instead of a half-million-operation fixture.
 fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (Vec<PlacedSvg>, Vec<PlacedSvg>) {
-    let resources = match page_resources(doc, page_id) {
+    let resources = match nearest_resources(doc, page_id) {
         Some(r) => r,
         None => return (Vec::new(), Vec::new()),
     };
@@ -577,7 +557,7 @@ pub fn attach_labels(figs: &mut [PlacedSvg], spans: &[LabelSpan]) {
 fn walk(
     doc: &Document,
     ops: &[lopdf::content::Operation],
-    xmap: &HashMap<Vec<u8>, ObjectId>,
+    xmap: &XMap,
     egmap: &HashMap<Vec<u8>, (Option<f32>, Option<f32>)>,
     base: GState,
     out: &mut Vec<Painted>,
@@ -712,45 +692,28 @@ fn walk(
                 }
             }
             "Do" => {
-                let id = match o.first().and_then(|x| x.as_name().ok()).and_then(|n| xmap.get(n)) {
-                    Some(&id) => id,
-                    None => continue,
+                // Images are `crate::img`'s business; only forms carry path ink. The
+                // descent inherits the page's scope (`OverlayParent`) so a form can paint
+                // through an ExtGState or XObject the page defines.
+                let Some((_, stream)) = crate::walker::xobject_at(doc, xmap, o) else {
+                    continue;
                 };
-                let stream = match doc.get_object(id).and_then(|x| x.as_stream().cloned()) {
-                    Ok(s) => s,
-                    Err(_) => continue,
+                let f = match descend_form(doc, stream, xmap, ScopePolicy::OverlayParent, budget, egmap.len()) {
+                    Descend::Into(f) => f,
+                    Descend::Skip => continue,
+                    Descend::Halt => return,
                 };
-                if stream.dict.get(b"Subtype").and_then(|x| x.as_name()).unwrap_or(b"") != b"Form" {
-                    continue; // images handled by crate::img
-                }
-                // Bill the descent before doing it: cloning the inherited resource maps and
-                // decoding the form stream dwarf a single operator's cost, and a form bomb
-                // pays exactly this per branch.
-                if !budget.spend(crate::FORM_DESCENT_COST + xmap.len() + egmap.len()) {
-                    return;
-                }
-                let fm = stream
-                    .dict
-                    .get(b"Matrix")
-                    .ok()
-                    .and_then(|x| x.as_array().ok())
-                    .filter(|a| a.len() >= 6)
-                    .map(|a| Mat { a: num(&a[0]), b: num(&a[1]), c: num(&a[2]), d: num(&a[3]), e: num(&a[4]), f: num(&a[5]) })
-                    .unwrap_or(Mat::ID);
-                let (mut child_x, mut child_eg) = (xmap.clone(), egmap.clone());
-                if let Some(fr) = stream.dict.get(b"Resources").ok().and_then(|x| deref(doc, x)).and_then(|x| x.as_dict().ok()) {
-                    for (k, v) in xobjects_of(doc, fr) {
-                        child_x.insert(k, v);
-                    }
+                // The ExtGState half of the scope is this walker's own interpretation, so
+                // it is overlaid here rather than in the shared descent.
+                let mut child_eg = egmap.clone();
+                if let Some(fr) = &f.scope.resources {
                     for (k, v) in extgstates_of(doc, fr) {
                         child_eg.insert(k, v);
                     }
                 }
-                if let Ok(content) = lopdf::content::Content::decode(&content_bytes(&stream)) {
-                    let mut sub = g;
-                    sub.ctm = fm.mul(g.ctm);
-                    walk(doc, &content.operations, &child_x, &child_eg, sub, out, depth + 1, budget);
-                }
+                let mut sub = g;
+                sub.ctm = f.matrix.mul(g.ctm);
+                walk(doc, &f.ops, &f.scope.xobjects, &child_eg, sub, out, depth + 1, budget);
             }
             _ => {}
         }
@@ -952,7 +915,7 @@ mod tests {
     }
 
     fn walk_page(doc: &Document, page_id: ObjectId, budget: usize) -> Vec<Painted> {
-        let resources = page_resources(doc, page_id).expect("fixture page has resources");
+        let resources = nearest_resources(doc, page_id).expect("fixture page has resources");
         let content = doc.get_and_decode_page_content(page_id).expect("fixture page has content");
         let xmap = xobjects_of(doc, &resources);
         let egmap = extgstates_of(doc, &resources);
@@ -1104,7 +1067,7 @@ mod tests {
         let doc = Document::load(path).expect("unfiltered_form.pdf fixture must load");
         let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
         // The premise, asserted rather than assumed: the form really is unfiltered.
-        let res = page_resources(&doc, page_id).expect("fixture page has resources");
+        let res = nearest_resources(&doc, page_id).expect("fixture page has resources");
         let form_id = xobjects_of(&doc, &res).get(b"UF".as_slice()).copied().expect("/UF form");
         let form = doc.get_object(form_id).unwrap().as_stream().unwrap();
         assert!(form.dict.get(b"Filter").is_err(), "the fixture's form must carry no /Filter");
@@ -1129,7 +1092,7 @@ mod tests {
         let doc = Document::load(path).expect("indirect_numbers.pdf fixture must load");
         let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
         // The premise: the alphas really are indirect.
-        let res = page_resources(&doc, page_id).expect("fixture page has resources");
+        let res = nearest_resources(&doc, page_id).expect("fixture page has resources");
         let eg = res.get(b"ExtGState").unwrap().as_dict().unwrap().get(b"GA").unwrap();
         let eg = deref(&doc, eg).unwrap().as_dict().unwrap();
         assert!(matches!(eg.get(b"ca").unwrap(), Object::Reference(_)));
