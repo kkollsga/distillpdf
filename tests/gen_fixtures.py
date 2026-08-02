@@ -938,6 +938,42 @@ def gen_cmyk_jpeg():
     }
 
 
+def gen_no_resources_paths():
+    """A page that draws a real vector figure and carries NO ``/Resources`` at all.
+
+    The path operators (``m``/``l``/``c``/``re`` and the ``f``/``S`` that paint them) name
+    no resource: ``/Resources`` is only needed to resolve an ``/ExtGState`` alpha or a form
+    ``Do``. ``vector::positioned_vectors_capped`` nevertheless returned empty the moment the
+    page's whole resource chain was empty, so a resource-less page lost all of its direct
+    path ink and emitted no ``<svg>``.
+
+    The fixture is a controlled A/B in one file — identical content streams, the sole
+    difference an empty ``/Resources << >>`` on page 2's dictionary (nothing is inheritable
+    from the ``/Pages`` node, which carries none either):
+
+      page 1  no ``/Resources`` key anywhere in its tree  -> used to emit 0 ``<svg>``;
+      page 2  ``/Resources << >>``                        -> always emitted 1.
+
+    Both must now emit exactly one. Eight filled bars clear the strong-figure bar
+    (``MIN_PATHS`` 6, ``MIN_W`` 72, ``MIN_H`` 54) with room to spare, so a clustering
+    threshold cannot be mistaken for the guard. reportlab always writes a ``/Resources``
+    dictionary, so this is hand-assembled."""
+    pdf = os.path.join(OUT, "no_resources_paths.pdf")
+    bars = [b"0.2 0.4 0.8 rg %d 400 20 %d re f" % (120 + i * 28, 40 + (i % 4) * 30) for i in range(8)]
+    content = b"\n".join(bars)
+    stream = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content)
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] >>",
+        3: b"<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>",
+        4: b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R /Resources << >> >>",
+        5: stream,
+        6: stream,
+    }
+    _assemble_pdf(objs, pdf)
+    GT["no_resources_paths.pdf"] = {"svgs_per_page": [1, 1], "paths_per_page": 8}
+
+
 def gen_render_samples():
     """Sampled rasters the RENDER path used to get wrong, each one *drawn* on the page so
     ``to_html`` has to decode it (``extract_images()`` already handled all of them).
@@ -2263,6 +2299,7 @@ def main():
     gen_undrawn_image()
     gen_colorspace_images()
     gen_image_order()
+    gen_no_resources_paths()
     gen_render_samples()
     gen_cmyk_jpeg()
     gen_decode_jpeg()

@@ -500,13 +500,15 @@ pub fn positioned_vectors(doc: &Document, page_id: ObjectId) -> (Vec<PlacedSvg>,
 /// [`MAX_OPS`]). Exposed internally so the truncation behaviour is unit-testable with a tiny
 /// cap instead of a half-million-operation fixture.
 fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (Vec<PlacedSvg>, Vec<PlacedSvg>) {
-    // A page with no `/Resources` anywhere in its tree is skipped entirely, as it always
-    // has been. (Its direct path ink goes with it — a separate defect from this one, and
-    // not this phase's to change.)
+    // A page with no `/Resources` anywhere in its tree used to return here, empty. But the
+    // path operators — `m`/`l`/`c`/`re`/`v`/`y`/`h` and the `f`/`S`/`B` that paint them —
+    // name no resource at all: `/Resources` is only needed to resolve an `/ExtGState` alpha
+    // or a form `Do`, and a page can legally draw its whole figure without either. The
+    // guard therefore deleted every direct path a resource-less page drew, and the SVG with
+    // it. Both maps below are simply empty for such a page, `Do` resolves to nothing, and
+    // the graphics state starts at the spec defaults (opaque, black) — which is exactly
+    // what a page with no `/ExtGState` is entitled to.
     let chain = page_resource_chain(doc, page_id);
-    if chain.is_empty() {
-        return (Vec::new(), Vec::new());
-    }
     let content = match doc.get_and_decode_page_content(page_id) {
         Ok(c) => c,
         Err(_) => return (Vec::new(), Vec::new()),
@@ -1142,5 +1144,54 @@ mod tests {
         let (strong, _weak) = positioned_vectors(&doc, page_id);
         assert_eq!(strong.len(), 1, "the bar chart must be one figure");
         assert!(strong[0].paths.contains("fill-opacity=\"0.85\""), "{}", strong[0].paths);
+    }
+
+    #[test]
+    fn a_page_with_no_resources_still_paints_its_direct_path_ink() {
+        // `tests/gen_fixtures.py::gen_no_resources_paths` is a controlled A/B in one file:
+        // two pages, identical content streams, the sole difference an empty
+        // `/Resources << >>` on page 2. `positioned_vectors_capped` bailed out the moment
+        // the page's whole resource chain was empty — but `re`/`f` name no resource, so
+        // page 1 lost its entire figure while page 2 kept it. Verified failing before the
+        // fix: page 1 gave 0 strong figures and 0 painted paths, page 2 gave 1 and 8.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/no_resources_paths.pdf");
+        let doc = Document::load(path).expect("no_resources_paths.pdf fixture must load");
+        let pages = doc.get_pages();
+        let bare = *pages.get(&1).expect("page 1");
+        let with_res = *pages.get(&2).expect("page 2");
+        assert!(page_resource_chain(&doc, bare).is_empty(), "page 1 must reach no /Resources at all");
+        assert!(!page_resource_chain(&doc, with_res).is_empty(), "page 2 is the control");
+
+        for (page_id, label) in [(bare, "no /Resources"), (with_res, "/Resources << >>")] {
+            let painted = walk_page_bare(&doc, page_id);
+            assert_eq!(painted.len(), 8, "{label}: eight filled bars must paint");
+            // Nothing supplies an /ExtGState, so the spec defaults must hold: fully opaque.
+            assert!(
+                painted.iter().all(|p| p.fill_op == 1.0 && p.stroke_op == 1.0),
+                "{label}: a page with no /ExtGState paints at full opacity"
+            );
+            let (strong, _weak) = positioned_vectors(&doc, page_id);
+            assert_eq!(strong.len(), 1, "{label}: the bars must reach the render as one figure");
+        }
+    }
+
+    /// [`walk_page`] for a page that may have no resource chain at all (the helper above
+    /// folds the chain, which is empty here — the point of the test).
+    fn walk_page_bare(doc: &Document, page_id: ObjectId) -> Vec<Painted> {
+        let content = doc.get_and_decode_page_content(page_id).expect("fixture page has content");
+        let mut painted = Vec::new();
+        let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
+        let egmap: HashMap<Vec<u8>, (Option<f32>, Option<f32>)> = HashMap::new();
+        walk(
+            doc,
+            &content.operations,
+            &XMap::new(),
+            &egmap,
+            GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0),
+            &mut painted,
+            0,
+            &mut budget,
+        );
+        painted
     }
 }

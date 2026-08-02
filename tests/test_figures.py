@@ -144,3 +144,23 @@ def test_indirect_extgstate_alpha_does_not_hide_the_figure():
         f"expected {g['n_paths']} paths, got {svgs[0].count('<path')}"
     assert f'fill-opacity="{g["fill_alpha"]}"' in svgs[0], "the indirect /ca did not reach the render"
     assert f'stroke-opacity="{g["stroke_alpha"]}"' in svgs[0], "the indirect /CA did not reach the render"
+
+
+def test_a_page_with_no_resources_still_draws_its_paths():
+    """``m``/``l``/``c``/``re`` and the ``f``/``S`` that paint them name no resource, but the
+    vector walk returned empty the moment a page's whole ``/Resources`` chain was — so a
+    page that draws its figure with nothing but path operators lost all of it.
+
+    ``no_resources_paths.pdf`` is the controlled A/B: two pages, identical content streams,
+    the sole difference an empty ``/Resources << >>`` on page 2. Page 1 emitted 0 ``<svg>``
+    and page 2 emitted 1; both must now emit exactly one, with all eight bars."""
+    g = GT["no_resources_paths.pdf"]
+    h = html("no_resources_paths.pdf")
+    svgs = re.findall(r"<svg\b.*?</svg>", h, re.DOTALL)
+    assert len(svgs) == len(g["svgs_per_page"]), \
+        f"both pages must render their bars, got {len(svgs)} <svg>"
+    for i, svg in enumerate(svgs, 1):
+        assert svg.count("<path") == g["paths_per_page"], \
+            f"page {i}: expected {g['paths_per_page']} bars, got {svg.count('<path')}"
+        assert "fill-opacity" not in svg, \
+            f"page {i}: no /ExtGState anywhere, so the ink must paint at the default full opacity"
