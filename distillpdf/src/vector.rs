@@ -581,46 +581,47 @@ impl PlacedSvg {
     /// viewport. `style` (caller-supplied) positions it over the image; `preserveAspect
     /// Ratio="none"` makes the ink fill the positioned box exactly, so the polygons line
     /// up with the raster (both are in page coordinates).
-    /// The one renderer that stays in PAGE orientation. `html.rs` positions this box with
-    /// percentages of the raster's page-space rect, over an `<img>` the raster path emits
-    /// **unturned** — so on a `/Rotate` page the overlay must register with that unturned
-    /// image, not with the display. `un_rotate` maps the display-oriented ink back; for an
-    /// upright page it is `None` and the output is byte-identical.
+    /// `html.rs` positions this box over the raster's `<img>`, whose pixels the raster path
+    /// now emits in DISPLAY orientation (`img::turn_pixels`) — so this renderer, its viewBox
+    /// and the CSS box that carries it are all in display orientation too, and the ink needs
+    /// no turn back. (It used to be the one renderer left in page orientation, wrapped in an
+    /// `un_rotate` matrix to register with an unturned `<img>`; that `<img>` no longer exists.)
     pub fn overlay_svg(&self, style: &str) -> String {
         const PAD: f32 = 1.0;
-        // Page-space extents: the local ones transposed back by the same quarter turn.
-        let (pw, ph) = local_extent(self.rot, self.w, self.h);
-        let (open, close) = match self.un_rotate() {
-            Some(m) => (format!("<g transform=\"matrix({})\">", m), "</g>"),
-            None => (String::new(), ""),
-        };
         format!(
             "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{} {} {} {}\" \
-             preserveAspectRatio=\"none\" style=\"{}\" font-family=\"sans-serif\" fill=\"#000\">{}{}{}{}</svg>",
+             preserveAspectRatio=\"none\" style=\"{}\" font-family=\"sans-serif\" fill=\"#000\">{}{}</svg>",
             fmt(-PAD),
             fmt(-PAD),
-            fmt(pw + 2.0 * PAD),
-            fmt(ph + 2.0 * PAD),
+            fmt(self.w + 2.0 * PAD),
+            fmt(self.h + 2.0 * PAD),
             style,
-            open,
             self.ink(),
             self.label_texts(),
-            close
         )
     }
 
-    /// SVG matrix mapping this figure's display-oriented local coords back to page-oriented
-    /// local coords, or `None` for an upright page. The inverse of [`to_local`]'s quarter
-    /// turn, expressed about the local box: with local extents `w × h`, `90°` sends
-    /// `(lx, ly)` to `(ly, w - lx)`, `180°` to `(w - lx, h - ly)` and `270°` to `(h - ly, lx)`.
-    fn un_rotate(&self) -> Option<String> {
-        let m = match self.rot {
-            90 => [0.0, -1.0, 1.0, 0.0, 0.0, self.w],
-            180 => [-1.0, 0.0, 0.0, -1.0, self.w, self.h],
-            270 => [0.0, 1.0, -1.0, 0.0, self.h, 0.0],
-            _ => return None,
-        };
-        Some(m.iter().map(|v| fmt(*v)).collect::<Vec<_>>().join(" "))
+    /// The CSS box that places this figure's [`PlacedSvg::overlay_svg`] over a raster whose
+    /// page-space rect is `(x_left, x_right, y_bottom, y_top)`.
+    ///
+    /// Both sides are taken in the raster's DISPLAY orientation, since that is what the `<img>`
+    /// shows. For an upright page every term is the page-space difference this replaced, so no
+    /// overlay moves by a rounding step.
+    pub fn overlay_style(&self, im: (f32, f32, f32, f32)) -> String {
+        let (ix0, ix1, iy0, iy1) = im;
+        let (dw, dh) = local_extent(self.rot, (ix1 - ix0).max(1.0), (iy1 - iy0).max(1.0));
+        let (ax, ay) = to_local(self.rot, ix0, iy0, ix1, iy1, self.x_left, self.y_top);
+        let (bx, by) = to_local(self.rot, ix0, iy0, ix1, iy1, self.x_right, self.y_bottom);
+        // Extents are the page-space spans transposed, never a difference of mapped corners
+        // (`ClipDefs::id_for` records why).
+        let (lw, lh) = local_extent(self.rot, self.x_right - self.x_left, self.y_top - self.y_bottom);
+        format!(
+            "position:absolute;left:{:.2}%;top:{:.2}%;width:{:.2}%;height:{:.2}%",
+            ax.min(bx) / dw * 100.0,
+            ay.min(by) / dh * 100.0,
+            lw / dw * 100.0,
+            lh / dh * 100.0,
+        )
     }
 
     /// Render ONE self-contained `<svg>` that composites one or more raster images WITH
@@ -2047,32 +2048,47 @@ mod tests {
         assert!(up.contains("<image href=\"IMG\" x=\"20\" y=\"50\" width=\"40\" height=\"30\""), "upright: {up}");
         assert!(!up.contains("matrix"), "upright must keep the plain rect form: {up}");
 
-        // /Rotate 90: unit square (0,0)->(250,20), (1,0)->(250,60), (0,1)->(220,20), i.e.
-        // matrix(0 40 -30 0 250 20) — a 40x30pt rect standing up as 30x40.
+        // /Rotate 90: the raster's 40x30 pt rect stands up as 30x40 at local (220, 20). The
+        // PIXELS are turned by `img::turn_pixels` and the placement matrix describes that
+        // turned unit square (`img::turned_placement` composes `[0 30 -40 0 160 420]`), so the
+        // matrix that comes out here is a plain axis-aligned box — the turn is in the samples,
+        // not in the transform. (Before the raster path turned its own pixels this was
+        // `matrix(0 40 -30 0 250 20)`: the same box with the rotation baked into the matrix,
+        // which was right for a composite and wrong for the `<img>` sharing the same URI.)
         let (strong, _) = positioned_vectors(&doc, ids[1]);
         let images = crate::img::positioned_images(&doc, ids[1], true);
+        assert!(images[0].ctm.is_some(), "a turned raster must carry the matrix for its turned unit square");
         let turned = strong[0].composite_svg(&[raster(&images[0])]);
-        assert!(turned.contains("transform=\"matrix(0 40 -30 0 250 20)\""), "/Rotate 90: {turned}");
+        assert!(turned.contains("transform=\"matrix(30 0 0 40 220 20)\""), "/Rotate 90: {turned}");
     }
 
     #[test]
-    fn a_css_overlay_stays_in_page_orientation_so_it_registers_with_its_unturned_image() {
-        // `overlay_svg` is the ONE renderer that must not turn: `html.rs` positions it with
-        // percentages of the raster's PAGE-space rect, over an `<img>` the raster path emits
-        // unturned. Turning the ink there would slide every polygon off the photo it
-        // annotates. Upright pages must be byte-identical (no wrapper at all).
+    fn a_css_overlay_registers_with_the_display_oriented_image_it_sits_on() {
+        // `overlay_svg` used to be the ONE renderer left in page orientation, wrapped in an
+        // `un_rotate` matrix, because `html.rs` laid it over an `<img>` the raster path emitted
+        // UNTURNED. That `<img>` no longer exists — `img::turn_pixels` turns the samples — so
+        // the overlay, its viewBox and the CSS box that carries it are all in display
+        // orientation, and the wrapper is gone. Upright output is byte-identical either way.
         let (doc, ids) = rotated_pages();
         let (upright, _) = positioned_vectors(&doc, ids[0]);
         let up = upright[0].overlay_svg("width:100%");
-        assert!(!up.contains("<g transform"), "an upright page must gain no wrapper: {up}");
-        assert!(up.contains("viewBox=\"-1 -1 202 302\""), "upright viewBox is the page-space box: {up}");
-        for (i, m) in [(1, "matrix(0 -1 1 0 0 300)"), (2, "matrix(-1 0 0 -1 200 300)"), (3, "matrix(0 1 -1 0 200 0)")] {
+        assert!(!up.contains("<g transform"), "no renderer needs an un-turn any more: {up}");
+        assert!(up.contains("viewBox=\"-1 -1 202 302\""), "upright viewBox: {up}");
+        // A quarter turn transposes the box; a half turn leaves it.
+        for (i, vb) in [(1, "-1 -1 302 202"), (2, "-1 -1 202 302"), (3, "-1 -1 302 202")] {
             let (figs, _) = positioned_vectors(&doc, ids[i]);
             let ov = figs[0].overlay_svg("width:100%");
-            assert!(ov.contains(&format!("<g transform=\"{m}\">")), "page {}: want {m}, got {ov}", i + 1);
-            // The viewBox is the PAGE-space box on every page — that is what the CSS box is.
-            assert!(ov.contains("viewBox=\"-1 -1 202 302\""), "page {}: {ov}", i + 1);
+            assert!(!ov.contains("<g transform"), "page {}: {ov}", i + 1);
+            assert!(ov.contains(&format!("viewBox=\"{vb}\"")), "page {}: want {vb}, got {ov}", i + 1);
         }
+        // And the CSS box is measured in the same orientation. The figure is x 100..300,
+        // y 200..500; place it over a raster whose rect is exactly the page, 400x600.
+        let page = (0.0, 400.0, 0.0, 600.0);
+        assert_eq!(upright[0].overlay_style(page), "position:absolute;left:25.00%;top:16.67%;width:50.00%;height:50.00%");
+        let (r90, _) = positioned_vectors(&doc, ids[1]);
+        // /Rotate 90 displays the page 600x400; the figure's local origin is (y0, x0) = (200, 100)
+        // and its extents transpose to 300x200.
+        assert_eq!(r90[0].overlay_style(page), "position:absolute;left:33.33%;top:25.00%;width:50.00%;height:50.00%");
     }
 
     /// [`walk_page`] for a page that may have no resource chain at all (the helper above

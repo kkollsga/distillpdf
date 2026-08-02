@@ -1416,6 +1416,46 @@ def gen_rotated_pages():
     }
 
 
+def gen_rotated_raster():
+    """A STANDALONE raster (no vector figure anywhere) on four ``/Rotate`` pages.
+
+    ``gen_rotated_pages`` covers a raster *composited into* a figure's ``<svg>``, which is
+    turned by the figure's page→local mapping. A raster that is not inside a figure goes down
+    ``img.rs`` and out as a plain ``<img>``, which applies no transform of any kind — so on a
+    ``/Rotate`` page it rendered sideways, and nothing in the suite objected.
+
+    Four pages sharing ONE byte-identical content stream, differing only in ``/Rotate``, each
+    drawing one 2x1 image — **red left, blue right** — at 200x100 pt. The image is 2x1 rather
+    than square so the turn shows in the DIMENSIONS as well as the pixels, and asymmetric so
+    90 is distinguishable from 270:
+
+      ``/Rotate 0``    2x1, red left     ``/Rotate 180``  2x1, blue left
+      ``/Rotate 90``   1x2, red TOP      ``/Rotate 270``  1x2, blue top
+
+    The placement rect must be identical on all four pages: it stays in page space, which is
+    what every cross-subsystem comparison in ``html.rs`` is expressed in."""
+    pdf = os.path.join(OUT, "rotated_raster.pdf")
+    content = b"q 200 0 0 100 100 250 cm /Im Do Q"
+    res = b"<< /XObject << /Im 8 0 R >> >>"
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] /Count 4 /MediaBox [0 0 400 600] >>",
+        3: b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources %s /Rotate 0 >>" % res,
+        4: b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources %s /Rotate 90 >>" % res,
+        5: b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources %s /Rotate 180 >>" % res,
+        6: b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources %s /Rotate 270 >>" % res,
+        7: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        8: _flate_image(8, 2, 1, b"/DeviceRGB", 8, bytes((255, 0, 0, 0, 0, 255))),
+    }
+    _assemble_pdf(objs, pdf)
+    GT["rotated_raster.pdf"] = {
+        "rotations": [0, 90, 180, 270],
+        "placement": [100, 250, 300, 350],
+        "displayed": {"0": [[255, 0, 0], [0, 0, 255]], "90": [[255, 0, 0], [0, 0, 255]],
+                      "180": [[0, 0, 255], [255, 0, 0]], "270": [[0, 0, 255], [255, 0, 0]]},
+    }
+
+
 def gen_separation():
     """Spot colours: ``Separation`` / ``DeviceN`` fills whose tints must pass through the
     space's TINT TRANSFORM before they mean a colour.
@@ -2927,6 +2967,7 @@ def main():
     gen_dashes()
     gen_alpha_groups()
     gen_rotated_pages()
+    gen_rotated_raster()
     gen_separation()
     gen_render_samples()
     gen_cmyk_jpeg()

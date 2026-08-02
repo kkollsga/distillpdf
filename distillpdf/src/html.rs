@@ -1930,20 +1930,12 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                     // with the raster), and clipped to the vector ink so stray prose the
                     // figure picked up below the map doesn't render.
                     let im = &images[*j];
-                    let iw = (im.x_right - im.x_left).max(1.0);
-                    let ih = (im.y_top - im.y_bottom).max(1.0);
+                    let rect = (im.x_left, im.x_right, im.y_bottom, im.y_top);
                     let overlays: String = img_overlays[*j]
                         .iter()
                         .map(|&vi| {
                             let v = &vectors[vi];
-                            let style = format!(
-                                "position:absolute;left:{:.2}%;top:{:.2}%;width:{:.2}%;height:{:.2}%",
-                                (v.x_left - im.x_left) / iw * 100.0,
-                                (im.y_top - v.y_top) / ih * 100.0,
-                                (v.x_right - v.x_left) / iw * 100.0,
-                                (v.y_top - v.y_bottom) / ih * 100.0,
-                            );
-                            v.overlay_svg(&style)
+                            v.overlay_svg(&v.overlay_style(rect))
                         })
                         .collect();
                     let rel = if overlays.is_empty() { "" } else { " style=\"position:relative\"" };

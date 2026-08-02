@@ -200,7 +200,7 @@ fn decodable(doc: &Document, res: &Dictionary, id: ObjectId) -> bool {
 /// Images with a soft mask (`/SMask`) are alpha-composited so transparency is
 /// preserved — without this, masked figures (whose visible content lives in the
 /// mask, over a flat-colour/black base) render as solid black boxes.
-fn data_uri(doc: &Document, res: &Dictionary, id: ObjectId, window: Option<(f32, f32, f32, f32)>) -> Option<String> {
+fn data_uri(doc: &Document, res: &Dictionary, id: ObjectId, window: Option<(f32, f32, f32, f32)>, turn: i32) -> Option<String> {
     let stream = doc.get_object(id).ok()?.as_stream().ok()?;
     let dict = stream.dict.clone();
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -225,9 +225,9 @@ fn data_uri(doc: &Document, res: &Dictionary, id: ObjectId, window: Option<(f32,
             // A clip is the third reason the bytes cannot pass straight through: the
             // passthrough hands over the WHOLE authored image, and the page shows a window of it.
             let inv = decode_inverts(doc, &dict);
-            if inv || window.is_some() || jpeg_is_cmyk(&jpeg) {
+            if inv || window.is_some() || turn != 0 || jpeg_is_cmyk(&jpeg) {
                 let rgb = decode_dct_rgb(&jpeg, inv)?;
-                return jpeg_uri(crop_window(rgb, window));
+                return jpeg_uri(turn_pixels(crop_window(rgb, window), turn));
             }
             return Some(format!("data:image/jpeg;base64,{}", b64.encode(&jpeg)));
         }
@@ -235,7 +235,7 @@ fn data_uri(doc: &Document, res: &Dictionary, id: ObjectId, window: Option<(f32,
             return None;
         }
         // CCITTFax falls through to decode_rgb (which decodes it via decode_ccitt) → PNG.
-        let rgb = crop_window(decode_rgb(doc, res, id)?, window);
+        let rgb = turn_pixels(crop_window(decode_rgb(doc, res, id)?, window), turn);
         let png = png_bytes(image::DynamicImage::ImageRgb8(rgb))?;
         return Some(format!("data:image/png;base64,{}", b64.encode(&png)));
     }
@@ -296,7 +296,64 @@ fn data_uri(doc: &Document, res: &Dictionary, id: ObjectId, window: Option<(f32,
     }
     // Match the source format: a JPEG base with a trivial (all-opaque) mask becomes a
     // compact JPEG; a mask with real transparency stays a lossless PNG.
-    rgba_uri(crop_window(rgba, window), filters.iter().any(|f| f == b"DCTDecode"))
+    rgba_uri(turn_pixels(crop_window(rgba, window), turn), filters.iter().any(|f| f == b"DCTDecode"))
+}
+
+/// Turn a decoded raster CLOCKWISE by a page's `/Rotate`, so the emitted pixels are the ones a
+/// reader displays.
+///
+/// P1 turned the rasters *composited into* a figure's `<svg>`; one that is not inside a vector
+/// figure goes out as a plain `<img>`, which applies no transform of any kind — so a photo on a
+/// `/Rotate 90` page came out sideways. Turning the samples, exactly as [`crop_window`] cuts
+/// them, is what makes the answer the same in `<img>`, in an `<svg>` `<image>`, and in any
+/// consumer that lifts the data URI out of the HTML. `rot == 0` returns the buffer untouched, so
+/// an upright page is byte-identical.
+fn turn_pixels<P>(img: image::ImageBuffer<P, Vec<P::Subpixel>>, rot: i32) -> image::ImageBuffer<P, Vec<P::Subpixel>>
+where
+    P: image::Pixel + 'static,
+{
+    match rot {
+        90 => image::imageops::rotate90(&img),
+        180 => image::imageops::rotate180(&img),
+        270 => image::imageops::rotate270(&img),
+        _ => img,
+    }
+}
+
+/// The unit-square remap a raster's placement matrix needs once [`turn_pixels`] has turned its
+/// samples: with the pixels already in display orientation, the matrix must map the *turned*
+/// unit square to the same page-space rect, so every consumer sees the same pixel land in the
+/// same place as before.
+///
+/// A PDF image's unit square has `(0, 0)` bottom-left with its FIRST pixel row at the top
+/// (`v = 1`). Turning the displayed image clockwise by 90° sends the sample at old `(u, v)` to
+/// new `(v, 1 - u)`, i.e. old `(u, v) = (1 - v', u')` — the matrix below. 180° and 270° follow
+/// the same substitution.
+fn turn_unit_square(rot: i32) -> Option<Mat> {
+    match rot {
+        90 => Some(Mat { a: 0.0, b: 1.0, c: -1.0, d: 0.0, e: 1.0, f: 0.0 }),
+        180 => Some(Mat { a: -1.0, b: 0.0, c: 0.0, d: -1.0, e: 1.0, f: 1.0 }),
+        270 => Some(Mat { a: 0.0, b: -1.0, c: 1.0, d: 0.0, e: 0.0, f: 1.0 }),
+        _ => None,
+    }
+}
+
+/// The placement matrix for a raster whose pixels [`turn_pixels`] has turned by `rot`, given the
+/// matrix (or, absent one, the axis-aligned rect) that placed the untouched samples.
+fn turned_placement(ctm: Option<[f32; 6]>, rect: (f32, f32, f32, f32), rot: i32) -> Option<[f32; 6]> {
+    let turn = match turn_unit_square(rot) {
+        Some(t) => t,
+        None => return ctm, // upright: exactly what the walk recorded, association included
+    };
+    // Without a placement matrix the image's own is the implicit `[w 0 0 h x0 y0]` that
+    // stretches its unit square over the placement rect.
+    let (x0, y0, x1, y1) = rect;
+    let base = match ctm {
+        Some([a, b, c, d, e, f]) => Mat { a, b, c, d, e, f },
+        None => Mat { a: x1 - x0, b: 0.0, c: 0.0, d: y1 - y0, e: x0, f: y0 },
+    };
+    let m = turn.mul(base);
+    Some([m.a, m.b, m.c, m.d, m.e, m.f])
 }
 
 /// Cut a decoded raster down to the sub-rectangle its clip leaves visible
@@ -499,7 +556,11 @@ pub fn positioned_images(doc: &Document, page_id: ObjectId, want_uris: bool) -> 
     let mut raws: Vec<RawTile> = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
     walk(doc, &content.operations, &xmap, &res, Mat::ID, None, &mut raws, 0, &mut budget, &[]);
-    finalize(doc, raws, want_uris)
+    // The page's `/Rotate` reaches only the emitted PIXELS and the matrix that places them
+    // (see `turn_pixels`): every bbox this module hands out stays in page space, because every
+    // cross-subsystem comparison in `html.rs` — captions, containment, reading order — is
+    // page-space, exactly as `vector::positioned_vectors_capped` reasons.
+    finalize(doc, raws, want_uris, crate::pdfobj::page_rotation(doc, page_id))
 }
 
 // The interpreter state is a flat argument list here exactly as it is in `vector::walk` and
@@ -684,7 +745,7 @@ fn walk(
 /// authoring software exports as a tile mosaic) and stitch each into ONE image; every
 /// other image is emitted on its own. In placeholder mode (`!want_uris`) the same
 /// grouping applies with no pixel decode — a grid becomes one empty-uri slot.
-fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool) -> Vec<Placed> {
+fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool, rot: i32) -> Vec<Placed> {
     let mut out = Vec::new();
     for g in cluster(&raws) {
         let tiles: Vec<&RawTile> = g.iter().map(|&i| &raws[i]).collect();
@@ -694,14 +755,15 @@ fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool) -> Vec<Placed> 
         if tiles.len() >= MIN_GRID_TILES && is_grid(&tiles) {
             // A stitched grid is composed axis-aligned, so it carries no rotation.
             if want_uris {
-                if let Some(uri) = stitch_grid(doc, &tiles, (x0, x1, y0, y1)) {
-                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri, ctm: None, seq: grid_seq(), clip: None });
+                if let Some(uri) = stitch_grid(doc, &tiles, (x0, x1, y0, y1), rot) {
+                    let ctm = turned_placement(None, (x0, y0, x1, y1), rot);
+                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri, ctm, seq: grid_seq(), clip: None });
                     continue;
                 }
                 // stitch failed → fall through to per-tile emission
             } else {
                 if tiles.iter().any(|t| decodable(doc, &t.res, t.id)) {
-                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri: String::new(), ctm: None, seq: grid_seq(), clip: None });
+                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri: String::new(), ctm: turned_placement(None, (x0, y0, x1, y1), rot), seq: grid_seq(), clip: None });
                 }
                 continue;
             }
@@ -714,12 +776,15 @@ fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool) -> Vec<Placed> 
             // then carries no mask; a ROTATED one cannot — a page-space rectangle is not a
             // pixel rectangle there — so it keeps the full pixels and an SVG `clip-path`.
             let (window, mask) = if t.ctm.is_none() { (t.window(), None) } else { (None, t.clip) };
+            // The placement matrix describes the TURNED unit square, because the samples the
+            // URI carries are turned — the two must agree or a composite double-turns.
+            let ctm = turned_placement(t.ctm, (t.x0, t.y0, t.x1, t.y1), rot);
             if want_uris {
-                if let Some(uri) = data_uri(doc, &t.res, t.id, window) {
-                    out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri, ctm: t.ctm, seq: t.seq.clone(), clip: mask });
+                if let Some(uri) = data_uri(doc, &t.res, t.id, window, rot) {
+                    out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri, ctm, seq: t.seq.clone(), clip: mask });
                 }
             } else if decodable(doc, &t.res, t.id) {
-                out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri: String::new(), ctm: t.ctm, seq: t.seq.clone(), clip: mask });
+                out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri: String::new(), ctm, seq: t.seq.clone(), clip: mask });
             }
         }
     }
@@ -852,7 +917,7 @@ fn decode_rgba(doc: &Document, res: &Dictionary, id: ObjectId) -> Option<image::
 /// size, and pasted at its grid position (PDF y-up → image y-down). The canvas starts
 /// opaque white so any uncovered seams stay opaque (and JPEG-encodable). None if nothing
 /// decodes.
-fn stitch_grid(doc: &Document, tiles: &[&RawTile], bbox: (f32, f32, f32, f32)) -> Option<String> {
+fn stitch_grid(doc: &Document, tiles: &[&RawTile], bbox: (f32, f32, f32, f32), turn: i32) -> Option<String> {
     let (x0, x1, y0, y1) = bbox;
     let (pw, ph) = (x1 - x0, y1 - y0);
     if pw <= 0.0 || ph <= 0.0 {
@@ -889,7 +954,7 @@ fn stitch_grid(doc: &Document, tiles: &[&RawTile], bbox: (f32, f32, f32, f32)) -
     if !placed_any {
         return None;
     }
-    rgba_uri(canvas, tiles.iter().all(|t| jpeg_source(doc, t.id)))
+    rgba_uri(turn_pixels(canvas, turn), tiles.iter().all(|t| jpeg_source(doc, t.id)))
 }
 
 #[cfg(test)]
@@ -1236,6 +1301,49 @@ mod tests {
         // local origin is x 68, y 90 (y measured down from the figure's top).
         let id = g.split("url(#").nth(1).and_then(|s| s.split(')').next()).expect("a clip-path url");
         assert!(html.contains(&format!("<clipPath id=\"{id}\"><rect x=\"68\" y=\"90\" width=\"80\" height=\"60\"/></clipPath>")), "clipPath {id} missing or wrong");
+    }
+
+    #[test]
+    fn a_standalone_raster_on_a_rotate_page_is_emitted_the_way_a_reader_sees_it() {
+        // `tests/gen_fixtures.py::gen_rotated_raster`: four pages, ONE content stream, only
+        // `/Rotate` differs, each drawing a 2x1 red|blue image with no vector ink anywhere —
+        // so it goes out as a plain `<img>`, which applies no transform at all. The four pages
+        // used to emit a BYTE-IDENTICAL data URI: the figure path had learned the page turn
+        // and the raster path had not.
+        //
+        // A quarter turn also transposes the pixel grid, so the dimensions prove it as well as
+        // the colours; red-first vs blue-first separates 90 from 270.
+        const RED: [u8; 3] = [255, 0, 0];
+        const BLUE: [u8; 3] = [0, 0, 255];
+        let mut uris = Vec::new();
+        for (page, dims, first, second) in [
+            (1u32, (2u32, 1u32), RED, BLUE),   // upright: red LEFT
+            (2, (1, 2), RED, BLUE),            // 90 cw: red on TOP
+            (3, (2, 1), BLUE, RED),            // 180: blue left
+            (4, (1, 2), BLUE, RED),            // 270: blue on top
+        ] {
+            let placed = placed_top_down("rotated_raster.pdf", page);
+            assert_eq!(placed.len(), 1, "page {page} paints exactly one raster");
+            let p = &placed[0];
+            // The placement rect stays in PAGE space on every page — `html.rs` compares
+            // captions, containment and reading order in that space and must not move.
+            for (got, want, what) in [(p.x_left, 100.0), (p.y_bottom, 250.0), (p.x_right, 300.0), (p.y_top, 350.0)]
+                .iter()
+                .zip(["x_left", "y_bottom", "x_right", "y_top"])
+                .map(|((g, w), n)| (*g, *w, n))
+            {
+                assert!((got - want).abs() < 0.5, "page {page} {what} {got} (want {want})");
+            }
+            let img = uri_rgb(&p.uri);
+            assert_eq!(img.dimensions(), dims, "page {page} pixel grid");
+            assert_eq!(img.get_pixel(0, 0).0, first, "page {page} first sample");
+            assert_eq!(img.get_pixel(dims.0 - 1, dims.1 - 1).0, second, "page {page} last sample");
+            uris.push(p.uri.clone());
+        }
+        assert_eq!(uris[0], uris[0], "sanity");
+        for i in 1..4 {
+            assert_ne!(uris[i], uris[0], "page {} must not re-emit the upright pixels", i + 1);
+        }
     }
 
     #[test]
