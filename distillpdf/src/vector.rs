@@ -395,19 +395,6 @@ fn local_extent(rot: i32, w: f32, h: f32) -> (f32, f32) {
 // to belong to the figure (form text sits just outside the boxes it annotates).
 const LABEL_MARGIN: f32 = 24.0;
 
-/// Gaps (as a fraction of the type size) inside which two label spans are consecutive glyphs
-/// of one word — see [`coalesce_glyph_runs`].
-///
-/// `0.2` is `layout::lines_of`'s own space threshold (`gap > s.size * 0.2` is where the body
-/// path decides a space is needed), so the two paths draw the word/space line in the same
-/// place. Anything wider stays two spans: this pass joins what is already contiguous, it
-/// never invents a space, and a real word gap is left exactly as it was.
-const GLYPH_JOIN_GAP: f32 = 0.2;
-/// Glyphs may also *overlap* slightly — kerning, an accent, a hand-tracked map label. A small
-/// negative gap is still one word; a deeply stacked glyph (a struck-through or overprinted
-/// mark) is not, and stays its own span.
-const GLYPH_OVERLAP_GAP: f32 = 0.35;
-
 impl PlacedSvg {
     /// Whether this figure draws curves or slanted lines — see [`has_graphic_ink`]. Used by
     /// `html.rs` to tell a diagram's own label grid (which must not suppress the diagram)
@@ -1112,8 +1099,7 @@ fn coalesce_glyph_runs(spans: &[LabelSpan]) -> Vec<LabelSpan> {
                 && run.bold == s.bold
                 && run.italic == s.italic
                 && (rv - v).abs() <= s.size * 0.15
-                && gap <= s.size * GLYPH_JOIN_GAP
-                && gap >= -s.size * GLYPH_OVERLAP_GAP
+                && crate::textutil::glyph_adjacent(gap, s.size)
             {
                 run.text.push_str(&s.text);
                 *end = u + s.width;

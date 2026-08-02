@@ -1649,7 +1649,7 @@ fn text_from_spans(mut spans: Vec<Span>) -> String {
             // Spans are word-level, so a gap at/above a typical space width (≈0.25em;
             // some fonts pack to ~0.28em) is a word boundary. 0.2em clears those while
             // staying below intra-word kerning (≈0).
-            if gap > s.size * 0.2 && !out.ends_with(' ') && !s.text.starts_with(' ') {
+            if gap > s.size * crate::textutil::SPACE_GAP && !out.ends_with(' ') && !s.text.starts_with(' ') {
                 out.push(' ');
             }
         }

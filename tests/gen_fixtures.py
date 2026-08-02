@@ -2082,6 +2082,64 @@ def gen_annot_appearance():
     }
 
 
+def gen_glyph_table():
+    """A data table whose body is drawn one ``Tj`` per glyph — the SEC-filing idiom.
+
+    Spans are word-level *at best*: a generator is entitled to emit one show-operator per
+    glyph, and every SEC filing in the local corpus does. Every path that concatenates spans
+    has to decide whether a space belongs between two of them, and the table-cell builders
+    did not decide at all — they spaced **every** appended span. ``Texas`` therefore came out
+    of a ``<th>`` as ``T e x a s``, in 266 of the corpus's 632 detected tables, and any
+    signal that reads cell TEXT (word counts, prose detection, a table-quality judgement)
+    was reading shredded input.
+
+    Courier is monospace, so every advance here is exactly ``0.6 x 9 pt = 5.4``: a glyph
+    boundary is a gap of 0 and a real word space is a gap of 5.4 (0.6 em). Both sides of the
+    rule are therefore pinned by one fixture:
+
+      row 0  drawn as whole words   -> the control: unchanged behaviour
+      rows 1-3 drawn glyph by glyph -> must read as words, not as spaced letters
+      ``East ridge``                -> a real space INSIDE a glyph-drawn cell must survive
+      ``42.5``                      -> and a decimal point must not become ``42 . 5``"""
+    pdf = os.path.join(OUT, "glyph_table.pdf")
+    ADV = 5.4  # Courier at 9 pt
+    COLS = (72.0, 220.0, 360.0)
+    ROWS = [
+        ["Region", "Samples", "Depth"],
+        ["North", "128", "42.5"],
+        ["South", "96", "31.0"],
+        ["East ridge", "77", "18.2"],
+    ]
+
+    def whole(x, y, s):
+        return b"BT /F1 9 Tf %.2f %.2f Td (%s) Tj ET" % (x, y, s.encode())
+
+    def per_glyph(x, y, s):
+        out = []
+        for i, ch in enumerate(s):
+            if ch != " ":
+                out.append(b"BT /F1 9 Tf %.2f %.2f Td (%s) Tj ET" % (x + i * ADV, y, ch.encode()))
+        return b"\n".join(out)
+
+    body = [b"BT /F2 15 Tf 72 740 Td (A Table Drawn One Glyph At A Time) Tj ET"]
+    for ri, row in enumerate(ROWS):
+        y = 700.0 - ri * 16.0
+        for ci, cell in enumerate(row):
+            body.append((whole if ri == 0 else per_glyph)(COLS[ci], y, cell))
+    stream = b"\n".join(body)
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+        5: b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>",
+        6: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["glyph_table.pdf"] = {"cells": ROWS}
+
+
 def gen_annot_render():
     """A `/Stamp` whose appearance draws a raster, vector ink AND text at a `/BBox` that has
     to be SCALED — non-uniformly — to reach its `/Rect`.
@@ -3816,6 +3874,7 @@ def main():
     gen_unfiltered_form()
     gen_annot_appearance()
     gen_annot_render()
+    gen_glyph_table()
     gen_no_spurious_figs()
     gen_links()
     gen_pagelabels()

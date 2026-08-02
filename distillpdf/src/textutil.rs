@@ -19,6 +19,39 @@
 
 use base64::Engine as _;
 
+/// The gap, as a fraction of the type size, at or above which two adjacent spans are
+/// separated by a **space** rather than being consecutive glyphs of one word.
+///
+/// Spans are word-level *at best*: a generator is entitled to emit one `Tj` per glyph, and
+/// several do (map labels, SEC filing tables). A typical space is ≈0.25 em and some fonts
+/// pack to ≈0.28; intra-word kerning is ≈0. `0.2` clears the former and stays below the
+/// latter, so it separates a word break from a glyph break without inventing either.
+///
+/// Spelled once because four paths draw this same line and had drifted into four copies of
+/// the literal: `layout::lines_of` (body prose), `text::extract_page` (plain text),
+/// `vector::coalesce_glyph_runs` (figure labels — see `GLYPH_JOIN_GAP`) and
+/// `extract::row_cells` (table cells). The last was the copy that did **not** exist: it
+/// spaced every glyph pair unconditionally, so a table header drawn glyph-by-glyph came out
+/// as `T e x a s`.
+pub(crate) const SPACE_GAP: f32 = 0.2;
+
+/// Glyphs may also *overlap* slightly — kerning, an accent, a hand-tracked label. A small
+/// negative gap is still one word; a deeply stacked glyph (a struck-through or overprinted
+/// mark), or a span that starts far to the LEFT of the previous one (a wrapped line folded
+/// into one cell), is not.
+pub(crate) const GLYPH_OVERLAP_GAP: f32 = 0.35;
+
+/// Are two adjacent spans consecutive glyphs of **one word**, i.e. is there no space between
+/// them? `gap` is the second span's start minus the first's end, both in the same units as
+/// `size`.
+///
+/// The one place this question is answered. It is asked wherever spans are concatenated into
+/// text — body lines, plain text, figure labels, table cells — and a generator that emits one
+/// `Tj` per glyph is what makes the answer load-bearing rather than cosmetic.
+pub(crate) fn glyph_adjacent(gap: f32, size: f32) -> bool {
+    gap <= size * SPACE_GAP && gap >= -size * GLYPH_OVERLAP_GAP
+}
+
 /// What a tag leaves behind when [`strip_tags`] removes it.
 ///
 /// The three are not interchangeable, and the input that separates them is a **stray `>`

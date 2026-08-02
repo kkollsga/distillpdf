@@ -454,7 +454,14 @@ fn row_cells(row: &[Span]) -> Vec<Cell> {
             && gap > s.size * 0.45;
         match cells.last_mut() {
             Some(prev) if gap < s.size * 1.3 && !numeric_split => {
-                if join_space(&prev.text, txt) {
+                // A space belongs where a READER sees one, and nowhere else. This branch
+                // used to space every merged pair unconditionally — correct for the
+                // word-level spans it was written against, and shredding for a generator
+                // that emits one `Tj` per glyph: `Texas` came back as `T e x a s`, and with
+                // it 266 of the corpus's 632 tables (every SEC filing header). The body
+                // path and the figure-label path already draw this line at
+                // [`crate::textutil::SPACE_GAP`]; this is the copy that was missing.
+                if !crate::textutil::glyph_adjacent(gap, s.size) && join_space(&prev.text, txt) {
                     prev.text.push(' ');
                 }
                 prev.text.push_str(txt);
@@ -963,6 +970,11 @@ fn detect_tables_region(spans: &[Span]) -> Vec<PosTable> {
                 .iter()
                 .map(|(_, _, spans)| {
                     let mut cells = vec![String::new(); kept.len()];
+                    // Where each cell's text currently ENDS, so the space decision below can
+                    // see the gap. This is the grid a consumer actually reads, and it spaced
+                    // every appended span unconditionally: on a generator that emits one `Tj`
+                    // per glyph — every SEC filing in the corpus — `Texas` came out `T e x a s`.
+                    let mut ends = vec![f32::NEG_INFINITY; kept.len()];
                     for s in spans {
                         let txt = s.text.trim();
                         if txt.is_empty() {
@@ -970,10 +982,14 @@ fn detect_tables_region(spans: &[Span]) -> Vec<PosTable> {
                         }
                         let w = if s.width > 0.1 { s.width } else { txt.chars().count() as f32 * s.size * 0.5 };
                         if let Some(k) = band_of(&kept, s.x + w * 0.5) {
-                            if !cells[k].is_empty() && join_space(&cells[k], txt) {
+                            if !cells[k].is_empty()
+                                && !crate::textutil::glyph_adjacent(s.x - ends[k], s.size)
+                                && join_space(&cells[k], txt)
+                            {
                                 cells[k].push(' ');
                             }
                             cells[k].push_str(txt);
+                            ends[k] = s.x + w;
                         }
                     }
                     cells
@@ -1306,6 +1322,35 @@ mod tests {
     fn form_image_doc() -> Document {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/form_image.pdf");
         Document::load(path).expect("form_image.pdf fixture must load")
+    }
+
+    #[test]
+    fn a_table_drawn_one_glyph_per_tj_reads_as_words_not_spaced_letters() {
+        // `tests/gen_fixtures.py::gen_glyph_table`. Both cell builders — `row_cells`, which
+        // feeds column detection, and `try_model`, which builds the grid a consumer reads —
+        // spaced EVERY appended span, with no gap test at all. That is right for the
+        // word-level spans they were written against and shredding for a generator that
+        // emits one `Tj` per glyph: `Texas` came out of a `<th>` as `T e x a s`, in 266 of
+        // the local corpus's 632 detected tables. Every table-quality signal that reads cell
+        // text — word counts, prose detection — was reading that.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/glyph_table.pdf");
+        let doc = Document::load(path).expect("glyph_table.pdf fixture must load");
+        let raw = std::fs::read(path).expect("fixture readable");
+        let page = *doc.get_pages().get(&1).expect("page 1");
+        let spans = crate::text::extract_spans(&doc, page, &raw);
+        let tables = detect_tables_pos(&spans);
+        assert_eq!(tables.len(), 1, "one table, got {}", tables.len());
+        let want = [
+            ["Region", "Samples", "Depth"],
+            ["North", "128", "42.5"],
+            ["South", "96", "31.0"],
+            ["East ridge", "77", "18.2"],
+        ];
+        let got: Vec<Vec<String>> = tables[0].grid.iter().map(|r| r.iter().map(|c| c.trim().to_string()).collect()).collect();
+        assert_eq!(got.len(), want.len(), "row count: {got:?}");
+        for (g, w) in got.iter().zip(want) {
+            assert_eq!(g.as_slice(), w.map(String::from).as_slice(), "grid: {got:?}");
+        }
     }
 
     #[test]

@@ -1090,5 +1090,29 @@
       "StampInkVisible",
       "SelectedStateOn"
     ]
+  },
+  "glyph_table.pdf": {
+    "cells": [
+      [
+        "Region",
+        "Samples",
+        "Depth"
+      ],
+      [
+        "North",
+        "128",
+        "42.5"
+      ],
+      [
+        "South",
+        "96",
+        "31.0"
+      ],
+      [
+        "East ridge",
+        "77",
+        "18.2"
+      ]
+    ]
   }
 }

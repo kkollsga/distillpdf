@@ -257,7 +257,7 @@ pub(crate) fn lines_of(mut spans: Vec<Span>, links: &[LinkBox]) -> Vec<Line> {
         let prev_txt = line.runs.last().map(|r| r.text.trim_end()).unwrap_or("");
         let mut pit = prev_txt.chars().rev();
         let (prev_c, prev_c2) = (pit.next(), pit.next());
-        let need_space = gap > s.size * 0.2 && !binds(prev_c, prev_c2, s.text.chars().next());
+        let need_space = gap > s.size * crate::textutil::SPACE_GAP && !binds(prev_c, prev_c2, s.text.chars().next());
         let end = s.x + span_width(s);
         // Link hit-test: a span belongs to a link if its center is in the rect.
         let href = href_at((s.x + end) * 0.5, s.y + s.size * 0.5, links);
