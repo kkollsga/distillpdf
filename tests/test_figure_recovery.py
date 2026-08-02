@@ -64,3 +64,31 @@ def test_no_spurious_figures_without_caption():
     # → exactly one figure. So the whole doc must have exactly the control's count.
     assert len(_figures(h)) == g["total_figures"], (
         f"expected {g['total_figures']} figure(s) total (control only), got {len(_figures(h))}")
+
+
+# ----- A label grid must not delete the map it labels -----
+def test_uncaptioned_map_survives_its_own_label_grid():
+    """`map_label_grid.pdf` is a controlled A/B for the `not_in_table` proportionality guard.
+
+    Both pages carry the SAME 4x4 grid of short place names, and on both the grid is what
+    the table detector sees. The ink differs: page 1 is a map (Bézier coastline + slanted
+    borders), page 2 is a ruled table (horizontal and vertical rules only).
+
+    A table that covers a small corner of a figure cannot BE that figure's ink, so on page 1
+    the map must survive; on page 2 the table really does own its region and no figure may
+    be emitted. Pre-fix, ANY overlapping table deleted the vector, so page 1 emitted zero
+    figures — which is how `geology_usgs_fs.pdf` p1's cover map went missing while the page
+    still emitted an `<svg>` for the banner logo above it.
+    """
+    h = html("map_label_grid.pdf")
+    g = GT["map_label_grid.pdf"]
+    figs = _figures(h)
+    total = g["page1_figures"] + g["page2_figures"]
+    assert len(figs) == total, f"expected {total} figure(s) (the map only), got {len(figs)}"
+    svg = "".join(f for f in figs if "<svg" in f)
+    assert "<path" in svg, "the map came back without its ink"
+    assert "C" in re.sub(r"[^A-Z]", "", re.search(r'd="([^"]+)"', svg).group(1)), \
+        "the recovered figure is not the curved map"
+    # Both label grids still reach the reader as tables — the guard adds a figure, it never
+    # removes a table.
+    assert h.count("<table") == 2, f"a table was lost: {h.count('<table')} remain"

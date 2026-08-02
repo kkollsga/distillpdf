@@ -1909,6 +1909,75 @@ def gen_no_spurious_figs():
     GT["no_spurious_figs.pdf"] = {"page1_figures": 0, "total_figures": 1}
 
 
+def gen_map_label_grid():
+    """A ruled table must own its region; an uncaptioned MAP must not lose its to one.
+
+    Both pages carry a large vector region with a grid of short text labels inside it, and
+    on both the label grid is what the table detector sees. The only difference is the ink:
+
+    * page 1 — a *map*: a coastline of Béziers plus diagonal borders. Curves and slanted
+      lines are ink no ruled table can draw, so the label grid cannot be the source of that
+      ink, and the figure must survive (this is `geology_usgs_fs.pdf` p1's cover map, whose
+      two label grids — 5% and 9% of the map's area — were deleting a 1,574-path map).
+    * page 2 — a *ruled table*: the identical label grid, but the vector ink is exactly the
+      table's own horizontal and vertical rules. The old rule is right here — the table owns
+      the region and no figure may be emitted for it.
+    """
+    pdf = os.path.join(OUT, "map_label_grid.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+
+    # ---- page 1: the map. Box (LM, 300) - (LM+400, 700).
+    mx, my, mw, mh = float(LM), 300.0, 400.0, 400.0
+    c.setStrokeColorRGB(0.1, 0.3, 0.6)
+    c.setLineWidth(0.9)
+    # A curved "coastline" (Béziers) …
+    for k in range(6):
+        off = k * 12.0
+        pth = c.beginPath()
+        pth.moveTo(mx + 20 + off, my + 30)
+        pth.curveTo(mx + 90 + off, my + 140, mx + 40 + off, my + 250, mx + 130 + off, mh + my - 40)
+        c.drawPath(pth, stroke=1, fill=0)
+    # … plus slanted county borders.
+    for k in range(6):
+        c.line(mx + 200, my + 40 + k * 55, mx + 380, my + 90 + k * 55)
+    # … and enough axis-aligned rules to clear MIN_PATHS on both pages alike.
+    for k in range(4):
+        c.line(mx, my + k * 100, mx + mw, my + k * 100)
+    c.setStrokeColorRGB(0, 0, 0)
+    _label_grid(c, mx + 30, my + 90)
+    c.setFont("Helvetica", 9.5)
+    c.drawString(LM, my - 24, "Base map from the fixture generator; no caption anchors this figure.")
+    c.showPage()
+
+    # ---- page 2: the control. The same label grid inside a purely RULED table.
+    tx, ty, tw = float(LM), 300.0, 400.0
+    c.setLineWidth(0.8)
+    for k in range(5):
+        c.line(tx, ty + 80 + k * 26, tx + tw, ty + 80 + k * 26)
+    for k in range(5):
+        c.line(tx + k * 62, ty + 80, tx + k * 62, ty + 184)
+    _label_grid(c, tx + 30, ty + 90)
+    c.setFont("Helvetica", 9.5)
+    c.drawString(LM, ty - 24, "A ruled data table drawn from horizontal and vertical rules only.")
+    c.showPage()
+    c.save()
+    GT["map_label_grid.pdf"] = {"page1_figures": 1, "page2_figures": 0}
+
+
+def _label_grid(c, x0, y0):
+    """A 4x4 grid of short place names — the shape a table detector reads as cells."""
+    names = [
+        ["Cloverdale", "Calistoga", "Sonoma", "Napa"],
+        ["Healdsburg", "Sebastopol", "Petaluma", "Vallejo"],
+        ["Guerneville", "Rohnert", "Novato", "Benicia"],
+        ["Windsor", "Cotati", "Larkspur", "Martinez"],
+    ]
+    c.setFont("Helvetica", 7.5)
+    for r, row in enumerate(names):
+        for col, name in enumerate(row):
+            c.drawString(x0 + col * 62, y0 + r * 26, name)
+
+
 def gen_dense_vector():
     """A DENSE vector page: two well-separated strong figures, the second built from a few
     hundred tiny filled rectangles, for a page content stream in the high hundreds of ops.
@@ -3072,6 +3141,7 @@ def main():
     gen_lof_dotleader()
     gen_small_vector_fig()
     gen_dense_vector()
+    gen_map_label_grid()
     gen_inherited_mediabox()
     gen_indirect_mediabox()
     gen_indirect_numbers()

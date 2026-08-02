@@ -1377,8 +1377,31 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         // borders read as vector ink and the table owns its region. The false tables that
         // would wrongly suppress a real plot vector were already removed above, so this
         // simple any-overlap test no longer fragments raster+vector crossplots.
+        //
+        // …with one proportionality guard. The rule's whole justification is that the ink IS
+        // the table's rules, so it only holds while the table can plausibly ACCOUNT for the
+        // ink. `geology_usgs_fs.pdf` p1 is the counterexample: its cover map draws place
+        // names one glyph at a time, and two of those label grids (5% and 9% of the map's
+        // area) were deleting a 1,574-path map — county boundary, shaded study areas, both
+        // pie charts, every city label. The page still emitted an `<svg>` (the USGS banner),
+        // so no count could see the loss.
+        //
+        // So: a table that covers less than a quarter of a figure that carries GRAPHIC INK
+        // (curves or slanted lines — `vector::has_graphic_ink`, which no ruled table, TOC
+        // dot-leader row or filing-chrome card can produce) is a label grid sitting *on* the
+        // figure, not the figure's source. It no longer suppresses it. A real ruled form is
+        // untouched twice over: its vector has no graphic ink, and its table coincides with
+        // that vector rather than covering a corner of it.
         let not_in_table = |v: &vector::PlacedSvg| {
-            !tables.iter().any(|t| v.x_left < t.x_right && v.x_right > t.x_left && v.y_bottom < t.y_top && v.y_top > t.y_bottom)
+            let vr = Rect::new(v.x_left, v.y_bottom, v.x_right, v.y_top);
+            let va = vr.area().max(1.0);
+            !tables.iter().any(|t| {
+                if !(v.x_left < t.x_right && v.x_right > t.x_left && v.y_bottom < t.y_top && v.y_top > t.y_bottom) {
+                    return false;
+                }
+                let tr = Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
+                !(v.graphic_ink() && vr.overlap_area(tr) < va * 0.25)
+            })
         };
         let mut vectors: Vec<vector::PlacedSvg> = raw_vectors.into_iter().filter(&not_in_table).collect();
         // Caption-aware recovery: a small vector diagram below the figure filter's strong bar

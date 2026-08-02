@@ -282,6 +282,9 @@ pub struct PlacedSvg {
     // — reference curves the PDF clips to the axes box — is cropped by the SVG viewport
     // instead of trailing far past the figure.
     plot: Option<(f32, f32, f32, f32)>,
+    /// Whether the cluster carries **graphic ink** — see [`has_graphic_ink`]. A map, a DAG or
+    /// a plot has it; a ruled table, a page-furniture card and a dot-leader row do not.
+    graphic_ink: bool,
     /// The page's `/Rotate` (0/90/180/270). The bbox above stays in **page space** — every
     /// cross-subsystem comparison in `html.rs` (captions, raster containment, reading order)
     /// is page-space and must not move — while the local geometry below is in **display
@@ -387,6 +390,13 @@ fn local_extent(rot: i32, w: f32, h: f32) -> (f32, f32) {
 const LABEL_MARGIN: f32 = 24.0;
 
 impl PlacedSvg {
+    /// Whether this figure draws curves or slanted lines — see [`has_graphic_ink`]. Used by
+    /// `html.rs` to tell a diagram's own label grid (which must not suppress the diagram)
+    /// from a real data table that happens to overlap it.
+    pub fn graphic_ink(&self) -> bool {
+        self.graphic_ink
+    }
+
     /// Attach form-internal text spans that belong to this figure, mapping each
     /// into local SVG coords. A span is claimed when its centre lies within the
     /// bbox expanded by [`LABEL_MARGIN`].
@@ -1414,7 +1424,53 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32, rot: i32) -> PlacedSvg {
         };
         paths.push((p.seq.clone(), format!("<path d=\"{d}\" fill=\"{fill}\"{fop}{stroke}{clip_attr}/>")));
     }
-    PlacedSvg { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, defs, paths, w: lw, h: lh, page_w, labels: Vec::new(), plot, rot }
+    PlacedSvg { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, defs, paths, w: lw, h: lh, page_w, labels: Vec::new(), plot, graphic_ink: has_graphic_ink(cluster), rot }
+}
+
+/// Does this cluster draw anything a **ruled table cannot**?
+///
+/// A data table, a form's cell grid, a dot-leader row and an SEC filing's backdrop card are
+/// drawn entirely from horizontal and vertical straight edges. A map coastline, a DAG's
+/// arrows, a plot's curves and a logo are not: they need Béziers or slanted lines. So "the
+/// cluster contains at least one curve segment or one non-axis-aligned line" separates
+/// diagram ink from tabular chrome without looking at colour or size at all.
+///
+/// `TOL` is a third of a point: a hairline rule authored at a fractionally non-integer
+/// coordinate (or one that has been through a CTM) must still read as axis-aligned, while a
+/// genuine diagonal on a figure-sized cluster is orders of magnitude longer than this.
+fn has_graphic_ink(cluster: &[Painted]) -> bool {
+    const TOL: f32 = 0.34;
+    cluster.iter().any(|p| {
+        let mut cur: Option<(f32, f32)> = None;
+        let mut start: Option<(f32, f32)> = None;
+        for s in &p.segs {
+            match *s {
+                Seg::C(..) => return true,
+                Seg::M(x, y) => {
+                    cur = Some((x, y));
+                    start = Some((x, y));
+                }
+                Seg::L(x, y) => {
+                    if let Some((px, py)) = cur {
+                        if (x - px).abs() > TOL && (y - py).abs() > TOL {
+                            return true;
+                        }
+                    }
+                    cur = Some((x, y));
+                }
+                // `h` closes back to the subpath's start; that closing edge is ink too.
+                Seg::Z => {
+                    if let (Some((px, py)), Some((sx, sy))) = (cur, start) {
+                        if (sx - px).abs() > TOL && (sy - py).abs() > TOL {
+                            return true;
+                        }
+                    }
+                    cur = start;
+                }
+            }
+        }
+        false
+    })
 }
 
 /// Intersect a new page-space clip rectangle into the one already in force. Shared with
@@ -1511,6 +1567,48 @@ mod tests {
         let doc = Document::load(path).expect("dense_vector.pdf fixture must load");
         let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
         (doc, page_id)
+    }
+
+    #[test]
+    fn a_map_carries_graphic_ink_and_a_ruled_table_does_not() {
+        // The primitive `html.rs` uses to tell a diagram's own label grid (which must not
+        // suppress the diagram) from a real data table that overlaps one. The fixture is a
+        // controlled A/B: `map_label_grid.pdf` draws the SAME 4x4 label grid on both pages,
+        // over a Bézier coastline with slanted borders on page 1 and over nothing but
+        // horizontal/vertical rules on page 2.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/map_label_grid.pdf");
+        let doc = Document::load(path).expect("map_label_grid.pdf fixture must load");
+        let pages = doc.get_pages();
+        for (n, want) in [(1u32, true), (2, false)] {
+            let page_id = *pages.get(&n).expect("fixture has this page");
+            let (strong, _weak) = positioned_vectors(&doc, page_id);
+            assert_eq!(strong.len(), 1, "page {n}: the fixture draws exactly one cluster");
+            assert_eq!(strong[0].graphic_ink(), want, "page {n}: graphic ink misread");
+        }
+    }
+
+    #[test]
+    fn a_hairline_rule_off_the_integer_grid_is_still_axis_aligned() {
+        // The tolerance is what keeps a ruled table honest: its rules land at fractional
+        // coordinates once a CTM has been through them, and a quarter-point of slop must
+        // not read as a diagonal. A real diagonal on a figure-sized cluster is orders of
+        // magnitude longer than this.
+        let rule = |dy: f32| Painted {
+            segs: vec![Seg::M(10.0, 100.0), Seg::L(400.0, 100.0 + dy)],
+            fill: None,
+            stroke: Some(Stroke { color: [0, 0, 0], width: 0.5, dash: None }),
+            fill_op: 1.0,
+            stroke_op: 1.0,
+            x0: 10.0,
+            y0: 100.0,
+            x1: 400.0,
+            y1: 100.0 + dy,
+            seq: PaintSeq::at(&[], 0),
+            clip: None,
+        };
+        assert!(!has_graphic_ink(&[rule(0.0)]), "a flat rule is not graphic ink");
+        assert!(!has_graphic_ink(&[rule(0.25)]), "a hairline off the grid is not a diagonal");
+        assert!(has_graphic_ink(&[rule(6.0)]), "a genuine slant IS graphic ink");
     }
 
     #[test]
