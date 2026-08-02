@@ -1107,6 +1107,75 @@ def gen_rotated_pages():
     }
 
 
+def gen_separation():
+    """Spot colours: ``Separation`` / ``DeviceN`` fills whose tints must pass through the
+    space's TINT TRANSFORM before they mean a colour.
+
+    ``scn`` in a ``Separation`` space carries a *tint* — "how much of this colorant" — not a
+    colour. The vector walk had no ``cs``/``CS`` arm at all, so it never knew the space and
+    read a 1-operand ``scn`` as a grey level: ``.1 scn`` painted ``#1a1a1a``, and a pale
+    (198,198,224) table header came out near-BLACK.
+
+    Three pages, one per path through the new evaluator; each draws a stroked frame plus 8
+    fills, so every page is one strong figure of 9 paths at exactly x 100..300, y 200..500:
+
+      page 1  ``[/Separation /Spot /DeviceRGB <Type 2>]`` — an exponential ramp from white
+              to the audit's own (198,198,224). Tints .1/.2/.5/1 must come out PALE, and
+              tint 1 must be exactly ``#c6c6e0``.
+      page 2  ``[/DeviceN [/A /B] /DeviceRGB <Type 0>]`` — two colorants through a 2x2
+              sampled grid, which also pins the "first dimension varies fastest" sample
+              order end to end: ``1 0 scn`` is red and ``0 1 scn`` is green, never swapped.
+      page 3  ``[/Separation /Spot /DeviceRGB <Type 4>]`` — a PostScript calculator, which
+              is deliberately NOT evaluated. It pins the fallback: the tint is read as INK
+              COVERAGE (luminance ``1 - t``), so tint .2 degrades to a pale ``#cccccc``
+              rather than inverting to the ``#333333`` the grey-level reading gave.
+
+    Hand-assembled: reportlab emits no spot colours at all."""
+    pdf = os.path.join(OUT, "separation.pdf")
+
+    def page(tints):
+        rows = [b"2 w 0 G 100 200 200 300 re S", b"/CS0 cs"]
+        spots = [(110, 210), (160, 210), (210, 210), (110, 290), (160, 290), (210, 290), (110, 370), (160, 370)]
+        for (x, y), t in zip(spots, tints):
+            rows.append(b"%s scn %d %d 40 60 re f" % (t, x, y))
+        c = b"\n".join(rows)
+        return b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c), c)
+
+    # Page 1 tints, page 3 tints (page 2 carries 2-component DeviceN operands).
+    p1 = page([b"0.1", b"0.1", b"0.2", b"0.2", b"0.5", b"0.5", b"1", b"1"])
+    p2 = page([b"0 0", b"1 0", b"0 1", b"1 1", b"0 0", b"1 0", b"0 1", b"1 1"])
+    p3 = page([b"0.2", b"0.2", b"0.2", b"0.2", b"0.75", b"0.75", b"0.75", b"0.75"])
+    # A 2x2x3 sample grid, FIRST dimension fastest: (0,0) white, (1,0) red, (0,1) green,
+    # (1,1) blue. Unfiltered on purpose — a function stream may legally carry no /Filter.
+    grid = bytes((255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255))
+    ps = b"{ dup dup }"  # a Type 4 program: 1 tint -> 3 equal components
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 /MediaBox [0 0 400 600] >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R /Resources << /ColorSpace "
+            b"<< /CS0 [/Separation /Spot /DeviceRGB 9 0 R] >> >> >>"),
+        4: (b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources << /ColorSpace "
+            b"<< /CS0 [/DeviceN [/A /B] /DeviceRGB 10 0 R] >> >> >>"),
+        5: (b"<< /Type /Page /Parent 2 0 R /Contents 8 0 R /Resources << /ColorSpace "
+            b"<< /CS0 [/Separation /Spot /DeviceRGB 11 0 R] >> >> >>"),
+        6: p1,
+        7: p2,
+        8: p3,
+        9: (b"<< /FunctionType 2 /Domain [0 1] /C0 [1 1 1] /C1 [0.776 0.776 0.878] /N 1 >>"),
+        10: (b"<< /FunctionType 0 /Domain [0 1 0 1] /Range [0 1 0 1 0 1] /Size [2 2] "
+             b"/BitsPerSample 8 /Length %d >>\nstream\n%s\nendstream" % (len(grid), grid)),
+        11: (b"<< /FunctionType 4 /Domain [0 1] /Range [0 1 0 1 0 1] /Length %d >>\n"
+             b"stream\n%s\nendstream" % (len(ps), ps)),
+    }
+    _assemble_pdf(objs, pdf)
+    GT["separation.pdf"] = {
+        "pages": ["Separation/Type2", "DeviceN/Type0", "Separation/Type4"],
+        "solid_tint_rgb": "#c6c6e0",
+        "type4_coverage": {"0.2": "#cccccc", "0.75": "#404040"},
+        "grey_level_misreadings": ["#1a1a1a", "#333333"],
+    }
+
+
 def gen_render_samples():
     """Sampled rasters the RENDER path used to get wrong, each one *drawn* on the page so
     ``to_html`` has to decode it (``extract_images()`` already handled all of them).
@@ -2531,6 +2600,7 @@ def main():
     gen_paint_order()
     gen_no_resources_paths()
     gen_rotated_pages()
+    gen_separation()
     gen_render_samples()
     gen_cmyk_jpeg()
     gen_decode_jpeg()

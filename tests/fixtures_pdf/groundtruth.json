@@ -774,5 +774,21 @@
       "Alpha",
       "Beta"
     ]
+  },
+  "separation.pdf": {
+    "pages": [
+      "Separation/Type2",
+      "DeviceN/Type0",
+      "Separation/Type4"
+    ],
+    "solid_tint_rgb": "#c6c6e0",
+    "type4_coverage": {
+      "0.2": "#cccccc",
+      "0.75": "#404040"
+    },
+    "grey_level_misreadings": [
+      "#1a1a1a",
+      "#333333"
+    ]
   }
 }

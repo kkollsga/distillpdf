@@ -10,11 +10,13 @@
 //! Shadings / patterns / soft masks are out of scope here (skipped); text inside
 //! a figure stays in the normal text flow (it is extracted as spans elsewhere).
 
+use crate::function::Function;
 use crate::geom::{Mat, Rect};
-use crate::pdfobj::{deref, num, num_deref};
+use crate::pdfobj::{deref, num, num_deref, sub_dict};
 use crate::walker::{descend_form, overlay_xobjects, page_resource_chain, Descend, PaintSeq, ScopePolicy, XMap};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 fn gray(g: f32) -> [u8; 3] {
     let v = (g.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -25,6 +27,116 @@ fn rgb(r: f32, g: f32, b: f32) -> [u8; 3] {
 }
 fn cmyk(c: f32, m: f32, y: f32, k: f32) -> [u8; 3] {
     rgb((1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - y) * (1.0 - k))
+}
+
+/// `n` colour components as RGB, by the component count alone — PDF's own device dispatch
+/// (1 gray, 3 rgb, 4 cmyk). The one place that mapping lives; both a bare `scn` operand
+/// list and a tint transform's output go through it.
+fn from_components(n: usize, v: &[f32]) -> Option<[u8; 3]> {
+    match n {
+        1 if !v.is_empty() => Some(gray(v[0])),
+        3 if v.len() >= 3 => Some(rgb(v[0], v[1], v[2])),
+        4 if v.len() >= 4 => Some(cmyk(v[0], v[1], v[2], v[3])),
+        _ => None,
+    }
+}
+
+/// A colour space as the *vector* path needs it: how many operands an `scn` carries, and
+/// what those operands mean.
+///
+/// Only the distinction `scn` acts on is modelled. Everything that is not a spot colour
+/// collapses to [`PaintCs::Device`] with a component count, which is exactly the dispatch
+/// `scn` did before any of this existed — so a well-formed device-colour stream is
+/// bit-preserved whether or not it names its space.
+enum PaintCs {
+    /// A device-ish space (`DeviceRGB`, `ICCBased`, `CalGray`, `Indexed`, …). Carries no
+    /// component count on purpose: for these the `scn` OPERAND count is authoritative and
+    /// already equals it, so dispatching on the space instead would only change behaviour
+    /// for a stream whose operands disagree with the space it named — i.e. for malformed
+    /// input, in a direction nothing has evidence for.
+    Device,
+    /// `Separation` or `DeviceN`: `k` tints that mean nothing until they pass through the
+    /// space's **tint transform** into an alternate space. `alt` is the alternate's
+    /// component count (1/3/4); either being `None` is what sends `scn` to the ink-coverage
+    /// fallback.
+    Tint { k: usize, tint: Option<Function>, alt: Option<usize> },
+    /// `Pattern`: `scn` names a pattern, which carries no directly usable colour — the same
+    /// `None` the component dispatch produced for a trailing name.
+    Pattern,
+}
+
+/// A `DeviceN` with more colorants than this is not a colour space we will serve.
+const MAX_COLORANTS: usize = 32;
+
+/// Parse one colour-space object. `None` means "not a space this path models" — the caller
+/// then leaves the active space unset, which is precisely today's behaviour.
+fn parse_cs(doc: &Document, res: &Dictionary, o: &Object, depth: u32) -> Option<PaintCs> {
+    if depth > crate::raster::MAX_CS_DEPTH {
+        return None;
+    }
+    // `resolve_cs` follows the reference AND the `/Resources`-`/ColorSpace` name lookup that
+    // makes `/CS0` mean anything (`raster.rs` owns that reader; there is one copy of it).
+    let resolved = crate::raster::resolve_cs(doc, res, o, 0)?;
+    if let Object::Name(n) = resolved {
+        if n.as_slice() == b"Pattern" {
+            return Some(PaintCs::Pattern);
+        }
+    }
+    if let Object::Array(a) = resolved {
+        let head = deref(doc, a.first()?)?.as_name().ok()?;
+        match head {
+            b"Separation" | b"DeviceN" => {
+                // `/Separation` is one colorant by definition; `/DeviceN`'s count is the
+                // length of its names array (§8.6.6.4/§8.6.6.5).
+                let k = if head == b"Separation" { 1 } else { deref(doc, a.get(1)?)?.as_array().ok()?.len() };
+                if k == 0 || k > MAX_COLORANTS {
+                    return None;
+                }
+                // The alternate space reduces to a component count — and an `/Indexed`
+                // alternate is illegal, so it degrades rather than being read as gray.
+                let alt = crate::raster::cs_model(doc, res, a.get(2)?, depth + 1).and_then(|c| match c {
+                    crate::raster::Cs::Indexed { .. } => None,
+                    other => Some(other.components()),
+                });
+                // A transform whose output arity disagrees with the alternate space it
+                // feeds is not a transform we trust — dropping it here sends `scn` to the
+                // coverage fallback instead of to a confidently wrong colour.
+                let tint = a
+                    .get(3)
+                    .and_then(|f| Function::parse(doc, f))
+                    .filter(|f| !matches!((f.n_outputs(), alt), (Some(n), Some(k)) if n != k));
+                return Some(PaintCs::Tint { k, tint, alt });
+            }
+            b"Pattern" => return Some(PaintCs::Pattern),
+            _ => {}
+        }
+    }
+    crate::raster::cs_model(doc, res, o, depth).map(|_| PaintCs::Device)
+}
+
+/// The colour spaces one resource dictionary defines, by name — the `/ColorSpace` half of
+/// what `cs`/`CS` resolve against, folded over the page's resource chain exactly as the
+/// `/ExtGState` map is.
+fn colorspaces_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, Rc<PaintCs>> {
+    let mut map = HashMap::new();
+    if let Some(csd) = sub_dict(doc, resources, b"ColorSpace") {
+        for (name, val) in csd.iter() {
+            if let Some(cs) = parse_cs(doc, resources, val, 0) {
+                map.insert(name.clone(), Rc::new(cs));
+            }
+        }
+    }
+    map
+}
+
+/// A `cs`/`CS` operand resolved to a space: the four names that mean a space in themselves,
+/// then the page's `/ColorSpace` resources.
+fn cs_operand(csmap: &HashMap<Vec<u8>, Rc<PaintCs>>, name: &[u8]) -> Option<Rc<PaintCs>> {
+    match name {
+        b"DeviceGray" | b"CalGray" | b"G" | b"DeviceRGB" | b"CalRGB" | b"RGB" | b"DeviceCMYK" | b"CMYK" => Some(Rc::new(PaintCs::Device)),
+        b"Pattern" => Some(Rc::new(PaintCs::Pattern)),
+        other => csmap.get(other).cloned(),
+    }
 }
 
 /// One path segment, points already in PDF page space (CTM applied).
@@ -54,7 +166,10 @@ struct Painted {
 }
 
 /// Graphics state carried through the walk and the q/Q stack.
-#[derive(Clone, Copy)]
+///
+/// `Clone`, not `Copy`: the active colour spaces are shared handles (a `DeviceN` transform
+/// is a whole parsed function, and `q`/`Q` copies the state on every nesting level).
+#[derive(Clone)]
 struct GState {
     ctm: Mat,
     fill: [u8; 3],
@@ -66,10 +181,17 @@ struct GState {
     // `W`/`W*` clip seen so far on the q/Q stack. `None` = unclipped (page bounds). A plot
     // clips its reference curves to the axes box; honouring it crops the curve overshoot.
     clip: Option<(f32, f32, f32, f32)>,
+    // Colour spaces selected by `cs`/`CS`. `None` = none named, in which case `scn` falls
+    // back to the operand-count dispatch — exactly what the whole walk did before.
+    // NOTE the spec's "selecting a space resets the colour to its initial value" is
+    // deliberately NOT implemented: nothing depended on it, and doing it here would repaint
+    // device-colour streams that are correct today.
+    fill_cs: Option<Rc<PaintCs>>,
+    stroke_cs: Option<Rc<PaintCs>>,
 }
 impl GState {
     fn new(ctm: Mat, fill: [u8; 3], stroke: [u8; 3], lw: f32, fill_a: f32, stroke_a: f32) -> GState {
-        GState { ctm, fill, stroke, lw, fill_a, stroke_a, clip: None }
+        GState { ctm, fill, stroke, lw, fill_a, stroke_a, clip: None, fill_cs: None, stroke_cs: None }
     }
 }
 
@@ -691,13 +813,15 @@ fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (
     // an ancestor defines finally resolves (see `walker::page_resource_chain`).
     let mut xmap = XMap::new();
     let mut egmap: HashMap<Vec<u8>, (Option<f32>, Option<f32>)> = HashMap::new();
+    let mut csmap: HashMap<Vec<u8>, Rc<PaintCs>> = HashMap::new();
     for res in &chain {
         overlay_xobjects(doc, res, &mut xmap);
         egmap.extend(extgstates_of(doc, res));
+        csmap.extend(colorspaces_of(doc, res));
     }
     let mut painted = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
-    walk(doc, ops, &xmap, &egmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget, &[]);
+    walk(doc, ops, &xmap, &egmap, &csmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget, &[]);
     // Paint order is stamped by the walk itself (`PaintSeq`, the operation's address in the
     // content tree) rather than re-derived from this vector's order here. The two are the
     // same ordering, but only the address is comparable with `img::positioned_images`'s
@@ -755,6 +879,7 @@ fn walk(
     ops: &[lopdf::content::Operation],
     xmap: &XMap,
     egmap: &HashMap<Vec<u8>, (Option<f32>, Option<f32>)>,
+    csmap: &HashMap<Vec<u8>, Rc<PaintCs>>,
     base: GState,
     out: &mut Vec<Painted>,
     depth: u32,
@@ -788,7 +913,7 @@ fn walk(
         }
         let o = &op.operands;
         match op.operator.as_str() {
-            "q" => stack.push(g),
+            "q" => stack.push(g.clone()),
             "Q" => {
                 if let Some(s) = stack.pop() {
                     g = s;
@@ -814,13 +939,17 @@ fn walk(
             "RG" if o.len() >= 3 => g.stroke = rgb(num(&o[0]), num(&o[1]), num(&o[2])),
             "k" if o.len() >= 4 => g.fill = cmyk(num(&o[0]), num(&o[1]), num(&o[2]), num(&o[3])),
             "K" if o.len() >= 4 => g.stroke = cmyk(num(&o[0]), num(&o[1]), num(&o[2]), num(&o[3])),
+            // `cs`/`CS` name the space the following `scn`/`SCN` operands live in. Without
+            // this arm the walk never knew, so a Separation tint was read as a grey level.
+            "cs" => g.fill_cs = o.first().and_then(|x| x.as_name().ok()).and_then(|n| cs_operand(csmap, n)),
+            "CS" => g.stroke_cs = o.first().and_then(|x| x.as_name().ok()).and_then(|n| cs_operand(csmap, n)),
             "sc" | "scn" => {
-                if let Some(c) = comps(o) {
+                if let Some(c) = scn_color(g.fill_cs.as_deref(), o) {
                     g.fill = c;
                 }
             }
             "SC" | "SCN" => {
-                if let Some(c) = comps(o) {
+                if let Some(c) = scn_color(g.stroke_cs.as_deref(), o) {
                     g.stroke = c;
                 }
             }
@@ -899,32 +1028,59 @@ fn walk(
                     Descend::Skip => continue,
                     Descend::Halt => return,
                 };
-                // The ExtGState half of the scope is this walker's own interpretation, so
-                // it is overlaid here rather than in the shared descent.
+                // The ExtGState and ColorSpace halves of the scope are this walker's own
+                // interpretation, so they are overlaid here rather than in the shared
+                // descent. A form routinely defines the spot colour it paints with.
                 let mut child_eg = egmap.clone();
+                let mut child_cs = csmap.clone();
                 if let Some(fr) = &f.scope.resources {
                     for (k, v) in extgstates_of(doc, fr) {
                         child_eg.insert(k, v);
                     }
+                    for (k, v) in colorspaces_of(doc, fr) {
+                        child_cs.insert(k, v);
+                    }
                 }
-                let mut sub = g;
+                let mut sub = g.clone();
                 sub.ctm = f.matrix.mul(g.ctm);
-                walk(doc, &f.ops, &f.scope.xobjects, &child_eg, sub, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice());
+                walk(doc, &f.ops, &f.scope.xobjects, &child_eg, &child_cs, sub, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice());
             }
             _ => {}
         }
     }
 }
 
-/// sc/scn operands → colour by component count (1 gray, 3 rgb, 4 cmyk). A
-/// trailing name (pattern) yields no usable colour.
-fn comps(o: &[Object]) -> Option<[u8; 3]> {
+/// `sc`/`scn` operands → colour, **in the colour space `cs`/`CS` selected**.
+///
+/// Without a space the operands are dispatched by count alone (1 gray, 3 rgb, 4 cmyk), and
+/// a trailing name (a pattern) yields no usable colour — the whole of what this did before.
+///
+/// With a `Separation` / `DeviceN` space the operands are *tints*, not colour: `.1 scn`
+/// means "10% of this colorant", and reading it as the grey level 0.1 paints a pale spot
+/// colour near-BLACK. The tint transform is what turns it into a colour, so it is evaluated
+/// into the alternate space.
+///
+/// **When the transform cannot be evaluated** (a Type 4 PostScript calculator, a malformed
+/// or absent function, an alternate space we cannot reduce) the tint is read as **ink
+/// coverage** instead: `t` of the colorant laid on white paper is luminance `1 - t`. That
+/// degrades a pale tint to pale and a solid one to dark — the right *direction*, where the
+/// old reading inverted it. For `DeviceN` the heaviest colorant sets the coverage.
+fn scn_color(cs: Option<&PaintCs>, o: &[Object]) -> Option<[u8; 3]> {
     let nums: Vec<f32> = o.iter().take_while(|x| matches!(x, Object::Integer(_) | Object::Real(_))).map(num).collect();
-    match nums.len() {
-        1 => Some(gray(nums[0])),
-        3 => Some(rgb(nums[0], nums[1], nums[2])),
-        4 => Some(cmyk(nums[0], nums[1], nums[2], nums[3])),
-        _ => None,
+    match cs {
+        Some(PaintCs::Tint { k, tint, alt }) if nums.len() == *k => {
+            if let (Some(f), Some(n)) = (tint, alt) {
+                if let Some(c) = f.eval(&nums).and_then(|out| from_components(*n, &out)) {
+                    return Some(c);
+                }
+            }
+            let ink = nums.iter().copied().fold(0.0f32, f32::max).clamp(0.0, 1.0);
+            Some(gray(1.0 - ink))
+        }
+        Some(PaintCs::Pattern) => None,
+        // Device spaces, an arity that does not match the named space, or no space at all:
+        // the operand-count dispatch, bit-for-bit as before.
+        _ => from_components(nums.len(), &nums),
     }
 }
 
@@ -1135,13 +1291,15 @@ mod tests {
         let content = doc.get_and_decode_page_content(page_id).expect("fixture page has content");
         let mut xmap = XMap::new();
         let mut egmap: HashMap<Vec<u8>, (Option<f32>, Option<f32>)> = HashMap::new();
+        let mut csmap: HashMap<Vec<u8>, Rc<PaintCs>> = HashMap::new();
         for res in &page_resource_chain(doc, page_id) {
             overlay_xobjects(doc, res, &mut xmap);
             egmap.extend(extgstates_of(doc, res));
+            csmap.extend(colorspaces_of(doc, res));
         }
         let mut painted = Vec::new();
         let mut budget = crate::WalkBudget::new(budget);
-        walk(doc, &content.operations, &xmap, &egmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget, &[]);
+        walk(doc, &content.operations, &xmap, &egmap, &csmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget, &[]);
         painted
     }
 
@@ -1418,6 +1576,104 @@ mod tests {
         }
     }
 
+    /// `tests/gen_fixtures.py::gen_separation` — three pages of spot-colour fills, one per
+    /// path through the tint evaluator. Returns the ink of page `n`'s single figure.
+    fn separation_ink(n: u32) -> String {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/separation.pdf");
+        let doc = Document::load(path).expect("separation.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&n).unwrap_or_else(|| panic!("fixture has page {n}"));
+        let (strong, _weak) = positioned_vectors(&doc, page_id);
+        assert_eq!(strong.len(), 1, "page {n}: the frame + 8 fills must be one figure");
+        strong[0].ink()
+    }
+
+    #[test]
+    fn a_separation_tint_goes_through_its_transform_instead_of_being_read_as_grey() {
+        // THE defect: `scn` in a `Separation` space carries a TINT, and the walk had no
+        // `cs` arm at all — so `.1 scn` was read as the grey level 0.1 and painted #1a1a1a.
+        // The fixture's transform ramps white -> (198,198,224), the exact pale header
+        // colour the visual audit found rendering near-black.
+        let ink = separation_ink(1);
+        assert!(ink.contains("fill=\"#c6c6e0\""), "tint 1 must be the transform's own colour: {ink}");
+        // Every emitted spot fill is PALE — that is the whole claim, and it is what the
+        // grey-level reading got exactly backwards.
+        let mut spots = 0;
+        for f in ink.split("fill=\"#").skip(1) {
+            let hex = &f[..6];
+            if hex == "000000" {
+                continue; // the frame stroke's own fill="none" is not a hex; black is the frame
+            }
+            let (r, g, b) = (
+                u8::from_str_radix(&hex[0..2], 16).unwrap(),
+                u8::from_str_radix(&hex[2..4], 16).unwrap(),
+                u8::from_str_radix(&hex[4..6], 16).unwrap(),
+            );
+            spots += 1;
+            assert!(r >= 190 && g >= 190 && b >= 190, "spot fill #{hex} is not pale");
+        }
+        assert_eq!(spots, 8, "all 8 spot fills must be emitted, got {spots}");
+        // …and the grey-level misreadings are gone, not merely outvoted.
+        for wrong in ["#1a1a1a", "#333333", "#808080"] {
+            assert!(!ink.contains(wrong), "the grey-level reading {wrong} survives: {ink}");
+        }
+    }
+
+    #[test]
+    fn a_devicen_tint_pair_evaluates_through_a_sampled_transform() {
+        // Two colorants through a 2x2 sampled grid. This is also the end-to-end pin on
+        // §7.10.2's sample order: reading the grid the other way swaps red and green here,
+        // which no unit test of the evaluator alone would catch in a real colour space.
+        let ink = separation_ink(2);
+        for (op, want) in [("1 0", "#ff0000"), ("0 1", "#00ff00"), ("1 1", "#0000ff"), ("0 0", "#ffffff")] {
+            assert!(ink.contains(&format!("fill=\"{want}\"")), "`{op} scn` must be {want}: {ink}");
+        }
+    }
+
+    #[test]
+    fn an_unevaluable_tint_transform_degrades_to_ink_coverage_instead_of_inverting() {
+        // A Type 4 (PostScript calculator) transform is not evaluated — and MUST NOT be
+        // guessed. The fallback reads the tint as ink coverage: `t` of a colorant on white
+        // paper is luminance `1 - t`, so a light tint stays light. The grey-level reading
+        // inverted it, which is the one thing worse than approximating.
+        let g = GT_SEPARATION;
+        let ink = separation_ink(3);
+        assert!(ink.contains("fill=\"#cccccc\""), "tint .2 must degrade PALE: {ink}");
+        assert!(ink.contains("fill=\"#404040\""), "tint .75 must degrade DARK: {ink}");
+        // The inverted reading of the same two tints must be absent.
+        for wrong in g {
+            assert!(!ink.contains(wrong), "the inverted grey-level reading {wrong} survives: {ink}");
+        }
+    }
+
+    /// The two colours the grey-level misreading produced for the Type 4 page's tints
+    /// (`gray(.2)` and `gray(.75)`) — neither may appear once coverage is the fallback.
+    const GT_SEPARATION: [&str; 2] = ["#333333", "#bfbfbf"];
+
+    #[test]
+    fn a_device_colour_stream_is_untouched_by_colour_space_tracking() {
+        // The `cs`/`CS` arms touch the colour path of EVERY figure, so the device-space
+        // fallback has to be bit-preserving: a stream that names no space, or names a
+        // device one, must paint exactly what it painted before. `no_resources_paths.pdf`
+        // is an ordinary `0.2 0.4 0.8 rg` device-colour figure on a page with no
+        // `/Resources` at all — so it also pins that an empty colour-space map is harmless.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/no_resources_paths.pdf");
+        let doc = Document::load(path).expect("no_resources_paths.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&1).expect("page 1");
+        let (strong, _) = positioned_vectors(&doc, page_id);
+        assert!(strong[0].ink().contains("fill=\"#3366cc\""), "{}", strong[0].ink());
+        // A 3-operand `scn` with no `cs` at all is still RGB, and a 1-operand one still grey.
+        assert_eq!(scn_color(None, &[Object::Real(0.2), Object::Real(0.4), Object::Real(0.8)]), Some([51, 102, 204]));
+        assert_eq!(scn_color(None, &[Object::Real(0.1)]), Some([26, 26, 26]));
+        assert_eq!(scn_color(Some(&PaintCs::Device), &[Object::Real(0.1)]), Some([26, 26, 26]));
+        // A pattern name yields no colour, exactly as the trailing-name case did.
+        assert_eq!(scn_color(Some(&PaintCs::Pattern), &[Object::Name(b"P1".to_vec())]), None);
+        assert_eq!(scn_color(None, &[Object::Name(b"P1".to_vec())]), None);
+        // An arity that disagrees with the named Separation falls back to the count
+        // dispatch rather than evaluating nonsense.
+        let sep = PaintCs::Tint { k: 1, tint: None, alt: Some(3) };
+        assert_eq!(scn_color(Some(&sep), &[Object::Real(0.2), Object::Real(0.4), Object::Real(0.8)]), Some([51, 102, 204]));
+    }
+
     /// `tests/gen_fixtures.py::gen_rotated_pages` — four pages, one byte-identical content
     /// stream, `/Rotate` 0/90/180/270. Returns the doc and the four page ids in order.
     fn rotated_pages() -> (Document, Vec<ObjectId>) {
@@ -1562,11 +1818,13 @@ mod tests {
         let mut painted = Vec::new();
         let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
         let egmap: HashMap<Vec<u8>, (Option<f32>, Option<f32>)> = HashMap::new();
+        let csmap: HashMap<Vec<u8>, Rc<PaintCs>> = HashMap::new();
         walk(
             doc,
             &content.operations,
             &XMap::new(),
             &egmap,
+            &csmap,
             GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0),
             &mut painted,
             0,

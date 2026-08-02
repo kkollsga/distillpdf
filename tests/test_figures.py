@@ -231,3 +231,45 @@ def test_a_rotated_page_emits_its_figure_in_display_orientation():
                 assert "rotate(" not in el, f"/Rotate {rot}: {text} must be upright, got {el}"
             else:
                 assert want_rot in el, f"/Rotate {rot}: {text} wants {want_rot}, got {el}"
+
+
+def test_separation_tints_render_as_colours_not_as_grey_levels():
+    """``scn`` in a ``Separation``/``DeviceN`` space carries a TINT — "how much of this
+    colorant" — which means nothing until it passes through the space's tint transform. The
+    vector walk had no ``cs``/``CS`` arm at all, so a 1-operand ``scn`` was read as a grey
+    level: ``.1 scn`` painted ``#1a1a1a`` and a pale (198,198,224) table header rendered
+    near-BLACK.
+
+    ``separation.pdf`` is one page per path through the evaluator:
+
+      page 1  a Type 2 exponential ramp to the audit's own (198,198,224) — pale, and tint 1
+              is exactly that colour;
+      page 2  a 2-component ``DeviceN`` through a Type 0 sampled grid — which also pins the
+              sample order end to end (``1 0 scn`` red, ``0 1 scn`` green, never swapped);
+      page 3  a Type 4 PostScript calculator, deliberately NOT evaluated — the tint degrades
+              to INK COVERAGE (``1 - t``), so a light tint stays light instead of inverting.
+    """
+    g = GT["separation.pdf"]
+    h = html("separation.pdf")
+    svgs = re.findall(r"<svg\b.*?</svg>", h, re.DOTALL)
+    assert len(svgs) == len(g["pages"]), f"one figure per page, got {len(svgs)}"
+    sep, devn, type4 = svgs
+
+    # Page 1: every spot fill is pale, and the solid tint is the transform's own colour.
+    assert f'fill="{g["solid_tint_rgb"]}"' in sep, "tint 1 must be the tint transform's colour"
+    fills = re.findall(r'fill="#([0-9a-f]{6})"', sep)
+    assert len(fills) == 8, f"all 8 spot fills must survive, got {fills}"
+    for hexval in fills:
+        rgb = [int(hexval[i:i + 2], 16) for i in (0, 2, 4)]
+        assert min(rgb) >= 190, f"spot fill #{hexval} is not pale — the grey-level reading is back"
+
+    # Page 2: two colorants through a sampled transform, in the right order.
+    for want in ("#ff0000", "#00ff00", "#0000ff", "#ffffff"):
+        assert f'fill="{want}"' in devn, f"DeviceN tint pair must evaluate to {want}"
+
+    # Page 3: the unevaluable transform degrades to coverage, not to an inversion.
+    for tint, want in g["type4_coverage"].items():
+        assert f'fill="{want}"' in type4, f"Type 4 tint {tint} must degrade to {want}"
+    for wrong in g["grey_level_misreadings"]:
+        assert wrong not in sep and wrong not in type4, \
+            f"the grey-level misreading {wrong} is still emitted"

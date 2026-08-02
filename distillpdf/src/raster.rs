@@ -52,7 +52,7 @@ pub(crate) fn filter_to_format(filters: &Option<Vec<String>>) -> &'static str {
 
 /// Cap on colour-space indirection (`/CS0 → [/Indexed [/ICCBased …] …]`, and the cyclic
 /// resource dictionary a hostile file can write).
-const MAX_CS_DEPTH: u32 = 8;
+pub(crate) const MAX_CS_DEPTH: u32 = 8;
 
 /// Resolve a `/ColorSpace` value to the object that actually describes the space.
 ///
@@ -62,7 +62,7 @@ const MAX_CS_DEPTH: u32 = 8;
 ///   * per PDF 32000-1 §8.6.3 an image may name a space *defined in the resource
 ///     dictionary's `/ColorSpace` sub-dictionary* (`/ColorSpace /CS0`) rather than a
 ///     device space, so the name has to be looked up in `res` before it means anything.
-fn resolve_cs<'a>(doc: &'a Document, res: &'a Dictionary, o: &'a Object, depth: u32) -> Option<&'a Object> {
+pub(crate) fn resolve_cs<'a>(doc: &'a Document, res: &'a Dictionary, o: &'a Object, depth: u32) -> Option<&'a Object> {
     if depth > MAX_CS_DEPTH {
         return None;
     }
@@ -115,7 +115,7 @@ pub(crate) fn image_color_space(doc: &Document, res: &Dictionary, dict: &Diction
 /// how those samples become RGB. Spaces we cannot faithfully reduce (`Lab`, `Separation`,
 /// `DeviceN`, `Pattern`) are deliberately absent — their rows keep `format:"raw"` rather
 /// than being handed back as a plausible-looking wrong colour.
-enum Cs {
+pub(crate) enum Cs {
     Gray,
     Rgb,
     Cmyk,
@@ -124,7 +124,7 @@ enum Cs {
 }
 
 impl Cs {
-    fn components(&self) -> usize {
+    pub(crate) fn components(&self) -> usize {
         match self {
             Cs::Gray => 1,
             Cs::Rgb => 3,
@@ -142,7 +142,7 @@ impl Cs {
     }
 }
 
-fn cs_model(doc: &Document, res: &Dictionary, o: &Object, depth: u32) -> Option<Cs> {
+pub(crate) fn cs_model(doc: &Document, res: &Dictionary, o: &Object, depth: u32) -> Option<Cs> {
     if depth > MAX_CS_DEPTH {
         return None;
     }

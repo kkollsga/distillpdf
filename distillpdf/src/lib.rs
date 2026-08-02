@@ -22,6 +22,7 @@ mod captions;
 mod elem_passes;
 mod extract;
 mod frontmatter;
+mod function;
 mod geom;
 mod headings;
 mod html;
@@ -41,6 +42,16 @@ mod walker;
 /// Maximum Form-XObject / content-stream recursion depth. Bounds runaway recursion and
 /// cyclic Form references while allowing legitimately deep nesting.
 pub(crate) const MAX_FORM_DEPTH: u32 = 40;
+
+/// Maximum nesting depth of a PDF *function* object ([`crate::function`]): a Type 3
+/// stitching function whose sub-functions are themselves Type 3, or an array of arrays.
+///
+/// A separate policy from [`MAX_FORM_DEPTH`] and far smaller, because the shapes are
+/// different: form nesting is a legitimate document-structure idiom that runs deep, while a
+/// tint transform or shading ramp nested more than a couple of levels is already unheard
+/// of. It lives here rather than beside its enforcement for the reason
+/// `structure::every_dos_cap_is_declared_once` states — a cap in two files is two policies.
+pub(crate) const MAX_FN_DEPTH: u32 = 8;
 
 /// Total work one page's content-stream walk may perform, across ALL nesting levels.
 ///
