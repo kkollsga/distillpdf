@@ -415,6 +415,14 @@ impl Pdf {
         self.inner.dbg_spans_xy(page_arg(page)?).map_err(to_py)
     }
 
+    /// Diagnostic: what the figure-ink gate did — `(accepted, suppressed, [pages])`.
+    ///
+    /// `suppressed` is the number of page-furniture clusters demoted to weak candidates
+    /// (still promotable by a caption), reported so the filter can never act silently.
+    fn _figure_gate(&self) -> PyResult<(u32, u32, Vec<u32>)> {
+        Ok(self.inner.figure_gate_stats())
+    }
+
     /// Diagnostic for one 1-indexed page.
     fn debug_page(&self, page: i64) -> PyResult<String> {
         self.inner.debug_page(page_arg(page)?).map_err(to_py)

@@ -313,6 +313,11 @@ def _vector_chart(c, ox, oy, vw, vh):
     for i, bh in enumerate((40, 95, 65, 110)):
         c.rect(ox + 20 + i * 48, oy, 28, min(bh, vh - 4), fill=1, stroke=1)
     c.setFillColorRGB(0, 0, 0)
+    # A trend line across the bars. Not decoration: axes, gridlines and bars are all
+    # axis-aligned, and `vector::passes_ink_gate` reads a cluster with no curve, no slanted
+    # line and no palette as page furniture (an SEC backdrop card, a ruled table). One
+    # slanted stroke is what makes this minimal chart read as the figure it stands in for.
+    c.line(ox + 24, oy + vh * 0.25, ox + vw - 24, oy + vh * 0.8)
 
 
 def gen_figure_hier():
@@ -634,9 +639,14 @@ def gen_xobject_figure():
             c.rect(cx0 - 4, ry - 6, 96, 16, stroke=1, fill=0)  # a node box per cell
             c.setFont("Helvetica", 9)
             c.drawString(cx0, ry, cell)
-        if r:  # vertical connectors between rows
+        if r:  # vertical connectors between rows, each with a slanted arrow head
             for cx0 in cols:
                 c.line(cx0 + 44, ry + 10, cx0 + 44, ry + cell_h - 6)
+                # The heads are the only non-axis-aligned ink on the page, and they are what
+                # keeps the schematic past `vector::passes_ink_gate` — a grid of boxes joined
+                # by vertical rules is, geometrically, a ruled table.
+                c.line(cx0 + 44, ry + 10, cx0 + 40, ry + 15)
+                c.line(cx0 + 44, ry + 10, cx0 + 48, ry + 15)
         ry -= cell_h
     c.line(cols[0] + 92, by + bh - 22, cols[1] - 4, by + bh - 22)  # cross arrows top row
     c.line(cols[1] + 92, by + bh - 22, cols[2] - 4, by + bh - 22)
@@ -907,8 +917,8 @@ def gen_paint_order():
       TOP    (y 520-700): raster, then the opaque grey panel over it → the PANEL wins.
       BOTTOM (y 120-300): the opaque grey panel, then the raster over it → the RASTER wins.
 
-    Each figure is a stroked outer frame + 5 tick marks + the panel (7 paths, clearing
-    ``MIN_PATHS``) spanning 300x180 pt, with the 160x120 pt raster wholly inside it — so
+    Each figure is a stroked outer frame + 5 tick marks + a slanted trend stroke + the
+    panel (8 paths, clearing ``MIN_PATHS``) spanning 300x180 pt, with the 160x120 pt raster wholly inside it — so
     the raster is absorbed INTO the vector figure's ``<svg>`` (``overlap/imarea`` = 1.0,
     ``overlap/varea`` = 0.36, i.e. the vector is the base) rather than the other way round.
     The panel is mid grey (#808080), not near-white, so ``build_svg``'s plot-background
@@ -928,8 +938,12 @@ def gen_paint_order():
             b"q 0 0 0 RG 1 w %d %d m %d %d l S Q" % (72 + 20 * i, y0, 72 + 20 * i, y0 + 12)
             for i in range(1, 6)
         )
+        # A slanted stroke inside the frame, painted BEFORE the pair under test so it cannot
+        # affect their order: without it the ink gate reads frame+ticks+grey panel as
+        # furniture, and this fixture is about z-order.
+        trend = b"q 0 0 0 RG 1 w 80 %d m 364 %d l S Q" % (y0 + 10, y0 + 170)
         ink = [raster, panel] if raster_first else [panel, raster]
-        return b"\n".join([frame, ticks] + ink)
+        return b"\n".join([frame, ticks, trend] + ink)
 
     stream = b"\n".join([
         b"BT /F1 12 Tf 72 720 Td (Paint order: the later operator must win.) Tj ET",
@@ -1057,7 +1071,16 @@ def gen_clipped_raster():
         do = b"q %s cm /Im0 Do Q" % cm
         if clip:
             do = b"q 140 %d 80 60 re W n\n%s\nQ" % (y0 + 30, do)
-        return b"\n".join([frame, ticks, do])
+        # A three-swatch legend down the left edge. Not decoration: the figure-ink gate
+        # (`vector::passes_ink_gate`) demotes a cluster that draws neither a curve nor a
+        # slanted line NOR a palette, and a black frame with black ticks is exactly the
+        # shape of a ruled table. Every real composited figure in the corpus carries colour;
+        # these swatches are what makes this minimal fixture one of them.
+        legend = b"\n".join(
+            b"q %s rg 78 %d 12 12 re f Q" % (rgb, y0 + 140 - 18 * i)
+            for i, rgb in enumerate((b"0.85 0.20 0.15", b"0.20 0.55 0.80", b"0.95 0.75 0.10"))
+        )
+        return b"\n".join([frame, ticks, legend, do])
 
     stream = b"\n".join([
         b"BT /F1 12 Tf 72 760 Td (A clipped raster shows only its window.) Tj ET",
@@ -1112,9 +1135,15 @@ def gen_smask_panel():
                        for i in range(1, 6))
     panel = b"q 0.2 0.6 0.6 rg 130 520 180 140 re f Q"
     raster = b"q 160 0 0 120 140 530 cm /Im0 Do Q"
+    # A three-swatch legend down the left edge — see `gen_clipped_raster`: the figure-ink
+    # gate demotes a rects-only cluster with no palette, and a lone teal panel is one colour.
+    legend = b"\n".join(
+        b"q %s rg 78 %d 12 12 re f Q" % (rgb, 640 - 18 * i)
+        for i, rgb in enumerate((b"0.85 0.20 0.15", b"0.20 0.55 0.80", b"0.95 0.75 0.10"))
+    )
     stream = b"\n".join([
         b"BT /F1 12 Tf 72 720 Td (A JPEG cut-out must not erase the panel behind it.) Tj ET",
-        frame, ticks, panel, raster,
+        frame, ticks, legend, panel, raster,
     ])
     objs = {
         1: b"<< /Type /Catalog /Pages 2 0 R >>",
@@ -1206,6 +1235,10 @@ def gen_no_resources_paths():
     dictionary, so this is hand-assembled."""
     pdf = os.path.join(OUT, "no_resources_paths.pdf")
     bars = [b"0.2 0.4 0.8 rg %d 400 20 %d re f" % (120 + i * 28, 40 + (i % 4) * 30) for i in range(8)]
+    # A slanted trend stroke over the bars: `vector::passes_ink_gate` reads a cluster of
+    # axis-aligned rects in a single colour as page furniture, and this fixture is about the
+    # resource chain, not about classification.
+    bars.append(b"0 0 0 RG 1 w 125 410 m 335 520 l S")
     content = b"\n".join(bars)
     stream = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content)
     objs = {
@@ -1217,7 +1250,7 @@ def gen_no_resources_paths():
         6: stream,
     }
     _assemble_pdf(objs, pdf)
-    GT["no_resources_paths.pdf"] = {"svgs_per_page": [1, 1], "paths_per_page": 8}
+    GT["no_resources_paths.pdf"] = {"svgs_per_page": [1, 1], "paths_per_page": 9}
 
 
 def gen_dashes():
@@ -1253,6 +1286,9 @@ def gen_dashes():
     for i, d in enumerate([None, b"[3 2] 0 d", b"[6 3] 2 d", b"[] 0 d", b"[0 0] 0 d"]):
         y = 230 + i * 55
         rows.append(b"q %s 110 %d m 290 %d l S Q" % (d or b"", y, y))
+    # A solid DIAGONAL, last and inside its own q/Q so no dash state reaches it: the ink gate
+    # demotes a cluster of axis-aligned rules in one colour, and this fixture is about `d`.
+    rows.append(b"q 115 215 m 285 495 l S Q")
     content = b"\n".join(rows)
     objs = {
         1: b"<< /Type /Catalog /Pages 2 0 R >>",
@@ -1265,7 +1301,7 @@ def gen_dashes():
         # In paint order after the frame: solid, [3 2], [6 3] phase 2, reset, invalid.
         "dasharrays": [None, "3 2", "6 3", None, None],
         "dashoffsets": [None, None, "2", None, None],
-        "paths": 6,
+        "paths": 7,
     }
 
 
@@ -1296,7 +1332,7 @@ def gen_alpha_groups():
                     sets ``ca 0.25``. An ordinary form inherits and may overwrite the
                     graphics state; only a group may not. Its rect must come out at 0.25.
 
-    Eight paths in one 200x300 pt box, clear of every clustering threshold.
+    Nine paths in one 200x300 pt box, clear of every clustering threshold.
     Hand-assembled: reportlab emits no transparency groups."""
     pdf = os.path.join(OUT, "alpha_groups.pdf")
     alphas = [b"0.0039", b"0.02", b"0.04", b"0.5", b"0.98", b"0"]
@@ -1312,7 +1348,10 @@ def gen_alpha_groups():
                     % (len(body), body))
         calls.append(b"/GA%d gs /Fm%d Do" % (i, i))
     # The outer group: pick an alpha, invoke the element that must wear it.
-    outer_body = b"\n".join([b"2 w 0 G 100 200 200 300 re S"] + calls + [b"/FmPlain Do"])
+    # The slanted stroke beside the frame is the ink gate's price of admission (see
+    # `_vector_chart`); this fixture is about alpha, and its ink is otherwise all rectangles.
+    outer_body = b"\n".join([b"2 w 0 G 100 200 200 300 re S", b"1 w 0 G 110 210 m 290 490 l S"]
+                            + calls + [b"/FmPlain Do"])
     outer_eg = b" ".join(b"/GA%d << /ca %s /CA %s >>" % (i, a, a) for i, a in enumerate(alphas))
     outer_xo = b" ".join(b"/Fm%d %d 0 R" % (i, 6 + i) for i in range(len(alphas)))
     outer = (b"<< /Type /XObject /Subtype /Form /BBox [0 0 400 600] /Group << /S "
@@ -1339,8 +1378,9 @@ def gen_alpha_groups():
     GT["alpha_groups.pdf"] = {
         # The opacity each element must carry in the emitted <svg>, in paint order.
         "group_opacities": ["0.0039", "0.02", "0.04", "0.5", "0.98"],
-        # `ca 0` is not faint, it is absent — 5 group rects + the control + the frame.
-        "paths": 7,
+        # `ca 0` is not faint, it is absent — 5 group rects + the control + the frame + the
+        # slanted stroke that keeps the cluster on the figure side of the ink gate.
+        "paths": 8,
         "plain_form_opacity": "0.25",
     }
 
@@ -1355,9 +1395,10 @@ def gen_rotated_pages():
     Every page shares one byte-identical content stream, so any difference in the emitted
     ``<svg>`` is attributable to ``/Rotate`` alone:
 
-      * a stroked frame + 8 filled rects, bbox exactly x 100..300, y 200..500 (200x300 pt,
-        9 paths — clear of ``MIN_PATHS`` 6 / ``MIN_W`` 72 / ``MIN_H`` 54 with room to
-        spare, so no clustering threshold can be mistaken for the rotation);
+      * a stroked frame + 8 filled rects + one slanted stroke, bbox exactly x 100..300,
+        y 200..500 (200x300 pt, 10 paths — clear of ``MIN_PATHS`` 6 / ``MIN_W`` 72 /
+        ``MIN_H`` 54 with room to spare, so no clustering threshold can be mistaken for the
+        rotation; the slant is what keeps the cluster past the figure-ink gate);
       * a **corner marker** — the one 20x20 rect at the figure's page-space BOTTOM-LEFT.
         Its local position in the SVG identifies the rotation unambiguously, which a
         symmetric figure could not: bottom-left at 0 deg, top-left at 90, top-right at 180,
@@ -1384,8 +1425,12 @@ def gen_rotated_pages():
         (280, 200, 20, 40),
     ]
     ink = b"\n".join(
+        # The trailing slanted stroke is inside the figure box (so the bbox is untouched) and
+        # identical on all four pages: without it the ink gate reads a frame plus eight
+        # axis-aligned rects in one colour as furniture, and this fixture is about /Rotate.
         [b"2 w 0 G 100 200 200 300 re S", b"0.2 0.4 0.8 rg"]
         + [b"%d %d %d %d re f" % r for r in rects]
+        + [b"1 w 0 G 110 210 m 290 490 l S"]
     )
     # `Alpha` upright in page space; `Beta` at +90 deg (a y-axis title's shape).
     text = (b"BT /F1 12 Tf 1 0 0 1 150 300 Tm (Alpha) Tj ET\n"
@@ -1466,7 +1511,7 @@ def gen_separation():
     (198,198,224) table header came out near-BLACK.
 
     Three pages, one per path through the new evaluator; each draws a stroked frame plus 8
-    fills, so every page is one strong figure of 9 paths at exactly x 100..300, y 200..500:
+    fills, so every page is one strong figure of 10 paths at exactly x 100..300, y 200..500:
 
       page 1  ``[/Separation /Spot /DeviceRGB <Type 2>]`` — an exponential ramp from white
               to the audit's own (198,198,224). Tints .1/.2/.5/1 must come out PALE, and
@@ -1489,7 +1534,9 @@ def gen_separation():
     pdf = os.path.join(OUT, "separation.pdf")
 
     def page(tints):
-        rows = [b"2 w 0 G 100 200 200 300 re S", b"/CS0 cs"]
+        # The slanted stroke is STROKE-ONLY, so the 8-fill census the test makes is untouched;
+        # it is what keeps a frame-plus-rects cluster on the figure side of the ink gate.
+        rows = [b"2 w 0 G 100 200 200 300 re S", b"1 w 0 G 110 210 m 290 490 l S", b"/CS0 cs"]
         spots = [(110, 210), (160, 210), (210, 210), (110, 290), (160, 290), (210, 290), (110, 370), (160, 370)]
         for (x, y), t in zip(spots, tints):
             rows.append(b"%s scn %d %d 40 60 re f" % (t, x, y))
@@ -2072,6 +2119,102 @@ def gen_map_label_grid():
     c.showPage()
     c.save()
     GT["map_label_grid.pdf"] = {"page1_figures": 1, "page2_figures": 0}
+
+
+def gen_ink_gate():
+    """The three cases the figure-ink gate has to tell apart, all rects-only.
+
+    None of these pages draws a curve or a slanted line, so `has_graphic_ink` says no to all
+    three and the gate's verdict rests entirely on the palette:
+
+    * page 1 — a **column chart**: bars in four saturated series colours. It is a real
+      figure and must be accepted (this is the shape of the Excel charts on
+      `Kaspersen_MScThesis` p131/p132, whose `#4a7ebb #98b954 #be4b48` survive the gate).
+    * page 2 — a **shaded data table**: the same rectangles, but the only fills are a grey
+      header band and zebra row shading. Page furniture; must be demoted.
+    * page 3 — an **invisible white-rect layer** over prose: a stack of white rectangles
+      painted on a white page, drawing nothing a reader can see. Must be demoted.
+
+    Neither page 2 nor page 3 carries a figure caption, so a demotion is the end of the road
+    for them — which is exactly what the assertion checks. Page 4 repeats page 2's table on a
+    ``/Rotate 90`` page, where the gate stands down (the body pipeline drops rotated spans, so
+    the figure is the page's only text carrier).
+    """
+    pdf = os.path.join(OUT, "ink_gate.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+
+    # ---- page 1: a column chart, rects only, four series colours.
+    series = [(0.29, 0.49, 0.73), (0.60, 0.73, 0.33), (0.75, 0.29, 0.28), (0.49, 0.38, 0.63)]
+    bx, by, bw = float(LM), 480.0, 96.0
+    for g in range(4):
+        for s, col in enumerate(series):
+            c.setFillColorRGB(*col)
+            h = 30.0 + 18.0 * ((g + s) % 4)
+            c.rect(bx + g * bw + s * 20.0, by, 18.0, h, stroke=0, fill=1)
+    c.setStrokeColorRGB(0, 0, 0)
+    c.setLineWidth(0.8)
+    c.line(bx, by, bx + 4 * bw, by)  # axis
+    c.line(bx, by, bx, by + 130.0)
+    c.setFillColorRGB(0, 0, 0)
+    c.setFont("Helvetica", 8)
+    for g in range(4):
+        c.drawString(bx + g * bw + 24.0, by - 12.0, f"Q{g + 1}")
+    c.showPage()
+
+    # ---- page 2: a shaded data table. Grey header + zebra rows + rules. No palette.
+    tx, ty, tw, rh = float(LM), 520.0, 400.0, 22.0
+    c.setFillColorRGB(0.85, 0.85, 0.85)
+    c.rect(tx, ty, tw, rh, stroke=0, fill=1)
+    for r in range(1, 7):
+        c.setFillColorRGB(0.95, 0.95, 0.95) if r % 2 else c.setFillColorRGB(1, 1, 1)
+        c.rect(tx, ty - r * rh, tw, rh, stroke=0, fill=1)
+    c.setStrokeColorRGB(0, 0, 0)
+    c.setLineWidth(0.6)
+    for r in range(8):
+        c.line(tx, ty + rh - r * rh, tx + tw, ty + rh - r * rh)
+    for k in range(5):
+        c.line(tx + k * (tw / 4), ty + rh, tx + k * (tw / 4), ty - 6 * rh)
+    c.setFillColorRGB(0, 0, 0)
+    c.setFont("Helvetica", 8)
+    for r in range(7):
+        for k in range(4):
+            c.drawString(tx + k * (tw / 4) + 6, ty + 6 - r * rh, f"{r}.{k}")
+    c.showPage()
+
+    # ---- page 3: an invisible white-rect layer over prose.
+    c.setFont("Helvetica", 10)
+    for i in range(12):
+        c.drawString(LM, 700.0 - i * 14.0, "Body prose that the invisible layer sits on top of, line %d." % (i + 1))
+    c.setFillColorRGB(1, 1, 1)
+    for i in range(10):
+        c.rect(float(LM), 690.0 - i * 14.0, 400.0, 10.0, stroke=0, fill=1)
+    c.showPage()
+
+    # ---- page 4: page 2's shaded table again, on a /Rotate 90 page. It must be ACCEPTED.
+    # `layout::lines_of` drops rotated spans from the body reading order, so on a quarter-
+    # turned page the figure is the only thing carrying the page's text into the output and
+    # the gate stands down (see `vector::cluster_figures`). Byte-identical ink to page 2, so
+    # the turn is the only difference between the two verdicts.
+    c.setPageRotation(90)
+    c.setFillColorRGB(0.85, 0.85, 0.85)
+    c.rect(tx, ty, tw, rh, stroke=0, fill=1)
+    for r in range(1, 7):
+        c.setFillColorRGB(0.95, 0.95, 0.95) if r % 2 else c.setFillColorRGB(1, 1, 1)
+        c.rect(tx, ty - r * rh, tw, rh, stroke=0, fill=1)
+    c.setStrokeColorRGB(0, 0, 0)
+    c.setLineWidth(0.6)
+    for r in range(8):
+        c.line(tx, ty + rh - r * rh, tx + tw, ty + rh - r * rh)
+    for k in range(5):
+        c.line(tx + k * (tw / 4), ty + rh, tx + k * (tw / 4), ty - 6 * rh)
+    c.setFillColorRGB(0, 0, 0)
+    c.setFont("Helvetica", 8)
+    for r in range(7):
+        for k in range(4):
+            c.drawString(tx + k * (tw / 4) + 6, ty + 6 - r * rh, f"{r}.{k}")
+    c.showPage()
+    c.save()
+    GT["ink_gate.pdf"] = {"page1_figures": 1, "page2_figures": 0, "page3_figures": 0, "page4_figures": 1}
 
 
 def _label_grid(c, x0, y0):
@@ -3252,6 +3395,7 @@ def main():
     gen_small_vector_fig()
     gen_dense_vector()
     gen_map_label_grid()
+    gen_ink_gate()
     gen_textstate_q()
     gen_caption_bleed()
     gen_inherited_mediabox()

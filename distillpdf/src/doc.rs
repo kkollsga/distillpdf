@@ -311,6 +311,34 @@ impl PdfDocument {
             .collect())
     }
 
+    /// What the **figure-ink gate** did to this document: `(accepted, suppressed, pages)`.
+    ///
+    /// `suppressed` counts the clusters that cleared the strong SIZE bar and were demoted to
+    /// weak candidates because they carry neither graphic ink nor a real palette (see
+    /// `vector::passes_ink_gate`) — page furniture, ruled tables, invisible white-rect
+    /// layers. A demoted cluster is **not deleted**: a figure caption beside it still
+    /// promotes it back at render time, so this is the gate's reach, not a loss count.
+    /// `pages` lists the 1-indexed pages where a demotion happened, in page order.
+    ///
+    /// Reported, never silent: the corpus gate reads this to keep the number visible per
+    /// document, so a filter can never quietly start eating real figures.
+    pub fn figure_gate_stats(&self) -> (u32, u32, Vec<u32>) {
+        let (mut accepted, mut suppressed, mut pages) = (0u32, 0u32, Vec::new());
+        let map = self.doc.get_pages();
+        let mut nums: Vec<u32> = map.keys().copied().collect();
+        nums.sort_unstable();
+        for n in nums {
+            let (strong, weak) = crate::vector::positioned_vectors(&self.doc, map[&n]);
+            let dropped = weak.iter().filter(|v| v.demoted()).count() as u32;
+            accepted += strong.len() as u32;
+            suppressed += dropped;
+            if dropped > 0 {
+                pages.push(n);
+            }
+        }
+        (accepted, suppressed, pages)
+    }
+
     /// Diagnostic for one 1-indexed page.
     pub fn debug_page(&self, page: u32) -> Result<String, Error> {
         let page_id = *self.doc.get_pages().get(&page).ok_or(Error::NoPage(Some(page)))?;

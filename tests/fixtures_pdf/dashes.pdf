@@ -10,7 +10,7 @@ endobj
 << /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << >> >>
 endobj
 4 0 obj
-<< /Length 203 >>
+<< /Length 229 >>
 stream
 2 w 0 0 0.8 RG
 100 200 200 300 re S
@@ -19,6 +19,7 @@ q [3 2] 0 d 110 285 m 290 285 l S Q
 q [6 3] 2 d 110 340 m 290 340 l S Q
 q [] 0 d 110 395 m 290 395 l S Q
 q [0 0] 0 d 110 450 m 290 450 l S Q
+q 115 215 m 285 495 l S Q
 endstream
 endobj
 xref
@@ -31,5 +32,5 @@ xref
 trailer
 << /Size 5 /Root 1 0 R >>
 startxref
-479
+505
 %%EOF

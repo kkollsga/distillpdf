@@ -285,6 +285,12 @@ pub struct PlacedSvg {
     /// Whether the cluster carries **graphic ink** — see [`has_graphic_ink`]. A map, a DAG or
     /// a plot has it; a ruled table, a page-furniture card and a dot-leader row do not.
     graphic_ink: bool,
+    /// Set when this candidate cleared the STRONG size bar but was demoted to weak by the
+    /// figure-ink gate ([`passes_ink_gate`]) — i.e. it is page furniture, a ruled table or a
+    /// monochrome chrome card as far as the gate can tell. It is still emitted if a figure
+    /// caption anchors it (`html.rs`'s weak promotion), so the gate never deletes outright;
+    /// the count is what `PdfDocument::figure_gate_stats` reports.
+    demoted: bool,
     /// The page's `/Rotate` (0/90/180/270). The bbox above stays in **page space** — every
     /// cross-subsystem comparison in `html.rs` (captions, raster containment, reading order)
     /// is page-space and must not move — while the local geometry below is in **display
@@ -395,6 +401,13 @@ impl PlacedSvg {
     /// from a real data table that happens to overlap it.
     pub fn graphic_ink(&self) -> bool {
         self.graphic_ink
+    }
+
+    /// Whether the figure-ink gate demoted this cluster from strong to weak — see
+    /// [`PlacedSvg::demoted`](#structfield.demoted). `html.rs` reads it to tell a demoted
+    /// candidate it promoted back (a caption anchored it) from one the gate really suppressed.
+    pub fn demoted(&self) -> bool {
+        self.demoted
     }
 
     /// Attach form-internal text spans that belong to this figure, mapping each
@@ -971,9 +984,17 @@ fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (
     // exactly as it was.
     let rot = crate::pdfobj::page_rotation(doc, page_id);
     let page_w = page_width(doc, page_id, rot);
-    let (strong, weak) = cluster_figures(painted);
-    let build = |cs: Vec<Vec<Painted>>| cs.iter().map(|c| build_svg(c, page_w, rot)).collect();
-    (build(strong), build(weak))
+    let (strong, weak) = cluster_figures(painted, rot);
+    let strong: Vec<PlacedSvg> = strong.iter().map(|c| build_svg(c, page_w, rot)).collect();
+    let weak: Vec<PlacedSvg> = weak
+        .iter()
+        .map(|(c, demoted)| {
+            let mut s = build_svg(c, page_w, rot);
+            s.demoted = *demoted;
+            s
+        })
+        .collect();
+    (strong, weak)
 }
 
 /// **Displayed** page width from the page box (used to size each figure as a share of the
@@ -1251,12 +1272,29 @@ fn scn_color(cs: Option<&PaintCs>, o: &[Object]) -> Option<[u8; 3]> {
     }
 }
 
+/// A cluster held aside as a WEAK candidate, paired with `true` when it cleared the strong
+/// size bar and was demoted there by [`passes_ink_gate`] rather than never clearing it.
+type WeakCluster = (Vec<Painted>, bool);
+
 /// Group painted paths into vertically-contiguous clusters and split them into
 /// `(strong, weak)`: STRONG clusters are real figures emitted unconditionally; WEAK
 /// clusters clear only the relaxed bar and are emitted by html.rs solely when a figure
 /// caption anchors to one (a small diagram the strong bar would drop). Clusters failing
 /// even the weak bar (single rules, stray marks) are discarded.
-fn cluster_figures(mut paths: Vec<Painted>) -> (Vec<Vec<Painted>>, Vec<Vec<Painted>>) {
+///
+/// Each weak entry carries a flag: `true` means it cleared the strong SIZE bar and was
+/// **demoted** by [`passes_ink_gate`] (page furniture), `false` means it never cleared it.
+/// The two are handled identically downstream — the flag exists so the demotions can be
+/// counted and reported rather than disappearing silently.
+///
+/// `rot` is the page's `/Rotate`, and it reaches this function for exactly one reason: on a
+/// quarter-turned page **every** text span is rotated in page space, and `layout::lines_of`
+/// drops rotated spans from the body reading order outright — so the figure is the only thing
+/// carrying that page's text into the output. Demoting it there deletes the page. Until the
+/// body pipeline reads a turned page upright (filed separately), the gate stands down on
+/// 90°/270° pages; upright pages, which is every page of every document that motivated the
+/// gate, are unaffected.
+fn cluster_figures(mut paths: Vec<Painted>, rot: i32) -> (Vec<Vec<Painted>>, Vec<WeakCluster>) {
     // Drop full-page background fills (a single huge rectangle) up front.
     paths.retain(|p| !(p.x1 - p.x0 > 400.0 && p.y1 - p.y0 > 600.0 && p.segs.len() <= 5));
     if paths.is_empty() {
@@ -1280,18 +1318,25 @@ fn cluster_figures(mut paths: Vec<Painted>) -> (Vec<Vec<Painted>>, Vec<Vec<Paint
         let bb = cluster_bbox(c);
         (bb.width(), bb.height())
     };
-    let (mut strong, mut weak): (Vec<Vec<Painted>>, Vec<Vec<Painted>>) = (Vec::new(), Vec::new());
+    let (mut strong, mut weak): (Vec<Vec<Painted>>, Vec<WeakCluster>) = (Vec::new(), Vec::new());
     for c in clusters {
         let (w, h) = extent(&c);
         if c.len() >= MIN_PATHS && w >= MIN_W && h >= MIN_H {
-            strong.push(c);
+            // The strong bar measures SIZE; the gate asks whether the ink is a figure's.
+            // A cluster that fails it falls through to weak rather than out of the document:
+            // the strong size bars are all at or above the weak ones, so it always lands.
+            if rot % 180 != 0 || passes_ink_gate(&c) {
+                strong.push(c);
+            } else {
+                weak.push((c, true));
+            }
         } else if c.len() >= WEAK_MIN_PATHS && w >= WEAK_MIN_W && h >= WEAK_MIN_H {
-            weak.push(c);
+            weak.push((c, false));
         }
     }
     // Restore stream paint order within each cluster (banding sorted by y): a fill
     // drawn after an outline must paint on top of it, not be reordered by position.
-    for c in strong.iter_mut().chain(weak.iter_mut()) {
+    for c in strong.iter_mut().chain(weak.iter_mut().map(|(c, _)| c)) {
         c.sort_by(|a, b| a.seq.cmp(&b.seq));
     }
     (strong, weak)
@@ -1424,7 +1469,7 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32, rot: i32) -> PlacedSvg {
         };
         paths.push((p.seq.clone(), format!("<path d=\"{d}\" fill=\"{fill}\"{fop}{stroke}{clip_attr}/>")));
     }
-    PlacedSvg { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, defs, paths, w: lw, h: lh, page_w, labels: Vec::new(), plot, graphic_ink: has_graphic_ink(cluster), rot }
+    PlacedSvg { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, defs, paths, w: lw, h: lh, page_w, labels: Vec::new(), plot, graphic_ink: has_graphic_ink(cluster), demoted: false, rot }
 }
 
 /// Does this cluster draw anything a **ruled table cannot**?
@@ -1473,6 +1518,55 @@ fn has_graphic_ink(cluster: &[Painted]) -> bool {
     })
 }
 
+/// How many **saturated** colours the cluster paints with.
+///
+/// The companion of [`has_graphic_ink`] for the one honest exception to it: a bar/column
+/// chart is drawn entirely from axis-aligned rectangles and so carries no graphic ink, but
+/// it encodes its data in a *palette*. Page furniture does not — a backdrop card is a tint
+/// and an accent, a ruled table is black on white.
+///
+/// Only genuinely saturated colours count (`SAT`, HSV saturation): the near-greys that make
+/// up chrome (`#f1f2f2` banding, `#cccccc` hairlines, `#e0e0ed` table shading) are excluded
+/// by construction, and so is the single pale wash a card is filled with. Measured over the
+/// 54-document local corpus, the SEC filings' furniture tops out at **one** saturated colour
+/// (a `#0000ff` link rule; the `#cceeff` card wash is 0.20 saturated and does not count),
+/// while every rects-only real figure in the corpus carries **three or more** — a
+/// Word/Excel column chart's series (`#4a7ebb #98b954 #be4b48`), a USGS legend's 6–15 keys.
+fn palette_variety(cluster: &[Painted]) -> usize {
+    // HSV saturation, i.e. chroma relative to the brightest channel: an absolute chroma bar
+    // would call a pale tint (#cceeff) and a dark one (#361c43) the same thing.
+    const SAT: f32 = 0.25;
+    let mut seen: Vec<[u8; 3]> = Vec::new();
+    for c in cluster.iter().flat_map(|p| p.fill.into_iter().chain(p.stroke.as_ref().map(|s| s.color))) {
+        let (mx, mn) = (c.iter().copied().max().unwrap_or(0), c.iter().copied().min().unwrap_or(0));
+        if mx == 0 || (mx - mn) as f32 / mx as f32 <= SAT {
+            continue; // black, a grey, or a wash — not a palette entry
+        }
+        if !seen.contains(&c) {
+            seen.push(c);
+        }
+    }
+    seen.len()
+}
+
+/// The **figure-ink gate**: does a cluster that clears the strong size bar actually look like
+/// a figure, or like page furniture?
+///
+/// A strong cluster is accepted only if it draws something a ruled table cannot
+/// ([`has_graphic_ink`] — a curve or a slanted line) **or** it paints with a real palette
+/// ([`palette_variety`]). The disjunction is the point: the ink test alone would reject a
+/// legitimate rects-only bar chart, and the palette test alone would reject a black-and-white
+/// line plot. Everything that fails *both* — an SEC filing's backdrop card, a TOC's
+/// dot-leader block, a financial table's cell rules, an invisible white-rect layer — is
+/// demoted to a WEAK candidate, **not deleted**: a figure caption sitting beside it still
+/// promotes it in `html.rs`. What the gate demoted is counted and reportable
+/// (`PdfDocument::figure_gate_stats`), because a silent filter is how real content is lost
+/// without anyone noticing.
+fn passes_ink_gate(cluster: &[Painted]) -> bool {
+    const MIN_PALETTE: usize = 3;
+    has_graphic_ink(cluster) || palette_variety(cluster) >= MIN_PALETTE
+}
+
 /// Intersect a new page-space clip rectangle into the one already in force. Shared with
 /// [`crate::img`]'s walk, which tracks the same state.
 pub(crate) fn intersect_clip(cur: Option<ClipRect>, add: ClipRect) -> ClipRect {
@@ -1497,6 +1591,21 @@ mod tests {
         let doc = Document::load(&path).unwrap_or_else(|e| panic!("{name} fixture must load: {e}"));
         let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
         (doc, page_id)
+    }
+
+    /// Every cluster that cleared the strong SIZE bar, in page order: the figures
+    /// [`passes_ink_gate`] accepted **plus** the ones it demoted to weak candidates.
+    ///
+    /// Most tests below exercise how a cluster is *built* — geometry, colour, alpha, dashes,
+    /// clipping, page rotation — on deliberately minimal fixtures that are often a handful of
+    /// axis-aligned monochrome rules, i.e. exactly what the ink gate demotes. That judgement
+    /// is orthogonal to what they assert and has its own fixtures
+    /// (`the_ink_gate_*`), so they read the size-bar view instead of the gated one.
+    fn size_bar_figures(doc: &Document, page_id: ObjectId) -> Vec<PlacedSvg> {
+        let (strong, weak) = positioned_vectors(doc, page_id);
+        let mut all: Vec<PlacedSvg> = strong.into_iter().chain(weak.into_iter().filter(|v| v.demoted())).collect();
+        all.sort_by(|a, b| b.y_top.partial_cmp(&a.y_top).unwrap_or(std::cmp::Ordering::Equal));
+        all
     }
 
     /// The page's own (nearest) resource dictionary — the last entry of the overlay chain.
@@ -1581,10 +1690,69 @@ mod tests {
         let pages = doc.get_pages();
         for (n, want) in [(1u32, true), (2, false)] {
             let page_id = *pages.get(&n).expect("fixture has this page");
-            let (strong, _weak) = positioned_vectors(&doc, page_id);
+            let strong = size_bar_figures(&doc, page_id);
             assert_eq!(strong.len(), 1, "page {n}: the fixture draws exactly one cluster");
             assert_eq!(strong[0].graphic_ink(), want, "page {n}: graphic ink misread");
         }
+    }
+
+    /// The gate fixture (`tests/gen_fixtures.py::gen_ink_gate`), by page.
+    fn ink_gate_page(n: u32) -> (Document, ObjectId) {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/ink_gate.pdf");
+        let doc = Document::load(path).expect("ink_gate.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&n).expect("fixture has this page");
+        (doc, page_id)
+    }
+
+    #[test]
+    fn a_rects_only_chart_keeps_its_figure_but_furniture_is_demoted() {
+        // `ink_gate.pdf`: three rects-only pages, so `has_graphic_ink` is false on all three
+        // and the palette is the whole verdict. Before the gate all three were emitted as
+        // figures — 315 of 315 SVGs on the three SEC filings in the local corpus were this
+        // kind of chrome, and one of them (SpaceX p4) had no text on the page at all.
+        for (n, accept, why) in [
+            (1u32, true, "a column chart's four series colours are a palette"),
+            (2, false, "a grey header band and zebra shading are not"),
+            (3, false, "a white-on-white layer paints nothing at all"),
+        ] {
+            let (doc, page_id) = ink_gate_page(n);
+            let (strong, weak) = positioned_vectors(&doc, page_id);
+            let demoted: Vec<&PlacedSvg> = weak.iter().filter(|v| v.demoted()).collect();
+            // Every page draws exactly one cluster over the strong size bar; the gate decides
+            // which side of the line it lands on.
+            assert_eq!(strong.len() + demoted.len(), 1, "page {n}: one cluster over the size bar");
+            assert_eq!(strong.len() == 1, accept, "page {n}: {why}");
+        }
+    }
+
+    #[test]
+    fn a_demoted_cluster_is_held_as_a_candidate_not_deleted() {
+        // The gate's safety property: what it rejects stays reachable. A demoted cluster is a
+        // WEAK candidate, so a figure caption beside it promotes it back in `html.rs` exactly
+        // as it would a small hand-drawn diagram — a rejection is never a deletion, and the
+        // count is reported (`PdfDocument::figure_gate_stats`).
+        let (doc, page_id) = ink_gate_page(2);
+        let (strong, weak) = positioned_vectors(&doc, page_id);
+        assert!(strong.is_empty(), "the shaded table is not a figure");
+        let d = weak.iter().find(|v| v.demoted()).expect("the rejected cluster is still a candidate");
+        assert!(d.ink().contains("<path"), "and it kept its geometry, ready to be promoted");
+    }
+
+    #[test]
+    fn the_gate_stands_down_on_a_quarter_turned_page() {
+        // `layout::lines_of` drops rotated spans from the body reading order, so on a 90°/270°
+        // page the figure is the ONLY carrier of the page's text (verified on
+        // `med_crispr_clinical_trials_pmc.pdf` p19-24: with the gate applied there, six pages
+        // of a clinical-trials table rendered as 160-character stubs). The exemption is what
+        // keeps the gate from deleting those pages. `ink_gate.pdf` p2 and p4 draw the same
+        // shaded table, so the turn is the only difference between the two verdicts.
+        let (doc, page_id) = ink_gate_page(2);
+        let (upright, uweak) = positioned_vectors(&doc, page_id);
+        assert!(upright.is_empty() && uweak.iter().any(|v| v.demoted()), "upright: the gate applies");
+        let (doc, page_id) = ink_gate_page(4);
+        let (turned, tweak) = positioned_vectors(&doc, page_id);
+        assert_eq!(turned.len(), 1, "a quarter-turned page keeps its figure");
+        assert!(!tweak.iter().any(|v| v.demoted()), "and nothing was demoted on it");
     }
 
     #[test]
@@ -1670,7 +1838,10 @@ mod tests {
         // indistinguishable from "this page has no figures" — a whole USGS cover map
         // disappeared. Truncating the walk instead keeps everything painted before the cap.
         let (doc, page_id) = dense_page();
-        let (strong, _weak) = positioned_vectors_capped(&doc, page_id, 50);
+        // Size-bar view (see `size_bar_figures`): the fixture's grid is 12 black rules, so
+        // the ink gate demotes it — what this test is about is that the CAP does not delete it.
+        let (strong, weak) = positioned_vectors_capped(&doc, page_id, 50);
+        let strong: Vec<PlacedSvg> = strong.into_iter().chain(weak.into_iter().filter(|v| v.demoted())).collect();
         assert_eq!(strong.len(), 1, "the early-painted grid figure must survive a tripped cap");
         let grid = &strong[0];
         let kept = grid.ink().matches("<path").count();
@@ -1687,7 +1858,7 @@ mod tests {
         // 600_000 ops is far above this fixture, so nothing is truncated: both the grid and
         // the scatter field come back. Locks the default cap against silently re-tightening.
         let (doc, page_id) = dense_page();
-        let (strong, _weak) = positioned_vectors(&doc, page_id);
+        let strong = size_bar_figures(&doc, page_id);
         assert_eq!(strong.len(), 2, "expected the grid AND the scatter field");
         let scatter = strong.iter().find(|f| f.y_bottom < 400.0).expect("scatter figure");
         assert!(scatter.ink().matches("<path").count() > 200, "scatter kept {} paths", scatter.ink().matches("<path").count());
@@ -1761,7 +1932,7 @@ mod tests {
         assert_eq!(painted.iter().filter(|p| p.fill.is_some()).count(), 8);
         assert!(painted.iter().all(|p| (p.fill_op - 0.85).abs() < 1e-6 && (p.stroke_op - 0.6).abs() < 1e-6));
         // The figure reaches the render as one placed <svg>, carrying the recovered opacity.
-        let (strong, _weak) = positioned_vectors(&doc, page_id);
+        let strong = size_bar_figures(&doc, page_id);
         assert_eq!(strong.len(), 1, "the bar chart must be one figure");
         assert!(strong[0].ink().contains("fill-opacity=\"0.85\""), "{}", strong[0].ink());
     }
@@ -1776,16 +1947,17 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/dashes.pdf");
         let doc = Document::load(path).expect("dashes.pdf fixture must load");
         let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
-        let (strong, _weak) = positioned_vectors(&doc, page_id);
+        let strong = size_bar_figures(&doc, page_id);
         assert_eq!(strong.len(), 1, "the five rules and their frame are one figure");
         let ink = strong[0].ink();
         // The five strokes differ ONLY in dash state, so every difference below is `d`'s.
         assert!(ink.contains("stroke-dasharray=\"3 2\""), "[3 2] must survive: {ink}");
         assert!(ink.contains("stroke-dasharray=\"6 3\" stroke-dashoffset=\"2\""), "a nonzero phase is an offset: {ink}");
-        // Solid, reset (`[] d`) and invalid (`[0 0] d`) all carry no dash at all: 6 paths,
-        // exactly 2 dashed. `stroke-dasharray="0 0"` renders as NOTHING in a browser, so the
-        // invalid case degrades visibly rather than being deleted.
-        assert_eq!(ink.matches("<path").count(), 6);
+        // Solid, reset (`[] d`) and invalid (`[0 0] d`) all carry no dash at all: 7 paths
+        // (5 rules, the frame and the fixture's slanted stroke), exactly 2 dashed.
+        // `stroke-dasharray="0 0"` renders as NOTHING in a browser, so the invalid case
+        // degrades visibly rather than being deleted.
+        assert_eq!(ink.matches("<path").count(), 7);
         assert_eq!(ink.matches("stroke-dasharray").count(), 2, "only the two valid patterns dash: {ink}");
         assert!(!ink.contains("stroke-dasharray=\"0"), "an all-zero pattern must not reach the SVG: {ink}");
     }
@@ -1804,9 +1976,10 @@ mod tests {
         let doc = Document::load(path).expect("alpha_groups.pdf fixture must load");
         let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
         let painted = walk_page(&doc, page_id, crate::MAX_FORM_WORK);
-        // 5 group rects + the non-group control + the frame. The `ca 0` element is ABSENT:
-        // transparent is not faint, and the no-ink rule still deletes it.
-        assert_eq!(painted.len(), 7, "got {:?}", painted.iter().map(|p| p.fill_op).collect::<Vec<_>>());
+        // 5 group rects + the non-group control + the frame + the fixture's slanted stroke.
+        // The `ca 0` element is ABSENT: transparent is not faint, and the no-ink rule still
+        // deletes it.
+        assert_eq!(painted.len(), 8, "got {:?}", painted.iter().map(|p| p.fill_op).collect::<Vec<_>>());
         let fills: Vec<f32> = painted.iter().filter(|p| p.fill.is_some()).map(|p| p.fill_op).collect();
         for want in [0.0039, 0.02, 0.04, 0.5, 0.98] {
             assert!(fills.iter().any(|a| (a - want).abs() < 1e-4), "alpha {want} lost; got {fills:?}");
@@ -1819,7 +1992,7 @@ mod tests {
         // …and every one of them reaches the SVG at its own opacity. Sub-0.04 paints used to
         // be dropped outright by `ALPHA_HIDDEN`, which in an attention or density figure
         // deletes the data itself — alpha IS the quantity there.
-        let (strong, _weak) = positioned_vectors(&doc, page_id);
+        let strong = size_bar_figures(&doc, page_id);
         assert_eq!(strong.len(), 1, "the box is one figure");
         let ink = strong[0].ink();
         for want in ["0.0039", "0.02", "0.04", "0.5", "0.98", "0.25"] {
@@ -1842,7 +2015,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/paint_order.pdf");
         let doc = Document::load(path).expect("paint_order.pdf fixture must load");
         let page_id = *doc.get_pages().get(&1).expect("page 1");
-        let (strong, _weak) = positioned_vectors(&doc, page_id);
+        let strong = size_bar_figures(&doc, page_id);
         assert_eq!(strong.len(), 2, "the two bands must cluster as two figures");
         let images = crate::img::positioned_images(&doc, page_id, true);
         assert_eq!(images.len(), 2, "one raster per figure");
@@ -1889,13 +2062,13 @@ mod tests {
 
         for (page_id, label) in [(bare, "no /Resources"), (with_res, "/Resources << >>")] {
             let painted = walk_page_bare(&doc, page_id);
-            assert_eq!(painted.len(), 8, "{label}: eight filled bars must paint");
+            assert_eq!(painted.len(), 9, "{label}: eight filled bars + the trend stroke must paint");
             // Nothing supplies an /ExtGState, so the spec defaults must hold: fully opaque.
             assert!(
                 painted.iter().all(|p| p.fill_op == 1.0 && p.stroke_op == 1.0),
                 "{label}: a page with no /ExtGState paints at full opacity"
             );
-            let (strong, _weak) = positioned_vectors(&doc, page_id);
+            let strong = size_bar_figures(&doc, page_id);
             assert_eq!(strong.len(), 1, "{label}: the bars must reach the render as one figure");
         }
     }
@@ -1906,7 +2079,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/separation.pdf");
         let doc = Document::load(path).expect("separation.pdf fixture must load");
         let page_id = *doc.get_pages().get(&n).unwrap_or_else(|| panic!("fixture has page {n}"));
-        let (strong, _weak) = positioned_vectors(&doc, page_id);
+        let strong = size_bar_figures(&doc, page_id);
         assert_eq!(strong.len(), 1, "page {n}: the frame + 8 fills must be one figure");
         strong[0].ink()
     }
@@ -1983,7 +2156,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/no_resources_paths.pdf");
         let doc = Document::load(path).expect("no_resources_paths.pdf fixture must load");
         let page_id = *doc.get_pages().get(&1).expect("page 1");
-        let (strong, _) = positioned_vectors(&doc, page_id);
+        let strong = size_bar_figures(&doc, page_id);
         assert!(strong[0].ink().contains("fill=\"#3366cc\""), "{}", strong[0].ink());
         // A 3-operand `scn` with no `cs` at all is still RGB, and a 1-operand one still grey.
         assert_eq!(scn_color(None, &[Object::Real(0.2), Object::Real(0.4), Object::Real(0.8)]), Some([51, 102, 204]));
@@ -2012,7 +2185,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/form_bbox.pdf");
         let doc = Document::load(path).expect("form_bbox.pdf fixture must load");
         let page_id = *doc.get_pages().values().next().expect("fixture has a page");
-        let (mut strong, _) = positioned_vectors(&doc, page_id);
+        let mut strong = size_bar_figures(&doc, page_id);
         strong.sort_by(|a, b| b.y_top.partial_cmp(&a.y_top).expect("finite"));
         assert_eq!(strong.len(), 2, "both forms must cluster into a figure");
         let (clipped, control) = (&strong[0], &strong[1]);
@@ -2066,7 +2239,7 @@ mod tests {
         for (i, &page_id) in ids.iter().enumerate() {
             let (rot, marker_d, (lw, lh)) = want[i];
             assert_eq!(crate::pdfobj::page_rotation(&doc, page_id), rot);
-            let (strong, _weak) = positioned_vectors(&doc, page_id);
+            let strong = size_bar_figures(&doc, page_id);
             assert_eq!(strong.len(), 1, "/Rotate {rot}: the 9 paths must cluster as one figure");
             let f = &strong[0];
             // The PAGE-space bbox is the SAME on all four pages. `html.rs` compares these
@@ -2103,7 +2276,7 @@ mod tests {
                 let s = spans.iter().find(|s| s.text.contains(t)).unwrap_or_else(|| panic!("/Rotate {rot}: span {t} missing"));
                 assert!((s.angle - a).abs() < 0.01, "/Rotate {rot}: {t} page angle {} want {a}", s.angle);
             }
-            let (mut strong, _weak) = positioned_vectors(&doc, page_id);
+            let mut strong = size_bar_figures(&doc, page_id);
             let labels: Vec<LabelSpan> = spans
                 .iter()
                 .map(|s| LabelSpan { x: s.x, y: s.y, size: s.size, width: s.width, text: s.text.clone(), bold: s.bold, italic: s.italic, angle: s.angle })
@@ -2135,7 +2308,7 @@ mod tests {
         // not.
         let (doc, ids) = rotated_pages();
         // Upright: the exact rect the raster occupies in local coords, plain form.
-        let (strong, _) = positioned_vectors(&doc, ids[0]);
+        let strong = size_bar_figures(&doc, ids[0]);
         let images = crate::img::positioned_images(&doc, ids[0], true);
         assert_eq!(images.len(), 1, "one raster per page");
         assert!(images[0].ctm.is_none(), "the fixture's placement is axis-aligned");
@@ -2153,7 +2326,7 @@ mod tests {
         // not in the transform. (Before the raster path turned its own pixels this was
         // `matrix(0 40 -30 0 250 20)`: the same box with the rotation baked into the matrix,
         // which was right for a composite and wrong for the `<img>` sharing the same URI.)
-        let (strong, _) = positioned_vectors(&doc, ids[1]);
+        let strong = size_bar_figures(&doc, ids[1]);
         let images = crate::img::positioned_images(&doc, ids[1], true);
         assert!(images[0].ctm.is_some(), "a turned raster must carry the matrix for its turned unit square");
         let turned = strong[0].composite_svg(&[raster(&images[0])]);
@@ -2168,13 +2341,13 @@ mod tests {
         // the overlay, its viewBox and the CSS box that carries it are all in display
         // orientation, and the wrapper is gone. Upright output is byte-identical either way.
         let (doc, ids) = rotated_pages();
-        let (upright, _) = positioned_vectors(&doc, ids[0]);
+        let upright = size_bar_figures(&doc, ids[0]);
         let up = upright[0].overlay_svg("width:100%");
         assert!(!up.contains("<g transform"), "no renderer needs an un-turn any more: {up}");
         assert!(up.contains("viewBox=\"-1 -1 202 302\""), "upright viewBox: {up}");
         // A quarter turn transposes the box; a half turn leaves it.
         for (i, vb) in [(1, "-1 -1 302 202"), (2, "-1 -1 202 302"), (3, "-1 -1 302 202")] {
-            let (figs, _) = positioned_vectors(&doc, ids[i]);
+            let figs = size_bar_figures(&doc, ids[i]);
             let ov = figs[0].overlay_svg("width:100%");
             assert!(!ov.contains("<g transform"), "page {}: {ov}", i + 1);
             assert!(ov.contains(&format!("viewBox=\"{vb}\"")), "page {}: want {vb}, got {ov}", i + 1);
@@ -2183,7 +2356,7 @@ mod tests {
         // y 200..500; place it over a raster whose rect is exactly the page, 400x600.
         let page = (0.0, 400.0, 0.0, 600.0);
         assert_eq!(upright[0].overlay_style(page), "position:absolute;left:25.00%;top:16.67%;width:50.00%;height:50.00%");
-        let (r90, _) = positioned_vectors(&doc, ids[1]);
+        let r90 = size_bar_figures(&doc, ids[1]);
         // /Rotate 90 displays the page 600x400; the figure's local origin is (y0, x0) = (200, 100)
         // and its extents transpose to 300x200.
         assert_eq!(r90[0].overlay_style(page), "position:absolute;left:33.33%;top:25.00%;width:50.00%;height:50.00%");

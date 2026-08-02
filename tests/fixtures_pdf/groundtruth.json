@@ -709,7 +709,7 @@
       1,
       1
     ],
-    "paths_per_page": 8
+    "paths_per_page": 9
   },
   "annot_appearance.pdf": {
     "images": [
@@ -823,7 +823,7 @@
       "0.5",
       "0.98"
     ],
-    "paths": 7,
+    "paths": 8,
     "plain_form_opacity": "0.25"
   },
   "dashes.pdf": {
@@ -841,7 +841,7 @@
       null,
       null
     ],
-    "paths": 6
+    "paths": 7
   },
   "smask_panel.pdf": {
     "panel_fill": "#339999",
@@ -998,5 +998,11 @@
       "Sim1a network only",
       "0.33"
     ]
+  },
+  "ink_gate.pdf": {
+    "page1_figures": 1,
+    "page2_figures": 0,
+    "page3_figures": 0,
+    "page4_figures": 1
   }
 }
