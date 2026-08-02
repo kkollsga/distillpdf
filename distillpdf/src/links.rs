@@ -12,6 +12,7 @@
 //! Named destinations are resolved via the catalog `/Dests` dict and the
 //! `/Names /Dests` name tree.
 
+use crate::pdfobj::{decode_text_string, deref, num_deref};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -27,18 +28,23 @@ pub struct Link {
     pub remote_file: Option<String>,
 }
 
-fn deref<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Object> {
-    match o {
-        Object::Reference(r) => doc.get_object(*r).ok(),
-        other => Some(other),
-    }
-}
-
-fn num(o: &Object) -> f32 {
-    match o {
-        Object::Integer(i) => *i as f32,
-        Object::Real(r) => *r,
-        _ => 0.0,
+impl Link {
+    /// Which of the three kinds this link is: `"uri"`, `"remote"` or `"internal"`.
+    ///
+    /// The discriminator is derived, not stored — the three fields are populated by
+    /// mutually exclusive branches of [`extract_links`] — and the ORDER of the tests is the
+    /// rule: a `/GoToR` carries a `remote_file` and may also carry a `dest_name`, so
+    /// `remote` must be decided before `internal` or a remote link reads as a jump inside
+    /// this document. It lived in the PyO3 binding, where no Rust consumer could reach it
+    /// and where the ordering rule was one edit away from being lost.
+    pub fn kind(&self) -> &'static str {
+        if self.uri.is_some() {
+            "uri"
+        } else if self.remote_file.is_some() {
+            "remote"
+        } else {
+            "internal"
+        }
     }
 }
 
@@ -54,47 +60,16 @@ fn pdf_string(o: &Object) -> Option<String> {
 /// legacy platform keys. Decoded as PDF text so UTF-16BE `/UF` values come out readable.
 fn file_spec(doc: &Document, o: &Object) -> Option<String> {
     match deref(doc, o)? {
-        Object::String(b, _) => Some(decode_pdf_text(b)),
+        Object::String(b, _) => Some(decode_text_string(b)),
         Object::Dictionary(d) => [&b"UF"[..], b"F", b"DOS", b"Mac", b"Unix"].iter().find_map(|k| {
             d.get(k).ok().and_then(|v| deref(doc, v)).and_then(|v| match v {
-                Object::String(b, _) => Some(decode_pdf_text(b)),
+                Object::String(b, _) => Some(decode_text_string(b)),
                 _ => None,
             })
         }),
         _ => None,
     }
     .filter(|s| !s.trim().is_empty())
-}
-
-/// A single PDFDocEncoding high byte (0x80–0xFF) → char. This is the encoding PDF text
-/// strings use when they are not UTF-16BE (PDF spec Annex D.2). NOTE it is NOT cp1252:
-/// e.g. 0x85 is EN DASH here (ellipsis in cp1252), 0x84 EM DASH, 0x8D/0x8E curly double
-/// quotes. ASCII (<0x80) and Latin-1 (0xA1–0xFF) map to the same code point; 0xA0 = €.
-fn pdfdoc_char(c: u8) -> char {
-    match c {
-        0x80 => '\u{2022}', 0x81 => '\u{2020}', 0x82 => '\u{2021}', 0x83 => '\u{2026}',
-        0x84 => '\u{2014}', 0x85 => '\u{2013}', 0x86 => '\u{0192}', 0x87 => '\u{2044}',
-        0x88 => '\u{2039}', 0x89 => '\u{203A}', 0x8A => '\u{2212}', 0x8B => '\u{2030}',
-        0x8C => '\u{201E}', 0x8D => '\u{201C}', 0x8E => '\u{201D}', 0x8F => '\u{2018}',
-        0x90 => '\u{2019}', 0x91 => '\u{201A}', 0x92 => '\u{2122}', 0x93 => '\u{FB01}',
-        0x94 => '\u{FB02}', 0x95 => '\u{0141}', 0x96 => '\u{0152}', 0x97 => '\u{0160}',
-        0x98 => '\u{0178}', 0x99 => '\u{017D}', 0x9A => '\u{0131}', 0x9B => '\u{0142}',
-        0x9C => '\u{0153}', 0x9D => '\u{0161}', 0x9E => '\u{017E}', 0x9F => '\u{FFFD}',
-        0xA0 => '\u{20AC}',
-        _ => c as char, // ASCII (<0x80) and Latin-1 (0xA1–0xFF) map to the same code point
-    }
-}
-
-/// Decode a PDF text string (outline titles, etc.): UTF-16BE when it carries a BE BOM,
-/// otherwise PDFDocEncoding. `from_utf8_lossy` mangles both — UTF-16 (NUL bytes) and the
-/// PDFDocEncoding high range — so titles need this.
-fn decode_pdf_text(b: &[u8]) -> String {
-    if b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF {
-        let u16s: Vec<u16> = b[2..].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
-        String::from_utf16_lossy(&u16s)
-    } else {
-        b.iter().map(|&c| pdfdoc_char(c)).collect()
-    }
 }
 
 /// Resolve a destination value (explicit `[pageRef /XYZ …]` array, or a dict with
@@ -108,8 +83,10 @@ fn dest_to_pos(doc: &Document, v: &Object, page_no: &HashMap<ObjectId, u32>) -> 
                 _ => return None,
             };
             let y = match a.get(1).and_then(|o| o.as_name().ok()) {
-                Some(b"XYZ") if a.len() >= 4 => Some(num(&a[3])),
-                Some(b"FitH") | Some(b"FitBH") if a.len() >= 3 => Some(num(&a[2])),
+                // Array VALUES, so `num_deref`: `/XYZ 72 15 0 R 0` is legal, and reading it
+                // with the direct-only `num` puts the anchor at y=0 (the page bottom).
+                Some(b"XYZ") if a.len() >= 4 => Some(num_deref(doc, &a[3])),
+                Some(b"FitH") | Some(b"FitBH") if a.len() >= 3 => Some(num_deref(doc, &a[2])),
                 _ => None,
             };
             Some((p, y))
@@ -133,6 +110,9 @@ fn resolve_dest(
 ) -> (Option<u32>, Option<String>) {
     match dest {
         Object::Array(_) => (dest_to_page(doc, dest, page_no), None),
+        // A destination NAME is a byte string used as a name-tree KEY, not a PDF text
+        // string: it must be read verbatim (never through `pdfobj::decode_text_string`)
+        // or it stops matching the `/Dests` entry it names. Lossy is correct here.
         Object::Name(n) | Object::String(n, _) => (
             named.get(n).copied(),
             Some(String::from_utf8_lossy(n).into_owned()),
@@ -215,6 +195,7 @@ fn walk_name_tree_pos(doc: &Document, tree: &Dictionary, page_no: &HashMap<Objec
         while i + 1 < names.len() {
             if let Object::String(key, _) = &names[i] {
                 if let Some((p, y)) = dest_to_pos(doc, &names[i + 1], page_no) {
+                    // Name-tree key: a byte string, not a text string — see `resolve_dest`.
                     out.push(NamedDest { name: String::from_utf8_lossy(key).into_owned(), page: p, y });
                 }
             }
@@ -236,6 +217,7 @@ pub fn named_destinations(doc: &Document) -> Vec<NamedDest> {
     if let Some(dests) = cat.get(b"Dests").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
         for (k, v) in dests.iter() {
             if let Some((p, y)) = dest_to_pos(doc, v, &page_no) {
+                // `/Dests` key: a byte string, not a text string — see `resolve_dest`.
                 out.push(NamedDest { name: String::from_utf8_lossy(k).into_owned(), page: p, y });
             }
         }
@@ -335,7 +317,7 @@ fn walk_outline(
         // `/Title 5 0 R` pointing at a UTF-16BE string), so deref before matching —
         // without this the title decodes empty and the entry is dropped below.
         let title = match item.get(b"Title").ok().and_then(|o| deref(doc, o)) {
-            Some(Object::String(b, _)) => decode_pdf_text(b),
+            Some(Object::String(b, _)) => decode_text_string(b),
             _ => String::new(),
         };
         let (page, _y) = outline_dest(doc, &item, page_no, named);
@@ -384,7 +366,11 @@ pub fn extract_links(doc: &Document) -> Vec<Link> {
             }
             let rect = ad.get(b"Rect").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_array().ok());
             let rect = match rect {
-                Some(r) if r.len() >= 4 => [num(&r[0]), num(&r[1]), num(&r[2]), num(&r[3])],
+                // Ditto: an annotation `/Rect` entry may be an indirect number, and reading
+                // one as 0.0 collapses the clickable box to the page corner.
+                Some(r) if r.len() >= 4 => {
+                    [num_deref(doc, &r[0]), num_deref(doc, &r[1]), num_deref(doc, &r[2]), num_deref(doc, &r[3])]
+                }
                 _ => continue,
             };
 
@@ -414,6 +400,8 @@ pub fn extract_links(doc: &Document) -> Vec<Link> {
                     // A `/GoToR` destination addresses the REMOTE file: never resolve it
                     // against this document's pages or named-destination map.
                     dest_name = match act.get(b"D").ok().and_then(|o| deref(doc, o)) {
+                        // Byte string / name-tree key in the REMOTE file, not a text
+                        // string — see `resolve_dest`.
                         Some(Object::Name(n)) | Some(Object::String(n, _)) => {
                             Some(String::from_utf8_lossy(n).into_owned())
                         }
@@ -444,6 +432,76 @@ mod tests {
     fn links_doc() -> Document {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/links.pdf");
         Document::load(path).expect("links.pdf fixture must load")
+    }
+
+    /// `tests/gen_fixtures.py::gen_indirect_numbers` — a `/Rect` and two destination tops
+    /// written as indirect references.
+    fn indirect_doc() -> Document {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/indirect_numbers.pdf");
+        Document::load(path).expect("indirect_numbers.pdf fixture must load")
+    }
+
+    fn link_of(uri: Option<&str>, dest_page: Option<u32>, dest_name: Option<&str>, remote: Option<&str>) -> Link {
+        Link {
+            page: 1,
+            rect: [0.0; 4],
+            uri: uri.map(String::from),
+            dest_page,
+            dest_name: dest_name.map(String::from),
+            remote_file: remote.map(String::from),
+        }
+    }
+
+    #[test]
+    fn link_kind_decides_remote_before_internal() {
+        assert_eq!(link_of(Some("https://x"), None, None, None).kind(), "uri");
+        assert_eq!(link_of(None, Some(3), None, None).kind(), "internal");
+        assert_eq!(link_of(None, None, Some("cite.devlin2018"), None).kind(), "internal");
+        // The ordering rule: a /GoToR carries a remote file AND a dest_name that addresses
+        // THAT file. Testing dest_name first would report it as a jump inside this document.
+        assert_eq!(link_of(None, None, Some("sec.2"), Some("other.pdf")).kind(), "remote");
+        assert_eq!(link_of(None, None, None, None).kind(), "internal", "a bare link degrades, it does not panic");
+    }
+
+    #[test]
+    fn every_extracted_link_reports_one_of_the_three_kinds() {
+        let doc = links_doc();
+        let links = extract_links(&doc);
+        assert!(!links.is_empty());
+        assert!(links.iter().all(|l| ["uri", "internal", "remote"].contains(&l.kind())));
+    }
+
+    #[test]
+    fn an_annotation_rect_with_indirect_entries_keeps_its_area() {
+        // `/Rect [72 696 13 0 R 14 0 R]`. A dictionary value may legally be indirect, but the
+        // direct-only `num` reader returned 0.0 for one, collapsing the clickable box to
+        // `[72, 696, 0, 0]` — an inverted, zero-area rectangle at the page corner.
+        let doc = indirect_doc();
+        // The premise: the fixture's rect really is written with indirect entries.
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        let annots = doc.get_dictionary(page_id).unwrap().get(b"Annots").unwrap().as_array().unwrap();
+        let annot = deref(&doc, &annots[0]).unwrap().as_dict().unwrap();
+        let r = annot.get(b"Rect").unwrap().as_array().unwrap();
+        assert!(matches!(r[2], Object::Reference(_)) && matches!(r[3], Object::Reference(_)));
+
+        let links = extract_links(&doc);
+        assert_eq!(links.len(), 1, "the fixture carries exactly one link");
+        assert_eq!(links[0].uri.as_deref(), Some("https://example.com/indirect"));
+        assert_eq!(links[0].rect, [72.0, 696.0, 420.0, 714.0], "indirect /Rect entries must resolve, not read 0");
+    }
+
+    #[test]
+    fn a_destination_top_written_indirectly_still_points_at_its_target() {
+        // `/XYZ 72 15 0 R 0` and `/FitH 16 0 R`: the anchor y is what places the target id on
+        // the rendered page. Read as 0.0 it lands at the page BOTTOM, not at the section.
+        let doc = indirect_doc();
+        let mut dests = named_destinations(&doc);
+        dests.sort_by(|a, b| a.name.cmp(&b.name));
+        let names: Vec<&str> = dests.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["fig.indirect", "sec.indirect"]);
+        assert!(dests.iter().all(|d| d.page == 2), "both resolve to page 2");
+        assert_eq!(dests[0].y, Some(700.0), "/XYZ top read indirectly");
+        assert_eq!(dests[1].y, Some(640.0), "/FitH top read indirectly");
     }
 
     #[test]

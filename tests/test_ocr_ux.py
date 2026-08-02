@@ -409,3 +409,26 @@ def test_image_ink_permille_blank_vs_inked():
     black = io.BytesIO(); Image.new("RGB", (64, 64), "black").save(black, "PNG")
     assert _distillpdf.image_ink_permille(white.getvalue()) < ocr._RESCUE_MIN_INK_PERMILLE
     assert _distillpdf.image_ink_permille(black.getvalue()) >= ocr._RESCUE_MIN_INK_PERMILLE
+
+
+# -- error mapping at the PyO3 boundary --------------------------------------
+def test_binding_errors_route_through_the_one_error_mapping(tmp_path):
+    """Seven binding call sites used to mint ``PyValueError`` themselves, one of them
+    hand-copying the ``write failed:`` string the core ``Error::Write`` owns. They now go
+    through ``to_py``, so every failure gets the class the mapping decides and the message
+    the core owns — and a future exception subclass reaches them automatically."""
+    from distillpdf import _distillpdf as _d
+
+    # Error::Write — the message the core owns, not a copy of it.
+    with pytest.raises(ValueError, match=r"^write failed: "):
+        _d.ocr_doctags_to_pdf([("<loc_0><loc_0><loc_10><loc_10>hi", "", 612.0, 792.0)],
+                              str(tmp_path / "no_such_dir" / "out.pdf"))
+
+    # Error::Ocr — the engine layer's own message, passed through verbatim.
+    with pytest.raises(ValueError, match=r"unknown native OCR engine"):
+        _d.ocr_page_native("no_such_engine_xyz", b"", None)
+    with pytest.raises(ValueError, match=r"unknown native OCR engine"):
+        _d.ocr_classify_native("no_such_engine_xyz", b"", None)
+    with pytest.raises(ValueError, match=r"^decode image: "):
+        _d.image_ink_permille(b"not an image at all")
+

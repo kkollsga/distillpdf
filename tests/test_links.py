@@ -65,3 +65,14 @@ def test_internal_link_uses_named_anchor_not_page():
     assert re.search(r'id="' + re.escape(G["dest_name"]) + r'"', h), \
         "no id anchor placed at the named destination"
     assert not re.search(r'href="#page-\d+"', h), "internal link fell back to #page-N"
+
+
+def test_indirect_rect_entries_keep_the_clickable_area():
+    """``/Rect [72 696 13 0 R 14 0 R]``: a dictionary value may legally be an indirect
+    number, and the direct-only reader turned both into 0.0 — collapsing the clickable box
+    to a zero-area rectangle at the page corner (``[0, 0, 72, 696]`` after normalisation)."""
+    g = GT["indirect_numbers.pdf"]
+    links = doc("indirect_numbers.pdf").extract_links()
+    assert len(links) == 1, links
+    assert links[0]["uri"] == g["uri"]
+    assert links[0]["rect"] == [float(v) for v in g["rect"]], links[0]["rect"]

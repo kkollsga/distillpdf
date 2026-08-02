@@ -5,12 +5,25 @@
 //! [`PdfDocument`] / typed model, assembling the Python objects and mapping the core's
 //! structured [`Error`] to the `ValueError` the Python API has always raised. The
 //! `#[pymodule]` name (`_distillpdf`) is bound to maturin's `module-name` and must not change.
+//!
+//! **[`to_py`] is the only place an exception is minted** (with [`page_arg`], which turns a
+//! Python integer into a page number before any core call exists to fail). Seven call sites
+//! used to raise `PyValueError` directly, and one of them hand-copied the exact `write
+//! failed: {e}` string that `Error::Write` owns and `error.rs`'s test behaviour-locks. The
+//! cost was not cosmetic: an error raised that way can never become
+//! `EncryptedPdfError` — or any future subclass — because the mapping that decides the
+//! class was never consulted. The rule is greppable, and the Phase-14 structure test
+//! enforces it: no `PyValueError::new_err` in this file outside those two functions.
+//!
+//! Logic follows the same rule. A discriminator like a link's `kind` is a property of the
+//! core type, not of the binding; `Link::kind()` lives in `links.rs` where Rust consumers
+//! can reach it and where its ordering rule is tested.
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use distillpdf::{doc, markdown, model, ocr, Error, PdfDocument};
+use distillpdf::{doc, markdown, model, ocr, Error, PdfDocument, DEFAULT_PAGE_PTS};
 
 pyo3::create_exception!(
     _distillpdf,
@@ -152,14 +165,7 @@ impl Pdf {
             let d = PyDict::new(py);
             d.set_item("page", lk.page)?;
             d.set_item("rect", lk.rect.to_vec())?;
-            let kind = if lk.uri.is_some() {
-                "uri"
-            } else if lk.remote_file.is_some() {
-                "remote"
-            } else {
-                "internal"
-            };
-            d.set_item("kind", kind)?;
+            d.set_item("kind", lk.kind())?;
             d.set_item("uri", lk.uri)?;
             d.set_item("dest_page", lk.dest_page)?;
             d.set_item("dest_name", lk.dest_name)?;
@@ -573,14 +579,14 @@ fn ocr_doctags_to_pdf(pages: Vec<(String, String, f64, f64)>, out_path: &str) ->
             let image = if img.is_empty() { None } else { image::open(img).ok() };
             ocr::pdf::PageInput {
                 page: ocr::doctags::parse(dt),
-                width: if *w > 0.0 { *w as f32 } else { 612.0 },
-                height: if *h > 0.0 { *h as f32 } else { 792.0 },
+                width: if *w > 0.0 { *w as f32 } else { DEFAULT_PAGE_PTS.0 },
+                height: if *h > 0.0 { *h as f32 } else { DEFAULT_PAGE_PTS.1 },
                 image,
             }
         })
         .collect();
-    let bytes = ocr::pdf::write_pdf(&inputs).map_err(PyValueError::new_err)?;
-    std::fs::write(out_path, bytes).map_err(|e| PyValueError::new_err(format!("write failed: {e}")))?;
+    let bytes = ocr::pdf::write_pdf(&inputs).map_err(|e| to_py(Error::Ocr(e)))?;
+    std::fs::write(out_path, bytes).map_err(|e| to_py(Error::Write(e)))?;
     Ok(())
 }
 
@@ -628,8 +634,8 @@ fn ocr_page_native(
     opts: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<String> {
     let cfg = parse_native_cfg(opts)?;
-    let eng = ocr::engine::native_engine(engine, &cfg).map_err(PyValueError::new_err)?;
-    py.allow_threads(|| eng.ocr_page(image)).map_err(PyValueError::new_err)
+    let eng = ocr::engine::native_engine(engine, &cfg).map_err(|e| to_py(Error::Ocr(e)))?;
+    py.allow_threads(|| eng.ocr_page(image)).map_err(|e| to_py(Error::Ocr(e)))
 }
 
 /// Classify a page image for the text-vs-true-image gate: returns `(raw_words,
@@ -645,8 +651,8 @@ fn ocr_classify_native(
     opts: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<(usize, usize)> {
     let cfg = parse_native_cfg(opts)?;
-    let eng = ocr::engine::native_engine(engine, &cfg).map_err(PyValueError::new_err)?;
-    py.allow_threads(|| eng.classify(image)).map_err(PyValueError::new_err)
+    let eng = ocr::engine::native_engine(engine, &cfg).map_err(|e| to_py(Error::Ocr(e)))?;
+    py.allow_threads(|| eng.classify(image)).map_err(|e| to_py(Error::Ocr(e)))
 }
 
 /// Fraction of "ink" pixels (luma below mid-grey) in a page image, in per-mille (0–1000). A
@@ -663,7 +669,7 @@ fn image_ink_permille(py: Python<'_>, image: &[u8]) -> PyResult<u32> {
         let ink = g.pixels().filter(|p| p.0[0] < 128).count() as u64;
         Ok::<u32, String>((ink * 1000 / total) as u32)
     })
-    .map_err(PyValueError::new_err)
+    .map_err(|e| to_py(Error::Ocr(e)))
 }
 
 /// Names of native OCR engines compiled into this wheel (e.g. ["tesseract","server"], or

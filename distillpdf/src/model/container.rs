@@ -335,7 +335,7 @@ mod tests {
                 generated_at: "2026-06-10T00:00:00Z".into(),
             },
             metadata: Metadata::default(),
-            pages: vec![Page { n: 1, width_pts: 612.0, height_pts: 792.0, labels: BTreeMap::new(), ocr_decision: None, active_ocr_pass: None }],
+            pages: vec![Page { n: 1, width_pts: crate::pdfobj::DEFAULT_PAGE_PTS.0, height_pts: crate::pdfobj::DEFAULT_PAGE_PTS.1, labels: BTreeMap::new(), ocr_decision: None, active_ocr_pass: None }],
             ocr_passes: Vec::new(),
             sections: Vec::new(),
             blocks,

@@ -4,6 +4,7 @@
 //! between html.rs and the feature modules (captions, headings, frontmatter, …).
 //! Extracted from html.rs.
 
+use crate::geom::Rect;
 use crate::html::esc;
 use crate::text::{self, Span};
 
@@ -18,7 +19,7 @@ pub(crate) struct LinkBox {
 fn href_at(x: f32, y: f32, links: &[LinkBox]) -> Option<String> {
     links
         .iter()
-        .find(|l| x >= l.rect[0] && x <= l.rect[2] && y >= l.rect[1] && y <= l.rect[3])
+        .find(|l| Rect::from(l.rect).contains(x, y))
         .map(|l| l.href.clone())
 }
 

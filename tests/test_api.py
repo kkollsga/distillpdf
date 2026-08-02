@@ -20,6 +20,8 @@ FORM_FONT = os.path.join(FIX, "form_font.pdf")
 UNDRAWN_IMAGE = os.path.join(FIX, "undrawn_image.pdf")
 COLORSPACE_IMAGES = os.path.join(FIX, "colorspace_images.pdf")
 CMYK_JPEG = os.path.join(FIX, "cmyk_jpeg.pdf")
+DECODE_JPEG = os.path.join(FIX, "decode_jpeg.pdf")
+ANNOT_APPEARANCE = os.path.join(FIX, "annot_appearance.pdf")
 
 
 def test_open_and_page_count():
@@ -136,6 +138,68 @@ def test_cmyk_jpeg_renders_in_the_authored_colour_in_html():
         assert max(abs(a - b) for a, b in zip(got, want)) <= 8, f"band x={x}: {got} vs {want}"
 
 
+def test_gray_and_rgb_jpegs_honour_an_inverting_decode_in_html():
+    """The `/Decode` half of the CMYK fix applied to CMYK only: a gray or RGB JPEG whose
+    image dict says `/Decode [1 0 …]` was passed through to the `<img>` byte-for-byte, so
+    `to_html` rendered the NEGATIVE of the authored colour. The RGB image's array is
+    INDIRECT, which the render path's own reader could not follow at all."""
+    Image = pytest.importorskip("PIL.Image")
+    import base64
+    h = distillpdf.Pdf.open(DECODE_JPEG).to_html(mode="page", return_string=True, image_mode="embed")
+    uris = re.findall(r"data:image/\w+;base64,([A-Za-z0-9+/=]+)", h)
+    assert len(uris) == 2, "the fixture places two images"
+    for uri, want in zip(uris, ((215, 215, 215), (55, 225, 165))):
+        im = Image.open(io.BytesIO(base64.b64decode(uri))).convert("RGB")
+        assert im.size == (64, 48)
+        got = im.getpixel((32, 24))
+        assert max(abs(a - b) for a, b in zip(got, want)) <= 8, f"{got} vs {want}"
+
+
+def _html_image_pixels(path, expect):
+    """The RGB pixels of every image `to_html(image_mode="embed")` inlines, in page order."""
+    Image = pytest.importorskip("PIL.Image")
+    import base64
+    h = distillpdf.Pdf.open(path).to_html(mode="page", return_string=True, image_mode="embed")
+    uris = re.findall(r"data:image/\w+;base64,([A-Za-z0-9+/=]+)", h)
+    assert len(uris) == expect, f"{os.path.basename(path)}: expected {expect} inline images, got {len(uris)}"
+    assert len(re.findall(r"<img\b", h)) == expect, "one <img> per inlined image"
+    return [Image.open(io.BytesIO(base64.b64decode(u))).convert("RGB") for u in uris]
+
+
+def test_the_render_path_decodes_the_samples_extract_can_decode():
+    """`to_html` carried its own, weaker sample decoder than `extract_images()`: 8 bpc only,
+    and a channel count guessed from `len(samples) / (w*h)` for any colour space it did not
+    model. An Indexed image's palette INDICES therefore rendered as gray levels (authored
+    red/blue came out (0,0,0)/(1,1,1)) and a 4-bpc image was dropped outright."""
+    idx, gray4 = _html_image_pixels(os.path.join(FIX, "render_samples.pdf"), 2)
+    assert idx.size == (2, 1)
+    assert idx.getpixel((0, 0)) == (255, 0, 0), "palette entry 0, not gray level 0"
+    assert idx.getpixel((1, 0)) == (0, 0, 255), "palette entry 1, not gray level 1"
+    assert gray4.getpixel((0, 0)) == (0, 0, 0) and gray4.getpixel((1, 0)) == (255, 255, 255)
+    # The colour-space fixture is drawn on its page too, so all four of its rasters — the
+    # 4-bpc Indexed one, the raw DeviceCMYK one, and the two that already worked — appear.
+    assert len(_html_image_pixels(COLORSPACE_IMAGES, 4)) == 4
+
+
+def test_an_unfiltered_raster_reaches_the_html():
+    """A stream with NO `/Filter` makes lopdf's `decompressed_content()` error, and the
+    render path read its samples with `.ok()?` — so `extract_images()` returned two valid
+    PNGs for this fixture while `to_html` emitted zero `<img>`."""
+    pages = _html_image_pixels(UNDRAWN_IMAGE, 2)
+    assert [p.size for p in pages] == [(40, 30), (42, 32)], "one per page: the drawn ones only"
+
+
+def test_placeholder_mode_counts_the_images_embed_mode_emits():
+    """`<image N>` stands in for an image inline mode would actually emit, so the two counts
+    must agree. The placeholder gate used to be an independently-written `bpc == 8` guess:
+    colorspace_images.pdf emitted 3 placeholders for 2 embedded images."""
+    for name in ("colorspace_images.pdf", "render_samples.pdf", "undrawn_image.pdf", "figures.pdf"):
+        doc = distillpdf.Pdf.open(os.path.join(FIX, name))
+        embed = len(re.findall(r"<img\b", doc.to_html(mode="page", return_string=True, image_mode="embed")))
+        drop = len(re.findall(r"<image\b", doc.to_html(mode="page", return_string=True, image_mode="drop")))
+        assert drop == embed, f"{name}: {drop} placeholders vs {embed} embedded images"
+
+
 def test_every_extracted_image_across_the_fixtures_opens():
     """The usability contract: on the owned corpus every returned blob is a file PIL can
     open. Only 44% of corpus blobs did before the bytes were assembled/unwrapped; a row we
@@ -199,6 +263,33 @@ def test_extract_images_reports_only_what_the_page_draws():
     # dictionaries but painted by nobody.
     assert all((i["width"], i["height"]) not in {(41, 31), (43, 33)} for i in imgs)
     assert all(len(i["data"]) > 0 for i in imgs)
+
+
+def test_extract_images_finds_annotation_appearance_streams():
+    """``/Annots -> /AP /N`` is a content stream a viewer paints onto the page and that
+    nothing in the pipeline used to walk, so an image living only inside a stamp's or a
+    widget's appearance was reported by nobody. The fixture pins the selection rules with
+    one distractor per rule."""
+    imgs = distillpdf.Pdf.open(ANNOT_APPEARANCE).extract_images()
+    assert [(i["page"], i["index"], i["width"], i["height"]) for i in imgs] == [
+        (1, 0, 40, 30),   # painted by the page's own content: keeps index 0
+        (1, 1, 10, 10),   # a /Stamp annotation's appearance stream
+        (1, 2, 12, 12),   # a /Widget whose /AS selects this appearance state
+        (1, 3, 15, 15),   # a state dictionary with no /AS: every state counts
+        (1, 4, 16, 16),
+    ]
+    sizes = {(i["width"], i["height"]) for i in imgs}
+    assert (11, 11) not in sizes, "in the appearance's /Resources but never drawn"
+    assert (13, 13) not in sizes, "the appearance state /AS did not select"
+    assert (14, 14) not in sizes, "a hidden (/F bit 2) annotation draws nothing"
+    assert all(len(i["data"]) > 0 for i in imgs)
+
+
+def test_extract_fonts_ignores_annotation_appearances():
+    """The deliberate asymmetry with images: a widget's own tick font is a property of the
+    form field, not of the page's text, and the parity reference does not report it."""
+    fonts = distillpdf.Pdf.open(ANNOT_APPEARANCE).extract_fonts()
+    assert [f["name"] for f in fonts] == ["F1"]
 
 
 def test_extract_tables():

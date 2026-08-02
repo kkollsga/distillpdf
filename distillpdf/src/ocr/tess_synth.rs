@@ -55,11 +55,7 @@ pub(crate) fn classify_lines(lines: &[OcrLine]) -> (usize, usize) {
     let mut words = 0usize;
     let mut conf_chars = 0usize;
     for ln in lines {
-        for w in ln.text.split_whitespace() {
-            if w.chars().filter(|c| c.is_alphanumeric()).count() >= 2 {
-                words += 1;
-            }
-        }
+        words += crate::textutil::word_like_count(&ln.text);
         if ln.conf >= MIN_CONF {
             conf_chars += ln.text.chars().filter(|c| !c.is_whitespace()).count();
         }

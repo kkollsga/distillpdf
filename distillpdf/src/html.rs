@@ -7,6 +7,7 @@
 use crate::captions::*;
 use crate::extract;
 use crate::frontmatter::*;
+use crate::geom::Rect;
 use crate::headings::*;
 use crate::img;
 use crate::layout::*;
@@ -18,7 +19,7 @@ use crate::text::{self, Span};
 use crate::vector;
 use lopdf::{Document, ObjectId};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 /// A PDF named-destination name (e.g. "cite.devlin2018", "section.3.1") → a valid,
 /// stable HTML id/fragment: keep [A-Za-z0-9._-], map anything else to '-'. Used for
@@ -38,19 +39,7 @@ fn num_id<S: AsRef<str>>(num: S) -> String {
     num.as_ref().chars().map(|c| if c == '.' { '-' } else { c.to_ascii_lowercase() }).collect()
 }
 
-pub(crate) fn esc(s: &str) -> String {
-    let mut o = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => o.push_str("&amp;"),
-            '<' => o.push_str("&lt;"),
-            '>' => o.push_str("&gt;"),
-            '"' => o.push_str("&quot;"),
-            _ => o.push(c),
-        }
-    }
-    o
-}
+pub(crate) use crate::textutil::esc;
 
 // Unambiguous bullet glyphs. Includes U+0095 / U+0085: some embedded fonts map
 // their LaTeX-itemize bullet to those C1 control code points.
@@ -383,9 +372,7 @@ pub(crate) type Bbox = [f32; 4];
 /// unpositioned one keeps the positioned box.
 pub(crate) fn bbox_union(a: Option<Bbox>, b: Option<Bbox>) -> Option<Bbox> {
     match (a, b) {
-        (Some([ax0, ay0, ax1, ay1]), Some([bx0, by0, bx1, by1])) => {
-            Some([ax0.min(bx0), ay0.min(by0), ax1.max(bx1), ay1.max(by1)])
-        }
+        (Some(a), Some(b)) => Some(Rect::from(a).union(Rect::from(b)).into()),
         (Some(x), None) | (None, Some(x)) => Some(x),
         (None, None) => None,
     }
@@ -888,17 +875,7 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[(String, u8)
 /// join with no space so "Rad-" + "ford et al." reads "Radford et al."
 /// First non-whitespace character of a fragment, skipping any leading HTML tags.
 fn first_visible(s: &str) -> Option<char> {
-    let mut intag = false;
-    for c in s.chars() {
-        match c {
-            '<' => intag = true,
-            '>' => intag = false,
-            _ if intag => {}
-            c if !c.is_whitespace() => return Some(c),
-            _ => {}
-        }
-    }
-    None
+    crate::textutil::visible_chars(s, crate::textutil::TagBreak::Join).find(|c| !c.is_whitespace())
 }
 
 pub(crate) fn append_piece(para: &mut String, piece: &str) {
@@ -975,7 +952,14 @@ fn build_doc_profile(page_spans: &[(u32, ObjectId, Vec<Span>)], body: f32, title
     }
     let body_i = body.round() as i32;
     let pages = page_spans.len().max(1);
-    let mut clusters: HashMap<(i32, bool, u32), Acc> = HashMap::new();
+    // BTreeMap, not HashMap: three consumers below read this map IN ITERATION ORDER —
+    // `max_by_key` for the body cluster and the title font (both return the LAST maximum),
+    // and the `cands` collect whose later `sort_by` is STABLE, so equal-ranking heading
+    // tiers keep iteration order and `take(4)` picks by it. `HashMap`'s order varies per
+    // map instance (`RandomState`), so any tie made the document's heading tiers — and the
+    // rendered HTML — differ run to run. Ordered by (size, bold, font), ties now resolve to
+    // the largest size / bold / highest font id, deterministically.
+    let mut clusters: BTreeMap<(i32, bool, u32), Acc> = BTreeMap::new();
     let mut numbered_hits = 0usize;
     for (pno, _id, spans) in page_spans {
         for s in spans {
@@ -1138,7 +1122,11 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         .collect();
     page_spans.sort_by_key(|(pno, _, _)| *pno);
     phase("01_spans", t);
-    let mut hist: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+    // BTreeMap: `max_by_key` below returns the LAST maximum in iteration order, so with a
+    // `HashMap` two equally-common body sizes picked a different winner run to run — and
+    // the body size drives every heading/paragraph decision downstream. Ascending key order
+    // makes the tie-break "the larger size wins", deterministically.
+    let mut hist: BTreeMap<i32, usize> = BTreeMap::new();
     for (_, _, spans) in &page_spans {
         for s in spans {
             if s.angle.abs() < 0.01 {
@@ -1276,26 +1264,23 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         // suppresses the overlapping vector, fragmenting a raster+vector plot (a Vp-depth
         // crossplot) into a lone raster plus loose axis text.
         tables.retain(|t| {
-            let ta = ((t.x_right - t.x_left) * (t.y_top - t.y_bottom)).max(1.0);
+            let tr = Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
+            let ta = tr.area().max(1.0);
             let raster_covered = images.iter().any(|im| {
-                let ia = ((im.x_right - im.x_left) * (im.y_top - im.y_bottom)).max(1.0);
-                let ox = (t.x_right.min(im.x_right) - t.x_left.max(im.x_left)).max(0.0);
-                let oy = (t.y_top.min(im.y_top) - t.y_bottom.max(im.y_bottom)).max(0.0);
-                ia >= ta * 0.15 && ox * oy >= ia * 0.5
+                let ir = Rect::new(im.x_left, im.y_bottom, im.x_right, im.y_top);
+                let ia = ir.area().max(1.0);
+                ia >= ta * 0.15 && tr.overlap_area(ir) >= ia * 0.5
             });
             let strip_in_plot = raw_vectors.iter().any(|v| {
-                let va = ((v.x_right - v.x_left) * (v.y_top - v.y_bottom)).max(1.0);
-                let ox = (v.x_right.min(t.x_right) - v.x_left.max(t.x_left)).max(0.0);
-                let oy = (v.y_top.min(t.y_top) - v.y_bottom.max(t.y_bottom)).max(0.0);
-                if !(ox * oy >= ta * 0.6 && ta < va * 0.5) {
+                let vr = Rect::new(v.x_left, v.y_bottom, v.x_right, v.y_top);
+                let va = vr.area().max(1.0);
+                if !(vr.overlap_area(tr) >= ta * 0.6 && ta < va * 0.5) {
                     return false;
                 }
                 // …and the vector is a composite plot: it contains a substantial raster.
                 images.iter().any(|im| {
-                    let ia = ((im.x_right - im.x_left) * (im.y_top - im.y_bottom)).max(1.0);
-                    let iox = (v.x_right.min(im.x_right) - v.x_left.max(im.x_left)).max(0.0);
-                    let ioy = (v.y_top.min(im.y_top) - v.y_bottom.max(im.y_bottom)).max(0.0);
-                    iox * ioy >= ia * 0.5
+                    let ir = Rect::new(im.x_left, im.y_bottom, im.x_right, im.y_top);
+                    vr.overlap_area(ir) >= ir.area().max(1.0) * 0.5
                 })
             });
             // A label grid belonging to a captioned vector figure — a diagram's node labels
@@ -1312,18 +1297,19 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
             // separated from the ink, so neither shape matches and it survives.
             let (tcx, tcy) = ((t.x_left + t.x_right) * 0.5, (t.y_bottom + t.y_top) * 0.5);
             let label_grid_in_fig = captioned_fig_boxes.iter().any(|&(xl, xr, yb, yt)| {
-                let center_in = tcx >= xl && tcx <= xr && tcy >= yb && tcy <= yt;
+                let fr = Rect::new(xl, yb, xr, yt);
+                let center_in = fr.contains(tcx, tcy);
                 let v_overlap = yt.min(t.y_top) > yb.max(t.y_bottom);
                 let x_aligned = tcx >= xl && tcx <= xr;
-                let va = ((xr - xl) * (yt - yb)).max(1.0);
+                let va = fr.area().max(1.0);
                 // The table blankets the figure horizontally: its x-extent covers most of the
                 // figure's width within the figure's y-band (the figure's labels mis-clustered
                 // into a row wider than the figure, often spanning into the neighbouring column).
                 // Bound the height so a genuine full-column data table that merely crosses the
                 // figure's y-band isn't swallowed.
-                let fw = (xr - xl).max(1.0);
-                let xcov = (xr.min(t.x_right) - xl.max(t.x_left)).max(0.0) / fw;
-                let blankets = xcov >= 0.6 && v_overlap && (t.y_top - t.y_bottom) < (yt - yb) * 1.2;
+                let fw = fr.width().max(1.0);
+                let xcov = fr.overlap_w(tr) / fw;
+                let blankets = xcov >= 0.6 && v_overlap && tr.height() < fr.height() * 1.2;
                 center_in || (x_aligned && v_overlap && ta < va) || blankets
             });
             !(raster_covered || strip_in_plot || label_grid_in_fig)
@@ -1816,15 +1802,15 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         let mut svg_rasters: Vec<Vec<usize>> = vec![Vec::new(); vectors.len()]; // vector → embedded images
         if inline_images {
             for (vi, v) in vectors.iter().enumerate() {
-                let varea = ((v.x_right - v.x_left) * (v.y_top - v.y_bottom)).max(1.0);
+                let vr = Rect::new(v.x_left, v.y_bottom, v.x_right, v.y_top);
+                let varea = vr.area().max(1.0);
                 for (ii, im) in images.iter().enumerate() {
                     if vec_owner[vi].is_some() || img_owner[ii].is_some() {
                         continue;
                     }
-                    let ox = (v.x_right.min(im.x_right) - v.x_left.max(im.x_left)).max(0.0);
-                    let oy = (v.y_top.min(im.y_top) - v.y_bottom.max(im.y_bottom)).max(0.0);
-                    let overlap = ox * oy;
-                    let imarea = ((im.x_right - im.x_left) * (im.y_top - im.y_bottom)).max(1.0);
+                    let ir = Rect::new(im.x_left, im.y_bottom, im.x_right, im.y_top);
+                    let overlap = vr.overlap_area(ir);
+                    let imarea = ir.area().max(1.0);
                     if overlap / varea > 0.6 {
                         vec_owner[vi] = Some(ii); // vector mostly inside image → raster base
                         img_overlays[ii].push(vi);
@@ -1906,7 +1892,12 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                         let href = format!("\u{0}{idx}\u{0}");
                         let im = &images[*j];
                         let vi = img_overlays[*j][0];
-                        let svg = vectors[vi].composite_svg(&[(&href, (im.x_left, im.x_right, im.y_bottom, im.y_top), im.ctm)]);
+                        let svg = vectors[vi].composite_svg(&[vector::Raster {
+                            href: &href,
+                            rect: (im.x_left, im.x_right, im.y_bottom, im.y_top),
+                            ctm: im.ctm,
+                            seq: &im.seq,
+                        }]);
                         // Caption may have attached to the image OR its overlay vector.
                         let cap = img_cap[*j].as_ref().or(svg_cap[vi].as_ref());
                         let (html, id, caption) = match cap {
@@ -1978,16 +1969,27 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                     // are a raster within the axes): composite into ONE `<svg>` with each
                     // raster embedded as an `<image>` in the figure's coordinate space.
                     let svg = if !svg_rasters[*j].is_empty() {
-                        let rasters: Vec<(String, (f32, f32, f32, f32), Option<[f32; 6]>)> = svg_rasters[*j]
+                        let hrefs: Vec<String> = svg_rasters[*j]
                             .iter()
                             .map(|&ii| {
                                 let idx = img_uris.len();
                                 img_uris.push(std::mem::take(&mut images[ii].uri));
-                                let im = &images[ii];
-                                (format!("\u{0}{idx}\u{0}"), (im.x_left, im.x_right, im.y_bottom, im.y_top), im.ctm)
+                                format!("\u{0}{idx}\u{0}")
                             })
                             .collect();
-                        let refs: Vec<(&str, (f32, f32, f32, f32), Option<[f32; 6]>)> = rasters.iter().map(|(h, r, m)| (h.as_str(), *r, *m)).collect();
+                        let refs: Vec<vector::Raster<'_>> = svg_rasters[*j]
+                            .iter()
+                            .zip(&hrefs)
+                            .map(|(&ii, href)| {
+                                let im = &images[ii];
+                                vector::Raster {
+                                    href: href.as_str(),
+                                    rect: (im.x_left, im.x_right, im.y_bottom, im.y_top),
+                                    ctm: im.ctm,
+                                    seq: &im.seq,
+                                }
+                            })
+                            .collect();
                         vectors[*j].composite_svg(&refs)
                     } else {
                         vectors[*j].svg()

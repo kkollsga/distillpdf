@@ -323,6 +323,14 @@
       }
     ]
   },
+  "image_order.pdf": {
+    "images": 6,
+    "renders_identical": 25
+  },
+  "paint_order.pdf": {
+    "figures": 2,
+    "panel_fill": "#808080"
+  },
   "cmyk_jpeg.pdf": {
     "caption": "Figure 1: Three flat CMYK bands.",
     "bands_rgb": [
@@ -381,7 +389,9 @@
       "1": "i",
       "2": "ii",
       "3": "1",
-      "4": "2"
+      "4": "2",
+      "5": "Ap\u00eandice 1",
+      "6": "Ap\u00eandice 2"
     },
     "roman_pages": [
       "i",
@@ -391,6 +401,12 @@
       "1",
       "2"
     ],
+    "utf16_prefix": "Ap\u00eandice ",
+    "utf16_pages": [
+      "Ap\u00eandice 1",
+      "Ap\u00eandice 2"
+    ],
+    "producer": "distillPDF\u2122 \u201cfixture\u201d writer",
     "page_ii_text": "front matter on roman page ii",
     "page_arabic1_text": "opens the body on arabic page 1"
   },
@@ -594,5 +610,151 @@
     "control": "form_repeat.pdf",
     "control_repeats": 3,
     "control_word": "REPEAT"
+  },
+  "unfiltered_form.pdf": {
+    "form_text": "Unfiltered form ink",
+    "n_bars": 5,
+    "caption": "Figure 1: Five bars painted by a form stream carrying no filter.",
+    "title": "A Form Stream With No Filter"
+  },
+  "indirect_mediabox.pdf": {
+    "page_width": 1008,
+    "page_height": 612,
+    "crop_width": 400,
+    "crop_height": 650,
+    "figure_width": 504,
+    "caption": "Figure 1: A grid spanning 504 of the 1008 point page.",
+    "n_figures": 1,
+    "crop_page_text": "This page states no MediaBox anywhere up the tree, only a CropBox."
+  },
+  "indirect_numbers.pdf": {
+    "uri": "https://example.com/indirect",
+    "rect": [
+      72,
+      696,
+      420,
+      714
+    ],
+    "fill_alpha": 0.85,
+    "stroke_alpha": 0.6,
+    "dest_xyz": {
+      "name": "fig.indirect",
+      "page": 2,
+      "y": 700
+    },
+    "dest_fith": {
+      "name": "sec.indirect",
+      "page": 2,
+      "y": 640
+    },
+    "n_bars": 8,
+    "n_paths": 10,
+    "caption": "Figure 1: Bars painted under an indirect alpha.",
+    "n_figures": 1
+  },
+  "decode_jpeg.pdf": {
+    "gray_rgb": [
+      215,
+      215,
+      215
+    ],
+    "rgb_rgb": [
+      55,
+      225,
+      165
+    ],
+    "width": 64,
+    "height": 48
+  },
+  "form_inherit.pdf": {
+    "word": "INHERIT",
+    "x": 172,
+    "image": {
+      "width": 40,
+      "height": 30,
+      "x_left": 172,
+      "y_bottom": 560
+    },
+    "panel_opacity": 0.5
+  },
+  "render_samples.pdf": {
+    "html_images": 2,
+    "indexed_px": {
+      "0,0": [
+        255,
+        0,
+        0
+      ],
+      "1,0": [
+        0,
+        0,
+        255
+      ]
+    },
+    "gray4_px": {
+      "0,0": [
+        0,
+        0,
+        0
+      ],
+      "1,0": [
+        255,
+        255,
+        255
+      ]
+    }
+  },
+  "no_resources_paths.pdf": {
+    "svgs_per_page": [
+      1,
+      1
+    ],
+    "paths_per_page": 8
+  },
+  "annot_appearance.pdf": {
+    "images": [
+      {
+        "index": 0,
+        "width": 40,
+        "height": 30
+      },
+      {
+        "index": 1,
+        "width": 10,
+        "height": 10
+      },
+      {
+        "index": 2,
+        "width": 12,
+        "height": 12
+      },
+      {
+        "index": 3,
+        "width": 15,
+        "height": 15
+      },
+      {
+        "index": 4,
+        "width": 16,
+        "height": 16
+      }
+    ],
+    "never_reported": [
+      {
+        "width": 11,
+        "height": 11,
+        "why": "in the appearance's resources, never drawn"
+      },
+      {
+        "width": 13,
+        "height": 13,
+        "why": "the state /AS did not select"
+      },
+      {
+        "width": 14,
+        "height": 14,
+        "why": "a hidden (/F bit 2) annotation"
+      }
+    ]
   }
 }

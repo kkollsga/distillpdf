@@ -43,17 +43,7 @@ pub(crate) fn pair_adjacent_figures(f1: &str, f2: &str) -> Option<String> {
 }
 
 pub(crate) fn strip_tags_inline(s: &str) -> String {
-    let mut o = String::new();
-    let mut in_tag = false;
-    for c in s.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => o.push(c),
-            _ => {}
-        }
-    }
-    o
+    crate::textutil::strip_tags(s, crate::textutil::TagBreak::Join)
 }
 
 /// A `<p>` whose content is a fragment of a DISPLAY EQUATION rather than prose: a
@@ -174,23 +164,11 @@ pub(crate) fn merge_adjacent_links(s: &str) -> String {
 /// author list repeated atop every page) shares this key across many pages. Shared by the
 /// element-IR demote pass (`crate::elem_passes`).
 pub(crate) fn demote_key(inner: &str) -> String {
-    let text: String = {
-        let mut s = String::new();
-        let mut intag = false;
-        for c in inner.chars() {
-            match c {
-                '<' => intag = true,
-                '>' => intag = false,
-                _ if !intag => s.push(c),
-                _ => {}
-            }
-        }
-        s
-    };
+    let text = strip_tags_inline(inner);
     let t = text.trim_start();
     // drop a leading "12 ", "3.2.1", "IV.", "A." token
     let t = t.trim_start_matches(|c: char| c.is_alphanumeric() || c == '.');
-    t.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+    crate::textutil::normalize_ws(&t.to_lowercase())
 }
 
 /// Generic single pass over `\0<idx>\0` sentinels: each is replaced by `repl(idx)`'s

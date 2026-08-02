@@ -441,6 +441,153 @@ def gen_small_vector_fig():
     }
 
 
+def gen_indirect_numbers():
+    """Hand-written PDF whose LINK and ALPHA numbers are written as indirect references.
+
+    Same defect class as ``indirect_mediabox.pdf``, at the two sites the page-box fix did not
+    reach. An array or dictionary VALUE may legally be an indirect reference (PDF 32000-1
+    §7.3.10 — only content-stream operands may not be), but the direct-only number reader
+    returns 0.0 for one, so the value is lost silently rather than failing:
+
+      * ``/Rect [72 696 13 0 R 14 0 R]`` on the Link annotation — the clickable rectangle
+        collapsed to ``[72, 696, 0, 0]``, i.e. an inverted zero-area box at the page corner.
+      * ``/XYZ 72 15 0 R 0`` and ``/FitH 16 0 R`` on the two named destinations — the target
+        y became 0.0, so the anchor landed at the page BOTTOM instead of at its section.
+      * ``/ca 10 0 R`` / ``/CA 11 0 R`` on the ExtGState — both alphas read 0.0, which is
+        below the "effectively invisible" threshold, so every bar and axis rule painted
+        under ``/GA gs`` was DROPPED and the figure disappeared from the page entirely.
+
+    The alphas are 0.85/0.6 rather than 1.0 so the recovered values are visible in the
+    rendered SVG (``fill-opacity``/``stroke-opacity``) and cannot be confused with defaults.
+    reportlab writes every one of these directly, so this is assembled by hand."""
+    pdf = os.path.join(OUT, "indirect_numbers.pdf")
+    rect = [72, 696, 420, 714]  # x1 and y1 written indirect
+    xyz_top, fith_top = 700, 640
+    fill_a, stroke_a = 0.85, 0.6
+    bx, by, bw, bh = 90, 430, 300, 170  # the figure's extent
+    bars = []
+    for i in range(8):
+        h = bh * (0.25 + 0.09 * ((i * 5) % 7))
+        bars.append(b"%.1f %.1f %.1f %.1f re f" % (bx + 6 + i * 36, by, 24, h))
+    axes = [b"%.1f %.1f m %.1f %.1f l S" % (bx, by, bx + bw, by),
+            b"%.1f %.1f m %.1f %.1f l S" % (bx, by, bx, by + bh)]
+    c1 = (b"BT /F1 16 Tf 72 730 Td (An Indirect Alpha) Tj ET\n"
+          b"q\n/GA gs\n0.2 0.4 0.8 rg\n0 0 0 RG\n1.2 w\n"
+          + b"\n".join(bars + axes) + b"\nQ\n"
+          b"BT /F1 9 Tf 72 %d Td "
+          b"(Figure 1: Bars painted under an indirect alpha.) Tj ET\n"
+          b"BT /F1 11 Tf 72 380 Td "
+          b"(The link above and the bars beside it both read numbers stored indirectly.) Tj ET"
+          % (by - 20))
+    c2 = (b"BT /F1 14 Tf 72 %d Td (Indirect Destinations) Tj ET\n"
+          b"BT /F1 11 Tf 72 %d Td "
+          b"(This target page is where both named destinations resolve to.) Tj ET"
+          % (xyz_top, fith_top))
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R /Names << /Dests 12 0 R >> >>",
+        2: b"<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 /MediaBox [0 0 612 792] >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Annots [9 0 R] "
+            b"/Resources << /Font << /F1 7 0 R >> /ExtGState << /GA 8 0 R >> >> >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c1), c1),
+        5: (b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R "
+            b"/Resources << /Font << /F1 7 0 R >> >> >>"),
+        6: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c2), c2),
+        7: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        # Both alphas indirect: pre-fix each read 0.0 and hid everything drawn under /GA.
+        8: b"<< /Type /ExtGState /ca 10 0 R /CA 11 0 R >>",
+        # /Rect's x1 and y1 indirect: pre-fix the clickable box collapsed to zero area.
+        9: (b"<< /Type /Annot /Subtype /Link /Rect [%d %d 13 0 R 14 0 R] /Border [0 0 0] "
+            b"/A << /S /URI /URI (https://example.com/indirect) >> >>" % (rect[0], rect[1])),
+        10: b"%.2f" % fill_a,
+        11: b"%.2f" % stroke_a,
+        # Named destinations whose /XYZ top and /FitH top are indirect.
+        12: (b"<< /Names [ (fig.indirect) [5 0 R /XYZ 72 15 0 R 0] "
+             b"(sec.indirect) [5 0 R /FitH 16 0 R] ] >>"),
+        13: b"%d" % rect[2],
+        14: b"%d" % rect[3],
+        15: b"%d" % xyz_top,
+        16: b"%d" % fith_top,
+    }
+    _assemble_pdf(objs, pdf)
+    GT["indirect_numbers.pdf"] = {
+        "uri": "https://example.com/indirect",
+        "rect": rect,
+        "fill_alpha": fill_a,
+        "stroke_alpha": stroke_a,
+        "dest_xyz": {"name": "fig.indirect", "page": 2, "y": xyz_top},
+        "dest_fith": {"name": "sec.indirect", "page": 2, "y": fith_top},
+        "n_bars": len(bars),
+        "n_paths": len(bars) + len(axes),
+        "caption": "Figure 1: Bars painted under an indirect alpha.",
+        "n_figures": 1,
+    }
+
+
+def gen_indirect_mediabox():
+    """Hand-written PDF whose page boxes are written the two ways the box walker used to miss.
+
+    Page 1's ``/MediaBox`` lives on an intermediate ``/Pages`` node AND its width/height
+    entries are INDIRECT REFERENCES (``[0 0 9 0 R 10 0 R]``) — perfectly legal for a
+    dictionary/array value (PDF 32000-1 §7.3.10; only content-stream operands may not be
+    indirect). The vector reader used the direct-only number reader, which returns 0.0 for a
+    reference, so the box measured 0pt wide, failed its sanity filter and fell back to the
+    guessed 612pt letter width — every figure on the page was then sized as the wrong share
+    of it. 1008x612 is deliberately neither 612x792 nor the 842pt of inherited_mediabox.pdf.
+
+    Page 2 hangs off a different ``/Pages`` branch that carries NO box at all, and states
+    only a ``/CropBox``. `/CropBox` is the spec's fallback when `/MediaBox` is absent; the OCR
+    page-size reader looked for `/MediaBox` alone and reported US-Letter for such a page,
+    which mis-scales every OCR bbox on it.
+
+    reportlab writes a direct per-page /MediaBox always, so this is assembled by hand."""
+    pdf = os.path.join(OUT, "indirect_mediabox.pdf")
+    page_w, page_h = 1008, 612           # page 1, via INDIRECT array entries
+    crop_w, crop_h = 400, 650            # page 2, via /CropBox only
+    fx, fy, fw, fh = 100, 250, 504, 200  # the figure spans exactly half of 1008pt
+    lines = []
+    for i in range(8):
+        yy = fy + fh * i / 7.0
+        lines.append(b"%.1f %.1f m %.1f %.1f l S" % (fx, yy, fx + fw, yy))
+    for i in range(8):
+        xx = fx + fw * i / 7.0
+        lines.append(b"%.1f %.1f m %.1f %.1f l S" % (xx, fy, xx, fy + fh))
+    c1 = (b"BT /F1 16 Tf 100 540 Td (An Indirect MediaBox) Tj ET\n"
+          b"0.8 w\n" + b"\n".join(lines) + b"\n"
+          b"BT /F1 9 Tf 100 %d Td "
+          b"(Figure 1: A grid spanning 504 of the 1008 point page.) Tj ET" % (fy - 18))
+    c2 = (b"BT /F1 14 Tf 40 600 Td (A CropBox Only Page) Tj ET\n"
+          b"BT /F1 10 Tf 40 570 Td "
+          b"(This page states no MediaBox anywhere up the tree, only a CropBox.) Tj ET")
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        # The root states NO box, so page 2 has nothing to inherit.
+        2: b"<< /Type /Pages /Kids [3 0 R 7 0 R] /Count 2 >>",
+        # Intermediate node: inheritable /MediaBox whose extents are indirect numbers.
+        3: (b"<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 "
+            b"/MediaBox [0 0 9 0 R 10 0 R] >>"),
+        4: (b"<< /Type /Page /Parent 3 0 R /Resources << /Font << /F1 6 0 R >> >> "
+            b"/Contents 5 0 R >>"),
+        5: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c1), c1),
+        6: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        7: (b"<< /Type /Page /Parent 2 0 R /CropBox [0 0 %d %d] "
+            b"/Resources << /Font << /F1 6 0 R >> >> /Contents 8 0 R >>" % (crop_w, crop_h)),
+        8: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c2), c2),
+        9: b"%d" % page_w,   # the indirect width …
+        10: b"%d" % page_h,  # … and height
+    }
+    _assemble_pdf(objs, pdf)
+    GT["indirect_mediabox.pdf"] = {
+        "page_width": page_w,
+        "page_height": page_h,
+        "crop_width": crop_w,
+        "crop_height": crop_h,
+        "figure_width": fw,
+        "caption": "Figure 1: A grid spanning 504 of the 1008 point page.",
+        "n_figures": 1,
+        "crop_page_text": "This page states no MediaBox anywhere up the tree, only a CropBox.",
+    }
+
+
 def gen_xobject_figure():
     """Regression lock for the Form-XObject text recursion (commit 864694e). The WHOLE page
     — body prose AND a captioned diagram with internal node labels — is drawn inside ONE Form
@@ -703,6 +850,109 @@ def gen_colorspace_images():
     }
 
 
+def gen_image_order():
+    """Six standalone rasters on ONE horizontal row — the shape that exposed
+    nondeterministic render output.
+
+    ``img::cluster`` groups touching tiles with union-find and used to return the groups
+    out of a ``HashMap``, whose iteration order ``RandomState`` seeds per map INSTANCE —
+    so two renders in the same process saw the page's images in different orders. Every
+    downstream step preserves that order (the emitter's raster/vector absorption is
+    first-match-wins, and images sharing a y_top get identical sort boxes), so the HTML
+    itself differed run to run.
+
+    Six images, each its own cluster (a >2pt gap — ``cluster``'s tolerance — separates
+    them), all sharing the SAME top edge so nothing downstream can re-sort them, and each
+    a different flat colour so a swapped pair is visible in the emitted data URIs. Six
+    gives 720 possible orderings: a determinism assertion over ~25 renders effectively
+    cannot pass by luck."""
+    pdf = os.path.join(OUT, "image_order.pdf")
+    colours = [(220, 30, 40), (30, 160, 60), (40, 70, 210), (230, 170, 20), (150, 40, 190), (20, 180, 190)]
+    # Each image is 2x2 flat pixels; placed 60x60 pt (over MIN_DIM) with a 16 pt gap.
+    xobjs, objs = [], {}
+    content = []
+    for i, rgb in enumerate(colours):
+        num = 5 + i
+        samples = bytes(rgb) * 4
+        objs[num] = _flate_image(num, 2, 2, b"/DeviceRGB", 8, samples)
+        xobjs.append(b"/Im%d %d 0 R" % (i, num))
+        content.append(b"q 60 0 0 60 %d 600 cm /Im%d Do Q" % (72 + i * 76, i))
+    text = (b"BT /F1 12 Tf 72 700 Td (Six rasters share one row and one top edge.) Tj ET")
+    stream = text + b"\n" + b"\n".join(content)
+    objs.update({
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 11 0 R >> /XObject << " + b" ".join(xobjs) + b" >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+        11: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    })
+    _assemble_pdf(objs, pdf)
+    GT["image_order.pdf"] = {"images": len(colours), "renders_identical": 25}
+
+
+def gen_paint_order():
+    """The SAME raster + panel, painted in both orders — a controlled A/B for the z-order
+    of a composited figure.
+
+    ``composite_svg`` used to emit every raster first and all the vector ink after it,
+    which is correct only for streams that happen to paint in that order. Real figures
+    interleave, and when a figure paints an OPAQUE panel over a raster the grouped output
+    covered the raster completely: the ``<image>`` was in the SVG and contributed nothing
+    a reader could see.
+
+    Two figures, geometrically identical, differing only in the order of two operators:
+
+      TOP    (y 520-700): raster, then the opaque grey panel over it → the PANEL wins.
+      BOTTOM (y 120-300): the opaque grey panel, then the raster over it → the RASTER wins.
+
+    Each figure is a stroked outer frame + 5 tick marks + the panel (7 paths, clearing
+    ``MIN_PATHS``) spanning 300x180 pt, with the 160x120 pt raster wholly inside it — so
+    the raster is absorbed INTO the vector figure's ``<svg>`` (``overlap/imarea`` = 1.0,
+    ``overlap/varea`` = 0.36, i.e. the vector is the base) rather than the other way round.
+    The panel is mid grey (#808080), not near-white, so ``build_svg``'s plot-background
+    drop leaves it in place — the occlusion under test is real ink, not a viewBox artifact.
+    The 220 pt gap between the two bands is far over ``BAND_GAP``, so they cluster apart."""
+    pdf = os.path.join(OUT, "paint_order.pdf")
+    # 2x2 flat crimson raster — unmistakable against the grey panel if it survives.
+    img = _flate_image(5, 2, 2, b"/DeviceRGB", 8, bytes((220, 30, 40)) * 4)
+
+    def figure(y0, raster_first):
+        """One 300x180 figure with its origin at (72, y0); `raster_first` picks the order."""
+        raster = b"q 160 0 0 120 %d %d cm /Im0 Do Q" % (140, y0 + 30)
+        # Opaque mid-grey panel covering the raster, and only it.
+        panel = b"q 0.5 0.5 0.5 rg 130 %d 180 140 re f Q" % (y0 + 20)
+        frame = b"q 0 0 0 RG 1 w 72 %d 300 180 re S Q" % y0
+        ticks = b"\n".join(
+            b"q 0 0 0 RG 1 w %d %d m %d %d l S Q" % (72 + 20 * i, y0, 72 + 20 * i, y0 + 12)
+            for i in range(1, 6)
+        )
+        ink = [raster, panel] if raster_first else [panel, raster]
+        return b"\n".join([frame, ticks] + ink)
+
+    stream = b"\n".join([
+        b"BT /F1 12 Tf 72 720 Td (Paint order: the later operator must win.) Tj ET",
+        figure(520, raster_first=True),
+        figure(120, raster_first=False),
+    ])
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 6 0 R >> /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+        5: img,
+        6: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["paint_order.pdf"] = {
+        "figures": 2,
+        # The figure whose raster is painted FIRST must show the panel on top of it, and
+        # the one whose raster is painted LAST must show the raster on top of the panel.
+        "panel_fill": "#808080",
+    }
+
+
 def gen_cmyk_jpeg():
     """A DeviceCMYK JPEG — the one image kind whose bytes decode to a *silently wrong
     colour* rather than failing.
@@ -750,6 +1000,192 @@ def gen_cmyk_jpeg():
     }
 
 
+def gen_no_resources_paths():
+    """A page that draws a real vector figure and carries NO ``/Resources`` at all.
+
+    The path operators (``m``/``l``/``c``/``re`` and the ``f``/``S`` that paint them) name
+    no resource: ``/Resources`` is only needed to resolve an ``/ExtGState`` alpha or a form
+    ``Do``. ``vector::positioned_vectors_capped`` nevertheless returned empty the moment the
+    page's whole resource chain was empty, so a resource-less page lost all of its direct
+    path ink and emitted no ``<svg>``.
+
+    The fixture is a controlled A/B in one file — identical content streams, the sole
+    difference an empty ``/Resources << >>`` on page 2's dictionary (nothing is inheritable
+    from the ``/Pages`` node, which carries none either):
+
+      page 1  no ``/Resources`` key anywhere in its tree  -> used to emit 0 ``<svg>``;
+      page 2  ``/Resources << >>``                        -> always emitted 1.
+
+    Both must now emit exactly one. Eight filled bars clear the strong-figure bar
+    (``MIN_PATHS`` 6, ``MIN_W`` 72, ``MIN_H`` 54) with room to spare, so a clustering
+    threshold cannot be mistaken for the guard. reportlab always writes a ``/Resources``
+    dictionary, so this is hand-assembled."""
+    pdf = os.path.join(OUT, "no_resources_paths.pdf")
+    bars = [b"0.2 0.4 0.8 rg %d 400 20 %d re f" % (120 + i * 28, 40 + (i % 4) * 30) for i in range(8)]
+    content = b"\n".join(bars)
+    stream = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content)
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] >>",
+        3: b"<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>",
+        4: b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R /Resources << >> >>",
+        5: stream,
+        6: stream,
+    }
+    _assemble_pdf(objs, pdf)
+    GT["no_resources_paths.pdf"] = {"svgs_per_page": [1, 1], "paths_per_page": 8}
+
+
+def gen_render_samples():
+    """Sampled rasters the RENDER path used to get wrong, each one *drawn* on the page so
+    ``to_html`` has to decode it (``extract_images()`` already handled all of them).
+
+    The render path carried its own, weaker sample decoder: 8 bits per component only, and
+    a channel count *guessed* from ``len(samples) / (w*h)`` whenever the colour space was
+    not a device name or ``ICCBased``. Two consequences, one image each:
+
+      ``/ImIdx8``   ``[/Indexed /DeviceRGB 1 <ff0000 0000ff>]`` at 8 bpc — one index byte
+                    per pixel, so the guess said "1 channel, grayscale" and the palette
+                    INDICES were rendered as gray levels: authored red/blue came out
+                    ``(0,0,0)`` / ``(1,1,1)``, i.e. a black box.
+      ``/ImGray4``  4-bpc ``/DeviceGray`` — refused outright by the ``bpc == 8`` gate, so
+                    the image was silently absent from the HTML.
+
+    Both are placed 80x40 pt (over ``img::MIN_DIM``) and 20 pt apart, so each is its own
+    cluster and emits its own ``<img>``. Hand-assembled: reportlab flattens every image it
+    embeds to 8-bpc DeviceRGB/DeviceGray, which is exactly the case that already worked."""
+    pdf = os.path.join(OUT, "render_samples.pdf")
+    palette = bytes((255, 0, 0, 0, 0, 255))
+    content = (b"q 80 0 0 40 72 700 cm /ImIdx8 Do Q\n"
+               b"q 80 0 0 40 72 640 cm /ImGray4 Do Q")
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/XObject << /ImIdx8 5 0 R /ImGray4 6 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        # 2x1, one index byte per pixel: palette entry 0 (red) then 1 (blue).
+        5: _flate_image(5, 2, 1, b"[/Indexed /DeviceRGB 1 <%s>]" % palette.hex().encode(), 8, bytes((0, 1))),
+        # 2x1 @ 4bpc: both pixels packed into one byte -> black, then full white.
+        6: _flate_image(6, 2, 1, b"/DeviceGray", 4, bytes((0x0F,))),
+    }
+    _assemble_pdf(objs, pdf)
+    GT["render_samples.pdf"] = {
+        "html_images": 2,
+        "indexed_px": {"0,0": [255, 0, 0], "1,0": [0, 0, 255]},
+        "gray4_px": {"0,0": [0, 0, 0], "1,0": [255, 255, 255]},
+    }
+
+
+def gen_decode_jpeg():
+    """Gray and RGB JPEGs carrying an INVERTING ``/Decode`` — the polarity a JPEG file
+    cannot express, and the one the render path used to apply to CMYK images only.
+
+    ``img.rs`` passed a 1- or 3-component ``DCTDecode`` stream straight through to the
+    ``<img>`` data URI and applied ``/Decode`` on its CMYK branch alone, so both images
+    below rendered as the NEGATIVE of the authored colour: the light-gray band came out
+    dark, the pink band came out mint. The RGB one's ``/Decode`` is written as an
+    **indirect array**, which the render path's own reader could not follow either
+    (it saw a bare ``Reference`` and answered "no inversion").
+
+    Hand-assembled: reportlab writes no ``/Decode`` array, and PIL cannot be made to emit
+    one. The JPEGs are flat single-colour at quality 100 with no chroma subsampling, so
+    the expected pixels survive the codec within a couple of levels."""
+    import io
+
+    pdf = os.path.join(OUT, "decode_jpeg.pdf")
+
+    def jpeg_bytes(im):
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=100, subsampling=0)
+        return buf.getvalue()
+
+    gray = jpeg_bytes(Image.new("L", (64, 48), 40))
+    rgb = jpeg_bytes(Image.new("RGB", (64, 48), (200, 30, 90)))
+    content = (b"q 128 0 0 96 72 600 cm /ImGray Do Q\n"
+               b"q 128 0 0 96 72 460 cm /ImRgb Do Q")
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/XObject << /ImGray 5 0 R /ImRgb 6 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        # Direct /Decode array.
+        5: (b"<< /Type /XObject /Subtype /Image /Width 64 /Height 48 /ColorSpace /DeviceGray "
+            b"/BitsPerComponent 8 /Filter /DCTDecode /Decode [1 0] /Length %d >>\nstream\n%s\nendstream"
+            % (len(gray), gray)),
+        # INDIRECT /Decode array — the reference the render path could not follow.
+        6: (b"<< /Type /XObject /Subtype /Image /Width 64 /Height 48 /ColorSpace /DeviceRGB "
+            b"/BitsPerComponent 8 /Filter /DCTDecode /Decode 7 0 R /Length %d >>\nstream\n%s\nendstream"
+            % (len(rgb), rgb)),
+        7: b"[1 0 1 0 1 0]",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["decode_jpeg.pdf"] = {
+        # authored = 255 - raw sample, because /Decode inverts every channel
+        "gray_rgb": [215, 215, 215],
+        "rgb_rgb": [55, 225, 165],
+        "width": 64,
+        "height": 48,
+    }
+
+
+def gen_form_inherit():
+    """Resources split ACROSS the page tree, plus an INDIRECT ``/Matrix`` — the two
+    recoveries the shared form-descent normalization brings.
+
+    The page carries no ``/Resources`` of its own. Its parent defines the form ``/F`` it
+    draws; its *grandparent* defines the image ``/Im`` that form paints and the
+    ``/ExtGState /GA`` the form's rectangle is painted through. The strict reading of
+    §7.7.3.4 takes the NEAREST ancestor's dictionary whole, so the walkers saw only the
+    parent's: the image resolved to nothing and vanished, and the alpha resolved to
+    nothing and the panel painted fully opaque. Folding the whole chain (nearest still
+    wins every name it defines) recovers both.
+
+    The form's ``/Matrix`` is written as an indirect reference to ``[1 0 0 1 100 0]``.
+    Read directly — ``as_array()`` on a ``Reference`` fails — it degraded to the identity,
+    so everything the form paints landed 100 pt to the LEFT of where the page puts it.
+    Every element below therefore has a ground-truth x of 172 (72 from the page's ``cm``
+    plus 100 from the matrix), which is 72 when the matrix is missed.
+
+    Hand-assembled: reportlab writes a page's resources onto the page."""
+    pdf = os.path.join(OUT, "form_inherit.pdf")
+    page_content = b"q 1 0 0 1 72 500 cm /F Do Q"
+    form_content = (b"q /GA gs 0 0 1 rg 0 0 90 50 re f Q\n"
+                    b"q 120 0 0 90 0 60 cm /Im Do Q\n"
+                    b"BT /F1 12 Tf 0 160 Td (INHERIT) Tj ET")
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        # Grandparent: owns the image and the ExtGState.
+        2: (b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] "
+            b"/Resources 6 0 R >>"),
+        # Parent: owns the form. This is the NEAREST dictionary the page inherits.
+        3: b"<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 /Resources 7 0 R >>",
+        4: b"<< /Type /Page /Parent 3 0 R /Contents 5 0 R >>",  # no /Resources at all
+        5: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(page_content), page_content),
+        6: b"<< /XObject << /Im 8 0 R >> /ExtGState << /GA 11 0 R >> >>",
+        7: b"<< /XObject << /F 9 0 R >> >>",
+        # Flate-compressed on purpose: an UNFILTERED sample block is a separate,
+        # already-known render-path gap (`img::decode_rgb` reads samples with
+        # `decompressed_content()`, which errors without a `/Filter`), and this fixture is
+        # about inheritance and the matrix, not about that.
+        8: _flate_image(8, 40, 30, b"/DeviceRGB", 8, bytes(0x20 + ((i * 7) % 0x5F) for i in range(40 * 30 * 3))),
+        9: (b"<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 300 300] "
+            b"/Matrix 10 0 R /Resources << /Font << /F1 12 0 R >> >> "
+            b"/Length %d >>\nstream\n%s\nendstream" % (len(form_content), form_content)),
+        10: b"[1 0 0 1 100 0]",
+        11: b"<< /Type /ExtGState /ca 0.5 /CA 0.5 >>",
+        12: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["form_inherit.pdf"] = {
+        "word": "INHERIT",
+        "x": 172,          # 72 (page cm) + 100 (indirect /Matrix); 72 if the matrix is lost
+        "image": {"width": 40, "height": 30, "x_left": 172, "y_bottom": 560},
+        "panel_opacity": 0.5,
+    }
+
+
 def gen_form_font():
     """Hand-written PDF where the page's own ``/Font`` dictionary is EMPTY and the only
     font lives in a Form XObject's own ``/Resources`` — the ``/TPL*`` template layout an
@@ -783,6 +1219,154 @@ def gen_form_font():
         "encoding": "WinAnsiEncoding",
         "n_font_rows": 1,
         "text": "Text drawn inside a form XObject.",
+    }
+
+
+def gen_unfiltered_form():
+    """Hand-written PDF whose Form XObject stream carries **no ``/Filter``** — the shape two
+    of the four content walkers used to decode as empty.
+
+    lopdf's ``decompressed_content()`` returns an *error* for a stream with no ``/Filter``
+    key, so ``…unwrap_or_default()`` (what ``vector.rs`` and ``text.rs`` did on the form
+    descent) yielded ZERO bytes and every glyph and path inside such a form vanished. The
+    extract/render walkers already carried the raw-bytes fallback, so this was a silent
+    split: ``extract_images`` saw the form, ``to_html``'s text and vector paths did not.
+
+    reportlab always Flate-compresses, so the file is assembled by hand. The form paints
+    five filled bars and one text label; the page adds a title, a lead paragraph and the
+    caption that promotes the bars to a figure. Everything inside the form must survive."""
+    pdf = os.path.join(OUT, "unfiltered_form.pdf")
+    bars = [110, 150, 90, 170, 130]
+    form_ops = [b"0.20 0.40 0.75 rg"]
+    for i, h in enumerate(bars):
+        form_ops.append(b"%d 20 40 %d re f" % (20 + i * 55, h))
+    form_ops.append(b"BT /FF1 11 Tf 20 205 Td (Unfiltered form ink) Tj ET")
+    form_content = b"\n".join(form_ops)
+    page_content = (
+        b"BT /F1 19 Tf 72 712 Td (A Form Stream With No Filter) Tj ET\n"
+        b"BT /F1 10.5 Tf 72 670 Td "
+        b"(The panel below is painted entirely inside a form XObject whose stream) Tj "
+        b"0 -14 Td (carries no filter at all, so its bytes are stored verbatim.) Tj ET\n"
+        b"q 1 0 0 1 100 400 cm /UF Do Q\n"
+        b"BT /F1 9 Tf 100 382 Td "
+        b"(Figure 1: Five bars painted by a form stream carrying no filter.) Tj ET\n"
+        b"BT /F1 10.5 Tf 72 330 Td "
+        b"(The narrative resumes after the figure so the page reads as a document.) Tj ET"
+    )
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 6 0 R >> /XObject << /UF 5 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(page_content), page_content),
+        # NOTE: no /Filter here — that is the whole point of the fixture.
+        5: (b"<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 300 230] "
+            b"/Resources << /Font << /FF1 6 0 R >> >> /Length %d >>\nstream\n%s\nendstream"
+            % (len(form_content), form_content)),
+        6: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["unfiltered_form.pdf"] = {
+        "form_text": "Unfiltered form ink",
+        "n_bars": len(bars),
+        "caption": "Figure 1: Five bars painted by a form stream carrying no filter.",
+        "title": "A Form Stream With No Filter",
+    }
+
+
+def gen_annot_appearance():
+    """Hand-written PDF whose images live ONLY in annotation appearance streams.
+
+    ``/Annots -> /AP /N`` is a content stream a viewer paints onto the page, and it is
+    reachable neither from the page's content stream nor from its ``/Resources``. Nothing
+    used to walk it, so an image inside a stamp's or a widget's appearance was reported by
+    nobody. A corpus preprint has exactly this: a 10x10 raster drawn by a ``/Stamp``
+    annotation's appearance and invisible to ``extract_images()``.
+
+    The page's own content paints ONE image (``/ImPage``) so the ordering rule stays
+    checkable, then four annotations exercise the selection rules:
+
+      1. ``/Stamp``           -> ``/AP /N`` is the stream itself; its form draws ``/ImStamp``
+         from its own ``/Resources`` (and lists ``/ImNever``, which it does not draw).
+      2. ``/Widget``          -> ``/AP /N`` is a STATE dictionary and ``/AS /On`` selects
+         one: only ``/ImOn`` counts, never ``/ImOff``.
+      3. ``/Stamp`` ``/F 2``  -> Hidden: contributes nothing at all.
+      4. ``/Widget``          -> a state dictionary with NO ``/AS``: no state is current, so
+         a collector takes every state (``/ImS1`` and ``/ImS2``).
+
+    reportlab has no way to attach an appearance stream carrying an image, so this is
+    assembled by hand."""
+    pdf = os.path.join(OUT, "annot_appearance.pdf")
+    page_content = (
+        b"BT /F1 19 Tf 72 712 Td (Images Inside Annotation Appearances) Tj ET\n"
+        b"q 120 0 0 90 72 560 cm /ImPage Do Q\n"
+        b"BT /F1 10.5 Tf 72 520 Td "
+        b"(The rasters below this line exist only inside annotation appearance streams.) Tj ET"
+    )
+    stamp_ap = b"q 40 0 0 40 4 4 cm /ImStamp Do Q"
+    on_ap = b"q 8 0 0 8 0 0 cm /ImOn Do Q"
+    off_ap = b"q 8 0 0 8 0 0 cm /ImOff Do Q"
+    hidden_ap = b"q 8 0 0 8 0 0 cm /ImHidden Do Q"
+    s1_ap = b"q 8 0 0 8 0 0 cm /ImS1 Do Q"
+    s2_ap = b"q 8 0 0 8 0 0 cm /ImS2 Do Q"
+
+    def _form(num, res, content):
+        return (b"<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 48 48] "
+                b"/Resources %s /Length %d >>\nstream\n%s\nendstream"
+                % (res, len(content), content))
+
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 6 0 R >> /XObject << /ImPage 5 0 R >> >> /Contents 4 0 R "
+            b"/Annots [10 0 R 12 0 R 16 0 R 18 0 R] >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(page_content), page_content),
+        5: _raw_rgb_image(40, 30),    # painted by the page itself -> index 0
+        6: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        # 1. a /Stamp whose appearance draws one image and lists another it never draws
+        7: _raw_rgb_image(10, 10),    # /ImStamp  -> reported
+        8: _raw_rgb_image(11, 11),    # /ImNever  -> in the appearance's resources, undrawn
+        9: _form(9, b"<< /XObject << /ImStamp 7 0 R /ImNever 8 0 R >> >>", stamp_ap),
+        10: (b"<< /Type /Annot /Subtype /Stamp /Rect [72 420 120 468] /F 4 "
+             b"/AP << /N 9 0 R >> >>"),
+        # 2. a /Widget with a state dictionary and /AS selecting one state
+        11: _raw_rgb_image(12, 12),   # /ImOn   -> reported (the selected state)
+        13: _raw_rgb_image(13, 13),   # /ImOff  -> the unselected state
+        14: _form(14, b"<< /XObject << /ImOn 11 0 R >> >>", on_ap),
+        15: _form(15, b"<< /XObject << /ImOff 13 0 R >> >>", off_ap),
+        12: (b"<< /Type /Annot /Subtype /Widget /Rect [140 420 156 436] /F 4 /AS /On "
+             b"/AP << /N << /On 14 0 R /Off 15 0 R >> >> >>"),
+        # 3. a HIDDEN annotation (/F bit 2): nothing it references is on the page
+        19: _raw_rgb_image(14, 14),   # /ImHidden -> must NEVER be reported
+        20: _form(20, b"<< /XObject << /ImHidden 19 0 R >> >>", hidden_ap),
+        16: (b"<< /Type /Annot /Subtype /Stamp /Rect [180 420 196 436] /F 2 "
+             b"/AP << /N 20 0 R >> >>"),
+        # 4. a state dictionary with NO /AS: no state is current -> every state counts
+        21: _raw_rgb_image(15, 15),   # /ImS1 -> reported
+        22: _raw_rgb_image(16, 16),   # /ImS2 -> reported
+        23: _form(23, b"<< /XObject << /ImS1 21 0 R >> >>", s1_ap),
+        24: _form(24, b"<< /XObject << /ImS2 22 0 R >> >>", s2_ap),
+        18: (b"<< /Type /Annot /Subtype /Widget /Rect [220 420 236 436] /F 4 "
+             b"/AP << /N << /S1 23 0 R /S2 24 0 R >> >> >>"),
+        # 17 is unused: /_assemble_pdf needs contiguous object numbers.
+        17: b"<< /Type /Null >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["annot_appearance.pdf"] = {
+        # (page, index) order: the page's own content first, appearances appended after.
+        "images": [
+            {"index": 0, "width": 40, "height": 30},   # painted by the page
+            {"index": 1, "width": 10, "height": 10},   # /Stamp appearance
+            {"index": 2, "width": 12, "height": 12},   # /Widget, /AS-selected state
+            {"index": 3, "width": 15, "height": 15},   # no /AS: first state
+            {"index": 4, "width": 16, "height": 16},   # no /AS: second state
+        ],
+        "never_reported": [
+            {"width": 11, "height": 11, "why": "in the appearance's resources, never drawn"},
+            {"width": 13, "height": 13, "why": "the state /AS did not select"},
+            {"width": 14, "height": 14, "why": "a hidden (/F bit 2) annotation"},
+        ],
     }
 
 
@@ -1134,8 +1718,11 @@ def gen_form_bomb():
 
 
 # ------------------------------------------------------------------------------ links
-def _assemble_pdf(objs, path):
-    """Write a minimal PDF from {objnum: bytes} (numbers contiguous from 1)."""
+def _assemble_pdf(objs, path, info=None):
+    """Write a minimal PDF from {objnum: bytes} (numbers contiguous from 1).
+
+    ``info`` is an optional object number to reference as the trailer's ``/Info``
+    dictionary (the document Info dict is a trailer entry, not a catalog one)."""
     body = bytearray(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n")
     offsets = {}
     for num in sorted(objs):
@@ -1146,7 +1733,9 @@ def _assemble_pdf(objs, path):
     body += b"xref\n0 %d\n0000000000 65535 f \n" % n
     for num in range(1, n):
         body += b"%010d 00000 n \n" % offsets[num]
-    body += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (n, xref_off)
+    info_ref = b" /Info %d 0 R" % info if info is not None else b""
+    body += (b"trailer\n<< /Size %d /Root 1 0 R%s >>\nstartxref\n%d\n%%%%EOF\n"
+             % (n, info_ref, xref_off))
     with open(path, "wb") as f:
         f.write(bytes(body))
 
@@ -1353,13 +1942,27 @@ def gen_links():
 # --------------------------------------------------------------------------- pagelabels
 def gen_pagelabels():
     """A hand-written PDF carrying a real ``/PageLabels`` number tree (reportlab cannot emit
-    one). Four pages: front matter labelled lowercase-roman ``i, ii`` (style ``/r``), then the
-    body labelled arabic ``1, 2`` (style ``/D``) restarting at 1. The model build's
-    ``page_labels`` reader fills ``pages[n].labels.pdf`` from this, so distill → ``read --pages
-    ii`` / ``find --pages 1`` resolve a LABEL to its physical page (the Wave-3 gap: no owned
-    fixture carried /PageLabels). Each page has one short heading + body line so it yields real
-    sections/blocks to read and find."""
+    one). Six pages: front matter labelled lowercase-roman ``i, ii`` (style ``/r``), then the
+    body labelled arabic ``1, 2`` (style ``/D``) restarting at 1, then a back-matter range
+    whose ``/P`` PREFIX is a UTF-16BE (BOM'd) string → ``Apêndice 1, Apêndice 2``. The model
+    build's ``page_labels`` reader fills ``pages[n].labels.pdf`` from this, so distill →
+    ``read --pages ii`` / ``find --pages 1`` resolve a LABEL to its physical page (the Wave-3
+    gap: no owned fixture carried /PageLabels). Each page has one short heading + body line so
+    it yields real sections/blocks to read and find.
+
+    The UTF-16BE prefix is the second half of the "three text-string decoders, one correct"
+    defect: the prefix reader used a bare ``from_utf8_lossy`` with NO BOM branch, so a
+    UTF-16BE prefix decoded to NUL-interleaved replacement-character garbage and every label
+    in the range came out unusable.
+
+    The trailer's ``/Info /Producer`` is written in PDFDocEncoding with high bytes (0x92 ™,
+    0x8D/0x8E curly double quotes) — the same defect's first half, in the OCR detector's
+    producer reader, which replaced each of those bytes with U+FFFD."""
     pdf = os.path.join(OUT, "pagelabels.pdf")
+    prefix = "Apêndice "
+    # PDFDocEncoding (PDF 32000-1 Annex D.2), NOT cp1252 and NOT UTF-8.
+    producer_bytes = b"distillPDF\x92 \x8Dfixture\x8E writer"
+    producer = "distillPDF™ “fixture” writer"
 
     def page_content(head, body):
         return (b"BT /F1 16 Tf 72 720 Td (%s) Tj ET\n"
@@ -1370,28 +1973,37 @@ def gen_pagelabels():
         (b"Acknowledgements", b"Acknowledgements continue the front matter on roman page ii."),
         (b"Introduction", b"The introduction opens the body on arabic page 1 of the work."),
         (b"Methods", b"The methods section is the body content on arabic page 2 here."),
+        (b"Appendix Tables", b"The first appendix page carries a UTF-16BE label prefix here."),
+        (b"Appendix Notes", b"The second appendix page continues the prefixed label range."),
     ]
-    # Object plan: 1 catalog, 2 pages-tree, 3 font, 4..7 page dicts, 8..11 content streams,
-    # 12 PageLabels dict. Page kids 4,5,6,7.
+    # Object plan: 1 catalog, 2 pages-tree, 3 font, then (page, content) pairs at 4..15,
+    # 16 PageLabels dict, 17 Info dict.
+    page_nums = [4 + 2 * i for i in range(len(pages))]
     objs = {
-        1: b"<< /Type /Catalog /Pages 2 0 R /PageLabels 12 0 R >>",
-        2: b"<< /Type /Pages /Kids [4 0 R 5 0 R 6 0 R 7 0 R] /Count 4 >>",
+        1: b"<< /Type /Catalog /Pages 2 0 R /PageLabels 16 0 R >>",
+        2: (b"<< /Type /Pages /Kids [%s] /Count %d >>"
+            % (b" ".join(b"%d 0 R" % n for n in page_nums), len(pages))),
         3: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-        12: (b"<< /Nums [ 0 << /S /r >> 2 << /S /D /St 1 >> ] >>"),
+        16: (b"<< /Nums [ 0 << /S /r >> 2 << /S /D /St 1 >> "
+             b"4 << /S /D /St 1 /P %s >> ] >>" % _utf16be_hex(prefix)),
+        17: b"<< /Producer (%s) >>" % producer_bytes,
     }
     for i, (head, body) in enumerate(pages):
-        page_num = 4 + i
-        content_num = 8 + i
+        page_num, content_num = page_nums[i], page_nums[i] + 1
         objs[page_num] = (
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
             b"/Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>" % content_num)
         c = page_content(head, body)
         objs[content_num] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c), c)
-    _assemble_pdf(objs, pdf)
+    _assemble_pdf(objs, pdf, info=17)
     GT["pagelabels.pdf"] = {
-        "labels": {1: "i", 2: "ii", 3: "1", 4: "2"},  # physical page -> /PageLabels label
+        # physical page -> /PageLabels label
+        "labels": {1: "i", 2: "ii", 3: "1", 4: "2", 5: prefix + "1", 6: prefix + "2"},
         "roman_pages": ["i", "ii"],
         "arabic_pages": ["1", "2"],
+        "utf16_prefix": prefix,
+        "utf16_pages": [prefix + "1", prefix + "2"],
+        "producer": producer,
         "page_ii_text": "front matter on roman page ii",
         "page_arabic1_text": "opens the body on arabic page 1",
     }
@@ -1838,12 +2450,22 @@ def main():
     gen_small_vector_fig()
     gen_dense_vector()
     gen_inherited_mediabox()
+    gen_indirect_mediabox()
+    gen_indirect_numbers()
     gen_xobject_figure()
     gen_form_image()
     gen_undrawn_image()
     gen_colorspace_images()
+    gen_image_order()
+    gen_paint_order()
+    gen_no_resources_paths()
+    gen_render_samples()
     gen_cmyk_jpeg()
+    gen_decode_jpeg()
+    gen_form_inherit()
     gen_form_font()
+    gen_unfiltered_form()
+    gen_annot_appearance()
     gen_no_spurious_figs()
     gen_links()
     gen_pagelabels()

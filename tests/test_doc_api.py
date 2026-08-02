@@ -343,6 +343,19 @@ def test_pagelabels_fixture_distills_with_labels(tmp_path):
     assert doc.page_label(4) == "2"
 
 
+def test_pagelabels_utf16be_prefix_decodes(tmp_path):
+    """A ``/P`` label prefix written UTF-16BE (BOM'd) — the shape any producer emits for a
+    non-ASCII prefix — must decode as text. The reader was a bare ``from_utf8_lossy`` with no
+    BOM branch, so the whole range came back as NUL-interleaved replacement characters."""
+    g = GT["pagelabels.pdf"]
+    doc = distillpdf.load(_dpdf(PAGELABELS, tmp_path))
+    assert doc.page_label(5) == g["utf16_pages"][0]
+    assert doc.page_label(6) == g["utf16_pages"][1]
+    for n in range(1, 7):
+        lab = doc.page_label(n)
+        assert "�" not in lab and "\x00" not in lab, f"label {lab!r} carries decode debris"
+
+
 def test_pagelabels_resolve_label_to_physical_page(tmp_path):
     """A LABEL token resolves to its physical page — both via Doc and the CLI ``read --pages``.
     Roman labels are unambiguous (a bare integer is read as a physical page first)."""

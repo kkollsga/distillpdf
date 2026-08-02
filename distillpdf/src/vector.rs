@@ -10,46 +10,11 @@
 //! Shadings / patterns / soft masks are out of scope here (skipped); text inside
 //! a figure stays in the normal text flow (it is extracted as spans elsewhere).
 
+use crate::geom::{Mat, Rect};
+use crate::pdfobj::{deref, num, num_deref};
+use crate::walker::{descend_form, overlay_xobjects, page_resource_chain, Descend, PaintSeq, ScopePolicy, XMap};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
-
-#[derive(Clone, Copy)]
-struct M {
-    a: f32,
-    b: f32,
-    c: f32,
-    d: f32,
-    e: f32,
-    f: f32,
-}
-impl M {
-    const ID: M = M { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
-    fn mul(self, r: M) -> M {
-        M {
-            a: self.a * r.a + self.b * r.c,
-            b: self.a * r.b + self.b * r.d,
-            c: self.c * r.a + self.d * r.c,
-            d: self.c * r.b + self.d * r.d,
-            e: self.e * r.a + self.f * r.c + r.e,
-            f: self.e * r.b + self.f * r.d + r.f,
-        }
-    }
-    fn apply(self, x: f32, y: f32) -> (f32, f32) {
-        (x * self.a + y * self.c + self.e, x * self.b + y * self.d + self.f)
-    }
-    /// Average linear scale factor (for converting line widths to device space).
-    fn scale(self) -> f32 {
-        (self.a * self.d - self.b * self.c).abs().sqrt()
-    }
-}
-
-fn num(o: &Object) -> f32 {
-    match o {
-        Object::Integer(i) => *i as f32,
-        Object::Real(r) => *r,
-        _ => 0.0,
-    }
-}
 
 fn gray(g: f32) -> [u8; 3] {
     let v = (g.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -82,7 +47,7 @@ struct Painted {
     y0: f32,
     x1: f32,
     y1: f32,
-    seq: usize, // paint order in the content stream — preserved for correct z-order
+    seq: PaintSeq, // paint position in the content TREE — preserved for correct z-order
     // Active clip rect (page space) when this path was painted, if it actually crops it.
     // Rendered as an SVG <clipPath> so the visible ink matches the PDF (no overshoot).
     clip: Option<(f32, f32, f32, f32)>,
@@ -91,7 +56,7 @@ struct Painted {
 /// Graphics state carried through the walk and the q/Q stack.
 #[derive(Clone, Copy)]
 struct GState {
-    ctm: M,
+    ctm: Mat,
     fill: [u8; 3],
     stroke: [u8; 3],
     lw: f32,
@@ -103,7 +68,7 @@ struct GState {
     clip: Option<(f32, f32, f32, f32)>,
 }
 impl GState {
-    fn new(ctm: M, fill: [u8; 3], stroke: [u8; 3], lw: f32, fill_a: f32, stroke_a: f32) -> GState {
+    fn new(ctm: Mat, fill: [u8; 3], stroke: [u8; 3], lw: f32, fill_a: f32, stroke_a: f32) -> GState {
         GState { ctm, fill, stroke, lw, fill_a, stroke_a, clip: None }
     }
 }
@@ -143,8 +108,16 @@ pub struct PlacedSvg {
     pub y_bottom: f32,
     pub x_left: f32,
     pub x_right: f32,
-    paths: String, // <path> elements, local coords: origin (x_left, y_top), y down
-    w: f32,        // vector-ink content extent
+    /// `<clipPath>` definitions the paths reference. Emitted before any ink; renders nothing
+    /// itself, so its position among the ink is free.
+    defs: String,
+    /// The `<path>` elements in local coords (origin `(x_left, y_top)`, y down), each kept
+    /// WITH the address of the operation that painted it. Held apart rather than
+    /// pre-concatenated because [`PlacedSvg::composite_svg`] has to slot raster `<image>`
+    /// elements between them at their own paint positions; the vector-only renderers just
+    /// concatenate in order ([`PlacedSvg::ink`]).
+    paths: Vec<(PaintSeq, String)>,
+    w: f32, // vector-ink content extent
     h: f32,
     page_w: f32, // page width — figure renders at its page-width share
     labels: Vec<Label>,
@@ -253,9 +226,20 @@ impl PlacedSvg {
             fmt(vbw),
             fmt(vbh),
             fmt(pct),
-            self.paths,
+            self.ink(),
             texts
         )
+    }
+
+    /// This figure's vector ink as SVG: the clip definitions followed by every `<path>` in
+    /// paint order. What every renderer here except [`PlacedSvg::composite_svg`] wants —
+    /// that one has rasters to slot in between the paths.
+    fn ink(&self) -> String {
+        let mut out = self.defs.clone();
+        for (_, p) in &self.paths {
+            out.push_str(p);
+        }
+        out
     }
 
     /// Render the `<text>` labels of this figure as SVG, in its local coords.
@@ -296,7 +280,7 @@ impl PlacedSvg {
             fmt(self.w + 2.0 * PAD),
             fmt(self.h + 2.0 * PAD),
             style,
-            self.paths,
+            self.ink(),
             self.label_texts()
         )
     }
@@ -307,13 +291,18 @@ impl PlacedSvg {
     /// ink, and every label, so nothing is clipped (axis labels in the margins included).
     /// Works in BOTH directions: a vector OVER a base raster (a location map: vector lines/
     /// labels over a base photo) and rasters INSIDE a larger vector frame (a plot whose
-    /// data points are a raster within the axes/legend). The raster sits behind the ink;
-    /// the vector's opaque plot-area background is dropped in `build_svg`, so the raster
-    /// shows and the grid/curves/axes overlay it. Each entry is
-    /// `(href, (x_left, x_right, y_bottom, y_top), ctm)`: the source, its PDF page rect (y up),
-    /// and an optional placement matrix `[a,b,c,d,e,f]` (page space) when the image is ROTATED
-    /// — then the pixels are mapped through that matrix instead of stretched into the rect.
-    pub fn composite_svg(&self, rasters: &[(&str, (f32, f32, f32, f32), Option<[f32; 6]>)]) -> String {
+    /// data points are a raster within the axes/legend).
+    ///
+    /// **Rasters and ink are interleaved by PAINT ORDER** ([`PaintSeq`]), not grouped by
+    /// kind. This function used to emit every raster first and all the ink after it, which
+    /// is right only when the stream painted them that way. Real figures interleave: a
+    /// panel, a photo dropped into it, then the annotation on top — and painting that photo
+    /// first put it *behind* the panel, i.e. deleted it from the output. (The reverse also
+    /// exists, which is why `build_svg` drops a near-white full-figure background: with paint
+    /// order honoured, a background that genuinely precedes the raster now stays behind it on
+    /// its own merits.) Sorting is stable, so equal addresses — impossible between two paints,
+    /// since an address IS an operation — keep the caller's order.
+    pub fn composite_svg(&self, rasters: &[Raster<'_>]) -> String {
         // viewBox base: the plot area if detected (crops overshooting reference curves).
         // When no plot box was found, start from an empty box and grow it from the rasters
         // + labels only (NOT the full ink): that still bounds the figure to its real content
@@ -326,8 +315,9 @@ impl PlacedSvg {
             .unwrap_or((f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY));
         // Raster rects in local coords (origin (x_left, y_top), y DOWN). The viewBox grows by
         // the axis-aligned placement bbox in both cases (a rotated image's bbox IS that box).
-        let mut images = String::new();
-        for (href, (ix0, ix1, iy0, iy1), ctm) in rasters {
+        let mut content: Vec<(&PaintSeq, String)> = Vec::with_capacity(rasters.len() + self.paths.len());
+        for r in rasters {
+            let (ix0, ix1, iy0, iy1) = r.rect;
             let img_lx = ix0 - self.x_left;
             let img_ly = self.y_top - iy1;
             let img_lw = (ix1 - ix0).max(0.1);
@@ -336,38 +326,39 @@ impl PlacedSvg {
             min_y = min_y.min(img_ly);
             max_x = max_x.max(img_lx + img_lw);
             max_y = max_y.max(img_ly + img_lh);
-            match ctm {
+            let el = match r.ctm {
                 // ROTATED: map the image's unit square [0,1]² through the placement matrix into
                 // figure-local coords. A PDF image's unit square has (0,0) bottom-left and its
                 // first pixel row at the top (v=1), so SVG image-space (su,sv) (y down, top-left
                 // origin) maps as u=su, v=1-sv. With page CTM (a,b,c,d,e,f) and figure origin
                 // (x_left, y_top) under the y-flip (ly = y_top - pagey), the SVG transform is
                 // matrix(a, -b, -c, d, c+e-x_left, y_top-d-f).
-                Some([a, b, c, d, e, f]) => {
-                    images.push_str(&format!(
-                        "<image href=\"{}\" x=\"0\" y=\"0\" width=\"1\" height=\"1\" preserveAspectRatio=\"none\" transform=\"matrix({} {} {} {} {} {})\"/>",
-                        href,
-                        fmt(*a),
-                        fmt(-b),
-                        fmt(-c),
-                        fmt(*d),
-                        fmt(c + e - self.x_left),
-                        fmt(self.y_top - d - f),
-                    ));
-                }
+                Some([a, b, c, d, e, f]) => format!(
+                    "<image href=\"{}\" x=\"0\" y=\"0\" width=\"1\" height=\"1\" preserveAspectRatio=\"none\" transform=\"matrix({} {} {} {} {} {})\"/>",
+                    r.href,
+                    fmt(a),
+                    fmt(-b),
+                    fmt(-c),
+                    fmt(d),
+                    fmt(c + e - self.x_left),
+                    fmt(self.y_top - d - f),
+                ),
                 // Axis-aligned (common case): place directly in the local rect (unchanged).
-                None => {
-                    images.push_str(&format!(
-                        "<image href=\"{}\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\"/>",
-                        href,
-                        fmt(img_lx),
-                        fmt(img_ly),
-                        fmt(img_lw),
-                        fmt(img_lh)
-                    ));
-                }
-            }
+                None => format!(
+                    "<image href=\"{}\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\"/>",
+                    r.href,
+                    fmt(img_lx),
+                    fmt(img_ly),
+                    fmt(img_lw),
+                    fmt(img_lh)
+                ),
+            };
+            content.push((r.seq, el));
         }
+        for (seq, el) in &self.paths {
+            content.push((seq, el.clone()));
+        }
+        content.sort_by(|a, b| a.0.cmp(b.0));
         // Grow to every (rotation-aware) label too.
         for l in &self.labels {
             let svg_rad = -l.angle;
@@ -396,21 +387,38 @@ impl PlacedSvg {
         max_y += PAD;
         let (vbw, vbh) = (max_x - min_x, max_y - min_y);
         let pct = if self.page_w > 1.0 { (vbw / self.page_w * 150.0).clamp(10.0, 100.0) } else { 100.0 };
-        // Rasters behind, then the vector ink, then the text labels on top.
+        // Clip definitions (render nothing), then rasters and vector ink interleaved in the
+        // order the page painted them, then the text labels on top. Labels stay last: they
+        // are the figure's own annotation and are the one thing that must never be occluded.
+        let mut body = self.defs.clone();
+        for (_, el) in &content {
+            body.push_str(el);
+        }
         format!(
             "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{} {} {} {}\" \
              style=\"display:block;width:{}%;height:auto;margin:0 auto\" \
-             font-family=\"sans-serif\" fill=\"#000\">{}{}{}</svg>",
+             font-family=\"sans-serif\" fill=\"#000\">{}{}</svg>",
             fmt(min_x),
             fmt(min_y),
             fmt(vbw),
             fmt(vbh),
             fmt(pct),
-            images,
-            self.paths,
+            body,
             self.label_texts()
         )
     }
+}
+
+/// One raster to composite into a figure's `<svg>` ([`PlacedSvg::composite_svg`]): the
+/// (deferred) href, its PDF page rect `(x_left, x_right, y_bottom, y_top)` in y-up page
+/// space, an optional placement matrix `[a,b,c,d,e,f]` when the image is ROTATED — then
+/// the pixels are mapped through it instead of stretched into the rect — and where the
+/// page painted it, which is what decides whether it lands above or below each path.
+pub struct Raster<'a> {
+    pub href: &'a str,
+    pub rect: (f32, f32, f32, f32),
+    pub ctm: Option<[f32; 6]>,
+    pub seq: &'a PaintSeq,
 }
 
 // Figure filter: a real vector figure is a cluster of ink at least this big with
@@ -435,42 +443,17 @@ const BAND_GAP: f32 = 24.0; // vertical gap that separates two figures
 // distribution. A page over budget is truncated, never dropped (see `positioned_vectors_capped`).
 const MAX_OPS: usize = 600_000;
 
-fn deref<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Object> {
-    match o {
-        Object::Reference(r) => doc.get_object(*r).ok(),
-        other => Some(other),
-    }
-}
-
-/// XObject name -> object id (images AND forms) from a resources dict.
-fn xobjects_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, ObjectId> {
-    let mut map = HashMap::new();
-    if let Some(xd) = resources.get(b"XObject").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
-        for (name, val) in xd.iter() {
-            if let Ok(id) = val.as_reference() {
-                map.insert(name.clone(), id);
-            }
-        }
-    }
-    map
-}
-
-fn page_resources(doc: &Document, page_id: ObjectId) -> Option<Dictionary> {
-    match doc.get_page_resources(page_id) {
-        Ok((Some(d), _)) => Some(d.clone()),
-        Ok((None, ids)) => ids.first().and_then(|id| doc.get_dictionary(*id).ok()).cloned(),
-        Err(_) => None,
-    }
-}
-
 /// ExtGState name -> (fill alpha `ca`, stroke alpha `CA`) where defined.
 fn extgstates_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, (Option<f32>, Option<f32>)> {
     let mut map = HashMap::new();
     if let Some(eg) = resources.get(b"ExtGState").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
         for (name, val) in eg.iter() {
             if let Some(d) = deref(doc, val).and_then(|o| o.as_dict().ok()) {
-                let ca = d.get(b"ca").ok().map(num);
-                let big = d.get(b"CA").ok().map(num);
+                // Dictionary VALUES, so `num_deref` — a writer that hoists a shared alpha into
+                // an indirect object is legal, and the direct-only `num` read it as 0.0, i.e.
+                // fully transparent, which silently deletes every paint made under this state.
+                let ca = d.get(b"ca").ok().map(|o| num_deref(doc, o));
+                let big = d.get(b"CA").ok().map(|o| num_deref(doc, o));
                 map.insert(name.clone(), (ca, big));
             }
         }
@@ -482,7 +465,12 @@ fn extgstates_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, (Op
 /// A path with neither fill nor stroke (e.g. a fully transparent `ca 0` fill, or
 /// a clip-only path) carries no ink and is dropped — it must not inflate a
 /// figure cluster or paint a "hidden" black field.
-fn finish(cur: &mut Vec<Seg>, fill: Option<[u8; 3]>, stroke: Option<([u8; 3], f32)>, fill_op: f32, stroke_op: f32, clip: Option<(f32, f32, f32, f32)>, out: &mut Vec<Painted>) {
+// One more argument than clippy's default bar, for the same reason `walk` (below) and
+// `text::decode_spans` carry the `#[allow]`: this is an interpreter's flat state, and
+// bundling it into a struct would hide which parts a paint operator supplies fresh
+// (colour, alpha, clip) from the address/output it merely threads through.
+#[allow(clippy::too_many_arguments)]
+fn finish(cur: &mut Vec<Seg>, fill: Option<[u8; 3]>, stroke: Option<([u8; 3], f32)>, fill_op: f32, stroke_op: f32, clip: Option<(f32, f32, f32, f32)>, seq: PaintSeq, out: &mut Vec<Painted>) {
     if cur.is_empty() {
         return;
     }
@@ -490,26 +478,20 @@ fn finish(cur: &mut Vec<Seg>, fill: Option<[u8; 3]>, stroke: Option<([u8; 3], f3
         cur.clear();
         return;
     }
-    let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
-    for s in cur.iter() {
-        let pts: &[(f32, f32)] = match s {
-            Seg::M(x, y) | Seg::L(x, y) => &[(*x, *y)],
-            Seg::C(a, b, c, d, e, f) => &[(*a, *b), (*c, *d), (*e, *f)],
-            Seg::Z => &[],
-        };
-        for &(x, y) in pts {
-            x0 = x0.min(x);
-            y0 = y0.min(y);
-            x1 = x1.max(x);
-            y1 = y1.max(y);
+    // `path_bbox` is `None` for exactly the point-free path this used to detect as `x1 < x0`.
+    let (mut x0, mut y0, mut x1, mut y1) = match path_bbox(cur) {
+        Some(bb) => bb,
+        None => {
+            cur.clear();
+            return;
         }
-    }
+    };
     // Drop paths whose extent is implausibly large. A real figure element never exceeds
     // page size (~800 pt); a span of thousands+ means a coordinate was left in the wrong
     // space (page coords leaking into a figure-local frame, a mis-applied matrix), which
     // otherwise draws a line shooting off the figure or collapses its viewBox.
     const MAX_EXTENT: f32 = 2000.0;
-    if x1 < x0 || (x1 - x0).max(y1 - y0) > MAX_EXTENT {
+    if (x1 - x0).max(y1 - y0) > MAX_EXTENT {
         cur.clear();
         return;
     }
@@ -523,25 +505,25 @@ fn finish(cur: &mut Vec<Seg>, fill: Option<[u8; 3]>, stroke: Option<([u8; 3], f3
     if let Some((cx0, cy0, cx1, cy1)) = clip {
         let crops = cx0 > x0 + 0.5 || cy0 > y0 + 0.5 || cx1 < x1 - 0.5 || cy1 < y1 - 0.5;
         if crops {
-            let (nx0, ny0, nx1, ny1) = (x0.max(cx0), y0.max(cy0), x1.min(cx1), y1.min(cy1));
-            if nx1 <= nx0 || ny1 <= ny0 {
+            let n = Rect::new(x0, y0, x1, y1).intersect(Rect::new(cx0, cy0, cx1, cy1));
+            if n.x1 <= n.x0 || n.y1 <= n.y0 {
                 cur.clear(); // path lies entirely outside its clip — invisible
                 return;
             }
-            x0 = nx0;
-            y0 = ny0;
-            x1 = nx1;
-            y1 = ny1;
+            x0 = n.x0;
+            y0 = n.y0;
+            x1 = n.x1;
+            y1 = n.y1;
             crop = clip;
         }
     }
-    out.push(Painted { segs: std::mem::take(cur), fill, stroke, fill_op, stroke_op, x0, y0, x1, y1, seq: 0, clip: crop });
+    out.push(Painted { segs: std::mem::take(cur), fill, stroke, fill_op, stroke_op, x0, y0, x1, y1, seq, clip: crop });
 }
 
 /// Page-space bounding box of a path under construction (a clip path is just a path
 /// followed by `W`/`W*`); `None` if it has no points.
 fn path_bbox(cur: &[Seg]) -> Option<(f32, f32, f32, f32)> {
-    let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let mut bb = Rect::EMPTY;
     for s in cur {
         let pts: &[(f32, f32)] = match s {
             Seg::M(x, y) | Seg::L(x, y) => &[(*x, *y)],
@@ -549,17 +531,10 @@ fn path_bbox(cur: &[Seg]) -> Option<(f32, f32, f32, f32)> {
             Seg::Z => &[],
         };
         for &(x, y) in pts {
-            x0 = x0.min(x);
-            y0 = y0.min(y);
-            x1 = x1.max(x);
-            y1 = y1.max(y);
+            bb.include(x, y);
         }
     }
-    if x1 >= x0 {
-        Some((x0, y0, x1, y1))
-    } else {
-        None
-    }
+    bb.is_valid().then_some((bb.x0, bb.y0, bb.x1, bb.y1))
 }
 
 /// Vector figures on a page, top-to-bottom.
@@ -573,10 +548,15 @@ pub fn positioned_vectors(doc: &Document, page_id: ObjectId) -> (Vec<PlacedSvg>,
 /// [`MAX_OPS`]). Exposed internally so the truncation behaviour is unit-testable with a tiny
 /// cap instead of a half-million-operation fixture.
 fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (Vec<PlacedSvg>, Vec<PlacedSvg>) {
-    let resources = match page_resources(doc, page_id) {
-        Some(r) => r,
-        None => return (Vec::new(), Vec::new()),
-    };
+    // A page with no `/Resources` anywhere in its tree used to return here, empty. But the
+    // path operators — `m`/`l`/`c`/`re`/`v`/`y`/`h` and the `f`/`S`/`B` that paint them —
+    // name no resource at all: `/Resources` is only needed to resolve an `/ExtGState` alpha
+    // or a form `Do`, and a page can legally draw its whole figure without either. The
+    // guard therefore deleted every direct path a resource-less page drew, and the SVG with
+    // it. Both maps below are simply empty for such a page, `Do` resolves to nothing, and
+    // the graphics state starts at the spec defaults (opaque, black) — which is exactly
+    // what a page with no `/ExtGState` is entitled to.
+    let chain = page_resource_chain(doc, page_id);
     let content = match doc.get_and_decode_page_content(page_id) {
         Ok(c) => c,
         Err(_) => return (Vec::new(), Vec::new()),
@@ -586,62 +566,39 @@ fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (
     // with no figures at all (a whole cover map disappeared), which is strictly worse than a
     // partial one — the ops are already parsed by this point, so the cap only bounds the walk.
     let ops = &content.operations[..content.operations.len().min(cap)];
-    let xmap = xobjects_of(doc, &resources);
-    let egmap = extgstates_of(doc, &resources);
+    // Both maps are folded over the WHOLE resource chain, outermost first, so the page's
+    // own dictionary still shadows an ancestor's entry of the same name while a name only
+    // an ancestor defines finally resolves (see `walker::page_resource_chain`).
+    let mut xmap = XMap::new();
+    let mut egmap: HashMap<Vec<u8>, (Option<f32>, Option<f32>)> = HashMap::new();
+    for res in &chain {
+        overlay_xobjects(doc, res, &mut xmap);
+        egmap.extend(extgstates_of(doc, res));
+    }
     let mut painted = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
-    walk(doc, ops, &xmap, &egmap, GState::new(M::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget);
-    // Stamp paint order before clustering reshuffles the vector for banding.
-    for (i, p) in painted.iter_mut().enumerate() {
-        p.seq = i;
-    }
+    walk(doc, ops, &xmap, &egmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget, &[]);
+    // Paint order is stamped by the walk itself (`PaintSeq`, the operation's address in the
+    // content tree) rather than re-derived from this vector's order here. The two are the
+    // same ordering, but only the address is comparable with `img::positioned_images`'s
+    // rasters, which is what lets a composited figure interleave the two.
     let page_w = page_width(doc, page_id);
     let (strong, weak) = cluster_figures(painted);
     let build = |cs: Vec<Vec<Painted>>| cs.iter().map(|c| build_svg(c, page_w)).collect();
     (build(strong), build(weak))
 }
 
-/// Page width from the MediaBox (used to size each figure as a share of the page).
+/// Page width from the page box (used to size each figure as a share of the page).
 ///
-/// `/MediaBox` is an INHERITABLE page attribute (PDF 32000-1 §7.7.3.4): a writer may state it
-/// once on the `/Pages` node and omit it from every page. Reading only the page dict made such
-/// files fall back to a guessed 612pt, so every figure on them was sized as the wrong share of
-/// the page. Walk up `/Parent` when the page itself doesn't carry the key.
+/// The box itself — `/MediaBox` then `/CropBox`, inherited up `/Parent`, extents resolved
+/// through indirect references — comes from [`crate::pdfobj::page_box`]. A width of zero or
+/// one point is not a page, so it degrades to the letter default rather than scaling every
+/// figure on the page by a garbage denominator.
 fn page_width(doc: &Document, page_id: ObjectId) -> f32 {
-    inherited_box(doc, page_id)
-        .filter(|a| a.len() >= 4)
-        .map(|a| (num(&a[2]) - num(&a[0])).abs())
+    crate::pdfobj::page_box(doc, page_id)
+        .map(|b| (b[2] - b[0]).abs())
         .filter(|w| *w > 1.0)
-        .unwrap_or(612.0)
-}
-
-/// The page's effective `/MediaBox` (falling back to `/CropBox`), inherited from the page tree
-/// when absent on the page node itself. Bounded by [`crate::MAX_FORM_DEPTH`] and a visited set
-/// so a malformed file with a cyclic or absurdly deep `/Parent` chain cannot hang the walk.
-fn inherited_box(doc: &Document, page_id: ObjectId) -> Option<Vec<Object>> {
-    let mut node = page_id;
-    let mut seen = Vec::new();
-    for _ in 0..crate::MAX_FORM_DEPTH {
-        if seen.contains(&node) {
-            return None; // cyclic /Parent chain
-        }
-        seen.push(node);
-        let dict = doc.get_object(node).ok()?.as_dict().ok()?;
-        let found = dict
-            .get(b"MediaBox")
-            .ok()
-            .or_else(|| dict.get(b"CropBox").ok())
-            .and_then(|o| deref(doc, o))
-            .and_then(|o| o.as_array().ok());
-        if let Some(a) = found {
-            return Some(a.clone());
-        }
-        node = match dict.get(b"Parent") {
-            Ok(Object::Reference(r)) => *r,
-            _ => return None,
-        };
-    }
-    None
+        .unwrap_or(crate::pdfobj::DEFAULT_PAGE_PTS.0)
 }
 
 /// Distribute form-internal text labels among the figures on a page (each label
@@ -660,16 +617,16 @@ pub fn attach_labels(figs: &mut [PlacedSvg], spans: &[LabelSpan]) {
 fn walk(
     doc: &Document,
     ops: &[lopdf::content::Operation],
-    xmap: &HashMap<Vec<u8>, ObjectId>,
+    xmap: &XMap,
     egmap: &HashMap<Vec<u8>, (Option<f32>, Option<f32>)>,
     base: GState,
     out: &mut Vec<Painted>,
     depth: u32,
     budget: &mut crate::WalkBudget,
+    // Address of the stream being walked (empty for the page's own content) — each
+    // operation's index is appended to it to stamp a path's `PaintSeq`.
+    here: &[u32],
 ) {
-    if depth > crate::MAX_FORM_DEPTH {
-        return;
-    }
     let mut g = base;
     let mut stack: Vec<GState> = Vec::new();
     let mut cur: Vec<Seg> = Vec::new();
@@ -682,7 +639,7 @@ fn walk(
     let eff_fill = |g: &GState| if g.fill_a >= ALPHA_HIDDEN { Some(g.fill) } else { None };
     let eff_stroke = |g: &GState| if g.stroke_a >= ALPHA_HIDDEN { Some((g.stroke, (g.lw * g.ctm.scale()).max(0.3))) } else { None };
 
-    for op in ops {
+    for (opi, op) in ops.iter().enumerate() {
         // Total-work budget (see `crate::WalkBudget`). `MAX_OPS` above truncates only the
         // page's TOP-LEVEL operator list; a self-referential form re-enters `walk` with a
         // fresh, tiny slice each time, so only a budget shared across all levels bounds it.
@@ -702,7 +659,7 @@ fn walk(
                 }
             }
             "cm" if o.len() >= 6 => {
-                g.ctm = M { a: num(&o[0]), b: num(&o[1]), c: num(&o[2]), d: num(&o[3]), e: num(&o[4]), f: num(&o[5]) }.mul(g.ctm);
+                g.ctm = Mat { a: num(&o[0]), b: num(&o[1]), c: num(&o[2]), d: num(&o[3]), e: num(&o[4]), f: num(&o[5]) }.mul(g.ctm);
             }
             "gs" => {
                 if let Some(&(ca, big)) = o.first().and_then(|x| x.as_name().ok()).and_then(|n| egmap.get(n)) {
@@ -778,59 +735,45 @@ fn walk(
                 if pending_clip {
                     if let Some(bb) = path_bbox(&cur) {
                         g.clip = Some(match g.clip {
-                            Some((x0, y0, x1, y1)) => (x0.max(bb.0), y0.max(bb.1), x1.min(bb.2), y1.min(bb.3)),
+                            Some(cl) => {
+                                let n = Rect::new(cl.0, cl.1, cl.2, cl.3).intersect(Rect::new(bb.0, bb.1, bb.2, bb.3));
+                                (n.x0, n.y0, n.x1, n.y1)
+                            }
                             None => bb,
                         });
                     }
                     pending_clip = false;
                 }
                 match op.operator.as_str() {
-                    "f" | "F" | "f*" => finish(&mut cur, eff_fill(&g), None, g.fill_a, g.stroke_a, g.clip, out),
-                    "S" | "s" => finish(&mut cur, None, eff_stroke(&g), g.fill_a, g.stroke_a, g.clip, out),
-                    "B" | "B*" | "b" | "b*" => finish(&mut cur, eff_fill(&g), eff_stroke(&g), g.fill_a, g.stroke_a, g.clip, out),
+                    "f" | "F" | "f*" => finish(&mut cur, eff_fill(&g), None, g.fill_a, g.stroke_a, g.clip, PaintSeq::at(here, opi), out),
+                    "S" | "s" => finish(&mut cur, None, eff_stroke(&g), g.fill_a, g.stroke_a, g.clip, PaintSeq::at(here, opi), out),
+                    "B" | "B*" | "b" | "b*" => finish(&mut cur, eff_fill(&g), eff_stroke(&g), g.fill_a, g.stroke_a, g.clip, PaintSeq::at(here, opi), out),
                     _ => cur.clear(), // "n": clip-only path → no ink
                 }
             }
             "Do" => {
-                let id = match o.first().and_then(|x| x.as_name().ok()).and_then(|n| xmap.get(n)) {
-                    Some(&id) => id,
-                    None => continue,
+                // Images are `crate::img`'s business; only forms carry path ink. The
+                // descent inherits the page's scope (`OverlayParent`) so a form can paint
+                // through an ExtGState or XObject the page defines.
+                let Some((_, stream)) = crate::walker::xobject_at(doc, xmap, o) else {
+                    continue;
                 };
-                let stream = match doc.get_object(id).and_then(|x| x.as_stream().cloned()) {
-                    Ok(s) => s,
-                    Err(_) => continue,
+                let f = match descend_form(doc, stream, xmap, ScopePolicy::OverlayParent, depth, budget, egmap.len()) {
+                    Descend::Into(f) => f,
+                    Descend::Skip => continue,
+                    Descend::Halt => return,
                 };
-                if stream.dict.get(b"Subtype").and_then(|x| x.as_name()).unwrap_or(b"") != b"Form" {
-                    continue; // images handled by crate::img
-                }
-                // Bill the descent before doing it: cloning the inherited resource maps and
-                // decoding the form stream dwarf a single operator's cost, and a form bomb
-                // pays exactly this per branch.
-                if !budget.spend(crate::FORM_DESCENT_COST + xmap.len() + egmap.len()) {
-                    return;
-                }
-                let fm = stream
-                    .dict
-                    .get(b"Matrix")
-                    .ok()
-                    .and_then(|x| x.as_array().ok())
-                    .filter(|a| a.len() >= 6)
-                    .map(|a| M { a: num(&a[0]), b: num(&a[1]), c: num(&a[2]), d: num(&a[3]), e: num(&a[4]), f: num(&a[5]) })
-                    .unwrap_or(M::ID);
-                let (mut child_x, mut child_eg) = (xmap.clone(), egmap.clone());
-                if let Some(fr) = stream.dict.get(b"Resources").ok().and_then(|x| deref(doc, x)).and_then(|x| x.as_dict().ok()) {
-                    for (k, v) in xobjects_of(doc, fr) {
-                        child_x.insert(k, v);
-                    }
+                // The ExtGState half of the scope is this walker's own interpretation, so
+                // it is overlaid here rather than in the shared descent.
+                let mut child_eg = egmap.clone();
+                if let Some(fr) = &f.scope.resources {
                     for (k, v) in extgstates_of(doc, fr) {
                         child_eg.insert(k, v);
                     }
                 }
-                if let Ok(content) = lopdf::content::Content::decode(&stream.decompressed_content().unwrap_or_default()) {
-                    let mut sub = g;
-                    sub.ctm = fm.mul(g.ctm);
-                    walk(doc, &content.operations, &child_x, &child_eg, sub, out, depth + 1, budget);
-                }
+                let mut sub = g;
+                sub.ctm = f.matrix.mul(g.ctm);
+                walk(doc, &f.ops, &f.scope.xobjects, &child_eg, sub, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice());
             }
             _ => {}
         }
@@ -875,11 +818,8 @@ fn cluster_figures(mut paths: Vec<Painted>) -> (Vec<Vec<Painted>>, Vec<Vec<Paint
         clusters.push(vec![p]);
     }
     let extent = |c: &[Painted]| {
-        let x0 = c.iter().map(|p| p.x0).fold(f32::INFINITY, f32::min);
-        let x1 = c.iter().map(|p| p.x1).fold(f32::NEG_INFINITY, f32::max);
-        let y0 = c.iter().map(|p| p.y0).fold(f32::INFINITY, f32::min);
-        let y1 = c.iter().map(|p| p.y1).fold(f32::NEG_INFINITY, f32::max);
-        (x1 - x0, y1 - y0)
+        let bb = cluster_bbox(c);
+        (bb.width(), bb.height())
     };
     let (mut strong, mut weak): (Vec<Vec<Painted>>, Vec<Vec<Painted>>) = (Vec::new(), Vec::new());
     for c in clusters {
@@ -893,7 +833,7 @@ fn cluster_figures(mut paths: Vec<Painted>) -> (Vec<Vec<Painted>>, Vec<Vec<Paint
     // Restore stream paint order within each cluster (banding sorted by y): a fill
     // drawn after an outline must paint on top of it, not be reordered by position.
     for c in strong.iter_mut().chain(weak.iter_mut()) {
-        c.sort_by_key(|p| p.seq);
+        c.sort_by(|a, b| a.seq.cmp(&b.seq));
     }
     (strong, weak)
 }
@@ -909,27 +849,20 @@ fn hex(c: [u8; 3]) -> String {
     format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
 }
 
-fn esc(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            _ => out.push(ch),
-        }
-    }
-    out
+use crate::textutil::esc_text as esc;
+
+/// Enclosing page-space box of a cluster of painted paths.
+fn cluster_bbox(cluster: &[Painted]) -> Rect {
+    cluster
+        .iter()
+        .fold(Rect::EMPTY, |acc, p| acc.union(Rect::new(p.x0, p.y0, p.x1, p.y1)))
 }
 
 /// Transcode one figure cluster into the path geometry of a [`PlacedSvg`]
 /// (paths in stream order, y flipped). The `<svg>` wrapper + any text labels are
 /// emitted later by [`PlacedSvg::svg`].
 fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
-    let x0 = cluster.iter().map(|p| p.x0).fold(f32::INFINITY, f32::min);
-    let x1 = cluster.iter().map(|p| p.x1).fold(f32::NEG_INFINITY, f32::max);
-    let y0 = cluster.iter().map(|p| p.y0).fold(f32::INFINITY, f32::min);
-    let y1 = cluster.iter().map(|p| p.y1).fold(f32::NEG_INFINITY, f32::max);
+    let Rect { x0, y0, x1, y1 } = cluster_bbox(cluster);
     let (w, h) = (x1 - x0, y1 - y0);
     // page space (y up) -> local SVG space (y down): lx = x-x0, ly = y1-y. A stray point
     // (one coordinate left in the wrong space, surviving the per-path extent gate) is
@@ -962,7 +895,7 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
         }
         id
     };
-    let mut paths = String::new();
+    let mut paths: Vec<(PaintSeq, String)> = Vec::new();
     for p in cluster {
         // Skip a near-white background fill that covers a large part of the figure:
         // invisible on the white page anyway, and in a raster+vector composite it would
@@ -976,7 +909,10 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
                 if r >= 248 && g >= 248 && b >= 248 && pa >= area * 0.3 {
                     let (bx0, bx1, by0, by1) = (p.x0 - x0, p.x1 - x0, y1 - p.y1, y1 - p.y0);
                     plot = Some(match plot {
-                        Some((mx0, my0, mx1, my1)) => (mx0.min(bx0), my0.min(by0), mx1.max(bx1), my1.max(by1)),
+                        Some(m) => {
+                            let u = Rect::new(m.0, m.1, m.2, m.3).union(Rect::new(bx0, by0, bx1, by1));
+                            (u.x0, u.y0, u.x1, u.y1)
+                        }
                         None => (bx0, by0, bx1, by1),
                     });
                     continue;
@@ -1007,10 +943,10 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32) -> PlacedSvg {
             Some(c) => format!(" clip-path=\"url(#{})\"", clip_id_for(c, &mut clip_defs)),
             None => String::new(),
         };
-        paths.push_str(&format!("<path d=\"{d}\" fill=\"{fill}\"{fop}{stroke}{clip_attr}/>"));
+        paths.push((p.seq.clone(), format!("<path d=\"{d}\" fill=\"{fill}\"{fop}{stroke}{clip_attr}/>")));
     }
-    let paths = if clip_defs.is_empty() { paths } else { format!("<defs>{clip_defs}</defs>{paths}") };
-    PlacedSvg { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, paths, w, h, page_w, labels: Vec::new(), plot }
+    let defs = if clip_defs.is_empty() { String::new() } else { format!("<defs>{clip_defs}</defs>") };
+    PlacedSvg { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, defs, paths, w, h, page_w, labels: Vec::new(), plot }
 }
 
 #[cfg(test)]
@@ -1027,14 +963,22 @@ mod tests {
         (doc, page_id)
     }
 
+    /// The page's own (nearest) resource dictionary — the last entry of the overlay chain.
+    fn page_res(doc: &Document, page_id: ObjectId) -> Dictionary {
+        page_resource_chain(doc, page_id).pop().expect("fixture page has resources")
+    }
+
     fn walk_page(doc: &Document, page_id: ObjectId, budget: usize) -> Vec<Painted> {
-        let resources = page_resources(doc, page_id).expect("fixture page has resources");
         let content = doc.get_and_decode_page_content(page_id).expect("fixture page has content");
-        let xmap = xobjects_of(doc, &resources);
-        let egmap = extgstates_of(doc, &resources);
+        let mut xmap = XMap::new();
+        let mut egmap: HashMap<Vec<u8>, (Option<f32>, Option<f32>)> = HashMap::new();
+        for res in &page_resource_chain(doc, page_id) {
+            overlay_xobjects(doc, res, &mut xmap);
+            egmap.extend(extgstates_of(doc, res));
+        }
         let mut painted = Vec::new();
         let mut budget = crate::WalkBudget::new(budget);
-        walk(doc, &content.operations, &xmap, &egmap, GState::new(M::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget);
+        walk(doc, &content.operations, &xmap, &egmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget, &[]);
         painted
     }
 
@@ -1102,6 +1046,35 @@ mod tests {
     }
 
     #[test]
+    fn page_width_resolves_indirect_media_box_entries() {
+        // `indirect_mediabox.pdf`: the inheritable /MediaBox on the /Pages node is written
+        // `[0 0 9 0 R 10 0 R]` — legal for an array value, and what the direct-only `num`
+        // reader turned into `[0 0 0 0]`. The zero-width box then failed the sanity filter
+        // and the page silently became the guessed 612pt letter, so the 504pt grid on it was
+        // sized as 82% of the page instead of the 50% it really spans.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/indirect_mediabox.pdf");
+        let doc = Document::load(path).expect("indirect_mediabox.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        // The premise: the page carries no box of its own, and the inherited one really is
+        // written with indirect entries.
+        let page = doc.get_object(page_id).unwrap().as_dict().unwrap();
+        assert!(page.get(b"MediaBox").is_err() && page.get(b"CropBox").is_err());
+        let parent = page.get(b"Parent").unwrap().as_reference().unwrap();
+        let mb = doc.get_object(parent).unwrap().as_dict().unwrap().get(b"MediaBox").unwrap().as_array().unwrap();
+        assert!(matches!(mb[2], Object::Reference(_)), "the fixture's box extents must be indirect");
+        assert_eq!(page_width(&doc, page_id), 1008.0, "an indirect /MediaBox width must resolve, not read 0");
+    }
+
+    #[test]
+    fn page_width_falls_back_to_the_crop_box_when_no_media_box_exists() {
+        // Page 2 of the same fixture states only a /CropBox, with nothing to inherit.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/indirect_mediabox.pdf");
+        let doc = Document::load(path).expect("indirect_mediabox.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&2).expect("fixture has page 2");
+        assert_eq!(page_width(&doc, page_id), 400.0, "the /CropBox is the fallback page box");
+    }
+
+    #[test]
     fn page_width_falls_back_when_no_ancestor_carries_a_box() {
         // A page dict with no /MediaBox anywhere up the chain still gets the letter default
         // rather than a zero-width figure scale.
@@ -1120,7 +1093,7 @@ mod tests {
         let (strong, _weak) = positioned_vectors_capped(&doc, page_id, 50);
         assert_eq!(strong.len(), 1, "the early-painted grid figure must survive a tripped cap");
         let grid = &strong[0];
-        let kept = grid.paths.matches("<path").count();
+        let kept = grid.ink().matches("<path").count();
         // The cap really does bite mid-figure (the fixture's grid is 12 rules), and what it
         // leaves behind still clears the figure bar.
         assert!((6..12).contains(&kept), "grid kept {kept} of 12 paths");
@@ -1137,6 +1110,169 @@ mod tests {
         let (strong, _weak) = positioned_vectors(&doc, page_id);
         assert_eq!(strong.len(), 2, "expected the grid AND the scatter field");
         let scatter = strong.iter().find(|f| f.y_bottom < 400.0).expect("scatter figure");
-        assert!(scatter.paths.matches("<path").count() > 200, "scatter kept {} paths", scatter.paths.matches("<path").count());
+        assert!(scatter.ink().matches("<path").count() > 200, "scatter kept {} paths", scatter.ink().matches("<path").count());
+    }
+
+    #[test]
+    fn a_form_stream_with_no_filter_still_paints_its_paths() {
+        // `unfiltered_form.pdf` (`gen_fixtures.py::gen_unfiltered_form`): the page's only ink
+        // is five filled bars inside a Form XObject whose stream carries NO /Filter. lopdf
+        // *errors* on `decompressed_content()` for such a stream, so the old
+        // `.unwrap_or_default()` handed the decoder zero bytes and the whole figure vanished
+        // — while `extract.rs`/`img.rs`, which carry the raw-bytes fallback, saw it fine.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/unfiltered_form.pdf");
+        let doc = Document::load(path).expect("unfiltered_form.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        // The premise, asserted rather than assumed: the form really is unfiltered.
+        let res = page_res(&doc, page_id);
+        let form_id = crate::walker::xobjects_of(&doc, &res).get(b"UF".as_slice()).copied().expect("/UF form");
+        let form = doc.get_object(form_id).unwrap().as_stream().unwrap();
+        assert!(form.dict.get(b"Filter").is_err(), "the fixture's form must carry no /Filter");
+        assert!(form.decompressed_content().is_err(), "the premise: lopdf errors without /Filter");
+
+        let painted = walk_page(&doc, page_id, crate::MAX_FORM_WORK);
+        assert_eq!(painted.len(), 5, "the five bars inside the unfiltered form must all be painted");
+        // …at five distinct x offsets, so this cannot pass on five copies of one bar.
+        let mut xs: Vec<i32> = painted.iter().map(|p| p.x0.round() as i32).collect();
+        xs.sort_unstable();
+        xs.dedup();
+        assert_eq!(xs.len(), 5, "the bars must land at five offsets, got {xs:?}");
+    }
+
+    #[test]
+    fn an_extgstate_defined_two_ancestors_up_still_governs_the_ink() {
+        // `tests/gen_fixtures.py::gen_form_inherit`. The page has NO /Resources; the
+        // /ExtGState /GA the form paints its panel through lives on the GRANDPARENT node.
+        // A nearest-only read of the inherited resources left `gs` resolving to nothing, so
+        // the panel painted fully opaque; and the form's indirect /Matrix, read directly,
+        // degraded to the identity and put the panel 100 pt to the left.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/form_inherit.pdf");
+        let doc = Document::load(path).expect("form_inherit.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        let painted = walk_page(&doc, page_id, crate::MAX_FORM_WORK);
+        assert_eq!(painted.len(), 1, "the form paints exactly one panel");
+        let p = &painted[0];
+        assert!((p.fill_op - 0.5).abs() < 1e-6, "fill opacity {} (1.0 means /GA never resolved)", p.fill_op);
+        assert!((p.x0 - 172.0).abs() < 0.5, "x0 {} (72 means the indirect /Matrix was lost)", p.x0);
+    }
+
+    #[test]
+    fn an_extgstate_alpha_written_indirectly_does_not_hide_the_figure() {
+        // `indirect_numbers.pdf`: `/GA` is `<< /ca 10 0 R /CA 11 0 R >>`. A dictionary value
+        // may legally be an indirect reference, but the direct-only `num` reader returned 0.0
+        // for one — below `ALPHA_HIDDEN` — so `eff_fill`/`eff_stroke` reported "no ink" and
+        // every bar and axis rule drawn under `/GA gs` was DROPPED. The figure disappeared.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/indirect_numbers.pdf");
+        let doc = Document::load(path).expect("indirect_numbers.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        // The premise: the alphas really are indirect.
+        let res = page_res(&doc, page_id);
+        let eg = res.get(b"ExtGState").unwrap().as_dict().unwrap().get(b"GA").unwrap();
+        let eg = deref(&doc, eg).unwrap().as_dict().unwrap();
+        assert!(matches!(eg.get(b"ca").unwrap(), Object::Reference(_)));
+        assert!(matches!(eg.get(b"CA").unwrap(), Object::Reference(_)));
+
+        // The alphas resolve to the authored values, not 0.0 …
+        let egmap = extgstates_of(&doc, &res);
+        assert_eq!(egmap.get(b"GA".as_slice()).copied(), Some((Some(0.85), Some(0.6))));
+        // … and the ink they gate survives the walk: 8 filled bars + 2 stroked axis rules.
+        let painted = walk_page(&doc, page_id, crate::MAX_FORM_WORK);
+        assert_eq!(painted.len(), 10, "8 bars + 2 axes must paint under a resolved alpha");
+        assert_eq!(painted.iter().filter(|p| p.fill.is_some()).count(), 8);
+        assert!(painted.iter().all(|p| (p.fill_op - 0.85).abs() < 1e-6 && (p.stroke_op - 0.6).abs() < 1e-6));
+        // The figure reaches the render as one placed <svg>, carrying the recovered opacity.
+        let (strong, _weak) = positioned_vectors(&doc, page_id);
+        assert_eq!(strong.len(), 1, "the bar chart must be one figure");
+        assert!(strong[0].ink().contains("fill-opacity=\"0.85\""), "{}", strong[0].ink());
+    }
+
+    #[test]
+    fn a_composited_figure_paints_its_raster_where_the_stream_did() {
+        // `tests/gen_fixtures.py::gen_paint_order` is a controlled A/B in one file: two
+        // geometrically identical figures, the sole difference the order of two operators.
+        // The TOP one paints the raster then an opaque grey panel over it (the panel must
+        // win); the BOTTOM one paints the panel then the raster (the raster must win).
+        // Before the fix `composite_svg` emitted every raster first and all path ink after,
+        // so BOTH figures rendered as a bare grey panel — the top one correctly, the bottom
+        // one by accident of grouping, and the raster it carried was invisible.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/paint_order.pdf");
+        let doc = Document::load(path).expect("paint_order.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&1).expect("page 1");
+        let (strong, _weak) = positioned_vectors(&doc, page_id);
+        assert_eq!(strong.len(), 2, "the two bands must cluster as two figures");
+        let images = crate::img::positioned_images(&doc, page_id, true);
+        assert_eq!(images.len(), 2, "one raster per figure");
+
+        // Pair each figure with the raster inside it, exactly as html.rs's absorb does.
+        for (fi, fig) in strong.iter().enumerate() {
+            let im = images
+                .iter()
+                .find(|im| im.x_left >= fig.x_left && im.x_right <= fig.x_right && im.y_bottom >= fig.y_bottom && im.y_top <= fig.y_top)
+                .unwrap_or_else(|| panic!("figure {fi} must contain a raster"));
+            let svg = fig.composite_svg(&[Raster {
+                href: "IMG",
+                rect: (im.x_left, im.x_right, im.y_bottom, im.y_top),
+                ctm: im.ctm,
+                seq: &im.seq,
+            }]);
+            let image_at = svg.find("<image ").expect("the raster must be in the composite");
+            let panel_at = svg.find("fill=\"#808080\"").expect("the opaque panel must be in the composite");
+            // `strong` is ordered top-of-page first, and the top figure is the raster-first one.
+            if fi == 0 {
+                assert!(image_at < panel_at, "raster painted first must sit BEHIND the panel: {svg}");
+            } else {
+                assert!(image_at > panel_at, "raster painted last must sit ON TOP of the panel: {svg}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_page_with_no_resources_still_paints_its_direct_path_ink() {
+        // `tests/gen_fixtures.py::gen_no_resources_paths` is a controlled A/B in one file:
+        // two pages, identical content streams, the sole difference an empty
+        // `/Resources << >>` on page 2. `positioned_vectors_capped` bailed out the moment
+        // the page's whole resource chain was empty — but `re`/`f` name no resource, so
+        // page 1 lost its entire figure while page 2 kept it. Verified failing before the
+        // fix: page 1 gave 0 strong figures and 0 painted paths, page 2 gave 1 and 8.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/no_resources_paths.pdf");
+        let doc = Document::load(path).expect("no_resources_paths.pdf fixture must load");
+        let pages = doc.get_pages();
+        let bare = *pages.get(&1).expect("page 1");
+        let with_res = *pages.get(&2).expect("page 2");
+        assert!(page_resource_chain(&doc, bare).is_empty(), "page 1 must reach no /Resources at all");
+        assert!(!page_resource_chain(&doc, with_res).is_empty(), "page 2 is the control");
+
+        for (page_id, label) in [(bare, "no /Resources"), (with_res, "/Resources << >>")] {
+            let painted = walk_page_bare(&doc, page_id);
+            assert_eq!(painted.len(), 8, "{label}: eight filled bars must paint");
+            // Nothing supplies an /ExtGState, so the spec defaults must hold: fully opaque.
+            assert!(
+                painted.iter().all(|p| p.fill_op == 1.0 && p.stroke_op == 1.0),
+                "{label}: a page with no /ExtGState paints at full opacity"
+            );
+            let (strong, _weak) = positioned_vectors(&doc, page_id);
+            assert_eq!(strong.len(), 1, "{label}: the bars must reach the render as one figure");
+        }
+    }
+
+    /// [`walk_page`] for a page that may have no resource chain at all (the helper above
+    /// folds the chain, which is empty here — the point of the test).
+    fn walk_page_bare(doc: &Document, page_id: ObjectId) -> Vec<Painted> {
+        let content = doc.get_and_decode_page_content(page_id).expect("fixture page has content");
+        let mut painted = Vec::new();
+        let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
+        let egmap: HashMap<Vec<u8>, (Option<f32>, Option<f32>)> = HashMap::new();
+        walk(
+            doc,
+            &content.operations,
+            &XMap::new(),
+            &egmap,
+            GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0),
+            &mut painted,
+            0,
+            &mut budget,
+            &[],
+        );
+        painted
     }
 }

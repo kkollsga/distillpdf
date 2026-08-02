@@ -22,7 +22,6 @@ pub(crate) mod tess_synth;
 #[cfg(feature = "tesseract")]
 pub mod tesseract;
 
-use base64::Engine as _;
 use lopdf::{Document, ObjectId};
 
 /// The page's main raster (largest placed image): standard image bytes (PNG/JPEG) plus
@@ -44,41 +43,16 @@ pub(crate) fn page_main_image(doc: &Document, page_id: ObjectId) -> Option<(Vec<
 
 /// Decode the base64 payload of a `data:...;base64,XXXX` URI.
 fn data_uri_bytes(uri: &str) -> Option<Vec<u8>> {
-    let comma = uri.find(',')?;
-    base64::engine::general_purpose::STANDARD.decode(uri[comma + 1..].as_bytes()).ok()
+    crate::textutil::decode_data_uri(uri).map(|(bytes, _)| bytes)
 }
 
-/// Page size in PDF points, resolving an inherited MediaBox (default US-Letter).
+/// Page size in PDF points, from the one page-box walker ([`crate::pdfobj::page_box`]):
+/// `/MediaBox` then `/CropBox`, inherited up `/Parent`, indirect extents resolved. Defaults
+/// to [`crate::pdfobj::DEFAULT_PAGE_PTS`] only when the document states no box at all.
 pub(crate) fn page_size_pts(doc: &Document, page_id: ObjectId) -> (f32, f32) {
-    fn f(doc: &Document, o: &lopdf::Object) -> f32 {
-        match o {
-            lopdf::Object::Integer(i) => *i as f32,
-            lopdf::Object::Real(r) => *r,
-            lopdf::Object::Reference(id) => doc.get_object(*id).map(|x| f(doc, x)).unwrap_or(0.0),
-            _ => 0.0,
-        }
-    }
-    fn mediabox(doc: &Document, id: ObjectId, depth: u8) -> Option<[f32; 4]> {
-        if depth > 12 {
-            return None;
-        }
-        let dict = doc.get_object(id).ok()?.as_dict().ok()?;
-        if let Ok(mb) = dict.get(b"MediaBox") {
-            let arr = match mb {
-                lopdf::Object::Array(a) => a.clone(),
-                lopdf::Object::Reference(r) => doc.get_object(*r).ok()?.as_array().ok()?.clone(),
-                _ => return None,
-            };
-            if arr.len() == 4 {
-                return Some([f(doc, &arr[0]), f(doc, &arr[1]), f(doc, &arr[2]), f(doc, &arr[3])]);
-            }
-        }
-        let parent = dict.get(b"Parent").ok()?.as_reference().ok()?;
-        mediabox(doc, parent, depth + 1)
-    }
-    match mediabox(doc, page_id, 0) {
+    match crate::pdfobj::page_box(doc, page_id) {
         Some([x0, y0, x1, y1]) => ((x1 - x0).abs().max(1.0), (y1 - y0).abs().max(1.0)),
-        None => (612.0, 792.0),
+        None => crate::pdfobj::DEFAULT_PAGE_PTS,
     }
 }
 
@@ -100,4 +74,38 @@ pub fn detect_language(text: &str) -> Option<String> {
         _ => return None,
     };
     Some(code.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The owned page-box fixture (`tests/gen_fixtures.py::gen_indirect_mediabox`).
+    fn box_fixture() -> Document {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/indirect_mediabox.pdf");
+        Document::load(path).expect("indirect_mediabox.pdf fixture must load")
+    }
+
+    #[test]
+    fn page_size_resolves_an_inherited_media_box_with_indirect_entries() {
+        let doc = box_fixture();
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        assert_eq!(page_size_pts(&doc, page_id), (1008.0, 612.0));
+    }
+
+    #[test]
+    fn page_size_falls_back_to_the_crop_box() {
+        // A page stating only a /CropBox (no /MediaBox anywhere up the tree) reported
+        // US-Letter, so every OCR bbox mapped onto it was scaled from the wrong page.
+        let doc = box_fixture();
+        let page_id = *doc.get_pages().get(&2).expect("fixture has page 2");
+        assert_eq!(page_size_pts(&doc, page_id), (400.0, 650.0), "/CropBox is the spec fallback");
+    }
+
+    #[test]
+    fn page_size_defaults_to_letter_when_no_box_exists_anywhere() {
+        // Degrade, never panic or return zero: a dangling page id has no box at all.
+        let doc = box_fixture();
+        assert_eq!(page_size_pts(&doc, (9_999, 0)), crate::pdfobj::DEFAULT_PAGE_PTS);
+    }
 }

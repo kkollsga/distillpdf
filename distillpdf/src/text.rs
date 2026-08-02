@@ -5,6 +5,9 @@
 //! ourselves, decode show-text operators through each font's ToUnicode CMap, and
 //! recover real Unicode — including 2-byte CID codes and diacritics.
 
+use crate::geom::Mat;
+use crate::pdfobj::{deref, num};
+use crate::walker::{descend_form, xobject_at, Descend, ScopePolicy, XMap};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -147,7 +150,7 @@ fn build_fonts_from_resources(doc: &Document, resources: &Dictionary, raw: &[u8]
 fn type1_encoding(doc: &Document, descriptor: Option<&Dictionary>) -> Option<HashMap<u32, String>> {
     let r = descriptor?.get(b"FontFile").ok().and_then(|o| o.as_reference().ok())?;
     let stream = doc.get_object(r).ok().and_then(|o| o.as_stream().ok())?;
-    let bytes = stream.decompressed_content().unwrap_or_else(|_| stream.content.clone());
+    let bytes = crate::pdfobj::content_bytes(stream);
     let end = bytes.windows(5).position(|w| w == b"eexec").unwrap_or(bytes.len());
     let text = String::from_utf8_lossy(&bytes[..end]);
     let toks: Vec<&str> = text.split_whitespace().collect();
@@ -186,7 +189,7 @@ fn font_info(doc: &Document, dict: &Dictionary, raw: &[u8]) -> FontInfo {
                     .get_object(r)
                     .ok()
                     .and_then(|o| o.as_stream().ok())
-                    .map(|s| s.decompressed_content().unwrap_or_else(|_| s.content.clone()))
+                    .map(|s| crate::pdfobj::content_bytes(s).into_owned())
                     .filter(|b| !b.is_empty());
                 let bytes = from_lopdf.or_else(|| recover_stream(raw, r.0))?;
                 Some(parse_tounicode(&bytes))
@@ -354,14 +357,6 @@ fn font_info(doc: &Document, dict: &Dictionary, raw: &[u8]) -> FontInfo {
     }
 }
 
-
-/// Dereference an object that may be an indirect reference.
-fn deref<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Object> {
-    match o {
-        Object::Reference(r) => doc.get_object(*r).ok(),
-        other => Some(other),
-    }
-}
 
 /// Parse a Type0 /W array: `[ c [w...] ]` and `[ c1 c2 w ]` forms.
 fn parse_cid_widths(w: &[Object], widths: &mut HashMap<u32, f32>) {
@@ -959,32 +954,6 @@ fn decode_words(elems: &[Show], font: Option<&FontInfo>, size: f32, tc: f32, tw:
 }
 
 /// 2x3 affine matrix (PDF row-vector convention): [a b c d e f].
-#[derive(Clone, Copy)]
-struct Mat {
-    a: f32,
-    b: f32,
-    c: f32,
-    d: f32,
-    e: f32,
-    f: f32,
-}
-impl Mat {
-    const ID: Mat = Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
-    fn mul(self, r: Mat) -> Mat {
-        Mat {
-            a: self.a * r.a + self.b * r.c,
-            b: self.a * r.b + self.b * r.d,
-            c: self.c * r.a + self.d * r.c,
-            d: self.c * r.b + self.d * r.d,
-            e: self.e * r.a + self.f * r.c + r.e,
-            f: self.e * r.b + self.f * r.d + r.f,
-        }
-    }
-    fn translate(tx: f32, ty: f32) -> Mat {
-        Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: tx, f: ty }
-    }
-}
-
 /// A positioned run of text (origin in PDF user space, y increases upward).
 #[derive(Clone)]
 pub struct Span {
@@ -1004,14 +973,6 @@ pub struct Span {
     pub font: u32,
 }
 
-fn num(o: &Object) -> f32 {
-    match o {
-        Object::Integer(i) => *i as f32,
-        Object::Real(r) => *r,
-        _ => 0.0,
-    }
-}
-
 /// Extract positioned text spans for one page via content-stream interpretation,
 /// recursing into the Form XObjects the page draws (`Do`). Body text rendered
 /// through a template/overlay form — the norm in e-filing bundles (SEI/PROJUDI/PJe,
@@ -1024,7 +985,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
         Err(_) => return Vec::new(),
     };
     let fonts = build_fonts(doc, page_id, raw);
-    let xmap = page_xobjects(doc, page_id);
+    let xmap = crate::walker::page_xobjects(doc, page_id);
     let mut spans = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
     decode_spans(doc, &content.operations, &fonts, &xmap, Mat::ID, raw, 0, &mut spans, &mut budget);
@@ -1032,19 +993,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
     spans
 }
 
-/// XObject name -> object id from a page's resources (the forms/images the page may
-/// `Do`). Mirrors `xobjects_of` but resolves the page's resource dict first.
-fn page_xobjects(doc: &Document, page_id: ObjectId) -> HashMap<Vec<u8>, ObjectId> {
-    let resources = match doc.get_page_resources(page_id) {
-        Ok((Some(d), _)) => d.clone(),
-        Ok((None, ids)) => match ids.first().and_then(|id| doc.get_dictionary(*id).ok()).cloned() {
-            Some(d) => d,
-            None => return HashMap::new(),
-        },
-        Err(_) => return HashMap::new(),
-    };
-    xobjects_of(doc, &resources)
-}
+
 
 /// Emit one positioned text span from a decoded word, resolving its device position
 /// from the text matrix and the graphics CTM (pure-translate / Y-flip / rotation
@@ -1121,7 +1070,7 @@ fn push_positioned_span(spans: &mut Vec<Span>, wtm: &Mat, ctm: &Mat, base_size: 
 /// Form XObjects on `Do`. `base` is the graphics CTM the stream is placed under
 /// (identity for the page; the form `/Matrix` × the invoking CTM for a nested form).
 #[allow(clippy::too_many_arguments)]
-fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashMap<Vec<u8>, FontInfo>, xmap: &HashMap<Vec<u8>, ObjectId>, base: Mat, raw: &[u8], depth: u32, spans: &mut Vec<Span>, budget: &mut crate::WalkBudget) {
+fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashMap<Vec<u8>, FontInfo>, xmap: &XMap, base: Mat, raw: &[u8], depth: u32, spans: &mut Vec<Span>, budget: &mut crate::WalkBudget) {
     let mut tm = Mat::ID;
     let mut tlm = Mat::ID;
     let mut leading = 0.0f32;
@@ -1244,42 +1193,25 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
             // through a template/overlay form is captured (placed under the form's
             // /Matrix and the CTM in effect at the `Do`). Inline images / non-Form
             // XObjects carry no text and are skipped.
-            "Do" if depth < crate::MAX_FORM_DEPTH => {
-                let id = match o.first().and_then(|x| x.as_name().ok()).and_then(|n| xmap.get(n)) {
-                    Some(&id) => id,
-                    None => continue,
-                };
-                let stream = match doc.get_object(id).and_then(|x| x.as_stream().cloned()) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                if stream.dict.get(b"Subtype").and_then(|x| x.as_name()).unwrap_or(b"") != b"Form" {
+            "Do" => {
+                let Some((_, stream)) = xobject_at(doc, xmap, o) else {
                     continue;
-                }
-                // Bill the descent before doing it: building the form's font map and
-                // decoding its stream dwarf a single operator's cost, and a form bomb pays
-                // exactly this per branch.
-                if !budget.spend(crate::FORM_DESCENT_COST + xmap.len() + fonts.len()) {
-                    return;
-                }
-                let fm = stream
-                    .dict
-                    .get(b"Matrix")
-                    .ok()
-                    .and_then(|x| x.as_array().ok())
-                    .filter(|a| a.len() >= 6)
-                    .map(|a| Mat { a: num(&a[0]), b: num(&a[1]), c: num(&a[2]), d: num(&a[3]), e: num(&a[4]), f: num(&a[5]) })
-                    .unwrap_or(Mat::ID);
-                // A form's fonts/XObjects live in its OWN /Resources (PDF spec: a form
-                // inherits the page's, never the invoking form's). Without Resources we
-                // can't resolve its fonts, so skip rather than mis-decode.
-                if let Some(fr) = stream.dict.get(b"Resources").ok().and_then(|x| deref(doc, x)).and_then(|x| x.as_dict().ok()).cloned() {
-                    let ff = build_fonts_from_resources(doc, &fr, raw);
-                    let fx = xobjects_of(doc, &fr);
-                    if let Ok(content) = lopdf::content::Content::decode(&stream.decompressed_content().unwrap_or_default()) {
-                        decode_spans(doc, &content.operations, &ff, &fx, fm.mul(ctm), raw, depth + 1, spans, budget);
-                    }
-                }
+                };
+                // `OwnOnly`: a form's fonts and XObjects live in its OWN /Resources (PDF
+                // 32000-1 §8.10.2 — it inherits the page's, never the invoking form's), and
+                // a form without one is skipped rather than decoded through some other
+                // scope's encoding. That is a deliberate policy difference from the raster
+                // and vector walks, which overlay the parent scope; see `walker::ScopePolicy`.
+                let f = match descend_form(doc, stream, xmap, ScopePolicy::OwnOnly, depth, budget, fonts.len()) {
+                    Descend::Into(f) => f,
+                    Descend::Skip => continue,
+                    Descend::Halt => return,
+                };
+                let ff = match &f.scope.resources {
+                    Some(fr) => build_fonts_from_resources(doc, fr, raw),
+                    None => continue, // unreachable under OwnOnly, which refuses a form without /Resources
+                };
+                decode_spans(doc, &f.ops, &ff, &f.scope.xobjects, f.matrix.mul(ctm), raw, depth + 1, spans, budget);
             }
             _ => {}
         }
@@ -1295,19 +1227,6 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
 fn dedup_coincident(spans: &mut Vec<Span>) {
     let mut seen = std::collections::HashSet::new();
     spans.retain(|s| seen.insert((s.x.round() as i32, s.y.round() as i32, s.text.clone())));
-}
-
-/// XObject name -> object id from a resources dict.
-fn xobjects_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, ObjectId> {
-    let mut map = HashMap::new();
-    if let Some(xd) = resources.get(b"XObject").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
-        for (name, val) in xd.iter() {
-            if let Ok(id) = val.as_reference() {
-                map.insert(name.clone(), id);
-            }
-        }
-    }
-    map
 }
 
 /// Effective span width (fall back to a char estimate if widths were absent).
@@ -1424,6 +1343,14 @@ pub fn xy_cut_order_opt(boxes: &[BBox], med: f32, tolerant: bool) -> Vec<usize> 
     order
 }
 
+/// How deep [`xy_cut`] may recurse before it stops splitting and emits the boxes in line
+/// order. A page-layout guard, **not** [`crate::MAX_FORM_DEPTH`]: the two govern unrelated
+/// recursions (whitespace-gutter subdivision vs. Form-XObject nesting) and share the value
+/// 40 by coincidence. Aliasing them would tie a layout heuristic to a DoS cap, so they stay
+/// separate constants — the structure test that forbids re-declared caps exempts this one by
+/// name for exactly that reason.
+const MAX_XY_CUT_DEPTH: u32 = 40;
+
 /// Recursive XY-cut: order box indices into human reading order by repeatedly
 /// splitting on the widest whitespace gutter.
 ///
@@ -1439,7 +1366,7 @@ pub fn xy_cut_order_opt(boxes: &[BBox], med: f32, tolerant: bool) -> Vec<usize> 
 /// has no vertical gap there — it gets peeled off by a horizontal cut first,
 /// after which the remaining body splits cleanly into columns.
 fn xy_cut(boxes: &[BBox], idx: Vec<usize>, med: f32, depth: u32, tolerant: bool, out: &mut Vec<usize>) {
-    if idx.len() <= 1 || depth >= 40 {
+    if idx.len() <= 1 || depth >= MAX_XY_CUT_DEPTH {
         out.extend(sorted_lines(boxes, idx, med));
         return;
     }
@@ -1663,7 +1590,7 @@ pub fn debug_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> String {
                     let dec = st.decompressed_content();
                     let raw_len = st.content.len();
                     let dec_len = dec.as_ref().map(|d| d.len() as i64).unwrap_or(-1);
-                    let used = dec.unwrap_or_else(|_| st.content.clone());
+                    let used = crate::pdfobj::content_bytes(&st);
                     let parsed = parse_tounicode(&used).len();
                     let sample: String = String::from_utf8_lossy(&used).chars().take(50).collect();
                     s += &format!(
@@ -1753,7 +1680,7 @@ mod tests {
         let (raw, doc, page_id) = adversarial("form_repeat.pdf");
         let content = doc.get_and_decode_page_content(page_id).expect("fixture page has content");
         let fonts = build_fonts(&doc, page_id, &raw);
-        let xmap = page_xobjects(&doc, page_id);
+        let xmap = crate::walker::page_xobjects(&doc, page_id);
         let mut spans = Vec::new();
         let mut budget = crate::WalkBudget::new(700);
         decode_spans(&doc, &content.operations, &fonts, &xmap, Mat::ID, &raw, 0, &mut spans, &mut budget);
@@ -1800,6 +1727,46 @@ mod tests {
         assert!(out.contains("Hello"), "subset font text lost: {out:?}");
         assert!(!out.contains("HelloA"), "unmapped CID 0x41 invented an 'A': {out:?}");
         assert!(!out.contains('A'), "no 'A' is drawn anywhere on this page: {out:?}");
+    }
+
+    #[test]
+    fn a_forms_indirect_matrix_places_its_text_where_the_page_puts_it() {
+        // `tests/gen_fixtures.py::gen_form_inherit`. The form's `/Matrix` is written as an
+        // indirect reference; read directly (`as_array()` on a `Reference` fails) it
+        // degraded to the identity, so every glyph inside the form landed 100 pt to the
+        // LEFT of its authored position — text that is present but in the wrong column,
+        // which reading order and figure attachment both then get wrong.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/form_inherit.pdf");
+        let raw = std::fs::read(path).expect("form_inherit.pdf fixture must exist");
+        let doc = Document::load_mem(&raw).expect("form_inherit.pdf fixture must load");
+        let pid = *doc.get_pages().get(&1).expect("fixture has page 1");
+        let spans = extract_spans(&doc, pid, &raw);
+        let s = spans.iter().find(|s| s.text.contains("INHERIT")).expect("the form's label");
+        assert!((s.x - 172.0).abs() < 1.0, "x {} (72 means the indirect /Matrix was lost)", s.x);
+    }
+
+    #[test]
+    fn a_form_stream_with_no_filter_still_shows_its_text() {
+        // `unfiltered_form.pdf` (`gen_fixtures.py::gen_unfiltered_form`): a label drawn inside
+        // a Form XObject whose stream carries NO /Filter. lopdf *errors* on
+        // `decompressed_content()` for such a stream, so `.unwrap_or_default()` fed the
+        // decoder zero bytes and every glyph inside the form disappeared — silently, and only
+        // on this walker and the vector one (extract/img carry the raw-bytes fallback).
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/unfiltered_form.pdf");
+        let raw = std::fs::read(path).expect("unfiltered_form.pdf fixture must exist");
+        let doc = Document::load_mem(&raw).expect("unfiltered_form.pdf fixture must load");
+        let pid = *doc.get_pages().get(&1).expect("fixture has page 1");
+        // The premise, asserted rather than assumed: the form really is unfiltered.
+        let form_id = crate::walker::page_xobjects(&doc, pid).get(b"UF".as_slice()).copied().expect("/UF form");
+        let form = doc.get_object(form_id).unwrap().as_stream().unwrap();
+        assert!(form.dict.get(b"Filter").is_err(), "the fixture's form must carry no /Filter");
+        assert!(form.decompressed_content().is_err(), "the premise: lopdf errors without /Filter");
+
+        let out = extract_page(&doc, pid, &raw).expect("page text");
+        assert!(out.contains("Unfiltered form ink"), "the form's own label is lost: {out:?}");
+        // The page-level text was never at risk — its presence proves the page decoded and
+        // only the form descent was dropping content.
+        assert!(out.contains("A Form Stream With No Filter"), "page-level text lost: {out:?}");
     }
 
     #[test]

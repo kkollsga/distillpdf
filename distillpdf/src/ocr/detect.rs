@@ -18,6 +18,7 @@
 
 use lopdf::{Document, Object, ObjectId};
 
+use crate::pdfobj::decode_text_string;
 use crate::text;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +134,9 @@ fn text_is_garbled(text: &str) -> bool {
     words >= 20 && novowel * 100 >= words * 18 // ≥18% vowel-less words
 }
 
-/// Read the document's Info /Producer (falling back to /Creator) as a lossy string.
+/// Read the document's Info /Producer (falling back to /Creator) as a PDF **text string**,
+/// via the one decoder ([`crate::pdfobj::decode_text_string`]) — UTF-16BE behind a BOM,
+/// PDFDocEncoding otherwise.
 fn doc_producer(doc: &Document) -> Option<String> {
     let info = doc.trailer.get(b"Info").ok()?;
     let dict = match info {
@@ -144,7 +147,7 @@ fn doc_producer(doc: &Document) -> Option<String> {
     for key in [b"Producer".as_slice(), b"Creator".as_slice()] {
         if let Ok(v) = dict.get(key) {
             if let Ok(bytes) = v.as_str() {
-                let s = decode_pdf_string(bytes);
+                let s = decode_text_string(bytes);
                 if !s.trim().is_empty() {
                     return Some(s);
                 }
@@ -152,16 +155,6 @@ fn doc_producer(doc: &Document) -> Option<String> {
         }
     }
     None
-}
-
-/// Decode a PDF text string: UTF-16BE if it carries a BOM, else Latin-1/lossy UTF-8.
-fn decode_pdf_string(b: &[u8]) -> String {
-    if b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF {
-        let u16s: Vec<u16> = b[2..].chunks(2).filter(|c| c.len() == 2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
-        String::from_utf16_lossy(&u16s)
-    } else {
-        String::from_utf8_lossy(b).into_owned()
-    }
 }
 
 #[cfg(test)]
@@ -237,6 +230,28 @@ mod tests {
         for ch in "Tesseract".encode_utf16() {
             b.extend_from_slice(&ch.to_be_bytes());
         }
-        assert!(looks_like_ocr_producer(&decode_pdf_string(&b)));
+        assert!(looks_like_ocr_producer(&decode_text_string(&b)));
+    }
+
+    #[test]
+    fn a_pdfdocencoding_producer_keeps_its_high_bytes() {
+        // The other half of `utf16be_producer_decodes`: a text string with NO BOM is
+        // PDFDocEncoding (PDF 32000-1 Annex D.2), not UTF-8. `from_utf8_lossy` replaced every
+        // 0x80-0xA0 byte with U+FFFD, so a producer that spells its own name with a ™ or a
+        // curly quote came back with holes in it.
+        assert_eq!(decode_text_string(b"distillPDF\x92 \x8Dfixture\x8E writer"), "distillPDF™ “fixture” writer");
+        // Latin-1 above 0xA0 is unchanged, and the ASCII-only path is untouched.
+        assert_eq!(decode_text_string(b"iText\xAE 5.4.1 \xA92000-2012"), "iText® 5.4.1 ©2000-2012");
+        assert_eq!(decode_text_string(b"Tesseract OCR 5.3"), "Tesseract OCR 5.3");
+    }
+
+    #[test]
+    fn the_producer_reader_decodes_a_real_files_info_dict() {
+        // End-to-end over the owned fixture, whose /Info /Producer is written in
+        // PDFDocEncoding with high bytes — proves `doc_producer` uses the shared decoder and
+        // not just that the decoder exists.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/pagelabels.pdf");
+        let doc = Document::load(path).expect("pagelabels.pdf fixture must load");
+        assert_eq!(doc_producer(&doc).as_deref(), Some("distillPDF™ “fixture” writer"));
     }
 }

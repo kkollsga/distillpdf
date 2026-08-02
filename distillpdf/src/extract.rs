@@ -3,8 +3,10 @@
 //! Pure Rust: these return plain owned structs. The PyO3 layer (`src/lib.rs`) assembles the
 //! Python dicts/lists from them — no pyo3 types appear in this module.
 
+use crate::pdfobj::{deref, filters_of, sub_dict};
+use crate::raster::{assemble_png, codec_payload, filter_to_format, image_bpc, image_color_space, normalized_jpeg_png};
 use crate::text::{self, Span};
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use lopdf::{Dictionary, Document, ObjectId};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
 /// One extracted raster image. Mirrors the dict `Pdf.extract_images` returns:
@@ -45,33 +47,11 @@ pub struct TableInfo {
     pub cells: Vec<Vec<String>>,
 }
 
-fn filter_to_format(filters: &Option<Vec<String>>) -> &'static str {
-    match filters {
-        Some(fs) => {
-            if fs.iter().any(|f| f == "DCTDecode") {
-                "jpeg"
-            } else if fs.iter().any(|f| f == "JPXDecode") {
-                "jpx"
-            } else if fs.iter().any(|f| f == "CCITTFaxDecode") {
-                "ccitt"
-            } else if fs.iter().any(|f| f == "JBIG2Decode") {
-                "jbig2"
-            } else {
-                "raw" // Flate/LZW/none: plain samples -> assemble_png turns most into "png"
-            }
-        }
-        None => "raw",
-    }
-}
-
-/// A sub-dictionary of `d` that may be written inline or as an indirect reference.
-fn sub_dict<'a>(doc: &'a Document, d: &'a Dictionary, key: &[u8]) -> Option<&'a Dictionary> {
-    d.get(key).ok().and_then(|o| resolve(doc, o)).and_then(|o| o.as_dict().ok())
-}
-
 /// Every resource dictionary a page can reach: its own `/Resources` (plus whatever it
 /// inherits from the page tree) and then, transitively, the `/Resources` of every
-/// `/Subtype /Form` XObject it references.
+/// `/Subtype /Form` XObject it references. Annotation appearance streams are **not**
+/// reached from here — they hang off `/Annots`, and [`appearance_resource_dicts`] is the
+/// walk that finds them.
 ///
 /// This is deliberately *not* what `img.rs` / `text.rs` do. Those are content-stream
 /// interpreters: they decode operators because they need placement (the CTM, the form's
@@ -86,7 +66,6 @@ fn sub_dict<'a>(doc: &'a Document, d: &'a Dictionary, key: &[u8]) -> Option<&'a 
 /// nested forms are appended breadth-first in `/XObject` dictionary order. A visited-
 /// `ObjectId` set cuts reference cycles; `crate::MAX_FORM_DEPTH` caps nesting.
 fn page_resource_dicts(doc: &Document, page_id: ObjectId) -> Vec<&Dictionary> {
-    let mut out: Vec<&Dictionary> = Vec::new();
     let mut queue: VecDeque<(&Dictionary, u32)> = VecDeque::new();
     let mut seen: HashSet<ObjectId> = HashSet::new();
 
@@ -105,7 +84,45 @@ fn page_resource_dicts(doc: &Document, page_id: ObjectId) -> Vec<&Dictionary> {
             }
         }
     }
+    resource_bfs(doc, queue, &mut seen)
+}
 
+/// Every resource dictionary reachable from an annotation's **appearance stream**
+/// (`/Annots` → `/AP` → `/N`), transitively through the Form XObjects it references.
+///
+/// An appearance stream hangs off the annotation, not off the page's `/Resources` — so
+/// nothing [`page_resource_dicts`] reaches can ever name an image that lives only in a
+/// stamp's or a widget's appearance. `extract_images` appends these dictionaries **after**
+/// the page's own, which is why every `(page, index)` a page already reported is unchanged
+/// and appearance rows land at the end.
+///
+/// `extract_fonts` deliberately does **not** consume this — see its doc comment.
+fn appearance_resource_dicts(doc: &Document, page_id: ObjectId) -> Vec<&Dictionary> {
+    let mut queue: VecDeque<(&Dictionary, u32)> = VecDeque::new();
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    for (id, stream) in crate::walker::appearance_streams(doc, page_id) {
+        if !seen.insert(id) {
+            continue; // one appearance stream shared by several annotations
+        }
+        // §12.5.5: an appearance stream's resources are its OWN — it inherits nothing from
+        // the page, the same rule the nested-form step below applies.
+        if let Some(fr) = sub_dict(doc, &stream.dict, b"Resources") {
+            queue.push_back((fr, 0));
+        }
+    }
+    resource_bfs(doc, queue, &mut seen)
+}
+
+/// The shared body of both resource walks: drain `queue` breadth-first, appending each
+/// dictionary and then queueing the own-`/Resources` of every `/Subtype /Form` XObject it
+/// names. `seen` cuts reference cycles (and is pre-seeded by the caller with whatever it
+/// has already visited); [`crate::MAX_FORM_DEPTH`] caps nesting.
+fn resource_bfs<'a>(
+    doc: &'a Document,
+    mut queue: VecDeque<(&'a Dictionary, u32)>,
+    seen: &mut HashSet<ObjectId>,
+) -> Vec<&'a Dictionary> {
+    let mut out: Vec<&Dictionary> = Vec::new();
     while let Some((res, depth)) = queue.pop_front() {
         out.push(res);
         if depth >= crate::MAX_FORM_DEPTH {
@@ -135,40 +152,25 @@ fn page_resource_dicts(doc: &Document, page_id: ObjectId) -> Vec<&Dictionary> {
     out
 }
 
-/// Overlay one resource dictionary's `/XObject` entries onto a name → object-id map.
-/// Later overlays win, so a nearer scope (the form's own resources, the page's own
-/// dictionary) shadows an outer one — the same precedence the renderer uses.
-fn overlay_xobjects(doc: &Document, res: &Dictionary, map: &mut std::collections::HashMap<Vec<u8>, ObjectId>) {
-    let Some(xd) = sub_dict(doc, res, b"XObject") else {
-        return;
-    };
-    for (name, val) in xd.iter() {
-        if let Ok(id) = val.as_reference() {
-            map.insert(name.clone(), id);
-        }
-    }
-}
-
-/// A content stream's bytes, decompressed when it carries a `/Filter`.
-fn content_bytes(stream: &lopdf::Stream) -> std::borrow::Cow<'_, [u8]> {
-    if stream.dict.get(b"Filter").is_err() {
-        return std::borrow::Cow::Borrowed(&stream.content);
-    }
-    match stream.decompressed_content() {
-        Ok(b) => std::borrow::Cow::Owned(b),
-        Err(_) => std::borrow::Cow::Borrowed(&stream.content),
-    }
-}
-
 /// Collect the image XObjects invoked by `Do` in this operator list, descending into the
 /// `/Subtype /Form` XObjects the stream actually invokes (a form's content can `Do`
 /// further XObjects). `xmap` is the resource scope in force: a form starts from its
-/// parent's map with its own `/Resources` overlaid, so an unqualified `/Im0` resolves to
+/// parent's map with its own `/Resources` overlaid
+/// ([`crate::walker::ScopePolicy::OverlayParent`]), so an unqualified `/Im0` resolves to
 /// *that* form's `/Im0` and not a sibling's.
+///
+/// This is the one walk that is a **collector**, not a renderer, and the difference is
+/// load-bearing. It answers "which images exist on this page", so a form already walked
+/// contributes nothing new and is skipped by `seen` — which also bounds the recursion, and
+/// is why this walk takes no [`crate::WalkBudget`]: with a visited set the work is bounded
+/// by the number of distinct forms, so the budget the three renderers need (they must
+/// repaint a repeated form and therefore cannot dedupe) would only risk truncating a
+/// legitimately huge document. It composes `walker`'s descent pieces rather than calling
+/// `walker::descend_form`, which is the budgeted composition.
 fn walk_drawn(
     doc: &Document,
     ops: &[lopdf::content::Operation],
-    xmap: &std::collections::HashMap<Vec<u8>, ObjectId>,
+    xmap: &crate::walker::XMap,
     depth: u32,
     seen: &mut HashSet<ObjectId>,
     out: &mut HashSet<ObjectId>,
@@ -177,32 +179,26 @@ fn walk_drawn(
         if op.operator != "Do" {
             continue;
         }
-        let Some(Object::Name(name)) = op.operands.first() else {
-            continue;
+        let Some((id, stream)) = crate::walker::xobject_at(doc, xmap, &op.operands) else {
+            continue; // not a name, a dangling name, or not a stream: nothing to draw
         };
-        let Some(&id) = xmap.get(name.as_slice()) else {
-            continue; // dangling name: nothing in scope to draw
-        };
-        let Ok(stream) = doc.get_object(id).and_then(|o| o.as_stream()) else {
-            continue;
-        };
-        match stream.dict.get(b"Subtype").and_then(|o| o.as_name()).unwrap_or(b"") {
+        match crate::walker::subtype_of(stream) {
             b"Image" => {
                 out.insert(id);
             }
             b"Form" => {
-                if depth >= crate::MAX_FORM_DEPTH {
-                    continue; // nesting cap
+                if crate::walker::too_deep(depth) {
+                    continue; // the one nesting cap
                 }
                 if !seen.insert(id) {
                     continue; // a form already walked on this page: cycle / repeat guard
                 }
-                let mut child = xmap.clone();
-                if let Some(fr) = sub_dict(doc, &stream.dict, b"Resources") {
-                    overlay_xobjects(doc, fr, &mut child);
-                }
-                if let Ok(c) = lopdf::content::Content::decode(&content_bytes(stream)) {
-                    walk_drawn(doc, &c.operations, &child, depth + 1, seen, out);
+                let Some(scope) = crate::walker::form_scope(doc, stream, xmap, crate::walker::ScopePolicy::OverlayParent)
+                else {
+                    continue;
+                };
+                if let Some(ops) = crate::walker::form_ops(stream) {
+                    walk_drawn(doc, &ops, &scope.xobjects, depth + 1, seen, out);
                 }
             }
             _ => {}
@@ -220,20 +216,25 @@ fn walk_drawn(
 /// `Do` operands decide membership and [`page_resource_dicts`] is left to do what it is
 /// good at: resolving a name to an object and fixing the report order.
 ///
+/// A page's **annotation appearances** are walked too, each as a form in its own right:
+/// `/Annots → /AP /N` is a content stream a viewer paints onto the page, and it is not
+/// reachable from the page's content stream or its `/Resources`. Its names resolve in its
+/// own `/Resources` alone ([`crate::walker::ScopePolicy::OwnOnly`], §12.5.5).
+///
 /// `None` when the page's content stream can't be read or parsed at all — the caller then
 /// falls back to plain reachability rather than silently reporting an image-less page.
 fn drawn_images(doc: &Document, page_id: ObjectId) -> Option<HashSet<ObjectId>> {
-    let mut xmap: std::collections::HashMap<Vec<u8>, ObjectId> = std::collections::HashMap::new();
+    let mut xmap = crate::walker::XMap::new();
     if let Ok((own, inherited)) = doc.get_page_resources(page_id) {
         // `inherited` runs page → parent → …; apply it outermost-first so the nearest
         // scope wins, then the page's own inline dictionary last of all.
         for id in inherited.iter().rev() {
             if let Ok(d) = doc.get_dictionary(*id) {
-                overlay_xobjects(doc, d, &mut xmap);
+                crate::walker::overlay_xobjects(doc, d, &mut xmap);
             }
         }
         if let Some(d) = own {
-            overlay_xobjects(doc, d, &mut xmap);
+            crate::walker::overlay_xobjects(doc, d, &mut xmap);
         }
     }
     let content = doc.get_page_content(page_id).ok()?;
@@ -241,457 +242,26 @@ fn drawn_images(doc: &Document, page_id: ObjectId) -> Option<HashSet<ObjectId>> 
     let mut out = HashSet::new();
     let mut seen = HashSet::new();
     walk_drawn(doc, &ops.operations, &xmap, 0, &mut seen, &mut out);
+    for (id, ap) in crate::walker::appearance_streams(doc, page_id) {
+        if !seen.insert(id) {
+            continue; // shared between annotations, or already reached from the content
+        }
+        let Some(scope) = crate::walker::form_scope(doc, ap, &crate::walker::XMap::new(), crate::walker::ScopePolicy::OwnOnly)
+        else {
+            continue; // no /Resources: nothing its names could resolve against
+        };
+        if let Some(ops) = crate::walker::form_ops(ap) {
+            // The appearance stream is itself one form level below the page's content.
+            walk_drawn(doc, &ops, &scope.xobjects, 1, &mut seen, &mut out);
+        }
+    }
     Some(out)
 }
 
-/// Cap on colour-space indirection (`/CS0 → [/Indexed [/ICCBased …] …]`, and the cyclic
-/// resource dictionary a hostile file can write).
-const MAX_CS_DEPTH: u32 = 8;
-
-/// Resolve a `/ColorSpace` value to the object that actually describes the space.
-///
-/// Two things make the declared value not be that object already, and both were why
-/// `color_space` came back `None` for 971 of 2604 corpus images:
-///   * it is written as an **indirect reference** (`/ColorSpace 42 0 R`), and
-///   * per PDF 32000-1 §8.6.3 an image may name a space *defined in the resource
-///     dictionary's `/ColorSpace` sub-dictionary* (`/ColorSpace /CS0`) rather than a
-///     device space, so the name has to be looked up in `res` before it means anything.
-fn resolve_cs<'a>(doc: &'a Document, res: &'a Dictionary, o: &'a Object, depth: u32) -> Option<&'a Object> {
-    if depth > MAX_CS_DEPTH {
-        return None;
-    }
-    match o {
-        Object::Reference(r) => resolve_cs(doc, res, doc.get_object(*r).ok()?, depth + 1),
-        Object::Name(n) if !is_builtin_cs_name(n) => {
-            match sub_dict(doc, res, b"ColorSpace").and_then(|d| d.get(n.as_slice()).ok()) {
-                Some(v) => resolve_cs(doc, res, v, depth + 1),
-                None => Some(o), // no such resource: report the name verbatim, honestly
-            }
-        }
-        other => Some(other),
-    }
-}
-
-/// Names that mean a space in themselves (so they are never resource lookups).
-fn is_builtin_cs_name(n: &[u8]) -> bool {
-    matches!(
-        n,
-        b"DeviceGray" | b"DeviceRGB" | b"DeviceCMYK" | b"G" | b"RGB" | b"CMYK" | b"Pattern"
-    )
-}
-
-/// PDF's abbreviated inline-image colour-space names spelled out in full.
-fn canonical_cs_name(n: &[u8]) -> String {
-    match n {
-        b"G" => "DeviceGray".to_string(),
-        b"RGB" => "DeviceRGB".to_string(),
-        b"CMYK" => "DeviceCMYK".to_string(),
-        b"I" => "Indexed".to_string(),
-        other => String::from_utf8_lossy(other).into_owned(),
-    }
-}
-
-/// The image's colour-space **family** name (`DeviceRGB`, `ICCBased`, `Indexed`, …),
-/// after [`resolve_cs`]. The family is what pymupdf reports too; the component count an
-/// `ICCBased`/`Indexed` space implies is what [`cs_model`] derives for PNG assembly.
-fn image_color_space(doc: &Document, res: &Dictionary, dict: &Dictionary) -> Option<String> {
-    match resolve_cs(doc, res, dict.get(b"ColorSpace").ok()?, 0)? {
-        Object::Name(n) => Some(canonical_cs_name(n)),
-        Object::Array(a) => {
-            let head = resolve(doc, a.first()?)?.as_name().ok()?;
-            Some(canonical_cs_name(head))
-        }
-        _ => None,
-    }
-}
-
-/// A colour space reduced to what PNG assembly needs: how many samples make a pixel and
-/// how those samples become RGB. Spaces we cannot faithfully reduce (`Lab`, `Separation`,
-/// `DeviceN`, `Pattern`) are deliberately absent — their rows keep `format:"raw"` rather
-/// than being handed back as a plausible-looking wrong colour.
-enum Cs {
-    Gray,
-    Rgb,
-    Cmyk,
-    /// Palette space: one index sample per pixel into `lookup`, `base`-many bytes each.
-    Indexed { base: Box<Cs>, lookup: Vec<u8> },
-}
-
-impl Cs {
-    fn components(&self) -> usize {
-        match self {
-            Cs::Gray => 1,
-            Cs::Rgb => 3,
-            Cs::Cmyk => 4,
-            Cs::Indexed { .. } => 1,
-        }
-    }
-    /// True when the space is achromatic, so the PNG can be 8-bit grayscale.
-    fn is_gray(&self) -> bool {
-        match self {
-            Cs::Gray => true,
-            Cs::Indexed { base, .. } => base.is_gray(),
-            _ => false,
-        }
-    }
-}
-
-fn cs_model(doc: &Document, res: &Dictionary, o: &Object, depth: u32) -> Option<Cs> {
-    if depth > MAX_CS_DEPTH {
-        return None;
-    }
-    match resolve_cs(doc, res, o, 0)? {
-        Object::Name(n) => match n.as_slice() {
-            b"DeviceGray" | b"G" | b"CalGray" => Some(Cs::Gray),
-            b"DeviceRGB" | b"RGB" | b"CalRGB" => Some(Cs::Rgb),
-            b"DeviceCMYK" | b"CMYK" => Some(Cs::Cmyk),
-            _ => None,
-        },
-        Object::Array(a) => match resolve(doc, a.first()?)?.as_name().ok()? {
-            // An ICC profile's `/N` is the component count — the whole point of reading it.
-            b"ICCBased" => match resolve(doc, a.get(1)?)?.as_stream().ok()?.dict.get(b"N").ok()?.as_i64().ok()? {
-                1 => Some(Cs::Gray),
-                3 => Some(Cs::Rgb),
-                4 => Some(Cs::Cmyk),
-                _ => None,
-            },
-            b"CalGray" => Some(Cs::Gray),
-            b"CalRGB" => Some(Cs::Rgb),
-            b"Indexed" | b"I" => {
-                let base = cs_model(doc, res, a.get(1)?, depth + 1)?;
-                if matches!(base, Cs::Indexed { .. }) {
-                    return None; // an Indexed base is illegal (§8.6.6.3); don't guess
-                }
-                let lookup = match resolve(doc, a.get(3)?)? {
-                    Object::String(s, _) => s.clone(),
-                    Object::Stream(st) => st.decompressed_content().unwrap_or_else(|_| st.content.clone()),
-                    _ => return None,
-                };
-                Some(Cs::Indexed { base: Box::new(base), lookup })
-            }
-            _ => None, // Lab / Separation / DeviceN / Pattern: not reducible to RGB here
-        },
-        _ => None,
-    }
-}
-
-/// Per-dimension and total-pixel ceilings, mirroring `img.rs`: a malformed or hostile
-/// stream can declare an enormous `/Width`×`/Height`, and assembly allocates from those.
-const MAX_ASSEMBLE_DIM: i64 = 0x1FFFF;
-const MAX_ASSEMBLE_PIXELS: usize = 64 << 20;
-
-/// The `/Decode` array as floats, when it has the 2·n entries the sample layout needs.
-fn decode_array(doc: &Document, dict: &Dictionary, n: usize) -> Option<Vec<f32>> {
-    let a = resolve(doc, dict.get(b"Decode").ok()?)?.as_array().ok()?;
-    if a.len() != n * 2 {
-        return None;
-    }
-    a.iter()
-        .map(|o| match o {
-            Object::Integer(i) => Some(*i as f32),
-            Object::Real(r) => Some(*r),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Assemble a real PNG file from an image XObject's *samples* — the `format:"raw"` case
-/// (Flate/LZW/uncompressed), which is 1167 of 2604 corpus rows and none of which opened
-/// as an image file before: the caller got back compressed samples with no container.
-///
-/// Handles 1/2/4/8/16 bits per component, the `/Decode` array, `/ImageMask` stencils, and
-/// Gray/RGB/CMYK/ICCBased/Indexed colour spaces. Returns `None` — leaving the row at
-/// `format:"raw"` with its (now complete) metadata — for anything it cannot reduce
-/// faithfully, rather than emitting a confidently wrong picture.
-fn assemble_png(doc: &Document, res: &Dictionary, stream: &lopdf::Stream, w: i64, h: i64) -> Option<Vec<u8>> {
-    let dict = &stream.dict;
-    if w <= 0 || h <= 0 || w > MAX_ASSEMBLE_DIM || h > MAX_ASSEMBLE_DIM {
-        return None;
-    }
-    let (wu, hu) = (w as usize, h as usize);
-    if wu.checked_mul(hu)? > MAX_ASSEMBLE_PIXELS {
-        return None;
-    }
-    // A stencil mask has no colour space and exactly one 1-bit sample per pixel (§8.9.6.2).
-    let is_mask = dict.get(b"ImageMask").and_then(|o| o.as_bool()).unwrap_or(false);
-    let (cs, bpc) = if is_mask {
-        (Cs::Gray, 1i64)
-    } else {
-        let cs = cs_model(doc, res, dict.get(b"ColorSpace").ok()?, 0)?;
-        let bpc = image_bpc(doc, dict)?;
-        (cs, bpc)
-    };
-    if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
-        return None;
-    }
-    let (bpc, nc) = (bpc as usize, cs.components());
-
-    let samples = content_bytes(stream);
-    // Rows are padded to a byte boundary (§8.9.5.1).
-    let stride = (wu.checked_mul(nc)?.checked_mul(bpc)?).div_ceil(8);
-    if stride == 0 || samples.len() < stride.checked_mul(hu)? {
-        return None; // truncated stream: reassembling it would fabricate pixels
-    }
-
-    let maxval = ((1u32 << bpc) - 1) as f32;
-    let decode = decode_array(doc, dict, nc);
-    let gray_out = cs.is_gray();
-    let out_ch = if gray_out { 1 } else { 3 };
-    let mut out: Vec<u8> = Vec::new();
-    out.try_reserve_exact(wu.checked_mul(hu)?.checked_mul(out_ch)?).ok()?;
-
-    // One pixel's colour-space samples, reused per pixel to avoid a per-pixel allocation.
-    let mut comp = vec![0u8; nc.max(4)];
-    for row in samples.chunks_exact(stride).take(hu) {
-        for x in 0..wu {
-            for (j, slot) in comp.iter_mut().enumerate().take(nc) {
-                let raw = sample_at(row, x * nc + j, bpc);
-                *slot = match &cs {
-                    // An index is an index: the default /Decode for Indexed is
-                    // [0 2^bpc-1], i.e. the raw value, and a non-default one remaps the
-                    // index range rather than a colour intensity.
-                    Cs::Indexed { .. } => match &decode {
-                        Some(d) => (d[0] + raw as f32 * (d[1] - d[0]) / maxval).round().clamp(0.0, 255.0) as u8,
-                        None => raw.min(255) as u8,
-                    },
-                    _ => {
-                        let v = match &decode {
-                            Some(d) => d[2 * j] + raw as f32 * (d[2 * j + 1] - d[2 * j]) / maxval,
-                            None => raw as f32 / maxval,
-                        };
-                        (v.clamp(0.0, 1.0) * 255.0).round() as u8
-                    }
-                };
-            }
-            let px: &[u8] = match &cs {
-                Cs::Indexed { base, lookup } => {
-                    let bn = base.components();
-                    let off = (comp[0] as usize) * bn;
-                    match lookup.get(off..off + bn) {
-                        Some(s) => s,
-                        None => &[0u8; 4][..bn], // index past the palette: black, per §8.6.6.3
-                    }
-                }
-                _ => &comp[..nc],
-            };
-            let base_cs: &Cs = match &cs {
-                Cs::Indexed { base, .. } => base,
-                other => other,
-            };
-            match base_cs {
-                Cs::Gray => out.push(px[0]),
-                Cs::Rgb => out.extend_from_slice(&px[..3]),
-                Cs::Cmyk => {
-                    let k = 255 - px[3] as u16;
-                    for c in &px[..3] {
-                        out.push(((255 - *c as u16) * k / 255) as u8);
-                    }
-                }
-                Cs::Indexed { .. } => return None, // excluded above
-            }
-        }
-    }
-
-    let img = if gray_out {
-        image::DynamicImage::ImageLuma8(image::GrayImage::from_raw(w as u32, h as u32, out)?)
-    } else {
-        image::DynamicImage::ImageRgb8(image::RgbImage::from_raw(w as u32, h as u32, out)?)
-    };
-    png_bytes(img)
-}
-
-/// The `i`-th `bpc`-bit sample of a packed row.
-fn sample_at(row: &[u8], i: usize, bpc: usize) -> u32 {
-    match bpc {
-        8 => row[i] as u32,
-        16 => ((row[2 * i] as u32) << 8) | row[2 * i + 1] as u32,
-        _ => {
-            let bit = i * bpc;
-            let shift = 8 - bpc - (bit % 8);
-            ((row[bit / 8] >> shift) as u32) & ((1u32 << bpc) - 1)
-        }
-    }
-}
-
-/// Encode to a PNG file. Same writer `img.rs` uses for the HTML data URIs — the `image`
-/// crate — so an assembled `extract_images()` blob and an embedded `<img>` agree.
-fn png_bytes(img: image::DynamicImage) -> Option<Vec<u8>> {
-    let mut out = std::io::Cursor::new(Vec::new());
-    img.write_to(&mut out, image::ImageFormat::Png).ok()?;
-    Some(out.into_inner())
-}
-
-/// Generic (non-codec) compression an image codec can be wrapped in, e.g.
-/// `[/FlateDecode /DCTDecode]` — a JPEG stored Flate-compressed.
-fn is_generic_filter(f: &str) -> bool {
-    matches!(f, "FlateDecode" | "Fl" | "LZWDecode" | "LZW" | "ASCII85Decode" | "A85" | "ASCIIHexDecode" | "AHx")
-}
-
-/// The codec payload of a coded image (`jpeg`/`jpx`/`ccitt`/`jbig2`): the stream bytes
-/// with any leading generic compression peeled off, so a Flate-wrapped JPEG is handed
-/// back as a JPEG file and not as a blob nothing can open.
-fn codec_payload(stream: &lopdf::Stream, filters: &[String]) -> Vec<u8> {
-    let lead: Vec<Object> = filters
-        .iter()
-        .take_while(|f| is_generic_filter(f))
-        .map(|f| Object::Name(f.as_bytes().to_vec()))
-        .collect();
-    if lead.is_empty() {
-        return stream.content.clone();
-    }
-    let mut s = stream.clone();
-    s.dict.set("Filter", Object::Array(lead));
-    s.dict.remove(b"DecodeParms"); // codec parms don't apply to the generic layers
-    s.dict.remove(b"DP");
-    s.decompressed_content().unwrap_or_else(|_| stream.content.clone())
-}
-
-/// True when the image dict carries an inverting `/Decode` array (`[1 0 …]`).
-fn decode_inverts(doc: &Document, dict: &Dictionary) -> bool {
-    match dict.get(b"Decode").ok().and_then(|o| resolve(doc, o)) {
-        Some(Object::Array(a)) if a.len() >= 2 => {
-            let n = |o: &Object| match o {
-                Object::Integer(i) => *i as f32,
-                Object::Real(r) => *r,
-                _ => 0.0,
-            };
-            n(&a[0]) > n(&a[1])
-        }
-        _ => false,
-    }
-}
-
-/// Component count from a JPEG's SOF (start-of-frame) marker, without decoding pixels.
-/// `4` => CMYK/YCCK, `3` => RGB/YCbCr, `1` => grayscale.
-fn jpeg_components(buf: &[u8]) -> Option<u8> {
-    let mut i = 2; // skip SOI
-    while i + 4 <= buf.len() {
-        if buf[i] != 0xFF {
-            i += 1;
-            continue;
-        }
-        let marker = buf[i + 1];
-        if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
-            i += 2; // standalone marker, no length field
-            continue;
-        }
-        let len = ((buf[i + 2] as usize) << 8) | buf[i + 3] as usize;
-        // SOF0/1/2/3, 5/6/7, 9/10/11, 13/14/15 carry the frame header; DHT/DAC/DNL don't.
-        if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) && i + 9 < buf.len() {
-            return Some(buf[i + 9]); // marker(2) len(2) precision(1) height(2) width(2) Nf(1)
-        }
-        if marker == 0xDA {
-            break; // SOS
-        }
-        i += 2 + len;
-    }
-    None
-}
-
-/// Decode a `DCTDecode` payload to RGB8 under **PDF** semantics, which are not the
-/// standalone-JPEG-file semantics every general-purpose decoder implements.
-///
-/// A JPEG file that carries an Adobe APP14 marker and four components is, by the
-/// standalone convention, stored with inverted CMYK — so libjpeg-derived decoders (PIL,
-/// `jpeg-decoder`) complement all four channels on the way out. PDF says something else:
-/// §7.4.8 makes the filter's output the *sample values*, with the APP14 transform byte
-/// selecting only the colour transform (0 none, 1 YCbCr, 2 YCCK), and polarity handled
-/// explicitly by the image dict's `/Decode` array — which is exactly why Distiller writes
-/// `/Decode [1 0 1 0 1 0 1 0]` next to a Photoshop CMYK JPEG.
-///
-/// So the decoder's complement has to be undone before `/Decode` is applied, and a
-/// document that omits `/Decode` (as `med_crispr_sicklecell_pmc.pdf` does) is the case
-/// where handing the raw stream to a consumer silently produced the wrong colour: its
-/// 873×116 image read as RGB `(110,116,52)` at (0,0) where the page renders `(17,12,75)`,
-/// and its 138×54 logo read black on a white corner.
-///
-/// `jpeg-decoder` complements both of its 4-component paths (`color_convert_line_cmyk`
-/// and the `255 - k` in `color_convert_line_ycck`), so one rule covers CMYK and YCCK.
-/// The 1- and 3-component paths do not complement, hence the opposite sense there.
-fn decode_dct_rgb(buf: &[u8], decode_inv: bool) -> Option<image::RgbImage> {
-    let mut dec = jpeg_decoder::Decoder::new(std::io::Cursor::new(buf));
-    // Read the frame header and reject absurd dimensions BEFORE decoding pixels: a hostile
-    // JPEG can declare a huge frame and force a giant allocation.
-    dec.read_info().ok()?;
-    let info = dec.info()?;
-    let (w, h) = (info.width as usize, info.height as usize);
-    if w == 0 || h == 0 || w > MAX_ASSEMBLE_DIM as usize || h > MAX_ASSEMBLE_DIM as usize || w * h > MAX_ASSEMBLE_PIXELS {
-        return None;
-    }
-    let px = dec.decode().ok()?;
-    let (w, h) = (w as u32, h as u32);
-    use jpeg_decoder::PixelFormat::*;
-    match dec.info()?.pixel_format {
-        L8 => {
-            let g = image::GrayImage::from_raw(w, h, maybe_invert(px, decode_inv))?;
-            Some(image::DynamicImage::ImageLuma8(g).to_rgb8())
-        }
-        L16 => None,
-        RGB24 => image::RgbImage::from_raw(w, h, maybe_invert(px, decode_inv)),
-        CMYK32 => {
-            let n = (w as usize) * (h as usize);
-            let mut rgb = Vec::new();
-            rgb.try_reserve_exact(n * 3).ok()?;
-            for i in 0..n {
-                let c = |j: usize| {
-                    let v = px[i * 4 + j];
-                    if decode_inv {
-                        v
-                    } else {
-                        255 - v
-                    }
-                };
-                let k = 255 - c(3) as u16;
-                for j in 0..3 {
-                    rgb.push(((255 - c(j) as u16) * k / 255) as u8);
-                }
-            }
-            image::RgbImage::from_raw(w, h, rgb)
-        }
-    }
-}
-
-fn maybe_invert(mut px: Vec<u8>, invert: bool) -> Vec<u8> {
-    if invert {
-        for v in &mut px {
-            *v = 255 - *v;
-        }
-    }
-    px
-}
-
-/// A normalized PNG for a JPEG whose bytes a consumer would decode to the wrong colour:
-/// a 4-component (CMYK/YCCK) stream, or any stream with an inverting `/Decode` the JPEG
-/// file itself cannot express. Everything else keeps its lossless JPEG passthrough.
-fn normalized_jpeg_png(doc: &Document, dict: &Dictionary, jpeg: &[u8]) -> Option<Vec<u8>> {
-    let decode_inv = decode_inverts(doc, dict);
-    if jpeg_components(jpeg) != Some(4) && !decode_inv {
-        return None;
-    }
-    png_bytes(image::DynamicImage::ImageRgb8(decode_dct_rgb(jpeg, decode_inv)?))
-}
-
-/// `/BitsPerComponent`, or the value the spec implies when the key is absent.
-fn image_bpc(doc: &Document, dict: &Dictionary) -> Option<i64> {
-    dict.get(b"BitsPerComponent")
-        .ok()
-        .and_then(|o| resolve(doc, o))
-        .and_then(|o| o.as_i64().ok())
-        // A stencil mask is 1-bit by definition and may omit the key (§8.9.6.2).
-        .or_else(|| dict.get(b"ImageMask").and_then(|o| o.as_bool()).unwrap_or(false).then_some(1))
-}
-
-/// The `/Filter` chain as names, in application order.
+/// The `/Filter` chain as display names, in application order — the `String` view of
+/// [`pdfobj::filters_of`] that [`ImageInfo::filters`] reports.
 fn image_filters(dict: &Dictionary) -> Vec<String> {
-    match dict.get(b"Filter") {
-        Ok(Object::Array(a)) => a
-            .iter()
-            .filter_map(|o| o.as_name().ok())
-            .map(|n| String::from_utf8_lossy(n).into_owned())
-            .collect(),
-        Ok(Object::Name(n)) => vec![String::from_utf8_lossy(n).into_owned()],
-        _ => Vec::new(),
-    }
+    filters_of(dict).iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect()
 }
 
 /// Extract images from all pages as owned [`ImageInfo`] rows.
@@ -705,7 +275,14 @@ fn image_filters(dict: &Dictionary) -> Vec<String> {
 /// image in the document on every page.
 ///
 /// [`page_resource_dicts`] still drives enumeration, so the reported `(page, index)`
-/// ordering is unchanged wherever the drawn set equals the reachable set.
+/// ordering is unchanged wherever the drawn set equals the reachable set; the annotation
+/// appearances ([`appearance_resource_dicts`]) are enumerated after it, so an image that
+/// exists only inside a stamp's or a widget's `/AP /N` stream is reported at the end.
+/// An appearance image that the page's resource tree *also* reaches (a producer sharing one
+/// `/Resources` across the file) is reported from there instead, at its ordinary place in
+/// resource-dictionary order — an annotation appearance widens the **drawn set**, and a
+/// newly-drawn image takes the index its enumeration position gives it, exactly like any
+/// other.
 ///
 /// `data` is a blob the caller can open, not the verbatim stream: a coded image is peeled
 /// back to its codec payload (so a `[/FlateDecode /DCTDecode]` stream is a JPEG file, not
@@ -724,7 +301,11 @@ pub fn extract_images(doc: &Document) -> Vec<ImageInfo> {
         // before this walk existed is unchanged.
         let mut seen: HashSet<ObjectId> = HashSet::new();
         let mut from_this_dict: Vec<ObjectId> = Vec::new();
-        for res in page_resource_dicts(doc, page_id) {
+        // The page's own resource tree first, so every `(page, index)` a page already
+        // reported keeps it; the annotation appearances are appended after.
+        let mut dicts = page_resource_dicts(doc, page_id);
+        dicts.extend(appearance_resource_dicts(doc, page_id));
+        for res in dicts {
             seen.extend(from_this_dict.drain(..));
             let Some(xobjects) = sub_dict(doc, res, b"XObject") else {
                 continue;
@@ -757,7 +338,7 @@ pub fn extract_images(doc: &Document) -> Vec<ImageInfo> {
                 // sample block is assembled into a PNG, and stays `raw` — with the
                 // metadata to reassemble it by hand — only when it cannot be.
                 let mut data = if format == "raw" {
-                    match assemble_png(doc, res, stream, width, height) {
+                    match assemble_png(doc, res, stream) {
                         Some(png) => {
                             format = "png";
                             png
@@ -765,7 +346,7 @@ pub fn extract_images(doc: &Document) -> Vec<ImageInfo> {
                         None => stream.content.clone(),
                     }
                 } else {
-                    codec_payload(stream, &filters)
+                    codec_payload(stream).into_owned()
                 };
                 // A CMYK JPEG is decoded to the wrong colours by every consumer that reads
                 // it as a standalone file, so it is normalized rather than passed through.
@@ -1622,31 +1203,23 @@ pub fn extract_tables(doc: &Document, raw: &[u8]) -> Vec<TableInfo> {
     out
 }
 
-/// Resolve an object that may be a direct value or an indirect reference.
-fn resolve<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Object> {
-    match obj {
-        Object::Reference(r) => doc.get_object(*r).ok(),
-        other => Some(other),
-    }
-}
-
 /// Does this font dict (or its descendant) carry an embedded font program?
 fn font_embedded(doc: &Document, dict: &Dictionary) -> bool {
     // Type0: descriptor lives on the descendant font.
     let descriptor = dict
         .get(b"FontDescriptor")
         .ok()
-        .and_then(|o| resolve(doc, o))
+        .and_then(|o| deref(doc, o))
         .or_else(|| {
             dict.get(b"DescendantFonts")
                 .ok()
-                .and_then(|o| resolve(doc, o))
+                .and_then(|o| deref(doc, o))
                 .and_then(|o| o.as_array().ok())
                 .and_then(|a| a.first())
-                .and_then(|o| resolve(doc, o))
+                .and_then(|o| deref(doc, o))
                 .and_then(|o| o.as_dict().ok())
                 .and_then(|dd| dd.get(b"FontDescriptor").ok())
-                .and_then(|o| resolve(doc, o))
+                .and_then(|o| deref(doc, o))
         });
     match descriptor.and_then(|o| o.as_dict().ok()) {
         Some(d) => {
@@ -1664,6 +1237,15 @@ fn font_embedded(doc: &Document, dict: &Dictionary) -> bool {
 /// (and inherited) `/Resources` and stops there: an astro-ph preprint in the corpus whose
 /// page `/Resources` carries an empty `/Font <<>>` and puts all content in `/TPL*` forms
 /// returned zero rows for all 166 pages, and ~22 of 54 documents missed fonts partially.
+///
+/// **Annotation appearance streams are deliberately not enumerated here**, unlike
+/// [`extract_images`]. The reference this pillar is measured against does not report them
+/// either: `fw9_form.pdf` in the corpus has eight `/Widget` annotations whose appearance
+/// streams set `/ZaDb` (ZapfDingbats, the checkbox tick) from their own `/Resources`, and
+/// pymupdf's `get_fonts()` returns the same six page fonts we do — not seven. A font a
+/// widget uses to draw its own tick is a property of the form field, not of the page's
+/// text, and adding it would put this pillar *ahead* of the parity target rather than at
+/// it. [`appearance_resource_dicts`] exists and is one call away if that verdict changes.
 pub fn extract_fonts(doc: &Document) -> Vec<FontInfo> {
     let mut out = Vec::new();
     for (&pno, &page_id) in &doc.get_pages() {
@@ -1679,7 +1261,7 @@ pub fn extract_fonts(doc: &Document) -> Vec<FontInfo> {
                 continue;
             };
             for (name, v) in fdict.iter() {
-                let Some(dict) = resolve(doc, v).and_then(|o| o.as_dict().ok()) else {
+                let Some(dict) = deref(doc, v).and_then(|o| o.as_dict().ok()) else {
                     continue;
                 };
                 fonts.entry((name.clone(), v.as_reference().ok())).or_insert(dict);
@@ -1858,6 +1440,47 @@ mod tests {
             .map(|x| x.iter().count())
             .sum();
         assert_eq!(reachable, 5, "page + form resources list 3 + 2 XObject entries");
+    }
+
+    #[test]
+    fn images_that_exist_only_in_an_annotation_appearance_are_reported() {
+        // `/Annots -> /AP /N` is a content stream nothing in this crate used to walk, so an
+        // image inside a stamp's or a widget's appearance was reported by nobody.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/annot_appearance.pdf");
+        let doc = Document::load(path).expect("annot_appearance.pdf fixture must load");
+        let dims: Vec<(u32, usize, i64, i64)> =
+            extract_images(&doc).iter().map(|i| (i.page, i.index, i.width, i.height)).collect();
+        assert_eq!(
+            dims,
+            vec![(1, 0, 40, 30), (1, 1, 10, 10), (1, 2, 12, 12), (1, 3, 15, 15), (1, 4, 16, 16)],
+            "the page's own image keeps index 0; the appearances are appended after it"
+        );
+        // What must NOT be there, and why each would be a different bug:
+        let sizes: Vec<i64> = extract_images(&doc).iter().map(|i| i.width).collect();
+        assert!(!sizes.contains(&11), "11x11 sits in the appearance's /Resources but is never drawn");
+        assert!(!sizes.contains(&13), "13x13 is the appearance state /AS did NOT select");
+        assert!(!sizes.contains(&14), "14x14 belongs to a HIDDEN (/F bit 2) annotation");
+    }
+
+    #[test]
+    fn appearance_stream_fonts_stay_out_of_the_font_report() {
+        // The deliberate asymmetry with `extract_images`, pinned so it cannot drift: a
+        // widget's own tick font is a property of the form field, and the parity reference
+        // (pymupdf `get_fonts()`) does not report it either. `annot_appearance.pdf` has no
+        // appearance fonts, so this checks the mechanism on the resource walk instead.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/annot_appearance.pdf");
+        let doc = Document::load(path).expect("annot_appearance.pdf fixture must load");
+        let page1 = *doc.get_pages().get(&1).expect("page 1");
+        assert_eq!(
+            page_resource_dicts(&doc, page1).len(),
+            1,
+            "extract_fonts sees the page's own /Resources only — no appearance dictionary"
+        );
+        assert_eq!(
+            appearance_resource_dicts(&doc, page1).len(),
+            4,
+            "stamp + /AS-selected state + both un-selected-/AS states; the hidden annot contributes none"
+        );
     }
 
     /// `tests/gen_fixtures.py::gen_colorspace_images` — Flate rasters in the four colour

@@ -26,7 +26,7 @@
 //! an `el_group` so they regroup into the single `<ul>/<ol>` / `<aside>` they came from; and
 //! `block.text` is the element's minimal inline HTML. One structure, two faces.
 
-use crate::html::{self, Bbox, ElKind, Mode, PageElement, PageIR};
+use crate::html::{self, ElKind, Mode, PageElement, PageIR};
 use crate::links::OutlineEntry;
 use crate::markdown::{self, ImgMode};
 
@@ -101,7 +101,7 @@ fn elements_from_blocks(blocks: &[&Block]) -> Vec<PageElement> {
                     && blocks[i].el_group == group
                 {
                     items.push(blocks[i].text.clone());
-                    bbox = bbox_union(bbox, blocks[i].bbox);
+                    bbox = html::bbox_union(bbox, blocks[i].bbox);
                     i += 1;
                 }
                 out.push(PageElement::at(ElKind::List { ordered, items }, bbox));
@@ -115,7 +115,7 @@ fn elements_from_blocks(blocks: &[&Block]) -> Vec<PageElement> {
                     && blocks[i].el_group == group
                 {
                     notes.push(blocks[i].text.clone());
-                    bbox = bbox_union(bbox, blocks[i].bbox);
+                    bbox = html::bbox_union(bbox, blocks[i].bbox);
                     i += 1;
                 }
                 out.push(PageElement::at(ElKind::Footnotes { notes }, bbox));
@@ -162,11 +162,6 @@ fn elements_from_blocks(blocks: &[&Block]) -> Vec<PageElement> {
         }
     }
     out
-}
-
-/// Union two bboxes (re-exported shape of `html::bbox_union`, used by the list/footnote regroup).
-fn bbox_union(a: Option<Bbox>, b: Option<Bbox>) -> Option<Bbox> {
-    html::bbox_union(a, b)
 }
 
 /// Reconstruct the PDF's own outline (`/Outlines`) from the model's `toc`, for the `assemble`
@@ -273,40 +268,8 @@ pub fn extract_text(model: &DocModel) -> String {
 /// tag boundary MUST become a token boundary so adjacent table cells / blocks
 /// (`<td>A</td><td>B</td>`) read as separate words `A B`, matching `extract_text`'s tokens.
 fn visible_text(html: &str) -> String {
-    let mut s = String::with_capacity(html.len());
-    let mut intag = false;
-    for c in html.chars() {
-        match c {
-            '<' => {
-                intag = true;
-                s.push(' ');
-            }
-            '>' => intag = false,
-            _ if !intag => s.push(c),
-            _ => {}
-        }
-    }
-    let s = s
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'");
-    // collapse runs of whitespace to single spaces.
-    let mut out = String::with_capacity(s.len());
-    let mut prev_ws = false;
-    for c in s.chars() {
-        if c.is_whitespace() {
-            if !prev_ws {
-                out.push(' ');
-            }
-            prev_ws = true;
-        } else {
-            out.push(c);
-            prev_ws = false;
-        }
-    }
-    out
+    use crate::textutil::{collapse_ws, strip_tags, unescape_entities, TagBreak};
+    collapse_ws(&unescape_entities(&strip_tags(html, TagBreak::SpaceAtOpen)))
 }
 
 /// Remove `<svg>…</svg>` subtrees (verbatim, balanced) from a body fragment.
@@ -333,14 +296,23 @@ mod tests {
     use crate::model::{Block, BlockKind, Coverage, Indexes, Metadata, Page, Source, NATIVE_CONFIDENCE, SCHEMA_VERSION};
     use std::collections::BTreeMap;
 
+    #[test]
+    fn an_escaped_entity_in_extracted_text_stops_being_double_unescaped() {
+        // `visible_text` ran `&amp;` FIRST, so `&amp;lt;` decoded to `<` — `extract_text`
+        // handed back markup where the document held the literal text `&lt;`.
+        assert_eq!(visible_text("<p>&amp;lt;</p>"), " &lt; ");
+        assert_eq!(visible_text("<td>A</td><td>B</td>"), " A B ", "a tag boundary is a token boundary");
+        assert_eq!(visible_text("<p>A &amp; B</p>"), " A & B ");
+    }
+
     /// A model built from BLOCKS (the render source of truth, post-`body_html`). Pages carry
     /// geometry only; render rebuilds the page-element IR from the per-page blocks.
     fn model_with_blocks(npages: u32, blocks: Vec<Block>) -> DocModel {
         let pages = (1..=npages)
             .map(|n| Page {
                 n,
-                width_pts: 612.0,
-                height_pts: 792.0,
+                width_pts: crate::pdfobj::DEFAULT_PAGE_PTS.0,
+                height_pts: crate::pdfobj::DEFAULT_PAGE_PTS.1,
                 labels: BTreeMap::new(),
                 ocr_decision: None,
                 active_ocr_pass: None,
