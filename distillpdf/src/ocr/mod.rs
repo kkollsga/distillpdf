@@ -22,6 +22,7 @@ pub(crate) mod tess_synth;
 #[cfg(feature = "tesseract")]
 pub mod tesseract;
 
+use crate::pdfobj::num_deref;
 use base64::Engine as _;
 use lopdf::{Document, ObjectId};
 
@@ -50,14 +51,6 @@ fn data_uri_bytes(uri: &str) -> Option<Vec<u8>> {
 
 /// Page size in PDF points, resolving an inherited MediaBox (default US-Letter).
 pub(crate) fn page_size_pts(doc: &Document, page_id: ObjectId) -> (f32, f32) {
-    fn f(doc: &Document, o: &lopdf::Object) -> f32 {
-        match o {
-            lopdf::Object::Integer(i) => *i as f32,
-            lopdf::Object::Real(r) => *r,
-            lopdf::Object::Reference(id) => doc.get_object(*id).map(|x| f(doc, x)).unwrap_or(0.0),
-            _ => 0.0,
-        }
-    }
     fn mediabox(doc: &Document, id: ObjectId, depth: u8) -> Option<[f32; 4]> {
         if depth > 12 {
             return None;
@@ -70,7 +63,7 @@ pub(crate) fn page_size_pts(doc: &Document, page_id: ObjectId) -> (f32, f32) {
                 _ => return None,
             };
             if arr.len() == 4 {
-                return Some([f(doc, &arr[0]), f(doc, &arr[1]), f(doc, &arr[2]), f(doc, &arr[3])]);
+                return Some([num_deref(doc, &arr[0]), num_deref(doc, &arr[1]), num_deref(doc, &arr[2]), num_deref(doc, &arr[3])]);
             }
         }
         let parent = dict.get(b"Parent").ok()?.as_reference().ok()?;

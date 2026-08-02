@@ -3,6 +3,7 @@
 //! Pure Rust: these return plain owned structs. The PyO3 layer (`src/lib.rs`) assembles the
 //! Python dicts/lists from them — no pyo3 types appear in this module.
 
+use crate::pdfobj::{content_bytes, deref, filters_of};
 use crate::text::{self, Span};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -66,7 +67,7 @@ fn filter_to_format(filters: &Option<Vec<String>>) -> &'static str {
 
 /// A sub-dictionary of `d` that may be written inline or as an indirect reference.
 fn sub_dict<'a>(doc: &'a Document, d: &'a Dictionary, key: &[u8]) -> Option<&'a Dictionary> {
-    d.get(key).ok().and_then(|o| resolve(doc, o)).and_then(|o| o.as_dict().ok())
+    d.get(key).ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok())
 }
 
 /// Every resource dictionary a page can reach: its own `/Resources` (plus whatever it
@@ -146,17 +147,6 @@ fn overlay_xobjects(doc: &Document, res: &Dictionary, map: &mut std::collections
         if let Ok(id) = val.as_reference() {
             map.insert(name.clone(), id);
         }
-    }
-}
-
-/// A content stream's bytes, decompressed when it carries a `/Filter`.
-fn content_bytes(stream: &lopdf::Stream) -> std::borrow::Cow<'_, [u8]> {
-    if stream.dict.get(b"Filter").is_err() {
-        return std::borrow::Cow::Borrowed(&stream.content);
-    }
-    match stream.decompressed_content() {
-        Ok(b) => std::borrow::Cow::Owned(b),
-        Err(_) => std::borrow::Cow::Borrowed(&stream.content),
     }
 }
 
@@ -298,7 +288,7 @@ fn image_color_space(doc: &Document, res: &Dictionary, dict: &Dictionary) -> Opt
     match resolve_cs(doc, res, dict.get(b"ColorSpace").ok()?, 0)? {
         Object::Name(n) => Some(canonical_cs_name(n)),
         Object::Array(a) => {
-            let head = resolve(doc, a.first()?)?.as_name().ok()?;
+            let head = deref(doc, a.first()?)?.as_name().ok()?;
             Some(canonical_cs_name(head))
         }
         _ => None,
@@ -347,9 +337,9 @@ fn cs_model(doc: &Document, res: &Dictionary, o: &Object, depth: u32) -> Option<
             b"DeviceCMYK" | b"CMYK" => Some(Cs::Cmyk),
             _ => None,
         },
-        Object::Array(a) => match resolve(doc, a.first()?)?.as_name().ok()? {
+        Object::Array(a) => match deref(doc, a.first()?)?.as_name().ok()? {
             // An ICC profile's `/N` is the component count — the whole point of reading it.
-            b"ICCBased" => match resolve(doc, a.get(1)?)?.as_stream().ok()?.dict.get(b"N").ok()?.as_i64().ok()? {
+            b"ICCBased" => match deref(doc, a.get(1)?)?.as_stream().ok()?.dict.get(b"N").ok()?.as_i64().ok()? {
                 1 => Some(Cs::Gray),
                 3 => Some(Cs::Rgb),
                 4 => Some(Cs::Cmyk),
@@ -362,7 +352,7 @@ fn cs_model(doc: &Document, res: &Dictionary, o: &Object, depth: u32) -> Option<
                 if matches!(base, Cs::Indexed { .. }) {
                     return None; // an Indexed base is illegal (§8.6.6.3); don't guess
                 }
-                let lookup = match resolve(doc, a.get(3)?)? {
+                let lookup = match deref(doc, a.get(3)?)? {
                     Object::String(s, _) => s.clone(),
                     Object::Stream(st) => st.decompressed_content().unwrap_or_else(|_| st.content.clone()),
                     _ => return None,
@@ -382,7 +372,7 @@ const MAX_ASSEMBLE_PIXELS: usize = 64 << 20;
 
 /// The `/Decode` array as floats, when it has the 2·n entries the sample layout needs.
 fn decode_array(doc: &Document, dict: &Dictionary, n: usize) -> Option<Vec<f32>> {
-    let a = resolve(doc, dict.get(b"Decode").ok()?)?.as_array().ok()?;
+    let a = deref(doc, dict.get(b"Decode").ok()?)?.as_array().ok()?;
     if a.len() != n * 2 {
         return None;
     }
@@ -548,7 +538,7 @@ fn codec_payload(stream: &lopdf::Stream, filters: &[String]) -> Vec<u8> {
 
 /// True when the image dict carries an inverting `/Decode` array (`[1 0 …]`).
 fn decode_inverts(doc: &Document, dict: &Dictionary) -> bool {
-    match dict.get(b"Decode").ok().and_then(|o| resolve(doc, o)) {
+    match dict.get(b"Decode").ok().and_then(|o| deref(doc, o)) {
         Some(Object::Array(a)) if a.len() >= 2 => {
             let n = |o: &Object| match o {
                 Object::Integer(i) => *i as f32,
@@ -675,23 +665,16 @@ fn normalized_jpeg_png(doc: &Document, dict: &Dictionary, jpeg: &[u8]) -> Option
 fn image_bpc(doc: &Document, dict: &Dictionary) -> Option<i64> {
     dict.get(b"BitsPerComponent")
         .ok()
-        .and_then(|o| resolve(doc, o))
+        .and_then(|o| deref(doc, o))
         .and_then(|o| o.as_i64().ok())
         // A stencil mask is 1-bit by definition and may omit the key (§8.9.6.2).
         .or_else(|| dict.get(b"ImageMask").and_then(|o| o.as_bool()).unwrap_or(false).then_some(1))
 }
 
-/// The `/Filter` chain as names, in application order.
+/// The `/Filter` chain as display names, in application order — the `String` view of
+/// [`pdfobj::filters_of`] that [`ImageInfo::filters`] reports.
 fn image_filters(dict: &Dictionary) -> Vec<String> {
-    match dict.get(b"Filter") {
-        Ok(Object::Array(a)) => a
-            .iter()
-            .filter_map(|o| o.as_name().ok())
-            .map(|n| String::from_utf8_lossy(n).into_owned())
-            .collect(),
-        Ok(Object::Name(n)) => vec![String::from_utf8_lossy(n).into_owned()],
-        _ => Vec::new(),
-    }
+    filters_of(dict).iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect()
 }
 
 /// Extract images from all pages as owned [`ImageInfo`] rows.
@@ -1622,31 +1605,23 @@ pub fn extract_tables(doc: &Document, raw: &[u8]) -> Vec<TableInfo> {
     out
 }
 
-/// Resolve an object that may be a direct value or an indirect reference.
-fn resolve<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Object> {
-    match obj {
-        Object::Reference(r) => doc.get_object(*r).ok(),
-        other => Some(other),
-    }
-}
-
 /// Does this font dict (or its descendant) carry an embedded font program?
 fn font_embedded(doc: &Document, dict: &Dictionary) -> bool {
     // Type0: descriptor lives on the descendant font.
     let descriptor = dict
         .get(b"FontDescriptor")
         .ok()
-        .and_then(|o| resolve(doc, o))
+        .and_then(|o| deref(doc, o))
         .or_else(|| {
             dict.get(b"DescendantFonts")
                 .ok()
-                .and_then(|o| resolve(doc, o))
+                .and_then(|o| deref(doc, o))
                 .and_then(|o| o.as_array().ok())
                 .and_then(|a| a.first())
-                .and_then(|o| resolve(doc, o))
+                .and_then(|o| deref(doc, o))
                 .and_then(|o| o.as_dict().ok())
                 .and_then(|dd| dd.get(b"FontDescriptor").ok())
-                .and_then(|o| resolve(doc, o))
+                .and_then(|o| deref(doc, o))
         });
     match descriptor.and_then(|o| o.as_dict().ok()) {
         Some(d) => {
@@ -1679,7 +1654,7 @@ pub fn extract_fonts(doc: &Document) -> Vec<FontInfo> {
                 continue;
             };
             for (name, v) in fdict.iter() {
-                let Some(dict) = resolve(doc, v).and_then(|o| o.as_dict().ok()) else {
+                let Some(dict) = deref(doc, v).and_then(|o| o.as_dict().ok()) else {
                     continue;
                 };
                 fonts.entry((name.clone(), v.as_reference().ok())).or_insert(dict);

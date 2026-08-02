@@ -28,6 +28,7 @@ mod img;
 mod layout;
 mod links;
 mod nav;
+mod pdfobj;
 mod postprocess;
 mod profile;
 mod text;

@@ -12,6 +12,7 @@
 //! Named destinations are resolved via the catalog `/Dests` dict and the
 //! `/Names /Dests` name tree.
 
+use crate::pdfobj::{decode_text_string, deref, num};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -27,21 +28,6 @@ pub struct Link {
     pub remote_file: Option<String>,
 }
 
-fn deref<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Object> {
-    match o {
-        Object::Reference(r) => doc.get_object(*r).ok(),
-        other => Some(other),
-    }
-}
-
-fn num(o: &Object) -> f32 {
-    match o {
-        Object::Integer(i) => *i as f32,
-        Object::Real(r) => *r,
-        _ => 0.0,
-    }
-}
-
 fn pdf_string(o: &Object) -> Option<String> {
     match o {
         Object::String(b, _) => Some(String::from_utf8_lossy(b).into_owned()),
@@ -54,47 +40,16 @@ fn pdf_string(o: &Object) -> Option<String> {
 /// legacy platform keys. Decoded as PDF text so UTF-16BE `/UF` values come out readable.
 fn file_spec(doc: &Document, o: &Object) -> Option<String> {
     match deref(doc, o)? {
-        Object::String(b, _) => Some(decode_pdf_text(b)),
+        Object::String(b, _) => Some(decode_text_string(b)),
         Object::Dictionary(d) => [&b"UF"[..], b"F", b"DOS", b"Mac", b"Unix"].iter().find_map(|k| {
             d.get(k).ok().and_then(|v| deref(doc, v)).and_then(|v| match v {
-                Object::String(b, _) => Some(decode_pdf_text(b)),
+                Object::String(b, _) => Some(decode_text_string(b)),
                 _ => None,
             })
         }),
         _ => None,
     }
     .filter(|s| !s.trim().is_empty())
-}
-
-/// A single PDFDocEncoding high byte (0x80–0xFF) → char. This is the encoding PDF text
-/// strings use when they are not UTF-16BE (PDF spec Annex D.2). NOTE it is NOT cp1252:
-/// e.g. 0x85 is EN DASH here (ellipsis in cp1252), 0x84 EM DASH, 0x8D/0x8E curly double
-/// quotes. ASCII (<0x80) and Latin-1 (0xA1–0xFF) map to the same code point; 0xA0 = €.
-fn pdfdoc_char(c: u8) -> char {
-    match c {
-        0x80 => '\u{2022}', 0x81 => '\u{2020}', 0x82 => '\u{2021}', 0x83 => '\u{2026}',
-        0x84 => '\u{2014}', 0x85 => '\u{2013}', 0x86 => '\u{0192}', 0x87 => '\u{2044}',
-        0x88 => '\u{2039}', 0x89 => '\u{203A}', 0x8A => '\u{2212}', 0x8B => '\u{2030}',
-        0x8C => '\u{201E}', 0x8D => '\u{201C}', 0x8E => '\u{201D}', 0x8F => '\u{2018}',
-        0x90 => '\u{2019}', 0x91 => '\u{201A}', 0x92 => '\u{2122}', 0x93 => '\u{FB01}',
-        0x94 => '\u{FB02}', 0x95 => '\u{0141}', 0x96 => '\u{0152}', 0x97 => '\u{0160}',
-        0x98 => '\u{0178}', 0x99 => '\u{017D}', 0x9A => '\u{0131}', 0x9B => '\u{0142}',
-        0x9C => '\u{0153}', 0x9D => '\u{0161}', 0x9E => '\u{017E}', 0x9F => '\u{FFFD}',
-        0xA0 => '\u{20AC}',
-        _ => c as char, // ASCII (<0x80) and Latin-1 (0xA1–0xFF) map to the same code point
-    }
-}
-
-/// Decode a PDF text string (outline titles, etc.): UTF-16BE when it carries a BE BOM,
-/// otherwise PDFDocEncoding. `from_utf8_lossy` mangles both — UTF-16 (NUL bytes) and the
-/// PDFDocEncoding high range — so titles need this.
-fn decode_pdf_text(b: &[u8]) -> String {
-    if b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF {
-        let u16s: Vec<u16> = b[2..].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
-        String::from_utf16_lossy(&u16s)
-    } else {
-        b.iter().map(|&c| pdfdoc_char(c)).collect()
-    }
 }
 
 /// Resolve a destination value (explicit `[pageRef /XYZ …]` array, or a dict with
@@ -133,6 +88,9 @@ fn resolve_dest(
 ) -> (Option<u32>, Option<String>) {
     match dest {
         Object::Array(_) => (dest_to_page(doc, dest, page_no), None),
+        // A destination NAME is a byte string used as a name-tree KEY, not a PDF text
+        // string: it must be read verbatim (never through `pdfobj::decode_text_string`)
+        // or it stops matching the `/Dests` entry it names. Lossy is correct here.
         Object::Name(n) | Object::String(n, _) => (
             named.get(n).copied(),
             Some(String::from_utf8_lossy(n).into_owned()),
@@ -215,6 +173,7 @@ fn walk_name_tree_pos(doc: &Document, tree: &Dictionary, page_no: &HashMap<Objec
         while i + 1 < names.len() {
             if let Object::String(key, _) = &names[i] {
                 if let Some((p, y)) = dest_to_pos(doc, &names[i + 1], page_no) {
+                    // Name-tree key: a byte string, not a text string — see `resolve_dest`.
                     out.push(NamedDest { name: String::from_utf8_lossy(key).into_owned(), page: p, y });
                 }
             }
@@ -236,6 +195,7 @@ pub fn named_destinations(doc: &Document) -> Vec<NamedDest> {
     if let Some(dests) = cat.get(b"Dests").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
         for (k, v) in dests.iter() {
             if let Some((p, y)) = dest_to_pos(doc, v, &page_no) {
+                // `/Dests` key: a byte string, not a text string — see `resolve_dest`.
                 out.push(NamedDest { name: String::from_utf8_lossy(k).into_owned(), page: p, y });
             }
         }
@@ -335,7 +295,7 @@ fn walk_outline(
         // `/Title 5 0 R` pointing at a UTF-16BE string), so deref before matching —
         // without this the title decodes empty and the entry is dropped below.
         let title = match item.get(b"Title").ok().and_then(|o| deref(doc, o)) {
-            Some(Object::String(b, _)) => decode_pdf_text(b),
+            Some(Object::String(b, _)) => decode_text_string(b),
             _ => String::new(),
         };
         let (page, _y) = outline_dest(doc, &item, page_no, named);
@@ -414,6 +374,8 @@ pub fn extract_links(doc: &Document) -> Vec<Link> {
                     // A `/GoToR` destination addresses the REMOTE file: never resolve it
                     // against this document's pages or named-destination map.
                     dest_name = match act.get(b"D").ok().and_then(|o| deref(doc, o)) {
+                        // Byte string / name-tree key in the REMOTE file, not a text
+                        // string — see `resolve_dest`.
                         Some(Object::Name(n)) | Some(Object::String(n, _)) => {
                             Some(String::from_utf8_lossy(n).into_owned())
                         }

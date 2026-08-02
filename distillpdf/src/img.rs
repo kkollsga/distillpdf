@@ -3,6 +3,7 @@
 //! PNG assembly for Flate-encoded raster samples).
 
 use base64::Engine;
+use crate::pdfobj::{content_bytes, deref, filters_of, num};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -26,21 +27,6 @@ impl M {
             e: self.e * r.a + self.f * r.c + r.e,
             f: self.e * r.b + self.f * r.d + r.f,
         }
-    }
-}
-
-fn num(o: &Object) -> f32 {
-    match o {
-        Object::Integer(i) => *i as f32,
-        Object::Real(r) => *r,
-        _ => 0.0,
-    }
-}
-
-fn deref<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Object> {
-    match o {
-        Object::Reference(r) => doc.get_object(*r).ok(),
-        other => Some(other),
     }
 }
 
@@ -93,28 +79,6 @@ fn cs_channels(dict: &Dictionary, doc: &Document) -> Option<usize> {
             }
         }
         _ => None,
-    }
-}
-
-fn filters_of(dict: &Dictionary) -> Vec<Vec<u8>> {
-    match dict.get(b"Filter").ok() {
-        Some(Object::Name(n)) => vec![n.clone()],
-        Some(Object::Array(a)) => a.iter().filter_map(|o| o.as_name().ok().map(|n| n.to_vec())).collect(),
-        _ => vec![],
-    }
-}
-
-/// A content stream's decoded bytes. lopdf's `decompressed_content()` returns an error for an
-/// UNFILTERED stream (no `/Filter` key) — some producers store form XObject / content streams
-/// raw — so fall back to the verbatim content in that case (and on any decode error) rather
-/// than losing the stream.
-fn stream_content(stream: &lopdf::Stream) -> std::borrow::Cow<'_, [u8]> {
-    if stream.dict.get(b"Filter").is_err() {
-        return std::borrow::Cow::Borrowed(&stream.content);
-    }
-    match stream.decompressed_content() {
-        Ok(b) => std::borrow::Cow::Owned(b),
-        Err(_) => std::borrow::Cow::Borrowed(&stream.content),
     }
 }
 
@@ -739,7 +703,7 @@ fn walk(
                             child.insert(k, v);
                         }
                     }
-                    if let Ok(content) = lopdf::content::Content::decode(&stream_content(&stream)) {
+                    if let Ok(content) = lopdf::content::Content::decode(&content_bytes(&stream)) {
                         walk(doc, &content.operations, &child, form_ctm, out, depth + 1, budget);
                     }
                 }

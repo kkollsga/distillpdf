@@ -10,6 +10,7 @@
 //! Shadings / patterns / soft masks are out of scope here (skipped); text inside
 //! a figure stays in the normal text flow (it is extracted as spans elsewhere).
 
+use crate::pdfobj::{deref, num};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -40,14 +41,6 @@ impl M {
     /// Average linear scale factor (for converting line widths to device space).
     fn scale(self) -> f32 {
         (self.a * self.d - self.b * self.c).abs().sqrt()
-    }
-}
-
-fn num(o: &Object) -> f32 {
-    match o {
-        Object::Integer(i) => *i as f32,
-        Object::Real(r) => *r,
-        _ => 0.0,
     }
 }
 
@@ -434,13 +427,6 @@ const BAND_GAP: f32 = 24.0; // vertical gap that separates two figures
 // peaks at ~34k, so the old value cut real figures (a USGS cover map) out of the middle of the
 // distribution. A page over budget is truncated, never dropped (see `positioned_vectors_capped`).
 const MAX_OPS: usize = 600_000;
-
-fn deref<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Object> {
-    match o {
-        Object::Reference(r) => doc.get_object(*r).ok(),
-        other => Some(other),
-    }
-}
 
 /// XObject name -> object id (images AND forms) from a resources dict.
 fn xobjects_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, ObjectId> {

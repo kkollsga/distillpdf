@@ -5,6 +5,7 @@
 //! ourselves, decode show-text operators through each font's ToUnicode CMap, and
 //! recover real Unicode — including 2-byte CID codes and diacritics.
 
+use crate::pdfobj::{deref, num};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -354,14 +355,6 @@ fn font_info(doc: &Document, dict: &Dictionary, raw: &[u8]) -> FontInfo {
     }
 }
 
-
-/// Dereference an object that may be an indirect reference.
-fn deref<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Object> {
-    match o {
-        Object::Reference(r) => doc.get_object(*r).ok(),
-        other => Some(other),
-    }
-}
 
 /// Parse a Type0 /W array: `[ c [w...] ]` and `[ c1 c2 w ]` forms.
 fn parse_cid_widths(w: &[Object], widths: &mut HashMap<u32, f32>) {
@@ -1002,14 +995,6 @@ pub struct Span {
     pub angle: f32,
     /// Stable font-face id (see [`font_id_of`]); 0 = unknown.
     pub font: u32,
-}
-
-fn num(o: &Object) -> f32 {
-    match o {
-        Object::Integer(i) => *i as f32,
-        Object::Real(r) => *r,
-        _ => 0.0,
-    }
 }
 
 /// Extract positioned text spans for one page via content-stream interpretation,

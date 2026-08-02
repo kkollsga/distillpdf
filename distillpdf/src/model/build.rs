@@ -217,12 +217,10 @@ fn page_labels(doc: &Document, page_count: u32) -> BTreeMap<u32, String> {
     out
 }
 
-/// Resolve an object through a single indirection (the depth `/PageLabels` needs).
-fn resolve<'a>(doc: &'a Document, o: &'a Object) -> Option<Object> {
-    match o {
-        Object::Reference(id) => doc.get_object(*id).ok().cloned(),
-        other => Some(other.clone()),
-    }
+/// An OWNED resolve: [`pdfobj::deref`] plus the clone this walk needs (it re-borrows the
+/// document while holding the result, so a borrowed view will not do).
+fn resolve(doc: &Document, o: &Object) -> Option<Object> {
+    crate::pdfobj::deref(doc, o).cloned()
 }
 
 /// Lowercase/uppercase roman numeral for a PDF page label (1 → i/I, 4 → iv/IV, …).
