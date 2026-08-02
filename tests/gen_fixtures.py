@@ -1106,6 +1106,87 @@ def gen_clipped_raster():
     }
 
 
+def gen_smask_group_raster():
+    """The same raster drawn three times: whole, under an `/ExtGState /SMask` ALPHA group, and
+    under a LUMINOSITY group whose non-black `/BC` makes its extent no bound at all.
+
+    PDF 32000-1 §11.6.5.2 lets the graphics state carry a *soft mask*: the `/SMask /G` form is
+    rendered off-screen and its alpha (or luminosity) multiplies everything painted while the
+    state is in force. That is how a producer crops a render to a thumbnail window when the
+    window is not a path clip — and the crate's `gs` handling read `/ca`/`/CA` only, so the
+    raster painted at its full placement rect and covered the ink drawn after it.
+
+    Geometry is `gen_clipped_raster`'s, deliberately: same three 300x180 figures, the same
+    160x120 pt raster at (140, y0+30), the same 80x60 window — so the two fixtures pin the two
+    mechanisms (path clip / soft mask) against an identical expected answer.
+
+      TOP    (y 560-740): no `gs` — the control.
+      MID    (y 320-500): `/GA gs`, whose group paints one opaque 80x60 rect at (140, 350).
+                          The window is that rect; the placement is axis-aligned, so the
+                          SAMPLES are cropped exactly as the path-clip case is.
+      BOTTOM (y  80-260): `/GL gs`, a `/Luminosity` mask with `/BC [1]` — a WHITE backdrop,
+                          which is opaque everywhere the group paints no ink. Its extent is
+                          therefore not an upper bound on what shows, and the raster must come
+                          back UNCROPPED. This is the regression that stops the approximation
+                          from deleting content it cannot bound."""
+    pdf = os.path.join(OUT, "smask_group_raster.pdf")
+    # Same 2x2 as `gen_clipped_raster`: red | green over blue | yellow, so the bottom-left
+    # quarter of the placement — the quarter the window keeps — is BLUE.
+    img = _flate_image(5, 2, 2, b"/DeviceRGB", 8,
+                       bytes((220, 30, 40, 30, 160, 60, 40, 60, 210, 230, 190, 40)))
+
+    def mask_group(num, y0):
+        body = b"q 0 0 0 rg 140 %d 80 60 re f Q" % (y0 + 30)
+        return (b"<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] "
+                b"/Group << /Type /Group /S /Transparency /CS /DeviceGray >> /Length %d >>"
+                b"\nstream\n%s\nendstream" % (len(body), body))
+
+    def figure(y0, gs=None):
+        frame = b"q 0 0 0 RG 1 w 72 %d 300 180 re S Q" % y0
+        ticks = b"\n".join(
+            b"q 0 0 0 RG 1 w %d %d m %d %d l S Q" % (72 + 20 * i, y0, 72 + 20 * i, y0 + 12)
+            for i in range(1, 6)
+        )
+        # The `gs` runs BEFORE the `cm`: §11.6.5.2 evaluates the mask group under the CTM in
+        # force at the `gs`, which here is page space — the group's rect is page coordinates.
+        do = b"q %s160 0 0 120 140 %d cm /Im0 Do Q" % (b"/%s gs " % gs if gs else b"", y0 + 30)
+        # See `gen_clipped_raster`: the figure-ink gate demotes a rects-only cluster with no
+        # palette, so each figure carries the same three-swatch legend.
+        legend = b"\n".join(
+            b"q %s rg 78 %d 12 12 re f Q" % (rgb, y0 + 140 - 18 * i)
+            for i, rgb in enumerate((b"0.85 0.20 0.15", b"0.20 0.55 0.80", b"0.95 0.75 0.10"))
+        )
+        return b"\n".join([frame, ticks, legend, do])
+
+    stream = b"\n".join([
+        b"BT /F1 12 Tf 72 760 Td (A soft-masked raster shows only its window.) Tj ET",
+        figure(560),
+        figure(320, gs=b"GA"),
+        figure(80, gs=b"GL"),
+    ])
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 6 0 R >> /XObject << /Im0 5 0 R >> /ExtGState << "
+            b"/GA << /Type /ExtGState /SMask << /Type /Mask /G 7 0 R /S /Alpha >> >> "
+            b"/GL << /Type /ExtGState /SMask << /Type /Mask /G 8 0 R /S /Luminosity /BC [1] >> >> "
+            b">> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+        5: img,
+        6: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        7: mask_group(7, 320),
+        8: mask_group(8, 80),
+    }
+    _assemble_pdf(objs, pdf)
+    GT["smask_group_raster.pdf"] = {
+        "figures": 3,
+        "placement": [140, 350, 300, 470],   # x0 y0 x1 y1 of the alpha-masked raster
+        "window": [140, 350, 220, 410],      # what the alpha mask leaves visible
+        "window_rgb": [40, 60, 210],         # the bottom-left quarter is blue
+    }
+
+
 def gen_smask_panel():
     """A JPEG cut-out over a coloured panel: the ``/SMask``'s transparency IS the figure.
 
@@ -3625,6 +3706,7 @@ def main():
     gen_render_samples()
     gen_cmyk_jpeg()
     gen_smask_panel()
+    gen_smask_group_raster()
     gen_clipped_raster()
     gen_form_bbox()
     gen_decode_jpeg()

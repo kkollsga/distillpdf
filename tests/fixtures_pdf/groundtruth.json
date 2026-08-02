@@ -998,11 +998,11 @@
   },
   "glyph_run_labels.pdf": {
     "joined": [
-      "Cloverdale"
+      "Cloverdale",
+      "Sonoma"
     ],
     "whole_already": [
-      "Healdsburg",
-      "Sonoma"
+      "Healdsburg"
     ],
     "must_stay_apart": [
       "Santa",
@@ -1041,5 +1041,25 @@
     },
     "intact_object": 8,
     "rects_authored": 10
+  },
+  "smask_group_raster.pdf": {
+    "figures": 3,
+    "placement": [
+      140,
+      350,
+      300,
+      470
+    ],
+    "window": [
+      140,
+      350,
+      220,
+      410
+    ],
+    "window_rgb": [
+      40,
+      60,
+      210
+    ]
   }
 }

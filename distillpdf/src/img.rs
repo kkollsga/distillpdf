@@ -19,7 +19,8 @@ use crate::raster::{
 };
 use crate::vector::ClipRect;
 use crate::walker::{
-    descend_form, overlay_resources, page_resources, page_xobjects, subtype_of, xobject_at, Descend, PaintSeq, ScopePolicy, XMap,
+    descend_form, overlay_resources, page_resources, page_xobjects, soft_mask_of, subtype_of, xobject_at, Descend, PaintSeq,
+    ScopePolicy, SoftMask, XMap,
 };
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::rc::Rc;
@@ -555,12 +556,172 @@ pub fn positioned_images(doc: &Document, page_id: ObjectId, want_uris: bool) -> 
     let res = Rc::new(page_resources(doc, page_id));
     let mut raws: Vec<RawTile> = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
-    walk(doc, &content.operations, &xmap, &res, Mat::ID, None, &mut raws, 0, &mut budget, &[]);
+    walk(doc, &content.operations, &xmap, &res, Mat::ID, None, None, &mut raws, 0, &mut budget, &[]);
     // The page's `/Rotate` reaches only the emitted PIXELS and the matrix that places them
     // (see `turn_pixels`): every bbox this module hands out stays in page space, because every
     // cross-subsystem comparison in `html.rs` — captions, containment, reading order — is
     // page-space, exactly as `vector::positioned_vectors_capped` reasons.
     finalize(doc, raws, want_uris, crate::pdfobj::page_rotation(doc, page_id))
+}
+
+/// Grow `out` by the part of `bb` its clip leaves visible. A rectangle entirely outside the
+/// clip contributes nothing — it is ink the group paints and the reader never sees.
+fn add_ink(bb: Rect, clip: Option<ClipRect>, out: &mut Rect) {
+    if !bb.is_valid() {
+        return;
+    }
+    let r = match clip {
+        Some((cx0, cy0, cx1, cy1)) => bb.intersect(Rect::new(cx0, cy0, cx1, cy1)),
+        None => bb,
+    };
+    if r.x1 > r.x0 && r.y1 > r.y0 {
+        out.include(r.x0, r.y0);
+        out.include(r.x1, r.y1);
+    }
+}
+
+/// Page-space extent of the ink a **soft-mask group** paints, grown into `out`.
+///
+/// Returns `false` for a group this cannot bound — then the caller must apply no mask at
+/// all. That is the load-bearing direction: an unbounded reading leaves today's behaviour
+/// (paint whole), a wrong one deletes content. `sh` and the text-showing operators bail for
+/// exactly that reason — a shading fills the clip region, which may be the whole page, and
+/// a glyph's extent is `text.rs`'s business, not this walk's.
+///
+/// Only extents matter, so this is [`walk`]'s path/`Do` bookkeeping without the placement:
+/// same `q`/`Q` stack, same deferred `W`/`W*`, same `/BBox` clip on a descended form.
+#[allow(clippy::too_many_arguments)]
+fn mask_extent(
+    doc: &Document,
+    ops: &[lopdf::content::Operation],
+    xmap: &XMap,
+    base: Mat,
+    base_clip: Option<ClipRect>,
+    depth: u32,
+    budget: &mut crate::WalkBudget,
+    out: &mut Rect,
+) -> bool {
+    let mut ctm = base;
+    let mut clip = base_clip;
+    let mut stack: Vec<(Mat, Option<ClipRect>)> = Vec::new();
+    let mut pending_clip = false;
+    let mut cur = Rect::EMPTY;
+    for op in ops {
+        if !budget.spend(1) {
+            return false;
+        }
+        let o = &op.operands;
+        match op.operator.as_str() {
+            "q" => stack.push((ctm, clip)),
+            "Q" => {
+                if let Some((m, c)) = stack.pop() {
+                    ctm = m;
+                    clip = c;
+                }
+            }
+            "cm" if o.len() >= 6 => {
+                let m = Mat { a: num(&o[0]), b: num(&o[1]), c: num(&o[2]), d: num(&o[3]), e: num(&o[4]), f: num(&o[5]) };
+                ctm = m.mul(ctm);
+            }
+            "m" | "l" if o.len() >= 2 => {
+                let (x, y) = ctm.apply(num(&o[0]), num(&o[1]));
+                cur.include(x, y);
+            }
+            "c" if o.len() >= 6 => {
+                for k in [0, 2, 4] {
+                    let (x, y) = ctm.apply(num(&o[k]), num(&o[k + 1]));
+                    cur.include(x, y);
+                }
+            }
+            "v" | "y" if o.len() >= 4 => {
+                for k in [0, 2] {
+                    let (x, y) = ctm.apply(num(&o[k]), num(&o[k + 1]));
+                    cur.include(x, y);
+                }
+            }
+            "re" if o.len() >= 4 => {
+                let (x, y, w, h) = (num(&o[0]), num(&o[1]), num(&o[2]), num(&o[3]));
+                for (u, v) in [(x, y), (x + w, y), (x + w, y + h), (x, y + h)] {
+                    let (px, py) = ctm.apply(u, v);
+                    cur.include(px, py);
+                }
+            }
+            "W" | "W*" => pending_clip = true,
+            "f" | "F" | "f*" | "S" | "s" | "B" | "B*" | "b" | "b*" | "n" => {
+                if pending_clip {
+                    if cur.is_valid() {
+                        clip = Some(crate::vector::intersect_clip(clip, (cur.x0, cur.y0, cur.x1, cur.y1)));
+                    }
+                    pending_clip = false;
+                }
+                if op.operator.as_str() != "n" {
+                    add_ink(cur, clip, out); // "n" is a clip-only path — no ink
+                }
+                cur = Rect::EMPTY;
+            }
+            // A shading or a glyph run is ink this walk cannot bound; see the doc comment.
+            "sh" | "Tj" | "TJ" | "'" | "\"" | "BI" => return false,
+            "Do" => {
+                let Some((_, stream)) = xobject_at(doc, xmap, o) else {
+                    continue;
+                };
+                if subtype_of(stream) == b"Image" {
+                    let mut bb = Rect::EMPTY;
+                    for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                        let (px, py) = ctm.apply(u, v);
+                        bb.include(px, py);
+                    }
+                    add_ink(bb, clip, out);
+                } else {
+                    match descend_form(doc, stream, xmap, ScopePolicy::OverlayParent, depth, budget, 0) {
+                        Descend::Into(f) => {
+                            let sub_ctm = f.matrix.mul(ctm);
+                            let sub_clip = match crate::walker::form_bbox_clip(doc, stream, sub_ctm) {
+                                Some(bb) => Some(crate::vector::intersect_clip(clip, (bb.x0, bb.y0, bb.x1, bb.y1))),
+                                None => clip,
+                            };
+                            if !mask_extent(doc, &f.ops, &f.scope.xobjects, sub_ctm, sub_clip, depth + 1, budget, out) {
+                                return false;
+                            }
+                        }
+                        Descend::Skip => continue,
+                        Descend::Halt => return false,
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// The visible window an `/ExtGState /SMask` group leaves, in page space — `None` when this
+/// mask must not crop anything.
+///
+/// PDF 32000-1 §11.6.5.2: the `/G` form is rendered off-screen **under the CTM in force at
+/// the `gs`**, and its alpha (or luminosity) multiplies everything painted while the state
+/// holds. Nothing here renders it: the group's painted extent is taken as the window, which
+/// is exact for the hard-edged crop-to-window idiom this exists to fix — a producer masking
+/// a 512x512 render down to a thumbnail — and an over-estimate for a soft one, i.e. wrong in
+/// the same direction every other approximation in these walks is (clip less, never more).
+///
+/// A group whose ink cannot be bounded ([`mask_extent`]), or which paints nothing at all,
+/// yields `None`. The empty case is deliberately *not* read as "alpha 0 everywhere, so
+/// nothing paints": an empty mask group is far more often a producer quirk or a form this
+/// walk failed to follow than an authored erasure, and "we could not read this" must cost
+/// nothing rather than delete a figure.
+fn mask_window(doc: &Document, form: &lopdf::Stream, xmap: &XMap, ctm: Mat, depth: u32, budget: &mut crate::WalkBudget) -> Option<ClipRect> {
+    let Descend::Into(f) = descend_form(doc, form, xmap, ScopePolicy::OverlayParent, depth, budget, 0) else {
+        return None;
+    };
+    let sub_ctm = f.matrix.mul(ctm);
+    // §8.10.2 applies to a mask group like any other form: its `/BBox` bounds its ink.
+    let sub_clip = crate::walker::form_bbox_clip(doc, form, sub_ctm).map(|bb| (bb.x0, bb.y0, bb.x1, bb.y1));
+    let mut ink = Rect::EMPTY;
+    if !mask_extent(doc, &f.ops, &f.scope.xobjects, sub_ctm, sub_clip, depth + 1, budget, &mut ink) {
+        return None;
+    }
+    (ink.is_valid() && ink.x1 > ink.x0 && ink.y1 > ink.y0).then_some((ink.x0, ink.y0, ink.x1, ink.y1))
 }
 
 // The interpreter state is a flat argument list here exactly as it is in `vector::walk` and
@@ -576,6 +737,9 @@ fn walk(
     base: Mat,
     // The clipping rectangle in force where this stream is invoked (page space, y up).
     base_clip: Option<ClipRect>,
+    // The `/ExtGState /SMask` window in force where this stream is invoked, if any — the
+    // graphics state is inherited by a form's content exactly as the clip is.
+    base_smask: Option<ClipRect>,
     out: &mut Vec<RawTile>,
     depth: u32,
     budget: &mut crate::WalkBudget,
@@ -589,7 +753,12 @@ fn walk(
     // raster the stream crops to a small window rendered at its full placement rect, and
     // since rasters paint in true paint order that means covering the ink drawn after it.
     let mut clip = base_clip;
-    let mut stack: Vec<(Mat, Option<ClipRect>)> = Vec::new();
+    // The window an `/ExtGState /SMask` group leaves visible (§11.6.5.2, see [`mask_window`]).
+    // Kept BESIDE the clip rather than folded into it because `gs` *replaces* the soft mask
+    // — `/SMask /None` clears it — and an intersection cannot be undone. Like the clip it is
+    // graphics state, so `q`/`Q` scopes it and a descended form inherits it.
+    let mut smask = base_smask;
+    let mut stack: Vec<(Mat, Option<ClipRect>, Option<ClipRect>)> = Vec::new();
     // `W`/`W*` mark the current path as a clip, but it takes effect only after the path's
     // painting operator (`vector::walk` defers it the same way).
     let mut pending_clip = false;
@@ -607,16 +776,36 @@ fn walk(
         }
         let o = &op.operands;
         match op.operator.as_str() {
-            "q" => stack.push((ctm, clip)),
+            "q" => stack.push((ctm, clip, smask)),
             "Q" => {
-                if let Some((m, c)) = stack.pop() {
+                if let Some((m, c, s)) = stack.pop() {
                     ctm = m;
                     clip = c;
+                    smask = s;
                 }
             }
             "cm" if o.len() >= 6 => {
                 let m = Mat { a: num(&o[0]), b: num(&o[1]), c: num(&o[2]), d: num(&o[3]), e: num(&o[4]), f: num(&o[5]) };
                 ctm = m.mul(ctm);
+            }
+            // §11.6.5.2's soft mask, the *other* way a producer says "show this part of that
+            // image". A `gs` that names no `/SMask` leaves the one in force alone; `/None`
+            // clears it; a group we can bound becomes a window (see [`mask_window`]).
+            "gs" if !o.is_empty() => {
+                let Some(gsd) = o[0]
+                    .as_name()
+                    .ok()
+                    .and_then(|n| crate::pdfobj::sub_dict(doc, res, b"ExtGState").and_then(|d| d.get(n).ok()))
+                    .and_then(|v| deref(doc, v))
+                    .and_then(|v| v.as_dict().ok().cloned())
+                else {
+                    continue;
+                };
+                match soft_mask_of(doc, &gsd) {
+                    Some(SoftMask::Cleared) => smask = None,
+                    Some(SoftMask::Group(g)) => smask = mask_window(doc, g, xmap, ctm, depth, budget),
+                    None => {}
+                }
             }
             // The path operators, tracked for their EXTENT alone — a clip path is just a path
             // followed by `W`/`W*`, and this walk needs no other use for them.
@@ -667,12 +856,18 @@ fn walk(
                         bb.include(px, py);
                     }
                     let Rect { mut x0, mut y0, mut x1, mut y1 } = bb;
+                    // What the page actually shows is the clip AND the soft-mask window; the
+                    // two are independent restrictions on the same paint, so they intersect.
+                    let visible = match smask {
+                        Some(w) => Some(crate::vector::intersect_clip(clip, w)),
+                        None => clip,
+                    };
                     // Honour the clip in force, on `vector::finish`'s discipline: keep it only
                     // when it actually crops (so the ubiquitous full-page `re W n` costs
                     // nothing), crop the recorded extent to what shows, and drop outright a
                     // raster that lies wholly outside its clip — the page never showed it.
                     let mut crop = None;
-                    if let Some((cx0, cy0, cx1, cy1)) = clip {
+                    if let Some((cx0, cy0, cx1, cy1)) = visible {
                         if cx0 > x0 + 0.5 || cy0 > y0 + 0.5 || cx1 < x1 - 0.5 || cy1 < y1 - 0.5 {
                             let n = Rect::new(x0, y0, x1, y1).intersect(Rect::new(cx0, cy0, cx1, cy1));
                             if n.x1 <= n.x0 || n.y1 <= n.y0 {
@@ -682,7 +877,7 @@ fn walk(
                             y0 = n.y0;
                             x1 = n.x1;
                             y1 = n.y1;
-                            crop = clip;
+                            crop = visible;
                         }
                     }
                     let (w, h) = (x1 - x0, y1 - y0);
@@ -728,7 +923,7 @@ fn walk(
                                 Some(bb) => Some(crate::vector::intersect_clip(clip, (bb.x0, bb.y0, bb.x1, bb.y1))),
                                 None => clip,
                             };
-                            walk(doc, &f.ops, &f.scope.xobjects, &child, sub_ctm, sub_clip, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice())
+                            walk(doc, &f.ops, &f.scope.xobjects, &child, sub_ctm, sub_clip, smask, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice())
                         }
                         Descend::Skip => continue,
                         Descend::Halt => return,
@@ -1031,7 +1226,7 @@ mod tests {
         let mut raws = Vec::new();
         let mut budget = crate::WalkBudget::new(700);
         let res = Rc::new(page_resources(&doc, page_id));
-        walk(&doc, &content.operations, &xmap, &res, Mat::ID, None, &mut raws, 0, &mut budget, &[]);
+        walk(&doc, &content.operations, &xmap, &res, Mat::ID, None, None, &mut raws, 0, &mut budget, &[]);
         assert!(!raws.is_empty(), "a tripped budget must not empty the page");
         assert!(raws.len() < 3, "the budget must really bite, got {} tiles", raws.len());
     }
@@ -1278,6 +1473,40 @@ mod tests {
             assert!((got - want).abs() < 0.5, "clip {c:?}");
         }
         assert_eq!(uri_rgb(&turned.uri).dimensions(), (2, 2), "a masked raster keeps every sample");
+    }
+
+    #[test]
+    fn a_soft_masked_raster_shows_only_the_window_its_mask_group_paints() {
+        // `tests/gen_fixtures.py::gen_smask_group_raster`: the same 160x120 raster in three
+        // identical figures — no `gs`, an `/S /Alpha` mask group painting one opaque 80x60
+        // rect, and an `/S /Luminosity` group with a WHITE `/BC`. The `gs` arm read `/ca`
+        // and `/CA` only, so all three came back at the full placement: §11.6.5.2's soft
+        // mask, the other way a PDF says "show this part of that image", was invisible here.
+        let mut placed = placed_top_down("smask_group_raster.pdf", 1);
+        assert_eq!(placed.len(), 3, "all three rasters must be placed");
+        placed.sort_by(|a, b| b.y_top.partial_cmp(&a.y_top).expect("finite"));
+        let (whole, masked, backdrop) = (&placed[0], &placed[1], &placed[2]);
+
+        assert!(whole.clip.is_none(), "the control carries no mask");
+        assert!((whole.x_right - whole.x_left - 160.0).abs() < 0.5, "control width {}", whole.x_right - whole.x_left);
+
+        // The alpha group's window is its painted rect, and — the placement being
+        // axis-aligned — it lands in the SAMPLES exactly as a path clip's does.
+        assert!((masked.x_right - masked.x_left - 80.0).abs() < 0.5, "masked width {}", masked.x_right - masked.x_left);
+        assert!((masked.y_top - masked.y_bottom - 60.0).abs() < 0.5, "masked height {}", masked.y_top - masked.y_bottom);
+        let win = uri_rgb(&masked.uri);
+        assert_eq!(win.dimensions(), (1, 1), "the window is a quarter of a 2x2 raster");
+        assert_eq!(win.get_pixel(0, 0).0, [40, 60, 210], "the surviving quarter is the blue one");
+
+        // A `/Luminosity` mask over a non-black backdrop is opaque everywhere its group
+        // paints nothing, so the group's extent bounds nothing — this raster must come back
+        // WHOLE. The approximation may only ever clip less than a conforming reader.
+        assert!(
+            (backdrop.x_right - backdrop.x_left - 160.0).abs() < 0.5,
+            "a mask we cannot bound must not crop: width {}",
+            backdrop.x_right - backdrop.x_left
+        );
+        assert_eq!(uri_rgb(&backdrop.uri).dimensions(), (2, 2), "and it keeps every sample");
     }
 
     #[test]

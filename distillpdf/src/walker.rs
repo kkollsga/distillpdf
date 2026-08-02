@@ -304,6 +304,62 @@ pub(crate) fn form_bbox_clip(doc: &Document, stream: &lopdf::Stream, ctm: Mat) -
     (bb.width() > 0.0 && bb.height() > 0.0).then_some(bb)
 }
 
+/// What a `gs` operator's `/SMask` entry says about the soft mask (§11.6.5.2).
+pub(crate) enum SoftMask<'a> {
+    /// `/SMask /None` — the mask is cleared; whatever was in force stops applying.
+    Cleared,
+    /// A mask group we are prepared to bound: the `/G` form XObject, to be rendered under
+    /// the CTM in force at the `gs` and its painted extent taken as the visible window.
+    Group(&'a lopdf::Stream),
+}
+
+/// Read the `/SMask` entry of an `/ExtGState` dictionary (§11.6.5.2 — a *soft mask*: the
+/// `/G` form is rendered off-screen and its alpha, or its luminosity, multiplies everything
+/// painted while the state is in force).
+///
+/// `None` means "this `gs` says nothing about the soft mask" — either the key is absent (the
+/// state is unchanged) or the mask is one we decline to interpret. The two are folded on
+/// purpose: a declined mask must leave the caller doing exactly what it did before, which is
+/// not masking at all. Cropping to a mask we have misread is the one outcome worse than
+/// ignoring it.
+///
+/// **What is declined, and why.** Callers approximate the mask by its group's painted
+/// *extent* — correct for the hard-edged window this exists to fix, and an over-estimate
+/// (clips less than a conforming reader, never more) for a soft one. Two constructions break
+/// that direction, so both are refused:
+/// - `/S /Luminosity` with a non-black `/BC`. The backdrop fills the group's box *outside*
+///   its ink, and a light backdrop is opaque there — so the ink extent is not an upper bound
+///   on what shows. Default `/BC` is black (§11.6.5.2), i.e. transparent, which is the case
+///   the extent does bound.
+/// - a `/TR` transfer function other than `/Identity`, which may map "no ink" to opaque.
+pub(crate) fn soft_mask_of<'a>(doc: &'a Document, gs: &Dictionary) -> Option<SoftMask<'a>> {
+    let sm = deref(doc, gs.get(b"SMask").ok()?)?;
+    if let Ok(name) = sm.as_name() {
+        return (name == b"None").then_some(SoftMask::Cleared);
+    }
+    let m = sm.as_dict().ok()?;
+    let subtype = m.get(b"S").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_name().ok().map(|n| n.to_vec()));
+    match subtype.as_deref() {
+        Some(b"Alpha") => {}
+        Some(b"Luminosity") => {
+            // A backdrop that is not black paints the group's box outside its own ink.
+            if let Some(bc) = m.get(b"BC").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_array().ok()) {
+                if bc.iter().any(|c| num_deref(doc, c).abs() > 1e-3) {
+                    return None;
+                }
+            }
+        }
+        _ => return None, // no `/S` at all, or one we do not model
+    }
+    if let Some(tr) = m.get(b"TR").ok().and_then(|o| deref(doc, o)) {
+        if tr.as_name().ok() != Some(b"Identity") {
+            return None;
+        }
+    }
+    let g = doc.get_object(m.get(b"G").ok()?.as_reference().ok()?).ok()?.as_stream().ok()?;
+    (subtype_of(g) == b"Form").then_some(SoftMask::Group(g))
+}
+
 /// The one depth convention: a descent is refused **at** [`crate::MAX_FORM_DEPTH`], so a
 /// page's own content (depth 0) may nest that many form levels below it.
 ///
