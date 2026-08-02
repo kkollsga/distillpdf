@@ -32,6 +32,19 @@ fn to_py(e: Error) -> PyErr {
     }
 }
 
+/// Normalize a 1-indexed page argument taken from Python.
+///
+/// The page-taking methods used to declare `page: u32`, so PyO3's own conversion rejected a
+/// negative page with a raw `OverflowError` — a different failure mode from the `ValueError`
+/// an in-range-but-absent page raises (core [`Error::NoPage`]). Taking the argument as `i64`
+/// and funnelling it through here gives every out-of-range page number one consistent
+/// `ValueError`, with the same `"no page N"` message [`Error::NoPage`] renders. Non-integers
+/// still raise `TypeError`, and an integer too large even for `i64` still raises
+/// `OverflowError` — both are wrong-type/absurd-magnitude cases, not page numbers.
+fn page_arg(page: i64) -> PyResult<u32> {
+    u32::try_from(page).map_err(|_| PyValueError::new_err(format!("no page {page}")))
+}
+
 /// The success sentinel returned by the file-writing methods: Python `int` 1.
 fn ok_one(py: Python<'_>) -> PyResult<Py<PyAny>> {
     use pyo3::IntoPyObject;
@@ -387,23 +400,23 @@ impl Pdf {
     }
 
     /// Diagnostic: raw spans (text, x, width, size) for a 1-indexed page.
-    fn _dbg_spans(&self, page: u32) -> PyResult<Vec<(String, f32, f32, f32)>> {
-        self.inner.dbg_spans(page).map_err(to_py)
+    fn _dbg_spans(&self, page: i64) -> PyResult<Vec<(String, f32, f32, f32)>> {
+        self.inner.dbg_spans(page_arg(page)?).map_err(to_py)
     }
 
     /// Diagnostic: spans with y for a 1-indexed page (text, x, y, width, size).
-    fn _dbg_spans_xy(&self, page: u32) -> PyResult<Vec<(String, f32, f32, f32, f32)>> {
-        self.inner.dbg_spans_xy(page).map_err(to_py)
+    fn _dbg_spans_xy(&self, page: i64) -> PyResult<Vec<(String, f32, f32, f32, f32)>> {
+        self.inner.dbg_spans_xy(page_arg(page)?).map_err(to_py)
     }
 
     /// Diagnostic for one 1-indexed page.
-    fn debug_page(&self, page: u32) -> PyResult<String> {
-        self.inner.debug_page(page).map_err(to_py)
+    fn debug_page(&self, page: i64) -> PyResult<String> {
+        self.inner.debug_page(page_arg(page)?).map_err(to_py)
     }
 
     /// Extract text from a single 1-indexed page (hybrid).
-    fn extract_page_text(&self, page: u32) -> PyResult<String> {
-        self.inner.extract_page_text(page).map_err(to_py)
+    fn extract_page_text(&self, page: i64) -> PyResult<String> {
+        self.inner.extract_page_text(page_arg(page)?).map_err(to_py)
     }
 }
 

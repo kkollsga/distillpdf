@@ -406,6 +406,28 @@ def test_user_password_pdf_raises_instead_of_blank_document(name):
         distillpdf.open(path)
 
 
+# ---- page-number arguments --------------------------------------------------
+# Every page-taking method reports a bad page the same way: ValueError. A negative page used
+# to escape as a raw OverflowError from the binding's u32 conversion, so callers had to catch
+# two unrelated exception types for the same mistake.
+
+@pytest.mark.parametrize("page", [-1, -1000, 2**32, 2**40])
+def test_out_of_range_page_number_raises_value_error(page):
+    d = distillpdf.Pdf.open(HEADINGS)
+    for call in (d.extract_page_text, d.debug_page, d._dbg_spans, d._dbg_spans_xy):
+        with pytest.raises(ValueError) as exc:
+            call(page)
+        assert "no page" in str(exc.value)
+
+
+def test_in_range_but_absent_page_raises_the_same_value_error():
+    """The floor the negative case is mapped onto: a positive page past the end."""
+    d = distillpdf.Pdf.open(HEADINGS)
+    assert d.page_count() < 9999
+    with pytest.raises(ValueError):
+        d.extract_page_text(9999)
+
+
 # ---- the convert CLI distills a .dpdf output --------------------------------
 
 def test_cli_distill_via_dpdf_output(tmp_path):
