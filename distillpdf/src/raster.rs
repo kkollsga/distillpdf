@@ -7,11 +7,11 @@
 //! the strong stack a home is what lets those render-path defects be fixed ONCE, at the
 //! helper, in the phases that follow — rather than by copying a fifth variant.
 //!
-//! `img.rs` adopts only the parts that are byte-identical to what it already had
-//! ([`png_bytes`], [`jpeg_components`], [`dims_sane`] and the size caps). Its
-//! `decode_rgb` / `decode_jpeg_rgb` / `decode_inverts` / `cs_channels` / `image_payload`
-//! are deliberately untouched here: their behaviour DIFFERS from the copies below, so
-//! rewiring them is a behaviour change and belongs to its own commit.
+//! `img.rs` now consumes the JPEG half of this stack too ([`decode_dct_rgb`],
+//! [`decode_inverts`], [`codec_payload`]), which is what makes the render path honour an
+//! inverting `/Decode` on a gray or RGB JPEG — its own copies applied that only to CMYK.
+//! Its `decode_rgb` / `cs_channels` (the raw-sample half) are still weaker than
+//! [`assemble_png`] below; rewiring those is a behaviour change of its own.
 //!
 //! **Invariants callers may rely on and must not re-check:**
 //! - Nothing here panics or fabricates pixels. A stream that cannot be reduced faithfully
@@ -24,8 +24,9 @@
 //! - Colour-space indirection is bounded by [`MAX_CS_DEPTH`], so a cyclic `/ColorSpace`
 //!   chain terminates.
 
-use crate::pdfobj::{content_bytes, deref, sub_dict};
+use crate::pdfobj::{content_bytes, deref, filters_of, sub_dict};
 use lopdf::{Dictionary, Document, Object};
+use std::borrow::Cow;
 
 pub(crate) fn filter_to_format(filters: &Option<Vec<String>>) -> &'static str {
     match filters {
@@ -333,31 +334,48 @@ pub(crate) fn png_bytes(img: image::DynamicImage) -> Option<Vec<u8>> {
 
 /// Generic (non-codec) compression an image codec can be wrapped in, e.g.
 /// `[/FlateDecode /DCTDecode]` — a JPEG stored Flate-compressed.
-fn is_generic_filter(f: &str) -> bool {
-    matches!(f, "FlateDecode" | "Fl" | "LZWDecode" | "LZW" | "ASCII85Decode" | "A85" | "ASCIIHexDecode" | "AHx")
+fn is_generic_filter(f: &[u8]) -> bool {
+    matches!(
+        f,
+        b"FlateDecode" | b"Fl" | b"LZWDecode" | b"LZW" | b"ASCII85Decode" | b"A85" | b"ASCIIHexDecode" | b"AHx"
+    )
 }
 
 /// The codec payload of a coded image (`jpeg`/`jpx`/`ccitt`/`jbig2`): the stream bytes
 /// with any leading generic compression peeled off, so a Flate-wrapped JPEG is handed
 /// back as a JPEG file and not as a blob nothing can open.
-pub(crate) fn codec_payload(stream: &lopdf::Stream, filters: &[String]) -> Vec<u8> {
-    let lead: Vec<Object> = filters
+///
+/// The filter chain is read from the stream's own dict, so no caller can peel against a
+/// list that disagrees with the bytes. Borrows when there is nothing to peel (the common
+/// single-codec case), so the passthrough path copies no pixels.
+///
+/// **Not a decode of the generic layers lopdf cannot apply.** `ASCIIHexDecode`/`AHx` are
+/// in the set above, but lopdf 0.40 answers `Unimplemented` for them, so a chain that
+/// includes one degrades to the verbatim stream (pinned by
+/// `an_ascii_hex_wrapper_degrades_to_the_raw_bytes_because_lopdf_cannot_apply_it`).
+pub(crate) fn codec_payload(stream: &lopdf::Stream) -> Cow<'_, [u8]> {
+    let lead: Vec<Object> = filters_of(&stream.dict)
         .iter()
         .take_while(|f| is_generic_filter(f))
-        .map(|f| Object::Name(f.as_bytes().to_vec()))
+        .map(|f| Object::Name(f.clone()))
         .collect();
     if lead.is_empty() {
-        return stream.content.clone();
+        return Cow::Borrowed(&stream.content);
     }
     let mut s = stream.clone();
     s.dict.set("Filter", Object::Array(lead));
     s.dict.remove(b"DecodeParms"); // codec parms don't apply to the generic layers
     s.dict.remove(b"DP");
-    s.decompressed_content().unwrap_or_else(|_| stream.content.clone())
+    match s.decompressed_content() {
+        Ok(b) => Cow::Owned(b),
+        Err(_) => Cow::Borrowed(&stream.content),
+    }
 }
 
 /// True when the image dict carries an inverting `/Decode` array (`[1 0 …]`).
-fn decode_inverts(doc: &Document, dict: &Dictionary) -> bool {
+///
+/// Follows an indirect `/Decode`, which the render path's own copy could not see.
+pub(crate) fn decode_inverts(doc: &Document, dict: &Dictionary) -> bool {
     match dict.get(b"Decode").ok().and_then(|o| deref(doc, o)) {
         Some(Object::Array(a)) if a.len() >= 2 => {
             let n = |o: &Object| match o {
@@ -418,7 +436,7 @@ pub(crate) fn jpeg_components(buf: &[u8]) -> Option<u8> {
 /// `jpeg-decoder` complements both of its 4-component paths (`color_convert_line_cmyk`
 /// and the `255 - k` in `color_convert_line_ycck`), so one rule covers CMYK and YCCK.
 /// The 1- and 3-component paths do not complement, hence the opposite sense there.
-fn decode_dct_rgb(buf: &[u8], decode_inv: bool) -> Option<image::RgbImage> {
+pub(crate) fn decode_dct_rgb(buf: &[u8], decode_inv: bool) -> Option<image::RgbImage> {
     let mut dec = jpeg_decoder::Decoder::new(std::io::Cursor::new(buf));
     // Read the frame header and reject absurd dimensions BEFORE decoding pixels: a hostile
     // JPEG can declare a huge frame and force a giant allocation.
@@ -527,11 +545,11 @@ mod tests {
     fn the_generic_filter_set_includes_the_ascii_hex_spelling() {
         // The set `img.rs` carries is missing ASCIIHexDecode/AHx; that gap is the reason
         // this predicate has one home. All four abbreviations count too.
-        for f in ["FlateDecode", "Fl", "LZWDecode", "LZW", "ASCII85Decode", "A85", "ASCIIHexDecode", "AHx"] {
-            assert!(is_generic_filter(f), "{f} is a generic (non-codec) filter");
+        for f in [&b"FlateDecode"[..], b"Fl", b"LZWDecode", b"LZW", b"ASCII85Decode", b"A85", b"ASCIIHexDecode", b"AHx"] {
+            assert!(is_generic_filter(f), "{} is a generic (non-codec) filter", String::from_utf8_lossy(f));
         }
-        for f in ["DCTDecode", "JPXDecode", "CCITTFaxDecode", "JBIG2Decode", "RunLengthDecode"] {
-            assert!(!is_generic_filter(f), "{f} is a codec, not a generic layer");
+        for f in [&b"DCTDecode"[..], b"JPXDecode", b"CCITTFaxDecode", b"JBIG2Decode", b"RunLengthDecode"] {
+            assert!(!is_generic_filter(f), "{} is a codec, not a generic layer", String::from_utf8_lossy(f));
         }
     }
 
@@ -541,7 +559,7 @@ mod tests {
         // as the ASCII blob nothing can open — the shape reportlab writes.
         let jpeg = b"\xff\xd8\xff\xe0hello";
         let s = stream(&["ASCII85Decode", "DCTDecode"], b"s4IA0BOu!rDZ~>".to_vec());
-        assert_eq!(codec_payload(&s, &["ASCII85Decode".into(), "DCTDecode".into()]), jpeg.to_vec());
+        assert_eq!(codec_payload(&s).as_ref(), jpeg);
     }
 
     #[test]
@@ -553,20 +571,20 @@ mod tests {
         let hex = b"ffd8ffe068656c6c6f>".to_vec();
         let s = stream(&["ASCIIHexDecode", "DCTDecode"], hex.clone());
         assert!(s.decompressed_content().is_err(), "the premise: lopdf cannot apply AHx");
-        assert_eq!(codec_payload(&s, &["ASCIIHexDecode".into(), "DCTDecode".into()]), hex);
+        assert_eq!(codec_payload(&s).as_ref(), hex);
     }
 
     #[test]
     fn codec_payload_hands_back_the_stream_verbatim_when_there_is_nothing_to_peel() {
         // A bare codec stream: no generic layer, so the bytes ARE the payload.
         let s = stream(&["DCTDecode"], b"\xff\xd8raw jpeg".to_vec());
-        assert_eq!(codec_payload(&s, &["DCTDecode".into()]), b"\xff\xd8raw jpeg".to_vec());
+        assert_eq!(codec_payload(&s).as_ref(), b"\xff\xd8raw jpeg");
         // A stream whose declared Flate wrapper is not actually deflate comes back EMPTY,
         // not raw: lopdf's zlib reader swallows its error and returns the partial output it
         // managed (the same lopdf quirk `pdfobj::content_bytes` documents), so the
         // `unwrap_or_else` fallback never fires for Flate. Stated, not assumed.
         let bad = stream(&["FlateDecode", "DCTDecode"], b"not deflate at all".to_vec());
-        assert!(codec_payload(&bad, &["FlateDecode".into(), "DCTDecode".into()]).is_empty());
+        assert!(codec_payload(&bad).is_empty());
     }
 
     #[test]
@@ -575,7 +593,7 @@ mod tests {
         // leaving it on the peeling copy makes lopdf misapply it.
         let mut s = stream(&["ASCII85Decode", "CCITTFaxDecode"], b"88/~>".to_vec()); // "Hi"
         s.dict.set("DecodeParms", dictionary! { "K" => -1i64, "Columns" => 1728i64 });
-        assert_eq!(codec_payload(&s, &["ASCII85Decode".into(), "CCITTFaxDecode".into()]), b"Hi".to_vec());
+        assert_eq!(codec_payload(&s).as_ref(), b"Hi");
     }
 
     #[test]

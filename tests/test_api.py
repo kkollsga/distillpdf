@@ -20,6 +20,7 @@ FORM_FONT = os.path.join(FIX, "form_font.pdf")
 UNDRAWN_IMAGE = os.path.join(FIX, "undrawn_image.pdf")
 COLORSPACE_IMAGES = os.path.join(FIX, "colorspace_images.pdf")
 CMYK_JPEG = os.path.join(FIX, "cmyk_jpeg.pdf")
+DECODE_JPEG = os.path.join(FIX, "decode_jpeg.pdf")
 
 
 def test_open_and_page_count():
@@ -134,6 +135,23 @@ def test_cmyk_jpeg_renders_in_the_authored_colour_in_html():
     for x, want in ((15, (255, 255, 255)), (47, (0, 255, 255)), (79, (255, 75, 255))):
         got = im.getpixel((x, 24))
         assert max(abs(a - b) for a, b in zip(got, want)) <= 8, f"band x={x}: {got} vs {want}"
+
+
+def test_gray_and_rgb_jpegs_honour_an_inverting_decode_in_html():
+    """The `/Decode` half of the CMYK fix applied to CMYK only: a gray or RGB JPEG whose
+    image dict says `/Decode [1 0 …]` was passed through to the `<img>` byte-for-byte, so
+    `to_html` rendered the NEGATIVE of the authored colour. The RGB image's array is
+    INDIRECT, which the render path's own reader could not follow at all."""
+    Image = pytest.importorskip("PIL.Image")
+    import base64
+    h = distillpdf.Pdf.open(DECODE_JPEG).to_html(mode="page", return_string=True, image_mode="embed")
+    uris = re.findall(r"data:image/\w+;base64,([A-Za-z0-9+/=]+)", h)
+    assert len(uris) == 2, "the fixture places two images"
+    for uri, want in zip(uris, ((215, 215, 215), (55, 225, 165))):
+        im = Image.open(io.BytesIO(base64.b64decode(uri))).convert("RGB")
+        assert im.size == (64, 48)
+        got = im.getpixel((32, 24))
+        assert max(abs(a - b) for a, b in zip(got, want)) <= 8, f"{got} vs {want}"
 
 
 def test_every_extracted_image_across_the_fixtures_opens():

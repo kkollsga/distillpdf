@@ -5,7 +5,9 @@
 use base64::Engine;
 use crate::geom::{Mat, Rect};
 use crate::pdfobj::{content_bytes, deref, filters_of, num};
-use crate::raster::{dims_sane, jpeg_components, png_bytes, MAX_IMAGE_PIXELS};
+use crate::raster::{
+    codec_payload, decode_dct_rgb, decode_inverts, dims_sane, jpeg_components, png_bytes, MAX_IMAGE_PIXELS,
+};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -61,108 +63,10 @@ fn cs_channels(dict: &Dictionary, doc: &Document) -> Option<usize> {
     }
 }
 
-/// Generic (non-image-codec) compression filters that an image codec can be wrapped in,
-/// e.g. `[FlateDecode, DCTDecode]` — a JPEG stored Flate-compressed. These are exactly the
-/// ones lopdf's `decompressed_content` can apply.
-fn is_generic_filter(f: &[u8]) -> bool {
-    matches!(f, b"FlateDecode" | b"Fl" | b"LZWDecode" | b"LZW" | b"ASCII85Decode" | b"A85")
-}
-
-/// The image codec payload: the stream bytes after peeling any leading generic compression
-/// layers (Flate/LZW/ASCII85), but BEFORE the terminal image codec (DCT/CCITT/JPX/JBIG2),
-/// which the codec decoders read directly. For the common single-filter case this is just
-/// `stream.content`. We peel by handing lopdf a copy whose `/Filter` lists only the leading
-/// generic filters — so it stops before the codec it can't decode.
-fn image_payload(stream: &lopdf::Stream) -> std::borrow::Cow<'_, [u8]> {
-    let filters = filters_of(&stream.dict);
-    let lead: Vec<Object> = filters
-        .iter()
-        .take_while(|f| is_generic_filter(f))
-        .map(|f| Object::Name(f.clone()))
-        .collect();
-    if lead.is_empty() {
-        return std::borrow::Cow::Borrowed(&stream.content);
-    }
-    let mut s = stream.clone();
-    s.dict.set("Filter", Object::Array(lead));
-    s.dict.remove(b"DecodeParms"); // codec parms (e.g. CCITT) don't apply to the generic layers
-    s.dict.remove(b"DP");
-    match s.decompressed_content() {
-        Ok(b) => std::borrow::Cow::Owned(b),
-        Err(_) => std::borrow::Cow::Borrowed(&stream.content),
-    }
-}
-
 /// True if a DCTDecode stream is a 4-component (CMYK) JPEG — these cannot be passed
 /// through to the browser as `image/jpeg` (Adobe CMYK renders inverted/black).
 fn jpeg_is_cmyk(content: &[u8]) -> bool {
     jpeg_components(content) == Some(4)
-}
-
-/// Decode a JPEG to RGB8 via `jpeg-decoder` (the `image`/zune path mis-renders Adobe
-/// CMYK as black). Handles grayscale, RGB, and CMYK.
-///
-/// The CMYK polarity follows **PDF** semantics, not standalone-JPEG-file semantics.
-/// §7.4.8 makes the `DCTDecode` output the *sample values*, with the Adobe APP14
-/// transform byte selecting only the colour transform (0 none, 1 YCbCr, 2 YCCK);
-/// polarity is stated separately by the image dict's `/Decode` array — which is exactly
-/// why Distiller writes `/Decode [1 0 1 0 1 0 1 0]` next to a Photoshop CMYK JPEG.
-/// `jpeg-decoder` complements **both** of its 4-component paths (`color_convert_line_cmyk`
-/// and the `255 - k` in `color_convert_line_ycck`) per the standalone convention, so that
-/// complement has to be undone before `/Decode` is applied: invert unless `/Decode`
-/// inverts, for CMYK and YCCK alike. Keying on `transform == 2` instead (the old rule) got
-/// the far commoner transform-0/absent case backwards and rendered those images inverted
-/// — the `cmyk_jpeg.pdf` fixture's authored white/cyan/magenta bands all came out black.
-fn decode_jpeg_rgb(content: &[u8], decode_invert: bool) -> Option<image::RgbImage> {
-    let mut dec = jpeg_decoder::Decoder::new(std::io::Cursor::new(content));
-    // Read the header first and reject absurd dimensions BEFORE decoding pixels (a hostile
-    // JPEG could declare a huge frame and force a giant allocation).
-    dec.read_info().ok()?;
-    if let Some(info) = dec.info() {
-        if !dims_sane(info.width as u32, info.height as u32) {
-            return None;
-        }
-    }
-    let px = dec.decode().ok()?;
-    let info = dec.info()?;
-    let (w, h) = (info.width as u32, info.height as u32);
-    use jpeg_decoder::PixelFormat::*;
-    match info.pixel_format {
-        L8 => {
-            let g = image::GrayImage::from_raw(w, h, px)?;
-            Some(image::DynamicImage::ImageLuma8(g).to_rgb8())
-        }
-        L16 => None,
-        RGB24 => image::RgbImage::from_raw(w, h, px),
-        CMYK32 => {
-            let net_invert = !decode_invert;
-            let n = (w as usize) * (h as usize);
-            let mut rgb = vec![0u8; n * 3];
-            for i in 0..n {
-                let (mut c, mut m, mut y, mut k) =
-                    (px[i * 4], px[i * 4 + 1], px[i * 4 + 2], px[i * 4 + 3]);
-                if net_invert {
-                    c = 255 - c;
-                    m = 255 - m;
-                    y = 255 - y;
-                    k = 255 - k;
-                }
-                let kk = 255 - k as u16;
-                rgb[i * 3] = ((255 - c as u16) * kk / 255) as u8;
-                rgb[i * 3 + 1] = ((255 - m as u16) * kk / 255) as u8;
-                rgb[i * 3 + 2] = ((255 - y as u16) * kk / 255) as u8;
-            }
-            image::RgbImage::from_raw(w, h, rgb)
-        }
-    }
-}
-
-/// True if the image dict carries an inverting `/Decode` array (first channel `[1 0 …]`).
-fn decode_inverts(dict: &Dictionary) -> bool {
-    match dict.get(b"Decode").ok() {
-        Some(Object::Array(a)) if a.len() >= 2 => num(&a[0]) > num(&a[1]),
-        _ => false,
-    }
 }
 
 /// The `/DecodeParms` fields that govern a CCITTFax stream.
@@ -215,7 +119,7 @@ fn decode_ccitt(doc: &Document, dict: &Dictionary, content: &[u8]) -> Option<ima
 
     // Default (BlackIs1=false): a fax-"black" pel is a black pixel (0). A `/Decode [1 0]`
     // array flips the mapping; the two inversions compose.
-    let invert = parms.black_is1 ^ decode_inverts(dict);
+    let invert = parms.black_is1 ^ decode_inverts(doc, dict);
     let (black, white) = if invert { (255u8, 0u8) } else { (0u8, 255u8) };
 
     let mut buf: Vec<u8> = Vec::new();
@@ -256,12 +160,12 @@ fn decode_rgb(doc: &Document, id: ObjectId) -> Option<image::RgbImage> {
     let dict = &stream.dict;
     let filters = filters_of(dict);
     if filters.iter().any(|f| f == b"DCTDecode") {
-        return decode_jpeg_rgb(&image_payload(stream), decode_inverts(dict));
+        return decode_dct_rgb(&codec_payload(stream), decode_inverts(doc, dict));
     }
     if filters.iter().any(|f| f == b"CCITTFaxDecode") {
         // Fax bitstreams are 1-bpc gray; lopdf can't apply the filter, so decode the codec
         // payload here (peeling any Flate wrapper first), then widen gray → RGB.
-        return decode_ccitt(doc, dict, &image_payload(stream)).map(|g| image::DynamicImage::ImageLuma8(g).to_rgb8());
+        return decode_ccitt(doc, dict, &codec_payload(stream)).map(|g| image::DynamicImage::ImageLuma8(g).to_rgb8());
     }
     if filters.iter().any(|f| f == b"JPXDecode" || f == b"JBIG2Decode") {
         return None;
@@ -292,9 +196,17 @@ fn decode_smask(doc: &Document, dict: &Dictionary) -> Option<image::GrayImage> {
     let sd = &stream.dict;
     let filters = filters_of(sd);
     if filters.iter().any(|f| f == b"DCTDecode") {
-        return image::load_from_memory_with_format(&image_payload(stream), image::ImageFormat::Jpeg)
-            .ok()
-            .map(|d| d.to_luma8());
+        let mut g = image::load_from_memory_with_format(&codec_payload(stream), image::ImageFormat::Jpeg)
+            .ok()?
+            .to_luma8();
+        // A soft mask carries its own `/Decode`, and `[1 0]` flips the alpha ramp
+        // (§8.9.5.2) — a polarity the JPEG file cannot express, so it is applied here.
+        if decode_inverts(doc, sd) {
+            for v in g.iter_mut() {
+                *v = 255 - *v;
+            }
+        }
+        return Some(g);
     }
     if filters.iter().any(|f| f == b"JPXDecode" || f == b"CCITTFaxDecode" || f == b"JBIG2Decode") {
         return None;
@@ -353,11 +265,19 @@ fn data_uri(doc: &Document, id: ObjectId) -> Option<String> {
     if !has_smask {
         if filters.iter().any(|f| f == b"DCTDecode") {
             // Peel any generic wrapper (e.g. [FlateDecode, DCTDecode]) to get the raw JPEG.
-            let jpeg = image_payload(stream);
-            // Gray/RGB JPEGs pass straight through (cheap, lossless). CMYK JPEGs can't:
-            // browsers render Adobe CMYK inverted/black, so decode → RGB and re-encode.
-            if jpeg_is_cmyk(&jpeg) {
-                let rgb = decode_jpeg_rgb(&jpeg, decode_inverts(&dict))?;
+            let jpeg = codec_payload(stream);
+            // A JPEG passes straight through (cheap, lossless) only when its own bytes
+            // decode to the authored colour. Two kinds do not, and both are re-encoded:
+            //   * CMYK — browsers apply the Adobe complement and render it inverted/black;
+            //   * ANY stream whose image dict carries an inverting `/Decode` — a polarity
+            //     the JPEG file cannot express, so a passthrough renders the NEGATIVE of
+            //     the authored image. This is the same gate `raster::normalized_jpeg_png`
+            //     applies on the extract path; the render path used to apply the `/Decode`
+            //     half to CMYK only, so a gray or RGB JPEG with `/Decode [1 0 …]` came out
+            //     inverted in `to_html`.
+            let inv = decode_inverts(doc, &dict);
+            if inv || jpeg_is_cmyk(&jpeg) {
+                let rgb = decode_dct_rgb(&jpeg, inv)?;
                 return jpeg_uri(rgb);
             }
             return Some(format!("data:image/jpeg;base64,{}", b64.encode(&jpeg)));
@@ -967,7 +887,7 @@ mod tests {
 
     #[test]
     fn the_gray_and_rgb_jpeg_paths_are_untouched_by_the_cmyk_polarity_rule() {
-        // `decode_jpeg_rgb` is shared: the 1- and 3-component paths must keep round-tripping
+        // `decode_dct_rgb` is shared: the 1- and 3-component paths must keep round-tripping
         // their colour whatever the CMYK rule does (no corpus fixture carries a non-CMYK
         // DCTDecode raster, so the JPEGs are encoded here).
         let rgb = flat_jpeg(image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
@@ -975,7 +895,7 @@ mod tests {
             8,
             image::Rgb([200, 30, 90]),
         )));
-        let got = decode_jpeg_rgb(&rgb, false).expect("RGB JPEG decodes").get_pixel(4, 4).0;
+        let got = decode_dct_rgb(&rgb, false).expect("RGB JPEG decodes").get_pixel(4, 4).0;
         for (g, w) in got.iter().zip([200u8, 30, 90]) {
             assert!(g.abs_diff(w) <= 4, "RGB JPEG round-trip: got {got:?}");
         }
@@ -985,8 +905,57 @@ mod tests {
             8,
             image::Luma([160]),
         )));
-        let got = decode_jpeg_rgb(&gray, false).expect("gray JPEG decodes").get_pixel(4, 4).0;
+        let got = decode_dct_rgb(&gray, false).expect("gray JPEG decodes").get_pixel(4, 4).0;
         assert!(got.iter().all(|v| v.abs_diff(160) <= 4), "gray JPEG round-trip: got {got:?}");
+    }
+
+    #[test]
+    fn an_inverting_decode_array_flips_the_gray_and_rgb_jpeg_paths_too() {
+        // The defect this pins: `decode_invert` was honoured on the CMYK path ONLY, and the
+        // suite never passed `true` on the other two — so a gray/RGB JPEG carrying
+        // `/Decode [1 0 …]` decoded to the NEGATIVE of the authored image with no test
+        // objecting. (Verified failing on the pre-fix decoder.)
+        let rgb = flat_jpeg(image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            8,
+            8,
+            image::Rgb([200, 30, 90]),
+        )));
+        let got = decode_dct_rgb(&rgb, true).expect("RGB JPEG decodes").get_pixel(4, 4).0;
+        for (g, w) in got.iter().zip([55u8, 225, 165]) {
+            assert!(g.abs_diff(w) <= 4, "inverted RGB JPEG: got {got:?}, want ~[55, 225, 165]");
+        }
+
+        let gray = flat_jpeg(image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(
+            8,
+            8,
+            image::Luma([160]),
+        )));
+        let got = decode_dct_rgb(&gray, true).expect("gray JPEG decodes").get_pixel(4, 4).0;
+        assert!(got.iter().all(|v| v.abs_diff(95) <= 4), "inverted gray JPEG: got {got:?}, want ~95");
+    }
+
+    #[test]
+    fn the_render_path_honours_an_inverting_decode_on_a_gray_and_an_rgb_jpeg() {
+        // `tests/gen_fixtures.py::gen_decode_jpeg` — a gray and an RGB DCTDecode image, each
+        // with an inverting `/Decode` (the RGB one written as an INDIRECT array, which
+        // `img.rs`'s own `decode_inverts` could not follow). Before the fix `to_html`
+        // embedded both by passing the JPEG bytes straight through, so both rendered as the
+        // negative of the authored colour.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/decode_jpeg.pdf");
+        let doc = Document::load(path).expect("decode_jpeg.pdf fixture must load");
+        let page_id = *doc.get_pages().values().next().expect("fixture has a page");
+        let placed = positioned_images(&doc, page_id, true);
+        assert_eq!(placed.len(), 2, "the fixture places two images");
+        // Top-to-bottom: the gray image sits above the RGB one.
+        let mut order: Vec<&Placed> = placed.iter().collect();
+        order.sort_by(|a, b| b.y_top.partial_cmp(&a.y_top).unwrap());
+        // Raw samples are gray 40 and RGB (200, 30, 90); `/Decode [1 0 …]` inverts both.
+        for (p, want) in [(order[0], [215u8, 215, 215]), (order[1], [55, 225, 165])] {
+            let img = uri_rgb(&p.uri);
+            let got = img.get_pixel(img.width() / 2, img.height() / 2).0;
+            let d = (0..3).map(|i| got[i].abs_diff(want[i])).max().unwrap();
+            assert!(d <= 8, "expected ~{want:?}, got {got:?}");
+        }
     }
 }
 

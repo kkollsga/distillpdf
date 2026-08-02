@@ -938,6 +938,59 @@ def gen_cmyk_jpeg():
     }
 
 
+def gen_decode_jpeg():
+    """Gray and RGB JPEGs carrying an INVERTING ``/Decode`` — the polarity a JPEG file
+    cannot express, and the one the render path used to apply to CMYK images only.
+
+    ``img.rs`` passed a 1- or 3-component ``DCTDecode`` stream straight through to the
+    ``<img>`` data URI and applied ``/Decode`` on its CMYK branch alone, so both images
+    below rendered as the NEGATIVE of the authored colour: the light-gray band came out
+    dark, the pink band came out mint. The RGB one's ``/Decode`` is written as an
+    **indirect array**, which the render path's own reader could not follow either
+    (it saw a bare ``Reference`` and answered "no inversion").
+
+    Hand-assembled: reportlab writes no ``/Decode`` array, and PIL cannot be made to emit
+    one. The JPEGs are flat single-colour at quality 100 with no chroma subsampling, so
+    the expected pixels survive the codec within a couple of levels."""
+    import io
+
+    pdf = os.path.join(OUT, "decode_jpeg.pdf")
+
+    def jpeg_bytes(im):
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=100, subsampling=0)
+        return buf.getvalue()
+
+    gray = jpeg_bytes(Image.new("L", (64, 48), 40))
+    rgb = jpeg_bytes(Image.new("RGB", (64, 48), (200, 30, 90)))
+    content = (b"q 128 0 0 96 72 600 cm /ImGray Do Q\n"
+               b"q 128 0 0 96 72 460 cm /ImRgb Do Q")
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/XObject << /ImGray 5 0 R /ImRgb 6 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        # Direct /Decode array.
+        5: (b"<< /Type /XObject /Subtype /Image /Width 64 /Height 48 /ColorSpace /DeviceGray "
+            b"/BitsPerComponent 8 /Filter /DCTDecode /Decode [1 0] /Length %d >>\nstream\n%s\nendstream"
+            % (len(gray), gray)),
+        # INDIRECT /Decode array — the reference the render path could not follow.
+        6: (b"<< /Type /XObject /Subtype /Image /Width 64 /Height 48 /ColorSpace /DeviceRGB "
+            b"/BitsPerComponent 8 /Filter /DCTDecode /Decode 7 0 R /Length %d >>\nstream\n%s\nendstream"
+            % (len(rgb), rgb)),
+        7: b"[1 0 1 0 1 0]",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["decode_jpeg.pdf"] = {
+        # authored = 255 - raw sample, because /Decode inverts every channel
+        "gray_rgb": [215, 215, 215],
+        "rgb_rgb": [55, 225, 165],
+        "width": 64,
+        "height": 48,
+    }
+
+
 def gen_form_font():
     """Hand-written PDF where the page's own ``/Font`` dictionary is EMPTY and the only
     font lives in a Form XObject's own ``/Resources`` — the ``/TPL*`` template layout an
@@ -2114,6 +2167,7 @@ def main():
     gen_colorspace_images()
     gen_image_order()
     gen_cmyk_jpeg()
+    gen_decode_jpeg()
     gen_form_font()
     gen_unfiltered_form()
     gen_no_spurious_figs()

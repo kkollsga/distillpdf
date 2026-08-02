@@ -647,5 +647,19 @@
     "n_paths": 10,
     "caption": "Figure 1: Bars painted under an indirect alpha.",
     "n_figures": 1
+  },
+  "decode_jpeg.pdf": {
+    "gray_rgb": [
+      215,
+      215,
+      215
+    ],
+    "rgb_rgb": [
+      55,
+      225,
+      165
+    ],
+    "width": 64,
+    "height": 48
   }
 }

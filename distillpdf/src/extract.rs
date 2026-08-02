@@ -288,7 +288,7 @@ pub fn extract_images(doc: &Document) -> Vec<ImageInfo> {
                         None => stream.content.clone(),
                     }
                 } else {
-                    codec_payload(stream, &filters)
+                    codec_payload(stream).into_owned()
                 };
                 // A CMYK JPEG is decoded to the wrong colours by every consumer that reads
                 // it as a standalone file, so it is normalized rather than passed through.
