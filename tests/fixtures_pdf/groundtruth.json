@@ -853,18 +853,40 @@
     "expect_format": "png"
   },
   "clipped_raster.pdf": {
-    "figures": 2,
+    "figures": 3,
     "placement": [
       140,
-      150,
+      350,
       300,
-      270
+      470
     ],
     "clip": [
       140,
-      150,
+      350,
       220,
+      410
+    ],
+    "window_rgb": [
+      40,
+      60,
       210
+    ]
+  },
+  "form_bbox.pdf": {
+    "in_box_fill": "#3366cc",
+    "out_of_box_fill": "#cc3333",
+    "clipped_box": [
+      72,
+      500,
+      372,
+      680
+    ],
+    "rasters": 1,
+    "raster_box": [
+      402,
+      270,
+      462,
+      330
     ]
   }
 }

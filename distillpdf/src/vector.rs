@@ -1193,6 +1193,12 @@ fn walk(
                     sub.stroke_a = 1.0;
                 }
                 sub.ctm = f.matrix.mul(g.ctm);
+                // §8.10.2: the form's `/BBox`, in form space, CLIPS its content. Intersect it
+                // into the clip the child inherits; `finish` already keeps a clip only when it
+                // actually crops, so the ubiquitous full-page BBox costs nothing.
+                if let Some(bb) = crate::walker::form_bbox_clip(doc, stream, sub.ctm) {
+                    sub.clip = Some(intersect_clip(sub.clip, (bb.x0, bb.y0, bb.x1, bb.y1)));
+                }
                 walk(doc, &f.ops, &f.scope.xobjects, &child_eg, &child_cs, sub, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice());
             }
             _ => {}
@@ -1891,6 +1897,45 @@ mod tests {
         // dispatch rather than evaluating nonsense.
         let sep = PaintCs::Tint { k: 1, tint: None, alt: Some(3) };
         assert_eq!(scn_color(Some(&sep), &[Object::Real(0.2), Object::Real(0.4), Object::Real(0.8)]), Some([51, 102, 204]));
+    }
+
+    #[test]
+    fn a_forms_bbox_clips_the_ink_it_paints_outside_it() {
+        // `tests/gen_fixtures.py::gen_form_bbox`. PDF 32000-1 §8.10.2 makes a form's `/BBox` a
+        // CLIP on its content; nothing in the crate read the key, so a form that deliberately
+        // overflows its box had that overflow emitted as figure ink — which then fed the
+        // cluster bbox and the viewBox. Corpus repro: `attention_1706.03762` p13, eight opaque
+        // tab10 swatches painted above a `/BBox` that ends below them, where the source page
+        // shows blank paper.
+        //
+        // Two forms, byte-identical content, differing ONLY in `/BBox`, both invoked through a
+        // non-identity `/Matrix` so the box goes through the transform and not just the clip.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/form_bbox.pdf");
+        let doc = Document::load(path).expect("form_bbox.pdf fixture must load");
+        let page_id = *doc.get_pages().values().next().expect("fixture has a page");
+        let (mut strong, _) = positioned_vectors(&doc, page_id);
+        strong.sort_by(|a, b| b.y_top.partial_cmp(&a.y_top).expect("finite"));
+        assert_eq!(strong.len(), 2, "both forms must cluster into a figure");
+        let (clipped, control) = (&strong[0], &strong[1]);
+
+        let svg = clipped.svg();
+        assert!(svg.contains("#3366cc"), "the in-box fill must survive: {svg}");
+        assert!(!svg.contains("#cc3333"), "ink outside the /BBox must not be emitted: {svg}");
+        // The figure's extent is the BBox mapped through /Matrix 1.5 at (72, 500) — it must not
+        // stretch to the off-box bars at x 420..492 / y 710..755.
+        for (got, want, what) in [
+            (clipped.x_left, 72.0, "x_left"),
+            (clipped.y_bottom, 500.0, "y_bottom"),
+            (clipped.x_right, 372.0, "x_right"),
+            (clipped.y_top, 680.0, "y_top"),
+        ] {
+            assert!((got - want).abs() < 1.5, "{what} {got} (want {want})");
+        }
+        // The control's box contains every mark, so nothing crops and NO mask is emitted —
+        // the ubiquitous full-page `/BBox` must stay free.
+        let ctl = control.svg();
+        assert!(ctl.contains("#cc3333"), "a BBox that contains its ink clips nothing: {ctl}");
+        assert!(!ctl.contains("clip-path"), "a non-cropping /BBox must emit no mask: {ctl}");
     }
 
     /// `tests/gen_fixtures.py::gen_rotated_pages` — four pages, one byte-identical content

@@ -200,7 +200,7 @@ fn decodable(doc: &Document, res: &Dictionary, id: ObjectId) -> bool {
 /// Images with a soft mask (`/SMask`) are alpha-composited so transparency is
 /// preserved — without this, masked figures (whose visible content lives in the
 /// mask, over a flat-colour/black base) render as solid black boxes.
-fn data_uri(doc: &Document, res: &Dictionary, id: ObjectId) -> Option<String> {
+fn data_uri(doc: &Document, res: &Dictionary, id: ObjectId, window: Option<(f32, f32, f32, f32)>) -> Option<String> {
     let stream = doc.get_object(id).ok()?.as_stream().ok()?;
     let dict = stream.dict.clone();
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -222,10 +222,12 @@ fn data_uri(doc: &Document, res: &Dictionary, id: ObjectId) -> Option<String> {
             //     applies on the extract path; the render path used to apply the `/Decode`
             //     half to CMYK only, so a gray or RGB JPEG with `/Decode [1 0 …]` came out
             //     inverted in `to_html`.
+            // A clip is the third reason the bytes cannot pass straight through: the
+            // passthrough hands over the WHOLE authored image, and the page shows a window of it.
             let inv = decode_inverts(doc, &dict);
-            if inv || jpeg_is_cmyk(&jpeg) {
+            if inv || window.is_some() || jpeg_is_cmyk(&jpeg) {
                 let rgb = decode_dct_rgb(&jpeg, inv)?;
-                return jpeg_uri(rgb);
+                return jpeg_uri(crop_window(rgb, window));
             }
             return Some(format!("data:image/jpeg;base64,{}", b64.encode(&jpeg)));
         }
@@ -233,7 +235,7 @@ fn data_uri(doc: &Document, res: &Dictionary, id: ObjectId) -> Option<String> {
             return None;
         }
         // CCITTFax falls through to decode_rgb (which decodes it via decode_ccitt) → PNG.
-        let rgb = decode_rgb(doc, res, id)?;
+        let rgb = crop_window(decode_rgb(doc, res, id)?, window);
         let png = png_bytes(image::DynamicImage::ImageRgb8(rgb))?;
         return Some(format!("data:image/png;base64,{}", b64.encode(&png)));
     }
@@ -294,7 +296,37 @@ fn data_uri(doc: &Document, res: &Dictionary, id: ObjectId) -> Option<String> {
     }
     // Match the source format: a JPEG base with a trivial (all-opaque) mask becomes a
     // compact JPEG; a mask with real transparency stays a lossless PNG.
-    rgba_uri(rgba, filters.iter().any(|f| f == b"DCTDecode"))
+    rgba_uri(crop_window(rgba, window), filters.iter().any(|f| f == b"DCTDecode"))
+}
+
+/// Cut a decoded raster down to the sub-rectangle its clip leaves visible
+/// ([`RawTile::window`], in unit-square fractions), or hand it back untouched when nothing was
+/// cropped.
+///
+/// Cropping the SAMPLES, rather than masking the element, is what makes the answer the same
+/// everywhere the URI is used: a plain `<img>` on the page has nowhere to put a `clip-path`, and
+/// a consumer that lifts the data URI out of the HTML has nowhere at all. An axis-aligned
+/// placement is the only case this can serve — a page-space clip on a ROTATED placement is not a
+/// pixel rectangle, and those keep the SVG mask ([`Placed::clip`]).
+fn crop_window<P>(img: image::ImageBuffer<P, Vec<P::Subpixel>>, window: Option<(f32, f32, f32, f32)>) -> image::ImageBuffer<P, Vec<P::Subpixel>>
+where
+    P: image::Pixel + 'static,
+{
+    let (u0, v0, u1, v1) = match window {
+        Some(w) => w,
+        None => return img,
+    };
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    let x0 = (u0 * w).round().clamp(0.0, w) as u32;
+    let x1 = (u1 * w).round().clamp(0.0, w) as u32;
+    // Image row 0 is the TOP row, i.e. `v = 1` — so the vertical span inverts.
+    let y0 = ((1.0 - v1) * h).round().clamp(0.0, h) as u32;
+    let y1 = ((1.0 - v0) * h).round().clamp(0.0, h) as u32;
+    if x1 <= x0 || y1 <= y0 {
+        return img; // a sub-pixel window: keep the image rather than emit nothing
+    }
+    let mut img = img;
+    image::imageops::crop(&mut img, x0, y0, x1 - x0, y1 - y0).to_image()
 }
 
 /// True if the image XObject is DCTDecode (a JPEG) at source.
@@ -411,28 +443,29 @@ struct RawTile {
     res: Rc<Dictionary>,
     /// Paint position of this tile's `Do` in the page's content tree (see [`Placed::seq`]).
     seq: PaintSeq,
-    /// The page-space clip in force at the `Do`, when it actually cropped this tile (see
-    /// [`Placed::clip`]). The bbox above is then already the CROPPED one.
+    /// The page-space clip in force at the `Do`, when it actually cropped this tile. The bbox
+    /// above is then already the CROPPED one.
     clip: Option<ClipRect>,
+    /// The UNCROPPED placement bbox — where the tile's pixels actually land. Equal to the bbox
+    /// above unless a clip cropped it, and the frame the crop is expressed as a fraction of.
+    full: (f32, f32, f32, f32),
 }
 
 impl RawTile {
-    /// Where this tile's PIXELS land, page space — the recorded rect for an unclipped tile
-    /// (bit-for-bit, so no grid moves by a rounding step), and the full placement recovered
-    /// from the matrix for a clipped one, whose recorded rect is only the visible window.
-    fn placement(&self) -> (f32, f32, f32, f32) {
-        match (self.clip, self.ctm) {
-            (Some(_), Some([a, b, c, d, e, f])) => {
-                let m = Mat { a, b, c, d, e, f };
-                let mut bb = Rect::EMPTY;
-                for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
-                    let (px, py) = m.apply(u, v);
-                    bb.include(px, py);
-                }
-                (bb.x0, bb.y0, bb.x1, bb.y1)
-            }
-            _ => (self.x0, self.y0, self.x1, self.y1),
+    /// The sub-rectangle of this tile's PIXELS that its clip leaves visible, as fractions of
+    /// the image's unit square `(u0, v0, u1, v1)` — `None` when nothing was cropped.
+    ///
+    /// A PDF image's unit square has `(0, 0)` bottom-left with its FIRST pixel row at the top
+    /// (`v = 1`), so the caller converts `v` to a row index as `(1 - v) * height`.
+    fn window(&self) -> Option<(f32, f32, f32, f32)> {
+        self.clip?;
+        let (fx0, fy0, fx1, fy1) = self.full;
+        let (w, h) = (fx1 - fx0, fy1 - fy0);
+        if w <= 0.0 || h <= 0.0 {
+            return None;
         }
+        Some((((self.x0 - fx0) / w).clamp(0.0, 1.0), ((self.y0 - fy0) / h).clamp(0.0, 1.0),
+              ((self.x1 - fx0) / w).clamp(0.0, 1.0), ((self.y1 - fy0) / h).clamp(0.0, 1.0)))
     }
 }
 
@@ -598,11 +631,8 @@ fn walk(
                     // A ROTATED placement (non-axis-aligned CTM) would render mangled if we
                     // just stretched the pixels into this axis-aligned bbox — keep the matrix
                     // so the emitter can rotate it. Axis-aligned (the common case) → None.
-                    // A CLIPPED raster needs it for a different reason: its recorded bbox is
-                    // the cropped window, while the pixels still fill the full placement, so
-                    // the rect form would squash them into the crop.
                     let scale = ctm.a.abs().max(ctm.b.abs()).max(ctm.c.abs()).max(ctm.d.abs()).max(1e-6);
-                    let rot_ctm = if crop.is_some() || ctm.b.abs() > 0.01 * scale || ctm.c.abs() > 0.01 * scale {
+                    let rot_ctm = if ctm.b.abs() > 0.01 * scale || ctm.c.abs() > 0.01 * scale {
                         Some([ctm.a, ctm.b, ctm.c, ctm.d, ctm.e, ctm.f])
                     } else {
                         None
@@ -610,7 +640,7 @@ fn walk(
                     // Record geometry + pixel dims; uri building / grid stitching happens
                     // in finalize() once the whole page's tiles are known.
                     let pw = stream.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0) as u32;
-                    out.push(RawTile { id, x0, x1, y0, y1, pw, ctm: rot_ctm, res: Rc::clone(res), seq: PaintSeq::at(here, opi), clip: crop });
+                    out.push(RawTile { id, x0, x1, y0, y1, pw, ctm: rot_ctm, res: Rc::clone(res), seq: PaintSeq::at(here, opi), clip: crop, full: (bb.x0, bb.y0, bb.x1, bb.y1) });
                 } else {
                     // A form is descended with the page's XObject scope still in force
                     // (`OverlayParent`): a raster the page defines and the form invokes by
@@ -629,7 +659,15 @@ fn walk(
                                 }
                                 None => Rc::clone(res),
                             };
-                            walk(doc, &f.ops, &f.scope.xobjects, &child, f.matrix.mul(ctm), clip, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice())
+                            let sub_ctm = f.matrix.mul(ctm);
+                            // §8.10.2: a form's `/BBox` clips its content — a raster the form
+                            // places outside its own box does not paint. Same reader, same
+                            // intersect as `vector::walk`'s `Do` arm.
+                            let sub_clip = match crate::walker::form_bbox_clip(doc, stream, sub_ctm) {
+                                Some(bb) => Some(crate::vector::intersect_clip(clip, (bb.x0, bb.y0, bb.x1, bb.y1))),
+                                None => clip,
+                            };
+                            walk(doc, &f.ops, &f.scope.xobjects, &child, sub_ctm, sub_clip, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice())
                         }
                         Descend::Skip => continue,
                         Descend::Halt => return,
@@ -671,12 +709,17 @@ fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool) -> Vec<Placed> 
         // Not a grid (or stitch failed): emit each tile individually (prior behaviour),
         // carrying its rotation matrix if any.
         for t in tiles {
+            // Two ways to honour a clip, and exactly one applies. An axis-aligned placement
+            // crops its SAMPLES (so `<img>`, `<image>` and any consumer of the URI agree), and
+            // then carries no mask; a ROTATED one cannot — a page-space rectangle is not a
+            // pixel rectangle there — so it keeps the full pixels and an SVG `clip-path`.
+            let (window, mask) = if t.ctm.is_none() { (t.window(), None) } else { (None, t.clip) };
             if want_uris {
-                if let Some(uri) = data_uri(doc, &t.res, t.id) {
-                    out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri, ctm: t.ctm, seq: t.seq.clone(), clip: t.clip });
+                if let Some(uri) = data_uri(doc, &t.res, t.id, window) {
+                    out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri, ctm: t.ctm, seq: t.seq.clone(), clip: mask });
                 }
             } else if decodable(doc, &t.res, t.id) {
-                out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri: String::new(), ctm: t.ctm, seq: t.seq.clone(), clip: t.clip });
+                out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri: String::new(), ctm: t.ctm, seq: t.seq.clone(), clip: mask });
             }
         }
     }
@@ -829,31 +872,17 @@ fn stitch_grid(doc: &Document, tiles: &[&RawTile], bbox: (f32, f32, f32, f32)) -
     let mut canvas = image::RgbaImage::from_pixel(cw, ch, image::Rgba([255, 255, 255, 255]));
     let mut placed_any = false;
     for t in tiles {
-        let tile = match decode_rgba(doc, &t.res, t.id) {
+        let tile = match decode_rgba(doc, &t.res, t.id).map(|im| crop_window(im, t.window())) {
             Some(im) => im,
             None => continue,
         };
-        // A CLIPPED tile's recorded rect is the window the page shows, not where its pixels
-        // go: they still fill the whole placement. Resize to the placement, then keep only
-        // the window — resizing straight into the window would squash the image into it.
-        let (fx0, fy0, fx1, fy1) = t.placement();
-        let tw = (((fx1 - fx0) * scale).round() as u32).max(1);
-        let th = (((fy1 - fy0) * scale).round() as u32).max(1);
-        let mut resized = image::imageops::resize(&tile, tw, th, image::imageops::FilterType::Triangle);
-        let mut ox = ((fx0 - x0) * scale).round() as i64;
-        let mut oy = ((y1 - fy1) * scale).round() as i64; // top edge → canvas top
-        if t.clip.is_some() {
-            let cx = (((t.x0 - fx0) * scale).round() as i64).clamp(0, tw as i64);
-            let cy = (((fy1 - t.y1) * scale).round() as i64).clamp(0, th as i64);
-            let cw = (((t.x1 - t.x0) * scale).round() as i64).clamp(0, tw as i64 - cx) as u32;
-            let chh = (((t.y1 - t.y0) * scale).round() as i64).clamp(0, th as i64 - cy) as u32;
-            if cw == 0 || chh == 0 {
-                continue;
-            }
-            resized = image::imageops::crop(&mut resized, cx as u32, cy as u32, cw, chh).to_image();
-            ox += cx;
-            oy += cy;
-        }
+        // `decode_rgba` has already cut a clipped tile down to its window, so the recorded
+        // rect is where these pixels go — no special case.
+        let tw = (((t.x1 - t.x0) * scale).round() as u32).max(1);
+        let th = (((t.y1 - t.y0) * scale).round() as u32).max(1);
+        let resized = image::imageops::resize(&tile, tw, th, image::imageops::FilterType::Triangle);
+        let ox = ((t.x0 - x0) * scale).round() as i64;
+        let oy = ((y1 - t.y1) * scale).round() as i64; // top edge → canvas top
         image::imageops::overlay(&mut canvas, &resized, ox, oy);
         placed_any = true;
     }
@@ -1151,54 +1180,77 @@ mod tests {
     }
 
     #[test]
-    fn a_clipped_raster_records_the_window_the_page_shows_not_its_placement() {
-        // `tests/gen_fixtures.py::gen_clipped_raster`: one raster placed 160x120 at
-        // (140, y0+30) in two identical figures, the second under `140 y0+30 80 60 re W n`.
-        // `img::walk` tracked no clip at all, so BOTH came back at the full 160x120 placement
-        // — the crop the page applied was invisible to the extractor.
+    fn a_clipped_raster_shows_its_window_and_nothing_else() {
+        // `tests/gen_fixtures.py::gen_clipped_raster`: one raster placed 160x120 in three
+        // identical figures — whole, clipped, and clipped under a ROTATED placement.
+        // `img::walk` tracked no clip at all, so all three came back at the full placement and
+        // carried every pixel: the crop the page applied was invisible to the extractor.
         let mut placed = placed_top_down("clipped_raster.pdf", 1);
-        assert_eq!(placed.len(), 2, "both rasters must be placed");
+        assert_eq!(placed.len(), 3, "all three rasters must be placed");
         placed.sort_by(|a, b| b.y_top.partial_cmp(&a.y_top).expect("finite"));
-        let (whole, cropped) = (&placed[0], &placed[1]);
-        assert!(whole.clip.is_none(), "the unclipped control must carry no clip");
-        assert!(whole.ctm.is_none(), "an axis-aligned unclipped placement stays in rect form");
-        assert!((whole.x_right - whole.x_left - 160.0).abs() < 0.5, "control width {}", whole.x_right - whole.x_left);
+        let (whole, cropped, turned) = (&placed[0], &placed[1], &placed[2]);
 
-        let c = cropped.clip.expect("the clipped raster must record its clip");
-        for (got, want) in [(c.0, 140.0), (c.1, 150.0), (c.2, 220.0), (c.3, 210.0)] {
-            assert!((got - want).abs() < 0.5, "clip {c:?}");
-        }
-        // The recorded extent is the WINDOW (80x60), because that is what the page shows and
-        // what reading order / figure absorption / the viewBox must measure...
+        assert!(whole.clip.is_none() && whole.ctm.is_none(), "the control is unclipped and axis-aligned");
+        assert!((whole.x_right - whole.x_left - 160.0).abs() < 0.5, "control width {}", whole.x_right - whole.x_left);
+        assert_eq!(uri_rgb(&whole.uri).dimensions(), (2, 2), "the control keeps every sample");
+
+        // Axis-aligned: the recorded extent is the WINDOW (what reading order, figure
+        // absorption and the viewBox must measure)...
         assert!((cropped.x_right - cropped.x_left - 80.0).abs() < 0.5, "cropped width {}", cropped.x_right - cropped.x_left);
         assert!((cropped.y_top - cropped.y_bottom - 60.0).abs() < 0.5, "cropped height {}", cropped.y_top - cropped.y_bottom);
-        // ...while the placement matrix still describes the FULL 160x120 rect, because the
-        // pixels have not moved — stretching them into the window would be a different bug.
-        let m = cropped.ctm.expect("a clipped raster must carry its full placement matrix");
-        assert_eq!([m[0], m[3], m[4], m[5]], [160.0, 120.0, 140.0, 150.0], "placement matrix {m:?}");
+        // ...and so are the SAMPLES, which is the only answer that also works for the plain
+        // `<img>` this raster becomes when no figure absorbs it. Bottom-left quarter = blue.
+        let win = uri_rgb(&cropped.uri);
+        assert_eq!(win.dimensions(), (1, 1), "the window is a quarter of a 2x2 raster");
+        assert_eq!(win.get_pixel(0, 0).0, [40, 60, 210], "the surviving quarter is the blue one");
+        assert!(cropped.clip.is_none(), "cropped samples need no mask on top of them");
+
+        // Rotated: a page-space rectangle is not a pixel rectangle, so the pixels are kept
+        // whole and the crop travels as an SVG mask instead.
+        assert!(turned.ctm.is_some(), "the rotated placement keeps its matrix");
+        let c = turned.clip.expect("a rotated clipped raster carries the mask");
+        for (got, want) in [(c.0, 140.0), (c.1, 110.0), (c.2, 220.0), (c.3, 170.0)] {
+            assert!((got - want).abs() < 0.5, "clip {c:?}");
+        }
+        assert_eq!(uri_rgb(&turned.uri).dimensions(), (2, 2), "a masked raster keeps every sample");
     }
 
     #[test]
-    fn a_clipped_composite_image_carries_the_clip_path_the_page_asked_for() {
-        // The emission half: `composite_svg` must mask the `<image>` with a `<clipPath>` at
-        // the crop, and the unclipped control in the same document must gain nothing.
+    fn a_masked_composite_image_wraps_the_clip_on_a_group_not_on_the_image() {
+        // The emission half. `transform` establishes a new user space and a `clip-path` on the
+        // SAME element resolves in it — so a mask on the transformed `<image>` would be scaled
+        // by the placement matrix and hide the raster outright. It goes on a wrapping `<g>`.
+        // (Verified by rendering: on the `<image>` the figure came out blank.)
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/clipped_raster.pdf");
         let doc = Document::load(path).expect("clipped_raster.pdf fixture must load");
         let raw = std::fs::read(path).expect("fixture readable");
         let html = crate::html::to_html(&doc, &raw, crate::html::Mode::Page, true, true);
-        assert_eq!(html.matches("<image ").count(), 2, "both figures must composite their raster");
-        // The mask goes on a WRAPPING `<g>`, never on the transformed `<image>` — `transform`
-        // establishes a new user space and a `clip-path` on the same element resolves in it,
-        // so the rect would be scaled by the 160x120 placement and hide the raster outright.
-        assert_eq!(html.matches("clip-path=").count(), 1, "exactly one of the two is clipped");
-        let g = html.split("<g clip-path=").nth(1).expect("the clip must sit on a wrapping <g>");
+        assert_eq!(html.matches("<image ").count(), 3, "all three figures composite their raster");
+        // Only the rotated one needs a mask; the axis-aligned crop is in the samples.
+        assert_eq!(html.matches("clip-path=").count(), 1, "exactly one mask");
+        let g = html.split("<g clip-path=").nth(1).expect("the mask must sit on a wrapping <g>");
         assert!(g.starts_with("\"url(#clip_"), "clip-path value: {}", &g[..40.min(g.len())]);
-        let clipped = g.split("<image ").nth(1).map(|s| s.split("/>").next().unwrap_or("")).expect("the <g> wraps the <image>");
-        assert!(clipped.contains("transform=\"matrix("), "a clipped raster is placed by matrix: {clipped}");
-        // The mask itself exists and is the 80x60 window (the figure box is 300x180 at
-        // (72, 120), so the crop's local origin is x 68, y 90 with y measured down from the top).
+        let el = g.split("<image ").nth(1).map(|s| s.split("/>").next().unwrap_or("")).expect("the <g> wraps the <image>");
+        assert!(el.contains("transform=\"matrix("), "a masked raster is placed by matrix: {el}");
+        // The mask is the 80x60 window: the figure box is 300x180 at (72, 80), so the crop's
+        // local origin is x 68, y 90 (y measured down from the figure's top).
         let id = g.split("url(#").nth(1).and_then(|s| s.split(')').next()).expect("a clip-path url");
-        assert!(html.contains(&format!("<clipPath id=\"{id}\"><rect x=\"68\" y=\"90\" width=\"80\" height=\"60\"/></clipPath>")), "clipPath {id} missing or wrong: {html:.0}");
+        assert!(html.contains(&format!("<clipPath id=\"{id}\"><rect x=\"68\" y=\"90\" width=\"80\" height=\"60\"/></clipPath>")), "clipPath {id} missing or wrong");
+    }
+
+    #[test]
+    fn a_raster_a_form_places_outside_its_own_bbox_is_not_placed() {
+        // `tests/gen_fixtures.py::gen_form_bbox`: one form body, two `/BBox`es. The raster sits
+        // at form (220,140)-(260,180), outside `[0 0 200 120]` and inside `[0 0 400 300]`, and
+        // both forms are invoked through `/Matrix [1.5 0 0 1.5 0 0]`. §8.10.2 makes `/BBox` a
+        // clip on the form's content, and nothing in the crate read the key — `grep -c b"BBox"`
+        // over the walkers was 0 — so the same raster was placed twice.
+        let placed = placed_top_down("form_bbox.pdf", 1);
+        assert_eq!(placed.len(), 1, "only the form whose BBox contains the raster may place it");
+        let p = &placed[0];
+        for (got, want, what) in [(p.x_left, 402.0, "x_left"), (p.y_bottom, 270.0, "y_bottom"), (p.x_right, 462.0, "x_right"), (p.y_top, 330.0, "y_top")] {
+            assert!((got - want).abs() < 0.5, "{what} {got} (want {want}) — the /Matrix must reach the BBox too");
+        }
     }
 
     #[test]

@@ -38,7 +38,7 @@
 //!   continues with the operators around it. Nothing here panics.
 
 use crate::geom::Mat;
-use crate::pdfobj::{content_bytes, deref, num_deref, sub_dict};
+use crate::pdfobj::{content_bytes, deref, num, num_deref, sub_dict};
 use lopdf::content::Operation;
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
@@ -266,6 +266,42 @@ pub(crate) fn is_transparency_group(doc: &Document, stream: &lopdf::Stream) -> b
         .and_then(|o| deref(doc, o))
         .and_then(|o| o.as_name().ok())
         .is_some_and(|n| n == b"Transparency")
+}
+
+/// A form XObject's `/BBox` as a page-space clipping rectangle under `ctm`, or `None` when
+/// the key is absent or unusable.
+///
+/// PDF 32000-1 §8.10.2: `/BBox` is expressed in FORM space and **clips the form's content** —
+/// ink outside the box does not paint. Nothing in the crate read the key at all, so a
+/// producer that reuses one oversized template form and relies on `/BBox` to crop it
+/// (matplotlib and several LaTeX figure pipelines do exactly this) had its off-box
+/// scaffolding emitted as content, which then fed the figure bbox and the viewBox.
+///
+/// The corners are NORMALIZED first — the spec fixes no ordering — and the returned rect is
+/// the axis-aligned box of the four mapped corners. Under a quarter-turn `ctm` that is exact;
+/// under a skewed one it is the conservative reading, which can only ever clip LESS than a
+/// conforming reader, never more.
+///
+/// Lives here, with `is_transparency_group`, because all three walks descend the same forms
+/// and must read the key the same way.
+pub(crate) fn form_bbox_clip(doc: &Document, stream: &lopdf::Stream, ctm: Mat) -> Option<crate::geom::Rect> {
+    let arr = deref(doc, stream.dict.get(b"BBox").ok()?)?;
+    let v = arr.as_array().ok()?;
+    if v.len() < 4 {
+        return None;
+    }
+    let c: Vec<f32> = v.iter().map(|o| deref(doc, o).map(num).unwrap_or(f32::NAN)).collect();
+    if c.iter().any(|x| !x.is_finite()) {
+        return None;
+    }
+    let (bx0, bx1) = (c[0].min(c[2]), c[0].max(c[2]));
+    let (by0, by1) = (c[1].min(c[3]), c[1].max(c[3]));
+    let mut bb = crate::geom::Rect::EMPTY;
+    for (u, w) in [(bx0, by0), (bx1, by0), (bx1, by1), (bx0, by1)] {
+        let (px, py) = ctm.apply(u, w);
+        bb.include(px, py);
+    }
+    (bb.width() > 0.0 && bb.height() > 0.0).then_some(bb)
 }
 
 /// The one depth convention: a descent is refused **at** [`crate::MAX_FORM_DEPTH`], so a

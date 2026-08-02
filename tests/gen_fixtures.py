@@ -954,48 +954,116 @@ def gen_paint_order():
     }
 
 
+def gen_form_bbox():
+    """A form XObject whose content OVERFLOWS its ``/BBox`` — which §8.10.2 makes a clip.
+
+    PDF 32000-1 §8.10.2: a form's ``/BBox``, in form space, clips its content; ink outside
+    the box does not paint. Nothing in the crate read the key, so a producer that reuses one
+    oversized template form and relies on ``/BBox`` to crop it (matplotlib and several LaTeX
+    figure pipelines do exactly this) had its off-box scaffolding emitted as figure ink — and
+    that ink then fed the cluster bbox and the viewBox. Reproduced on the corpus by
+    ``attention_1706.03762`` p13, where eight opaque tab10 swatches are painted above a
+    ``/BBox`` that ends below them and the source page shows blank paper there.
+
+    Two forms with byte-identical content (frame + 5 ticks + one blue in-box fill = 7 paths,
+    clearing ``MIN_PATHS``; plus two RED bars deliberately outside ``[0 0 200 120]`` — one
+    above it, one to its right), differing ONLY in ``/BBox``:
+
+      TOP    (y 500): ``/BBox [0 0 200 120]`` — the red bars must be GONE.
+      BOTTOM (y 60):  ``/BBox [0 0 400 300]`` — contains every mark, so nothing is clipped
+                      and no ``clip-path`` may be emitted at all (the ubiquitous
+                      full-page BBox must stay free).
+
+    Both are invoked through a non-identity ``/Matrix [1.5 0 0 1.5 0 0]``, so the box is
+    exercised through the transform rather than only through the clip."""
+    pdf = os.path.join(OUT, "form_bbox.pdf")
+    body = b"\n".join(
+        [b"q 0 0 0 RG 1 w 0 0 200 120 re S Q"]
+        + [b"q 0 0 0 RG 1 w %d 0 m %d 12 l S Q" % (20 * i, 20 * i) for i in range(1, 6)]
+        + [b"q 0.2 0.4 0.8 rg 40 30 120 60 re f Q",
+           b"q 0.8 0.2 0.2 rg 20 140 160 30 re f Q",     # ABOVE the small BBox
+           b"q 0.8 0.2 0.2 rg 220 20 60 80 re f Q",      # RIGHT of the small BBox
+           b"q 40 0 0 40 220 140 cm /Im0 Do Q"]          # a RASTER outside the small BBox
+    )
+
+    def form(num, bbox):
+        return (b"<< /Type /XObject /Subtype /Form /BBox %s /Matrix [1.5 0 0 1.5 0 0] "
+                b"/Resources << /XObject << /Im0 8 0 R >> >> /Length %d >>\nstream\n%s\nendstream"
+                % (bbox, len(body), body))
+
+    stream = b"\n".join([
+        b"BT /F1 12 Tf 72 720 Td (A form's /BBox clips its content.) Tj ET",
+        b"q 1 0 0 1 72 500 cm /Fm0 Do Q",
+        b"q 1 0 0 1 72 60 cm /Fm1 Do Q",
+    ])
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 7 0 R >> /XObject << /Fm0 5 0 R /Fm1 6 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+        5: form(5, b"[0 0 200 120]"),
+        6: form(6, b"[0 0 400 300]"),
+        7: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        8: _flate_image(8, 2, 2, b"/DeviceRGB", 8, bytes((10, 200, 90)) * 4),
+    }
+    _assemble_pdf(objs, pdf)
+    GT["form_bbox.pdf"] = {
+        "in_box_fill": "#3366cc",
+        "out_of_box_fill": "#cc3333",
+        # The clipped form's ink box in page space: BBox [0 0 200 120] x /Matrix 1.5 at (72, 500).
+        "clipped_box": [72, 500, 372, 680],
+        # The raster lives outside the small BBox, so only the control form places it.
+        "rasters": 1,
+        "raster_box": [402, 270, 462, 330],
+    }
+
+
 def gen_clipped_raster():
-    """The same raster drawn twice — once whole, once under a ``re W n`` clip.
+    """The same raster drawn three times: whole, clipped, and clipped under a ROTATED placement.
 
-    ``vector::walk`` honours the active clip for path ink (it stores it and emits an SVG
-    ``<clipPath>``); ``img::walk`` tracked no clip at all, so a raster the content stream
-    crops to a small window rendered at its FULL placement rect. Since rasters paint in true
-    paint order that means covering whatever the page drew after it.
+    ``vector::walk`` honours the active clip for path ink; ``img::walk`` tracked no clip at all,
+    so a raster the content stream crops to a small window rendered at its FULL placement rect —
+    and since rasters paint in true paint order, it covers whatever the page drew after it.
 
-    Two geometrically identical 300x180 figures (stroked frame + 5 ticks = 6 paths, clearing
-    ``MIN_PATHS``), 220 pt apart so they cluster separately, each holding one 160x120 pt
-    raster at (140, y0+30):
+    Three geometrically identical 300x180 figures (stroked frame + 5 ticks = 6 paths, clearing
+    ``MIN_PATHS``), 60 pt apart so they cluster separately, each holding one 160x120 pt raster at
+    (140, y0+30). The 2x2 raster is red|green over blue|yellow, so which quarter survives is
+    unambiguous — the clip takes the BOTTOM-LEFT quarter, which is blue.
 
-      TOP    (y 520-700): unclipped — the control. Plain ``x/y/width/height`` ``<image>``,
-                          no ``clip-path``.
-      BOTTOM (y 120-300): the identical ``Do`` under ``140 150 80 60 re W n``, i.e. the
-                          raster's BOTTOM-LEFT QUARTER. The ``<image>`` must carry a
-                          ``clip-path``, must be placed by MATRIX (the pixels still fill the
-                          whole 160x120 rect — only the window shrank), and the figure's
-                          recorded extent must be the 80x60 crop, not the 160x120 placement.
-
-    The raster is four flat quadrant colours, so which quarter survives is unambiguous."""
+      TOP    (y 560-740): unclipped — the control. Plain ``x/y/width/height``, no mask.
+      MID    (y 320-500): ``140 350 80 60 re W n`` around an AXIS-ALIGNED placement. The window
+                          is a pixel rectangle, so the SAMPLES are cropped and no mask is
+                          emitted — the one answer that is also right for a plain ``<img>``.
+      BOTTOM (y  80-260): the same clip around a ROTATED placement, where a page-space rectangle
+                          is NOT a pixel rectangle. Those keep every pixel and an SVG
+                          ``clip-path``, on a wrapping ``<g>`` (a ``clip-path`` on the
+                          transformed ``<image>`` itself would be scaled by the placement matrix
+                          and hide the raster outright)."""
     pdf = os.path.join(OUT, "clipped_raster.pdf")
-    # 2x2: red | green over blue | yellow. In PDF image space row 0 is the TOP row, so the
+    # 2x2: red | green over blue | yellow. Row 0 is the TOP row in PDF image space, so the
     # bottom-left quarter of the placement is BLUE.
     img = _flate_image(5, 2, 2, b"/DeviceRGB", 8,
                        bytes((220, 30, 40, 30, 160, 60, 40, 60, 210, 230, 190, 40)))
 
-    def figure(y0, clip):
+    def figure(y0, clip, rotated=False):
         frame = b"q 0 0 0 RG 1 w 72 %d 300 180 re S Q" % y0
         ticks = b"\n".join(
             b"q 0 0 0 RG 1 w %d %d m %d %d l S Q" % (72 + 20 * i, y0, 72 + 20 * i, y0 + 12)
             for i in range(1, 6)
         )
-        do = b"q 160 0 0 120 140 %d cm /Im0 Do Q" % (y0 + 30)
+        # Both placements occupy x 140..300, y y0+30..y0+150; the second turns the pixels.
+        cm = b"0 120 -160 0 300 %d" % (y0 + 30) if rotated else b"160 0 0 120 140 %d" % (y0 + 30)
+        do = b"q %s cm /Im0 Do Q" % cm
         if clip:
             do = b"q 140 %d 80 60 re W n\n%s\nQ" % (y0 + 30, do)
         return b"\n".join([frame, ticks, do])
 
     stream = b"\n".join([
-        b"BT /F1 12 Tf 72 720 Td (A clipped raster shows only its window.) Tj ET",
-        figure(520, clip=False),
-        figure(120, clip=True),
+        b"BT /F1 12 Tf 72 760 Td (A clipped raster shows only its window.) Tj ET",
+        figure(560, clip=False),
+        figure(320, clip=True),
+        figure(80, clip=True, rotated=True),
     ])
     objs = {
         1: b"<< /Type /Catalog /Pages 2 0 R >>",
@@ -1008,9 +1076,10 @@ def gen_clipped_raster():
     }
     _assemble_pdf(objs, pdf)
     GT["clipped_raster.pdf"] = {
-        "figures": 2,
-        "placement": [140, 150, 300, 270],   # x0 y0 x1 y1 of the clipped figure's raster
-        "clip": [140, 150, 220, 210],        # the window the page actually shows
+        "figures": 3,
+        "placement": [140, 350, 300, 470],   # x0 y0 x1 y1 of the axis-aligned clipped raster
+        "clip": [140, 350, 220, 410],        # the window the page actually shows
+        "window_rgb": [40, 60, 210],         # the bottom-left quarter is blue
     }
 
 
@@ -2863,6 +2932,7 @@ def main():
     gen_cmyk_jpeg()
     gen_smask_panel()
     gen_clipped_raster()
+    gen_form_bbox()
     gen_decode_jpeg()
     gen_form_inherit()
     gen_form_font()
