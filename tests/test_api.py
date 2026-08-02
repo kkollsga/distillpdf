@@ -118,6 +118,24 @@ def test_cmyk_jpeg_is_normalized_to_the_authored_colour():
         assert max(abs(a - b) for a, b in zip(got, want)) <= 8, f"band x={x}: {got} vs {want}"
 
 
+def test_cmyk_jpeg_renders_in_the_authored_colour_in_html():
+    """The render path had the same silent inversion as the extract path, keyed on the
+    Adobe APP14 transform byte instead of `/Decode`: `to_html(image_mode="embed")` embedded
+    this fixture's white/cyan/magenta bands as SOLID BLACK. Polarity is `/Decode`'s to
+    state (PDF §7.4.8), so the decoder's standalone-JPEG complement is undone unless
+    `/Decode` already inverts."""
+    Image = pytest.importorskip("PIL.Image")
+    import base64
+    h = distillpdf.Pdf.open(CMYK_JPEG).to_html(mode="page", return_string=True, image_mode="embed")
+    uris = re.findall(r"data:image/\w+;base64,([A-Za-z0-9+/=]+)", h)
+    assert len(uris) == 1, "the fixture places exactly one image"
+    im = Image.open(io.BytesIO(base64.b64decode(uris[0]))).convert("RGB")
+    assert im.size == (96, 48)
+    for x, want in ((15, (255, 255, 255)), (47, (0, 255, 255)), (79, (255, 75, 255))):
+        got = im.getpixel((x, 24))
+        assert max(abs(a - b) for a, b in zip(got, want)) <= 8, f"band x={x}: {got} vs {want}"
+
+
 def test_every_extracted_image_across_the_fixtures_opens():
     """The usability contract: on the owned corpus every returned blob is a file PIL can
     open. Only 44% of corpus blobs did before the bytes were assembled/unwrapped; a row we

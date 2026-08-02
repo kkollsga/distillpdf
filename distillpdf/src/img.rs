@@ -150,37 +150,6 @@ fn image_payload(stream: &lopdf::Stream) -> std::borrow::Cow<'_, [u8]> {
     }
 }
 
-/// The Adobe APP14 `transform` byte of a JPEG, if the marker is present.
-/// `2` = YCCK (Photoshop/Adobe CMYK, stored with inverted polarity).
-fn adobe_transform(buf: &[u8]) -> Option<u8> {
-    let mut i = 2; // skip SOI (FF D8)
-    while i + 4 <= buf.len() {
-        if buf[i] != 0xFF {
-            i += 1;
-            continue;
-        }
-        let marker = buf[i + 1];
-        // standalone markers (no length) / start of scan
-        if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
-            i += 2;
-            continue;
-        }
-        if marker == 0xDA {
-            break; // SOS — compressed data follows
-        }
-        let len = ((buf[i + 2] as usize) << 8) | buf[i + 3] as usize;
-        if marker == 0xEE {
-            // APP14: "Adobe" + version(2) + flags0(2) + flags1(2) + transform(1)
-            let seg = &buf[i + 4..(i + 2 + len).min(buf.len())];
-            if seg.starts_with(b"Adobe") && seg.len() >= 12 {
-                return Some(seg[11]);
-            }
-        }
-        i += 2 + len;
-    }
-    None
-}
-
 /// Component count from the JPEG SOF (start-of-frame) marker, without a full decode.
 /// 4 => CMYK; 3 => RGB/YCbCr; 1 => grayscale.
 fn jpeg_components(buf: &[u8]) -> Option<u8> {
@@ -217,9 +186,19 @@ fn jpeg_is_cmyk(content: &[u8]) -> bool {
 }
 
 /// Decode a JPEG to RGB8 via `jpeg-decoder` (the `image`/zune path mis-renders Adobe
-/// CMYK as black). Handles grayscale, RGB, and CMYK; for CMYK it mirrors MuPDF: invert
-/// the Adobe YCCK polarity (transform==2), optionally XOR a PDF `/Decode` inversion,
-/// then map true CMYK → RGB.
+/// CMYK as black). Handles grayscale, RGB, and CMYK.
+///
+/// The CMYK polarity follows **PDF** semantics, not standalone-JPEG-file semantics.
+/// §7.4.8 makes the `DCTDecode` output the *sample values*, with the Adobe APP14
+/// transform byte selecting only the colour transform (0 none, 1 YCbCr, 2 YCCK);
+/// polarity is stated separately by the image dict's `/Decode` array — which is exactly
+/// why Distiller writes `/Decode [1 0 1 0 1 0 1 0]` next to a Photoshop CMYK JPEG.
+/// `jpeg-decoder` complements **both** of its 4-component paths (`color_convert_line_cmyk`
+/// and the `255 - k` in `color_convert_line_ycck`) per the standalone convention, so that
+/// complement has to be undone before `/Decode` is applied: invert unless `/Decode`
+/// inverts, for CMYK and YCCK alike. Keying on `transform == 2` instead (the old rule) got
+/// the far commoner transform-0/absent case backwards and rendered those images inverted
+/// — the `cmyk_jpeg.pdf` fixture's authored white/cyan/magenta bands all came out black.
 fn decode_jpeg_rgb(content: &[u8], decode_invert: bool) -> Option<image::RgbImage> {
     let mut dec = jpeg_decoder::Decoder::new(std::io::Cursor::new(content));
     // Read the header first and reject absurd dimensions BEFORE decoding pixels (a hostile
@@ -242,7 +221,7 @@ fn decode_jpeg_rgb(content: &[u8], decode_invert: bool) -> Option<image::RgbImag
         L16 => None,
         RGB24 => image::RgbImage::from_raw(w, h, px),
         CMYK32 => {
-            let net_invert = (adobe_transform(content) == Some(2)) ^ decode_invert;
+            let net_invert = !decode_invert;
             let n = (w as usize) * (h as usize);
             let mut rgb = vec![0u8; n * 3];
             for i in 0..n {
@@ -941,4 +920,69 @@ fn stitch_grid(doc: &Document, tiles: &[&RawTile], bbox: (f32, f32, f32, f32)) -
         return None;
     }
     rgba_uri(canvas, tiles.iter().all(|t| jpeg_source(doc, t.id)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decode the base64 payload of a `data:` URI into an RGB image.
+    fn uri_rgb(uri: &str) -> image::RgbImage {
+        let b64 = uri.split_once(";base64,").expect("data URI must be base64").1;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).expect("valid base64");
+        image::load_from_memory(&bytes).expect("the embedded payload must decode").to_rgb8()
+    }
+
+    #[test]
+    fn the_render_path_embeds_a_cmyk_jpeg_in_the_authored_colour() {
+        // `tests/gen_fixtures.py::gen_cmyk_jpeg` — three flat CMYK bands behind an Adobe
+        // APP14 marker (transform 0) and `/Decode [1 0 1 0 1 0 1 0]`. Keying the polarity
+        // on `transform == 2` inverted every non-YCCK CMYK JPEG, so `to_html`'s embedded
+        // image came out SOLID BLACK for all three bands. K is 0 throughout, so the
+        // expected RGB is just 255 - ink.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/cmyk_jpeg.pdf");
+        let doc = Document::load(path).expect("cmyk_jpeg.pdf fixture must load");
+        let page_id = *doc.get_pages().values().next().expect("fixture has a page");
+        let placed = positioned_images(&doc, page_id, true);
+        assert_eq!(placed.len(), 1, "the fixture places exactly one image");
+        let img = uri_rgb(&placed[0].uri);
+        assert_eq!(img.dimensions(), (96, 48));
+        for (x, want) in [(15u32, [255u8, 255, 255]), (47, [0, 255, 255]), (79, [255, 75, 255])] {
+            let got = img.get_pixel(x, 24).0;
+            let d = (0..3).map(|i| got[i].abs_diff(want[i])).max().unwrap();
+            assert!(d <= 8, "band at x={x}: expected ~{want:?}, got {got:?}");
+        }
+    }
+
+    /// A flat single-colour JPEG of the given pixel format, encoded in memory.
+    fn flat_jpeg(img: image::DynamicImage) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 100);
+        img.write_with_encoder(enc).expect("encode");
+        out.into_inner()
+    }
+
+    #[test]
+    fn the_gray_and_rgb_jpeg_paths_are_untouched_by_the_cmyk_polarity_rule() {
+        // `decode_jpeg_rgb` is shared: the 1- and 3-component paths must keep round-tripping
+        // their colour whatever the CMYK rule does (no corpus fixture carries a non-CMYK
+        // DCTDecode raster, so the JPEGs are encoded here).
+        let rgb = flat_jpeg(image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            8,
+            8,
+            image::Rgb([200, 30, 90]),
+        )));
+        let got = decode_jpeg_rgb(&rgb, false).expect("RGB JPEG decodes").get_pixel(4, 4).0;
+        for (g, w) in got.iter().zip([200u8, 30, 90]) {
+            assert!(g.abs_diff(w) <= 4, "RGB JPEG round-trip: got {got:?}");
+        }
+
+        let gray = flat_jpeg(image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(
+            8,
+            8,
+            image::Luma([160]),
+        )));
+        let got = decode_jpeg_rgb(&gray, false).expect("gray JPEG decodes").get_pixel(4, 4).0;
+        assert!(got.iter().all(|v| v.abs_diff(160) <= 4), "gray JPEG round-trip: got {got:?}");
+    }
 }
