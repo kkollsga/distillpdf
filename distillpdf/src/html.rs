@@ -1751,6 +1751,14 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                     .any(|&(xl, xr, yb, yt)| x >= xl - cap_m && x <= xr + cap_m && y >= yb - cap_m && y <= yt + cap_m)
             };
             let mut labels: Vec<vector::LabelSpan> = Vec::new();
+            // Parallel to `labels`: does this span sit inside a table the page emits? A
+            // figure whose text is almost entirely a table's cells is a callout panel
+            // REPRODUCING that table, and must not print the numbers a second time — see
+            // `vector::PlacedSvg::attach`. Display space, like every other box test here.
+            let mut label_in_table: Vec<bool> = Vec::new();
+            let in_table = |x: f32, y: f32| {
+                tables.iter().any(|t| x >= t.x_left && x <= t.x_right && y >= t.y_bottom && y <= t.y_top)
+            };
             // Which spans a figure claims is decided in DISPLAY space (`ds`), against the
             // display-space figure boxes; what is HANDED to the figure is the PAGE-space span
             // (`s`), because `PlacedSvg` maps page space to its own turned local space itself
@@ -1771,9 +1779,10 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                 // nothing; `in_figure` — the tight 4pt box — stays unconditional.
                 if (take || (in_captioned_fig_pt(cx, cy) && !on_split_row(cx, cy))) && !in_caption(cx, cy) {
                     labels.push(mk(clone_span(s)));
+                    label_in_table.push(in_table(cx, cy));
                 }
             }
-            vector::attach_labels(&mut vectors, &labels);
+            vector::attach_labels(&mut vectors, &labels, &label_in_table);
         }
 
         // Page x-extent (from text lines), used to give full-width boxes to

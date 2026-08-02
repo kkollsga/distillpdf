@@ -1,0 +1,62 @@
+%PDF-1.5
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 1308 >>
+stream
+BT /F2 17 Tf 72 730 Td (A Callout Panel Around A Real Table) Tj ET
+BT /F1 10 Tf 72 700 Td (The panel below is a figure; the grid inside it is a table.) Tj ET
+BT /F2 11 Tf 88 594 Td (Benchmarks for evaluating groundwater quality) Tj ET
+q 0.93 0.95 0.90 rg 72 400 468 240 re f Q
+q 0 0 0 RG 1.2 w 72 400 468 240 re S Q
+q 0.85 0.20 0.15 rg 84 608 10 10 re f Q
+q 0.20 0.55 0.80 rg 98 608 10 10 re f Q
+q 0.95 0.75 0.10 rg 112 608 10 10 re f Q
+q 0 0 0 RG 0.6 w 88 566 m 500 566 l S Q
+q 0 0 0 RG 0.6 w 88 494 m 500 494 l S Q
+q 0.20 0.45 0.70 rg 470 420 m 500 438 500 462 470 450 c f Q
+q 0.20 0.45 0.70 rg 470 450 m 500 468 500 492 470 480 c f Q
+q 0 0 0 RG 0.8 w 470 420 m 512 462 l S Q
+BT /F1 9 Tf 96.0 572.0 Td (Constituent) Tj ET
+BT /F1 9 Tf 260.0 572.0 Td (Benchmark) Tj ET
+BT /F1 9 Tf 410.0 572.0 Td (Value) Tj ET
+BT /F1 9 Tf 96.0 548.0 Td (Arsenic) Tj ET
+BT /F1 9 Tf 260.0 548.0 Td (Federal MCL) Tj ET
+BT /F1 9 Tf 410.0 548.0 Td (10 ppb) Tj ET
+BT /F1 9 Tf 96.0 524.0 Td (Boron) Tj ET
+BT /F1 9 Tf 260.0 524.0 Td (Federal HAL) Tj ET
+BT /F1 9 Tf 410.0 524.0 Td (6,000 ppb) Tj ET
+BT /F1 9 Tf 96.0 500.0 Td (Radon-222) Tj ET
+BT /F1 9 Tf 260.0 500.0 Td (Proposed MCL) Tj ET
+BT /F1 9 Tf 410.0 500.0 Td (4,000 pCi) Tj ET
+BT /F1 10 Tf 72 356 Td (Sampled wells in the shallow aquifer system ranged widely in depth.) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000257 00000 n 
+0000001617 00000 n 
+0000001714 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+1816
+%%EOF

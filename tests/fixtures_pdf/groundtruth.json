@@ -1114,5 +1114,30 @@
         "18.2"
       ]
     ]
+  },
+  "panel_table.pdf": {
+    "cells": [
+      [
+        "Constituent",
+        "Benchmark",
+        "Value"
+      ],
+      [
+        "Arsenic",
+        "Federal MCL",
+        "10 ppb"
+      ],
+      [
+        "Boron",
+        "Federal HAL",
+        "6,000 ppb"
+      ],
+      [
+        "Radon-222",
+        "Proposed MCL",
+        "4,000 pCi"
+      ]
+    ],
+    "panel_own_text": "Benchmarks"
   }
 }

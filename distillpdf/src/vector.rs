@@ -395,6 +395,13 @@ fn local_extent(rot: i32, w: f32, h: f32) -> (f32, f32) {
 // to belong to the figure (form text sits just outside the boxes it annotates).
 const LABEL_MARGIN: f32 = 24.0;
 
+/// The share of a figure's own claimed text that has to be cells of a table the page also
+/// emits before the figure **yields** that text to the table — see [`PlacedSvg::attach`].
+///
+/// `0.6` sits in the gap the corpus leaves: the two callout panels that duplicate a table
+/// score 0.95 and 0.79, and the cover map that must keep its labels scores at most 0.32.
+const TABLE_YIELD_SHARE: f32 = 0.6;
+
 impl PlacedSvg {
     /// Whether this figure draws curves or slanted lines — see [`has_graphic_ink`]. Used by
     /// `html.rs` to tell a diagram's own label grid (which must not suppress the diagram)
@@ -417,14 +424,34 @@ impl PlacedSvg {
     /// The *claim* stays in page space — spans arrive in page space and so does the bbox, so
     /// which figure owns a label is decided exactly as it was before `/Rotate` existed here.
     /// Only the label's **local placement** is turned into display orientation.
-    fn attach(&mut self, spans: &[LabelSpan]) {
-        for s in spans {
-            let cx = s.x + s.width * 0.5;
-            let cy = s.y + s.size * 0.5;
-            if cx >= self.x_left - LABEL_MARGIN
-                && cx <= self.x_right + LABEL_MARGIN
-                && cy >= self.y_bottom - LABEL_MARGIN
-                && cy <= self.y_top + LABEL_MARGIN
+    fn attach(&mut self, spans: &[(LabelSpan, bool)]) {
+        let mine: Vec<&(LabelSpan, bool)> = spans
+            .iter()
+            .filter(|(s, _)| {
+                let cx = s.x + s.width * 0.5;
+                let cy = s.y + s.size * 0.5;
+                cx >= self.x_left - LABEL_MARGIN && cx <= self.x_right + LABEL_MARGIN && cy >= self.y_bottom - LABEL_MARGIN && cy <= self.y_top + LABEL_MARGIN
+            })
+            .collect();
+        // A figure whose text is almost entirely a table's cells is not a figure with
+        // labels — it is a panel REPRODUCING a table the page also emits as `<table>`, and
+        // the reader gets the numbers twice (`geology_usgs_fs` p3's "Benchmarks for
+        // evaluating groundwater quality" callout, `nonenglish_spanish_astrofisica` p24's
+        // "Gravedad" callout). Such a figure yields those spans; it keeps whatever is its
+        // own (the panel's heading, its ink).
+        //
+        // The share is measured over the FIGURE's own text, not the table's, and that is the
+        // whole discrimination. Measured on the pages in question: the two duplicating
+        // callouts are at 0.95 and 0.79, while `geology_usgs_fs` p1's cover MAP — which a
+        // spurious label grid overlaps, and which must keep every city name — is at 0.21,
+        // 0.17 and 0.32 against the three grids it overlaps. A map is a figure that happens
+        // to overlap a table; a callout panel is a table with a box drawn round it.
+        let claimed = mine.iter().filter(|(_, t)| *t).count();
+        let yields = !mine.is_empty() && claimed as f32 >= mine.len() as f32 * TABLE_YIELD_SHARE;
+        for (s, in_table) in mine {
+            if yields && *in_table {
+                continue;
+            }
             {
                 let (lx, ly) = self.to_local(s.x, s.y);
                 self.labels.push(Label {
@@ -1044,8 +1071,18 @@ fn page_width(doc: &Document, page_id: ObjectId, rot: i32) -> f32 {
 ///
 /// The spans are [`coalesce_glyph_runs`]-joined first, so a label a cartographic exporter
 /// drew one glyph per `Tj` reaches its figure as the WORD it is.
-pub fn attach_labels(figs: &mut [PlacedSvg], spans: &[LabelSpan]) {
-    let spans = coalesce_glyph_runs(spans);
+/// `in_table[i]` says whether `spans[i]` sits inside a table the page emits as `<table>` —
+/// see [`PlacedSvg::attach`] for what a figure does about it. Passed as a parallel slice
+/// rather than a field on [`LabelSpan`] because the test is made in DISPLAY space (against
+/// the turned table boxes) while the span handed here is page space; keeping it out of the
+/// struct keeps the two spaces from being confused for each other.
+pub fn attach_labels(figs: &mut [PlacedSvg], spans: &[LabelSpan], in_table: &[bool]) {
+    // A joined run inherits its FIRST member's verdict: the run is one word, and a word is
+    // in the table or it is not.
+    let spans: Vec<(LabelSpan, bool)> = coalesce_glyph_runs(spans)
+        .into_iter()
+        .map(|(s, first)| (s, in_table.get(first).copied().unwrap_or(false)))
+        .collect();
     for f in figs.iter_mut() {
         f.attach(&spans);
     }
@@ -1062,14 +1099,16 @@ pub fn attach_labels(figs: &mut [PlacedSvg], spans: &[LabelSpan]) {
 /// up as "the label is decoded but never rendered" when in fact it was never *assembled*.
 ///
 /// **Deliberately narrow.** Only a gap the reader would not see as a break is closed
-/// ([`GLYPH_JOIN_GAP`]), and no space is ever invented: a span pair separated by a real word
+/// ([`crate::textutil::glyph_adjacent`]), and no space is ever invented: a span pair separated by a real word
 /// space stays two spans, exactly as before. Adjacency is measured **along the baseline**,
 /// not along x, so a 90° axis title's glyphs join the same way. Style, size and angle must
 /// all match — a run that changes any of them is a different run.
 ///
 /// Output order is the input's: each joined run takes the position of its FIRST member, so
-/// no figure's existing `<text>` sequence is reshuffled by this pass.
-fn coalesce_glyph_runs(spans: &[LabelSpan]) -> Vec<LabelSpan> {
+/// no figure's existing `<text>` sequence is reshuffled by this pass. That first index is
+/// returned beside the run — a caller carrying a per-span verdict ([`attach_labels`]'s
+/// `in_table`) needs to know which input the run speaks for.
+fn coalesce_glyph_runs(spans: &[LabelSpan]) -> Vec<(LabelSpan, usize)> {
     // Along-baseline and across-baseline coordinates of a span's anchor.
     let uv = |s: &LabelSpan| {
         let (sin, cos) = s.angle.sin_cos();
@@ -1114,7 +1153,7 @@ fn coalesce_glyph_runs(spans: &[LabelSpan]) -> Vec<LabelSpan> {
         runs.push((i, clone_label(s), u + s.width));
     }
     runs.sort_by_key(|(first, _, _)| *first);
-    runs.into_iter().map(|(_, s, _)| s).collect()
+    runs.into_iter().map(|(first, s, _)| (s, first)).collect()
 }
 
 fn clone_label(s: &LabelSpan) -> LabelSpan {
@@ -1892,7 +1931,7 @@ mod tests {
         big.size = 14.0;
         spans.push(big);
 
-        let out = coalesce_glyph_runs(&spans);
+        let out: Vec<LabelSpan> = coalesce_glyph_runs(&spans).into_iter().map(|(s, _)| s).collect();
         let texts: Vec<&str> = out.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(texts, vec!["Cloverdale", "Napa", "Sonoma", "XL"], "runs, in the input's order");
         // The joined run's width is the PAINTED extent, so the claim tests and the viewBox
@@ -2438,7 +2477,7 @@ mod tests {
                 .iter()
                 .map(|s| LabelSpan { x: s.x, y: s.y, size: s.size, width: s.width, text: s.text.clone(), bold: s.bold, italic: s.italic, angle: s.angle })
                 .collect();
-            attach_labels(&mut strong, &labels);
+            attach_labels(&mut strong, &labels, &vec![false; labels.len()]);
             let svg = strong[0].svg();
             for (text, degs) in &want {
                 let deg = degs[i];
@@ -2488,6 +2527,32 @@ mod tests {
         assert!(images[0].ctm.is_some(), "a turned raster must carry the matrix for its turned unit square");
         let turned = strong[0].composite_svg(&[raster(&images[0])]);
         assert!(turned.contains("transform=\"matrix(30 0 0 40 220 20)\""), "/Rotate 90: {turned}");
+    }
+
+    #[test]
+    fn a_callout_panel_yields_the_table_it_boxes_and_keeps_its_own_text() {
+        // `tests/gen_fixtures.py::gen_panel_table`. A shaded callout that clears the figure
+        // bar reproduced, as SVG `<text>`, the cells of the real table drawn inside it —
+        // while that table was ALSO emitted as `<table>`, so the reader saw every number
+        // twice and the SVG copy was the lossy one (`geology_usgs_fs` p3 kept `Perchlorate`
+        // and dropped `Radon-222`). Before the fix this fixture emits one `<table>`, one
+        // `<svg>`, and every cell exactly TWICE — verified.
+        //
+        // The panel's own heading must survive: the answer is not "a figure holding a table
+        // emits nothing", it is "a figure whose text is almost entirely a table's yields
+        // that text and keeps the rest".
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/panel_table.pdf");
+        let doc = Document::load(path).expect("panel_table.pdf fixture must load");
+        let raw = std::fs::read(path).expect("fixture readable");
+        let html = crate::html::to_html(&doc, &raw, crate::html::Mode::Page, true, true);
+        assert_eq!(html.matches("<table").count(), 1, "the ruled grid is still a table");
+        assert_eq!(html.matches("<svg").count(), 1, "the panel is still a figure");
+        for cell in ["Constituent", "Arsenic", "Federal MCL", "10 ppb", "Boron", "Federal HAL", "Radon-222", "Proposed MCL", "4,000 pCi"] {
+            assert_eq!(html.matches(cell).count(), 1, "{cell:?} appears {} time(s), not once", html.matches(cell).count());
+        }
+        let svg = html.split("<svg").nth(1).and_then(|s| s.split("</svg>").next()).expect("the figure's svg");
+        assert!(svg.contains("Benchmarks"), "the panel keeps its OWN heading: {svg}");
+        assert!(!svg.contains("Radon-222"), "and none of the table's cells: {svg}");
     }
 
     #[test]
@@ -2541,4 +2606,5 @@ mod tests {
         );
         painted
     }
+
 }

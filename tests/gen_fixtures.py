@@ -2082,6 +2082,72 @@ def gen_annot_appearance():
     }
 
 
+def gen_panel_table():
+    """A boxed callout panel with a real ruled table inside it — each cell exactly ONCE.
+
+    A shaded/bordered callout that clears the figure bar reproduces, as SVG ``<text>``, the
+    cells of a real table drawn inside it — while that table is *also* emitted as
+    ``<table>``. The reader sees the numbers twice, and the SVG copy is the lossy one: it
+    keeps whichever cells fall in the ink box and silently drops the rest
+    (``geology_usgs_fs`` p3's benchmark callout kept ``Perchlorate`` and lost ``Radon-222``).
+
+    This is the duplicate half of the exactly-once invariant P10 pinned for the *dropped*
+    half, and its natural pair is ``caption_bleed.pdf``.
+
+    The panel carries a heading and a palette of its own, so the fix cannot be "a figure
+    holding a table emits nothing": what must survive is the panel's own text, and what must
+    go is the table's."""
+    pdf = os.path.join(OUT, "panel_table.pdf")
+    COLS = (96.0, 260.0, 410.0)
+    ROWS = [
+        ["Constituent", "Benchmark", "Value"],
+        ["Arsenic", "Federal MCL", "10 ppb"],
+        ["Boron", "Federal HAL", "6,000 ppb"],
+        ["Radon-222", "Proposed MCL", "4,000 pCi"],
+    ]
+    panel = [
+        b"q 0.93 0.95 0.90 rg 72 400 468 240 re f Q",          # the shaded callout
+        b"q 0 0 0 RG 1.2 w 72 400 468 240 re S Q",             # its border
+        b"q 0.85 0.20 0.15 rg 84 608 10 10 re f Q",            # the panel's own palette —
+        b"q 0.20 0.55 0.80 rg 98 608 10 10 re f Q",            # see gen_clipped_raster
+        b"q 0.95 0.75 0.10 rg 112 608 10 10 re f Q",
+    ]
+    # Horizontal rules under the header and above the last row: a genuinely RULED table.
+    panel += [b"q 0 0 0 RG 0.6 w 88 %d m 500 %d l S Q" % (y, y) for y in (566, 494)]
+    # A small curved mark in the panel corner. `has_graphic_ink` looks for curves or
+    # slanted lines: without one this rects-and-rules panel reads as a ruled TABLE and
+    # never becomes a figure at all, and the fixture stops reproducing anything.
+    panel += [
+        b"q 0.20 0.45 0.70 rg 470 %d m 500 %d 500 %d 470 %d c f Q" % (y, y + 18, y + 42, y + 30)
+        for y in (420, 450)
+    ]
+    panel.append(b"q 0 0 0 RG 0.8 w 470 420 m 512 462 l S Q")
+    body = [b"BT /F2 17 Tf 72 730 Td (A Callout Panel Around A Real Table) Tj ET",
+            b"BT /F1 10 Tf 72 700 Td (The panel below is a figure; the grid inside it is a table.) Tj ET",
+            b"BT /F2 11 Tf 88 594 Td (Benchmarks for evaluating groundwater quality) Tj ET"]
+    body += panel
+    for ri, row in enumerate(ROWS):
+        y = 572.0 - ri * 24.0
+        for ci, cell in enumerate(row):
+            body.append(b"BT /F1 9 Tf %.1f %.1f Td (%s) Tj ET" % (COLS[ci], y, cell.encode()))
+    body.append(b"BT /F1 10 Tf 72 356 Td (Sampled wells in the shallow aquifer system ranged widely in depth.) Tj ET")
+    stream = b"\n".join(body)
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+        5: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        6: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["panel_table.pdf"] = {
+        "cells": ROWS,
+        "panel_own_text": "Benchmarks for evaluating groundwater quality",
+    }
+
+
 def gen_glyph_table():
     """A data table whose body is drawn one ``Tj`` per glyph — the SEC-filing idiom.
 
@@ -3875,6 +3941,7 @@ def main():
     gen_annot_appearance()
     gen_annot_render()
     gen_glyph_table()
+    gen_panel_table()
     gen_no_spurious_figs()
     gen_links()
     gen_pagelabels()
