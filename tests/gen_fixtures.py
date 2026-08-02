@@ -1227,8 +1227,11 @@ def gen_form_bomb():
 
 
 # ------------------------------------------------------------------------------ links
-def _assemble_pdf(objs, path):
-    """Write a minimal PDF from {objnum: bytes} (numbers contiguous from 1)."""
+def _assemble_pdf(objs, path, info=None):
+    """Write a minimal PDF from {objnum: bytes} (numbers contiguous from 1).
+
+    ``info`` is an optional object number to reference as the trailer's ``/Info``
+    dictionary (the document Info dict is a trailer entry, not a catalog one)."""
     body = bytearray(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n")
     offsets = {}
     for num in sorted(objs):
@@ -1239,7 +1242,9 @@ def _assemble_pdf(objs, path):
     body += b"xref\n0 %d\n0000000000 65535 f \n" % n
     for num in range(1, n):
         body += b"%010d 00000 n \n" % offsets[num]
-    body += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (n, xref_off)
+    info_ref = b" /Info %d 0 R" % info if info is not None else b""
+    body += (b"trailer\n<< /Size %d /Root 1 0 R%s >>\nstartxref\n%d\n%%%%EOF\n"
+             % (n, info_ref, xref_off))
     with open(path, "wb") as f:
         f.write(bytes(body))
 
@@ -1446,13 +1451,27 @@ def gen_links():
 # --------------------------------------------------------------------------- pagelabels
 def gen_pagelabels():
     """A hand-written PDF carrying a real ``/PageLabels`` number tree (reportlab cannot emit
-    one). Four pages: front matter labelled lowercase-roman ``i, ii`` (style ``/r``), then the
-    body labelled arabic ``1, 2`` (style ``/D``) restarting at 1. The model build's
-    ``page_labels`` reader fills ``pages[n].labels.pdf`` from this, so distill → ``read --pages
-    ii`` / ``find --pages 1`` resolve a LABEL to its physical page (the Wave-3 gap: no owned
-    fixture carried /PageLabels). Each page has one short heading + body line so it yields real
-    sections/blocks to read and find."""
+    one). Six pages: front matter labelled lowercase-roman ``i, ii`` (style ``/r``), then the
+    body labelled arabic ``1, 2`` (style ``/D``) restarting at 1, then a back-matter range
+    whose ``/P`` PREFIX is a UTF-16BE (BOM'd) string → ``Apêndice 1, Apêndice 2``. The model
+    build's ``page_labels`` reader fills ``pages[n].labels.pdf`` from this, so distill →
+    ``read --pages ii`` / ``find --pages 1`` resolve a LABEL to its physical page (the Wave-3
+    gap: no owned fixture carried /PageLabels). Each page has one short heading + body line so
+    it yields real sections/blocks to read and find.
+
+    The UTF-16BE prefix is the second half of the "three text-string decoders, one correct"
+    defect: the prefix reader used a bare ``from_utf8_lossy`` with NO BOM branch, so a
+    UTF-16BE prefix decoded to NUL-interleaved replacement-character garbage and every label
+    in the range came out unusable.
+
+    The trailer's ``/Info /Producer`` is written in PDFDocEncoding with high bytes (0x92 ™,
+    0x8D/0x8E curly double quotes) — the same defect's first half, in the OCR detector's
+    producer reader, which replaced each of those bytes with U+FFFD."""
     pdf = os.path.join(OUT, "pagelabels.pdf")
+    prefix = "Apêndice "
+    # PDFDocEncoding (PDF 32000-1 Annex D.2), NOT cp1252 and NOT UTF-8.
+    producer_bytes = b"distillPDF\x92 \x8Dfixture\x8E writer"
+    producer = "distillPDF™ “fixture” writer"
 
     def page_content(head, body):
         return (b"BT /F1 16 Tf 72 720 Td (%s) Tj ET\n"
@@ -1463,28 +1482,37 @@ def gen_pagelabels():
         (b"Acknowledgements", b"Acknowledgements continue the front matter on roman page ii."),
         (b"Introduction", b"The introduction opens the body on arabic page 1 of the work."),
         (b"Methods", b"The methods section is the body content on arabic page 2 here."),
+        (b"Appendix Tables", b"The first appendix page carries a UTF-16BE label prefix here."),
+        (b"Appendix Notes", b"The second appendix page continues the prefixed label range."),
     ]
-    # Object plan: 1 catalog, 2 pages-tree, 3 font, 4..7 page dicts, 8..11 content streams,
-    # 12 PageLabels dict. Page kids 4,5,6,7.
+    # Object plan: 1 catalog, 2 pages-tree, 3 font, then (page, content) pairs at 4..15,
+    # 16 PageLabels dict, 17 Info dict.
+    page_nums = [4 + 2 * i for i in range(len(pages))]
     objs = {
-        1: b"<< /Type /Catalog /Pages 2 0 R /PageLabels 12 0 R >>",
-        2: b"<< /Type /Pages /Kids [4 0 R 5 0 R 6 0 R 7 0 R] /Count 4 >>",
+        1: b"<< /Type /Catalog /Pages 2 0 R /PageLabels 16 0 R >>",
+        2: (b"<< /Type /Pages /Kids [%s] /Count %d >>"
+            % (b" ".join(b"%d 0 R" % n for n in page_nums), len(pages))),
         3: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-        12: (b"<< /Nums [ 0 << /S /r >> 2 << /S /D /St 1 >> ] >>"),
+        16: (b"<< /Nums [ 0 << /S /r >> 2 << /S /D /St 1 >> "
+             b"4 << /S /D /St 1 /P %s >> ] >>" % _utf16be_hex(prefix)),
+        17: b"<< /Producer (%s) >>" % producer_bytes,
     }
     for i, (head, body) in enumerate(pages):
-        page_num = 4 + i
-        content_num = 8 + i
+        page_num, content_num = page_nums[i], page_nums[i] + 1
         objs[page_num] = (
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
             b"/Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>" % content_num)
         c = page_content(head, body)
         objs[content_num] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c), c)
-    _assemble_pdf(objs, pdf)
+    _assemble_pdf(objs, pdf, info=17)
     GT["pagelabels.pdf"] = {
-        "labels": {1: "i", 2: "ii", 3: "1", 4: "2"},  # physical page -> /PageLabels label
+        # physical page -> /PageLabels label
+        "labels": {1: "i", 2: "ii", 3: "1", 4: "2", 5: prefix + "1", 6: prefix + "2"},
         "roman_pages": ["i", "ii"],
         "arabic_pages": ["1", "2"],
+        "utf16_prefix": prefix,
+        "utf16_pages": [prefix + "1", prefix + "2"],
+        "producer": producer,
         "page_ii_text": "front matter on roman page ii",
         "page_arabic1_text": "opens the body on arabic page 1",
     }

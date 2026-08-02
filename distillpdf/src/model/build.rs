@@ -187,8 +187,11 @@ fn page_labels(doc: &Document, page_count: u32) -> BTreeMap<u32, String> {
             Some(Object::Name(n)) => String::from_utf8_lossy(&n).to_string(),
             _ => String::new(),
         };
+        // `/P` is a PDF **text string**, so it needs the one decoder: a non-ASCII prefix is
+        // routinely written UTF-16BE behind a BOM, which `from_utf8_lossy` turns into
+        // NUL-interleaved replacement characters.
         let prefix = match d.get(b"P").ok().and_then(|o| resolve(doc, o)) {
-            Some(Object::String(s, _)) => String::from_utf8_lossy(&s).to_string(),
+            Some(Object::String(s, _)) => crate::pdfobj::decode_text_string(&s),
             _ => String::new(),
         };
         let st = match d.get(b"St").ok().and_then(|o| resolve(doc, o)) {
@@ -988,5 +991,24 @@ mod tests {
         assert_eq!(alpha(1, false), "a");
         assert_eq!(alpha(27, false), "aa");
         assert_eq!(alpha(2, true), "B");
+    }
+
+    #[test]
+    fn a_utf16be_page_label_prefix_decodes_as_text_not_bytes() {
+        // `pagelabels.pdf`'s third range carries `/P` as a BOM'd UTF-16BE string — the shape
+        // any producer emits for a non-ASCII prefix. The reader here was a bare
+        // `from_utf8_lossy` with NO BOM branch, so the prefix came back as
+        // "\u{FFFD}\u{FFFD}\0A\0p…" and every label in the range was unusable.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/pagelabels.pdf");
+        let doc = Document::load(path).expect("pagelabels.pdf fixture must load");
+        let labels = page_labels(&doc, 6);
+        assert_eq!(labels.get(&1).map(String::as_str), Some("i"));
+        assert_eq!(labels.get(&4).map(String::as_str), Some("2"));
+        assert_eq!(labels.get(&5).map(String::as_str), Some("Apêndice 1"), "UTF-16BE /P prefix mangled");
+        assert_eq!(labels.get(&6).map(String::as_str), Some("Apêndice 2"), "UTF-16BE /P prefix mangled");
+        // Nothing may leak the BOM or the UTF-16 padding NULs into a label.
+        for l in labels.values() {
+            assert!(!l.contains('\u{FFFD}') && !l.contains('\0'), "label {l:?} carries decode debris");
+        }
     }
 }
