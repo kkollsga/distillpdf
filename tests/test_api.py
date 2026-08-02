@@ -16,6 +16,7 @@ NUMERIC = os.path.join(FIX, "numeric.pdf")
 LINKS = os.path.join(FIX, "links.pdf")
 FORM_IMAGE = os.path.join(FIX, "form_image.pdf")
 FORM_FONT = os.path.join(FIX, "form_font.pdf")
+UNDRAWN_IMAGE = os.path.join(FIX, "undrawn_image.pdf")
 
 
 def test_open_and_page_count():
@@ -102,6 +103,22 @@ def test_extract_images_recurses_into_form_xobjects():
 
     page2 = [i for i in imgs if i["page"] == 2]
     assert [(i["index"], i["width"], i["height"]) for i in page2] == [(0, 120, 90), (1, 240, 160)]
+
+
+def test_extract_images_reports_only_what_the_page_draws():
+    """The fixture's two pages share ONE /Resources dict (inherited from /Pages) listing
+    every image in the file — the iText layout that made a reachability walk report all
+    338 images of a corpus preprint on each of its 166 pages. Only the images the page's
+    content stream actually paints are its images, including through a form."""
+    imgs = distillpdf.Pdf.open(UNDRAWN_IMAGE).extract_images()
+    assert [(i["page"], i["index"], i["width"], i["height"]) for i in imgs] == [
+        (1, 0, 40, 30),   # page 1 paints /ImDrawn
+        (2, 0, 42, 32),   # page 2 paints only the form, whose content paints /ImInForm
+    ]
+    # /ImNever (41x31) and /ImFormNever (43x33) are listed in the same resource
+    # dictionaries but painted by nobody.
+    assert all((i["width"], i["height"]) not in {(41, 31), (43, 33)} for i in imgs)
+    assert all(len(i["data"]) > 0 for i in imgs)
 
 
 def test_extract_tables():

@@ -192,6 +192,32 @@
       }
     ]
   },
+  "undrawn_image.pdf": {
+    "page1_images": [
+      {
+        "index": 0,
+        "width": 40,
+        "height": 30
+      }
+    ],
+    "page2_images": [
+      {
+        "index": 0,
+        "width": 42,
+        "height": 32
+      }
+    ],
+    "never_drawn": [
+      {
+        "width": 41,
+        "height": 31
+      },
+      {
+        "width": 43,
+        "height": 33
+      }
+    ]
+  },
   "form_font.pdf": {
     "font_name": "FF1",
     "base_font": "Helvetica",

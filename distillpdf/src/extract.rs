@@ -127,6 +127,115 @@ fn page_resource_dicts(doc: &Document, page_id: ObjectId) -> Vec<&Dictionary> {
     out
 }
 
+/// Overlay one resource dictionary's `/XObject` entries onto a name → object-id map.
+/// Later overlays win, so a nearer scope (the form's own resources, the page's own
+/// dictionary) shadows an outer one — the same precedence the renderer uses.
+fn overlay_xobjects(doc: &Document, res: &Dictionary, map: &mut std::collections::HashMap<Vec<u8>, ObjectId>) {
+    let Some(xd) = sub_dict(doc, res, b"XObject") else {
+        return;
+    };
+    for (name, val) in xd.iter() {
+        if let Ok(id) = val.as_reference() {
+            map.insert(name.clone(), id);
+        }
+    }
+}
+
+/// A content stream's bytes, decompressed when it carries a `/Filter`.
+fn content_bytes(stream: &lopdf::Stream) -> std::borrow::Cow<'_, [u8]> {
+    if stream.dict.get(b"Filter").is_err() {
+        return std::borrow::Cow::Borrowed(&stream.content);
+    }
+    match stream.decompressed_content() {
+        Ok(b) => std::borrow::Cow::Owned(b),
+        Err(_) => std::borrow::Cow::Borrowed(&stream.content),
+    }
+}
+
+/// Collect the image XObjects invoked by `Do` in this operator list, descending into the
+/// `/Subtype /Form` XObjects the stream actually invokes (a form's content can `Do`
+/// further XObjects). `xmap` is the resource scope in force: a form starts from its
+/// parent's map with its own `/Resources` overlaid, so an unqualified `/Im0` resolves to
+/// *that* form's `/Im0` and not a sibling's.
+fn walk_drawn(
+    doc: &Document,
+    ops: &[lopdf::content::Operation],
+    xmap: &std::collections::HashMap<Vec<u8>, ObjectId>,
+    depth: u32,
+    seen: &mut HashSet<ObjectId>,
+    out: &mut HashSet<ObjectId>,
+) {
+    for op in ops {
+        if op.operator != "Do" {
+            continue;
+        }
+        let Some(Object::Name(name)) = op.operands.first() else {
+            continue;
+        };
+        let Some(&id) = xmap.get(name.as_slice()) else {
+            continue; // dangling name: nothing in scope to draw
+        };
+        let Ok(stream) = doc.get_object(id).and_then(|o| o.as_stream()) else {
+            continue;
+        };
+        match stream.dict.get(b"Subtype").and_then(|o| o.as_name()).unwrap_or(b"") {
+            b"Image" => {
+                out.insert(id);
+            }
+            b"Form" => {
+                if depth >= crate::MAX_FORM_DEPTH {
+                    continue; // nesting cap
+                }
+                if !seen.insert(id) {
+                    continue; // a form already walked on this page: cycle / repeat guard
+                }
+                let mut child = xmap.clone();
+                if let Some(fr) = sub_dict(doc, &stream.dict, b"Resources") {
+                    overlay_xobjects(doc, fr, &mut child);
+                }
+                if let Ok(c) = lopdf::content::Content::decode(&content_bytes(stream)) {
+                    walk_drawn(doc, &c.operations, &child, depth + 1, seen, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The image XObjects this page's content stream actually DRAWS.
+///
+/// Reachability through the resource tree is not the same question. A producer may share
+/// ONE `/Resources` dictionary across every page (iText does; one 166-page corpus document
+/// lists all 166 of its page-body forms in a single shared dict), which makes a pure
+/// resource walk report every image in the document on every page — 56,108 rows and 2.4 GB
+/// of pixels for 338 distinct images. What a page *contains* is what it paints, so the
+/// `Do` operands decide membership and [`page_resource_dicts`] is left to do what it is
+/// good at: resolving a name to an object and fixing the report order.
+///
+/// `None` when the page's content stream can't be read or parsed at all — the caller then
+/// falls back to plain reachability rather than silently reporting an image-less page.
+fn drawn_images(doc: &Document, page_id: ObjectId) -> Option<HashSet<ObjectId>> {
+    let mut xmap: std::collections::HashMap<Vec<u8>, ObjectId> = std::collections::HashMap::new();
+    if let Ok((own, inherited)) = doc.get_page_resources(page_id) {
+        // `inherited` runs page → parent → …; apply it outermost-first so the nearest
+        // scope wins, then the page's own inline dictionary last of all.
+        for id in inherited.iter().rev() {
+            if let Ok(d) = doc.get_dictionary(*id) {
+                overlay_xobjects(doc, d, &mut xmap);
+            }
+        }
+        if let Some(d) = own {
+            overlay_xobjects(doc, d, &mut xmap);
+        }
+    }
+    let content = doc.get_page_content(page_id).ok()?;
+    let ops = lopdf::content::Content::decode(&content).ok()?;
+    let mut out = HashSet::new();
+    let mut seen = HashSet::new();
+    walk_drawn(doc, &ops.operations, &xmap, 0, &mut seen, &mut out);
+    Some(out)
+}
+
 /// The `/ColorSpace` family name, as lopdf's `PdfImage` reports it: an array's first
 /// element (`/ICCBased`, `/Indexed`, …) or a bare name. Deeper resolution is Phase 6.
 fn image_color_space(dict: &Dictionary) -> Option<String> {
@@ -152,14 +261,21 @@ fn image_filters(dict: &Dictionary) -> Vec<String> {
 
 /// Extract images from all pages as owned [`ImageInfo`] rows.
 ///
-/// Enumerates image XObjects through [`page_resource_dicts`], so images referenced only
-/// from inside a Form XObject are found. lopdf's `get_page_images()` reads the page's own
-/// `/Resources` and stops there, which left 13 of 54 corpus documents (every LaTeX/e-filing
-/// producer that wraps its page body in a form) reporting no images at all.
+/// A page's images are the ones its content stream actually **draws** ([`drawn_images`]),
+/// including those drawn from inside a Form XObject — lopdf's `get_page_images()` reads
+/// the page's own `/Resources` and stops there, which left 13 of 54 corpus documents
+/// (every LaTeX/e-filing producer that wraps its page body in a form) reporting no images
+/// at all. An image merely *reachable* through the resource tree but never painted is not
+/// this page's image; reporting those made a shared-`/Resources` producer return every
+/// image in the document on every page.
+///
+/// [`page_resource_dicts`] still drives enumeration, so the reported `(page, index)`
+/// ordering is unchanged wherever the drawn set equals the reachable set.
 pub fn extract_images(doc: &Document) -> Vec<ImageInfo> {
     let mut out = Vec::new();
     for (&pno, &page_id) in &doc.get_pages() {
         let mut index = 0usize;
+        let drawn = drawn_images(doc, page_id);
         // Dedup is across resource dictionaries only: an image the page's own /XObject
         // already listed is not re-reported when a nested form points at it too. Repeats
         // *within* one dictionary are kept, so the `index` a directly-referenced image had
@@ -173,6 +289,9 @@ pub fn extract_images(doc: &Document) -> Vec<ImageInfo> {
             };
             for (_, v) in xobjects.iter() {
                 let Ok(id) = v.as_reference() else { continue };
+                if drawn.as_ref().is_some_and(|d| !d.contains(&id)) {
+                    continue; // reachable from the resource tree, but this page never paints it
+                }
                 if seen.contains(&id) {
                     continue; // already reported from an outer resource dictionary
                 }
@@ -1195,7 +1314,9 @@ mod tests {
                         },
                     },
                 },
-                b"q Q".to_vec(),
+                // Invokes ITSELF and the inner form (which invokes it back) before painting
+                // the image: the cycle is in the content stream, not just the resource tree.
+                b"q /Fm0 Do /Fm1 Do /Im0 Do Q".to_vec(),
             ),
         );
         doc.set_object(
@@ -1208,11 +1329,11 @@ mod tests {
                         "XObject" => dictionary! { "Fm0" => form_id },
                     },
                 },
-                b"q Q".to_vec(),
+                b"q /Fm0 Do Q".to_vec(),
             ),
         );
         let pages_id = doc.new_object_id();
-        let contents_id = doc.add_object(Stream::new(dictionary! {}, b"q Q".to_vec()));
+        let contents_id = doc.add_object(Stream::new(dictionary! {}, b"q /Fm0 Do Q".to_vec()));
         let page_id = doc.add_object(dictionary! {
             "Type" => "Page",
             "Parent" => pages_id,
@@ -1244,6 +1365,32 @@ mod tests {
         let rows = extract_images(&doc);
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].page, rows[0].index, rows[0].width, rows[0].height), (1, 0, 7, 5));
+    }
+
+    #[test]
+    fn images_listed_in_the_resources_but_never_drawn_are_not_reported() {
+        // One /Resources dict shared by both pages through the /Pages node (the iText
+        // layout a 166-page corpus preprint uses). Reachability alone made every page
+        // reach every image in the document — 56,108 rows for 338 distinct images there.
+        // A page's images are the ones its content stream paints.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/undrawn_image.pdf");
+        let doc = Document::load(path).expect("undrawn_image.pdf fixture must load");
+        let rows = extract_images(&doc);
+        let dims: Vec<(u32, usize, i64, i64)> = rows.iter().map(|i| (i.page, i.index, i.width, i.height)).collect();
+        // page 1 paints /ImDrawn (40x30) only; page 2 paints only the form, whose content
+        // paints /ImInForm (42x32). /ImNever (41x31) and /ImFormNever (43x33) are listed
+        // in the very same resource dictionaries and must not appear.
+        assert_eq!(dims, vec![(1, 0, 40, 30), (2, 0, 42, 32)]);
+
+        // The reachability walk still sees all four — the filter is the `Do` walk, not a
+        // narrower resource tree (which extract_fonts shares).
+        let page1 = *doc.get_pages().get(&1).expect("page 1");
+        let reachable: usize = page_resource_dicts(&doc, page1)
+            .iter()
+            .filter_map(|r| sub_dict(&doc, r, b"XObject"))
+            .map(|x| x.iter().count())
+            .sum();
+        assert_eq!(reachable, 5, "page + form resources list 3 + 2 XObject entries");
     }
 
     #[test]

@@ -572,6 +572,58 @@ def gen_form_image():
     }
 
 
+def _raw_rgb_image(w, h):
+    """An uncompressed DeviceRGB image XObject of the given pixel size (hand-written: no
+    filter, so the fixture stays byte-inspectable and needs no codec)."""
+    px = bytes(0x20 + ((i * 7) % 0x5F) for i in range(w * h * 3))
+    return (b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceRGB "
+            b"/BitsPerComponent 8 /Length %d >>\nstream\n%s\nendstream" % (w, h, len(px), px))
+
+
+def gen_undrawn_image():
+    """Images listed in a page's ``/Resources`` but NEVER drawn by its content stream.
+
+    One ``/Resources`` dictionary is shared by both pages via the ``/Pages`` node — the
+    iText layout a 166-page corpus preprint uses, where every page's resource dict lists
+    every page-body form in the document. A pure reachability walk therefore makes each
+    page reach every image in the file (56,108 rows for 338 distinct images on that
+    document). A page's images are the ones it actually PAINTS, so:
+
+      page 1 draws ``/ImDrawn`` directly → only that row, never ``/ImNever``;
+      page 2 draws only the form ``/TPL``, whose own content paints ``/ImInForm`` and
+      leaves ``/ImFormNever`` untouched → exactly one row, the nested one.
+
+    reportlab always draws what it embeds, so this is hand-assembled."""
+    pdf = os.path.join(OUT, "undrawn_image.pdf")
+    page1_content = b"q 200 0 0 150 72 500 cm /ImDrawn Do Q"
+    page2_content = b"q 1 0 0 1 0 0 cm /TPL Do Q"
+    form_content = b"q 180 0 0 120 72 300 cm /ImInForm Do Q"
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        # The shared, INHERITED resource dictionary: both pages reach all four images.
+        2: (b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] "
+            b"/Resources 5 0 R >>"),
+        3: b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>",
+        4: b"<< /Type /Page /Parent 2 0 R /Contents 7 0 R >>",
+        5: (b"<< /XObject << /ImDrawn 8 0 R /ImNever 9 0 R /TPL 10 0 R >> >>"),
+        6: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(page1_content), page1_content),
+        7: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(page2_content), page2_content),
+        8: _raw_rgb_image(40, 30),   # drawn on page 1
+        9: _raw_rgb_image(41, 31),   # listed everywhere, painted nowhere
+        10: (b"<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 612 792] "
+             b"/Resources << /XObject << /ImInForm 11 0 R /ImFormNever 12 0 R >> >> "
+             b"/Length %d >>\nstream\n%s\nendstream" % (len(form_content), form_content)),
+        11: _raw_rgb_image(42, 32),  # drawn by the form
+        12: _raw_rgb_image(43, 33),  # in the form's resources, never painted
+    }
+    _assemble_pdf(objs, pdf)
+    GT["undrawn_image.pdf"] = {
+        "page1_images": [{"index": 0, "width": 40, "height": 30}],
+        "page2_images": [{"index": 0, "width": 42, "height": 32}],
+        "never_drawn": [{"width": 41, "height": 31}, {"width": 43, "height": 33}],
+    }
+
+
 def gen_form_font():
     """Hand-written PDF where the page's own ``/Font`` dictionary is EMPTY and the only
     font lives in a Form XObject's own ``/Resources`` — the ``/TPL*`` template layout an
@@ -1490,6 +1542,7 @@ def main():
     gen_inherited_mediabox()
     gen_xobject_figure()
     gen_form_image()
+    gen_undrawn_image()
     gen_form_font()
     gen_no_spurious_figs()
     gen_links()
