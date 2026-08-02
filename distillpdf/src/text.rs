@@ -1133,7 +1133,24 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
     let mut ts = 0.0f32; // text rise (Ts): baseline shift in text space — sub/superscripts
     let mut cur: Option<&FontInfo> = None;
     let mut ctm = base; // graphics CTM (q/Q/cm) — needed for rotated/transformed text
-    let mut cstack: Vec<Mat> = Vec::new();
+    // `q`/`Q` save and restore the WHOLE graphics state, and PDF 32000-1 §9.3 puts the text
+    // state parameters (Tc, Tw, TL, Tf/Tfs, Ts — Table 104) in it. Saving only the CTM let a
+    // character spacing set once inside a `q` leak over everything drawn after the matching
+    // `Q`: `geology_usgs_fs.pdf` sets `Tc 0.047` at operation 10, inside a `q`, and nothing
+    // resets it, so every one of the page's 68,529 operations' glyph advances came out
+    // 0.047·Tfs too wide. On its map labels — drawn one `Tj` per glyph, then repositioned by
+    // an absolute `Td` for the last one — the accumulated drift overshot that `Td`, and the
+    // x-sort read "Cloverdale" back as "Cloverdael".
+    struct Saved<'a> {
+        ctm: Mat,
+        size: f32,
+        tc: f32,
+        tw: f32,
+        ts: f32,
+        leading: f32,
+        font: Option<&'a FontInfo>,
+    }
+    let mut cstack: Vec<Saved> = Vec::new();
 
     for op in ops {
         // Total-work budget (see `crate::WalkBudget`): the depth cap alone lets a
@@ -1144,10 +1161,16 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
         }
         let o = &op.operands;
         match op.operator.as_str() {
-            "q" => cstack.push(ctm),
+            "q" => cstack.push(Saved { ctm, size, tc, tw, ts, leading, font: cur }),
             "Q" => {
-                if let Some(m) = cstack.pop() {
-                    ctm = m;
+                if let Some(g) = cstack.pop() {
+                    ctm = g.ctm;
+                    size = g.size;
+                    tc = g.tc;
+                    tw = g.tw;
+                    ts = g.ts;
+                    leading = g.leading;
+                    cur = g.font;
                 }
             }
             "cm" if o.len() >= 6 => {
@@ -1926,5 +1949,34 @@ mod tests {
         // a single column reads top-to-bottom (higher y first)
         let single: Vec<BBox> = vec![(0.0, 40.0, 30.0, 40.0), (0.0, 40.0, 90.0, 100.0), (0.0, 40.0, 60.0, 70.0)];
         assert_eq!(xy_cut_order(&single, body), vec![1, 2, 0], "top-to-bottom");
+    }
+
+    #[test]
+    fn a_char_spacing_set_inside_a_q_does_not_survive_the_matching_q() {
+        // `tests/gen_fixtures.py::gen_textstate_q`. The text state (Tc, Tw, Tf/Tfs, TL, Ts)
+        // is part of the GRAPHICS state — PDF 32000-1 §9.3 — so `Q` restores it. Saving only
+        // the CTM let `geology_usgs_fs.pdf`'s `Tc 0.047`, set inside a `q` at operation 10,
+        // widen every glyph advance on all 68,529 operations of the page. On a GIS label
+        // drawn one `Tj` per glyph and then repositioned by an absolute `Td` for its last
+        // letter, the accumulated drift overshot that `Td` and the x-sort returned
+        // "Cloverdale" as "Cloverdael" — a confidently wrong place name.
+        //
+        // Both lines of the fixture are byte-identical text; only the leading `q … Q` differs
+        // from the empty state, so a leak shows up as a wrong word rather than a shifted one.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/textstate_q.pdf");
+        let doc = Document::load(path).expect("textstate_q.pdf fixture must load");
+        let raw = std::fs::read(path).expect("fixture readable");
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        let spans = extract_spans(&doc, page_id, &raw);
+        let mut by_line: std::collections::BTreeMap<i32, Vec<&Span>> = std::collections::BTreeMap::new();
+        for s in &spans {
+            by_line.entry(-(s.y.round() as i32)).or_default().push(s);
+        }
+        assert_eq!(by_line.len(), 2, "the fixture draws the word twice");
+        for (_, mut line) in by_line {
+            line.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+            let word: String = line.iter().map(|s| s.text.as_str()).collect();
+            assert_eq!(word, "Cloverdale", "leaked char spacing transposed the last two glyphs");
+        }
     }
 }

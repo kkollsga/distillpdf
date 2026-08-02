@@ -1386,12 +1386,17 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         // pie charts, every city label. The page still emitted an `<svg>` (the USGS banner),
         // so no count could see the loss.
         //
-        // So: a table that covers less than a quarter of a figure that carries GRAPHIC INK
+        // So: a table that covers less than HALF of a figure that carries GRAPHIC INK
         // (curves or slanted lines — `vector::has_graphic_ink`, which no ruled table, TOC
         // dot-leader row or filing-chrome card can produce) is a label grid sitting *on* the
         // figure, not the figure's source. It no longer suppresses it. A real ruled form is
         // untouched twice over: its vector has no graphic ink, and its table coincides with
         // that vector rather than covering a corner of it.
+        //
+        // Half, not a quarter: `geology_usgs_volcanic_hazards_california.pdf` p30's Cal OES
+        // county map has a label grid over 38% of it. A quarter was tuned on one document
+        // and a fraction of a large diagram is still not that diagram's ink; the conjunction
+        // with graphic ink is what carries the rule, not the size of the share.
         let not_in_table = |v: &vector::PlacedSvg| {
             let vr = Rect::new(v.x_left, v.y_bottom, v.x_right, v.y_top);
             let va = vr.area().max(1.0);
@@ -1400,7 +1405,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                     return false;
                 }
                 let tr = Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
-                !(v.graphic_ink() && vr.overlap_area(tr) < va * 0.25)
+                !(v.graphic_ink() && vr.overlap_area(tr) < va * 0.5)
             })
         };
         let mut vectors: Vec<vector::PlacedSvg> = raw_vectors.into_iter().filter(&not_in_table).collect();
@@ -1551,19 +1556,127 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                 prose_rows.push((l.x0, l.x1, l.y - 1.0, l.y + l.size + 1.0));
             }
         }
+        // The y-band one line occupies, as the point tests below want it.
+        let band_of = |l: &Line| (l.x0, l.x1, l.y - 1.0, l.y + l.size + 1.0);
         let in_prose = |x: f32, y: f32| {
             prose_rows.iter().any(|&(x0, x1, y0, y1)| x >= x0 - 2.0 && x <= x1 + 2.0 && y >= y0 && y <= y1)
+        };
+        // A line OUTSIDE the figure's ink is claimed whole or not at all.
+        //
+        // `near_fig_label` decides span by span, and a span is not a unit of meaning. On
+        // `econ_EM_2606_02234.pdf` p25 the figure is the 58pt band of a booktabs table's header
+        // rules; the margin below it reaches the first two data rows, and of each row it takes
+        // only the numeric spans — every `0.33`, every `0.50` — while "Sim1a CIA-∇D only (α = 1,
+        // γ = 2)" stays in the body, because a scenario name is not axis-shaped. The reader gets
+        // an SVG of Bias/RMSE numbers with no row context, which is worse than either half alone.
+        //
+        // So: find the lines that lie outside every figure's ink and are NOT label lines when
+        // judged AS A WHOLE, and refuse every span on that row. Judging the whole line is the
+        // point — `is_axis_label_text` says yes to "0.33" and no to the row it belongs to.
+        //
+        // The refusal spans the CLAIMING FIGURE'S WIDTH, not just the rejected line's own. A
+        // table row breaks into one line per column group the moment its cells are far enough
+        // apart, so the numeric cells to the right of "Sim1a CIA-∇D only …" are lines of their
+        // own and would each pass the whole-line test. What the figure may not do is take part
+        // of a row it cannot take all of — so one rejected fragment closes the whole row, across
+        // that figure's own x-span and no further (a second column's labels are untouched).
+        //
+        // Spans that belong to no line keep today's behaviour, so this only ever removes a claim
+        // the line-level reading contradicts.
+        let split_rows: Vec<(f32, f32, f32, f32)> = lines
+            .iter()
+            .filter(|l| {
+                let cx = (l.x0 + l.x1) * 0.5;
+                !in_figure(cx, l.y) && !near_fig_label(cx, l.y, l.size, &l.text())
+            })
+            .map(|l| {
+                let (mut x0, mut x1, y0, y1) = band_of(l);
+                for &(xl, xr, yb, yt) in &fig_boxes {
+                    let in_margin = l.y >= yb - axis_margin && l.y <= yt + axis_margin;
+                    let overlaps = l.x1 > xl - axis_margin && l.x0 < xr + axis_margin;
+                    if in_margin && overlaps {
+                        x0 = x0.min(xl);
+                        x1 = x1.max(xr);
+                    }
+                }
+                (x0, x1, y0, y1)
+            })
+            .collect();
+        let on_split_row = |x: f32, y: f32| {
+            split_rows.iter().any(|&(x0, x1, y0, y1)| x >= x0 - 2.0 && x <= x1 + 2.0 && y >= y0 && y <= y1)
+        };
+        // The same question asked of a whole LINE, by overlap rather than by centre. The body
+        // side works in lines and the figure side in spans, and a centre test answers the two
+        // differently for a line that straddles the band's edge — the figure refuses its spans
+        // while the body still drops it as a label, and the row is emitted NEITHER place.
+        let line_on_split_row = |l: &Line| {
+            split_rows
+                .iter()
+                .any(|&(x0, x1, y0, y1)| l.x1 >= x0 - 2.0 && l.x0 <= x1 + 2.0 && l.y >= y0 && l.y <= y1)
         };
         // A figure caption ("Figure N …", "Table N …") sits just outside the figure ink,
         // within `near_fig_label`'s margin. Its numeric fragments (the "5.6"/"-" in
         // "Figure 5.6: …") otherwise read as axis ticks and get scooped INTO the SVG — and
         // duplicated, since the caption is also emitted normally. Exclude any span on a
         // caption line from figure-label capture.
-        let caption_bands: Vec<(f32, f32, f32, f32)> = lines
-            .iter()
-            .filter(|l| caption_label(&l.text()).is_some())
-            .map(|l| (l.x0, l.x1, l.y - 1.0, l.y + l.size + 1.0))
-            .collect();
+        //
+        // A caption is a PARAGRAPH, not a line. Excluding only the "Figure N …" line left its
+        // continuation lines claimable, and the neighbouring figure ate them — `cs_LG_2606_02576`
+        // p1 rendered "continual tuning streams." (Figure 1's last caption line) across the top of
+        // Figure 2's SVG, and `cs_DS_2606_02492` p34 swept two whole lines of Figure 3's caption
+        // into the figure. So the band runs from the caption line through the lines that continue
+        // it: same type size, the next baseline down, and horizontally inside the caption's own
+        // column. The first line that breaks any of those ends the caption, which is what keeps
+        // the following body paragraph — and a second caption — out of the band.
+        let mut caption_bands: Vec<(f32, f32, f32, f32)> = Vec::new();
+        for l in lines.iter().filter(|l| caption_label(&l.text()).is_some()) {
+            let mut block = vec![band_of(l)];
+            let mut prev = l;
+            // Walk DOWN the caption by nearest baseline rather than by index: `lines` is in
+            // reading order, but a page header or a neighbouring column can sit between two
+            // lines of the same caption, and an index walk would stop at the first of them.
+            loop {
+                let next = lines
+                    .iter()
+                    .filter(|nxt| {
+                        let drop = prev.y - nxt.y;
+                        (nxt.size - l.size).abs() < 0.6
+                            && drop > 0.5
+                            // Within 1.6 line-heights — a caption's own leading. The gap to
+                            // whatever follows it is larger: `physics_higgs_cms_discovery.pdf`
+                            // p11 sets its caption at a 13.4pt pitch and then leaves 19.3pt
+                            // before the table's header row, and at a looser bound the block
+                            // ran straight on into the table and took its column headings out
+                            // of the figure.
+                            && drop < prev.size * 1.6
+                            // A caption's FIRST line is indented by its marker ("Figure 3 "),
+                            // so the lines that continue it start further LEFT, not further
+                            // right — `cs_DS_2606_02492` p34 hangs its caption by 14pt. Bound
+                            // the overhang rather than forbidding it, and hold the right edge
+                            // to the caption's own column so a wider block below is not taken.
+                            && nxt.x0 >= l.x0 - prev.size * 4.0
+                            && nxt.x1 <= l.x1.max(nxt.x0) + prev.size * 2.0
+                            && caption_label(&nxt.text()).is_none()
+                            && detect_header(nxt, body, Some(&profile)).is_none()
+                    })
+                    .max_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
+                match next {
+                    Some(n) => {
+                        block.push(band_of(n));
+                        prev = n;
+                    }
+                    None => break,
+                }
+            }
+            // Every line of the block gets the block's FULL column width. A caption's last
+            // line often ends mid-column with a display fragment set beside it (a `⋁` and a
+            // `kPunch[u, v]` on `cs_DS_2606_02492` p34 are lines of their own, to the right of
+            // the text they belong to); keyed on the line's own x-extent, those fragments fall
+            // outside the band and get scooped onto the figure alone.
+            let bx0 = block.iter().map(|b| b.0).fold(f32::INFINITY, f32::min);
+            let bx1 = block.iter().map(|b| b.1).fold(f32::NEG_INFINITY, f32::max);
+            caption_bands.extend(block.into_iter().map(|(_, _, y0, y1)| (bx0, bx1, y0, y1)));
+        }
         let in_caption = |x: f32, y: f32| {
             caption_bands.iter().any(|&(x0, x1, y0, y1)| x >= x0 - 2.0 && x <= x1 + 2.0 && y >= y0 && y <= y1)
         };
@@ -1592,8 +1705,15 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                 // it on the SVG even if the in-figure "prose" gate flagged it (that gate guards
                 // an UNcaptioned framed block). This keeps the labels visible (figure_text) while
                 // the body flow drops them as figure content. A caption line is still excluded.
-                let take = (in_figure(cx, cy) || near_fig_label(cx, cy, s.size, &s.text)) && !in_prose(cx, cy);
-                if (take || in_captioned_fig_pt(cx, cy)) && !in_caption(cx, cy) {
+                let take =
+                    (in_figure(cx, cy) || (near_fig_label(cx, cy, s.size, &s.text) && !on_split_row(cx, cy))) && !in_prose(cx, cy);
+                // The same wholeness rule binds the captioned-figure blanket claim: it also
+                // reaches outside the ink, and on `arxiv_nerf.pdf` p18 its margin catches the
+                // page's RUNNING HEADER ("18 B. Mildenhall, P. P. Srinivasan, M. Tancik et
+                // al."), which then renders across the top of the architecture diagram at
+                // figure scale. A claim from outside the ink is a claim on a whole line or on
+                // nothing; `in_figure` — the tight 4pt box — stays unconditional.
+                if (take || (in_captioned_fig_pt(cx, cy) && !on_split_row(cx, cy))) && !in_caption(cx, cy) {
                     labels.push(mk(clone_span(s)));
                 }
             }
@@ -1775,7 +1895,12 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
             // An axis tick/title is part of the figure even when it's bold/short enough to
             // look like a heading (a plot's "Vp (m/s)" title); a merely-contained line is a
             // figure label only when it isn't a real section heading.
-            let axis_label = near_fig_label(fig_cx, l.y, l.size, &l.text());
+            // `!on_split_row` here is the OTHER half of the exactly-once invariant. The figure
+            // side refuses a claim on a row it cannot take whole (see `split_rows`); if the body
+            // side kept dropping that row as a figure label, the row would be emitted NEITHER
+            // place — which is how `econ_EM_2606_02234.pdf` p25 could lose "0.33 0.34 0.50 0.50"
+            // entirely. Both sides ask the same question, so exactly one of them keeps it.
+            let axis_label = near_fig_label(fig_cx, l.y, l.size, &l.text()) && !line_on_split_row(l);
             // Text sitting INSIDE a CAPTIONED figure's ink box is that diagram's own label
             // ("Image Semantics", "Group 2", "Outputs") — a figure carries a caption, so its
             // interior is figure content, never a section heading. (A real heading sits OUTSIDE

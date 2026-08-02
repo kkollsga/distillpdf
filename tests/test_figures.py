@@ -319,3 +319,50 @@ def test_dashed_strokes_render_dashed():
     # Solid, `[] d` (reset) and `[0 0] d` (invalid) all carry no dash whatsoever.
     n = sum(1 for d in g["dasharrays"] if d)
     assert len(re.findall(r"stroke-dasharray", svg)) == n, f"only {n} strokes may dash: {svg}"
+
+
+# ----- Claim margins: a figure takes its own labels and nothing else -----
+def _svg_text(h):
+    return " ".join(
+        " ".join(re.sub(r"<[^>]+>", " ", s).split())
+        for s in re.findall(r"<svg\b.*?</svg>", h, re.DOTALL)
+    )
+
+
+def _body_text(h):
+    return " ".join(re.sub(r"<[^>]+>", " ", re.sub(r"<svg\b.*?</svg>", " ", h, flags=re.DOTALL)).split())
+
+
+def test_figure_claims_its_labels_and_nothing_else():
+    """`caption_bleed.pdf` — three neighbours a figure used to swallow, one per audit case.
+
+    Page 2: the running page header above the diagram (`arxiv_nerf.pdf` p18) and the
+    continuation lines of its caption (`cs_LG_2606_02576` p1, `cs_DS_2606_02492` p34).
+    Page 3: a data row whose numeric half is axis-shaped and whose label half is not
+    (`econ_EM_2606_02234.pdf` p25 rendered the numbers with no row context).
+
+    The diagram's own labels must still be on the SVG, and every trap must be in the body —
+    exactly once, which is the half that also has to hold: refusing a row on the figure side
+    while the body side still drops it as a label loses the row entirely.
+    """
+    from _fixtures import GT as _GT
+    h = html("caption_bleed.pdf")
+    g = _GT["caption_bleed.pdf"]
+    svg, body = _svg_text(h), _body_text(h)
+    for lbl in g["svg_labels"]:
+        assert lbl in svg, f"the diagram lost its own label {lbl!r}"
+    for trap in g["must_stay_in_body"]:
+        assert trap not in svg, f"{trap!r} bled into the figure"
+        assert trap in body, f"{trap!r} was emitted NEITHER on the figure nor in the body"
+
+
+def test_char_spacing_inside_q_does_not_leak(): 
+    """`textstate_q.pdf` — the text state is graphics state, so `Q` restores `Tc`.
+
+    A leak widens every later glyph advance; on a label drawn one `Tj` per glyph and then
+    repositioned by an absolute `Td`, the drift transposes the last two letters.
+    """
+    from _fixtures import GT as _GT, doc as _doc
+    g = _GT["textstate_q.pdf"]
+    t = _doc("textstate_q.pdf").extract_text()
+    assert t.count(g["word"]) == g["occurrences"], f"expected {g['word']!r} twice, got {t!r}"

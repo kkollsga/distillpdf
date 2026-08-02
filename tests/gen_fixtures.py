@@ -1909,6 +1909,116 @@ def gen_no_spurious_figs():
     GT["no_spurious_figs.pdf"] = {"page1_figures": 0, "total_figures": 1}
 
 
+def gen_textstate_q():
+    """`Tc` set inside a `q` must not survive the matching `Q` (PDF 32000-1 §9.3).
+
+    Hand-written, because reportlab will not emit a bare `Tc` inside a `q` and then rely on
+    the `Q` to undo it — which is exactly what `geology_usgs_fs.pdf` does at operation 10 of
+    a 68,529-operation page, leaving every later glyph advance 0.047·Tfs too wide.
+
+    Both lines draw "Cloverdale" the way a GIS labeller does: one `Tj` per glyph so the
+    advance accumulates, then an absolute `Td` that repositions the final "e". Line 1 is the
+    control (no `Tc` anywhere). Line 2 sets `Tc 0.047` inside a `q`/`Q` that closes BEFORE the
+    text — so it must read identically. With the leak, the accumulated "l" oversteps the
+    absolutely-placed "e" and the x-sort returns "Cloverdael".
+    """
+    pdf = os.path.join(OUT, "textstate_q.pdf")
+    # Times-Roman advances at Tf 1 / Tm scale 7: C 667, l 278, o 500, v 500, e 444, r 333,
+    # d 500, a 444 -> the 9th glyph ("l") sits at 3.666 em and the Td places "e" at 3.97 em.
+    glyphs = b"".join(b"(%s) Tj " % bytes([c]) for c in b"Cloverdal")
+    line = lambda y: (b"BT /F1 1 Tf 7 0 0 7 96 %d Tm " % y) + glyphs + b"3.97 0 Td (e) Tj ET\n"
+    content = (
+        b"q 0.047 Tc -0.047 Tw Q\n"          # set inside q/Q: must NOT reach the text below
+        + line(700)
+        + line(660)
+    )
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << "
+            b"/F1 5 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        5: b"<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["textstate_q.pdf"] = {"word": "Cloverdale", "occurrences": 2}
+
+
+def gen_caption_bleed():
+    """A figure must not scoop up its neighbours' text — three traps, each a real audit case.
+
+    Page 1: a running page HEADER above a captioned diagram (`arxiv_nerf.pdf` p18 rendered
+    "18 B. Mildenhall, P. P. Srinivasan, M. Tancik et al." across the top of the architecture
+    diagram), and a three-line CAPTION below it — a caption is a paragraph, and only its first
+    line used to be excluded, so the neighbours ate the rest (`cs_LG_2606_02576` p1's
+    "continual tuning streams.", two lines of `cs_DS_2606_02492` p34's Figure 3).
+
+    Page 2: a data ROW below the figure whose numeric half is axis-shaped and whose label half
+    is not. `econ_EM_2606_02234.pdf` p25 took every number off two such rows and left
+    "Sim1a CIA-∇D only …" in the body, leaving Bias/RMSE values with no row context.
+
+    Both pages carry a block of body-size prose so the document's body size — which scales the
+    claim margin — is the 10.5pt of the prose, not the 8pt of the traps. The diagram's own
+    short labels must survive on the SVG in both cases.
+    """
+    pdf = os.path.join(OUT, "caption_bleed.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+
+    def diagram():
+        """Three boxes, two arrows and a diagonal each: ink from y=690 to y=750."""
+        bx, by = LM + 20, 690.0
+        c.setLineWidth(1)
+        for i in range(3):
+            c.rect(bx + i * 120, by, 80, 60, stroke=1, fill=0)
+            c.line(bx + i * 120, by, bx + i * 120 + 80, by + 60)
+        for i in range(2):
+            c.line(bx + i * 120 + 80, by + 30, bx + (i + 1) * 120, by + 30)
+        c.setFont("Helvetica", 6)
+        for i, lbl in enumerate(("256", "512", "RGB")):
+            c.drawString(bx + i * 120 + 30, by + 26, lbl)
+
+    def prose(y):
+        c.setFont(BODY_F, BODY_S)
+        for _ in range(9):
+            c.drawString(LM, y, "The surrounding narrative is ordinary body prose and sets the "
+                                "document body size that scales every claim margin.")
+            y -= LEAD
+
+    # ---- page 1: plain prose. A first page runs the front-matter pass, which would consume
+    # the traps below before the figure ever sees them; keep the cases off it.
+    title(c, "Claim Margins Around A Figure")
+    prose(PAGE_H - 140)
+    c.showPage()
+
+    # ---- page 2: running header + caption paragraph. Both are BODY size, which is what
+    # makes them traps: at label size they would be honest figure labels.
+    c.setFont(BODY_F, BODY_S)
+    c.drawString(LM, 760, "18 B. Mildenhall, P. P. Srinivasan, M. Tancik et al.")
+    diagram()
+    c.setFont(BODY_F, BODY_S)
+    y = 680
+    for ln in ("Figure 1: A visualisation of the fully connected network architecture used",
+               "throughout this appendix, with the layer widths marked on each block.",
+               "Residual connections are drawn as diagonal rules."):
+        c.drawString(LM, y, ln)
+        y -= 12
+    prose(630)
+    c.showPage()
+
+    # ---- page 3: a data row the figure must take whole or not at all
+    diagram()
+    c.setFont(BODY_F, BODY_S)
+    c.drawString(LM, 680, "Sim1a network only (alpha = 1, gamma = 2)")
+    c.drawString(LM + 300, 680, "0.33   0.34   0.50   0.50")
+    prose(630)
+    c.showPage()
+    c.save()
+    GT["caption_bleed.pdf"] = {
+        "svg_labels": ["256", "512", "RGB"],
+        "must_stay_in_body": ["Mildenhall", "Residual connections", "Sim1a network only", "0.33"],
+    }
+
+
 def gen_map_label_grid():
     """A ruled table must own its region; an uncaptioned MAP must not lose its to one.
 
@@ -3142,6 +3252,8 @@ def main():
     gen_small_vector_fig()
     gen_dense_vector()
     gen_map_label_grid()
+    gen_textstate_q()
+    gen_caption_bleed()
     gen_inherited_mediabox()
     gen_indirect_mediabox()
     gen_indirect_numbers()

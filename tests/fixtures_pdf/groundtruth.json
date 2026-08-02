@@ -981,5 +981,22 @@
   "map_label_grid.pdf": {
     "page1_figures": 1,
     "page2_figures": 0
+  },
+  "textstate_q.pdf": {
+    "word": "Cloverdale",
+    "occurrences": 2
+  },
+  "caption_bleed.pdf": {
+    "svg_labels": [
+      "256",
+      "512",
+      "RGB"
+    ],
+    "must_stay_in_body": [
+      "Mildenhall",
+      "Residual connections",
+      "Sim1a network only",
+      "0.33"
+    ]
   }
 }
