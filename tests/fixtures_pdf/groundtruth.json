@@ -598,5 +598,11 @@
     "control": "form_repeat.pdf",
     "control_repeats": 3,
     "control_word": "REPEAT"
+  },
+  "unfiltered_form.pdf": {
+    "form_text": "Unfiltered form ink",
+    "n_bars": 5,
+    "caption": "Figure 1: Five bars painted by a form stream carrying no filter.",
+    "title": "A Form Stream With No Filter"
   }
 }

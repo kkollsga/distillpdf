@@ -827,6 +827,58 @@ def gen_form_font():
     }
 
 
+def gen_unfiltered_form():
+    """Hand-written PDF whose Form XObject stream carries **no ``/Filter``** — the shape two
+    of the four content walkers used to decode as empty.
+
+    lopdf's ``decompressed_content()`` returns an *error* for a stream with no ``/Filter``
+    key, so ``…unwrap_or_default()`` (what ``vector.rs`` and ``text.rs`` did on the form
+    descent) yielded ZERO bytes and every glyph and path inside such a form vanished. The
+    extract/render walkers already carried the raw-bytes fallback, so this was a silent
+    split: ``extract_images`` saw the form, ``to_html``'s text and vector paths did not.
+
+    reportlab always Flate-compresses, so the file is assembled by hand. The form paints
+    five filled bars and one text label; the page adds a title, a lead paragraph and the
+    caption that promotes the bars to a figure. Everything inside the form must survive."""
+    pdf = os.path.join(OUT, "unfiltered_form.pdf")
+    bars = [110, 150, 90, 170, 130]
+    form_ops = [b"0.20 0.40 0.75 rg"]
+    for i, h in enumerate(bars):
+        form_ops.append(b"%d 20 40 %d re f" % (20 + i * 55, h))
+    form_ops.append(b"BT /FF1 11 Tf 20 205 Td (Unfiltered form ink) Tj ET")
+    form_content = b"\n".join(form_ops)
+    page_content = (
+        b"BT /F1 19 Tf 72 712 Td (A Form Stream With No Filter) Tj ET\n"
+        b"BT /F1 10.5 Tf 72 670 Td "
+        b"(The panel below is painted entirely inside a form XObject whose stream) Tj "
+        b"0 -14 Td (carries no filter at all, so its bytes are stored verbatim.) Tj ET\n"
+        b"q 1 0 0 1 100 400 cm /UF Do Q\n"
+        b"BT /F1 9 Tf 100 382 Td "
+        b"(Figure 1: Five bars painted by a form stream carrying no filter.) Tj ET\n"
+        b"BT /F1 10.5 Tf 72 330 Td "
+        b"(The narrative resumes after the figure so the page reads as a document.) Tj ET"
+    )
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 6 0 R >> /XObject << /UF 5 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(page_content), page_content),
+        # NOTE: no /Filter here — that is the whole point of the fixture.
+        5: (b"<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 300 230] "
+            b"/Resources << /Font << /FF1 6 0 R >> >> /Length %d >>\nstream\n%s\nendstream"
+            % (len(form_content), form_content)),
+        6: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["unfiltered_form.pdf"] = {
+        "form_text": "Unfiltered form ink",
+        "n_bars": len(bars),
+        "caption": "Figure 1: Five bars painted by a form stream carrying no filter.",
+        "title": "A Form Stream With No Filter",
+    }
+
+
 def gen_no_spurious_figs():
     """Precision gate: a prose page with incidental tiny marks (a short underline rule, a
     small box) and NO figure caption anywhere. Weak vector candidates must NOT be promoted
@@ -1886,6 +1938,7 @@ def main():
     gen_image_order()
     gen_cmyk_jpeg()
     gen_form_font()
+    gen_unfiltered_form()
     gen_no_spurious_figs()
     gen_links()
     gen_pagelabels()

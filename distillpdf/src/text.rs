@@ -5,7 +5,7 @@
 //! ourselves, decode show-text operators through each font's ToUnicode CMap, and
 //! recover real Unicode — including 2-byte CID codes and diacritics.
 
-use crate::pdfobj::{deref, num};
+use crate::pdfobj::{content_bytes, deref, num};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -1261,7 +1261,7 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
                 if let Some(fr) = stream.dict.get(b"Resources").ok().and_then(|x| deref(doc, x)).and_then(|x| x.as_dict().ok()).cloned() {
                     let ff = build_fonts_from_resources(doc, &fr, raw);
                     let fx = xobjects_of(doc, &fr);
-                    if let Ok(content) = lopdf::content::Content::decode(&stream.decompressed_content().unwrap_or_default()) {
+                    if let Ok(content) = lopdf::content::Content::decode(&content_bytes(&stream)) {
                         decode_spans(doc, &content.operations, &ff, &fx, fm.mul(ctm), raw, depth + 1, spans, budget);
                     }
                 }
@@ -1785,6 +1785,30 @@ mod tests {
         assert!(out.contains("Hello"), "subset font text lost: {out:?}");
         assert!(!out.contains("HelloA"), "unmapped CID 0x41 invented an 'A': {out:?}");
         assert!(!out.contains('A'), "no 'A' is drawn anywhere on this page: {out:?}");
+    }
+
+    #[test]
+    fn a_form_stream_with_no_filter_still_shows_its_text() {
+        // `unfiltered_form.pdf` (`gen_fixtures.py::gen_unfiltered_form`): a label drawn inside
+        // a Form XObject whose stream carries NO /Filter. lopdf *errors* on
+        // `decompressed_content()` for such a stream, so `.unwrap_or_default()` fed the
+        // decoder zero bytes and every glyph inside the form disappeared — silently, and only
+        // on this walker and the vector one (extract/img carry the raw-bytes fallback).
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/unfiltered_form.pdf");
+        let raw = std::fs::read(path).expect("unfiltered_form.pdf fixture must exist");
+        let doc = Document::load_mem(&raw).expect("unfiltered_form.pdf fixture must load");
+        let pid = *doc.get_pages().get(&1).expect("fixture has page 1");
+        // The premise, asserted rather than assumed: the form really is unfiltered.
+        let form_id = page_xobjects(&doc, pid).get(b"UF".as_slice()).copied().expect("/UF form");
+        let form = doc.get_object(form_id).unwrap().as_stream().unwrap();
+        assert!(form.dict.get(b"Filter").is_err(), "the fixture's form must carry no /Filter");
+        assert!(form.decompressed_content().is_err(), "the premise: lopdf errors without /Filter");
+
+        let out = extract_page(&doc, pid, &raw).expect("page text");
+        assert!(out.contains("Unfiltered form ink"), "the form's own label is lost: {out:?}");
+        // The page-level text was never at risk — its presence proves the page decoded and
+        // only the form descent was dropping content.
+        assert!(out.contains("A Form Stream With No Filter"), "page-level text lost: {out:?}");
     }
 
     #[test]

@@ -85,3 +85,19 @@ def test_dense_vector_page_emits_both_figures():
     svgs = re.findall(r"<svg\b.*?</svg>", h, re.DOTALL)
     assert len(svgs) == g["n_figures"], f"expected {g['n_figures']} <svg>, got {len(svgs)}"
     assert sum(s.count("<path") for s in svgs) > g["scatter_paths"], "scatter marks missing from the svg"
+
+
+def test_unfiltered_form_vector_ink_survives():
+    """The vector half of the same defect: five filled bars painted inside a Form XObject
+    whose stream carries no /Filter. The walker decoded the form as zero bytes, so the whole
+    figure vanished from the render while `extract_images` (which carries the raw-bytes
+    fallback) still saw the form."""
+    g = GT["unfiltered_form.pdf"]
+    h = html("unfiltered_form.pdf")
+    svgs = re.findall(r"<svg\b.*?</svg>", h, re.DOTALL)
+    assert len(svgs) == 1, f"expected the bars to render as one <svg>, got {len(svgs)}"
+    assert svgs[0].count("<path") == g["n_bars"], \
+        f"expected {g['n_bars']} bars, got {svgs[0].count('<path')}"
+    cap = re.search(r"<figcaption>(.*?)</figcaption>", h, re.DOTALL)
+    assert cap and g["caption"][:30] in re.sub(r"\s+", " ", cap.group(1)), \
+        "the unfiltered-form figure did not get its caption"

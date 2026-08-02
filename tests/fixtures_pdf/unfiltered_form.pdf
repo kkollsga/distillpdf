@@ -1,0 +1,50 @@
+%PDF-1.5
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 6 0 R >> /XObject << /UF 5 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 468 >>
+stream
+BT /F1 19 Tf 72 712 Td (A Form Stream With No Filter) Tj ET
+BT /F1 10.5 Tf 72 670 Td (The panel below is painted entirely inside a form XObject whose stream) Tj 0 -14 Td (carries no filter at all, so its bytes are stored verbatim.) Tj ET
+q 1 0 0 1 100 400 cm /UF Do Q
+BT /F1 9 Tf 100 382 Td (Figure 1: Five bars painted by a form stream carrying no filter.) Tj ET
+BT /F1 10.5 Tf 72 330 Td (The narrative resumes after the figure so the page reads as a document.) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 300 230] /Resources << /Font << /FF1 6 0 R >> >> /Length 161 >>
+stream
+0.20 0.40 0.75 rg
+20 20 40 110 re f
+75 20 40 150 re f
+130 20 40 90 re f
+185 20 40 170 re f
+240 20 40 130 re f
+BT /FF1 11 Tf 20 205 Td (Unfiltered form ink) Tj ET
+endstream
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000272 00000 n 
+0000000791 00000 n 
+0000001105 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+1202
+%%EOF

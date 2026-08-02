@@ -10,7 +10,7 @@
 //! Shadings / patterns / soft masks are out of scope here (skipped); text inside
 //! a figure stays in the normal text flow (it is extracted as spans elsewhere).
 
-use crate::pdfobj::{deref, num};
+use crate::pdfobj::{content_bytes, deref, num};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -812,7 +812,7 @@ fn walk(
                         child_eg.insert(k, v);
                     }
                 }
-                if let Ok(content) = lopdf::content::Content::decode(&stream.decompressed_content().unwrap_or_default()) {
+                if let Ok(content) = lopdf::content::Content::decode(&content_bytes(&stream)) {
                     let mut sub = g;
                     sub.ctm = fm.mul(g.ctm);
                     walk(doc, &content.operations, &child_x, &child_eg, sub, out, depth + 1, budget);
@@ -1124,5 +1124,31 @@ mod tests {
         assert_eq!(strong.len(), 2, "expected the grid AND the scatter field");
         let scatter = strong.iter().find(|f| f.y_bottom < 400.0).expect("scatter figure");
         assert!(scatter.paths.matches("<path").count() > 200, "scatter kept {} paths", scatter.paths.matches("<path").count());
+    }
+
+    #[test]
+    fn a_form_stream_with_no_filter_still_paints_its_paths() {
+        // `unfiltered_form.pdf` (`gen_fixtures.py::gen_unfiltered_form`): the page's only ink
+        // is five filled bars inside a Form XObject whose stream carries NO /Filter. lopdf
+        // *errors* on `decompressed_content()` for such a stream, so the old
+        // `.unwrap_or_default()` handed the decoder zero bytes and the whole figure vanished
+        // — while `extract.rs`/`img.rs`, which carry the raw-bytes fallback, saw it fine.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/unfiltered_form.pdf");
+        let doc = Document::load(path).expect("unfiltered_form.pdf fixture must load");
+        let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
+        // The premise, asserted rather than assumed: the form really is unfiltered.
+        let res = page_resources(&doc, page_id).expect("fixture page has resources");
+        let form_id = xobjects_of(&doc, &res).get(b"UF".as_slice()).copied().expect("/UF form");
+        let form = doc.get_object(form_id).unwrap().as_stream().unwrap();
+        assert!(form.dict.get(b"Filter").is_err(), "the fixture's form must carry no /Filter");
+        assert!(form.decompressed_content().is_err(), "the premise: lopdf errors without /Filter");
+
+        let painted = walk_page(&doc, page_id, crate::MAX_FORM_WORK);
+        assert_eq!(painted.len(), 5, "the five bars inside the unfiltered form must all be painted");
+        // …at five distinct x offsets, so this cannot pass on five copies of one bar.
+        let mut xs: Vec<i32> = painted.iter().map(|p| p.x0.round() as i32).collect();
+        xs.sort_unstable();
+        xs.dedup();
+        assert_eq!(xs.len(), 5, "the bars must land at five offsets, got {xs:?}");
     }
 }

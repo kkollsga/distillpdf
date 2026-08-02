@@ -113,3 +113,17 @@ def test_subset_cid_font_does_not_invent_text_from_glyph_indices():
     t = doc("identity_cid_font.pdf").extract_page_text(1)
     assert gt["subset_text"] in t, f"subset font text lost: {t!r}"
     assert "A" not in t, f"an unmapped glyph index was invented as text: {t!r}"
+
+
+def test_unfiltered_form_text_survives():
+    """A Form XObject whose stream carries NO /Filter must still yield its glyphs.
+
+    lopdf errors on `decompressed_content()` for an unfiltered stream, and the text walker
+    took `.unwrap_or_default()` — so every glyph drawn inside such a form decoded as
+    nothing. The page-level text was never affected, which is what made the loss silent."""
+    gt = GT["unfiltered_form.pdf"]
+    t = doc("unfiltered_form.pdf").extract_page_text(1)
+    assert gt["form_text"] in t, f"text drawn inside the unfiltered form is lost: {t!r}"
+    assert gt["title"] in t, f"page-level text lost: {t!r}"
+    # …and through the HTML render, not only the raw text extractor.
+    assert gt["form_text"] in text(html("unfiltered_form.pdf"))
