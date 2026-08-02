@@ -954,6 +954,66 @@ def gen_paint_order():
     }
 
 
+def gen_clipped_raster():
+    """The same raster drawn twice — once whole, once under a ``re W n`` clip.
+
+    ``vector::walk`` honours the active clip for path ink (it stores it and emits an SVG
+    ``<clipPath>``); ``img::walk`` tracked no clip at all, so a raster the content stream
+    crops to a small window rendered at its FULL placement rect. Since rasters paint in true
+    paint order that means covering whatever the page drew after it.
+
+    Two geometrically identical 300x180 figures (stroked frame + 5 ticks = 6 paths, clearing
+    ``MIN_PATHS``), 220 pt apart so they cluster separately, each holding one 160x120 pt
+    raster at (140, y0+30):
+
+      TOP    (y 520-700): unclipped — the control. Plain ``x/y/width/height`` ``<image>``,
+                          no ``clip-path``.
+      BOTTOM (y 120-300): the identical ``Do`` under ``140 150 80 60 re W n``, i.e. the
+                          raster's BOTTOM-LEFT QUARTER. The ``<image>`` must carry a
+                          ``clip-path``, must be placed by MATRIX (the pixels still fill the
+                          whole 160x120 rect — only the window shrank), and the figure's
+                          recorded extent must be the 80x60 crop, not the 160x120 placement.
+
+    The raster is four flat quadrant colours, so which quarter survives is unambiguous."""
+    pdf = os.path.join(OUT, "clipped_raster.pdf")
+    # 2x2: red | green over blue | yellow. In PDF image space row 0 is the TOP row, so the
+    # bottom-left quarter of the placement is BLUE.
+    img = _flate_image(5, 2, 2, b"/DeviceRGB", 8,
+                       bytes((220, 30, 40, 30, 160, 60, 40, 60, 210, 230, 190, 40)))
+
+    def figure(y0, clip):
+        frame = b"q 0 0 0 RG 1 w 72 %d 300 180 re S Q" % y0
+        ticks = b"\n".join(
+            b"q 0 0 0 RG 1 w %d %d m %d %d l S Q" % (72 + 20 * i, y0, 72 + 20 * i, y0 + 12)
+            for i in range(1, 6)
+        )
+        do = b"q 160 0 0 120 140 %d cm /Im0 Do Q" % (y0 + 30)
+        if clip:
+            do = b"q 140 %d 80 60 re W n\n%s\nQ" % (y0 + 30, do)
+        return b"\n".join([frame, ticks, do])
+
+    stream = b"\n".join([
+        b"BT /F1 12 Tf 72 720 Td (A clipped raster shows only its window.) Tj ET",
+        figure(520, clip=False),
+        figure(120, clip=True),
+    ])
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 6 0 R >> /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+        5: img,
+        6: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["clipped_raster.pdf"] = {
+        "figures": 2,
+        "placement": [140, 150, 300, 270],   # x0 y0 x1 y1 of the clipped figure's raster
+        "clip": [140, 150, 220, 210],        # the window the page actually shows
+    }
+
+
 def gen_smask_panel():
     """A JPEG cut-out over a coloured panel: the ``/SMask``'s transparency IS the figure.
 
@@ -2802,6 +2862,7 @@ def main():
     gen_render_samples()
     gen_cmyk_jpeg()
     gen_smask_panel()
+    gen_clipped_raster()
     gen_decode_jpeg()
     gen_form_inherit()
     gen_form_font()

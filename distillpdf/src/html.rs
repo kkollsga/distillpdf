@@ -1896,6 +1896,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                             href: &href,
                             rect: (im.x_left, im.x_right, im.y_bottom, im.y_top),
                             ctm: im.ctm,
+                            clip: im.clip,
                             seq: &im.seq,
                         }]);
                         // Caption may have attached to the image OR its overlay vector.
@@ -1986,6 +1987,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                                     href: href.as_str(),
                                     rect: (im.x_left, im.x_right, im.y_bottom, im.y_top),
                                     ctm: im.ctm,
+                                    clip: im.clip,
                                     seq: &im.seq,
                                 }
                             })

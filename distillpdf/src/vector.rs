@@ -180,7 +180,7 @@ struct Painted {
     seq: PaintSeq, // paint position in the content TREE — preserved for correct z-order
     // Active clip rect (page space) when this path was painted, if it actually crops it.
     // Rendered as an SVG <clipPath> so the visible ink matches the PDF (no overshoot).
-    clip: Option<(f32, f32, f32, f32)>,
+    clip: Option<ClipRect>,
 }
 
 /// Graphics state carried through the walk and the q/Q stack.
@@ -206,7 +206,7 @@ struct GState {
     // Active clipping rectangle in PAGE space (x0, y0, x1, y1), the intersection of every
     // `W`/`W*` clip seen so far on the q/Q stack. `None` = unclipped (page bounds). A plot
     // clips its reference curves to the axes box; honouring it crops the curve overshoot.
-    clip: Option<(f32, f32, f32, f32)>,
+    clip: Option<ClipRect>,
     // Colour spaces selected by `cs`/`CS`. `None` = none named, in which case `scn` falls
     // back to the operand-count dispatch — exactly what the whole walk did before.
     // NOTE the spec's "selecting a space resets the colour to its initial value" is
@@ -263,8 +263,10 @@ pub struct PlacedSvg {
     pub x_left: f32,
     pub x_right: f32,
     /// `<clipPath>` definitions the paths reference. Emitted before any ink; renders nothing
-    /// itself, so its position among the ink is free.
-    defs: String,
+    /// itself, so its position among the ink is free. Kept as [`ClipDefs`] rather than the
+    /// finished string because [`PlacedSvg::composite_svg`] adds to it — a clipped raster
+    /// needs a `<clipPath>` too, and it must not duplicate one the ink already defined.
+    defs: ClipDefs,
     /// The `<path>` elements in local coords (origin `(x_left, y_top)`, y down), each kept
     /// WITH the address of the operation that painted it. Held apart rather than
     /// pre-concatenated because [`PlacedSvg::composite_svg`] has to slot raster `<image>`
@@ -302,6 +304,71 @@ fn to_local(rot: i32, x0: f32, y0: f32, x1: f32, y1: f32, x: f32, y: f32) -> (f3
         180 => (x1 - x, y - y0),
         270 => (y1 - y, x1 - x),
         _ => (x - x0, y1 - y),
+    }
+}
+
+/// A clipping rectangle in PAGE space, `(x0, y0, x1, y1)` with y up — the shape the walks,
+/// the emitters and [`ClipDefs`] all pass around.
+pub(crate) type ClipRect = (f32, f32, f32, f32);
+
+/// The `<clipPath>` definitions one figure's SVG carries, and the geometry-keyed ids that
+/// name them.
+///
+/// **One copy, two emitters.** [`build_svg`] mints these for path ink and
+/// [`PlacedSvg::composite_svg`] mints them for a clipped raster; both need the id of "the
+/// clipPath for THIS page-space rect in THIS figure", and two independently-written copies
+/// of that rule would drift apart the moment either changed.
+///
+/// The id is derived from the clip's own figure-LOCAL geometry so that `same id ⟺ same
+/// <rect>`. That is what keeps clipping correct once the whole document is assembled: ids
+/// must be globally unique, but every figure shares the same page content origin, so an
+/// origin- or index-based id collides across figures — and the doc-wide `dedup_ids` pass
+/// then renames the colliding `id=` WITHOUT touching the `clip-path="url(#…)"` reference,
+/// silently breaking the clip. A geometry-keyed id avoids that: distinct clips get distinct
+/// ids (no rename), and any genuinely identical clip that does get renamed still resolves to
+/// a clipPath with an identical rect.
+#[derive(Clone, Default)]
+struct ClipDefs {
+    ids: Vec<(i32, i32, i32, i32)>,
+    body: String,
+}
+
+impl ClipDefs {
+    /// The id for page-space clip rect `c` inside a figure whose page box is
+    /// `(fx0, fy0, fx1, fy1)` under page turn `rot`, defining the `<clipPath>` on first use.
+    fn id_for(&mut self, rot: i32, fx0: f32, fy0: f32, fx1: f32, fy1: f32, c: ClipRect) -> String {
+        // page space -> figure-local (y flipped, turned by /Rotate). The ORIGIN comes from
+        // the corner map; the EXTENTS are the page-space spans merely transposed — taking
+        // them as a difference of two mapped corners instead would reassociate the
+        // subtraction (`(c.2-x0)-(c.0-x0)` is not `c.2-c.0` in f32) and move an upright
+        // figure's clip by a rounding step.
+        let (ax, ay) = to_local(rot, fx0, fy0, fx1, fy1, c.0, c.3);
+        let (bx, by) = to_local(rot, fx0, fy0, fx1, fy1, c.2, c.1);
+        let (lx, ly) = (ax.min(bx), ay.min(by));
+        let (lw, lh) = local_extent(rot, (c.2 - c.0).max(0.0), (c.3 - c.1).max(0.0));
+        let key = ((lx * 4.0) as i32, (ly * 4.0) as i32, (lw * 4.0) as i32, (lh * 4.0) as i32);
+        let id = format!("clip_{}_{}_{}_{}", key.0, key.1, key.2, key.3);
+        if !self.ids.contains(&key) {
+            self.body.push_str(&format!(
+                "<clipPath id=\"{}\"><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/></clipPath>",
+                id,
+                fmt(lx),
+                fmt(ly),
+                fmt(lw),
+                fmt(lh)
+            ));
+            self.ids.push(key);
+        }
+        id
+    }
+
+    /// The `<defs>` block to emit before any ink — empty when nothing is clipped.
+    fn render(&self) -> String {
+        if self.body.is_empty() {
+            String::new()
+        } else {
+            format!("<defs>{}</defs>", self.body)
+        }
     }
 }
 
@@ -479,7 +546,7 @@ impl PlacedSvg {
     /// paint order. What every renderer here except [`PlacedSvg::composite_svg`] wants —
     /// that one has rasters to slot in between the paths.
     fn ink(&self) -> String {
-        let mut out = self.defs.clone();
+        let mut out = self.defs.render();
         for (_, p) in &self.paths {
             out.push_str(p);
         }
@@ -587,8 +654,28 @@ impl PlacedSvg {
         // Raster rects in local coords (origin (x_left, y_top), y DOWN). The viewBox grows by
         // the axis-aligned placement bbox in both cases (a rotated image's bbox IS that box).
         let mut content: Vec<(&PaintSeq, String)> = Vec::with_capacity(rasters.len() + self.paths.len());
+        let mut defs = self.defs.clone();
         for r in rasters {
             let (ix0, ix1, iy0, iy1) = r.rect;
+            // The clip in force at this raster's `Do`, when it actually cropped it. `r.rect`
+            // is already the CROPPED extent (so the viewBox bounds to what shows), while the
+            // pixels still fill the full placement — which is why a clipped raster always
+            // carries a matrix and never takes the plain-rect branch below.
+            //
+            // The clip goes on a WRAPPING `<g>`, never on the `<image>` itself: `transform`
+            // establishes a new user space for the element it sits on, and a `clip-path` on
+            // that same element resolves in the NEW space — so the mask would be scaled by
+            // the placement matrix (here a 160x120 factor) and land off the page, hiding the
+            // raster completely. The `<g>` keeps the mask in the figure's own coordinates,
+            // which is the space `ClipDefs` mints the rect in. Verified against a renderer:
+            // on the `<image>` the fixture rendered blank, on the `<g>` it renders its window.
+            let (clip_open, clip_close) = match r.clip {
+                Some(c) => (
+                    format!("<g clip-path=\"url(#{})\">", defs.id_for(self.rot, self.x_left, self.y_bottom, self.x_right, self.y_top, c)),
+                    "</g>",
+                ),
+                None => (String::new(), ""),
+            };
             // The raster arrives in PAGE space (that is the space `html.rs` pairs it with this
             // figure in); a quarter turn maps its rect to a rect, so the two opposite corners
             // re-ordered give the local box exactly. Upright, this is `ix0 - x_left` etc.
@@ -609,7 +696,7 @@ impl PlacedSvg {
             // raster on such a page goes through the matrix path.
             let el = match self.rot_image_matrix(r) {
                 Some([a, b, c, d, e, f]) => format!(
-                    "<image href=\"{}\" x=\"0\" y=\"0\" width=\"1\" height=\"1\" preserveAspectRatio=\"none\" transform=\"matrix({} {} {} {} {} {})\"/>",
+                    "{clip_open}<image href=\"{}\" x=\"0\" y=\"0\" width=\"1\" height=\"1\" preserveAspectRatio=\"none\" transform=\"matrix({} {} {} {} {} {})\"/>{clip_close}",
                     r.href,
                     fmt(a),
                     fmt(b),
@@ -619,7 +706,7 @@ impl PlacedSvg {
                     fmt(f),
                 ),
                 None => format!(
-                    "<image href=\"{}\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\"/>",
+                    "{clip_open}<image href=\"{}\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" preserveAspectRatio=\"none\"/>{clip_close}",
                     r.href,
                     fmt(img_lx),
                     fmt(img_ly),
@@ -664,7 +751,7 @@ impl PlacedSvg {
         // Clip definitions (render nothing), then rasters and vector ink interleaved in the
         // order the page painted them, then the text labels on top. Labels stay last: they
         // are the figure's own annotation and are the one thing that must never be occluded.
-        let mut body = self.defs.clone();
+        let mut body = defs.render();
         for (_, el) in &content {
             body.push_str(el);
         }
@@ -692,6 +779,10 @@ pub struct Raster<'a> {
     pub href: &'a str,
     pub rect: (f32, f32, f32, f32),
     pub ctm: Option<[f32; 6]>,
+    /// The page-space clipping rectangle in force at the `Do`, when it actually cropped the
+    /// placement (`(x0, y0, x1, y1)`, y up). Emitted as an SVG `clip-path`; `None` — the
+    /// common case — leaves the `<image>` unmasked.
+    pub clip: Option<ClipRect>,
     pub seq: &'a PaintSeq,
 }
 
@@ -744,7 +835,7 @@ fn extgstates_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, (Op
 // bundling it into a struct would hide which parts a paint operator supplies fresh
 // (colour, alpha, clip) from the address/output it merely threads through.
 #[allow(clippy::too_many_arguments)]
-fn finish(cur: &mut Vec<Seg>, fill: Option<[u8; 3]>, stroke: Option<Stroke>, fill_op: f32, stroke_op: f32, clip: Option<(f32, f32, f32, f32)>, seq: PaintSeq, out: &mut Vec<Painted>) {
+fn finish(cur: &mut Vec<Seg>, fill: Option<[u8; 3]>, stroke: Option<Stroke>, fill_op: f32, stroke_op: f32, clip: Option<ClipRect>, seq: PaintSeq, out: &mut Vec<Painted>) {
     if cur.is_empty() {
         return;
     }
@@ -1055,13 +1146,7 @@ fn walk(
                 // path's bbox into the graphics-state clip (q/Q scopes it via the GState copy).
                 if pending_clip {
                     if let Some(bb) = path_bbox(&cur) {
-                        g.clip = Some(match g.clip {
-                            Some(cl) => {
-                                let n = Rect::new(cl.0, cl.1, cl.2, cl.3).intersect(Rect::new(bb.0, bb.1, bb.2, bb.3));
-                                (n.x0, n.y0, n.x1, n.y1)
-                            }
-                            None => bb,
-                        });
+                        g.clip = Some(intersect_clip(g.clip, bb));
                     }
                     pending_clip = false;
                 }
@@ -1251,34 +1336,8 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32, rot: i32) -> PlacedSvg {
     let area = (w * h).max(1.0);
     let mut plot: Option<(f32, f32, f32, f32)> = None;
     // SVG <clipPath> definitions for paths drawn under a PDF clip (a plot's reference curves
-    // clipped to the axes box). The id is derived from the clip's own figure-LOCAL geometry
-    // so that `same id ⟺ same <rect>`. This is what keeps clipping correct once the whole
-    // document is assembled: ids must be globally unique, but every figure shares the same
-    // page content origin, so an origin- or index-based id collides across figures — and the
-    // doc-wide `dedup_ids` pass then renames the colliding `id=` WITHOUT touching the
-    // `clip-path="url(#…)"` reference, silently breaking the clip. A geometry-keyed id avoids
-    // that: distinct clips get distinct ids (no rename), and any genuinely identical clip
-    // that does get renamed still resolves to a clipPath with an identical rect.
-    let mut clip_defs = String::new();
-    let mut clip_ids: Vec<(i32, i32, i32, i32)> = Vec::new();
-    let mut clip_id_for = |c: (f32, f32, f32, f32), defs: &mut String| -> String {
-        // page space -> figure-local (y flipped, turned by /Rotate): a clip rect (cx0,cy0,cx1,cy1).
-        // The ORIGIN comes from the corner map; the EXTENTS are the page-space spans merely
-        // transposed — taking them as a difference of two mapped corners instead would
-        // reassociate the subtraction (`(c.2-x0)-(c.0-x0)` is not `c.2-c.0` in f32) and move
-        // an upright figure's clip by a rounding step.
-        let (cl0, cl1, _, _) = lrect(c.0, c.1, c.2, c.3);
-        let (cw, ch) = local_extent(rot, (c.2 - c.0).max(0.0), (c.3 - c.1).max(0.0));
-        let (lx, lw_) = (cl0, cw);
-        let (ly, lh_) = (cl1, ch);
-        let key = ((lx * 4.0) as i32, (ly * 4.0) as i32, (lw_ * 4.0) as i32, (lh_ * 4.0) as i32);
-        let id = format!("clip_{}_{}_{}_{}", key.0, key.1, key.2, key.3);
-        if !clip_ids.contains(&key) {
-            defs.push_str(&format!("<clipPath id=\"{}\"><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/></clipPath>", id, fmt(lx), fmt(ly), fmt(lw_), fmt(lh_)));
-            clip_ids.push(key);
-        }
-        id
-    };
+    // clipped to the axes box) — see [`ClipDefs`], which the raster emitter shares.
+    let mut defs = ClipDefs::default();
     let mut paths: Vec<(PaintSeq, String)> = Vec::new();
     for p in cluster {
         // Skip a near-white background fill that covers a large part of the figure:
@@ -1343,13 +1402,24 @@ fn build_svg(cluster: &Vec<Painted>, page_w: f32, rot: i32) -> PlacedSvg {
             None => String::new(),
         };
         let clip_attr = match p.clip {
-            Some(c) => format!(" clip-path=\"url(#{})\"", clip_id_for(c, &mut clip_defs)),
+            Some(c) => format!(" clip-path=\"url(#{})\"", defs.id_for(rot, x0, y0, x1, y1, c)),
             None => String::new(),
         };
         paths.push((p.seq.clone(), format!("<path d=\"{d}\" fill=\"{fill}\"{fop}{stroke}{clip_attr}/>")));
     }
-    let defs = if clip_defs.is_empty() { String::new() } else { format!("<defs>{clip_defs}</defs>") };
     PlacedSvg { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, defs, paths, w: lw, h: lh, page_w, labels: Vec::new(), plot, rot }
+}
+
+/// Intersect a new page-space clip rectangle into the one already in force. Shared with
+/// [`crate::img`]'s walk, which tracks the same state.
+pub(crate) fn intersect_clip(cur: Option<ClipRect>, add: ClipRect) -> ClipRect {
+    match cur {
+        Some(c) => {
+            let n = Rect::new(c.0, c.1, c.2, c.3).intersect(Rect::new(add.0, add.1, add.2, add.3));
+            (n.x0, n.y0, n.x1, n.y1)
+        }
+        None => add,
+    }
 }
 
 #[cfg(test)]
@@ -1682,6 +1752,7 @@ mod tests {
                 href: "IMG",
                 rect: (im.x_left, im.x_right, im.y_bottom, im.y_top),
                 ctm: im.ctm,
+                clip: im.clip,
                 seq: &im.seq,
             }]);
             let image_at = svg.find("<image ").expect("the raster must be in the composite");
@@ -1925,7 +1996,7 @@ mod tests {
         assert_eq!(images.len(), 1, "one raster per page");
         assert!(images[0].ctm.is_none(), "the fixture's placement is axis-aligned");
         fn raster(im: &crate::img::Placed) -> Raster<'_> {
-            Raster { href: "IMG", rect: (im.x_left, im.x_right, im.y_bottom, im.y_top), ctm: im.ctm, seq: &im.seq }
+            Raster { href: "IMG", rect: (im.x_left, im.x_right, im.y_bottom, im.y_top), ctm: im.ctm, clip: im.clip, seq: &im.seq }
         }
         let up = strong[0].composite_svg(&[raster(&images[0])]);
         assert!(up.contains("<image href=\"IMG\" x=\"20\" y=\"50\" width=\"40\" height=\"30\""), "upright: {up}");

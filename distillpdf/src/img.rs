@@ -17,6 +17,7 @@ use crate::raster::{
     codec_payload, decode_dct_rgb, decode_inverts, decode_samples, dims_sane, jpeg_components, png_bytes,
     samples_decodable, MAX_IMAGE_PIXELS,
 };
+use crate::vector::ClipRect;
 use crate::walker::{
     descend_form, overlay_resources, page_resources, page_xobjects, subtype_of, xobject_at, Descend, PaintSeq, ScopePolicy, XMap,
 };
@@ -383,6 +384,13 @@ pub struct Placed {
     /// A stitched grid takes the address of its EARLIEST tile: the mosaic occupies the
     /// span from its first paint onward, so anything painted before all of it is behind it.
     pub(crate) seq: PaintSeq,
+    /// The page-space clipping rectangle in force where this raster was `Do`ne, kept ONLY
+    /// when it actually cropped the placement. The bbox above is then the CROPPED extent —
+    /// what the page shows, which is what reading order, figure absorption and the composite
+    /// viewBox must measure — while `ctm` still describes the FULL placement, because the
+    /// pixels have not moved. (`vector::finish` sets the precedent: crop the stored bbox,
+    /// keep the full geometry, mask it at render time.)
+    pub(crate) clip: Option<ClipRect>,
 }
 
 /// One placed image XObject before clustering: its object id, placed bbox (page points),
@@ -403,6 +411,29 @@ struct RawTile {
     res: Rc<Dictionary>,
     /// Paint position of this tile's `Do` in the page's content tree (see [`Placed::seq`]).
     seq: PaintSeq,
+    /// The page-space clip in force at the `Do`, when it actually cropped this tile (see
+    /// [`Placed::clip`]). The bbox above is then already the CROPPED one.
+    clip: Option<ClipRect>,
+}
+
+impl RawTile {
+    /// Where this tile's PIXELS land, page space — the recorded rect for an unclipped tile
+    /// (bit-for-bit, so no grid moves by a rounding step), and the full placement recovered
+    /// from the matrix for a clipped one, whose recorded rect is only the visible window.
+    fn placement(&self) -> (f32, f32, f32, f32) {
+        match (self.clip, self.ctm) {
+            (Some(_), Some([a, b, c, d, e, f])) => {
+                let m = Mat { a, b, c, d, e, f };
+                let mut bb = Rect::EMPTY;
+                for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                    let (px, py) = m.apply(u, v);
+                    bb.include(px, py);
+                }
+                (bb.x0, bb.y0, bb.x1, bb.y1)
+            }
+            _ => (self.x0, self.y0, self.x1, self.y1),
+        }
+    }
 }
 
 /// Images smaller than this (rendered, points) are diagram tiles / rules /
@@ -434,7 +465,7 @@ pub fn positioned_images(doc: &Document, page_id: ObjectId, want_uris: bool) -> 
     let res = Rc::new(page_resources(doc, page_id));
     let mut raws: Vec<RawTile> = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
-    walk(doc, &content.operations, &xmap, &res, Mat::ID, &mut raws, 0, &mut budget, &[]);
+    walk(doc, &content.operations, &xmap, &res, Mat::ID, None, &mut raws, 0, &mut budget, &[]);
     finalize(doc, raws, want_uris)
 }
 
@@ -449,6 +480,8 @@ fn walk(
     xmap: &XMap,
     res: &Rc<Dictionary>,
     base: Mat,
+    // The clipping rectangle in force where this stream is invoked (page space, y up).
+    base_clip: Option<ClipRect>,
     out: &mut Vec<RawTile>,
     depth: u32,
     budget: &mut crate::WalkBudget,
@@ -457,7 +490,20 @@ fn walk(
     here: &[u32],
 ) {
     let mut ctm = base;
-    let mut stack: Vec<Mat> = Vec::new();
+    // Active clip in PAGE space, the intersection of every `W`/`W*` seen so far on the q/Q
+    // stack — the same state `vector::GState.clip` keeps, for the same reason. Without it a
+    // raster the stream crops to a small window rendered at its full placement rect, and
+    // since rasters paint in true paint order that means covering the ink drawn after it.
+    let mut clip = base_clip;
+    let mut stack: Vec<(Mat, Option<ClipRect>)> = Vec::new();
+    // `W`/`W*` mark the current path as a clip, but it takes effect only after the path's
+    // painting operator (`vector::walk` defers it the same way).
+    let mut pending_clip = false;
+    // Page-space extent of the path under construction. Only its BOUNDS matter here — this
+    // walk paints nothing — so a `Rect` accumulator says everything `vector`'s segment list
+    // would, control points included (which over-estimates a curved clip in exactly the same
+    // direction: it can only ever clip less than a conforming reader, never more).
+    let mut cur = Rect::EMPTY;
     for (opi, op) in ops.iter().enumerate() {
         // Total-work budget (see `crate::WalkBudget`): the depth cap alone lets a
         // self-referential form branch 2x per level. Out of budget → stop and keep the
@@ -467,15 +513,52 @@ fn walk(
         }
         let o = &op.operands;
         match op.operator.as_str() {
-            "q" => stack.push(ctm),
+            "q" => stack.push((ctm, clip)),
             "Q" => {
-                if let Some(m) = stack.pop() {
+                if let Some((m, c)) = stack.pop() {
                     ctm = m;
+                    clip = c;
                 }
             }
             "cm" if o.len() >= 6 => {
                 let m = Mat { a: num(&o[0]), b: num(&o[1]), c: num(&o[2]), d: num(&o[3]), e: num(&o[4]), f: num(&o[5]) };
                 ctm = m.mul(ctm);
+            }
+            // The path operators, tracked for their EXTENT alone — a clip path is just a path
+            // followed by `W`/`W*`, and this walk needs no other use for them.
+            "m" | "l" if o.len() >= 2 => {
+                let (x, y) = ctm.apply(num(&o[0]), num(&o[1]));
+                cur.include(x, y);
+            }
+            "c" if o.len() >= 6 => {
+                for k in [0, 2, 4] {
+                    let (x, y) = ctm.apply(num(&o[k]), num(&o[k + 1]));
+                    cur.include(x, y);
+                }
+            }
+            "v" | "y" if o.len() >= 4 => {
+                for k in [0, 2] {
+                    let (x, y) = ctm.apply(num(&o[k]), num(&o[k + 1]));
+                    cur.include(x, y);
+                }
+            }
+            "re" if o.len() >= 4 => {
+                let (x, y, w, h) = (num(&o[0]), num(&o[1]), num(&o[2]), num(&o[3]));
+                for (u, v) in [(x, y), (x + w, y), (x + w, y + h), (x, y + h)] {
+                    let (px, py) = ctm.apply(u, v);
+                    cur.include(px, py);
+                }
+            }
+            "W" | "W*" => pending_clip = true,
+            "f" | "F" | "f*" | "S" | "s" | "B" | "B*" | "b" | "b*" | "n" => {
+                // A pending `W`/`W*` applies from after this paint op; `q`/`Q` scopes it.
+                if pending_clip {
+                    if cur.is_valid() {
+                        clip = Some(crate::vector::intersect_clip(clip, (cur.x0, cur.y0, cur.x1, cur.y1)));
+                    }
+                    pending_clip = false;
+                }
+                cur = Rect::EMPTY;
             }
             "Do" => {
                 let Some((id, stream)) = xobject_at(doc, xmap, o) else {
@@ -489,16 +572,37 @@ fn walk(
                         let (px, py) = ctm.apply(u, v);
                         bb.include(px, py);
                     }
-                    let Rect { x0, y0, x1, y1 } = bb;
-                    let (w, h) = (bb.width(), bb.height());
+                    let Rect { mut x0, mut y0, mut x1, mut y1 } = bb;
+                    // Honour the clip in force, on `vector::finish`'s discipline: keep it only
+                    // when it actually crops (so the ubiquitous full-page `re W n` costs
+                    // nothing), crop the recorded extent to what shows, and drop outright a
+                    // raster that lies wholly outside its clip — the page never showed it.
+                    let mut crop = None;
+                    if let Some((cx0, cy0, cx1, cy1)) = clip {
+                        if cx0 > x0 + 0.5 || cy0 > y0 + 0.5 || cx1 < x1 - 0.5 || cy1 < y1 - 0.5 {
+                            let n = Rect::new(x0, y0, x1, y1).intersect(Rect::new(cx0, cy0, cx1, cy1));
+                            if n.x1 <= n.x0 || n.y1 <= n.y0 {
+                                continue;
+                            }
+                            x0 = n.x0;
+                            y0 = n.y0;
+                            x1 = n.x1;
+                            y1 = n.y1;
+                            crop = clip;
+                        }
+                    }
+                    let (w, h) = (x1 - x0, y1 - y0);
                     if w < MIN_DIM || h < MIN_DIM {
                         continue; // diagram tile / rule / icon — not a figure
                     }
                     // A ROTATED placement (non-axis-aligned CTM) would render mangled if we
                     // just stretched the pixels into this axis-aligned bbox — keep the matrix
                     // so the emitter can rotate it. Axis-aligned (the common case) → None.
+                    // A CLIPPED raster needs it for a different reason: its recorded bbox is
+                    // the cropped window, while the pixels still fill the full placement, so
+                    // the rect form would squash them into the crop.
                     let scale = ctm.a.abs().max(ctm.b.abs()).max(ctm.c.abs()).max(ctm.d.abs()).max(1e-6);
-                    let rot_ctm = if ctm.b.abs() > 0.01 * scale || ctm.c.abs() > 0.01 * scale {
+                    let rot_ctm = if crop.is_some() || ctm.b.abs() > 0.01 * scale || ctm.c.abs() > 0.01 * scale {
                         Some([ctm.a, ctm.b, ctm.c, ctm.d, ctm.e, ctm.f])
                     } else {
                         None
@@ -506,7 +610,7 @@ fn walk(
                     // Record geometry + pixel dims; uri building / grid stitching happens
                     // in finalize() once the whole page's tiles are known.
                     let pw = stream.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0) as u32;
-                    out.push(RawTile { id, x0, x1, y0, y1, pw, ctm: rot_ctm, res: Rc::clone(res), seq: PaintSeq::at(here, opi) });
+                    out.push(RawTile { id, x0, x1, y0, y1, pw, ctm: rot_ctm, res: Rc::clone(res), seq: PaintSeq::at(here, opi), clip: crop });
                 } else {
                     // A form is descended with the page's XObject scope still in force
                     // (`OverlayParent`): a raster the page defines and the form invokes by
@@ -525,7 +629,7 @@ fn walk(
                                 }
                                 None => Rc::clone(res),
                             };
-                            walk(doc, &f.ops, &f.scope.xobjects, &child, f.matrix.mul(ctm), out, depth + 1, budget, PaintSeq::at(here, opi).as_slice())
+                            walk(doc, &f.ops, &f.scope.xobjects, &child, f.matrix.mul(ctm), clip, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice())
                         }
                         Descend::Skip => continue,
                         Descend::Halt => return,
@@ -553,13 +657,13 @@ fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool) -> Vec<Placed> 
             // A stitched grid is composed axis-aligned, so it carries no rotation.
             if want_uris {
                 if let Some(uri) = stitch_grid(doc, &tiles, (x0, x1, y0, y1)) {
-                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri, ctm: None, seq: grid_seq() });
+                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri, ctm: None, seq: grid_seq(), clip: None });
                     continue;
                 }
                 // stitch failed → fall through to per-tile emission
             } else {
                 if tiles.iter().any(|t| decodable(doc, &t.res, t.id)) {
-                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri: String::new(), ctm: None, seq: grid_seq() });
+                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri: String::new(), ctm: None, seq: grid_seq(), clip: None });
                 }
                 continue;
             }
@@ -569,10 +673,10 @@ fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool) -> Vec<Placed> 
         for t in tiles {
             if want_uris {
                 if let Some(uri) = data_uri(doc, &t.res, t.id) {
-                    out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri, ctm: t.ctm, seq: t.seq.clone() });
+                    out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri, ctm: t.ctm, seq: t.seq.clone(), clip: t.clip });
                 }
             } else if decodable(doc, &t.res, t.id) {
-                out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri: String::new(), ctm: t.ctm, seq: t.seq.clone() });
+                out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri: String::new(), ctm: t.ctm, seq: t.seq.clone(), clip: t.clip });
             }
         }
     }
@@ -729,11 +833,27 @@ fn stitch_grid(doc: &Document, tiles: &[&RawTile], bbox: (f32, f32, f32, f32)) -
             Some(im) => im,
             None => continue,
         };
-        let tw = (((t.x1 - t.x0) * scale).round() as u32).max(1);
-        let th = (((t.y1 - t.y0) * scale).round() as u32).max(1);
-        let resized = image::imageops::resize(&tile, tw, th, image::imageops::FilterType::Triangle);
-        let ox = ((t.x0 - x0) * scale).round() as i64;
-        let oy = ((y1 - t.y1) * scale).round() as i64; // top edge → canvas top
+        // A CLIPPED tile's recorded rect is the window the page shows, not where its pixels
+        // go: they still fill the whole placement. Resize to the placement, then keep only
+        // the window — resizing straight into the window would squash the image into it.
+        let (fx0, fy0, fx1, fy1) = t.placement();
+        let tw = (((fx1 - fx0) * scale).round() as u32).max(1);
+        let th = (((fy1 - fy0) * scale).round() as u32).max(1);
+        let mut resized = image::imageops::resize(&tile, tw, th, image::imageops::FilterType::Triangle);
+        let mut ox = ((fx0 - x0) * scale).round() as i64;
+        let mut oy = ((y1 - fy1) * scale).round() as i64; // top edge → canvas top
+        if t.clip.is_some() {
+            let cx = (((t.x0 - fx0) * scale).round() as i64).clamp(0, tw as i64);
+            let cy = (((fy1 - t.y1) * scale).round() as i64).clamp(0, th as i64);
+            let cw = (((t.x1 - t.x0) * scale).round() as i64).clamp(0, tw as i64 - cx) as u32;
+            let chh = (((t.y1 - t.y0) * scale).round() as i64).clamp(0, th as i64 - cy) as u32;
+            if cw == 0 || chh == 0 {
+                continue;
+            }
+            resized = image::imageops::crop(&mut resized, cx as u32, cy as u32, cw, chh).to_image();
+            ox += cx;
+            oy += cy;
+        }
         image::imageops::overlay(&mut canvas, &resized, ox, oy);
         placed_any = true;
     }
@@ -817,7 +937,7 @@ mod tests {
         let mut raws = Vec::new();
         let mut budget = crate::WalkBudget::new(700);
         let res = Rc::new(page_resources(&doc, page_id));
-        walk(&doc, &content.operations, &xmap, &res, Mat::ID, &mut raws, 0, &mut budget, &[]);
+        walk(&doc, &content.operations, &xmap, &res, Mat::ID, None, &mut raws, 0, &mut budget, &[]);
         assert!(!raws.is_empty(), "a tripped budget must not empty the page");
         assert!(raws.len() < 3, "the budget must really bite, got {} tiles", raws.len());
     }
@@ -1028,6 +1148,57 @@ mod tests {
         assert_eq!(right[3], 0, "the masked-out half must stay transparent, got {right:?}");
         // And the panel is still painted, so there is something for that transparency to reveal.
         assert!(html.contains("#339999"), "the teal panel must survive alongside the raster");
+    }
+
+    #[test]
+    fn a_clipped_raster_records_the_window_the_page_shows_not_its_placement() {
+        // `tests/gen_fixtures.py::gen_clipped_raster`: one raster placed 160x120 at
+        // (140, y0+30) in two identical figures, the second under `140 y0+30 80 60 re W n`.
+        // `img::walk` tracked no clip at all, so BOTH came back at the full 160x120 placement
+        // — the crop the page applied was invisible to the extractor.
+        let mut placed = placed_top_down("clipped_raster.pdf", 1);
+        assert_eq!(placed.len(), 2, "both rasters must be placed");
+        placed.sort_by(|a, b| b.y_top.partial_cmp(&a.y_top).expect("finite"));
+        let (whole, cropped) = (&placed[0], &placed[1]);
+        assert!(whole.clip.is_none(), "the unclipped control must carry no clip");
+        assert!(whole.ctm.is_none(), "an axis-aligned unclipped placement stays in rect form");
+        assert!((whole.x_right - whole.x_left - 160.0).abs() < 0.5, "control width {}", whole.x_right - whole.x_left);
+
+        let c = cropped.clip.expect("the clipped raster must record its clip");
+        for (got, want) in [(c.0, 140.0), (c.1, 150.0), (c.2, 220.0), (c.3, 210.0)] {
+            assert!((got - want).abs() < 0.5, "clip {c:?}");
+        }
+        // The recorded extent is the WINDOW (80x60), because that is what the page shows and
+        // what reading order / figure absorption / the viewBox must measure...
+        assert!((cropped.x_right - cropped.x_left - 80.0).abs() < 0.5, "cropped width {}", cropped.x_right - cropped.x_left);
+        assert!((cropped.y_top - cropped.y_bottom - 60.0).abs() < 0.5, "cropped height {}", cropped.y_top - cropped.y_bottom);
+        // ...while the placement matrix still describes the FULL 160x120 rect, because the
+        // pixels have not moved — stretching them into the window would be a different bug.
+        let m = cropped.ctm.expect("a clipped raster must carry its full placement matrix");
+        assert_eq!([m[0], m[3], m[4], m[5]], [160.0, 120.0, 140.0, 150.0], "placement matrix {m:?}");
+    }
+
+    #[test]
+    fn a_clipped_composite_image_carries_the_clip_path_the_page_asked_for() {
+        // The emission half: `composite_svg` must mask the `<image>` with a `<clipPath>` at
+        // the crop, and the unclipped control in the same document must gain nothing.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/clipped_raster.pdf");
+        let doc = Document::load(path).expect("clipped_raster.pdf fixture must load");
+        let raw = std::fs::read(path).expect("fixture readable");
+        let html = crate::html::to_html(&doc, &raw, crate::html::Mode::Page, true, true);
+        assert_eq!(html.matches("<image ").count(), 2, "both figures must composite their raster");
+        // The mask goes on a WRAPPING `<g>`, never on the transformed `<image>` — `transform`
+        // establishes a new user space and a `clip-path` on the same element resolves in it,
+        // so the rect would be scaled by the 160x120 placement and hide the raster outright.
+        assert_eq!(html.matches("clip-path=").count(), 1, "exactly one of the two is clipped");
+        let g = html.split("<g clip-path=").nth(1).expect("the clip must sit on a wrapping <g>");
+        assert!(g.starts_with("\"url(#clip_"), "clip-path value: {}", &g[..40.min(g.len())]);
+        let clipped = g.split("<image ").nth(1).map(|s| s.split("/>").next().unwrap_or("")).expect("the <g> wraps the <image>");
+        assert!(clipped.contains("transform=\"matrix("), "a clipped raster is placed by matrix: {clipped}");
+        // The mask itself exists and is the 80x60 window (the figure box is 300x180 at
+        // (72, 120), so the crop's local origin is x 68, y 90 with y measured down from the top).
+        let id = g.split("url(#").nth(1).and_then(|s| s.split(')').next()).expect("a clip-path url");
+        assert!(html.contains(&format!("<clipPath id=\"{id}\"><rect x=\"68\" y=\"90\" width=\"80\" height=\"60\"/></clipPath>")), "clipPath {id} missing or wrong: {html:.0}");
     }
 
     #[test]

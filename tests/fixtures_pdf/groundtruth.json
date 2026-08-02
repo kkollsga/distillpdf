@@ -851,5 +851,20 @@
       40
     ],
     "expect_format": "png"
+  },
+  "clipped_raster.pdf": {
+    "figures": 2,
+    "placement": [
+      140,
+      150,
+      300,
+      270
+    ],
+    "clip": [
+      140,
+      150,
+      220,
+      210
+    ]
   }
 }
