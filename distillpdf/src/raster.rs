@@ -170,7 +170,7 @@ fn cs_model(doc: &Document, res: &Dictionary, o: &Object, depth: u32) -> Option<
                 }
                 let lookup = match deref(doc, a.get(3)?)? {
                     Object::String(s, _) => s.clone(),
-                    Object::Stream(st) => st.decompressed_content().unwrap_or_else(|_| st.content.clone()),
+                    Object::Stream(st) => content_bytes(st).into_owned(),
                     _ => return None,
                 };
                 Some(Cs::Indexed { base: Box::new(base), lookup })

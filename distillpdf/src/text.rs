@@ -150,7 +150,7 @@ fn build_fonts_from_resources(doc: &Document, resources: &Dictionary, raw: &[u8]
 fn type1_encoding(doc: &Document, descriptor: Option<&Dictionary>) -> Option<HashMap<u32, String>> {
     let r = descriptor?.get(b"FontFile").ok().and_then(|o| o.as_reference().ok())?;
     let stream = doc.get_object(r).ok().and_then(|o| o.as_stream().ok())?;
-    let bytes = stream.decompressed_content().unwrap_or_else(|_| stream.content.clone());
+    let bytes = crate::pdfobj::content_bytes(stream);
     let end = bytes.windows(5).position(|w| w == b"eexec").unwrap_or(bytes.len());
     let text = String::from_utf8_lossy(&bytes[..end]);
     let toks: Vec<&str> = text.split_whitespace().collect();
@@ -189,7 +189,7 @@ fn font_info(doc: &Document, dict: &Dictionary, raw: &[u8]) -> FontInfo {
                     .get_object(r)
                     .ok()
                     .and_then(|o| o.as_stream().ok())
-                    .map(|s| s.decompressed_content().unwrap_or_else(|_| s.content.clone()))
+                    .map(|s| crate::pdfobj::content_bytes(s).into_owned())
                     .filter(|b| !b.is_empty());
                 let bytes = from_lopdf.or_else(|| recover_stream(raw, r.0))?;
                 Some(parse_tounicode(&bytes))
@@ -1343,6 +1343,14 @@ pub fn xy_cut_order_opt(boxes: &[BBox], med: f32, tolerant: bool) -> Vec<usize> 
     order
 }
 
+/// How deep [`xy_cut`] may recurse before it stops splitting and emits the boxes in line
+/// order. A page-layout guard, **not** [`crate::MAX_FORM_DEPTH`]: the two govern unrelated
+/// recursions (whitespace-gutter subdivision vs. Form-XObject nesting) and share the value
+/// 40 by coincidence. Aliasing them would tie a layout heuristic to a DoS cap, so they stay
+/// separate constants — the structure test that forbids re-declared caps exempts this one by
+/// name for exactly that reason.
+const MAX_XY_CUT_DEPTH: u32 = 40;
+
 /// Recursive XY-cut: order box indices into human reading order by repeatedly
 /// splitting on the widest whitespace gutter.
 ///
@@ -1358,7 +1366,7 @@ pub fn xy_cut_order_opt(boxes: &[BBox], med: f32, tolerant: bool) -> Vec<usize> 
 /// has no vertical gap there — it gets peeled off by a horizontal cut first,
 /// after which the remaining body splits cleanly into columns.
 fn xy_cut(boxes: &[BBox], idx: Vec<usize>, med: f32, depth: u32, tolerant: bool, out: &mut Vec<usize>) {
-    if idx.len() <= 1 || depth >= 40 {
+    if idx.len() <= 1 || depth >= MAX_XY_CUT_DEPTH {
         out.extend(sorted_lines(boxes, idx, med));
         return;
     }
@@ -1582,7 +1590,7 @@ pub fn debug_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> String {
                     let dec = st.decompressed_content();
                     let raw_len = st.content.len();
                     let dec_len = dec.as_ref().map(|d| d.len() as i64).unwrap_or(-1);
-                    let used = dec.unwrap_or_else(|_| st.content.clone());
+                    let used = crate::pdfobj::content_bytes(&st);
                     let parsed = parse_tounicode(&used).len();
                     let sample: String = String::from_utf8_lossy(&used).chars().take(50).collect();
                     s += &format!(
