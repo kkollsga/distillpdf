@@ -238,7 +238,10 @@ fn drawn_images(doc: &Document, page_id: ObjectId) -> Option<HashSet<ObjectId>> 
             crate::walker::overlay_xobjects(doc, d, &mut xmap);
         }
     }
-    let content = doc.get_page_content(page_id).ok()?;
+    // lopdf 0.44 made `get_page_content` infallible (returns `Vec<u8>`, empty when the
+    // page has no/unreadable content). The old `.ok()?` bailed out on Err; an empty
+    // vec now decodes to zero operations, which reaches the same empty result.
+    let content = doc.get_page_content(page_id);
     let ops = lopdf::content::Content::decode(&content).ok()?;
     let mut out = HashSet::new();
     let mut seen = HashSet::new();

@@ -487,12 +487,21 @@ mod tests {
 
     #[test]
     fn content_bytes_keeps_an_unfiltered_stream_instead_of_emptying_it() {
-        // THE reason this helper exists: `decompressed_content()` errors on a stream with
-        // no /Filter, so `unwrap_or_default()` returns "" and the stream's whole content —
-        // text, paths — disappears.
+        // THE reason this helper exists: through lopdf 0.43 `decompressed_content()` errored
+        // on a stream with no /Filter, so `unwrap_or_default()` returned "" and the stream's
+        // whole content — text, paths — disappeared.
+        //
+        // lopdf 0.44 converged on our behaviour: `decode_filters` now catches the missing
+        // /Filter and returns the raw content. The helper is therefore belt-and-braces on
+        // 0.44 rather than load-bearing, but it stays — it is the single choke point that
+        // makes every caller immune, and it keeps us correct if upstream reverts.
         let raw = b"BT /F1 12 Tf (hi) Tj ET".to_vec();
         let s = Stream::new(dictionary! {}, raw.clone());
-        assert!(s.decompressed_content().is_err(), "the premise: lopdf errors without /Filter");
+        assert_eq!(
+            s.decompressed_content().ok().as_deref(),
+            Some(&raw[..]),
+            "the premise, lopdf 0.44: an unfiltered stream decodes to its raw content",
+        );
         assert_eq!(content_bytes(&s).as_ref(), &raw[..]);
     }
 

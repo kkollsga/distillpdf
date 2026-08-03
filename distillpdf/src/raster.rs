@@ -914,15 +914,21 @@ mod tests {
 
     #[test]
     fn an_unfiltered_raster_keeps_its_samples() {
-        // `decompressed_content()` ERRORS on a stream with no `/Filter`, and the render
-        // path's own sample reader used `.ok()?` — so an uncompressed image decoded to
-        // nothing and simply never appeared in `to_html`
+        // Through lopdf 0.43 `decompressed_content()` ERRORED on a stream with no `/Filter`,
+        // and the render path's own sample reader used `.ok()?` — so an uncompressed image
+        // decoded to nothing and simply never appeared in `to_html`
         // (`tests/fixtures_pdf/undrawn_image.pdf`). Reading through `content_bytes` is what
-        // makes the shared decoder immune.
+        // makes the shared decoder immune; lopdf 0.44 now returns the raw content itself,
+        // so this asserts the new premise and the same end behaviour.
         let doc = Document::with_version("1.5");
         let d = dictionary! { "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8i64, "Width" => 2, "Height" => 1 };
-        let s = Stream::new(d, vec![10, 20, 30, 40, 50, 60]);
-        assert!(s.decompressed_content().is_err(), "lopdf refuses an unfiltered stream — the whole point");
+        let samples = vec![10u8, 20, 30, 40, 50, 60];
+        let s = Stream::new(d, samples.clone());
+        assert_eq!(
+            s.decompressed_content().ok().as_deref(),
+            Some(&samples[..]),
+            "the premise, lopdf 0.44: an unfiltered stream decodes to its raw samples",
+        );
         let px = decode_samples(&doc, &Dictionary::new(), &s).expect("unfiltered samples decode").into_rgb8();
         assert_eq!(px.get_pixel(0, 0).0, [10, 20, 30]);
         assert_eq!(px.get_pixel(1, 0).0, [40, 50, 60]);

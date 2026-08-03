@@ -21,7 +21,7 @@ categories = ["text-processing", "parser-implementations"]
 tesseract = ["dep:cmake", "dep:whatlang"]
 
 [dependencies]
-lopdf = "0.40"
+lopdf = "0.44"
 # Independent Flate validation (`pdfobj::flate_incomplete`). lopdf swallows its own zlib
 # error and returns the partial output, so a TRUNCATED stream reports Ok and renders short
 # with no signal; inflating the bytes ourselves is the only way to tell. Already linked twice

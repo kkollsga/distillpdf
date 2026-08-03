@@ -2266,10 +2266,11 @@ mod tests {
     #[test]
     fn a_form_stream_with_no_filter_still_paints_its_paths() {
         // `unfiltered_form.pdf` (`gen_fixtures.py::gen_unfiltered_form`): the page's only ink
-        // is five filled bars inside a Form XObject whose stream carries NO /Filter. lopdf
-        // *errors* on `decompressed_content()` for such a stream, so the old
+        // is five filled bars inside a Form XObject whose stream carries NO /Filter. Through
+        // lopdf 0.43 `decompressed_content()` *errored* for such a stream, so the old
         // `.unwrap_or_default()` handed the decoder zero bytes and the whole figure vanished
         // — while `extract.rs`/`img.rs`, which carry the raw-bytes fallback, saw it fine.
+        // lopdf 0.44 returns the raw content instead; the fallback keeps us correct either way.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/unfiltered_form.pdf");
         let doc = Document::load(path).expect("unfiltered_form.pdf fixture must load");
         let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
@@ -2278,7 +2279,11 @@ mod tests {
         let form_id = crate::walker::xobjects_of(&doc, &res).get(b"UF".as_slice()).copied().expect("/UF form");
         let form = doc.get_object(form_id).unwrap().as_stream().unwrap();
         assert!(form.dict.get(b"Filter").is_err(), "the fixture's form must carry no /Filter");
-        assert!(form.decompressed_content().is_err(), "the premise: lopdf errors without /Filter");
+        assert_eq!(
+            form.decompressed_content().ok().as_deref(),
+            Some(&form.content[..]),
+            "the premise, lopdf 0.44: an unfiltered stream decodes to its raw content",
+        );
 
         let painted = walk_page(&doc, page_id, crate::MAX_FORM_WORK);
         assert_eq!(painted.len(), 5, "the five bars inside the unfiltered form must all be painted");

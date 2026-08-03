@@ -2049,10 +2049,11 @@ mod tests {
     #[test]
     fn a_form_stream_with_no_filter_still_shows_its_text() {
         // `unfiltered_form.pdf` (`gen_fixtures.py::gen_unfiltered_form`): a label drawn inside
-        // a Form XObject whose stream carries NO /Filter. lopdf *errors* on
-        // `decompressed_content()` for such a stream, so `.unwrap_or_default()` fed the
-        // decoder zero bytes and every glyph inside the form disappeared — silently, and only
-        // on this walker and the vector one (extract/img carry the raw-bytes fallback).
+        // a Form XObject whose stream carries NO /Filter. Through lopdf 0.43
+        // `decompressed_content()` *errored* for such a stream, so `.unwrap_or_default()` fed
+        // the decoder zero bytes and every glyph inside the form disappeared — silently, and
+        // only on this walker and the vector one (extract/img carry the raw-bytes fallback).
+        // lopdf 0.44 returns the raw content instead; the fallback keeps us correct either way.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/unfiltered_form.pdf");
         let raw = std::fs::read(path).expect("unfiltered_form.pdf fixture must exist");
         let doc = Document::load_mem(&raw).expect("unfiltered_form.pdf fixture must load");
@@ -2061,7 +2062,11 @@ mod tests {
         let form_id = crate::walker::page_xobjects(&doc, pid).get(b"UF".as_slice()).copied().expect("/UF form");
         let form = doc.get_object(form_id).unwrap().as_stream().unwrap();
         assert!(form.dict.get(b"Filter").is_err(), "the fixture's form must carry no /Filter");
-        assert!(form.decompressed_content().is_err(), "the premise: lopdf errors without /Filter");
+        assert_eq!(
+            form.decompressed_content().ok().as_deref(),
+            Some(&form.content[..]),
+            "the premise, lopdf 0.44: an unfiltered stream decodes to its raw content",
+        );
 
         let out = extract_page(&doc, pid, &raw).expect("page text");
         assert!(out.contains("Unfiltered form ink"), "the form's own label is lost: {out:?}");
