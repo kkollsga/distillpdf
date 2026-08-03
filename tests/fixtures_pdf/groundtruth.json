@@ -16,6 +16,9 @@
     "paths": 8,
     "plain_form_opacity": "0.25"
   },
+  "alpha_header_data_table.pdf": {
+    "tables": 1
+  },
   "annot_appearance.pdf": {
     "images": [
       {
@@ -301,6 +304,9 @@
     "grid_paths": 12,
     "n_figures": 2,
     "scatter_paths": 300
+  },
+  "display_equation_block.pdf": {
+    "tables": 0
   },
   "encrypted": {
     "inline_encrypt": [
@@ -1059,6 +1065,9 @@
       40
     ],
     "panel_fill": "#339999"
+  },
+  "split_survivor_table.pdf": {
+    "tables": 1
   },
   "stacked_tables.pdf": {
     "tables": 2

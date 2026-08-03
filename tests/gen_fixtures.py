@@ -3636,6 +3636,97 @@ def gen_banded_one_table():
     GT["banded_one_table.pdf"] = {"tables": 1}
 
 
+def gen_alpha_header_data_table():
+    """A numeric data table whose HEADER cell carries a Greek letter and an '=' sign.
+
+    Drawn from `pdf-parse-bench` doc 069 page 1 (truth table 0, 10x3): a confidence-interval
+    table headed `a=0.90 | Confidence interval | Exact confidence`. The equation guard in
+    `is_coherent_grid` fired on `op >= 1 && has_rel` — ONE cell containing a Greek letter and
+    an '=' — and its supposed protection for data tables, `alpha_words <= nz`, compares a word
+    count to a cell count and is true of virtually every grid. So the whole 10x3 table was
+    refused and its 30 cells fell out into the prose.
+
+    Measured on the 100-document corpus this guard fired 119 times and 87 of those grids had
+    more than half their cells holding a decimal or a 3+-digit number. This is the positive
+    side of [`EQ_DATAVAL_DENOM`]: 24 of the 30 occupied cells here are data values (well over
+    the 1/3 the constant asks for), so the guard must stand down.
+
+    Assert ONE 3-column table of ten rows."""
+    pdf = os.path.join(OUT, "alpha_header_data_table.pdf")
+    X = (60.0, 150.0, 300.0)
+    ROWS = [["a=0.90", "Confidence interval", "Exact confidence"],
+            ["GANN", "[1800, 27450]", "0.9008"], ["ETSA", "[-124800, -13300]", "0.9008"],
+            ["GSACO", "[-2750, 41000]", "0.9008"], ["HGSA", "[2800, 26950]", "0.9008"],
+            ["MGWOA", "[-128500, -9000]", "0.9008"], ["MAAA", "[3450, 76650]", "0.9008"],
+            ["MILPN", "[4200, 51650]", "0.9008"], ["MILP", "[6100, 83000]", "0.9008"],
+            ["AEDGA", "[5100, 76500]", "0.9008"]]
+    body = [b"BT /F2 11 Tf 60 740 Td (Interval Table) Tj ET"]
+    for ri, row in enumerate(ROWS):
+        for ci, cell in enumerate(row):
+            body.append(b"BT /F1 10 Tf %.1f %.1f Td (%s) Tj ET" % (X[ci], 700.0 - ri * 14.0, cell.encode()))
+    stream = b"\n".join(body)
+    _assemble_pdf(_one_page(stream), pdf)
+    GT["alpha_header_data_table.pdf"] = {"tables": 1}
+
+
+def gen_display_equation_block():
+    """The NEGATIVE twin of `gen_alpha_header_data_table`: a display equation, NOT a table.
+
+    Three aligned lines of a derivation, each `lhs = rhs (n)`. Column-aligned the way a
+    LaTeX `align*` environment leaves them, so the run-builder sees a clean 3-row / 3-column
+    run and only the CONTENT can tell it apart from the fixture above. Its numbers are bare
+    single digits and equation numbers — it has no measured values at all, which is precisely
+    what [`EQ_DATAVAL_DENOM`] keys on, so the equation guard must still refuse it.
+
+    Together the two fixtures bracket the constant: this side must stay refused while a grid
+    that is a third or more data values must be admitted. Assert NO table."""
+    pdf = os.path.join(OUT, "display_equation_block.pdf")
+    X = (90.0, 150.0, 480.0)
+    ROWS = [["f(x)", "= a x + b", "(1)"],
+            ["g(x)", "= a x - b", "(2)"],
+            ["h(x)", "= f(x) + g(x)", "(3)"]]
+    body = [b"BT /F2 11 Tf 60 740 Td (A Derivation) Tj ET"]
+    for ri, row in enumerate(ROWS):
+        for ci, cell in enumerate(row):
+            body.append(b"BT /F1 10 Tf %.1f %.1f Td (%s) Tj ET" % (X[ci], 700.0 - ri * 14.0, cell.encode()))
+    stream = b"\n".join(body)
+    _assemble_pdf(_one_page(stream), pdf)
+    GT["display_equation_block.pdf"] = {"tables": 0}
+
+
+def gen_split_survivor_table():
+    """Two stacked bands where the UPPER one is not a table and the lower one is.
+
+    `pitch_breaks` cuts this run in two (the gap is 45pt against a 15pt pitch, 3.0x). The
+    upper part is a wrapped two-column prose block that `flush` refuses; the lower part is a
+    clean 3-column data table that it admits. The split therefore yields ONE table, and the
+    "a split must produce at least two tables" fallback then threw that one away and re-flushed
+    the whole run — which `flush` also refuses, because the prose rows are still in it. Net
+    result: a table that had passed every guard was traded for nothing.
+
+    Measured on the 100-document corpus that happened 8 times (docs 018, 033, 045, 058, 059,
+    069 twice, 070). Assert the survivor is emitted: ONE 3-column table."""
+    pdf = os.path.join(OUT, "split_survivor_table.pdf")
+    PROSE_X = (60.0, 210.0)
+    PROSE = [["Every measurement in this section was", "taken twice and then averaged over"],
+             ["the whole run, so the reported figure", "is a mean and never a single read."],
+             ["The apparatus was recalibrated once", "between the two halves of the study."]]
+    X = (60.0, 190.0, 300.0)
+    ROWS = [["Corpus", "Size", "Split"], ["News", "128", "0.80"], ["Web", "96", "0.75"],
+            ["Books", "77", "0.90"], ["Talks", "54", "0.85"], ["Legal", "63", "0.70"]]
+    body = [b"BT /F2 11 Tf 60 740 Td (Survivor) Tj ET"]
+    for ri, row in enumerate(PROSE):
+        for ci, cell in enumerate(row):
+            body.append(b"BT /F1 10 Tf %.1f %.1f Td (%s) Tj ET" % (PROSE_X[ci], 700.0 - ri * 15.0, cell.encode()))
+    # 45pt below the last prose line — 3.0x the 15pt pitch, past the swept 2.5x break.
+    for ri, row in enumerate(ROWS):
+        for ci, cell in enumerate(row):
+            body.append(b"BT /F1 10 Tf %.1f %.1f Td (%s) Tj ET" % (X[ci], 610.0 - ri * 15.0, cell.encode()))
+    stream = b"\n".join(body)
+    _assemble_pdf(_one_page(stream), pdf)
+    GT["split_survivor_table.pdf"] = {"tables": 1}
+
+
 def _one_page(stream):
     """The five objects a one-page, two-font, letter-size PDF needs around `stream`."""
     return {
@@ -4595,6 +4686,9 @@ def main():
     gen_two_column_tables_prose()
     gen_stacked_tables()
     gen_banded_one_table()
+    gen_alpha_header_data_table()
+    gen_display_equation_block()
+    gen_split_survivor_table()
     gen_panel_table()
     gen_tagged_table()
     gen_undecodable_codec()

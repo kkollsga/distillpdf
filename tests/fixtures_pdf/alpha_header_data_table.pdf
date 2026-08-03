@@ -1,0 +1,67 @@
+%PDF-1.5
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 1405 >>
+stream
+BT /F2 11 Tf 60 740 Td (Interval Table) Tj ET
+BT /F1 10 Tf 60.0 700.0 Td (a=0.90) Tj ET
+BT /F1 10 Tf 150.0 700.0 Td (Confidence interval) Tj ET
+BT /F1 10 Tf 300.0 700.0 Td (Exact confidence) Tj ET
+BT /F1 10 Tf 60.0 686.0 Td (GANN) Tj ET
+BT /F1 10 Tf 150.0 686.0 Td ([1800, 27450]) Tj ET
+BT /F1 10 Tf 300.0 686.0 Td (0.9008) Tj ET
+BT /F1 10 Tf 60.0 672.0 Td (ETSA) Tj ET
+BT /F1 10 Tf 150.0 672.0 Td ([-124800, -13300]) Tj ET
+BT /F1 10 Tf 300.0 672.0 Td (0.9008) Tj ET
+BT /F1 10 Tf 60.0 658.0 Td (GSACO) Tj ET
+BT /F1 10 Tf 150.0 658.0 Td ([-2750, 41000]) Tj ET
+BT /F1 10 Tf 300.0 658.0 Td (0.9008) Tj ET
+BT /F1 10 Tf 60.0 644.0 Td (HGSA) Tj ET
+BT /F1 10 Tf 150.0 644.0 Td ([2800, 26950]) Tj ET
+BT /F1 10 Tf 300.0 644.0 Td (0.9008) Tj ET
+BT /F1 10 Tf 60.0 630.0 Td (MGWOA) Tj ET
+BT /F1 10 Tf 150.0 630.0 Td ([-128500, -9000]) Tj ET
+BT /F1 10 Tf 300.0 630.0 Td (0.9008) Tj ET
+BT /F1 10 Tf 60.0 616.0 Td (MAAA) Tj ET
+BT /F1 10 Tf 150.0 616.0 Td ([3450, 76650]) Tj ET
+BT /F1 10 Tf 300.0 616.0 Td (0.9008) Tj ET
+BT /F1 10 Tf 60.0 602.0 Td (MILPN) Tj ET
+BT /F1 10 Tf 150.0 602.0 Td ([4200, 51650]) Tj ET
+BT /F1 10 Tf 300.0 602.0 Td (0.9008) Tj ET
+BT /F1 10 Tf 60.0 588.0 Td (MILP) Tj ET
+BT /F1 10 Tf 150.0 588.0 Td ([6100, 83000]) Tj ET
+BT /F1 10 Tf 300.0 588.0 Td (0.9008) Tj ET
+BT /F1 10 Tf 60.0 574.0 Td (AEDGA) Tj ET
+BT /F1 10 Tf 150.0 574.0 Td ([5100, 76500]) Tj ET
+BT /F1 10 Tf 300.0 574.0 Td (0.9008) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000257 00000 n 
+0000001714 00000 n 
+0000001811 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+1913
+%%EOF

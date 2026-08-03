@@ -623,6 +623,51 @@ fn band_of(bands: &[(f32, f32)], x: f32) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// How much of a grid must hold measured VALUES before the equation guard stops
+/// applying: the guard is skipped once `dataval * EQ_DATAVAL_DENOM >= nz`, i.e. once
+/// at least `1/EQ_DATAVAL_DENOM` of the occupied cells carry a decimal or a 3+-digit
+/// number. A display equation carries none of those at all.
+///
+/// SWEPT end-to-end on the 100-doc / 451-table `pdf-parse-bench` "2026-q1-tables-only"
+/// corpus (GriTS-Doc_Con micro, md surface; one clean-worktree wheel per point,
+/// changing nothing else):
+///
+/// ```text
+///   denom     micro md   precision   recall   strict   emitted   phantoms
+///   (off)      0.6798      0.4269    0.4013     181       424        39   <- guard as it was
+///     2        0.7050      0.4298    0.4346     196       456        50
+///     3        0.7061      0.4323    0.4390     198       458        51
+///     4        0.7061      0.4323    0.4390     198       458        51
+///   any >0     0.7069      0.4336    0.4412     199       459        52
+/// ```
+///
+/// The curve SATURATES at 3 — no grid in this corpus has a data-value share between
+/// 1/4 and 1/3 — so 3 sits on the plateau edge, which is where a threshold wants to be.
+/// The last row is the limit case "a single data value anywhere stands the guard down".
+/// It is 0.0008 micro better and is not taken: letting one cell decide is precisely the
+/// failure being fixed here, and it leaves no margin for a stray decimal inside a real
+/// derivation. Everything from 2 to that limit lies inside 0.002 micro, so this is a
+/// plateau, not a peak, and the safer end of it is free.
+const EQ_DATAVAL_DENOM: usize = 3;
+
+/// How operator-dense a grid must be for the equation guard's STRONG trigger to fire
+/// on its own, ignoring the data-value evidence above: `op * EQ_OP_DENSE >= nz`, so 2
+/// means "half the occupied cells carry an operator or a Greek letter".
+///
+/// SWEPT with the local 25-document corpus gate (`fidelity_math_as_table`, target 0) as
+/// the veto and GriTS-Doc_Con micro as the objective:
+///
+/// ```text
+///   value   micro md   precision   recall   strict   emitted   phantoms   math_as_table
+///     1      0.7137      0.4328    0.4568     206       476        56        3  VETOED
+///     2      0.7061      0.4323    0.4390     198       458        51        0
+/// ```
+///
+/// 1 buys 0.0076 micro and 13 matched tables, and pays for them with THREE real display
+/// equations re-emitted as tables in the local corpus — the exact false positive this
+/// guard exists to stop. A corpus-gate breach is not a trade, so 2 stands.
+const EQ_OP_DENSE: usize = 2;
+
 /// Structural ADMISSION test: is this region a genuine data table, or prose / an
 /// equation / a symbolic matrix that merely happens to have aligned tokens?
 ///
@@ -632,6 +677,13 @@ fn band_of(bands: &[(f32, f32)], x: f32) -> Option<usize> {
 /// the region's content, column-keeping reads its geometry, and the two no longer
 /// interfere. Returns true to accept the region as a table.
 fn is_coherent_grid(grid: &[Vec<String>]) -> bool {
+    incoherent_reason(grid).is_none()
+}
+
+/// Why [`is_coherent_grid`] refused, or `None` if it did not. Split out from the
+/// predicate so a refusal is auditable under `DPDF_FLUSH` — a guard nobody can see
+/// firing is a guard nobody can sweep.
+fn incoherent_reason(grid: &[Vec<String>]) -> Option<&'static str> {
     // Prose guard: real tabular cells are terse. A 2-column block averaging >4
     // words/cell is running prose (wrapped body lines), not a table.
     let (mut wc, mut nz, mut prose) = (0usize, 0usize, 0usize);
@@ -650,7 +702,7 @@ fn is_coherent_grid(grid: &[Vec<String>]) -> bool {
     let mean_words = if nz > 0 { wc as f32 / nz as f32 } else { 0.0 };
     let ncols = grid.first().map(|r| r.len()).unwrap_or(0);
     if ncols <= 2 && mean_words > 4.0 {
-        return false;
+        return Some("prose-2col");
     }
     // 2-col body gridded into 3 cols (gutter-crossing title): tell is a phantom
     // anchor column empty in nearly every row plus long cells. Real 3-col tables
@@ -662,11 +714,11 @@ fn is_coherent_grid(grid: &[Vec<String>]) -> bool {
             empty * 5 >= grid.len() * 4
         });
     if ncols == 3 && mean_words > 4.5 && has_empty_col {
-        return false;
+        return Some("gutter-title-3col");
     }
     // Wider mis-grids: reject only when nearly every cell is a full sentence.
     if nz >= 6 && prose * 3 >= nz * 2 && mean_words > 6.0 {
-        return false;
+        return Some("prose-wide");
     }
     // Display EQUATION mis-detected as a table: cells are dominated by math
     // operators / Greek (not numeric data) and the region carries an '=' or an
@@ -688,10 +740,76 @@ fn is_coherent_grid(grid: &[Vec<String>]) -> bool {
     // Real (alphabetic, ≥2-letter) words — an equation has almost none; its
     // "words" are space-separated symbols. A data table has real words.
     let alpha_words = grid.iter().flatten().flat_map(|c| c.split(|ch: char| !ch.is_alphabetic())).filter(|w| w.chars().count() >= 3).count();
-    // Reject an equation region: it carries a relation or eq-number, OR it is
-    // operator-dense (a relation/arrow chain), and it has almost no real words.
-    if nz > 0 && alpha_words <= nz && ((op >= 1 && (has_rel || eqnum)) || op * 2 >= nz) {
-        return false;
+    // A cell holding a real DATA VALUE — a decimal, or a number of three digits or
+    // more. This is the crate's existing tell for "this is measured data, not
+    // notation": the symbolic-matrix guard below already turns on `dataval == 0`
+    // for exactly that reason ("a real data table has decimals or multi-digit
+    // numbers; a matrix has only single-digit sub/superscripts").
+    //
+    // PARENTHESISED runs are cut out first, because the commonest thing that looks
+    // like a decimal and is not a measurement is an equation NUMBER: `(3.1) y` reads
+    // as data value + variable, and four of those lines are a derivation, not a
+    // table (`tests/gen_tables.py` L4 / `t0_neg_equation.pdf` lock exactly that).
+    // A measurement's own parenthetical — `98.48(7)`, `37.8 (n=37)` — still counts,
+    // because the value sits OUTSIDE the brackets, which is the whole distinction.
+    let dataval = grid
+        .iter()
+        .flatten()
+        .filter(|c| {
+            let mut depth = 0i32;
+            let bare: String = c
+                .chars()
+                .filter(|&ch| {
+                    if ch == '(' {
+                        depth += 1;
+                        false
+                    } else if ch == ')' {
+                        depth = (depth - 1).max(0);
+                        false
+                    } else {
+                        depth == 0
+                    }
+                })
+                .collect();
+            let b = bare.as_bytes();
+            // A decimal, or ONE number of three or more digits. The digits have to be
+            // CONTIGUOUS: counting them across the whole cell made `1 1 2 1 1 2` — a
+            // display equation's subscripts, flattened by extraction — read as a
+            // measurement, which is how five real math blocks in the corpus turned into
+            // tables. `27450` is a value; three separate single digits are notation.
+            (0..b.len()).any(|i| b[i].is_ascii_digit() && i + 2 < b.len() && b[i + 1] == b'.' && b[i + 2].is_ascii_digit())
+                || bare
+                    .as_bytes()
+                    .split(|c| !c.is_ascii_digit())
+                    .any(|run| run.len() >= 3)
+        })
+        .count();
+    // Reject an equation region. Two triggers, and they are NOT equally strong:
+    //
+    //   DENSE — half the occupied cells carry an operator or a Greek letter. That is
+    //           what a relation/arrow chain looks like, and it stands on its own.
+    //   WEAK  — there is at least ONE operator cell and somewhere a relation or an
+    //           equation number. This one fires on a single cell.
+    //
+    // The weak trigger, unqualified, was deciding the fate of whole tables: a header
+    // reading `α=0.90` satisfies it, and the gate meant to spare data tables
+    // (`alpha_words <= nz`) compares a WORD count to a CELL count, so it is true of
+    // nearly every grid and protects almost nothing. Measured on the 100-document
+    // `pdf-parse-bench` tables corpus this guard fired 119 times and 87 of those grids
+    // had a majority of cells holding a decimal or a multi-digit number — a display
+    // equation has none of those, which is the same evidence the symbolic-matrix guard
+    // below already trusts (`dataval == 0`).
+    //
+    // So the value evidence qualifies the WEAK trigger only. Letting it override DENSE
+    // as well re-admitted three real math blocks in the local corpus (`math_AG_2606_02429`
+    // twice, `econ_EM_2606_02234`) whose coefficients are large integers — a polynomial
+    // has values too, and there the operator density is the honest signal.
+    if nz > 0 && alpha_words <= nz {
+        let dense = op * EQ_OP_DENSE >= nz;
+        let weak = op >= 1 && (has_rel || eqnum);
+        if dense || (weak && dataval * EQ_DATAVAL_DENOM < nz) {
+            return Some("equation");
+        }
     }
     // Symbolic MATRIX/array mis-detected as a table (e.g. a block matrix of
     // subscripted variables W₀, D₁Y₁, ∇W₁). Unlike the equation case above it
@@ -701,18 +819,9 @@ fn is_coherent_grid(grid: &[Vec<String>]) -> bool {
     // real words, and a majority of cells are variable-like (start with a letter).
     // A numeric data table fails this (its cells start with digits and it has data
     // values), so it is unaffected.
-    let dataval = grid
-        .iter()
-        .flatten()
-        .filter(|c| {
-            let b = c.as_bytes();
-            (0..b.len()).any(|i| b[i].is_ascii_digit() && i + 2 < b.len() && b[i + 1] == b'.' && b[i + 2].is_ascii_digit())
-                || c.chars().filter(|ch| ch.is_ascii_digit()).count() >= 3
-        })
-        .count();
     let letter_start = grid.iter().flatten().filter(|c| c.trim_start().chars().next().is_some_and(|ch| ch.is_alphabetic())).count();
     if nz >= 4 && dataval == 0 && alpha_words == 0 && letter_start * 2 >= nz {
-        return false;
+        return Some("matrix");
     }
     // Scattered symbolic DIAGRAM mis-detected as a table (e.g. a commutative
     // diagram: nodes X, Y, D, E with arrow labels ⟨(234)⟩ flung across the page).
@@ -739,9 +848,9 @@ fn is_coherent_grid(grid: &[Vec<String>]) -> bool {
         (0..b.len()).any(|i| b[i].is_ascii_digit() && i + 2 < b.len() && b[i + 1] == b'.' && b[i + 2].is_ascii_digit())
     });
     if nz >= 6 && diagram_glyph && alpha_words * 3 <= nz && !has_decimal {
-        return false;
+        return Some("diagram");
     }
-    true
+    None
 }
 
 /// Detect tables: runs of >=3 consecutive rows that each have >=2 gutter-separated
@@ -1901,8 +2010,32 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
 
     let mut tables = Vec::new();
 
+    let trace = std::env::var_os("DPDF_FLUSH").is_some();
+    if trace {
+        eprintln!("REGION avg_size={avg_size:.1} tol={tol:.1} rows={}", celled.len());
+        for (y, cs, _) in &celled {
+            eprintln!(
+                "  row y={y:7.1} n={} :: {}",
+                cs.len(),
+                cs.iter().map(|c| format!("[{:.0}-{:.0}]{}", c.x, c.end, c.text)).collect::<Vec<_>>().join(" | ")
+            );
+        }
+    }
+
     let flush = |run: &Vec<&(f32, Vec<Cell>, Vec<Span>)>, headers: &[&(f32, Vec<Cell>, Vec<Span>)], tables: &mut Vec<PosTable>| {
+        if trace {
+            eprintln!(
+                "FLUSH run={} hdr={} y={:.1}..{:.1}",
+                run.len(),
+                headers.len(),
+                run.last().map_or(0.0, |r| r.0),
+                run.first().map_or(0.0, |r| r.0)
+            );
+        }
         if run.len() < 2 {
+            if trace {
+                eprintln!("  REJECT run.len()<2");
+            }
             return;
         }
         let owned: Vec<Vec<Cell>> = run
@@ -1933,10 +2066,16 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
             // real header-plus-one-row table is wide — the World Bank disbursement tables this
             // rule exists for are seven and eight columns.
             if owned.iter().any(|r| r.len() < 3) {
+                if trace {
+                    eprintln!("  REJECT 2-row run with a <3-col row");
+                }
                 return;
             }
             let (y_lo, y_hi) = (run.last().map_or(0.0, |r| r.0), run.first().map_or(0.0, |r| r.0));
             if !rule_banded(bands, x_left, x_right, y_lo, y_hi, avg_size * 3.0) {
+                if trace {
+                    eprintln!("  REJECT 2-row run not rule_banded");
+                }
                 return;
             }
         }
@@ -1987,10 +2126,14 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
                     return None;
                 }
             }
-            if is_coherent_grid(&grid) {
-                Some((grid, kept.iter().map(|b| b.0).collect()))
-            } else {
-                None
+            match incoherent_reason(&grid) {
+                None => Some((grid, kept.iter().map(|b| b.0).collect())),
+                Some(why) => {
+                    if trace {
+                        eprintln!("    INCOHERENT[{why}] {}x{} :: {:?}", grid.len(), kept.len(), &grid[..grid.len().min(3)]);
+                    }
+                    None
+                }
             }
         };
         // WHITESPACE-LANE band columns: keys on where text SITS, so right-aligned numerics
@@ -2088,16 +2231,33 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
         // The 0.008 micro that "left-x first" buys over this is bought by giving up a committed
         // structural guarantee, so it is not taken.
         let (grid, kept_x) = match {
-            let by_alignment = try_model(leftx_kept(), 0.5);
+            let (lx, nb) = (leftx_kept(), band_kept.len());
+            let nl = lx.len();
+            let by_alignment = try_model(lx, 0.5);
             let by_lanes = try_model(band_kept, 0.0);
+            if trace {
+                eprintln!(
+                    "  leftx_kept={nl} -> {:?}   band_kept={nb} -> {:?}",
+                    by_alignment.as_ref().map(|a| a.1.len()),
+                    by_lanes.as_ref().map(|a| a.1.len())
+                );
+            }
             match (by_alignment, by_lanes) {
                 (Some(a), Some(b)) => Some(if a.1.len() > b.1.len() { a } else { b }),
                 (x, y) => x.or(y),
             }
         } {
             Some(gx) => gx,
-            None => return,
+            None => {
+                if trace {
+                    eprintln!("  REJECT both models None");
+                }
+                return;
+            }
         };
+        if trace {
+            eprintln!("  ADMIT {}x{}", grid.len(), kept_x.len());
+        }
 
         // Now that the data table is ACCEPTED (past every prose/equation guard), attach
         // the grouped/multi-level HEADER rows the run-builder skipped — they don't form
@@ -2244,9 +2404,20 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
         // only the survivor DROPS rows. 62 of the 63 fused emissions still matched a truth
         // table, so the run is mostly right and the split must never make it worse: fall back
         // to the whole run, which is exactly what was emitted before this test existed.
+        //
+        // …but only if the whole run is a table AT ALL. When the un-split run is refused too,
+        // the fallback traded the one part that passed every guard for NOTHING — measured on
+        // the 100-doc corpus, that happened 8 times (docs 018, 033, 045, 058, 059, 069 twice,
+        // 070), and six of those documents carry an unmatched truth table on exactly that
+        // region. A survivor is a worse answer than both parts; it is a strictly better answer
+        // than silence. So the truncate is now conditional on the re-flush actually replacing
+        // what it discards.
         if tables.len() - before < 2 {
-            tables.truncate(before);
+            let survivors: Vec<PosTable> = tables.split_off(before);
             flush(&run_slice, &headers, &mut tables);
+            if tables.len() == before {
+                tables.extend(survivors);
+            }
         }
     }
     tables
@@ -2605,6 +2776,71 @@ mod tests {
         assert!(
             tables[0].grid.iter().any(|r| r[0].trim() == "Northern Basin"),
             "the band row is still inside it: {:?}",
+            tables[0].grid
+        );
+    }
+
+    #[test]
+    fn one_greek_equals_sign_in_a_header_does_not_delete_a_data_table() {
+        // `tests/gen_fixtures.py::gen_alpha_header_data_table`, from `pdf-parse-bench` doc 069
+        // page 1. The equation guard fired on `op >= 1 && has_rel` — satisfied by the SINGLE
+        // header cell `a=0.90` — and the gate meant to spare data tables (`alpha_words <= nz`)
+        // compares a word count to a cell count, so it is true of nearly every grid. A clean
+        // 10x3 table of confidence intervals was refused outright. [`EQ_DATAVAL_DENOM`] is what
+        // stands the guard down here: most of these cells hold measured values.
+        let tables = detect_fixture("alpha_header_data_table.pdf");
+        assert_eq!(
+            tables.len(),
+            1,
+            "one table, got {}: {:?}",
+            tables.len(),
+            tables.iter().map(|t| (t.grid.len(), t.grid[0].len())).collect::<Vec<_>>()
+        );
+        assert_eq!(tables[0].grid[0].len(), 3, "three columns: {:?}", tables[0].grid[0]);
+        assert_eq!(tables[0].grid.len(), 10, "all ten rows: {:?}", tables[0].grid);
+        assert!(
+            tables[0].grid.iter().any(|r| r[0].trim() == "AEDGA"),
+            "the last row survived: {:?}",
+            tables[0].grid
+        );
+    }
+
+    #[test]
+    fn a_display_equation_is_still_not_a_table() {
+        // `tests/gen_fixtures.py::gen_display_equation_block`, the NEGATIVE twin of the test
+        // above and the lower bracket on [`EQ_DATAVAL_DENOM`]. Three aligned `lhs = rhs (n)`
+        // lines are a clean 3x3 run geometrically; only the CONTENT separates them from a data
+        // table, and the separator is that a derivation carries no measured values at all.
+        // Relaxing the guard on anything weaker than that re-opens this.
+        let tables = detect_fixture("display_equation_block.pdf");
+        assert!(
+            tables.is_empty(),
+            "a derivation is not a table, got {}: {:?}",
+            tables.len(),
+            tables.iter().map(|t| t.grid.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_pitch_split_keeps_its_survivor_when_the_whole_run_is_refused() {
+        // `tests/gen_fixtures.py::gen_split_survivor_table`. `pitch_breaks` cuts this run into a
+        // prose block `flush` refuses and a data table it admits. "A split must yield at least
+        // two tables" then discarded the admitted one and re-flushed the whole run — which is
+        // refused too, because the prose is back in it. The table was traded for silence.
+        // Measured on the 100-document corpus: 8 occurrences (docs 018, 033, 045, 058, 059,
+        // 069 twice, 070). Falling back is only right when the fallback produces something.
+        let tables = detect_fixture("split_survivor_table.pdf");
+        assert_eq!(
+            tables.len(),
+            1,
+            "the survivor is emitted, got {}: {:?}",
+            tables.len(),
+            tables.iter().map(|t| (t.grid.len(), t.grid[0].len())).collect::<Vec<_>>()
+        );
+        assert_eq!(tables[0].grid[0].len(), 3, "three columns: {:?}", tables[0].grid[0]);
+        assert!(
+            tables[0].grid.iter().any(|r| r[0].trim() == "Corpus"),
+            "and it is the data band, not the prose: {:?}",
             tables[0].grid
         );
     }
