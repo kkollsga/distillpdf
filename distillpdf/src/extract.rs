@@ -602,27 +602,6 @@ fn column_bands(rows: &[Vec<(f32, f32)>], bridge: usize) -> Vec<(f32, f32)> {
     bands
 }
 
-/// Index of the band whose interval contains `x`, else the nearest band by distance
-/// to its interval. Used to assign a span to a column in PASS 2.
-fn band_of(bands: &[(f32, f32)], x: f32) -> Option<usize> {
-    if bands.is_empty() {
-        return None;
-    }
-    for (i, &(lo, hi)) in bands.iter().enumerate() {
-        if x >= lo && x <= hi {
-            return Some(i);
-        }
-    }
-    bands
-        .iter()
-        .enumerate()
-        .min_by(|(_, &(lo, hi)), (_, &(lo2, hi2))| {
-            let d = |l: f32, h: f32| if x < l { l - x } else { x - h };
-            d(lo, hi).partial_cmp(&d(lo2, hi2)).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(i, _)| i)
-}
-
 /// How much of a grid must hold measured VALUES before the equation guard stops
 /// applying: the guard is skipped once `dataval * EQ_DATAVAL_DENOM >= nz`, i.e. once
 /// at least `1/EQ_DATAVAL_DENOM` of the occupied cells carry a decimal or a 3+-digit
@@ -2012,33 +1991,39 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
             if kept.len() < 2 {
                 return None;
             }
-            let grid: Vec<Vec<String>> = run
+            let raw_rows: Vec<&[Span]> = run.iter().map(|(_, _, spans)| spans.as_slice()).collect();
+            let bound = crate::grid::bind_rows_by_center(&kept, &raw_rows, |s| {
+                let txt = s.text.trim();
+                let w = if s.width > 0.1 { s.width } else { txt.chars().count() as f32 * s.size * 0.5 };
+                s.x + w * 0.5
+            });
+            let grid: Vec<Vec<String>> = bound
                 .iter()
-                .map(|(_, _, spans)| {
-                    let mut cells = vec![String::new(); kept.len()];
-                    // Where each cell's text currently ENDS, so the space decision below can
-                    // see the gap. This is the grid a consumer actually reads, and it spaced
-                    // every appended span unconditionally: on a generator that emits one `Tj`
-                    // per glyph — every SEC filing in the corpus — `Texas` came out `T e x a s`.
-                    let mut ends = vec![f32::NEG_INFINITY; kept.len()];
-                    for s in spans {
-                        let txt = s.text.trim();
-                        if txt.is_empty() {
-                            continue;
-                        }
-                        let w = if s.width > 0.1 { s.width } else { txt.chars().count() as f32 * s.size * 0.5 };
-                        if let Some(k) = band_of(&kept, s.x + w * 0.5) {
-                            if !cells[k].is_empty()
-                                && !crate::textutil::glyph_adjacent(s.x - ends[k], s.size)
-                                && join_space(&cells[k], txt)
-                            {
-                                cells[k].push(' ');
+                .map(|row| {
+                    row.iter()
+                        .map(|spans| {
+                            let mut cell = String::new();
+                            let mut end = f32::NEG_INFINITY;
+                            // The grid a consumer reads preserves the text layer's spacing
+                            // after the geometric core has allocated pieces to cells.
+                            for &s in spans {
+                                let txt = s.text.trim();
+                                if txt.is_empty() {
+                                    continue;
+                                }
+                                let w = if s.width > 0.1 { s.width } else { txt.chars().count() as f32 * s.size * 0.5 };
+                                if !cell.is_empty()
+                                    && !crate::textutil::glyph_adjacent(s.x - end, s.size)
+                                    && join_space(&cell, txt)
+                                {
+                                    cell.push(' ');
+                                }
+                                cell.push_str(txt);
+                                end = s.x + w;
                             }
-                            cells[k].push_str(txt);
-                            ends[k] = s.x + w;
-                        }
-                    }
-                    cells
+                            cell
+                        })
+                        .collect()
                 })
                 .collect();
             if min_fill > 0.0 {
@@ -2072,7 +2057,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
                 for row in &cell_rows {
                     let mut hit = vec![false; bands.len()];
                     for &(lo, hi) in row {
-                        if let Some(bi) = band_of(&bands, (lo + hi) * 0.5) {
+                        if let Some(bi) = crate::grid::column_band_index(&bands, (lo + hi) * 0.5) {
                             hit[bi] = true;
                         }
                     }

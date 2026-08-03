@@ -53,6 +53,53 @@ fn band_index(bounds: &[f32], v: f32) -> usize {
     }
 }
 
+/// Index of the column band containing `x`, or the nearest band when `x` falls in a gap.
+///
+/// Inferred grids publish occupied x-ranges rather than boundary axes. Keeping their exact
+/// containment-and-nearest rule here gives every inferred producer one allocation contract.
+pub(crate) fn column_band_index(bands: &[(f32, f32)], x: f32) -> Option<usize> {
+    if bands.is_empty() {
+        return None;
+    }
+    for (i, &(lo, hi)) in bands.iter().enumerate() {
+        if x >= lo && x <= hi {
+            return Some(i);
+        }
+    }
+    bands
+        .iter()
+        .enumerate()
+        .min_by(|(_, &(lo, hi)), (_, &(lo2, hi2))| {
+            let d = |l: f32, h: f32| if x < l { l - x } else { x - h };
+            d(lo, hi)
+                .partial_cmp(&d(lo2, hi2))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+}
+
+/// Assign each row's items to inferred column bands by horizontal centre.
+///
+/// Item order inside a cell is stable. Text joining remains the text layer's responsibility;
+/// this geometric core returns only the allocation produced by the shared band contract.
+pub(crate) fn bind_rows_by_center<'a, T>(
+    bands: &[(f32, f32)],
+    rows: &[&'a [T]],
+    center: impl Fn(&T) -> f32,
+) -> Vec<Vec<Vec<&'a T>>> {
+    rows.iter()
+        .map(|row| {
+            let mut cells = vec![Vec::new(); bands.len()];
+            for item in *row {
+                if let Some(k) = column_band_index(bands, center(item)) {
+                    cells[k].push(item);
+                }
+            }
+            cells
+        })
+        .collect()
+}
+
 /// Bind upright spans to a producer's cells by containment.
 ///
 /// `split` cuts one span at all interior x boundaries.  It is supplied by the text layer so
@@ -259,6 +306,15 @@ mod tests {
         let ys = [0.0, 10.0, 20.0];
         assert_eq!(2 - 1 - band_index(&ys, 15.0), 0);
         assert_eq!(2 - 1 - band_index(&ys, 5.0), 1);
+    }
+
+    #[test]
+    fn inferred_rows_bind_by_center_and_use_the_nearest_gap_band() {
+        let bands = [(0.0, 4.0), (6.0, 10.0)];
+        let row = [1.0f32, 5.5, 8.0];
+        let bound = bind_rows_by_center(&bands, &[&row], |x| *x);
+        assert_eq!(bound[0][0], vec![&1.0]);
+        assert_eq!(bound[0][1], vec![&5.5, &8.0]);
     }
 
     #[test]
