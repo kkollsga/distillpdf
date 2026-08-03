@@ -3739,6 +3739,69 @@ def _span_rows(body, rows, x2, x1, y0, pitch, gaps=()):
     return body
 
 
+def gen_multitier_header_table():
+    """A genuine two-tier detached header over a uniform two-column parameter table.
+
+    Both full-width tiers are intentionally one-cell rows, so they are detached from the
+    aligned body but remain semantic headers. This is the negative twin of G7's over-claim:
+    bounding header ownership at a previous run must not flatten real local tiers.
+    """
+    pdf = os.path.join(OUT, "multitier_header_table.pdf")
+    rows = [
+        ("Operating envelope",),
+        ("Measured parameters",),
+        ("Parameter", "Value"),
+        ("Altitude", "1200"),
+        ("Velocity", "84"),
+        ("Pressure", "101.3"),
+        ("Temperature", "22.4"),
+    ]
+    body = _span_rows(
+        [b"BT /F2 11 Tf 60 760 Td (Flight Test Summary) Tj ET"],
+        rows,
+        (60.0, 220.0),
+        (95.0,),
+        700.0,
+        15.0,
+    )
+    _assemble_pdf(_one_page(b"\n".join(body)), pdf)
+    GT["multitier_header_table.pdf"] = {"tables": 1, "header_rows": 2}
+
+
+def gen_header_backwalk_table():
+    """Three admitted runs separated by local one-cell labels.
+
+    This isolates G7 from G3's intentionally ignored merge defect. Each aligned segment is
+    independently long enough to be admitted today; the upward walk for segments two/three
+    therefore attaches already-owned prior runs as visible prefix rows. Those rows must stay
+    present until G3 is solved, but only the original first row is a semantic header.
+    """
+    pdf = os.path.join(OUT, "header_backwalk_table.pdf")
+    rows = [
+        ("Parameter", "Value"),
+        ("Altitude", "1200"),
+        ("Velocity", "84"),
+        ("Upper sequence",),
+        ("Pressure", "101.3"),
+        ("Temperature", "22.4"),
+        ("Density", "1.18"),
+        ("Lower sequence",),
+        ("Lift", "42.5"),
+        ("Drag", "18.7"),
+        ("Range", "630"),
+    ]
+    body = _span_rows(
+        [b"BT /F2 11 Tf 60 760 Td (Parameter Summary) Tj ET"],
+        rows,
+        (60.0, 220.0),
+        (95.0,),
+        700.0,
+        15.0,
+    )
+    _assemble_pdf(_one_page(b"\n".join(body)), pdf)
+    GT["header_backwalk_table.pdf"] = {"logical_tables": 1, "header_rows": 1}
+
+
 def gen_section_heading_table():
     """ONE table whose body is grouped under one-cell SECTION HEADINGS set on its own leading.
 
@@ -4763,6 +4826,8 @@ def main():
     gen_alpha_header_data_table()
     gen_display_equation_block()
     gen_split_survivor_table()
+    gen_multitier_header_table()
+    gen_header_backwalk_table()
     gen_section_heading_table()
     gen_heading_ends_table()
     gen_panel_table()

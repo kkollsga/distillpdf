@@ -1242,9 +1242,7 @@ pub(crate) fn declared_pos_tables(declared: &[crate::structtree::DeclaredTable],
             x_right: region.x1,
             grid: grid[nhdr..].to_vec(),
             header,
-            // Preserve the legacy renderer's row-0 fallback until the semantic ownership
-            // phase supplies the exact declared depth in its own bisectable change.
-            header_rows: if nhdr == 0 { 1 } else { nhdr },
+            header_rows: nhdr,
         });
     }
     out
@@ -2261,13 +2259,28 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
             header.push(hrow);
             y_top = y_top.max(hr.0);
         }
+        // The upward attachment walk deliberately preserves visible content even when it
+        // crosses a prior aligned run: G3 proved that clamping the walk fragments the only
+        // complete/scoring emission on these pages. But rows from that already-owned run are
+        // not semantic headers of the later run. Keep every attached row, bbox and cell in
+        // place; only bound `<th>` ownership at the run boundary. A detached-only prefix keeps
+        // its existing depth (genuine grouped/multi-tier headers), while an attachment that
+        // reclaimed any >=2-cell run has exactly the original leading header row.
+        let reclaimed_prior_run = headers.iter().any(|(_, cells, _)| cells.len() >= 2);
+        let header_rows = if reclaimed_prior_run {
+            1
+        } else if header.is_empty() {
+            1
+        } else {
+            header.len()
+        };
         tables.push(PosTable {
             y_top,
             y_bottom: run.last().map(|(y, _, _)| *y).unwrap_or(0.0),
             x_left,
             x_right,
             grid,
-            header_rows: if header.is_empty() { 1 } else { header.len() },
+            header_rows,
             header,
         });
     };
@@ -2801,6 +2814,23 @@ mod tests {
     ///
     /// The fixtures stay so the evidence does; the day the paragraph regression is closed,
     /// promotion is deleting two `#[ignore]` lines. See `dev-docs/plans/consider-for-future.md`.
+    #[test]
+    fn a_section_break_cannot_claim_prior_table_rows_as_headers() {
+        // G7 is narrower than the ignored G3 content fix below: keep every currently attached
+        // row and every emission, but never render an already-owned aligned run as a stack of
+        // semantic headers. This stays green if G3 is eventually fixed at source too.
+        let tables = detect_fixture("header_backwalk_table.pdf");
+        assert!(!tables.is_empty());
+        assert!(
+            tables.iter().all(|t| t.header_rows <= 1),
+            "prior runs are data, not headers: {:?}",
+            tables
+                .iter()
+                .map(|t| (t.header_rows, t.header.len(), t.grid.len()))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     #[ignore = "G3 red ledger: fixed by spanning_row.patch, which breaches full-grid|paragraphs"]
     fn a_section_heading_inside_a_table_does_not_publish_it_three_times() {
@@ -3383,11 +3413,31 @@ mod tests {
         assert_eq!(out.refused, vec![Refusal::TooFewRows, Refusal::TooFewCols]);
         assert_eq!(out.tables.len(), 1);
         let t = &out.tables[0];
+        assert_eq!(t.header_rows, 1, "the declaration carries exactly one TH row");
         assert_eq!(t.header, vec![vec![("Region".into(), 1), (String::new(), 1), ("Total".into(), 1)]]);
         assert_eq!(t.grid, vec![
             vec!["North".to_string(), "Alpha".into(), "11".into()],
             vec![String::new(), "Beta".into(), "22".into()],
         ], "the /RowSpan 2 cell holds column 0 of the row below it");
+    }
+
+    #[test]
+    fn a_declared_table_with_no_th_cells_has_no_semantic_header() {
+        // Same generated L0 fixture and geometry, with the accepted declaration's cells read
+        // as TD. This isolates the state the old `header.is_empty() => row 0 is TH` fallback
+        // could not represent; exact declarations must not acquire an inferred header.
+        let (doc, spans, page) = tagged();
+        let mut declared = crate::structtree::declared_tables(&doc);
+        for row in &mut declared.get_mut(&page).expect("page is declared")[0].rows {
+            for cell in row {
+                cell.header = false;
+            }
+        }
+        let annots = crate::walker::annot_rects(&doc, page);
+        let out = declared_pos_tables(&declared[&page], &spans, &annots);
+        assert_eq!(out.tables.len(), 1);
+        assert!(out.tables[0].header.is_empty());
+        assert_eq!(out.tables[0].header_rows, 0);
     }
 
     #[test]

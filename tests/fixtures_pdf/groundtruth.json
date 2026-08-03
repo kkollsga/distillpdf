@@ -498,6 +498,10 @@
       ]
     ]
   },
+  "header_backwalk_table.pdf": {
+    "header_rows": 1,
+    "logical_tables": 1
+  },
   "heading_ends_table.pdf": {
     "tables": 2
   },
@@ -693,6 +697,10 @@
     "cmmi": "\u03b1\u03bc\u03bb\u2202",
     "cmsy": "\u2264\u2265\u2192\u2208",
     "diff_names": "\u2211\u222b\u03b1\u2264"
+  },
+  "multitier_header_table.pdf": {
+    "header_rows": 2,
+    "tables": 1
   },
   "no_resources_paths.pdf": {
     "paths_per_page": 9,
