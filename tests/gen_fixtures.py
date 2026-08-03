@@ -3568,6 +3568,74 @@ def gen_two_column_tables_prose():
     GT["two_column_tables_prose.pdf"] = {"tables": 2}
 
 
+def gen_stacked_tables():
+    """Two 3-column tables STACKED in one text column, with nothing between them.
+
+    The run-builder takes every consecutive stretch of >=2-cell rows as one table and had no
+    test for where a table ends, so a page like this came back as one 12x3 grid mixing two
+    unrelated tables. Measured on the 100-document `pdf-parse-bench` tables corpus this was
+    the largest remaining content defect: 63 of 69 contaminated emissions, 587 misplaced cells.
+
+    The shape is the MAJORITY case, not the tidy one: in 48 of those 63 there is no row of any
+    kind between the two bands — no caption, no rule, nothing a text test could fire on. All
+    that separates them is space, so space is what the fix reads (`pitch_breaks`). The gap here
+    is 48pt against a 15pt row pitch, 3.2x; a caption line between them would only widen it.
+    Its negative twin (`gen_banded_one_table`) sits at 1.47x, so the two bracket the swept
+    2.5x break from both sides.
+
+    Assert two 3-column tables, not one."""
+    pdf = os.path.join(OUT, "stacked_tables.pdf")
+    X = (60.0, 190.0, 300.0)
+    TOP = [["Model", "BLEU", "Rate"], ["Alpha", "18.2", "0.71"], ["Beta", "31.0", "0.64"],
+           ["Gamma", "42.5", "0.58"], ["Delta", "27.4", "0.66"], ["Epsilon", "35.1", "0.60"]]
+    BOT = [["Corpus", "Size", "Split"], ["News", "128", "0.80"], ["Web", "96", "0.75"],
+           ["Books", "77", "0.90"], ["Talks", "54", "0.85"], ["Legal", "63", "0.70"]]
+    body = [b"BT /F2 11 Tf 60 740 Td (Stacked Tables) Tj ET"]
+    for ri, row in enumerate(TOP):
+        for ci, cell in enumerate(row):
+            body.append(b"BT /F1 10 Tf %.1f %.1f Td (%s) Tj ET" % (X[ci], 700.0 - ri * 15.0, cell.encode()))
+    # 48pt below the last row of the table above — 3.2x the 15pt pitch the run itself sets.
+    for ri, row in enumerate(BOT):
+        for ci, cell in enumerate(row):
+            body.append(b"BT /F1 10 Tf %.1f %.1f Td (%s) Tj ET" % (X[ci], 577.0 - ri * 15.0, cell.encode()))
+    stream = b"\n".join(body)
+    _assemble_pdf(_one_page(stream), pdf)
+    GT["stacked_tables.pdf"] = {"tables": 2}
+
+
+def gen_banded_one_table():
+    """The NEGATIVE twin of `gen_stacked_tables`: ONE table whose interior is not evenly set.
+
+    A table is not a metronome. Its header is given air, and bench100's USGS 6-way-split class
+    puts full-width BAND rows inside a single table that must not end it (the stranded-header
+    machinery landed for that class depends on it). Both leave a gap wider than the body pitch,
+    which is exactly the shape `pitch_breaks` keys on — so this fixture is what makes the break
+    a swept *threshold* rather than "there is extra space here".
+
+    Both wide gaps here are 22pt against a 15pt body pitch — 1.47x, inside the 2.0x break, and
+    the swept value has to keep clearing them. The band row carries a cell in two columns so it
+    stays inside the >=2-cell run; a one-cell band row would end the run on its own and would
+    lock nothing. Assert ONE table."""
+    pdf = os.path.join(OUT, "banded_one_table.pdf")
+    X = (60.0, 190.0, 300.0)
+    ROWS = [["Site", "Depth", "Grade"], None,          # header, then air under it
+            ["Alpha", "18.2", "0.71"], ["Beta", "31.0", "0.64"],
+            ["Northern Basin", "sub", "total"], None,  # a full-width band row, then air
+            ["Gamma", "42.5", "0.58"], ["Delta", "27.4", "0.66"], ["Epsilon", "35.1", "0.60"]]
+    body = [b"BT /F2 11 Tf 60 740 Td (One Table) Tj ET"]
+    y = 700.0
+    for row in ROWS:
+        if row is None:
+            y -= 7.0  # 15 + 7 = 22pt across the wide gaps
+            continue
+        for ci, cell in enumerate(row):
+            body.append(b"BT /F1 10 Tf %.1f %.1f Td (%s) Tj ET" % (X[ci], y, cell.encode()))
+        y -= 15.0
+    stream = b"\n".join(body)
+    _assemble_pdf(_one_page(stream), pdf)
+    GT["banded_one_table.pdf"] = {"tables": 1}
+
+
 def _one_page(stream):
     """The five objects a one-page, two-font, letter-size PDF needs around `stream`."""
     return {
@@ -4525,6 +4593,8 @@ def main():
     gen_three_column_prose()
     gen_two_column_tables()
     gen_two_column_tables_prose()
+    gen_stacked_tables()
+    gen_banded_one_table()
     gen_panel_table()
     gen_tagged_table()
     gen_undecodable_codec()

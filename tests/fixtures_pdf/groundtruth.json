@@ -91,6 +91,9 @@
       550
     ]
   },
+  "banded_one_table.pdf": {
+    "tables": 1
+  },
   "booktabs_wrapped.pdf": {
     "tables": 1
   },
@@ -1056,6 +1059,9 @@
       40
     ],
     "panel_fill": "#339999"
+  },
+  "stacked_tables.pdf": {
+    "tables": 2
   },
   "tagged_table.pdf": {
     "declared_cols": 3,

@@ -806,6 +806,87 @@ const BASELINE_AGREE: f32 = 0.45;
 /// Swept over {1, 2, 4, 8, 12}: flat at 0.5214 md up to 4, then 0.5185 at 8 and 0.5135 at 12.
 const GUTTER_MIN_ROWS: usize = 4;
 
+/// How far out of step with a run's own row pitch one line gap must be before it is read as
+/// **the end of one table and the start of the next** rather than a wide row.
+///
+/// The run-builder in [`detect_tables_region`] takes every consecutive stretch of >=2-cell rows
+/// as ONE table, and had no test for where a table ends: two tables stacked in one text column
+/// are one unbroken stretch, so they came out as one grid. Measured on the 100-document
+/// `pdf-parse-bench` "2026-q1-tables-only" corpus, that was the single largest content defect
+/// left — 63 of 69 contaminated emissions, 587 cells belonging to a table other than the one
+/// they were emitted in.
+///
+/// **Swept on our own corpus; nothing here is adopted from anywhere.** Four candidate boundary
+/// signals were scored at every internal row boundary of all 250 joinable runs, against the
+/// true cut point of the 52 fusions that join to a run (`dev-docs/bench/out/g2/`):
+///
+/// | signal | argmax lands on the true cut | true-cut score p50 | clean-run max p95 |
+/// |---|---|---|---|
+/// | column-model discontinuity | 24/52 | 0.600 | 0.800 |
+/// | row cell-count change | 23/52 | 0.400 | 0.667 |
+/// | **inter-row-gap outlier** | **46/52** | **2.732** | **1.414** |
+///
+/// Only the gap outlier separates: the other two put the true cut inside the clean population.
+/// This also *disproves* the two signals the evidence bank promoted — the owners' column counts
+/// disagree in 55 of 63 fusions, but that disagreement is not *localised* at the boundary, so a
+/// column-model test cannot find it. `rule_banded` was tried as the discriminator the USGS
+/// band-row class wants and fires on 28 of 52 fused runs against 141 of 198 clean ones — it
+/// carries no information here and is not used.
+///
+/// The threshold was then swept ON THE CORPUS, end to end, one clean-worktree wheel each
+/// (`dev-docs/bench/out/g2/corpus_sweep.md`) — micro GriTS-Doc_Con, md surface:
+///
+/// | x median gap | 1.6 | 1.8 | 2.0 | **2.5** | 3.0 |
+/// |---|---|---|---|---|---|
+/// | micro md | 0.6745 | 0.6740 | 0.6769 | **0.6798** | 0.6728 |
+/// | vertical contamination | 24 | 24 | 24 | **24** | 27 |
+/// | minority cells | 107 | 107 | 107 | **120** | 165 |
+/// | docs scoring < 0.50 | 18 | 18 | 18 | **17** | 18 |
+///
+/// A single interior peak, not a cliff: below it the split starts cutting inside tables that
+/// were already right (emitted tables climb to 444 while micro falls), above it stacked pairs
+/// start surviving again (vertical contamination back to 27). The offline separation predicted
+/// the shape — 2.5 catches 39 of the 52 fusions against 40 at 2.0, but cuts only 4 clean runs
+/// against 7 — and the corpus confirmed it is the better trade.
+const ROW_PITCH_BREAK: f32 = 2.5;
+/// The fewest rows either side of a pitch break may have. Swept over {2, 3} at both 2.0 and
+/// the chosen 2.5: at 2.5 the two are indistinguishable on micro md (0.6798 either way) and 2
+/// leaves one fewer fused emission (24 v 25) and two fewer misplaced cells (120 v 122), because
+/// short stacked tables are the common case rather than the exception. A part too small or too
+/// sparse to be a table is refused by `flush`'s own admission and the whole split is then
+/// abandoned — see [`pitch_breaks`] — so 2 gives up nothing in safety to buy that.
+const ROW_PITCH_MIN_PART: usize = 2;
+
+/// Where a run of aligned rows stops being ONE table, by its own row pitch.
+///
+/// Returns the row indices at which to cut (each is the first row of the next part), empty when
+/// the run reads as one table. A gap of at least [`ROW_PITCH_BREAK`] times the run's median line
+/// gap is the boundary: two tables stacked in a column are separated by the leading a caption or
+/// a paragraph break puts there, and that space survives even when — as in 48 of the 63 measured
+/// fusions — there is no text row between the two bands at all for a caption test to see.
+///
+/// The median is the run's own pitch, so a loosely set table is judged against itself; nothing
+/// here is absolute.
+fn pitch_breaks(ys: &[f32]) -> Vec<usize> {
+    if ys.len() < 2 * ROW_PITCH_MIN_PART {
+        return Vec::new();
+    }
+    let gaps: Vec<f32> = ys.windows(2).map(|w| w[0] - w[1]).collect();
+    let mut sorted = gaps.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = sorted.len() / 2;
+    let base = if sorted.len() % 2 == 0 { (sorted[mid - 1] + sorted[mid]) * 0.5 } else { sorted[mid] };
+    if base <= 0.0 {
+        return Vec::new();
+    }
+    (0..gaps.len())
+        .map(|i| i + 1)
+        .filter(|&k| {
+            k >= ROW_PITCH_MIN_PART && ys.len() - k >= ROW_PITCH_MIN_PART && gaps[k - 1] >= ROW_PITCH_BREAK * base
+        })
+        .collect()
+}
+
 /// The x of the central gutter when the page is a two-column layout, else None.
 ///
 /// A two-column page is split down the middle by a vertical whitespace lane that
@@ -2138,7 +2219,35 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
         }
         let headers: Vec<&(f32, Vec<Cell>, Vec<Span>)> = celled[h..start].iter().collect();
         let run_slice: Vec<&(f32, Vec<Cell>, Vec<Span>)> = celled[start..i].iter().collect();
-        flush(&run_slice, &headers, &mut tables);
+        // Where does this run stop being ONE table? A run is a stretch of aligned rows, and two
+        // tables stacked in one column are one unbroken stretch — the boundary is in the row
+        // PITCH, not in the text (see [`pitch_breaks`]).
+        let ys: Vec<f32> = run_slice.iter().map(|(y, _, _)| *y).collect();
+        let breaks = pitch_breaks(&ys);
+        if breaks.is_empty() {
+            flush(&run_slice, &headers, &mut tables);
+            continue;
+        }
+        // Only the FIRST part inherits the stranded header rows walked up above the run; a part
+        // below an interior break has no rows between it and the part above, so its own first
+        // row is its header — which is what `flush`'s band model already reads.
+        let before = tables.len();
+        let mut prev = 0usize;
+        for &k in breaks.iter().chain(std::iter::once(&run_slice.len())) {
+            let part: Vec<&(f32, Vec<Cell>, Vec<Span>)> = run_slice[prev..k].to_vec();
+            let hdr: Vec<&(f32, Vec<Cell>, Vec<Span>)> = if prev == 0 { headers.clone() } else { Vec::new() };
+            flush(&part, &hdr, &mut tables);
+            prev = k;
+        }
+        // A split that does not produce at least two tables has not found a boundary — it has
+        // cut a table into a piece that survives and a piece that `flush` refuses, and emitting
+        // only the survivor DROPS rows. 62 of the 63 fused emissions still matched a truth
+        // table, so the run is mostly right and the split must never make it worse: fall back
+        // to the whole run, which is exactly what was emitted before this test existed.
+        if tables.len() - before < 2 {
+            tables.truncate(before);
+            flush(&run_slice, &headers, &mut tables);
+        }
     }
     tables
 }
@@ -2450,6 +2559,54 @@ mod tests {
         }
         let heads: Vec<&str> = tables.iter().map(|t| t.grid[0][0].trim()).collect();
         assert!(heads.contains(&"Model") && heads.contains(&"Corpus"), "one table per column: {heads:?}");
+    }
+
+    #[test]
+    fn two_tables_stacked_in_one_column_are_two_tables() {
+        // `tests/gen_fixtures.py::gen_stacked_tables`. The run-builder takes every consecutive
+        // stretch of >=2-cell rows as ONE table and had no test for where a table ends, so a
+        // stacked pair came back as one 12x3 grid. Measured on the `pdf-parse-bench` tables
+        // corpus this was the largest remaining content defect: 63 of 69 contaminated
+        // emissions, 587 misplaced cells. Nothing sits between the two bands here — that is
+        // the majority shape (48 of the 63) — so only the row PITCH can see the boundary.
+        let tables = detect_fixture("stacked_tables.pdf");
+        assert_eq!(
+            tables.len(),
+            2,
+            "two tables, got {}: {:?}",
+            tables.len(),
+            tables.iter().map(|t| (t.grid.len(), t.grid[0].len())).collect::<Vec<_>>()
+        );
+        for t in &tables {
+            assert_eq!(t.grid[0].len(), 3, "three columns each: {:?}", t.grid[0]);
+            assert_eq!(t.grid.len(), 6, "six rows each — neither band lost a row: {:?}", t.grid);
+        }
+        let heads: Vec<&str> = tables.iter().map(|t| t.grid[0][0].trim()).collect();
+        assert!(heads.contains(&"Model") && heads.contains(&"Corpus"), "one table per band: {heads:?}");
+    }
+
+    #[test]
+    fn a_wide_gap_inside_one_table_does_not_end_it() {
+        // `tests/gen_fixtures.py::gen_banded_one_table`, the negative twin of the test above
+        // and the direct tension with bench100's USGS 6-way-split class: a table gives its
+        // header air, and a full-width band row inside one table must NOT terminate it (the
+        // stranded-header machinery landed for that class depends on it). Both wide gaps here
+        // are 1.47x the body pitch, inside the swept 2.5x break — which is what makes
+        // [`ROW_PITCH_BREAK`] a threshold rather than "there is extra space here".
+        let tables = detect_fixture("banded_one_table.pdf");
+        assert_eq!(
+            tables.len(),
+            1,
+            "one table, got {}: {:?}",
+            tables.len(),
+            tables.iter().map(|t| (t.grid.len(), t.grid[0].len())).collect::<Vec<_>>()
+        );
+        assert_eq!(tables[0].grid.len(), 7, "all seven rows, band included: {:?}", tables[0].grid);
+        assert!(
+            tables[0].grid.iter().any(|r| r[0].trim() == "Northern Basin"),
+            "the band row is still inside it: {:?}",
+            tables[0].grid
+        );
     }
 
     #[test]
