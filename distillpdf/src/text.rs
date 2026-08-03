@@ -1024,6 +1024,17 @@ pub struct Span {
     pub angle: f32,
     /// Stable font-face id (see [`font_id_of`]); 0 = unknown.
     pub font: u32,
+    /// The *marked-content id* this glyph run was painted under (`/MCID` of the innermost
+    /// enclosing `BDC`), when the page declares one. This is the only handle that ties a
+    /// tagged PDF's logical structure — `/StructTreeRoot` → `/Table` → `/TD` — to the actual
+    /// glyphs, and it is what [`crate::structtree`]'s declared tables resolve against.
+    ///
+    /// Captured **only** for the page's own content stream. Marked-content ids inside a Form
+    /// XObject or an annotation appearance number a *different* sequence (the form's own
+    /// `/StructParents` key, §14.7.4.4), so stamping them with the page's numbering would
+    /// associate a cell with unrelated text; those spans stay `None` and resolve by geometry
+    /// or not at all.
+    pub mcid: Option<u32>,
 }
 
 /// Extract positioned text spans for one page via content-stream interpretation,
@@ -1041,7 +1052,8 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
     let xmap = crate::walker::page_xobjects(doc, page_id);
     let mut spans = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
-    decode_spans(doc, &content.operations, &fonts, &xmap, Mat::ID, raw, 0, &mut spans, &mut budget);
+    let props = marked_properties(doc, page_id);
+    decode_spans(doc, &content.operations, &fonts, &xmap, Mat::ID, raw, 0, &mut spans, &mut budget, Some(&props));
     // §12.5.5: an annotation's appearance stream is page content — a filled form field's
     // value, a stamp's caption — reachable from neither the content stream nor the page's
     // `/Resources`. `walker::placed_appearances` carries the `/BBox`→`/Rect` mapping that
@@ -1054,7 +1066,7 @@ pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span>
         };
         let Some(fr) = &f.scope.resources else { continue };
         let ff = build_fonts_from_resources(doc, fr, raw);
-        decode_spans(doc, &f.ops, &ff, &f.scope.xobjects, f.matrix.mul(actm), raw, 1, &mut spans, &mut budget);
+        decode_spans(doc, &f.ops, &ff, &f.scope.xobjects, f.matrix.mul(actm), raw, 1, &mut spans, &mut budget, None);
     }
     dedup_coincident(&mut spans);
     spans
@@ -1129,6 +1141,7 @@ fn push_positioned_span(spans: &mut Vec<Span>, wtm: &Mat, ctm: &Mat, base_size: 
                 mono: style.2,
                 angle,
                 font: style.3,
+                mcid: None, // stamped by the caller's marked-content stack (see `decode_spans`)
             });
         }
 }
@@ -1136,8 +1149,14 @@ fn push_positioned_span(spans: &mut Vec<Span>, wtm: &Mat, ctm: &Mat, base_size: 
 /// Walk a content stream's operators, emitting positioned spans and recursing into
 /// Form XObjects on `Do`. `base` is the graphics CTM the stream is placed under
 /// (identity for the page; the form `/Matrix` × the invoking CTM for a nested form).
+///
+/// `props` is the stream's `/Resources /Properties` — the named property lists a `BDC` may
+/// reference instead of writing its dictionary inline — and its presence is what switches
+/// **marked-content capture** on. It is passed only for the page's own content stream: see
+/// [`Span::mcid`] for why a form's or an annotation's marked-content ids must not be stamped
+/// with the page's numbering.
 #[allow(clippy::too_many_arguments)]
-fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashMap<Vec<u8>, FontInfo>, xmap: &XMap, base: Mat, raw: &[u8], depth: u32, spans: &mut Vec<Span>, budget: &mut crate::WalkBudget) {
+fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashMap<Vec<u8>, FontInfo>, xmap: &XMap, base: Mat, raw: &[u8], depth: u32, spans: &mut Vec<Span>, budget: &mut crate::WalkBudget, props: Option<&HashMap<Vec<u8>, u32>>) {
     let mut tm = Mat::ID;
     let mut tlm = Mat::ID;
     let mut leading = 0.0f32;
@@ -1165,6 +1184,14 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
         font: Option<&'a FontInfo>,
     }
     let mut cstack: Vec<Saved> = Vec::new();
+    // The marked-content stack (§14.6): `BDC`/`BMC` push, `EMC` pops, and the innermost
+    // entry carrying an `/MCID` is the id every glyph painted here belongs to. Only tracked
+    // when `props` says this is the page's own stream. `mc_over` counts pushes refused by
+    // the nesting cap so an unbalanced-but-capped stream still pops in step — a stream of
+    // 8M unmatched `BDC`s would otherwise grow the stack without bound.
+    let mut mcstack: Vec<Option<u32>> = Vec::new();
+    let mut mc_over = 0usize;
+    let mut mcid: Option<u32> = None;
 
     for op in ops {
         // Total-work budget (see `crate::WalkBudget`): the depth cap alone lets a
@@ -1174,7 +1201,29 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
             return;
         }
         let o = &op.operands;
+        // Spans this operator paints directly. A `Do` recursion's spans are excluded
+        // deliberately: they belong to the form's own marked-content numbering, not ours.
+        let mark = spans.len();
         match op.operator.as_str() {
+            "BDC" | "BMC" if props.is_some() => {
+                let id = (op.operator == "BDC")
+                    .then(|| o.get(1).and_then(|p| mcid_of(doc, p, props.unwrap_or(&HashMap::new()))))
+                    .flatten();
+                if mcstack.len() < crate::MAX_MARKED_NESTING {
+                    mcstack.push(id);
+                } else {
+                    mc_over += 1;
+                }
+                mcid = mcstack.iter().rev().find_map(|m| *m);
+            }
+            "EMC" if props.is_some() => {
+                if mc_over > 0 {
+                    mc_over -= 1;
+                } else {
+                    mcstack.pop();
+                }
+                mcid = mcstack.iter().rev().find_map(|m| *m);
+            }
             "q" => cstack.push(Saved { ctm, size, tc, tw, ts, leading, font: cur }),
             "Q" => {
                 if let Some(g) = cstack.pop() {
@@ -1309,14 +1358,53 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
                 // placement. See `clip_spans_to`.
                 let clip = crate::walker::form_bbox_clip(doc, stream, sub);
                 let mark = spans.len();
-                decode_spans(doc, &f.ops, &ff, &f.scope.xobjects, sub, raw, depth + 1, spans, budget);
+                decode_spans(doc, &f.ops, &ff, &f.scope.xobjects, sub, raw, depth + 1, spans, budget, None);
                 if let Some(bb) = clip {
                     clip_spans_to(spans, mark, bb);
                 }
+                continue; // the form's spans carry the form's numbering, never the page's
             }
             _ => {}
         }
+        if let Some(m) = mcid {
+            spans[mark..].iter_mut().for_each(|s| s.mcid = Some(m));
+        }
     }
+}
+
+/// The `/MCID` a `BDC`'s property operand names — written inline as a dictionary, or as a
+/// name into the stream's `/Resources /Properties`.
+fn mcid_of(doc: &Document, prop: &Object, props: &HashMap<Vec<u8>, u32>) -> Option<u32> {
+    match prop {
+        Object::Name(n) => props.get(n.as_slice()).copied(),
+        _ => {
+            let d = crate::pdfobj::deref(doc, prop)?.as_dict().ok()?;
+            u32::try_from(crate::pdfobj::deref(doc, d.get(b"MCID").ok()?)?.as_i64().ok()?).ok()
+        }
+    }
+}
+
+/// The page's own `/Resources /Properties` as name → `/MCID`, for the `/Tag /P0 BDC`
+/// spelling. Page-level only, and deliberately so: a form's `/Properties` names a sequence in
+/// the form's numbering, which this walk does not stamp.
+fn marked_properties(doc: &Document, page_id: ObjectId) -> HashMap<Vec<u8>, u32> {
+    let mut m = HashMap::new();
+    let Ok((own, inherited)) = doc.get_page_resources(page_id) else { return m };
+    for res in own.into_iter().chain(inherited.into_iter().filter_map(|id| doc.get_dictionary(id).ok())) {
+        let Some(props) = crate::pdfobj::sub_dict(doc, res, b"Properties") else { continue };
+        for (k, v) in props.iter() {
+            if let Some(id) = crate::pdfobj::deref(doc, v)
+                .and_then(|o| o.as_dict().ok())
+                .and_then(|d| d.get(b"MCID").ok())
+                .and_then(|o| crate::pdfobj::deref(doc, o))
+                .and_then(|o| o.as_i64().ok())
+                .and_then(|v| u32::try_from(v).ok())
+            {
+                m.insert(k.to_vec(), id);
+            }
+        }
+    }
+    m
 }
 
 /// Drop the spans a descended form's `/BBox` crops away — everything from index `from`
@@ -1822,7 +1910,7 @@ mod tests {
         let xmap = crate::walker::page_xobjects(&doc, page_id);
         let mut spans = Vec::new();
         let mut budget = crate::WalkBudget::new(700);
-        decode_spans(&doc, &content.operations, &fonts, &xmap, Mat::ID, &raw, 0, &mut spans, &mut budget);
+        decode_spans(&doc, &content.operations, &fonts, &xmap, Mat::ID, &raw, 0, &mut spans, &mut budget, None);
         assert!(!spans.is_empty(), "a tripped budget must not empty the page");
         assert!(spans.len() < 3, "the budget must really bite, got {} spans", spans.len());
     }

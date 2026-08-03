@@ -1183,6 +1183,10 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
     // Document-wide style profile: the body/heading size·weight·font tiers, numbering,
     // outline presence and column layout — drives heading classification per-document.
     let profile = build_doc_profile(&page_spans, body, title_sz, !outline.is_empty());
+    // L0 evidence: the tables the document DECLARES (`/StructTreeRoot`), keyed by page. Read
+    // once for the whole document — the tree is document-wide and a table may straddle a page
+    // break — and empty for the untagged majority.
+    let declared_tables = crate::structtree::declared_tables(doc);
     // Global heading pre-detection: distrust over-used emphasis/label styles so a filing's
     // line-item flood doesn't read as hundreds of headings (see plan_headings).
     let head_plan = plan_headings(&page_spans, body, &profile);
@@ -1346,6 +1350,52 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
             });
             !(raster_covered || strip_in_plot || label_grid_in_fig)
         });
+        // ── L0: the tables this page DECLARES ──────────────────────────────────────────
+        // A tagged PDF states its table structure in `/StructTreeRoot`; where a declaration
+        // resolves to content the page actually paints, it is exact evidence and outranks
+        // every heuristic above. It engages only inside its own region: the declared table
+        // replaces whatever inference found there, and the rest of the page is detected
+        // exactly as it was — a page carrying one declared and one undeclared table (IRS
+        // f1040 p1, measured) keeps both. A document with no structure tree reaches an empty
+        // map and nothing below this point runs, which is why L0 cannot move an untagged
+        // document by so much as a byte.
+        //
+        // Placed AFTER the false-table filters above deliberately. Those filters answer "is
+        // this grid of text really a figure's own labels", a question the declaration has
+        // already answered; running them over a declared table would let a heuristic overrule
+        // the file's own statement.
+        if let Some(decl) = declared_tables.get(_pid) {
+            let annots: Vec<(ObjectId, Rect)> = crate::walker::annot_rects(doc, *_pid)
+                .into_iter()
+                .map(|(id, r)| {
+                    let (x0, x1, y0, y1) = turn.rect(r.x0, r.x1, r.y0, r.y1);
+                    (id, Rect::new(x0, y0, x1, y1))
+                })
+                .collect();
+            let found = extract::declared_pos_tables(decl, dspans, &annots);
+            // Per-page L0 trace, off unless asked for (`DPDF_L0=1`), same idiom as
+            // `DPDF_PROFILE`: which declarations were accepted and which the trust rule
+            // refused, and why. A refusal that is never visible is a refusal nobody audits.
+            if std::env::var_os("DPDF_L0").is_some() {
+                eprintln!("  L0 page {pno}: declared={} accepted={} refused={:?}", decl.len(), found.tables.len(), found.refused);
+            }
+            if !found.tables.is_empty() {
+                let regions: Vec<Rect> = found.tables.iter().map(|t| Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top)).collect();
+                // An inferred table that substantially coincides with a declared region is
+                // the same table read worse — the USGS grid inference splits six ways is
+                // declared once — so it goes. "Substantially" is measured against the
+                // SMALLER of the two, which is what makes the rule work in both directions:
+                // inference over-splits a declared table (fragments inside the region) and it
+                // also over-merges one (a declared block plus its neighbours read as a single
+                // wide grid). Either way the declaration owns the structure there. A table
+                // that merely clips a corner of the region is a different table and survives.
+                tables.retain(|t| {
+                    let tr = Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
+                    !regions.iter().any(|r| r.overlap_area(tr) >= 0.5 * tr.area().min(r.area()).max(1.0))
+                });
+                tables.extend(found.tables);
+            }
+        }
         // Link rectangles are page-space too, and they are hit-tested against the spans in
         // `lines_of` — so they take the same turn, or a turned page's links land nowhere.
         let page_links = links_by_page.get(pno).unwrap_or(&no_links);
@@ -2379,6 +2429,7 @@ pub(crate) fn clone_span(s: &Span) -> Span {
         mono: s.mono,
         angle: s.angle,
         font: s.font,
+        mcid: s.mcid,
     }
 }
 

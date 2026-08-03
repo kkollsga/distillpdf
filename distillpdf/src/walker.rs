@@ -567,6 +567,34 @@ pub(crate) fn placed_appearances(doc: &Document, page_id: ObjectId) -> Vec<(Obje
         .collect()
 }
 
+/// A page's annotations as `(object id, /Rect)` — the identity a structure tree's `/OBJR`
+/// names, with the box it occupies.
+///
+/// A tagged fillable form files its data cells as `/OBJR` references to widget annotations
+/// rather than as `/MCID`s: the cell's *value* is painted by the widget's appearance stream,
+/// which has no marked content of its own. Without this mapping every such cell would resolve
+/// to nothing and the whole declaration would be rejected — which is every IRS form in the
+/// measurement corpus. Hidden annotations are excluded on the same rule as the render walks:
+/// a viewer does not draw them, so they are not on the page.
+pub(crate) fn annot_rects(doc: &Document, page_id: ObjectId) -> Vec<(ObjectId, crate::geom::Rect)> {
+    let mut out = Vec::new();
+    let Ok(page) = doc.get_dictionary(page_id) else { return out };
+    let Some(annots) = page.get(b"Annots").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_array().ok()) else {
+        return out;
+    };
+    for a in annots {
+        let Object::Reference(id) = a else { continue };
+        let Some(annot) = deref(doc, a).and_then(|o| o.as_dict().ok()) else { continue };
+        if annotation_hidden(annot) {
+            continue;
+        }
+        if let Some(r) = rect_key(doc, annot, b"Rect") {
+            out.push((*id, r));
+        }
+    }
+    out
+}
+
 /// A 4-number rectangle from a dictionary key, normalized. Every element is dereferenced:
 /// a `/Rect [344.9 456.1 348.9 5 0 R]` is legal and a direct-only read turns it into 0.
 fn rect_key(doc: &Document, d: &Dictionary, key: &[u8]) -> Option<crate::geom::Rect> {

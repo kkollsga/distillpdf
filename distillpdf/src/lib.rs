@@ -35,6 +35,7 @@ mod pdfobj;
 mod postprocess;
 mod profile;
 mod raster;
+mod structtree;
 mod text;
 mod textutil;
 mod vector;
@@ -43,6 +44,35 @@ mod walker;
 /// Maximum Form-XObject / content-stream recursion depth. Bounds runaway recursion and
 /// cyclic Form references while allowing legitimately deep nesting.
 pub(crate) const MAX_FORM_DEPTH: u32 = 40;
+
+/// Structure-tree (`/StructTreeRoot`) hardening — the [`crate::structtree`] walk's bounds.
+///
+/// A logical-structure tree is a general graph in a hostile file: `/K` may point back up,
+/// `/RoleMap` may cycle, and `/ColSpan 2000000000` is a legal integer. The walk carries a
+/// cycle guard for indirect elements, but a guard alone bounds neither *work* (a tree of
+/// direct dictionaries has no object ids to remember) nor *allocation*, so each dimension
+/// gets a declared ceiling. Sized against the corpus's largest real tree — the 88-document
+/// bench100 set peaks at 268 `/Table` elements across a document, 36 declared rows in one
+/// table and 15 columns — with roughly an order of magnitude of headroom, so no real
+/// document is truncated and no malformed one is followed.
+pub(crate) const MAX_STRUCT_NODES: usize = 400_000;
+/// Nesting depth of the structure tree, and of a cell's content wrappers.
+pub(crate) const MAX_STRUCT_DEPTH: u32 = 40;
+/// `/Table` elements read from one document.
+pub(crate) const MAX_STRUCT_TABLES: usize = 4_000;
+/// `/TR` rows read from one `/Table`, and `/TH`/`/TD` cells read from one `/TR`. The column
+/// cap doubles as the clamp on a declared `/RowSpan`/`/ColSpan`.
+pub(crate) const MAX_STRUCT_ROWS: usize = 2_000;
+pub(crate) const MAX_STRUCT_COLS: usize = 512;
+/// `/K` entries read from one element, and content references (`/MCID` + `/OBJR`) harvested
+/// for one cell.
+pub(crate) const MAX_STRUCT_KIDS: usize = 20_000;
+pub(crate) const MAX_STRUCT_CELL_REFS: usize = 4_000;
+
+/// Nesting of marked-content sequences (`BDC`/`BMC` … `EMC`) one content stream may open.
+/// A stream of unmatched `BDC`s is legal bytes, and the text walk's stack would otherwise
+/// grow once per operator up to [`MAX_FORM_WORK`]. Real nesting is 2-3 deep.
+pub(crate) const MAX_MARKED_NESTING: usize = 512;
 
 /// Maximum nesting depth of a PDF *function* object ([`crate::function`]): a Type 3
 /// stitching function whose sub-functions are themselves Type 3, or an array of arrays.

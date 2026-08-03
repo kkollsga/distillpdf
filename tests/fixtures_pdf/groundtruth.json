@@ -1166,5 +1166,52 @@
     "control_page": 2,
     "filter": "JPXDecode",
     "human": "JPEG 2000"
+  },
+  "tagged_table.pdf": {
+    "declared_grid": [
+      [
+        "Region",
+        "",
+        "Total"
+      ],
+      [
+        "North",
+        "Alpha",
+        "11"
+      ],
+      [
+        "",
+        "Beta",
+        "22"
+      ]
+    ],
+    "declared_rows": 3,
+    "declared_cols": 3,
+    "refused": [
+      "single-row shard",
+      "single-column shard"
+    ],
+    "undeclared_rows": [
+      [
+        "Site",
+        "Depth",
+        "Yield"
+      ],
+      [
+        "Ridge",
+        "18.2",
+        "77"
+      ],
+      [
+        "Basin",
+        "31.0",
+        "96"
+      ],
+      [
+        "Delta",
+        "42.5",
+        "128"
+      ]
+    ]
   }
 }

@@ -764,6 +764,7 @@ fn clone_span(s: &Span) -> Span {
         mono: s.mono,
         angle: s.angle,
         font: s.font,
+        mcid: s.mcid,
     }
 }
 
@@ -825,6 +826,199 @@ pub(crate) fn central_gutter(spans: &[Span]) -> Option<f32> {
     } else {
         None
     }
+}
+
+/// Why a declared table was refused. Reported per page so a rejection is evidence, not a
+/// silent fall-through.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Refusal {
+    /// Fewer than two rows resolved to content on this page — the World Bank shard shape
+    /// (one table declared as 1×9 + 1×8 + 4×13, the first two of which are not tables).
+    TooFewRows,
+    /// Fewer than two columns after span expansion.
+    TooFewCols,
+    /// The cells name marked content that this page does not paint, or name nothing at all.
+    Unresolved,
+    /// The resolved content occupies no area — a table with nowhere to be.
+    Degenerate,
+}
+
+/// A page's declared tables after the trust rule has run.
+pub(crate) struct Declared {
+    /// Accepted declarations, ready to place like any other detected table.
+    pub tables: Vec<PosTable>,
+    /// Refusals, in declaration order.
+    pub refused: Vec<Refusal>,
+}
+
+/// **L0** — the tables the page *declares* (`/StructTreeRoot`), resolved against the spans it
+/// actually paints.
+///
+/// The declaration supplies the structure — how many rows, how many columns, which cells are
+/// headers, which cells span — and the page supplies the content: each cell's `/MCID`s select
+/// the glyph runs [`crate::text`] stamped with that id, and each `/OBJR` selects the widget
+/// annotation whose appearance carries a form field's value. Nothing here is inferred and
+/// nothing is thresholded; the only judgement is the trust rule, which decides whether the
+/// declaration *resolved*, never whether it is well-shaped:
+///
+/// - **≥2 rows** with content on this page. A declaration that fragments into single-row
+///   shards is not describing a table, whatever it says.
+/// - **≥2 columns** after span expansion.
+/// - **≥2 cells** resolving to real content, so a tree pointing at nothing is refused rather
+///   than emitted as an empty grid.
+/// - a **non-degenerate region**, since the region is what masks inference off the area.
+///
+/// A refusal is a fall-through, not an error: the page is then extracted exactly as an
+/// untagged page would be. That asymmetry is the whole safety argument for L0 — it can only
+/// act where a declaration exists *and* resolves, so every path it does not touch is
+/// byte-identical to before.
+///
+/// `spans` and `annots` must be in the same (display) space; the returned tables are too.
+pub(crate) fn declared_pos_tables(declared: &[crate::structtree::DeclaredTable], spans: &[Span], annots: &[(ObjectId, crate::geom::Rect)]) -> Declared {
+    use crate::geom::Rect;
+    let mut out = Declared { tables: Vec::new(), refused: Vec::new() };
+    if declared.is_empty() {
+        return out;
+    }
+    let mut by_mcid: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (i, s) in spans.iter().enumerate() {
+        if let Some(m) = s.mcid {
+            by_mcid.entry(m).or_default().push(i);
+        }
+    }
+    // Spans no marked-content sequence claimed. A widget's value is painted by an appearance
+    // stream, which carries no `/MCID`, so an `/OBJR` cell collects by geometry — but only
+    // from the unclaimed pool, so it can never steal another cell's declared content.
+    let free: Vec<usize> = spans.iter().enumerate().filter(|(_, s)| s.mcid.is_none()).map(|(i, _)| i).collect();
+    let sbox = |i: usize| {
+        let s = &spans[i];
+        Rect::new(s.x, s.y, s.x + s.width.max(s.size * 0.3), s.y + s.size)
+    };
+
+    for t in declared {
+        let cols = t.cols();
+        // Resolve every cell: its span set, its box, and whether it resolved at all.
+        let rows: Vec<Vec<(String, Rect, bool)>> = t
+            .rows
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|c| {
+                        let mut idx: Vec<usize> = c.mcids.iter().filter_map(|m| by_mcid.get(m)).flatten().copied().collect();
+                        let mut bx = Rect::EMPTY;
+                        let mut resolved = !idx.is_empty();
+                        for o in &c.objs {
+                            let Some(r) = annots.iter().find(|(id, _)| id == o).map(|(_, r)| *r) else { continue };
+                            resolved = true;
+                            bx = bx.union(r);
+                            idx.extend(free.iter().copied().filter(|&i| {
+                                let b = sbox(i);
+                                r.contains((b.x0 + b.x1) * 0.5, (b.y0 + b.y1) * 0.5)
+                            }));
+                        }
+                        idx.sort_unstable();
+                        idx.dedup();
+                        bx = idx.iter().fold(bx, |a, &i| a.union(sbox(i)));
+                        (cell_text(spans, &idx), bx, resolved)
+                    })
+                    .collect()
+            })
+            .collect();
+        // Rows the page really carries. `structtree` filtered by what the tree *claims*;
+        // this filters by what the page *paints* — a claim about a page that does not paint
+        // it is exactly the stale tag the trust rule exists for.
+        let live: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].iter().any(|c| c.2)).collect();
+        let filled = rows.iter().flatten().filter(|c| c.2 && !c.0.trim().is_empty()).count();
+        let region = rows.iter().flatten().filter(|c| c.2).fold(Rect::EMPTY, |a, c| a.union(c.1));
+        let refusal = if live.len() < 2 {
+            Some(Refusal::TooFewRows)
+        } else if cols < 2 {
+            Some(Refusal::TooFewCols)
+        } else if filled < 2 {
+            Some(Refusal::Unresolved)
+        } else if !region.is_valid() || region.width() <= 1.0 || region.height() <= 1.0 {
+            Some(Refusal::Degenerate)
+        } else {
+            None
+        };
+        if let Some(r) = refusal {
+            out.refused.push(r);
+            continue;
+        }
+        let kept: Vec<&Vec<(String, Rect, bool)>> = live.iter().map(|&i| &rows[i]).collect();
+        let spans_of: Vec<Vec<(usize, usize)>> =
+            live.iter().map(|&i| t.rows[i].iter().map(|c| (c.rowspan, c.colspan)).collect()).collect();
+        let grid = lay_out_grid(&kept, &spans_of, cols);
+        // Leading rows that are entirely header cells become the table's `<th>` rows; a
+        // header cell further down stays a `<td>`, which is the same simplification the
+        // inference path makes and costs nothing the scorer sees.
+        let nhdr = live
+            .iter()
+            .take_while(|&&i| !t.rows[i].is_empty() && t.rows[i].iter().all(|c| c.header))
+            .count()
+            .min(grid.len().saturating_sub(1));
+        let header: Vec<Vec<(String, usize)>> =
+            grid[..nhdr].iter().map(|r| r.iter().map(|c| (c.clone(), 1usize)).collect()).collect();
+        out.tables.push(PosTable {
+            y_top: region.y1,
+            y_bottom: region.y0,
+            x_left: region.x0,
+            x_right: region.x1,
+            grid: grid[nhdr..].to_vec(),
+            header,
+        });
+    }
+    out
+}
+
+/// One declared cell's text: its spans read as lines (top-down, left-to-right), each line's
+/// words merged by the same typographic rules the inference path uses, lines joined by a
+/// space. A cell is normally one run; a wrapped one is two or three.
+fn cell_text(spans: &[Span], idx: &[usize]) -> String {
+    if idx.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for row in rows_of(idx.iter().map(|&i| clone_span(&spans[i])).collect()) {
+        let line = row_cells(&row).into_iter().map(|c| c.text).collect::<Vec<_>>().join(" ");
+        if !line.trim().is_empty() {
+            parts.push(line.trim().to_string());
+        }
+    }
+    parts.join(" ")
+}
+
+/// Expand a declared table into a rectangular `cols`-wide grid, honouring `/RowSpan` and
+/// `/ColSpan`: the spanning cell's text lands in its first covered position and the positions
+/// it continues over are empty. The declared merge is preserved as *shape* — the grid is the
+/// one a reader sees — while the emitted HTML stays a plain cell matrix; scoring merges needs
+/// a ground-truth extension this phase does not have.
+fn lay_out_grid(rows: &[&Vec<(String, crate::geom::Rect, bool)>], spans: &[Vec<(usize, usize)>], cols: usize) -> Vec<Vec<String>> {
+    let cols = cols.max(1);
+    let mut occupied: Vec<Vec<bool>> = vec![vec![false; cols]; rows.len()];
+    let mut grid: Vec<Vec<String>> = vec![vec![String::new(); cols]; rows.len()];
+    for (r, row) in rows.iter().enumerate() {
+        let mut c = 0usize;
+        for (i, cell) in row.iter().enumerate() {
+            while c < cols && occupied[r][c] {
+                c += 1;
+            }
+            if c >= cols {
+                break;
+            }
+            let (rs, cs) = spans[r].get(i).copied().unwrap_or((1, 1));
+            grid[r][c] = cell.0.clone();
+            for dr in 0..rs.max(1) {
+                for dc in 0..cs.max(1) {
+                    if let Some(slot) = occupied.get_mut(r + dr).and_then(|row| row.get_mut(c + dc)) {
+                        *slot = true;
+                    }
+                }
+            }
+            c += cs.max(1);
+        }
+    }
+    grid
 }
 
 /// Detect tables. On a two-column page we split down the middle and detect each
@@ -1843,5 +2037,62 @@ mod tests {
             &["2", "4", "", "", ""],
         ]);
         assert!(!is_coherent_grid(&g));
+    }
+
+    // ---------------------------------------------------------------- L0: the trust rule
+
+    /// The tagged fixture (`tests/gen_fixtures.py::gen_tagged_table`), loaded with its spans.
+    fn tagged() -> (Document, Vec<Span>, ObjectId) {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/tagged_table.pdf");
+        let doc = Document::load(path).expect("tagged_table.pdf fixture must load");
+        let raw = std::fs::read(path).expect("fixture readable");
+        let page = *doc.get_pages().get(&1).expect("page 1");
+        let spans = crate::text::extract_spans(&doc, page, &raw);
+        (doc, spans, page)
+    }
+
+    #[test]
+    fn the_page_content_carries_the_marked_content_ids_the_tree_names() {
+        // Without this the declaration is unusable: a `/TD` can name `/MCID 3` all it likes,
+        // but nothing ties it to glyphs until the text walk tracks `BDC`/`EMC`. No
+        // marked-content handling existed anywhere in the crate before this phase.
+        let (_doc, spans, _page) = tagged();
+        let marked: Vec<&Span> = spans.iter().filter(|s| s.mcid.is_some()).collect();
+        assert_eq!(marked.len(), 13, "the fixture marks 13 runs, got {}", marked.len());
+        let alpha = spans.iter().find(|s| s.text == "Alpha").expect("the fixture paints Alpha");
+        assert_eq!(alpha.mcid, Some(3));
+        let plain = spans.iter().find(|s| s.text == "Ridge").expect("the undeclared grid is painted");
+        assert_eq!(plain.mcid, None, "content outside every BDC belongs to no sequence");
+    }
+
+    #[test]
+    fn a_declared_table_is_emitted_with_the_declared_grid_and_the_shards_are_refused() {
+        // All three trust-rule outcomes in one page: the 3x3 with `/ColSpan 2` + `/RowSpan 2`
+        // is accepted and expanded exactly as declared; the one-row and one-column `/Table`
+        // elements are refused (both shapes occur in the measurement corpus — one World Bank
+        // table is declared as 1x9 + 1x8 + 4x13 for a single 2x12 grid).
+        let (doc, spans, page) = tagged();
+        let declared = crate::structtree::declared_tables(&doc);
+        let annots = crate::walker::annot_rects(&doc, page);
+        let out = declared_pos_tables(&declared[&page], &spans, &annots);
+        assert_eq!(out.refused, vec![Refusal::TooFewRows, Refusal::TooFewCols]);
+        assert_eq!(out.tables.len(), 1);
+        let t = &out.tables[0];
+        assert_eq!(t.header, vec![vec![("Region".into(), 1), (String::new(), 1), ("Total".into(), 1)]]);
+        assert_eq!(t.grid, vec![
+            vec!["North".to_string(), "Alpha".into(), "11".into()],
+            vec![String::new(), "Beta".into(), "22".into()],
+        ], "the /RowSpan 2 cell holds column 0 of the row below it");
+    }
+
+    #[test]
+    fn a_declaration_whose_cells_resolve_to_nothing_is_refused() {
+        // The stale tag: the tree survives an edit that removed the content it named. An
+        // empty grid is worse than no grid, so the page falls back to inference.
+        let (doc, _spans, page) = tagged();
+        let declared = crate::structtree::declared_tables(&doc);
+        let out = declared_pos_tables(&declared[&page], &[], &[]);
+        assert!(out.tables.is_empty());
+        assert!(out.refused.iter().all(|r| *r == Refusal::TooFewRows), "got {:?}", out.refused);
     }
 }

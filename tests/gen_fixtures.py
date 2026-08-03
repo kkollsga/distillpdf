@@ -2361,6 +2361,111 @@ def gen_glyph_table():
     GT["glyph_table.pdf"] = {"cells": ROWS}
 
 
+def gen_tagged_table():
+    """A **tagged** PDF: one page that declares its table structure in ``/StructTreeRoot``.
+
+    This is the L0 fixture — accept, reject and mask-not-switch in one file. Everything a
+    declared table can say is said here, and every one of the three outcomes is asserted:
+
+      * **Accepted** — ``Table 1`` is declared 3x3 with a header row whose first ``/TH``
+        carries ``/ColSpan 2``, and a first data cell carrying ``/RowSpan 2``. Its emitted
+        grid must be exactly what the declaration says (3 ``<tr>``, 3 columns, the spanning
+        cell's text in its first covered position), not what alignment inference would guess.
+        One of its cells names its marked content **indirectly** (``/K [N 0 R]`` where object
+        N is the integer) — legal, and the shape every World Bank document in the measurement
+        corpus uses; reading only DIRECT integers found the declaration and none of its
+        content, so the whole table was (correctly, uselessly) refused by the trust rule.
+      * **Refused** — two degenerate declarations that a tagged file is entitled to contain:
+        a single-row shard (``/Table`` with one ``/TR``) and a single-column one (three
+        ``/TR``s of one ``/TD``). Neither is a table whatever the file says, and both must
+        fall through to inference rather than be emitted.
+      * **Not switched** — an UNDECLARED ruled table lower on the same page, outside every
+        declared region and named by no structure element. Inference must still find it, at
+        its own row/column count. This is the guarantee that L0 masks its region rather than
+        taking over the page: partial coverage is the norm (IRS f1040 p1 declares one of its
+        two tables), so a page must be able to carry both kinds at once.
+
+    Hand-assembled: reportlab writes no structure tree."""
+    pdf = os.path.join(OUT, "tagged_table.pdf")
+    # --- the declared table (marked content, one MCID per cell) --------------------------
+    DECL = [
+        # (mcid, x, y, text) — row 0 header, rows 1-2 data
+        (0, 72, 700, "Region"), (1, 300, 700, "Total"),
+        (2, 72, 682, "North"), (3, 186, 682, "Alpha"), (4, 300, 682, "11"),
+        (5, 186, 664, "Beta"), (6, 300, 664, "22"),
+    ]
+    SHARD_ROW = [(7, 72, 600, "one"), (8, 186, 600, "row"), (9, 300, 600, "only")]
+    SHARD_COL = [(10, 72, 560, "alpha"), (11, 72, 542, "beta"), (12, 72, 524, "gamma")]
+    # --- the undeclared ruled table (no marked content at all) --------------------------
+    PLAIN = [["Site", "Depth", "Yield"], ["Ridge", "18.2", "77"],
+             ["Basin", "31.0", "96"], ["Delta", "42.5", "128"]]
+    PLAIN_X = (72.0, 220.0, 360.0)
+    PLAIN_TOP = 430.0
+
+    def marked(mcid, x, y, s, size=10):
+        return (b"/P << /MCID %d >> BDC BT /F1 %d Tf %.1f %.1f Td (%s) Tj ET EMC"
+                % (mcid, size, x, y, s.encode()))
+
+    body = [b"BT /F2 15 Tf 72 740 Td (A Table The File Declares) Tj ET"]
+    for m, x, y, s in DECL + SHARD_ROW + SHARD_COL:
+        body.append(marked(m, x, y, s))
+    body.append(b"BT /F1 10 Tf 72 470 Td "
+                b"(The grid below is drawn and ruled but named by no structure element.) Tj ET")
+    for ri, row in enumerate(PLAIN):
+        y = PLAIN_TOP - ri * 18.0
+        for ci, cell in enumerate(row):
+            body.append(b"BT /F1 10 Tf %.1f %.1f Td (%s) Tj ET" % (PLAIN_X[ci], y, cell.encode()))
+    for ri in range(len(PLAIN) + 1):  # horizontal rules around every row
+        y = PLAIN_TOP + 12.0 - ri * 18.0
+        body.append(b"0.6 w 60 %.1f m 460 %.1f l S" % (y, y))
+    stream = b"\n".join(body)
+
+    def elem(s, kids, extra=b""):
+        return b"<< /Type /StructElem /S /%s /Pg 3 0 R %s/K [%s] >>" % (s, extra, kids)
+
+    def cell(tag, mcids, span=b""):
+        a = b"/A << /O /Table %s >> " % span if span else b""
+        return elem(tag, b" ".join(mcids), a)
+
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 7 0 R /MarkInfo << /Marked true >> >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /StructParents 0 "
+            b"/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+        5: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        6: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
+        7: b"<< /Type /StructTreeRoot /K [8 0 R] >>",
+        8: elem(b"Document", b"9 0 R 13 0 R 17 0 R"),
+        # Table 1 — accepted. Header /TH with /ColSpan 2, first data /TD with /RowSpan 2.
+        9: elem(b"Table", b"10 0 R 11 0 R 12 0 R"),
+        10: elem(b"TR", b"%s %s" % (cell(b"TH", [b"0"], b"/ColSpan 2"), cell(b"TH", [b"1"]))),
+        11: elem(b"TR", b"%s %s %s" % (cell(b"TD", [b"2"], b"/RowSpan 2"),
+                                       cell(b"TD", [b"21 0 R"]),  # INDIRECT MCID (obj 21 = 3)
+                                       cell(b"TD", [b"4"]))),
+        12: elem(b"TR", b"%s %s" % (cell(b"TD", [b"5"]), cell(b"TD", [b"6"]))),
+        # Table 2 — one row: refused (TooFewRows).
+        13: elem(b"Table", b"14 0 R"),
+        14: elem(b"TR", b"%s %s %s" % (cell(b"TD", [b"7"]), cell(b"TD", [b"8"]), cell(b"TD", [b"9"]))),
+        # Table 3 — one column: refused (TooFewCols).
+        17: elem(b"Table", b"18 0 R 19 0 R 20 0 R"),
+        18: elem(b"TR", cell(b"TD", [b"10"])),
+        19: elem(b"TR", cell(b"TD", [b"11"])),
+        20: elem(b"TR", cell(b"TD", [b"12"])),
+        21: b"3",
+    }
+    for n in (15, 16):  # keep the object numbers contiguous for the xref writer
+        objs[n] = b"<< >>"
+    _assemble_pdf(objs, pdf)
+    GT["tagged_table.pdf"] = {
+        "declared_grid": [["Region", "", "Total"], ["North", "Alpha", "11"], ["", "Beta", "22"]],
+        "declared_rows": 3,
+        "declared_cols": 3,
+        "refused": ["single-row shard", "single-column shard"],
+        "undeclared_rows": PLAIN,
+    }
+
+
 def gen_annot_render():
     """A `/Stamp` whose appearance draws a raster, vector ink AND text at a `/BBox` that has
     to be SCALED — non-uniformly — to reach its `/Rect`.
@@ -4098,6 +4203,7 @@ def main():
     gen_annot_render()
     gen_glyph_table()
     gen_panel_table()
+    gen_tagged_table()
     gen_undecodable_codec()
     gen_codec_basemap()
     gen_no_spurious_figs()
