@@ -160,4 +160,47 @@ else
   exit 2
 fi
 
+step "Table-corpus source-fidelity parity gate (the honesty deliverable)"
+# The table torture corpus (tests/table_corpus/, 74 self-generated PDFs / 72 tables) is the
+# CELL-TRUTH gate, and it runs in CI with the rest of pytest: its truth is exact and
+# committed, which is the one thing bench100's judged truth can never be.
+#
+# What CI cannot run is this: the corpus's own honesty check. A generated corpus's failure
+# mode is being CLEANER than reality — a suite of tables we pass says nothing unless each
+# mimics a real page faithfully enough to fail the same way. So every case names a real
+# source page in the local bench100 corpus, and this step scores the extractor on the
+# generated PDF and on that page WITH THE SAME FUNCTION (bench100_score.table_score).
+# A case is oversimplified iff C_gen - C_real > 0.15; harder than reality always passes.
+#
+# `C` is the position-blind metric — the one that reads 1.0 when the grid is right and every
+# value sits under the wrong header. It is used here only because it is the one metric
+# computable on real pages, where no cell truth exists. Parity on C is NECESSARY, NOT
+# SUFFICIENT; the cell-positional gates in tests/test_table_corpus.py remain the measurement.
+#
+# STANDING RULE (spec §10.1.2): this corpus gates REGRESSION and CELL-LEVEL CORRECTNESS;
+# bench100 gates WILD CAPABILITY. **A change that raises torture-corpus scores while dropping
+# any bench100 floor above is a FAILED change**, not a trade-off. The two are mutually
+# load-bearing on purpose.
+#
+# An unexplained OVERSIMPLIFIED row exits non-zero and blocks the release: it means a
+# torture-corpus number is being cited that the real page does not support. An oversimplified
+# case that CANNOT be enriched keeps its flag in truth.json, is excluded from the coverage
+# claim for its type, and is listed with its reason in the report — that is a disposition, not
+# a pass.
+if [ -d benchmarking/bench100 ]; then
+  "$RUN_PY" tests/gen_table_corpus.py --parity
+  echo "report: dev-docs/bench/results/table_corpus_parity.md"
+  # The parity run regenerates the corpus; a diff here means the committed bytes and the
+  # generator have parted company, which the CI drift check would also catch.
+  if ! git diff --quiet -- tests/table_corpus; then
+    echo "FAILED — the parity run's regeneration changed tests/table_corpus/."
+    echo "         Commit the regenerated corpus and its truth together, or fix the"
+    echo "         non-determinism. See scripts/check-fixture-drift.sh."
+    exit 2
+  fi
+else
+  echo "SKIPPED — no benchmarking/bench100 on this machine, so no real page to score against."
+  echo "         (Unreachable in practice: the gate above already exited 2.)"
+fi
+
 step "All checks passed — safe to bump + push (with the user's go-ahead)."

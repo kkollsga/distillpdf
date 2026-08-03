@@ -30,15 +30,23 @@ PY="${PYTHON:-${ROOT}/.venv/bin/python}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/tests"
-cp "$ROOT"/tests/gen_fixtures.py "$ROOT"/tests/gen_tables.py "$ROOT"/tests/gen_demo.py "$TMP/tests/"
-cp -R "$ROOT"/tests/fixtures_pdf "$ROOT"/tests/corpus_tables "$ROOT"/tests/demo "$TMP/tests/"
+cp "$ROOT"/tests/gen_fixtures.py "$ROOT"/tests/gen_tables.py "$ROOT"/tests/gen_demo.py \
+   "$ROOT"/tests/gen_table_corpus.py "$ROOT"/tests/_rawpdf.py "$TMP/tests/"
+cp -R "$ROOT"/tests/fixtures_pdf "$ROOT"/tests/corpus_tables "$ROOT"/tests/demo \
+      "$ROOT"/tests/table_corpus "$TMP/tests/"
 
-"$PY" "$TMP/tests/gen_fixtures.py" >/dev/null
-"$PY" "$TMP/tests/gen_tables.py"   >/dev/null
-"$PY" "$TMP/tests/gen_demo.py"     >/dev/null
+"$PY" "$TMP/tests/gen_fixtures.py"     >/dev/null
+"$PY" "$TMP/tests/gen_tables.py"       >/dev/null
+"$PY" "$TMP/tests/gen_demo.py"         >/dev/null
+# The table torture corpus is held to the same standard: it embeds no images at all (so the
+# reportlab image-path defect cannot recur), seeds each case's RNG from a CRC of its id
+# rather than from PYTHONHASHSEED-salted hash(), and writes truth.json with sort_keys.
+# `floors.json` is a frozen artefact, not a generated one: it is seeded from the committed
+# copy above and therefore compares equal here by construction.
+"$PY" "$TMP/tests/gen_table_corpus.py" >/dev/null
 
 rc=0
-for d in fixtures_pdf corpus_tables demo; do
+for d in fixtures_pdf corpus_tables demo table_corpus; do
   # --brief on the whole tree: catches changed bytes AND a committed file the generator no
   # longer produces (or a produced file nobody committed).
   diff -r --brief "$ROOT/tests/$d" "$TMP/tests/$d" || rc=1
@@ -54,4 +62,4 @@ together, with a note on which side is right), or generation is not deterministi
 MSG
   exit 1
 fi
-echo "fixture drift check: clean (fixtures_pdf, corpus_tables, demo)"
+echo "fixture drift check: clean (fixtures_pdf, corpus_tables, demo, table_corpus)"
