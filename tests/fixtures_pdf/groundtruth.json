@@ -1,358 +1,199 @@
 {
-  "headings.pdf": {
-    "title": "Structural Heading Showcase",
-    "headings": [
+  "adversarial": {
+    "bomb": "form_bomb.pdf",
+    "control": "form_repeat.pdf",
+    "control_repeats": 3,
+    "control_word": "REPEAT"
+  },
+  "alpha_groups.pdf": {
+    "group_opacities": [
+      "0.0039",
+      "0.02",
+      "0.04",
+      "0.5",
+      "0.98"
+    ],
+    "paths": 8,
+    "plain_form_opacity": "0.25"
+  },
+  "annot_appearance.pdf": {
+    "images": [
       {
-        "text": "Abstract",
-        "tag": "h2"
+        "height": 30,
+        "index": 0,
+        "width": 40
       },
       {
-        "text": "1 Introduction",
-        "tag": "h2"
+        "height": 10,
+        "index": 1,
+        "width": 10
       },
       {
-        "text": "1.1 Background",
-        "tag": "h3"
+        "height": 12,
+        "index": 2,
+        "width": 12
       },
       {
-        "text": "1.1.1 Prior Work",
-        "tag": "h4"
+        "height": 15,
+        "index": 3,
+        "width": 15
       },
       {
-        "text": "2 Methods",
-        "tag": "h2"
-      },
-      {
-        "text": "References",
-        "tag": "h2"
+        "height": 16,
+        "index": 4,
+        "width": 16
       }
     ],
-    "not_headings": [
-      "Smith et al. (2019) demonstrated the approach on several datasets in detail.",
-      "This is an ordinary declarative sentence of body prose that ends with a period.",
-      "We thank J. K. Lee and M. R. Patel for helpful discussions and feedback here."
-    ]
-  },
-  "heading_traps.pdf": {
-    "headings": [
+    "never_reported": [
       {
-        "text": "Introduction",
-        "tag": "h2"
+        "height": 11,
+        "why": "in the appearance's resources, never drawn",
+        "width": 11
+      },
+      {
+        "height": 13,
+        "why": "the state /AS did not select",
+        "width": 13
+      },
+      {
+        "height": 14,
+        "why": "a hidden (/F bit 2) annotation",
+        "width": 14
       }
-    ],
-    "not_headings": [
-      "x = y + z",
-      "a b c d e f",
-      "The ATLAS Collaboration",
-      "The result was set during the run"
     ]
   },
-  "sec_structure.pdf": {
-    "anchors": [
-      "PART I",
-      "Item 1. Business",
-      "Item 1A. Risk Factors"
+  "annot_render.pdf": {
+    "label": "StampInkVisible",
+    "label_size": 12,
+    "label_xy": [
+      208,
+      520
     ],
-    "genuine": [
-      "Financial Overview"
+    "must_not_paint": [
+      "HiddenStampMustNotPaint",
+      "UnselectedStateOff",
+      "NoStateSelected"
     ],
-    "flood": [
-      "Net product sales",
-      "Cost of sales",
-      "Gross profit",
-      "Research and development",
-      "Selling and marketing",
-      "General and administrative",
-      "Operating loss",
-      "Interest income",
-      "Interest expense",
-      "Other income",
-      "Provision for taxes",
-      "Net loss",
-      "Total assets",
-      "Total liabilities",
-      "Cash and equivalents"
+    "must_paint": [
+      "StampInkVisible",
+      "SelectedStateOn"
+    ],
+    "raster": [
+      208,
+      406,
+      248,
+      436
+    ],
+    "rect": [
+      200,
+      400,
+      400,
+      550
     ]
   },
-  "lists.pdf": {
-    "numbered": [
-      "First ordered step in the procedure.",
-      "Second ordered step in the procedure.",
-      "Third ordered step in the procedure."
-    ],
-    "colon": [
-      "Question one introduced after a colon line.",
-      "Question two introduced after a colon line."
-    ],
-    "wrapped_snippet": "folded back into the same list item",
-    "unordered_items": [
-      "Star-marked alpha is the first unordered item.",
-      "Star-marked beta is the second unordered item.",
-      "Star-marked gamma is the third unordered item.",
-      "Star-marked delta wraps onto a second line so its continuation is folded back into the same list item rather than splitting off as a paragraph."
-    ],
-    "ordered_items": [
-      "First ordered step in the procedure.",
-      "Second ordered step in the procedure.",
-      "Third ordered step in the procedure.",
-      "Question one introduced after a colon line.",
-      "Question two introduced after a colon line."
-    ]
-  },
-  "runin.pdf": {
-    "head": "Model Architecture",
-    "rejoined": "modular architecture that lets downstream",
-    "not_present": "architec- ture"
-  },
-  "footnotes.pdf": {
-    "foot_snippets": [
-      "First footnote explains a referenced detail",
-      "Second footnote points readers to a related",
-      "Third footnote adds a final clarifying remark"
-    ]
-  },
-  "twolists.pdf": {
-    "first": [
-      "Initialize the system before starting the run.",
-      "Run the main computation loop to completion."
-    ],
-    "second": [
-      "Validate the computed results for correctness.",
-      "Report the final summary output to the user."
-    ],
-    "middle_snippet": "must remain its own paragraph and never be swallowed"
-  },
-  "figures.pdf": {
-    "fig1_caption": "Figure 1: A raster bar chart comparing two measured groups.",
-    "fig2_caption": "Figure 2: A vector line chart with a rotated axis title.",
-    "rotated_label": "Amplitude",
-    "inline_xref": "As shown in Figure 1 the bars differ",
-    "n_figures": 2
-  },
-  "figures_onepage.pdf": {
-    "fig1_caption": "Figure 1: A raster bar chart comparing two measured groups.",
-    "fig2_caption": "Figure 2: A vector line chart of the same measurements."
-  },
-  "figures_hier.pdf": {
-    "fig_id": "fig-2-3-1",
-    "tab_id": "tab-0-1-1",
-    "fig_caption": "Figure 2.3.1",
-    "tab_caption": "Table 0.1-1",
-    "linked_no_graphic": "Figure 6"
-  },
-  "figures_continued.pdf": {
-    "caption": "Figure 4",
-    "dup_id": "fig-4-2"
-  },
-  "figures_nodot.pdf": {
-    "nodot_id": "fig-5",
-    "nature_id": "fig-7",
-    "inline_xref": "As shown in Fig 5 the trend"
-  },
-  "lof_dotleader.pdf": {
-    "entry_text": "Overview of the study area",
-    "wrapped_text": "considerably longer descriptive title",
-    "n_figures": 0
-  },
-  "small_vector_fig.pdf": {
-    "caption": "Figure 1: A small diagram of the mapping between two objects.",
-    "n_figures": 1
-  },
-  "dense_vector.pdf": {
-    "n_figures": 2,
-    "grid_paths": 12,
-    "scatter_paths": 300,
-    "captions": [
-      "Figure 1: A reference grid drawn as twelve stroked rules.",
-      "Figure 2: A dense scatter field of three hundred marks."
-    ]
-  },
-  "map_label_grid.pdf": {
-    "page1_figures": 1,
-    "page2_figures": 0
-  },
-  "glyph_run_labels.pdf": {
-    "joined": [
-      "Cloverdale",
-      "Sonoma"
-    ],
-    "whole_already": [
-      "Healdsburg"
-    ],
-    "must_stay_apart": [
-      "Santa",
-      "Rosa",
-      "Napa"
-    ]
-  },
-  "ink_gate.pdf": {
-    "page1_figures": 1,
-    "page2_figures": 0,
-    "page3_figures": 0,
-    "page4_figures": 1
-  },
-  "damaged_streams.pdf": {
-    "pages": 3,
-    "issues": {
-      "6": "flate-truncated",
-      "7": "filter-unapplied"
-    },
-    "intact_object": 8,
-    "rects_authored": 10
-  },
-  "textstate_q.pdf": {
-    "word": "Cloverdale",
-    "occurrences": 2
+  "booktabs_wrapped.pdf": {
+    "tables": 1
   },
   "caption_bleed.pdf": {
-    "svg_labels": [
-      "256",
-      "512",
-      "RGB"
-    ],
     "must_stay_in_body": [
       "Mildenhall",
       "Residual connections",
       "Sim1a network only",
       "0.33"
+    ],
+    "svg_labels": [
+      "256",
+      "512",
+      "RGB"
     ]
   },
-  "inherited_mediabox.pdf": {
-    "page_width": 842,
-    "page_height": 595,
-    "figure_width": 300,
-    "caption": "Figure 1: A grid spanning 300 of the 842 point page.",
-    "n_figures": 1
-  },
-  "indirect_mediabox.pdf": {
-    "page_width": 1008,
-    "page_height": 612,
-    "crop_width": 400,
-    "crop_height": 650,
-    "figure_width": 504,
-    "caption": "Figure 1: A grid spanning 504 of the 1008 point page.",
-    "n_figures": 1,
-    "crop_page_text": "This page states no MediaBox anywhere up the tree, only a CropBox."
-  },
-  "indirect_numbers.pdf": {
-    "uri": "https://example.com/indirect",
-    "rect": [
-      72,
-      696,
-      420,
-      714
+  "clipped_raster.pdf": {
+    "clip": [
+      140,
+      350,
+      220,
+      410
     ],
-    "fill_alpha": 0.85,
-    "stroke_alpha": 0.6,
-    "dest_xyz": {
-      "name": "fig.indirect",
-      "page": 2,
-      "y": 700
-    },
-    "dest_fith": {
-      "name": "sec.indirect",
-      "page": 2,
-      "y": 640
-    },
-    "n_bars": 8,
-    "n_paths": 10,
-    "caption": "Figure 1: Bars painted under an indirect alpha.",
-    "n_figures": 1
-  },
-  "xobject_figure.pdf": {
-    "caption": "Figure 1: The model pipeline encodes images and text into logits.",
-    "n_figures": 1,
-    "body_once": [
-      "assembled as a single full-page form overlay",
-      "feeds the output layer"
+    "figures": 3,
+    "placement": [
+      140,
+      350,
+      300,
+      470
     ],
-    "figure_labels": [
-      "Image Encoder",
-      "Text Encoder",
-      "Output Layer"
+    "window_rgb": [
+      40,
+      60,
+      210
     ]
   },
-  "form_image.pdf": {
-    "caption": "Figure 1: A raster bar chart drawn inside a form XObject.",
-    "page1_images": [
-      {
-        "width": 240,
-        "height": 160
-      }
+  "cmyk_jpeg.pdf": {
+    "bands_rgb": [
+      [
+        255,
+        255,
+        255
+      ],
+      [
+        0,
+        255,
+        255
+      ],
+      [
+        255,
+        75,
+        255
+      ]
     ],
-    "page2_images": [
-      {
-        "index": 0,
-        "width": 120,
-        "height": 90
-      },
-      {
-        "index": 1,
-        "width": 240,
-        "height": 160
-      }
-    ]
+    "caption": "Figure 1: Three flat CMYK bands.",
+    "height": 48,
+    "sample_x": [
+      15,
+      47,
+      79
+    ],
+    "sample_y": 24,
+    "width": 96
   },
-  "undrawn_image.pdf": {
-    "page1_images": [
-      {
-        "index": 0,
-        "width": 40,
-        "height": 30
-      }
-    ],
-    "page2_images": [
-      {
-        "index": 0,
-        "width": 42,
-        "height": 32
-      }
-    ],
-    "never_drawn": [
-      {
-        "width": 41,
-        "height": 31
-      },
-      {
-        "width": 43,
-        "height": 33
-      }
-    ]
+  "codec_basemap.pdf": {
+    "basemap_page": 1,
+    "control_page": 2,
+    "filter": "JPXDecode",
+    "human": "JPEG 2000"
   },
   "colorspace_images.pdf": {
     "images": [
       {
-        "index": 0,
-        "width": 4,
-        "height": 2,
-        "color_space": "Indexed",
         "bits_per_component": 4,
+        "color_space": "Indexed",
         "format": "png",
+        "height": 2,
+        "index": 0,
         "px": {
           "0,0": [
             255,
             0,
             0
           ],
-          "3,0": [
-            255,
-            255,
-            255
-          ],
           "0,1": [
             255,
             255,
             255
+          ],
+          "3,0": [
+            255,
+            255,
+            255
           ]
-        }
+        },
+        "width": 4
       },
       {
-        "index": 1,
-        "width": 2,
-        "height": 2,
-        "color_space": "ICCBased",
         "bits_per_component": 8,
+        "color_space": "ICCBased",
         "format": "png",
+        "height": 2,
+        "index": 1,
         "px": {
           "0,0": [
             10,
@@ -364,15 +205,15 @@
             110,
             120
           ]
-        }
+        },
+        "width": 2
       },
       {
-        "index": 2,
-        "width": 2,
-        "height": 1,
-        "color_space": "DeviceCMYK",
         "bits_per_component": 8,
+        "color_space": "DeviceCMYK",
         "format": "png",
+        "height": 1,
+        "index": 2,
         "px": {
           "0,0": [
             255,
@@ -384,15 +225,15 @@
             255,
             255
           ]
-        }
+        },
+        "width": 2
       },
       {
-        "index": 3,
-        "width": 2,
-        "height": 1,
-        "color_space": "ICCBased",
         "bits_per_component": 8,
+        "color_space": "ICCBased",
         "format": "png",
+        "height": 1,
+        "index": 3,
         "px": {
           "0,0": [
             0,
@@ -404,24 +245,19 @@
             255,
             255
           ]
-        }
+        },
+        "width": 2
       }
     ]
   },
-  "image_order.pdf": {
-    "images": 6,
-    "renders_identical": 25
-  },
-  "paint_order.pdf": {
-    "figures": 2,
-    "panel_fill": "#808080"
-  },
-  "no_resources_paths.pdf": {
-    "svgs_per_page": [
-      1,
-      1
-    ],
-    "paths_per_page": 9
+  "damaged_streams.pdf": {
+    "intact_object": 8,
+    "issues": {
+      "6": "flate-truncated",
+      "7": "filter-unapplied"
+    },
+    "pages": 3,
+    "rects_authored": 10
   },
   "dashes.pdf": {
     "dasharrays": [
@@ -440,24 +276,597 @@
     ],
     "paths": 7
   },
-  "alpha_groups.pdf": {
-    "group_opacities": [
-      "0.0039",
-      "0.02",
-      "0.04",
-      "0.5",
-      "0.98"
+  "decode_jpeg.pdf": {
+    "gray_rgb": [
+      215,
+      215,
+      215
     ],
-    "paths": 8,
-    "plain_form_opacity": "0.25"
+    "height": 48,
+    "rgb_rgb": [
+      55,
+      225,
+      165
+    ],
+    "width": 64
   },
-  "rotated_pages.pdf": {
+  "dense_vector.pdf": {
+    "captions": [
+      "Figure 1: A reference grid drawn as twelve stroked rules.",
+      "Figure 2: A dense scatter field of three hundred marks."
+    ],
+    "grid_paths": 12,
+    "n_figures": 2,
+    "scatter_paths": 300
+  },
+  "encrypted": {
+    "inline_encrypt": [
+      "inline_encrypt_aes_128.pdf",
+      "inline_encrypt_rc4_128.pdf",
+      "inline_encrypt_userpw.pdf"
+    ],
+    "owner_only": [
+      "rc4_40.pdf",
+      "rc4_128.pdf",
+      "aes_128.pdf",
+      "aes_256.pdf",
+      "inline_encrypt_aes_128.pdf",
+      "inline_encrypt_rc4_128.pdf"
+    ],
+    "sentence": "Encrypted fixture sentinel phrase for distillPDF.",
+    "user_password": "secret",
+    "user_password_files": [
+      "userpw.pdf",
+      "inline_encrypt_userpw.pdf"
+    ]
+  },
+  "figures.pdf": {
+    "fig1_caption": "Figure 1: A raster bar chart comparing two measured groups.",
+    "fig2_caption": "Figure 2: A vector line chart with a rotated axis title.",
+    "inline_xref": "As shown in Figure 1 the bars differ",
+    "n_figures": 2,
+    "rotated_label": "Amplitude"
+  },
+  "figures_continued.pdf": {
+    "caption": "Figure 4",
+    "dup_id": "fig-4-2"
+  },
+  "figures_hier.pdf": {
+    "fig_caption": "Figure 2.3.1",
+    "fig_id": "fig-2-3-1",
+    "linked_no_graphic": "Figure 6",
+    "tab_caption": "Table 0.1-1",
+    "tab_id": "tab-0-1-1"
+  },
+  "figures_nodot.pdf": {
+    "inline_xref": "As shown in Fig 5 the trend",
+    "nature_id": "fig-7",
+    "nodot_id": "fig-5"
+  },
+  "figures_onepage.pdf": {
+    "fig1_caption": "Figure 1: A raster bar chart comparing two measured groups.",
+    "fig2_caption": "Figure 2: A vector line chart of the same measurements."
+  },
+  "footnotes.pdf": {
+    "foot_snippets": [
+      "First footnote explains a referenced detail",
+      "Second footnote points readers to a related",
+      "Third footnote adds a final clarifying remark"
+    ]
+  },
+  "form_bbox.pdf": {
+    "clipped_box": [
+      72,
+      500,
+      372,
+      680
+    ],
+    "in_box_fill": "#3366cc",
+    "out_of_box_fill": "#cc3333",
+    "raster_box": [
+      402,
+      270,
+      462,
+      330
+    ],
+    "rasters": 1
+  },
+  "form_bbox_text.pdf": {
+    "botband_xy": [
+      95,
+      371.6
+    ],
+    "labels": {
+      "BOTBAND": 1,
+      "TOPBAND": 1
+    },
+    "topband_xy": [
+      92,
+      700
+    ]
+  },
+  "form_font.pdf": {
+    "base_font": "Helvetica",
+    "encoding": "WinAnsiEncoding",
+    "font_name": "FF1",
+    "n_font_rows": 1,
+    "subtype": "Type1",
+    "text": "Text drawn inside a form XObject."
+  },
+  "form_image.pdf": {
+    "caption": "Figure 1: A raster bar chart drawn inside a form XObject.",
+    "page1_images": [
+      {
+        "height": 160,
+        "width": 240
+      }
+    ],
+    "page2_images": [
+      {
+        "height": 90,
+        "index": 0,
+        "width": 120
+      },
+      {
+        "height": 160,
+        "index": 1,
+        "width": 240
+      }
+    ]
+  },
+  "form_inherit.pdf": {
+    "image": {
+      "height": 30,
+      "width": 40,
+      "x_left": 172,
+      "y_bottom": 560
+    },
+    "panel_opacity": 0.5,
+    "word": "INHERIT",
+    "x": 172
+  },
+  "frontmatter.pdf": {
+    "abstract_contains": "verify front-matter extraction",
+    "authors": [
+      {
+        "affiliation_contains": "University of Example",
+        "name": "A. B. First"
+      },
+      {
+        "affiliation_contains": "Institute of Testing",
+        "name": "C. D. Second"
+      },
+      {
+        "affiliation_contains": "University of Example",
+        "name": "E. F. Third"
+      }
+    ],
+    "body_contains": "ordinary body prose under a numbered section",
+    "email_fragment": "first@example.edu",
+    "keywords": [
+      "testing",
+      "extraction",
+      "metadata",
+      "fixtures"
+    ],
+    "title": "A Study of Example Phenomena in Test Documents"
+  },
+  "glyph_run_labels.pdf": {
+    "joined": [
+      "Cloverdale",
+      "Sonoma"
+    ],
+    "must_stay_apart": [
+      "Santa",
+      "Rosa",
+      "Napa"
+    ],
+    "whole_already": [
+      "Healdsburg"
+    ]
+  },
+  "glyph_table.pdf": {
+    "cells": [
+      [
+        "Region",
+        "Samples",
+        "Depth"
+      ],
+      [
+        "North",
+        "128",
+        "42.5"
+      ],
+      [
+        "South",
+        "96",
+        "31.0"
+      ],
+      [
+        "East ridge",
+        "77",
+        "18.2"
+      ]
+    ]
+  },
+  "heading_traps.pdf": {
+    "headings": [
+      {
+        "tag": "h2",
+        "text": "Introduction"
+      }
+    ],
+    "not_headings": [
+      "x = y + z",
+      "a b c d e f",
+      "The ATLAS Collaboration",
+      "The result was set during the run"
+    ]
+  },
+  "headings.pdf": {
+    "headings": [
+      {
+        "tag": "h2",
+        "text": "Abstract"
+      },
+      {
+        "tag": "h2",
+        "text": "1 Introduction"
+      },
+      {
+        "tag": "h3",
+        "text": "1.1 Background"
+      },
+      {
+        "tag": "h4",
+        "text": "1.1.1 Prior Work"
+      },
+      {
+        "tag": "h2",
+        "text": "2 Methods"
+      },
+      {
+        "tag": "h2",
+        "text": "References"
+      }
+    ],
+    "not_headings": [
+      "Smith et al. (2019) demonstrated the approach on several datasets in detail.",
+      "This is an ordinary declarative sentence of body prose that ends with a period.",
+      "We thank J. K. Lee and M. R. Patel for helpful discussions and feedback here."
+    ],
+    "title": "Structural Heading Showcase"
+  },
+  "identity_cid_font.pdf": {
+    "lines": [
+      "Geometry: \u2220 \u221f \u22a5 \u2225 \u25b3 \u25a1 \u25cb \u2b1f \u2b22 \u2b21",
+      "Chemistry: \u21cc \u21c4 \u2191 \u2193 \u27f6 \u27f5 \u27f7"
+    ],
+    "subset_text": "Hello",
+    "symbols": [
+      "\u2220",
+      "\u221f",
+      "\u22a5",
+      "\u2225",
+      "\u25b3",
+      "\u25a1",
+      "\u25cb",
+      "\u2b1f",
+      "\u2b22",
+      "\u2b21",
+      "\u21cc",
+      "\u21c4",
+      "\u2191",
+      "\u2193",
+      "\u27f6",
+      "\u27f5",
+      "\u27f7"
+    ],
+    "uncovered": [
+      "\u2b1f",
+      "\u2b22",
+      "\u2b21",
+      "\u27f6",
+      "\u27f5",
+      "\u27f7"
+    ]
+  },
+  "image_order.pdf": {
+    "images": 6,
+    "renders_identical": 25
+  },
+  "indirect_mediabox.pdf": {
+    "caption": "Figure 1: A grid spanning 504 of the 1008 point page.",
+    "crop_height": 650,
+    "crop_page_text": "This page states no MediaBox anywhere up the tree, only a CropBox.",
+    "crop_width": 400,
+    "figure_width": 504,
+    "n_figures": 1,
+    "page_height": 612,
+    "page_width": 1008
+  },
+  "indirect_numbers.pdf": {
+    "caption": "Figure 1: Bars painted under an indirect alpha.",
+    "dest_fith": {
+      "name": "sec.indirect",
+      "page": 2,
+      "y": 640
+    },
+    "dest_xyz": {
+      "name": "fig.indirect",
+      "page": 2,
+      "y": 700
+    },
+    "fill_alpha": 0.85,
+    "n_bars": 8,
+    "n_figures": 1,
+    "n_paths": 10,
+    "rect": [
+      72,
+      696,
+      420,
+      714
+    ],
+    "stroke_alpha": 0.6,
+    "uri": "https://example.com/indirect"
+  },
+  "inherited_mediabox.pdf": {
+    "caption": "Figure 1: A grid spanning 300 of the 842 point page.",
+    "figure_width": 300,
+    "n_figures": 1,
+    "page_height": 595,
+    "page_width": 842
+  },
+  "ink_gate.pdf": {
+    "page1_figures": 1,
+    "page2_figures": 0,
+    "page3_figures": 0,
+    "page4_figures": 1
+  },
+  "links.pdf": {
+    "dest_name": "cite.smith2020",
+    "dest_page": 2,
+    "internal_text": "Methods section",
+    "launch_file": "datasheet_launch.pdf",
+    "outline_direct_page": 1,
+    "outline_direct_title": "Appendix A Notation",
+    "outline_indirect_page": 2,
+    "outline_indirect_title": "M\u00e9todos y An\u00e1lisis \u00a72",
+    "remote_file": "appendix_other.pdf",
+    "uri": "https://example.com/distillpdf",
+    "uri_text": "Visit our project homepage"
+  },
+  "lists.pdf": {
+    "colon": [
+      "Question one introduced after a colon line.",
+      "Question two introduced after a colon line."
+    ],
+    "numbered": [
+      "First ordered step in the procedure.",
+      "Second ordered step in the procedure.",
+      "Third ordered step in the procedure."
+    ],
+    "ordered_items": [
+      "First ordered step in the procedure.",
+      "Second ordered step in the procedure.",
+      "Third ordered step in the procedure.",
+      "Question one introduced after a colon line.",
+      "Question two introduced after a colon line."
+    ],
+    "unordered_items": [
+      "Star-marked alpha is the first unordered item.",
+      "Star-marked beta is the second unordered item.",
+      "Star-marked gamma is the third unordered item.",
+      "Star-marked delta wraps onto a second line so its continuation is folded back into the same list item rather than splitting off as a paragraph."
+    ],
+    "wrapped_snippet": "folded back into the same list item"
+  },
+  "lof_dotleader.pdf": {
+    "entry_text": "Overview of the study area",
+    "n_figures": 0,
+    "wrapped_text": "considerably longer descriptive title"
+  },
+  "map_label_grid.pdf": {
+    "page1_figures": 1,
+    "page2_figures": 0
+  },
+  "math.pdf": {
+    "equation_fragment": "S(w)",
+    "section": "1 Analysis",
+    "theorem_text": "The estimator is consistent under the stated assumptions",
+    "title": "Convergence Analysis"
+  },
+  "mathfonts.pdf": {
+    "c1": "\u2014\u2019",
+    "cmmi": "\u03b1\u03bc\u03bb\u2202",
+    "cmsy": "\u2264\u2265\u2192\u2208",
+    "diff_names": "\u2211\u222b\u03b1\u2264"
+  },
+  "no_resources_paths.pdf": {
+    "paths_per_page": 9,
+    "svgs_per_page": [
+      1,
+      1
+    ]
+  },
+  "no_spurious_figs.pdf": {
+    "page1_figures": 0,
+    "total_figures": 1
+  },
+  "numeric.pdf": {
+    "decimals": [
+      "84.6",
+      "0.21",
+      "92.3",
+      "0.12"
+    ],
+    "header": [
+      "System",
+      "Acc",
+      "F1",
+      "Loss"
+    ],
+    "rows": [
+      [
+        "BaseNet",
+        "84.6",
+        "83.4",
+        "0.21"
+      ],
+      [
+        "WideNet",
+        "88.2",
+        "87.9",
+        "0.18"
+      ],
+      [
+        "DeepNet",
+        "91.5",
+        "90.7",
+        "0.15"
+      ],
+      [
+        "MegaNet",
+        "92.3",
+        "91.8",
+        "0.12"
+      ]
+    ]
+  },
+  "pagelabels.pdf": {
+    "arabic_pages": [
+      "1",
+      "2"
+    ],
+    "labels": {
+      "1": "i",
+      "2": "ii",
+      "3": "1",
+      "4": "2",
+      "5": "Ap\u00eandice 1",
+      "6": "Ap\u00eandice 2"
+    },
+    "page_arabic1_text": "opens the body on arabic page 1",
+    "page_ii_text": "front matter on roman page ii",
+    "producer": "distillPDF\u2122 \u201cfixture\u201d writer",
+    "roman_pages": [
+      "i",
+      "ii"
+    ],
+    "utf16_pages": [
+      "Ap\u00eandice 1",
+      "Ap\u00eandice 2"
+    ],
+    "utf16_prefix": "Ap\u00eandice "
+  },
+  "paint_order.pdf": {
+    "figures": 2,
+    "panel_fill": "#808080"
+  },
+  "panel_table.pdf": {
+    "cells": [
+      [
+        "Constituent",
+        "Benchmark",
+        "Value"
+      ],
+      [
+        "Arsenic",
+        "Federal MCL",
+        "10 ppb"
+      ],
+      [
+        "Boron",
+        "Federal HAL",
+        "6,000 ppb"
+      ],
+      [
+        "Radon-222",
+        "Proposed MCL",
+        "4,000 pCi"
+      ]
+    ],
+    "panel_own_text": "Benchmarks for evaluating groundwater quality"
+  },
+  "partial_tounicode.pdf": {
+    "macroman_forbidden": [
+      "\u00a5",
+      "\u00c9",
+      "\u00d0",
+      "\u00d5"
+    ],
+    "macroman_text": "\u2022\u2026\u2013\u2019",
+    "symbolic_forbidden": [
+      "a",
+      "^"
+    ],
+    "symbolic_mapped": [
+      "\u2206",
+      "\u2248"
+    ],
+    "winansi_line": "Redding Sacramento EXPLANATION KILOMETERS 42\u00b0",
+    "winansi_words": [
+      "Redding",
+      "Sacramento",
+      "EXPLANATION",
+      "KILOMETERS",
+      "42\u00b0"
+    ]
+  },
+  "profile_heads.pdf": {
+    "body_snippet": "ordinary Helvetica prose at the body size",
+    "section_heads": [
+      "Background and Motivation",
+      "Method and Materials",
+      "Results and Discussion"
+    ],
+    "title": "Profile Driven Heading Detection"
+  },
+  "render_samples.pdf": {
+    "gray4_px": {
+      "0,0": [
+        0,
+        0,
+        0
+      ],
+      "1,0": [
+        255,
+        255,
+        255
+      ]
+    },
+    "html_images": 2,
+    "indexed_px": {
+      "0,0": [
+        255,
+        0,
+        0
+      ],
+      "1,0": [
+        0,
+        0,
+        255
+      ]
+    }
+  },
+  "rotated_body.pdf": {
+    "heading": "Turning the page",
+    "paragraphs": [
+      "A page that carries a Rotate key is turned clockwise before it is shown, and its text is authored at the matching angle so that the reader sees ordinary upright prose on an ordinary page.",
+      "Nothing about that page is a figure, so nothing else can carry its words into the output."
+    ],
     "rotations": [
       0,
       90,
       180,
       270
     ],
+    "spine_label": "SPINE LABEL"
+  },
+  "rotated_image.pdf": {
+    "caption": "Figure 1: A chart whose right-axis label is a rotated raster."
+  },
+  "rotated_pages.pdf": {
     "figure_page_bbox": [
       100,
       200,
@@ -467,49 +876,17 @@
     "labels": [
       "Alpha",
       "Beta"
+    ],
+    "rotations": [
+      0,
+      90,
+      180,
+      270
     ]
   },
-  "rotated_body.pdf": {
-    "rotations": [
-      0,
-      90,
-      180,
-      270
-    ],
-    "heading": "Turning the page",
-    "paragraphs": [
-      "A page that carries a Rotate key is turned clockwise before it is shown, and its text is authored at the matching angle so that the reader sees ordinary upright prose on an ordinary page.",
-      "Nothing about that page is a figure, so nothing else can carry its words into the output."
-    ],
-    "spine_label": "SPINE LABEL"
-  },
   "rotated_raster.pdf": {
-    "rotations": [
-      0,
-      90,
-      180,
-      270
-    ],
-    "placement": [
-      100,
-      250,
-      300,
-      350
-    ],
     "displayed": {
       "0": [
-        [
-          255,
-          0,
-          0
-        ],
-        [
-          0,
-          0,
-          255
-        ]
-      ],
-      "90": [
         [
           255,
           0,
@@ -544,24 +921,92 @@
           0,
           0
         ]
+      ],
+      "90": [
+        [
+          255,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          255
+        ]
       ]
-    }
+    },
+    "placement": [
+      100,
+      250,
+      300,
+      350
+    ],
+    "rotations": [
+      0,
+      90,
+      180,
+      270
+    ]
+  },
+  "ruled_blank_cells.pdf": {
+    "cols": 4,
+    "rows": 6
+  },
+  "runin.pdf": {
+    "head": "Model Architecture",
+    "not_present": "architec- ture",
+    "rejoined": "modular architecture that lets downstream"
+  },
+  "sec_structure.pdf": {
+    "anchors": [
+      "PART I",
+      "Item 1. Business",
+      "Item 1A. Risk Factors"
+    ],
+    "flood": [
+      "Net product sales",
+      "Cost of sales",
+      "Gross profit",
+      "Research and development",
+      "Selling and marketing",
+      "General and administrative",
+      "Operating loss",
+      "Interest income",
+      "Interest expense",
+      "Other income",
+      "Provision for taxes",
+      "Net loss",
+      "Total assets",
+      "Total liabilities",
+      "Cash and equivalents"
+    ],
+    "genuine": [
+      "Financial Overview"
+    ]
   },
   "separation.pdf": {
+    "grey_level_misreadings": [
+      "#1a1a1a",
+      "#333333"
+    ],
     "pages": [
       "Separation/Type2",
       "DeviceN/Type0",
       "Separation/Type4"
     ],
     "solid_tint_rgb": "#c6c6e0",
-    "type4_coverage": {
-      "0.2": "#cccccc",
-      "0.75": "#404040"
+    "spot_image_intensity_misreading": {
+      "0,0": [
+        0,
+        0,
+        0
+      ],
+      "2,0": [
+        255,
+        255,
+        255
+      ]
     },
-    "grey_level_misreadings": [
-      "#1a1a1a",
-      "#333333"
-    ],
     "spot_image_px": {
       "0,0": [
         255,
@@ -574,82 +1019,14 @@
         224
       ]
     },
-    "spot_image_intensity_misreading": {
-      "0,0": [
-        0,
-        0,
-        0
-      ],
-      "2,0": [
-        255,
-        255,
-        255
-      ]
+    "type4_coverage": {
+      "0.2": "#cccccc",
+      "0.75": "#404040"
     }
   },
-  "render_samples.pdf": {
-    "html_images": 2,
-    "indexed_px": {
-      "0,0": [
-        255,
-        0,
-        0
-      ],
-      "1,0": [
-        0,
-        0,
-        255
-      ]
-    },
-    "gray4_px": {
-      "0,0": [
-        0,
-        0,
-        0
-      ],
-      "1,0": [
-        255,
-        255,
-        255
-      ]
-    }
-  },
-  "cmyk_jpeg.pdf": {
-    "caption": "Figure 1: Three flat CMYK bands.",
-    "bands_rgb": [
-      [
-        255,
-        255,
-        255
-      ],
-      [
-        0,
-        255,
-        255
-      ],
-      [
-        255,
-        75,
-        255
-      ]
-    ],
-    "sample_x": [
-      15,
-      47,
-      79
-    ],
-    "sample_y": 24,
-    "width": 96,
-    "height": 48
-  },
-  "smask_panel.pdf": {
-    "panel_fill": "#339999",
-    "image_rgb": [
-      220,
-      30,
-      40
-    ],
-    "expect_format": "png"
+  "small_vector_fig.pdf": {
+    "caption": "Figure 1: A small diagram of the mapping between two objects.",
+    "n_figures": 1
   },
   "smask_group_raster.pdf": {
     "figures": 3,
@@ -671,237 +1048,17 @@
       210
     ]
   },
-  "clipped_raster.pdf": {
-    "figures": 3,
-    "placement": [
-      140,
-      350,
-      300,
-      470
-    ],
-    "clip": [
-      140,
-      350,
+  "smask_panel.pdf": {
+    "expect_format": "png",
+    "image_rgb": [
       220,
-      410
+      30,
+      40
     ],
-    "window_rgb": [
-      40,
-      60,
-      210
-    ]
-  },
-  "form_bbox.pdf": {
-    "in_box_fill": "#3366cc",
-    "out_of_box_fill": "#cc3333",
-    "clipped_box": [
-      72,
-      500,
-      372,
-      680
-    ],
-    "rasters": 1,
-    "raster_box": [
-      402,
-      270,
-      462,
-      330
-    ]
-  },
-  "form_bbox_text.pdf": {
-    "labels": {
-      "TOPBAND": 1,
-      "BOTBAND": 1
-    },
-    "topband_xy": [
-      92,
-      700
-    ],
-    "botband_xy": [
-      95,
-      371.6
-    ]
-  },
-  "decode_jpeg.pdf": {
-    "gray_rgb": [
-      215,
-      215,
-      215
-    ],
-    "rgb_rgb": [
-      55,
-      225,
-      165
-    ],
-    "width": 64,
-    "height": 48
-  },
-  "form_inherit.pdf": {
-    "word": "INHERIT",
-    "x": 172,
-    "image": {
-      "width": 40,
-      "height": 30,
-      "x_left": 172,
-      "y_bottom": 560
-    },
-    "panel_opacity": 0.5
-  },
-  "form_font.pdf": {
-    "font_name": "FF1",
-    "base_font": "Helvetica",
-    "subtype": "Type1",
-    "encoding": "WinAnsiEncoding",
-    "n_font_rows": 1,
-    "text": "Text drawn inside a form XObject."
-  },
-  "unfiltered_form.pdf": {
-    "form_text": "Unfiltered form ink",
-    "n_bars": 5,
-    "caption": "Figure 1: Five bars painted by a form stream carrying no filter.",
-    "title": "A Form Stream With No Filter"
-  },
-  "annot_appearance.pdf": {
-    "images": [
-      {
-        "index": 0,
-        "width": 40,
-        "height": 30
-      },
-      {
-        "index": 1,
-        "width": 10,
-        "height": 10
-      },
-      {
-        "index": 2,
-        "width": 12,
-        "height": 12
-      },
-      {
-        "index": 3,
-        "width": 15,
-        "height": 15
-      },
-      {
-        "index": 4,
-        "width": 16,
-        "height": 16
-      }
-    ],
-    "never_reported": [
-      {
-        "width": 11,
-        "height": 11,
-        "why": "in the appearance's resources, never drawn"
-      },
-      {
-        "width": 13,
-        "height": 13,
-        "why": "the state /AS did not select"
-      },
-      {
-        "width": 14,
-        "height": 14,
-        "why": "a hidden (/F bit 2) annotation"
-      }
-    ]
-  },
-  "annot_render.pdf": {
-    "rect": [
-      200,
-      400,
-      400,
-      550
-    ],
-    "raster": [
-      208,
-      406,
-      248,
-      436
-    ],
-    "label": "StampInkVisible",
-    "label_xy": [
-      208,
-      520
-    ],
-    "label_size": 12,
-    "must_not_paint": [
-      "HiddenStampMustNotPaint",
-      "UnselectedStateOff",
-      "NoStateSelected"
-    ],
-    "must_paint": [
-      "StampInkVisible",
-      "SelectedStateOn"
-    ]
-  },
-  "glyph_table.pdf": {
-    "cells": [
-      [
-        "Region",
-        "Samples",
-        "Depth"
-      ],
-      [
-        "North",
-        "128",
-        "42.5"
-      ],
-      [
-        "South",
-        "96",
-        "31.0"
-      ],
-      [
-        "East ridge",
-        "77",
-        "18.2"
-      ]
-    ]
-  },
-  "ruled_blank_cells.pdf": {
-    "rows": 6,
-    "cols": 4
-  },
-  "booktabs_wrapped.pdf": {
-    "tables": 1
-  },
-  "three_column_prose.pdf": {
-    "tables": 1
-  },
-  "two_column_tables.pdf": {
-    "tables": 2
-  },
-  "two_column_tables_prose.pdf": {
-    "tables": 2
-  },
-  "panel_table.pdf": {
-    "cells": [
-      [
-        "Constituent",
-        "Benchmark",
-        "Value"
-      ],
-      [
-        "Arsenic",
-        "Federal MCL",
-        "10 ppb"
-      ],
-      [
-        "Boron",
-        "Federal HAL",
-        "6,000 ppb"
-      ],
-      [
-        "Radon-222",
-        "Proposed MCL",
-        "4,000 pCi"
-      ]
-    ],
-    "panel_own_text": "Benchmarks for evaluating groundwater quality"
+    "panel_fill": "#339999"
   },
   "tagged_table.pdf": {
+    "declared_cols": 3,
     "declared_grid": [
       [
         "Region",
@@ -920,7 +1077,6 @@
       ]
     ],
     "declared_rows": 3,
-    "declared_cols": 3,
     "refused": [
       "single-row shard",
       "single-column shard"
@@ -948,74 +1104,18 @@
       ]
     ]
   },
-  "undecodable_codec.pdf": {
-    "declined_object": 5,
-    "control_object": 6,
-    "filter": "JPXDecode",
-    "human": "JPEG 2000",
-    "kind": "codec-unsupported"
+  "textstate_q.pdf": {
+    "occurrences": 2,
+    "word": "Cloverdale"
   },
-  "codec_basemap.pdf": {
-    "basemap_page": 1,
-    "control_page": 2,
-    "filter": "JPXDecode",
-    "human": "JPEG 2000"
+  "three_column_prose.pdf": {
+    "tables": 1
   },
-  "no_spurious_figs.pdf": {
-    "page1_figures": 0,
-    "total_figures": 1
+  "two_column_tables.pdf": {
+    "tables": 2
   },
-  "links.pdf": {
-    "uri": "https://example.com/distillpdf",
-    "dest_name": "cite.smith2020",
-    "dest_page": 2,
-    "uri_text": "Visit our project homepage",
-    "internal_text": "Methods section",
-    "outline_indirect_title": "M\u00e9todos y An\u00e1lisis \u00a72",
-    "outline_indirect_page": 2,
-    "outline_direct_title": "Appendix A Notation",
-    "outline_direct_page": 1,
-    "remote_file": "appendix_other.pdf",
-    "launch_file": "datasheet_launch.pdf"
-  },
-  "pagelabels.pdf": {
-    "labels": {
-      "1": "i",
-      "2": "ii",
-      "3": "1",
-      "4": "2",
-      "5": "Ap\u00eandice 1",
-      "6": "Ap\u00eandice 2"
-    },
-    "roman_pages": [
-      "i",
-      "ii"
-    ],
-    "arabic_pages": [
-      "1",
-      "2"
-    ],
-    "utf16_prefix": "Ap\u00eandice ",
-    "utf16_pages": [
-      "Ap\u00eandice 1",
-      "Ap\u00eandice 2"
-    ],
-    "producer": "distillPDF\u2122 \u201cfixture\u201d writer",
-    "page_ii_text": "front matter on roman page ii",
-    "page_arabic1_text": "opens the body on arabic page 1"
-  },
-  "typography.pdf": {
-    "accents": [
-      "caf\u00e9",
-      "r\u00e9sum\u00e9",
-      "na\u00efve",
-      "P\u00e9rez",
-      "fjord"
-    ],
-    "dehyphenated": "automatic",
-    "not_present": "auto- matic",
-    "superscript_base": "mc",
-    "subscript_base": "H"
+  "two_column_tables_prose.pdf": {
+    "tables": 2
   },
   "twocol.pdf": {
     "order": [
@@ -1025,14 +1125,6 @@
       "RIGHTONE",
       "RIGHTTWO",
       "RIGHTTHREE"
-    ]
-  },
-  "twocol_tight.pdf": {
-    "order": [
-      "LEFTSTART",
-      "LEFTEND",
-      "RIGHTSTART",
-      "RIGHTEND"
     ]
   },
   "twocol_fullwidth.pdf": {
@@ -1045,8 +1137,89 @@
       "RIGHTEND"
     ]
   },
-  "rotated_image.pdf": {
-    "caption": "Figure 1: A chart whose right-axis label is a rotated raster."
+  "twocol_tight.pdf": {
+    "order": [
+      "LEFTSTART",
+      "LEFTEND",
+      "RIGHTSTART",
+      "RIGHTEND"
+    ]
+  },
+  "twolists.pdf": {
+    "first": [
+      "Initialize the system before starting the run.",
+      "Run the main computation loop to completion."
+    ],
+    "middle_snippet": "must remain its own paragraph and never be swallowed",
+    "second": [
+      "Validate the computed results for correctness.",
+      "Report the final summary output to the user."
+    ]
+  },
+  "typography.pdf": {
+    "accents": [
+      "caf\u00e9",
+      "r\u00e9sum\u00e9",
+      "na\u00efve",
+      "P\u00e9rez",
+      "fjord"
+    ],
+    "dehyphenated": "automatic",
+    "not_present": "auto- matic",
+    "subscript_base": "H",
+    "superscript_base": "mc"
+  },
+  "undecodable_codec.pdf": {
+    "control_object": 6,
+    "declined_object": 5,
+    "filter": "JPXDecode",
+    "human": "JPEG 2000",
+    "kind": "codec-unsupported"
+  },
+  "undrawn_image.pdf": {
+    "never_drawn": [
+      {
+        "height": 31,
+        "width": 41
+      },
+      {
+        "height": 33,
+        "width": 43
+      }
+    ],
+    "page1_images": [
+      {
+        "height": 30,
+        "index": 0,
+        "width": 40
+      }
+    ],
+    "page2_images": [
+      {
+        "height": 32,
+        "index": 0,
+        "width": 42
+      }
+    ]
+  },
+  "unfiltered_form.pdf": {
+    "caption": "Figure 1: Five bars painted by a form stream carrying no filter.",
+    "form_text": "Unfiltered form ink",
+    "n_bars": 5,
+    "title": "A Form Stream With No Filter"
+  },
+  "xobject_figure.pdf": {
+    "body_once": [
+      "assembled as a single full-page form overlay",
+      "feeds the output layer"
+    ],
+    "caption": "Figure 1: The model pipeline encodes images and text into logits.",
+    "figure_labels": [
+      "Image Encoder",
+      "Text Encoder",
+      "Output Layer"
+    ],
+    "n_figures": 1
   },
   "yflip.pdf": {
     "order": [
@@ -1056,178 +1229,5 @@
       "YFLIPFOUR",
       "YFLIPFIVE"
     ]
-  },
-  "math.pdf": {
-    "title": "Convergence Analysis",
-    "section": "1 Analysis",
-    "equation_fragment": "S(w)",
-    "theorem_text": "The estimator is consistent under the stated assumptions"
-  },
-  "mathfonts.pdf": {
-    "cmsy": "\u2264\u2265\u2192\u2208",
-    "cmmi": "\u03b1\u03bc\u03bb\u2202",
-    "diff_names": "\u2211\u222b\u03b1\u2264",
-    "c1": "\u2014\u2019"
-  },
-  "identity_cid_font.pdf": {
-    "symbols": [
-      "\u2220",
-      "\u221f",
-      "\u22a5",
-      "\u2225",
-      "\u25b3",
-      "\u25a1",
-      "\u25cb",
-      "\u2b1f",
-      "\u2b22",
-      "\u2b21",
-      "\u21cc",
-      "\u21c4",
-      "\u2191",
-      "\u2193",
-      "\u27f6",
-      "\u27f5",
-      "\u27f7"
-    ],
-    "uncovered": [
-      "\u2b1f",
-      "\u2b22",
-      "\u2b21",
-      "\u27f6",
-      "\u27f5",
-      "\u27f7"
-    ],
-    "lines": [
-      "Geometry: \u2220 \u221f \u22a5 \u2225 \u25b3 \u25a1 \u25cb \u2b1f \u2b22 \u2b21",
-      "Chemistry: \u21cc \u21c4 \u2191 \u2193 \u27f6 \u27f5 \u27f7"
-    ],
-    "subset_text": "Hello"
-  },
-  "partial_tounicode.pdf": {
-    "winansi_line": "Redding Sacramento EXPLANATION KILOMETERS 42\u00b0",
-    "winansi_words": [
-      "Redding",
-      "Sacramento",
-      "EXPLANATION",
-      "KILOMETERS",
-      "42\u00b0"
-    ],
-    "symbolic_mapped": [
-      "\u2206",
-      "\u2248"
-    ],
-    "symbolic_forbidden": [
-      "a",
-      "^"
-    ],
-    "macroman_text": "\u2022\u2026\u2013\u2019",
-    "macroman_forbidden": [
-      "\u00a5",
-      "\u00c9",
-      "\u00d0",
-      "\u00d5"
-    ]
-  },
-  "numeric.pdf": {
-    "header": [
-      "System",
-      "Acc",
-      "F1",
-      "Loss"
-    ],
-    "rows": [
-      [
-        "BaseNet",
-        "84.6",
-        "83.4",
-        "0.21"
-      ],
-      [
-        "WideNet",
-        "88.2",
-        "87.9",
-        "0.18"
-      ],
-      [
-        "DeepNet",
-        "91.5",
-        "90.7",
-        "0.15"
-      ],
-      [
-        "MegaNet",
-        "92.3",
-        "91.8",
-        "0.12"
-      ]
-    ],
-    "decimals": [
-      "84.6",
-      "0.21",
-      "92.3",
-      "0.12"
-    ]
-  },
-  "frontmatter.pdf": {
-    "title": "A Study of Example Phenomena in Test Documents",
-    "authors": [
-      {
-        "name": "A. B. First",
-        "affiliation_contains": "University of Example"
-      },
-      {
-        "name": "C. D. Second",
-        "affiliation_contains": "Institute of Testing"
-      },
-      {
-        "name": "E. F. Third",
-        "affiliation_contains": "University of Example"
-      }
-    ],
-    "abstract_contains": "verify front-matter extraction",
-    "keywords": [
-      "testing",
-      "extraction",
-      "metadata",
-      "fixtures"
-    ],
-    "body_contains": "ordinary body prose under a numbered section",
-    "email_fragment": "first@example.edu"
-  },
-  "profile_heads.pdf": {
-    "title": "Profile Driven Heading Detection",
-    "section_heads": [
-      "Background and Motivation",
-      "Method and Materials",
-      "Results and Discussion"
-    ],
-    "body_snippet": "ordinary Helvetica prose at the body size"
-  },
-  "encrypted": {
-    "sentence": "Encrypted fixture sentinel phrase for distillPDF.",
-    "owner_only": [
-      "rc4_40.pdf",
-      "rc4_128.pdf",
-      "aes_128.pdf",
-      "aes_256.pdf",
-      "inline_encrypt_aes_128.pdf",
-      "inline_encrypt_rc4_128.pdf"
-    ],
-    "inline_encrypt": [
-      "inline_encrypt_aes_128.pdf",
-      "inline_encrypt_rc4_128.pdf",
-      "inline_encrypt_userpw.pdf"
-    ],
-    "user_password_files": [
-      "userpw.pdf",
-      "inline_encrypt_userpw.pdf"
-    ],
-    "user_password": "secret"
-  },
-  "adversarial": {
-    "bomb": "form_bomb.pdf",
-    "control": "form_repeat.pdf",
-    "control_repeats": 3,
-    "control_word": "REPEAT"
   }
 }

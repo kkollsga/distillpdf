@@ -9,12 +9,20 @@ Used by test_tables.py to score distillpdf's table detection (precision/recall/s
 cell-content) against ground truth — the robust goalline for table extraction.
 """
 import json, os, random
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.units import inch
-from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer,
-                                BaseDocTemplate, Frame, PageTemplate)
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+from reportlab import rl_config
+
+# Committed fixtures, asserted byte-for-byte -> regeneration must be a no-op. Without
+# this reportlab stamps a wall-clock /CreationDate + /ModDate and seeds the trailer /ID
+# from them, rewriting every file here on every run. Must precede any DocTemplate.
+rl_config.invariant = 1
+
+from reportlab.lib import colors  # noqa: E402
+from reportlab.lib.pagesizes import letter  # noqa: E402
+from reportlab.lib.units import inch  # noqa: E402
+from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle, Paragraph,  # noqa: E402
+                                Spacer, BaseDocTemplate, Frame, PageTemplate)
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle  # noqa: E402
 
 OUT = os.path.join(os.path.dirname(__file__), "corpus_tables")
 os.makedirs(OUT, exist_ok=True)

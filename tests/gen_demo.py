@@ -13,12 +13,19 @@ matches how real PDFs place text and is extracted cleanly.
 import json
 import os
 
-from PIL import Image, ImageDraw
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib.utils import simpleSplit
-from reportlab.pdfgen import canvas
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+from reportlab import rl_config
+
+# Committed fixtures, asserted byte-for-byte -> regeneration must be a no-op. Without
+# this reportlab stamps a wall-clock /CreationDate + /ModDate and seeds the trailer /ID
+# from them, rewriting both demo PDFs on every run. Must precede any Canvas/DocTemplate.
+rl_config.invariant = 1
+
+from PIL import Image, ImageDraw  # noqa: E402
+from reportlab.lib.pagesizes import letter  # noqa: E402
+from reportlab.lib.styles import getSampleStyleSheet  # noqa: E402
+from reportlab.lib.utils import simpleSplit  # noqa: E402
+from reportlab.pdfgen import canvas  # noqa: E402
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer  # noqa: E402
 
 OUT = os.path.join(os.path.dirname(__file__), "demo")
 os.makedirs(OUT, exist_ok=True)
@@ -159,7 +166,15 @@ def build():
 
     # Figure: image then caption.
     img_w, img_h = 173, 108
-    c.drawImage(png, LM, y - img_h, width=img_w, height=img_h)
+    # Relative name with the cwd pinned to OUT: reportlab digests the *path string* into
+    # the image XObject's name (`/FormXob.<md5>`), so an absolute path would bake this
+    # checkout's directory into the committed PDF. See gen_fixtures.draw_image.
+    cwd = os.getcwd()
+    os.chdir(OUT)
+    try:
+        c.drawImage(os.path.relpath(png, OUT), LM, y - img_h, width=img_w, height=img_h)
+    finally:
+        os.chdir(cwd)
     y -= img_h + 14
     c.setFont("Helvetica", 9.5)
     c.drawCentredString(LM + img_w / 2, y, FIG_CAPTION)

@@ -23,12 +23,24 @@ import os
 import re
 import zlib
 
-from PIL import Image, ImageDraw
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.utils import simpleSplit
-from reportlab.pdfgen import canvas
-from reportlab.platypus import BaseDocTemplate, Frame, PageTemplate, Paragraph
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab import rl_config
+
+# These PDFs are COMMITTED and the suite asserts against the committed bytes, so
+# regeneration on a clean tree must be a no-op. reportlab otherwise stamps a wall-clock
+# `/CreationDate`/`/ModDate` and derives the trailer `/ID` from them, which rewrote 43 of
+# these files on every run; `invariant` pins the timestamp to D:20000101000000+00'00',
+# the `/Creator` to `anonymous`, and makes the `/ID` a pure digest of the content. It
+# must be set before any Canvas/DocTemplate is built (they snapshot it at construction).
+rl_config.invariant = 1
+
+from PIL import Image, ImageDraw  # noqa: E402
+from reportlab.lib.pagesizes import letter  # noqa: E402
+from reportlab.lib.utils import simpleSplit  # noqa: E402
+from reportlab.pdfgen import canvas  # noqa: E402
+from reportlab.platypus import (  # noqa: E402
+    BaseDocTemplate, Frame, PageTemplate, Paragraph,
+)
+from reportlab.lib.styles import getSampleStyleSheet  # noqa: E402
 
 OUT = os.path.join(os.path.dirname(__file__), "fixtures_pdf")
 os.makedirs(OUT, exist_ok=True)
@@ -37,6 +49,29 @@ LM = 72
 COL_W = PAGE_W - 2 * LM
 BODY_F, BODY_S, LEAD = "Helvetica", 10.5, 14
 GT = {}
+
+
+def draw_image(c, path, *args, **kw):
+    """``canvas.drawImage`` with a machine-independent image XObject name.
+
+    Given a *filename* source, reportlab names the XObject ``/FormXob.<md5>`` where the
+    digest is over the path STRING (``canvas.py``: ``_digester('%s%s' % (image, mask))``)
+    — so an absolute path bakes the checkout directory into the PDF and the same
+    generator run from a different directory emits different bytes. Passing the name
+    relative to ``OUT``, with the cwd pinned there for the call, keeps the source a
+    filename while making the digest depend only on the fixture's own name.
+
+    Deliberately NOT an ``ImageReader`` (whose name IS content-derived): that takes a
+    different embedding path in ``PDFImageXObject`` — ``loadImageFromSRC`` instead of
+    ``loadImageFromJPEG`` — which would re-encode and lose the DCTDecode/Adobe-marker
+    passthrough ``cmyk_jpeg.pdf`` exists to assert.
+    """
+    cwd = os.getcwd()
+    os.chdir(OUT)
+    try:
+        return c.drawImage(os.path.relpath(path, OUT), *args, **kw)
+    finally:
+        os.chdir(cwd)
 
 
 def title(c, text):
@@ -261,7 +296,7 @@ def gen_figures():
     y = para(c, "This document contains a raster figure and a vector figure. As shown in "
                 "Figure 1 the bars differ in height, which the analysis discusses below.", y)
     img_w, img_h = 230, 146
-    c.drawImage(png, LM, y - img_h, width=img_w, height=img_h)
+    draw_image(c, png, LM, y - img_h, width=img_w, height=img_h)
     y -= img_h + 14
     c.setFont("Helvetica", 9.5)
     c.drawString(LM, y, "Figure 1: A raster bar chart comparing two measured groups.")
@@ -704,7 +739,7 @@ def gen_form_image():
     y = para(c, "The bar chart in Figure 1 is drawn inside a form XObject, so it is reachable "
                 "only through the form's own resource dictionary.", y)
     c.beginForm("rasterform")
-    c.drawImage(png_a, LM, y - 150, width=240, height=150)
+    draw_image(c, png_a, LM, y - 150, width=240, height=150)
     c.endForm()
     c.doForm("rasterform")
     y -= 164
@@ -713,9 +748,9 @@ def gen_form_image():
     c.showPage()
     # --- page 2: direct image first, then a form-nested one ----------------------
     y = PAGE_H - 100
-    c.drawImage(png_b, LM, y - 90, width=120, height=90)   # direct -> index 0
+    draw_image(c, png_b, LM, y - 90, width=120, height=90)   # direct -> index 0
     c.beginForm("nestedform")
-    c.drawImage(png_a, LM + 200, y - 150, width=240, height=150)  # nested -> index 1
+    draw_image(c, png_a, LM + 200, y - 150, width=240, height=150)  # nested -> index 1
     c.endForm()
     c.doForm("nestedform")
     c.showPage()
@@ -1330,7 +1365,7 @@ def gen_cmyk_jpeg():
     y = PAGE_H - 130
     y = para(c, "The three flat bands below are a CMYK JPEG with an Adobe marker: white, "
                 "cyan, and magenta. Read as a standalone JPEG they invert.", y)
-    c.drawImage(jpg, LM, y - 100, width=192, height=96)
+    draw_image(c, jpg, LM, y - 100, width=192, height=96)
     y -= 116
     c.setFont("Helvetica", 9.5)
     c.drawString(LM, y, "Figure 1: Three flat CMYK bands.")
@@ -3048,7 +3083,7 @@ def gen_figures_onepage():
     title(c, "Two Figures On One Page")
     y = PAGE_H - 120
     img_w, img_h = 220, 140
-    c.drawImage(png, LM, y - img_h, width=img_w, height=img_h)
+    draw_image(c, png, LM, y - img_h, width=img_w, height=img_h)
     y -= img_h + 14
     c.setFont("Helvetica", 9.5)
     c.drawString(LM, y, "Figure 1: A raster bar chart comparing two measured groups.")
@@ -3075,6 +3110,51 @@ ENC_OUT = os.path.join(OUT, "encrypted")
 ENC_SENTENCE = "Encrypted fixture sentinel phrase for distillPDF."
 ENC_USER_PW = "secret"
 
+# The ONE fixture class that cannot be made byte-deterministic. qpdf (through pikepdf)
+# draws a fresh random AES initialisation vector for every encrypted object — and, for
+# R6, a fresh random file-encryption key — and exposes no seed hook, so the ciphertext
+# differs on every run no matter how `/ID` is pinned. Measured: `Pdf.save(static_id=True)`
+# of one input is byte-stable for unencrypted and RC4 output (RC4 is a keystream with no
+# IV) and byte-different for R4-AES and R6-AES, which is why only these four are listed.
+# Quarantined rather than dropped: they are rewritten only when their DECRYPTED content
+# or encryption scheme actually changes, so a clean tree stays clean while a real change
+# still lands. Everything else in this generator is byte-deterministic.
+AES_NONDETERMINISTIC = {
+    "aes_128.pdf",
+    "aes_256.pdf",
+    "inline_encrypt_aes_128.pdf",
+    "inline_encrypt_userpw.pdf",
+}
+
+
+def _enc_content_key(data, password):
+    """Everything about an encrypted PDF except the random IVs: the decrypted body,
+    normalised, prefixed by the scheme parameters from the encryption dictionary."""
+    import pikepdf
+
+    with pikepdf.open(io.BytesIO(data), password=password) as p:
+        e = p.encryption
+        scheme = (e.R, e.V, e.P, str(e.stream_method), str(e.string_method))
+        buf = io.BytesIO()
+        p.save(buf, static_id=True, compress_streams=False, normalize_content=True)
+    return repr(scheme).encode() + b"\n" + buf.getvalue()
+
+
+def _write_enc(name, data, password=""):
+    """Write an encrypted fixture; for the AES quarantine, skip when only the IVs moved."""
+    path = os.path.join(ENC_OUT, name)
+    if name in AES_NONDETERMINISTIC and os.path.exists(path):
+        with open(path, "rb") as f:
+            old = f.read()
+        try:
+            if _enc_content_key(old, password) == _enc_content_key(data, password):
+                return path
+        except Exception:  # unreadable/older shape -> fall through and rewrite
+            pass
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
 
 def _enc_page(c):
     c.setFont("Helvetica-Bold", 16)
@@ -3085,7 +3165,7 @@ def _enc_page(c):
     c.save()
 
 
-def _inline_encrypt_dict(path, out_name):
+def _inline_encrypt_dict(path, out_name, password=""):
     """Rewrite an encrypted PDF so its `/Encrypt` dictionary sits DIRECTLY in the trailer.
 
     The producer shape MuPDF/PyMuPDF emits — `/Encrypt<</Filter/Standard/R 4 …>>` instead of
@@ -3107,8 +3187,7 @@ def _inline_encrypt_dict(path, out_name):
     body = obj.group(1).strip()
     data = data[: obj.start(1)] + b"null".ljust(len(obj.group(1))) + data[obj.end(1) :]
     spliced = data[: ref.start()] + b"/Encrypt" + body + data[ref.end() :]
-    with open(os.path.join(ENC_OUT, out_name), "wb") as f:
-        f.write(spliced)
+    _write_enc(out_name, spliced, password)
     return out_name
 
 
@@ -3153,24 +3232,30 @@ def gen_encrypted():
     _enc_page(canvas.Canvas(buf, pagesize=letter))
     plain = buf.getvalue()
 
-    def pikepdf_enc(name, **kw):
-        path = os.path.join(ENC_OUT, name)
+    def pikepdf_enc(name, password="", **kw):
+        # static_id: qpdf otherwise writes a random trailer /ID, which is both churn in
+        # its own right AND (for RC4) the seed of the encryption key, so the whole file
+        # moved. With it pinned, every non-AES file below is byte-reproducible.
+        out = io.BytesIO()
         with pikepdf.open(io.BytesIO(plain)) as p:
-            p.save(path, encryption=pikepdf.Encryption(**kw))
-        return path
+            p.save(out, static_id=True, encryption=pikepdf.Encryption(**kw))
+        return _write_enc(name, out.getvalue(), password)
 
     aes_128 = pikepdf_enc("aes_128.pdf", R=4, aes=True, user="", owner="owner")
     pikepdf_enc("aes_256.pdf", R=6, aes=True, user="", owner="owner")
     # RC4 through pikepdf needs metadata=False (it refuses to leave metadata unencrypted
     # without AES); the reportlab RC4 files above cover the encrypted-metadata variant.
     rc4_128 = pikepdf_enc("rc4_128_pk.pdf", R=4, aes=False, user="", owner="owner", metadata=False)
-    userpw_aes = pikepdf_enc("userpw_aes_128.pdf", R=4, aes=True, user=ENC_USER_PW, owner="owner")
+    userpw_aes = pikepdf_enc("userpw_aes_128.pdf", password=ENC_USER_PW,
+                             R=4, aes=True, user=ENC_USER_PW, owner="owner")
 
+    # Each splice reads the file as it now stands on disk, so when the AES quarantine
+    # keeps `aes_128.pdf`'s committed bytes the inline splice of it is unchanged too.
     inline = [
         _inline_encrypt_dict(aes_128, "inline_encrypt_aes_128.pdf"),
         _inline_encrypt_dict(rc4_128, "inline_encrypt_rc4_128.pdf"),
     ]
-    inline_userpw = _inline_encrypt_dict(userpw_aes, "inline_encrypt_userpw.pdf")
+    inline_userpw = _inline_encrypt_dict(userpw_aes, "inline_encrypt_userpw.pdf", ENC_USER_PW)
     # The two files the inline shape was spliced from are only intermediates; the indirect
     # shape is already covered by the reportlab/pikepdf originals above.
     for tmp in (rc4_128, userpw_aes):
@@ -3221,7 +3306,7 @@ def gen_form_bomb():
     page = pdf.add_blank_page(page_size=(200, 200))
     page.Contents = pikepdf.Stream(pdf, b"q /X Do Q")
     page.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(X=form))
-    pdf.save(os.path.join(ADV_OUT, "form_bomb.pdf"))
+    pdf.save(os.path.join(ADV_OUT, "form_bomb.pdf"), static_id=True)
 
     # -- the control: one form legitimately drawn three times ------------------------
     pdf = pikepdf.new()
@@ -3253,7 +3338,7 @@ def gen_form_bomb():
                                         b"q 1 0 0 1 20 160 cm /R Do Q\n"
                                         b"q 1 0 0 1 20 30 cm /R Do Q\n")
     page.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(R=rep))
-    pdf.save(os.path.join(ADV_OUT, "form_repeat.pdf"))
+    pdf.save(os.path.join(ADV_OUT, "form_repeat.pdf"), static_id=True)
 
     GT["adversarial"] = {
         "bomb": "form_bomb.pdf",
@@ -4098,7 +4183,7 @@ def gen_rotated_image_fig():
     c.saveState()
     c.translate(ox + vw - 10, oy + 20)
     c.rotate(90)
-    c.drawImage(png, 0, 0, width=90, height=38)
+    draw_image(c, png, 0, 0, width=90, height=38)
     c.restoreState()
     c.setFont("Helvetica", 9.5)
     c.drawString(LM, oy - 18, "Figure 1: A chart whose right-axis label is a rotated raster.")
@@ -4463,7 +4548,11 @@ def main():
     gen_encrypted()
     gen_form_bomb()
     with open(os.path.join(OUT, "groundtruth.json"), "w") as f:
-        json.dump(GT, f, indent=2)
+        # sort_keys: the dict's insertion order is main()'s call order, so adding or
+        # reordering one generator reshuffled the whole file and buried the real change
+        # in a rename diff. Every consumer looks entries up by key.
+        json.dump(GT, f, indent=2, sort_keys=True)
+        f.write("\n")
     print(f"generated {len(GT)} fixture entries + groundtruth.json -> {OUT}")
 
 
