@@ -61,6 +61,7 @@ fn band_index(bounds: &[f32], v: f32) -> usize {
 pub(crate) fn bind_contained(
     axes: &GridAxes<'_>,
     spans: &[Span],
+    extent: impl Fn(&Span) -> (f32, f32),
     split: impl Fn(&Span, &[f32]) -> Vec<Span>,
 ) -> BoundCells {
     let (ncols, nrows) = (axes.ncols(), axes.nrows());
@@ -77,8 +78,7 @@ pub(crate) fn bind_contained(
         if cy < axes.ys[0] - tol || cy > axes.ys[nrows] + tol {
             continue;
         }
-        let x0 = s.x;
-        let x1 = s.x + s.width.max(0.0);
+        let (x0, x1) = extent(s);
         if x1 < axes.xs[0] - tol || x0 > axes.xs[ncols] + tol {
             continue;
         }
@@ -88,8 +88,7 @@ pub(crate) fn bind_contained(
         seen += 1;
         cut += usize::from(pieces.len() > 1);
         for piece in pieces {
-            let px0 = piece.x;
-            let px1 = piece.x + piece.width.max(0.0);
+            let (px0, px1) = extent(&piece);
             let c = band_index(axes.xs, (px0 + px1) * 0.5);
             cells[r * ncols + c].push(piece);
         }

@@ -1460,15 +1460,6 @@ fn l3_aligned(c: &Candidate, _spans: &[Span]) -> Option<PosTable> {
     c.aligned.clone()
 }
 
-/// Index of the band `bounds[k]..bounds[k+1]` containing `v`, clamped to the ends.
-fn band_index(bounds: &[f32], v: f32) -> usize {
-    match bounds.iter().position(|&b| v < b) {
-        Some(0) => 0,
-        Some(k) => k - 1,
-        None => bounds.len().saturating_sub(2),
-    }
-}
-
 /// A lattice bigger than this is a chart's gridlines or a calendar of nothing; building a grid
 /// of that size from spans is pure cost.
 const MAX_LATTICE_CELLS: usize = 4096;
@@ -1508,37 +1499,12 @@ const FRAME_COVERS: f32 = 0.5;
 /// gridlines or a form's decorative border, not a table.
 fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PosTable> {
     let f = c.frame?;
-    let (ncols, nrows) = (f.xs.len() - 1, f.ys.len() - 1);
+    let axes = f.axes();
+    let (ncols, nrows) = (axes.ncols(), axes.nrows());
     if ncols < 2 || nrows < 2 || ncols * nrows > MAX_LATTICE_CELLS {
         return None;
     }
-    let mut cells: Vec<Vec<Span>> = vec![Vec::new(); ncols * nrows];
-    let (mut seen, mut cut) = (0usize, 0usize);
-    let tol = 1.0f32;
-    for s in spans {
-        if s.angle.abs() >= 0.01 || s.text.trim().is_empty() {
-            continue;
-        }
-        // Text sits ON its cell's baseline, a little above the rule below it; nudge to the
-        // glyph body's middle so a baseline that grazes the boundary lands in its own row.
-        let cy = s.y + s.size * 0.25;
-        if cy < f.ys[0] - tol || cy > f.ys[nrows] + tol {
-            continue;
-        }
-        let (x0, x1) = span_extent(s);
-        if x1 < f.xs[0] - tol || x0 > f.xs[ncols] + tol {
-            continue;
-        }
-        // `ys` is ascending with y up, so the first READING-ORDER row is the last band.
-        let r = nrows - 1 - band_index(&f.ys, cy);
-        let pieces = split_span_at(s, &f.xs);
-        seen += 1;
-        cut += usize::from(pieces.len() > 1);
-        for piece in pieces {
-            let (px0, px1) = span_extent(&piece);
-            cells[r * ncols + band_index(&f.xs, (px0 + px1) * 0.5)].push(piece);
-        }
-    }
+    let bound = crate::grid::bind_contained(&axes, spans, span_extent, split_span_at);
     // A grid line THROUGH a word is evidence against the lattice, not for it. Containment is
     // only meaningful where the producer meant the line to bound a cell; a map's graticule, a
     // chart's gridlines and a decorative rule all cross whatever text is under them, and
@@ -1546,11 +1512,16 @@ fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PosTable> {
     // (`tests/fixtures_pdf/map_label_grid.pdf`: `Guerneville` → `Guernevil` + `le`). A real
     // table's ruling essentially never cuts a word, so the tolerance is a floor against
     // measurement noise rather than a budget.
-    if seen > 0 && cut * 100 > seen * LATTICE_CUT_PCT {
+    if bound.seen > 0 && bound.cut * 100 > bound.seen * LATTICE_CUT_PCT {
         return None;
     }
-    let grid: Vec<Vec<String>> =
-        (0..nrows).map(|r| (0..ncols).map(|k| lattice_cell_text(&cells[r * ncols + k])).collect()).collect();
+    let grid: Vec<Vec<String>> = (0..bound.nrows)
+        .map(|r| {
+            (0..bound.ncols)
+                .map(|k| lattice_cell_text(&bound.cells[r * bound.ncols + k]))
+                .collect()
+        })
+        .collect();
     // ADMISSION. A lattice is evidence of cell boundaries, not of a table: a chart's gridlines
     // and a form's decorative border draw one too. Require real content, spread over at least
     // two rows AND two columns — one populated row is a caption strip, one populated column is
@@ -1568,10 +1539,10 @@ fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PosTable> {
         return None;
     }
     Some(PosTable {
-        y_top: f.bbox.y1,
-        y_bottom: f.bbox.y0,
-        x_left: f.bbox.x0,
-        x_right: f.bbox.x1,
+        y_top: axes.bbox.y1,
+        y_bottom: axes.bbox.y0,
+        x_left: axes.bbox.x0,
+        x_right: axes.bbox.x1,
         grid,
         header: Vec::new(),
     })
