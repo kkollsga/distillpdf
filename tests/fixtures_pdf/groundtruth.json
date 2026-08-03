@@ -1213,5 +1213,15 @@
         "128"
       ]
     ]
+  },
+  "ruled_blank_cells.pdf": {
+    "rows": 6,
+    "cols": 4
+  },
+  "booktabs_wrapped.pdf": {
+    "tables": 1
+  },
+  "three_column_prose.pdf": {
+    "tables": 1
   }
 }

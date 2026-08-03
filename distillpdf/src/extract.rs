@@ -1026,21 +1026,37 @@ fn lay_out_grid(rows: &[&Vec<(String, crate::geom::Rect, bool)>], spans: &[Vec<(
 /// two sides are genuinely separate (this is what stops adjacent-column prose from
 /// merging into a phantom wide table). Otherwise (single column, or a full-width
 /// element across the centre) the whole page is one region.
-pub fn detect_tables_pos(spans: &[Span]) -> Vec<PosTable> {
+///
+/// `rules` is the page's ruling ([`crate::vector::PageRules`]) — the second evidence source.
+/// It enters here as **edges only**: [`crate::lattice::h_bands`] merges the horizontal rules
+/// into row bands, and the detector consults them where alignment alone cannot decide (see
+/// [`rule_banded`]). The ruling does NOT build a grid of its own and does not bind text to
+/// cells; [`crate::lattice::frames`] derives the closed-cell geometry a shared grid core will
+/// consume, and until that core exists nothing downstream of these edges is duplicated here.
+pub fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Vec<PosTable> {
     // Tables are built from upright text only — rotated labels (axis titles etc.) must
     // not perturb gutter detection or column structure (they're figure labels).
     let upright: Vec<Span> = spans.iter().filter(|s| s.angle.abs() < 0.01).map(clone_span).collect();
     let spans = &upright[..];
+    // The row BANDS the page rules, merged. Booktabs evidence: a rule above the header and one
+    // under the last row, which is all a booktabs table publishes and all the alignment path
+    // needs to trust a run too short to trust on alignment alone.
+    let bands = if rules.h.is_empty() { Vec::new() } else { crate::lattice::h_bands(rules) };
+    detect_aligned_tables(spans, &bands)
+}
+
+/// L1a — the text-alignment detector: the whole page, or one lane per text column.
+fn detect_aligned_tables(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTable> {
     match central_gutter(spans) {
-        None => detect_tables_region(spans),
+        None => detect_lanes(spans, bands),
         Some(g) => {
             // Split down the gutter and detect each side independently (this is what
             // stops adjacent-column prose from merging into a phantom wide table).
             let side = |left: bool| -> Vec<Span> {
                 spans.iter().filter(|s| (s.x + s.width.max(0.0) * 0.5 < g) == left).map(clone_span).collect()
             };
-            let lt = detect_tables_region(&side(true));
-            let rt = detect_tables_region(&side(false));
+            let lt = detect_tables_region(&side(true), bands);
+            let rt = detect_tables_region(&side(false), bands);
             // A full-width table (e.g. BERT's GLUE table) was split into a left half
             // and a right half that occupy the SAME rows. Detect that: a left-side
             // table whose vertical extent overlaps a right-side table is one table cut
@@ -1064,7 +1080,7 @@ pub fn detect_tables_pos(spans: &[Span]) -> Vec<PosTable> {
                         let pad = 2.0;
                         let band: Vec<Span> =
                             spans.iter().filter(|s| s.y >= yb - pad && s.y <= yt + pad).map(clone_span).collect();
-                        let merged = detect_tables_region(&band);
+                        let merged = detect_tables_region(&band, bands);
                         if merged.is_empty() {
                             out.push(l.clone());
                             out.push(r.clone());
@@ -1085,10 +1101,169 @@ pub fn detect_tables_pos(spans: &[Span]) -> Vec<PosTable> {
     }
 }
 
+/// Is this run of rows bracketed above and below by a rule that spans it?
+///
+/// The booktabs signature, read literally: a horizontal band above the header and another under
+/// the last row, each covering most of the run's width and sitting within `pad` of it (so a rule
+/// belonging to something else further up the page cannot vouch for anything). Bands arrive
+/// already merged ([`crate::lattice::h_bands`]) — a rule drawn in three abutting pieces is one
+/// boundary, and read as three it spans nothing.
+fn rule_banded(bands: &[(f32, f32, f32)], x0: f32, x1: f32, y_lo: f32, y_hi: f32, pad: f32) -> bool {
+    let w = x1 - x0;
+    if w < 60.0 {
+        return false; // too narrow to be a table's width; two aligned words, not two rows
+    }
+    let spans = |&(a, b, _): &(f32, f32, f32)| b.min(x1) - a.max(x0) >= w * 0.7;
+    let above = bands.iter().any(|r| spans(r) && r.2 > y_hi && r.2 <= y_hi + pad);
+    let below = bands.iter().any(|r| spans(r) && r.2 < y_lo && r.2 >= y_lo - pad);
+    above && below
+}
+
+/// Whether a set of rows carries wrapping PROSE between `lo` and `hi`: a line that is a
+/// single wide cell of ≥4 words spanning most of the lane. This is the same test
+/// [`central_gutter`] makes of each half, factored out so an n-column page is judged by
+/// exactly the rule a two-column page is.
+fn prose_lines_in(rows: &[Vec<Span>], lo: f32, hi: f32, min_w: f32) -> usize {
+    rows.iter()
+        .filter(|r| {
+            let side: Vec<Span> =
+                r.iter().filter(|s| { let c = s.x + s.width.max(0.0) * 0.5; c >= lo && c < hi }).map(clone_span).collect();
+            let cells = row_cells(&side);
+            cells.len() == 1 && cells[0].text.split_whitespace().count() >= 4 && (cells[0].end - cells[0].x) > min_w
+        })
+        .count()
+}
+
+/// The gutters of a page laid out in **three or more** text columns, left to right.
+///
+/// [`central_gutter`] answers the two-column question by scanning the middle third for the
+/// single clearest lane — which is exactly right for two columns and structurally unable to
+/// see three. A three-column page has no clean *centre* lane at all, so the whole page was
+/// treated as one region and adjacent columns' lines clustered into phantom rows: measured on
+/// `gov_usgs_usgs70277647` p1, three blocks of newsletter prose came back as 13×3, 19×3 and
+/// 7×3 tables. This finds every clear lane instead of the best one.
+///
+/// The admission rule is the two-column rule applied to every resulting column: each must
+/// carry ≥3 lines of wrapping prose. A TABLE's internal gutters are clear too — that is what a
+/// column gutter is — and its columns are not prose, which is what tells the two apart.
+///
+/// Returns empty for a page with fewer than two gutters; the two-column case stays with
+/// [`central_gutter`], byte for byte.
+pub(crate) fn column_gutters(spans: &[Span]) -> Vec<f32> {
+    let rows = rows_of(spans.iter().map(clone_span).collect());
+    if rows.len() < 6 {
+        return Vec::new();
+    }
+    let span_r = |s: &Span| (s.x, s.x + s.width.max(s.size * 0.3));
+    let x0 = spans.iter().map(|s| s.x).fold(f32::INFINITY, f32::min);
+    let x1 = spans.iter().map(|s| span_r(s).1).fold(f32::NEG_INFINITY, f32::max);
+    let width = x1 - x0;
+    if !width.is_finite() || width <= 1.0 {
+        return Vec::new();
+    }
+    let need = rows.len() as f32 * 0.88;
+    let step = (width / 400.0).max(0.5);
+    // Maximal runs of x crossed by almost no row. The margins are excluded: a page's outer
+    // whitespace is clear by definition and is not a gutter.
+    let mut lanes: Vec<(f32, f32)> = Vec::new();
+    let mut run: Option<(f32, f32)> = None;
+    let mut x = x0 + width * 0.08;
+    let hi = x1 - width * 0.08;
+    while x <= hi {
+        let clear = rows.iter().filter(|r| !r.iter().any(|s| { let (a, b) = span_r(s); a <= x && x <= b })).count();
+        if clear as f32 >= need {
+            run = Some(run.map_or((x, x), |(a, _)| (a, x)));
+        } else if let Some(r) = run.take() {
+            lanes.push(r);
+        }
+        x += step;
+    }
+    if let Some(r) = run.take() {
+        lanes.push(r);
+    }
+    // A gutter is a LANE, not the one-step gap between two words.
+    lanes.retain(|&(a, b)| b - a >= width * 0.015);
+    if lanes.len() < 2 {
+        return Vec::new();
+    }
+    let gutters: Vec<f32> = lanes.iter().map(|&(a, b)| (a + b) * 0.5).collect();
+    let mut edges: Vec<f32> = vec![f32::NEG_INFINITY];
+    edges.extend(gutters.iter().copied());
+    edges.push(f32::INFINITY);
+    for w in edges.windows(2) {
+        let (lo, hi) = (w[0], w[1]);
+        // The lane's own width, for the "spans most of the column" test: unbounded at the
+        // page edges, so clamp to the text extent.
+        let (plo, phi) = (lo.max(x0 - 1.0), hi.min(x1 + 1.0));
+        if prose_lines_in(&rows, lo, hi, (phi - plo) * 0.5) < 3 || phi - plo < width * 0.1 {
+            return Vec::new(); // not a multi-column PROSE layout — treat the page whole
+        }
+    }
+    gutters
+}
+
+/// Detect tables on a page that has no clean CENTRE gutter: either three-or-more prose columns
+/// (each detected independently, then rejoined where one table spans them) or, far more often,
+/// a single region.
+fn detect_lanes(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTable> {
+    let gutters = column_gutters(spans);
+    if gutters.len() < 2 {
+        return detect_tables_region(spans, bands);
+    }
+    let lane_of = |s: &Span| gutters.iter().filter(|&&g| s.x + s.width.max(0.0) * 0.5 >= g).count();
+    let nlanes = gutters.len() + 1;
+    let per_lane: Vec<Vec<PosTable>> =
+        (0..nlanes).map(|k| detect_tables_region(&spans.iter().filter(|s| lane_of(s) == k).map(clone_span).collect::<Vec<_>>(), bands)).collect();
+    // A table spanning the columns was cut into pieces occupying the SAME rows — the
+    // two-column path's rejoin, generalised: chain each lane's table to an unused overlapping
+    // one in a lane to its right, then re-detect across the full width within just that
+    // vertical band. A single-column table beside prose has no mate and is kept as it is.
+    let overlaps = |a: (f32, f32), b: &PosTable| {
+        let lo = a.0.max(b.y_bottom);
+        let hi = a.1.min(b.y_top);
+        let span = (a.1 - a.0).min(b.y_top - b.y_bottom).max(1.0);
+        (hi - lo) >= span * 0.5
+    };
+    let mut used: Vec<Vec<bool>> = per_lane.iter().map(|v| vec![false; v.len()]).collect();
+    let mut out: Vec<PosTable> = Vec::new();
+    for k in 0..nlanes {
+        for i in 0..per_lane[k].len() {
+            if used[k][i] {
+                continue;
+            }
+            used[k][i] = true;
+            let t = &per_lane[k][i];
+            let (mut yb, mut yt) = (t.y_bottom, t.y_top);
+            let mut chain: Vec<&PosTable> = vec![t];
+            for (k2, lane) in per_lane.iter().enumerate().skip(k + 1) {
+                if let Some(j) = (0..lane.len()).find(|&j| !used[k2][j] && overlaps((yb, yt), &lane[j])) {
+                    used[k2][j] = true;
+                    yb = yb.min(lane[j].y_bottom);
+                    yt = yt.max(lane[j].y_top);
+                    chain.push(&lane[j]);
+                }
+            }
+            if chain.len() == 1 {
+                out.push(t.clone());
+                continue;
+            }
+            let pad = 2.0;
+            let band: Vec<Span> = spans.iter().filter(|s| s.y >= yb - pad && s.y <= yt + pad).map(clone_span).collect();
+            let merged = detect_tables_region(&band, bands);
+            if merged.is_empty() {
+                out.extend(chain.into_iter().cloned());
+            } else {
+                out.extend(merged);
+            }
+        }
+    }
+    out
+}
+
 /// Detect tables within a single region (one text column, or the whole page):
 /// runs of >=3 consecutive multi-cell rows sharing >=2 aligned columns (occupied
 /// in a majority of rows). Rejects word-positioned prose (words merge to a cell).
-fn detect_tables_region(spans: &[Span]) -> Vec<PosTable> {
+fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTable> {
     let avg_size = if spans.is_empty() {
         10.0
     } else {
@@ -1125,14 +1300,26 @@ fn detect_tables_region(spans: &[Span]) -> Vec<PosTable> {
                 if cx <= region_min_x + tol {
                     continue; // sits at the left edge -> a row label / prose line, not overflow
                 }
+                // A column of the NEIGHBOURHOOD, not only of the anchor this line will join.
+                // The narrow reading missed the commonest wrapped cell there is: a status
+                // value ("Not / Effective") whose two lines both sit under the *header's*
+                // Status column while the data row beside them has nothing in that column at
+                // all — there is no cell to line up with in the row it belongs to, because the
+                // column is named one row further up. Widened to the whole region it is far
+                // too greedy (measured: it swallowed the label lines of three IRS forms and
+                // destroyed their tables), so the neighbourhood is a couple of lines.
+                let near = avg_size * 4.0;
+                let names_column = anchors.iter().any(|&i| {
+                    (celled[i].0 - celled[ti].0).abs() <= near && celled[i].1.iter().any(|c| (c.x - cx).abs() <= tol)
+                });
+                if !names_column {
+                    continue;
+                }
                 let mut best: Option<(usize, f32)> = None;
                 for &ai in &anchors {
                     let dy = (celled[ai].0 - celled[ti].0).abs();
                     if dy > avg_size * 1.8 {
                         continue; // not vertically adjacent -> not the same wrapped cell
-                    }
-                    if !celled[ai].1.iter().any(|c| (c.x - cx).abs() <= tol) {
-                        continue; // overflow x must line up with one of the anchor's columns
                     }
                     if best.is_none_or(|(_, bd)| dy < bd) {
                         best = Some((ai, dy));
@@ -1174,7 +1361,7 @@ fn detect_tables_region(spans: &[Span]) -> Vec<PosTable> {
     let mut tables = Vec::new();
 
     let flush = |run: &Vec<&(f32, Vec<Cell>, Vec<Span>)>, headers: &[&(f32, Vec<Cell>, Vec<Span>)], tables: &mut Vec<PosTable>| {
-        if run.len() < 3 {
+        if run.len() < 2 {
             return;
         }
         let owned: Vec<Vec<Cell>> = run
@@ -1187,6 +1374,29 @@ fn detect_tables_region(spans: &[Span]) -> Vec<PosTable> {
             for c in row {
                 x_left = x_left.min(c.x);
                 x_right = x_right.max(c.end);
+            }
+        }
+        // A run of three aligned rows is a table on its own evidence. A run of TWO is not —
+        // two lines of anything can accidentally align, and admitting them on alignment alone
+        // is the classic false-positive flood. But a two-row run bracketed by a rule above and
+        // a rule below, each running the width of the run, is exactly what a booktabs table
+        // IS, and the ruling is not accidental. Measured: five World Bank status pages publish
+        // their disbursement and key-dates tables as header + one data row between two rules,
+        // and no amount of alignment work can reach them.
+        if run.len() < 3 {
+            // …and at least three columns in every row. Two rows and two columns is a BOX, and
+            // a boxed pair of fields is the commonest ruled thing on a page that is not a
+            // table: measured on `space_moon_lunar_surface_databook_nasa`, the running header
+            // ("Revision | Document No | Effective Date | Page") is a 2x2 ruled block repeated
+            // on all 70 pages, and admitting it took that document from 25 tables to 93. A
+            // real header-plus-one-row table is wide — the World Bank disbursement tables this
+            // rule exists for are seven and eight columns.
+            if owned.iter().any(|r| r.len() < 3) {
+                return;
+            }
+            let (y_lo, y_hi) = (run.last().map_or(0.0, |r| r.0), run.first().map_or(0.0, |r| r.0));
+            if !rule_banded(bands, x_left, x_right, y_lo, y_hi, avg_size * 3.0) {
+                return;
             }
         }
         // Build a grid from the RAW SPANS for a candidate set of kept columns (expressed as
@@ -1436,8 +1646,8 @@ fn detect_tables_region(spans: &[Span]) -> Vec<PosTable> {
     tables
 }
 
-fn detect_tables(spans: Vec<Span>) -> Vec<Vec<Vec<String>>> {
-    detect_tables_pos(&spans).into_iter().map(|t| t.grid).collect()
+fn detect_tables(spans: Vec<Span>, rules: &crate::vector::PageRules) -> Vec<Vec<Vec<String>>> {
+    detect_tables_pos(&spans, rules).into_iter().map(|t| t.grid).collect()
 }
 
 
@@ -1450,8 +1660,13 @@ fn detect_tables(spans: Vec<Span>) -> Vec<Vec<Vec<String>>> {
 /// loop, including each page's internal table order.
 pub fn extract_tables(doc: &Document, raw: &[u8]) -> Vec<TableInfo> {
     let pages = doc.get_pages();
-    let mut per_page: Vec<(u32, Vec<Vec<Vec<String>>>)> =
-        pages.par_iter().map(|(&pno, &page_id)| (pno, detect_tables(text::extract_spans(doc, page_id, raw)))).collect();
+    let mut per_page: Vec<(u32, Vec<Vec<Vec<String>>>)> = pages
+        .par_iter()
+        .map(|(&pno, &page_id)| {
+            let rules = crate::vector::page_rules(doc, page_id);
+            (pno, detect_tables(text::extract_spans(doc, page_id, raw), &rules))
+        })
+        .collect();
     per_page.sort_by_key(|(pno, _)| *pno);
     per_page
         .into_iter()
@@ -1564,6 +1779,75 @@ mod tests {
         Document::load(path).expect("form_image.pdf fixture must load")
     }
 
+    /// One committed fixture's page 1, detected exactly as the product detects it: spans and
+    /// ruling from the same page, through the same entry point.
+    fn detect_fixture(name: &str) -> Vec<PosTable> {
+        let path = format!("{}/../tests/fixtures_pdf/{name}", env!("CARGO_MANIFEST_DIR"));
+        let doc = Document::load(&path).unwrap_or_else(|e| panic!("{name} must load: {e}"));
+        let raw = std::fs::read(&path).expect("fixture readable");
+        let page = *doc.get_pages().get(&1).expect("page 1");
+        let spans = crate::text::extract_spans(&doc, page, &raw);
+        detect_tables_pos(&spans, &crate::vector::page_rules(&doc, page))
+    }
+
+    #[test]
+    fn a_ruled_grid_publishes_its_own_rows_and_columns_where_the_text_cannot() {
+        // `tests/gen_fixtures.py::gen_ruled_blank_cells`. Two shapes that are invisible to text
+        // clustering *by construction*: a column nobody typed in (nothing aligns there) and a
+        // full-width band title (a ONE-cell row, which ends the run of multi-cell rows and cuts
+        // the table in two). The RULING states both plainly — six row bands, four column bands,
+        // every cell closed on all four sides — and that geometry is what a shared grid core
+        // consumes. This test pins the derivation, not a binding: see the `lattice` module note
+        // on why the cell assembly is not here.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/ruled_blank_cells.pdf");
+        let doc = Document::load(path).expect("ruled_blank_cells.pdf must load");
+        let raw = std::fs::read(path).expect("fixture readable");
+        let page = *doc.get_pages().get(&1).expect("page 1");
+        let rules = crate::vector::page_rules(&doc, page);
+        let frames = crate::lattice::frames(&rules);
+        assert_eq!(frames.len(), 1, "one ruled frame, got {}", frames.len());
+        assert_eq!(frames[0].xs.len(), 5, "4 column bands: {:?}", frames[0].xs);
+        assert_eq!(frames[0].ys.len(), 7, "6 row bands, band titles included: {:?}", frames[0].ys);
+
+        // And the repro this fixture exists for, kept live rather than described: the text path
+        // — which is all that runs today — cannot produce that shape from this page.
+        let spans = crate::text::extract_spans(&doc, page, &raw);
+        let text_only = detect_tables_pos(&spans, &rules);
+        assert!(
+            text_only.len() != 1 || text_only[0].grid.len() != 6 || text_only[0].grid[0].len() != 4,
+            "if the text path already got this right the fixture proves nothing: {shape:?}",
+            shape = text_only.iter().map(|t| (t.grid.len(), t.grid[0].len())).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_booktabs_table_with_a_wrapped_cell_is_one_table_not_three() {
+        // `tests/gen_fixtures.py::gen_booktabs_wrapped`. This is the shape we lead pymupdf on
+        // by an order of magnitude, and the shape a ruling path most easily damages: the
+        // under-header rule looks like a row boundary and the wrapped Description line looks
+        // like a row. Nothing here closes a cell, so the lattice must find nothing at all.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/booktabs_wrapped.pdf");
+        let doc = Document::load(path).expect("booktabs_wrapped.pdf must load");
+        let page = *doc.get_pages().get(&1).expect("page 1");
+        let rules = crate::vector::page_rules(&doc, page);
+        assert!(crate::lattice::frames(&rules).is_empty(), "horizontal rules alone close no cell");
+        let tables = detect_fixture("booktabs_wrapped.pdf");
+        assert_eq!(tables.len(), 1, "one table, got {}", tables.len());
+        let g = &tables[0].grid;
+        assert_eq!(g.len(), 4, "the wrapped line folds into its cell: {g:?}");
+        assert!(g[2][1].contains("long") && g[2][1].contains("sweeps"), "wrapped cell joined: {g:?}");
+    }
+
+    #[test]
+    fn a_three_column_page_yields_its_one_real_table_and_no_phantoms() {
+        // `tests/gen_fixtures.py::gen_three_column_prose`, the `gov_usgs_usgs70277647` p1
+        // class. With no clean CENTRE gutter the page was read whole and the three columns'
+        // lines clustered into rows across the gutters — three phantom N×3 grids of prose.
+        let tables = detect_fixture("three_column_prose.pdf");
+        assert_eq!(tables.len(), 1, "exactly one table, got {}: {:?}", tables.len(), tables.iter().map(|t| t.grid.len()).collect::<Vec<_>>());
+        assert_eq!(tables[0].grid[0][0].trim(), "Zone", "and it is the ruled one: {:?}", tables[0].grid);
+    }
+
     #[test]
     fn a_table_drawn_one_glyph_per_tj_reads_as_words_not_spaced_letters() {
         // `tests/gen_fixtures.py::gen_glyph_table`. Both cell builders — `row_cells`, which
@@ -1578,7 +1862,7 @@ mod tests {
         let raw = std::fs::read(path).expect("fixture readable");
         let page = *doc.get_pages().get(&1).expect("page 1");
         let spans = crate::text::extract_spans(&doc, page, &raw);
-        let tables = detect_tables_pos(&spans);
+        let tables = detect_tables_pos(&spans, &crate::vector::page_rules(&doc, page));
         assert_eq!(tables.len(), 1, "one table, got {}", tables.len());
         let want = [
             ["Region", "Samples", "Depth"],
@@ -1617,7 +1901,7 @@ mod tests {
             let Ok(doc) = Document::load_mem(&raw) else { continue }; // encrypted / damaged
             let mut want: Vec<(u32, Vec<Vec<String>>)> = Vec::new();
             for (&pno, &page_id) in &doc.get_pages() {
-                for grid in detect_tables(text::extract_spans(&doc, page_id, &raw)) {
+                for grid in detect_tables(text::extract_spans(&doc, page_id, &raw), &crate::vector::page_rules(&doc, page_id)) {
                     want.push((pno, grid));
                 }
             }

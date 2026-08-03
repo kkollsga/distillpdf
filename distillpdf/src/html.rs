@@ -1250,9 +1250,14 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         // goes through these; `v.x_left`/`im.x_left` stay page-space for the SVG emitters.
         let dvbox = |v: &vector::PlacedSvg| turn.rect(v.x_left, v.x_right, v.y_bottom, v.y_top);
         let dibox = |im: &img::Placed| turn.rect(im.x_left, im.x_right, im.y_bottom, im.y_top);
-        let mut tables = extract::detect_tables_pos(dspans);
         let mut images = img::positioned_images(doc, *_pid, inline_images);
-        let (raw_vectors, weak_vectors) = vector::positioned_vectors(doc, *_pid);
+        // One vector walk, two answers: the figures, and the page's RULING — L1's second
+        // evidence source for tables (`extract::detect_tables_pos`). The ruling arrives in
+        // page space like every other geometry the walk produces, so it takes the same turn
+        // the spans did, or a rotated page's lattice lands nowhere.
+        let (raw_vectors, weak_vectors, page_rules) = vector::positioned_vectors_ruled(doc, *_pid);
+        let page_rules = turn_rules(turn, page_rules);
+        let mut tables = extract::detect_tables_pos(dspans, &page_rules);
         // Vector figures that carry a "Figure N" caption — their *internal* text (a diagram's
         // node labels: "E[CLS] E1 … EN", "Trm Trm … Trm") now lands in the page span stream
         // (extract_spans recurses into Form XObjects), where detect_tables_pos reads the
@@ -2415,6 +2420,32 @@ pub(crate) const DOC_SHELL_HEAD: &str = "<!doctype html>\n<html>\n<head>\n<meta 
 pub(crate) fn turn_span(turn: geom::PageTurn, s: &Span) -> Span {
     let (x, y) = turn.pt(s.x, s.y);
     Span { x, y, angle: turn.angle(s.angle), ..clone_span(s) }
+}
+
+/// A page's ruling in DISPLAY space. Each rule is a degenerate rectangle, so it turns through
+/// [`geom::PageTurn::rect`] exactly like a table or figure box does — and on a quarter-turned
+/// page a horizontal rule becomes a vertical one, which is why the two lists swap rather than
+/// each being mapped in place. Upright pages take the untouched original.
+fn turn_rules(turn: geom::PageTurn, r: vector::PageRules) -> vector::PageRules {
+    if turn.is_identity() {
+        return r;
+    }
+    let mut out = vector::PageRules::default();
+    let mut place = |x0: f32, y0: f32, x1: f32, y1: f32| {
+        let (dx0, dx1, dy0, dy1) = turn.rect(x0, x1, y0, y1);
+        if dx1 - dx0 >= dy1 - dy0 {
+            out.h.push((dx0, dx1, (dy0 + dy1) * 0.5));
+        } else {
+            out.v.push(((dx0 + dx1) * 0.5, dy0, dy1));
+        }
+    };
+    for &(x0, x1, y) in &r.h {
+        place(x0, y, x1, y);
+    }
+    for &(x, y0, y1) in &r.v {
+        place(x, y0, x, y1);
+    }
+    out
 }
 
 pub(crate) fn clone_span(s: &Span) -> Span {

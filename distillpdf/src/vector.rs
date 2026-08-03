@@ -1019,17 +1019,154 @@ fn path_bbox(cur: &[Seg]) -> Option<(f32, f32, f32, f32)> {
     bb.is_valid().then_some((bb.x0, bb.y0, bb.x1, bb.y1))
 }
 
+/// The axis-aligned RULING a page paints, in page space (y up).
+///
+/// A ruled table publishes its own cell boundaries geometrically — the rules *are* the grid —
+/// and that evidence is completely independent of where the text sits, which is what makes it
+/// able to see a blank cell (invisible to text clustering by construction) and a band title
+/// that would otherwise terminate a text run. [`crate::lattice`] turns these segments into
+/// closed-cell frames; nothing here knows what a table is.
+#[derive(Default)]
+pub struct PageRules {
+    /// `(x0, x1, y)` per horizontal rule, `x0 < x1`.
+    pub h: Vec<(f32, f32, f32)>,
+    /// `(x, y0, y1)` per vertical rule, `y0 < y1`.
+    pub v: Vec<(f32, f32, f32)>,
+}
+
+/// A rule is THIN — anything fatter is a filled panel (a shaded header band, a callout box),
+/// whose *edges* may bound cells but whose body is not a boundary.
+const RULE_THICK: f32 = 3.0;
+/// Shorter than this is a tick, a hyphen glyph outline or a leader dot, not a cell boundary.
+const RULE_MIN_LEN: f32 = 8.0;
+/// How far off-axis a segment may run and still be read as a rule.
+const RULE_STRAIGHT: f32 = 0.8;
+/// Ruling budget for one page. A cartographic page paints tens of thousands of short
+/// segments; the lattice caps its own line count anyway, and this bounds the collection.
+const MAX_RULES: usize = 20_000;
+
+/// One straight segment's contribution to the ruling, if it is one.
+fn push_rule(out: &mut PageRules, ax: f32, ay: f32, bx: f32, by: f32) {
+    let (dx, dy) = ((bx - ax).abs(), (by - ay).abs());
+    if dy <= RULE_STRAIGHT && dx >= RULE_MIN_LEN {
+        out.h.push((ax.min(bx), ax.max(bx), (ay + by) * 0.5));
+    } else if dx <= RULE_STRAIGHT && dy >= RULE_MIN_LEN {
+        out.v.push(((ax + bx) * 0.5, ay.min(by), ay.max(by)));
+    }
+}
+
+/// Read the page's painted paths as ruling. Both forms a producer uses are collected: a THIN
+/// FILLED box (how every government form paints its grid) and every axis-aligned straight
+/// segment of a STROKED path (which hands over all four edges of a stroked cell box).
+fn rules_of(painted: &[Painted]) -> PageRules {
+    let mut out = PageRules::default();
+    for p in painted {
+        if out.h.len() + out.v.len() >= MAX_RULES {
+            break;
+        }
+        if p.fill.is_some() && p.fill_op > 0.05 {
+            let (w, h) = (p.x1 - p.x0, p.y1 - p.y0);
+            if h <= RULE_THICK && w >= RULE_MIN_LEN {
+                out.h.push((p.x0, p.x1, (p.y0 + p.y1) * 0.5));
+            } else if w <= RULE_THICK && h >= RULE_MIN_LEN {
+                out.v.push(((p.x0 + p.x1) * 0.5, p.y0, p.y1));
+            }
+        }
+        if p.stroke.is_some() && p.stroke_op > 0.05 {
+            let (mut cx, mut cy, mut sx, mut sy) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            let mut open = false;
+            for s in &p.segs {
+                match *s {
+                    Seg::M(x, y) => {
+                        cx = x;
+                        cy = y;
+                        sx = x;
+                        sy = y;
+                        open = true;
+                    }
+                    Seg::L(x, y) => {
+                        if open {
+                            push_rule(&mut out, cx, cy, x, y);
+                        }
+                        cx = x;
+                        cy = y;
+                        open = true;
+                    }
+                    Seg::C(_, _, _, _, x, y) => {
+                        cx = x;
+                        cy = y;
+                    }
+                    Seg::Z => {
+                        if open {
+                            push_rule(&mut out, cx, cy, sx, sy);
+                        }
+                        cx = sx;
+                        cy = sy;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Vector figures on a page, top-to-bottom.
 /// Returns `(strong, weak)` placed vector figures. STRONG are emitted unconditionally; WEAK
 /// are sub-threshold candidates html.rs promotes only when a figure caption anchors to one.
 pub fn positioned_vectors(doc: &Document, page_id: ObjectId) -> (Vec<PlacedSvg>, Vec<PlacedSvg>) {
+    let (s, w, _) = positioned_vectors_capped(doc, page_id, MAX_OPS);
+    (s, w)
+}
+
+/// [`positioned_vectors`] plus the page's ruling — one walk, two answers, for the caller
+/// (`html.rs`) that needs both. The ruling is the table pillar's second evidence source.
+pub fn positioned_vectors_ruled(doc: &Document, page_id: ObjectId) -> (Vec<PlacedSvg>, Vec<PlacedSvg>, PageRules) {
     positioned_vectors_capped(doc, page_id, MAX_OPS)
+}
+
+/// Just the page's ruling, for the table pillar's own entry point (`extract_tables`), which
+/// has no use for the figures.
+pub fn page_rules(doc: &Document, page_id: ObjectId) -> PageRules {
+    rules_of(&painted_page(doc, page_id, MAX_OPS))
 }
 
 /// [`positioned_vectors`] with an explicit operation budget (the public entry point passes
 /// [`MAX_OPS`]). Exposed internally so the truncation behaviour is unit-testable with a tiny
 /// cap instead of a half-million-operation fixture.
-fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (Vec<PlacedSvg>, Vec<PlacedSvg>) {
+fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (Vec<PlacedSvg>, Vec<PlacedSvg>, PageRules) {
+    let painted = painted_page(doc, page_id, cap);
+    let rules = rules_of(&painted);
+    // Paint order is stamped by the walk itself (`PaintSeq`, the operation's address in the
+    // content tree) rather than re-derived from this vector's order here. The two are the
+    // same ordering, but only the address is comparable with `img::positioned_images`'s
+    // rasters, which is what lets a composited figure interleave the two.
+    // The page's `/Rotate` reaches only the FIGURE geometry (`build_svg`'s local mapping and
+    // the label/raster plumbing that shares it). Everything upstream of this line — the walk,
+    // the clip crop, `cluster_figures`'s banding and its size bars — deliberately stays in
+    // page space: those thresholds (`BAND_GAP`, `MIN_W`/`MIN_H`, the 400×600 full-page-fill
+    // filter) are orientation-sensitive, so folding the turn into the base CTM would silently
+    // change which clusters become figures on a rotated page for reasons unrelated to this
+    // defect. Turning at the page→SVG-local boundary fixes the orientation and leaves every
+    // selection rule — and every page-space comparison `html.rs` makes against these boxes —
+    // exactly as it was.
+    let rot = crate::pdfobj::page_rotation(doc, page_id);
+    let page_w = page_width(doc, page_id, rot);
+    let (strong, weak) = cluster_figures(painted, rot);
+    let strong: Vec<PlacedSvg> = strong.iter().map(|c| build_svg(c, page_w, rot)).collect();
+    let weak: Vec<PlacedSvg> = weak
+        .iter()
+        .map(|(c, demoted)| {
+            let mut s = build_svg(c, page_w, rot);
+            s.demoted = *demoted;
+            s
+        })
+        .collect();
+    (strong, weak, rules)
+}
+
+/// Interpret one page's content (and its annotation appearances) into painted paths — the
+/// shared front half of [`positioned_vectors_capped`] and [`page_rules`].
+fn painted_page(doc: &Document, page_id: ObjectId, cap: usize) -> Vec<Painted> {
     // A page with no `/Resources` anywhere in its tree used to return here, empty. But the
     // path operators — `m`/`l`/`c`/`re`/`v`/`y`/`h` and the `f`/`S`/`B` that paint them —
     // name no resource at all: `/Resources` is only needed to resolve an `/ExtGState` alpha
@@ -1041,7 +1178,7 @@ fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (
     let chain = page_resource_chain(doc, page_id);
     let content = match doc.get_and_decode_page_content(page_id) {
         Ok(c) => c,
-        Err(_) => return (Vec::new(), Vec::new()),
+        Err(_) => return Vec::new(),
     };
     // Over-budget pages DEGRADE, they do not vanish: interpret the first `cap` operations and
     // keep whatever was painted by then. Returning empty here made a dense page look like a page
@@ -1085,32 +1222,7 @@ fn positioned_vectors_capped(doc: &Document, page_id: ObjectId, cap: usize) -> (
         let here = PaintSeq::at(&[], content.operations.len() + k);
         walk(doc, &f.ops, &f.scope.xobjects, &aeg, &acs, g, &mut painted, 1, &mut budget, here.as_slice());
     }
-    // Paint order is stamped by the walk itself (`PaintSeq`, the operation's address in the
-    // content tree) rather than re-derived from this vector's order here. The two are the
-    // same ordering, but only the address is comparable with `img::positioned_images`'s
-    // rasters, which is what lets a composited figure interleave the two.
-    // The page's `/Rotate` reaches only the FIGURE geometry (`build_svg`'s local mapping and
-    // the label/raster plumbing that shares it). Everything upstream of this line — the walk,
-    // the clip crop, `cluster_figures`'s banding and its size bars — deliberately stays in
-    // page space: those thresholds (`BAND_GAP`, `MIN_W`/`MIN_H`, the 400×600 full-page-fill
-    // filter) are orientation-sensitive, so folding the turn into the base CTM would silently
-    // change which clusters become figures on a rotated page for reasons unrelated to this
-    // defect. Turning at the page→SVG-local boundary fixes the orientation and leaves every
-    // selection rule — and every page-space comparison `html.rs` makes against these boxes —
-    // exactly as it was.
-    let rot = crate::pdfobj::page_rotation(doc, page_id);
-    let page_w = page_width(doc, page_id, rot);
-    let (strong, weak) = cluster_figures(painted, rot);
-    let strong: Vec<PlacedSvg> = strong.iter().map(|c| build_svg(c, page_w, rot)).collect();
-    let weak: Vec<PlacedSvg> = weak
-        .iter()
-        .map(|(c, demoted)| {
-            let mut s = build_svg(c, page_w, rot);
-            s.demoted = *demoted;
-            s
-        })
-        .collect();
-    (strong, weak)
+    painted
 }
 
 /// **Displayed** page width from the page box (used to size each figure as a share of the
@@ -2127,7 +2239,7 @@ mod tests {
         let (doc, page_id) = dense_page();
         // Size-bar view (see `size_bar_figures`): the fixture's grid is 12 black rules, so
         // the ink gate demotes it — what this test is about is that the CAP does not delete it.
-        let (strong, weak) = positioned_vectors_capped(&doc, page_id, 50);
+        let (strong, weak, _) = positioned_vectors_capped(&doc, page_id, 50);
         let strong: Vec<PlacedSvg> = strong.into_iter().chain(weak.into_iter().filter(|v| v.demoted())).collect();
         assert_eq!(strong.len(), 1, "the early-painted grid figure must survive a tripped cap");
         let grid = &strong[0];

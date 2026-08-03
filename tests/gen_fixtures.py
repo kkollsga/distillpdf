@@ -3263,6 +3263,147 @@ def gen_form_bomb():
     }
 
 
+# ------------------------------------------------------------------- table evidence
+def gen_ruled_blank_cells():
+    """A fully ruled grid whose third column is EMPTY, carrying in-grid band titles.
+
+    Both shapes are invisible to text clustering *by construction*, and both are ordinary:
+
+      * a **blank cell** has no words, so nothing aligns there — a 4-column ruled table whose
+        third column nobody filled in reads as a 3-column one, while the reader (and the
+        ground truth) sees four, because four rules bound them;
+      * an in-grid **band title** ("Northern district") is one wide cell, i.e. a ONE-cell row,
+        and the alignment detector's run of multi-cell rows ends at it — so one table comes
+        back as two, split on its own sub-heading.
+
+    The ruling says both things plainly: every cell here is closed on all four sides. This is
+    the frame-lattice path's repro, and the assertion is one table of 6 rows x 4 columns.
+
+    Hand-assembled so the geometry is exact."""
+    pdf = os.path.join(OUT, "ruled_blank_cells.pdf")
+    XS = [72.0, 200.0, 300.0, 400.0, 520.0]                  # 4 column bands
+    YS = [560.0, 590.0, 620.0, 650.0, 680.0, 710.0, 740.0]   # 6 row bands, bottom-up
+    # (row from the TOP, column, text). Column index 2 is left entirely empty on purpose.
+    CELLS = [
+        (0, 0, "Site"), (0, 1, "Depth"), (0, 3, "Yield"),
+        (1, 0, "Northern district"),      # a band title: one wide cell, its own row
+        (2, 0, "Ridge"), (2, 1, "18.2"), (2, 3, "77"),
+        (3, 0, "Basin"), (3, 1, "31.0"), (3, 3, "96"),
+        (4, 0, "Southern district"),
+        (5, 0, "Delta"), (5, 1, "42.5"), (5, 3, "128"),
+    ]
+    body = [b"BT /F2 15 Tf 72 762 Td (A Ruled Grid With Blank Cells) Tj ET"]
+    for r, c, text in CELLS:
+        y = YS[len(YS) - 2 - r] + 10.0
+        body.append(b"BT /F1 10 Tf %.1f %.1f Td (%s) Tj ET" % (XS[c] + 4.0, y, text.encode()))
+    for y in YS:
+        body.append(b"0.6 w %.1f %.1f m %.1f %.1f l S" % (XS[0], y, XS[-1], y))
+    for x in XS:
+        body.append(b"0.6 w %.1f %.1f m %.1f %.1f l S" % (x, YS[0], x, YS[-1]))
+    stream = b"\n".join(body)
+    _assemble_pdf(_one_page(stream), pdf)
+    GT["ruled_blank_cells.pdf"] = {"rows": len(YS) - 1, "cols": len(XS) - 1}
+
+
+def gen_booktabs_wrapped():
+    """A borderless **booktabs** table — three horizontal rules, no verticals — with a
+    wrapped cell in the middle of its body.
+
+    The lead this library holds over pymupdf is almost entirely on this shape, and the risk in
+    adding a ruling path is that it starts cutting these up: the under-header rule looks like a
+    row boundary, the wrapped second line of a Description cell looks like a row of its own,
+    and one table comes back as three. Nothing here closes a cell, so the lattice must find
+    NOTHING and the alignment path must return exactly one table.
+
+    It also pins the two-row admission rule from the other side: this run is long, so it is
+    admitted on alignment alone and the ruling is never consulted."""
+    pdf = os.path.join(OUT, "booktabs_wrapped.pdf")
+    X = (72.0, 250.0, 430.0)
+    ROWS = [
+        ["Method", "Description", "Score"],
+        ["Baseline", "The plain configuration", "31.0"],
+        ["Tuned", "The configuration after a long", "42.5"],
+        [None, "schedule of parameter sweeps", None],   # the wrapped continuation line
+        ["Ablated", "No warm restart at all", "18.2"],
+    ]
+    TOP = 700.0
+    body = [b"BT /F2 15 Tf 72 740 Td (A Booktabs Table That Must Not Be Split) Tj ET"]
+    for ri, row in enumerate(ROWS):
+        y = TOP - ri * 18.0
+        for ci, cell in enumerate(row):
+            if cell:
+                body.append(b"BT /F1 10 Tf %.1f %.1f Td (%s) Tj ET" % (X[ci], y, cell.encode()))
+    for y in (TOP + 13.0, TOP - 5.0, TOP - len(ROWS) * 18.0 + 13.0):  # top / under-header / bottom
+        body.append(b"0.8 w 66 %.1f m 500 %.1f l S" % (y, y))
+    stream = b"\n".join(body)
+    _assemble_pdf(_one_page(stream), pdf)
+    GT["booktabs_wrapped.pdf"] = {"tables": 1}
+
+
+def gen_three_column_prose():
+    """A **three-column** page carrying exactly one real table.
+
+    `central_gutter` answers the two-column question by scanning the middle third for the one
+    clearest lane. A three-column page has no clean centre lane at all, so the whole page was
+    read as a single region and the three columns' lines clustered into rows across the
+    gutters: measured on `gov_usgs_usgs70277647` p1, three blocks of newsletter prose came back
+    as 13x3, 19x3 and 7x3 phantom tables, and the page's table count then divided the two REAL
+    tables it also found by six.
+
+    Assert exactly one table — the ruled one inside the middle column. The prose lines are of
+    varying length so no two columns' line ends accidentally align."""
+    pdf = os.path.join(OUT, "three_column_prose.pdf")
+    LANES = (56.0, 246.0, 436.0)
+    SENTENCES = [
+        "The survey team recorded every sounding along the",
+        "northern reach of the channel during the spring",
+        "campaign and again after the autumn floods had",
+        "receded, which allowed a direct comparison of the",
+        "two bed elevations at each cross section that the",
+        "earlier programme had established on this river.",
+        "Sediment transport was estimated from the change",
+        "in storage between the two surveys rather than",
+        "from any rating curve, because the gauge record",
+        "for this reach is incomplete before the year of",
+        "the second campaign and no reliable substitute",
+        "was available from the neighbouring catchments.",
+    ]
+    body = [b"BT /F2 14 Tf 56 750 Td (Three Columns And One Table) Tj ET"]
+    for li, lx in enumerate(LANES):
+        for si, text in enumerate(SENTENCES):
+            if li == 1 and 3 <= si <= 8:
+                continue  # the band the middle column's table occupies
+            y = 720.0 - si * 13.0
+            body.append(b"BT /F1 8 Tf %.1f %.1f Td (%s) Tj ET" % (lx, y, text[: 34 + (si + li) % 8].encode()))
+    TX = [246.0, 300.0, 340.0, 376.0]
+    TY = [608.0, 622.0, 636.0, 650.0, 664.0]
+    TCELLS = [["Zone", "Depth", "N"], ["A", "18.2", "77"], ["B", "31.0", "96"], ["C", "42.5", "128"]]
+    for ri, row in enumerate(TCELLS):
+        y = TY[len(TY) - 2 - ri] + 4.0
+        for ci, cell in enumerate(row):
+            body.append(b"BT /F1 8 Tf %.1f %.1f Td (%s) Tj ET" % (TX[ci] + 2.0, y, cell.encode()))
+    for y in TY:
+        body.append(b"0.5 w %.1f %.1f m %.1f %.1f l S" % (TX[0], y, TX[-1], y))
+    for x in TX:
+        body.append(b"0.5 w %.1f %.1f m %.1f %.1f l S" % (x, TY[0], x, TY[-1]))
+    stream = b"\n".join(body)
+    _assemble_pdf(_one_page(stream), pdf)
+    GT["three_column_prose.pdf"] = {"tables": 1}
+
+
+def _one_page(stream):
+    """The five objects a one-page, two-font, letter-size PDF needs around `stream`."""
+    return {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+        5: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        6: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
+    }
+
+
 # ------------------------------------------------------------------------------ links
 def _assemble_pdf(objs, path, info=None):
     """Write a minimal PDF from {objnum: bytes} (numbers contiguous from 1).
@@ -4202,6 +4343,9 @@ def main():
     gen_annot_appearance()
     gen_annot_render()
     gen_glyph_table()
+    gen_ruled_blank_cells()
+    gen_booktabs_wrapped()
+    gen_three_column_prose()
     gen_panel_table()
     gen_tagged_table()
     gen_undecodable_codec()

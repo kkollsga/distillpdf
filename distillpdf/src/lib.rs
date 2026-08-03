@@ -28,6 +28,7 @@ mod geom;
 mod headings;
 mod html;
 mod img;
+mod lattice;
 mod layout;
 mod links;
 mod nav;
