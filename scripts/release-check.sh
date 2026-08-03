@@ -68,4 +68,30 @@ else
   exit 2
 fi
 
+step "Accuracy floor gate (per-table-type x per-dimension, bench100)"
+# The 37-metric corpus gate above is a *mechanical* gate: it holds our own extraction
+# counters at-or-above a frozen baseline. It cannot see the thing that matters most here —
+# that a change trades one table population for another. Measured over 84 ground-truth
+# table pages we score 0.587 against pymupdf's 0.043 on booktabs (horizontal rules only)
+# and 0.503 against its 0.805 on full ruled grids; a looser detector wins the grids,
+# invents tables on papers, and leaves the aggregate almost unmoved. The floor gate holds
+# every table-type x dimension cell at its own floor and names the pages that moved.
+#
+# It re-scores first (~30 s over 256 pages / 88 docs) because this script has just
+# reinstalled the wheel: scoring the shipped build is the whole point, and the gate refuses
+# to run on measurements older than the installed module.
+#
+# Same local-corpus caveat as above — bench100 lives under the gitignored benchmarking/
+# tree with its ground truth in dev-docs/. When it is absent this step is skipped loudly
+# rather than fatal: the corpus gate above already hard-blocks a release on a machine with
+# no corpus at all, so this skip is only reachable when bench100 specifically is missing.
+GATE="dev-docs/bench/scripts/bench100_gate.py"
+if [ -f "$GATE" ] && [ -f dev-docs/bench/results/bench100_floors.json ] \
+   && [ -d benchmarking/bench100 ] && "$RUN_PY" -c "import fitz" 2>/dev/null; then
+  "$RUN_PY" "$GATE" --rescore --summary
+else
+  echo "SKIPPED — bench100 corpus / ground truth / floors not present on this machine."
+  echo "         Behaviour phases MUST run it: $GATE --rescore"
+fi
+
 step "All checks passed — safe to bump + push (with the user's go-ahead)."
