@@ -442,6 +442,11 @@ fn rows_of(mut spans: Vec<Span>) -> Vec<Vec<Span>> {
     rows
 }
 
+/// How wide a fully clear vertical lane must be, in ems of the run's mean type size, to be a
+/// COLUMN separator rather than the space between two words of one cell.
+///
+/// Swept on the 100-document `pdf-parse-bench` tables corpus — see the sweep table in
+/// `dev-docs/plans/fidelity-fix-sweep.md`.
 /// A merged cell: text, its left x-edge, and current right edge.
 struct Cell {
     x: f32,
@@ -513,12 +518,13 @@ fn row_cells(row: &[Span]) -> Vec<Cell> {
     cells
 }
 
-/// Cluster cell LEFT edges into column anchors (gap-based, tolerance `tol`). This is the
-/// pre-band-model detector, kept as a FALLBACK: the whitespace-lane `column_bands` is the
-/// primary, but on a wide-first-column table (e.g. the Transformer "Layer Type | …" Table 1)
-/// a long row label bridges the lane and merges columns, so the band model degenerates to
-/// <2 columns and the table is lost. Left-x clustering recovers those — it anchors on where
-/// each column STARTS, which a wide neighbour doesn't disturb.
+/// Cluster cell LEFT edges into column anchors (gap-based, tolerance `tol`) — the PRIMARY
+/// column model.
+///
+/// It anchors on where each column STARTS, which a wide neighbour does not disturb, and it is
+/// a vote: an outlier row can only add an anchor, never remove one. That is the whole reason
+/// it is asked before the whitespace-lane model, whose boundaries a single bridging row
+/// deletes for the entire table — see the model-order note in `detect_tables_region`.
 fn columns(rows: &[Vec<Cell>], tol: f32) -> Vec<f32> {
     let mut xs: Vec<f32> = rows.iter().flat_map(|r| r.iter().map(|c| c.x)).collect();
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -550,13 +556,17 @@ fn nearest_col(cols: &[f32], x: f32) -> Option<usize> {
 /// rows may span a lane before it stops being a separator (0 = a lane must be fully
 /// clear). Cells within a row are disjoint, so interval coverage == row coverage.
 /// Returns each column band as (lo, hi), left→right; deterministic (event sweep).
-fn column_bands(rows: &[&[Cell]], bridge: usize) -> Vec<(f32, f32)> {
+///
+/// *What* is projected is the whole question, so the caller supplies the intervals:
+/// projecting gap-merged cells lets one row's accidental spacing fix a column boundary for the
+/// entire run, while projecting the raw WORDS makes every row vote (see [`word_lanes`]).
+fn column_bands(rows: &[Vec<(f32, f32)>], bridge: usize) -> Vec<(f32, f32)> {
     let mut ev: Vec<(f32, i32)> = Vec::new();
     for r in rows {
-        for c in *r {
-            if c.end > c.x {
-                ev.push((c.x, 1));
-                ev.push((c.end, -1));
+        for &(lo, hi) in r {
+            if hi > lo {
+                ev.push((lo, 1));
+                ev.push((hi, -1));
             }
         }
     }
@@ -1452,20 +1462,21 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
                 None
             }
         };
-        // PASS 1a (PRIMARY) — whitespace-lane band columns: keys on where text SITS, so
-        // right-aligned numerics stay distinct and a header-named sparse column survives.
+        // WHITESPACE-LANE band columns: keys on where text SITS, so right-aligned numerics
+        // stay distinct and a header-named sparse column survives. Now the FALLBACK — see the
+        // model order below.
         let band_kept: Vec<(f32, f32)> = {
-            let owned_slices: Vec<&[Cell]> = owned.iter().map(|r| r.as_slice()).collect();
-            let bands = column_bands(&owned_slices, 0);
+            let cell_rows: Vec<Vec<(f32, f32)>> =
+                owned.iter().map(|r| r.iter().map(|c| (c.x, c.end)).collect()).collect();
+            let bands = column_bands(&cell_rows, 0);
             if bands.len() < 2 {
                 Vec::new()
             } else {
-                let center = |c: &Cell| (c.x + c.end) * 0.5;
                 let mut occ = vec![0usize; bands.len()];
-                for row in &owned {
+                for row in &cell_rows {
                     let mut hit = vec![false; bands.len()];
-                    for c in row {
-                        if let Some(bi) = band_of(&bands, center(c)) {
+                    for &(lo, hi) in row {
+                        if let Some(bi) = band_of(&bands, (lo + hi) * 0.5) {
                             hit[bi] = true;
                         }
                     }
@@ -1491,7 +1502,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
                     .collect()
             }
         };
-        // PASS 1b (FALLBACK) — left-x clustering, as bands [anchor_k, anchor_{k+1}). Recovers
+        // LEFT-X clustering (PRIMARY), as bands [anchor_k, anchor_{k+1}). Recovers the
         // wide-first-column tables the lane model over-merges (Transformer Table 1), where a
         // long row label bridges a lane and collapses the band grid to <2 columns.
         let leftx_kept = || -> Vec<(f32, f32)> {
@@ -1513,10 +1524,46 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
                 .map(|(j, &k)| (cols[k], keep.get(j + 1).map(|&nk| cols[nk]).unwrap_or(x_right + tol * 0.5)))
                 .collect()
         };
-        // Band model first; on its failure (degenerate or rejected) fall back to left-x,
-        // which must clear a density bar (≥0.5 filled) so a sparse math scatter the band
-        // model correctly rejected isn't resurrected as a spurious table.
-        let (grid, kept_x) = match try_model(band_kept, 0.0).or_else(|| try_model(leftx_kept(), 0.5)) {
+        // MODEL CHOICE — ask BOTH, keep the one that resolved more columns.
+        //
+        // This used to be a fixed order, lanes then left-x, and the order was the single
+        // largest cause of our table-CONTENT loss. The two models fail in opposite directions.
+        // A lane is a boundary only where *no* row paints across it, so **one** bridging row —
+        // a caption, a line interleaved from the facing text column, a wide row label — deletes
+        // that column boundary for every row of the table. Left-x clustering is a vote: an
+        // outlier row can add an anchor, never remove one. But left-x has the opposite failure,
+        // a sparse column whose few values never reach the ≥50% occupancy bar (the wide
+        // header-named table `tests/test_table_columns.py` locks), and there the lane model is
+        // the one that is right.
+        //
+        // Neither order is therefore correct, and picking by *columns resolved* is: a column
+        // boundary is positive evidence, both answers have already passed their own admission
+        // test (`is_coherent_grid`, and a ≥0.5 density bar on left-x that keeps a sparse symbol
+        // scatter out), so the model that found more real boundaries is the model that read the
+        // table. On a tie the lane answer stands, which is what keeps the sparse-column lock.
+        //
+        // MEASURED on the 100-document / 451-table `pdf-parse-bench` "2026-q1-tables-only"
+        // corpus (GriTS-Doc_Con, `dev-docs/bench/scripts/table_content_metric.py`), changing
+        // NOTHING else:
+        //
+        //   lanes first (was)  : micro 0.4177 md / 0.4203 html, 44/451 strict, 1067 emitted
+        //                        cells that were two truth cells run together, 200 truth
+        //                        tables missed
+        //   left-x first       : micro 0.4995 / 0.5033, 79 strict, 647 run-together, 168 missed
+        //                        — but it breaks the sparse-column lock (10 columns → 3)
+        //   more columns wins  : micro 0.4910 / 0.4947, 78 strict, 672 run-together, 165 missed,
+        //                        header association 0.1456 (best of the three), lock intact
+        //
+        // The 0.008 micro that "left-x first" buys over this is bought by giving up a committed
+        // structural guarantee, so it is not taken.
+        let (grid, kept_x) = match {
+            let by_alignment = try_model(leftx_kept(), 0.5);
+            let by_lanes = try_model(band_kept, 0.0);
+            match (by_alignment, by_lanes) {
+                (Some(a), Some(b)) => Some(if a.1.len() > b.1.len() { a } else { b }),
+                (x, y) => x.or(y),
+            }
+        } {
             Some(gx) => gx,
             None => return,
         };
