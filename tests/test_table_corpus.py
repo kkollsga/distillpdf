@@ -258,7 +258,6 @@ def check_expect(path, rec, res):
             fails.append(f"cols {sorted(cols)} not in {e['cols_any']}")
     if e.get("must_not_merge"):
         # no detected table may carry tokens exclusive to two different GT tables
-        import distillpdf
         det = detect(path)
         gts = [set().union(*[toks(c["text"]) for c in t["cells"]]) for t in rec["tables"]]
         excl = [g - set().union(*[o for k, o in enumerate(gts) if k != i])

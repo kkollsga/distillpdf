@@ -565,7 +565,6 @@ T1_TYPES = {
 def t1_clean_singles():
     for typ, (rows, cols, hdr, skey, mimics) in T1_TYPES.items():
         prov = (dict(source=src(skey, mimics)) if skey else dict(invented=mimics))
-        par = {} if skey else {}
 
         # ---- variant 1: source_median (the measured shape) -----------------------------
         cid = f"t1_{typ}_source_median"
@@ -583,7 +582,7 @@ def t1_clean_singles():
                                                S["Heading3"]), t])
         emit(f"{cid}.pdf", tier=1, family=typ, variant="source_median", tagged=False,
              tables=[tbl(g[0]["draws"], grid, style=typ, header_rows=hdr)],
-             expect={"table_count": 1}, **prov, **par)
+             expect={"table_count": 1}, **prov)
         if typ == "booktabs":
             assert_no_verticals(f"{cid}.pdf")
 
@@ -593,7 +592,7 @@ def t1_clean_singles():
         t = flow(grid, typ, tid=cid, numeric=(3,))
         g = build_doc(f"{cid}.pdf", [t])
         emit(f"{cid}.pdf", tier=1, family=typ, variant="small", tagged=False,
-             tables=[tbl(g[0]["draws"], grid, style=typ)], expect={"table_count": 1}, **prov, **par)
+             tables=[tbl(g[0]["draws"], grid, style=typ)], expect={"table_count": 1}, **prov)
         if typ == "booktabs":
             assert_no_verticals(f"{cid}.pdf")
 
@@ -604,7 +603,7 @@ def t1_clean_singles():
         g = build_doc(f"{cid}.pdf", [Paragraph(PROSE, BODY), Spacer(1, 14), t, Spacer(1, 14),
                                      Paragraph(PROSE, BODY)])
         emit(f"{cid}.pdf", tier=1, family=typ, variant="in_prose", tagged=False,
-             tables=[tbl(g[0]["draws"], grid, style=typ)], expect={"table_count": 1}, **prov, **par)
+             tables=[tbl(g[0]["draws"], grid, style=typ)], expect={"table_count": 1}, **prov)
         if typ == "booktabs":
             assert_no_verticals(f"{cid}.pdf")
 
@@ -620,7 +619,7 @@ def t1_clean_singles():
                                title=f"Table 1. {typ}, declared")
         rec["page"] = 0
         emit(f"{cid}.pdf", tier=1, family=typ, variant="tagged", tagged=True,
-             tables=[rec], expect={"table_count": 1}, **prov, **par)
+             tables=[rec], expect={"table_count": 1}, **prov)
         if typ == "booktabs":
             assert_no_verticals(f"{cid}.pdf")
 
@@ -912,7 +911,6 @@ def t2_confounds():
     # --- sparse_wide (bench54 moderna p153 / Transformer Table 3; migrated L1) ----------
     def sparse(declared, populated):
         def build(cid):
-            r = rng_for(cid)
             grid = [["Key"] + [f"Q{c}" for c in range(1, declared)]]
             for i in range(9):
                 row = [f"Row{i + 1}"] + [""] * (declared - 1)
@@ -1614,7 +1612,7 @@ def main(argv=None):
         print(f"seed {SEED}: positional cell accuracy {res['aggregate']['cell_acc']:.4f}, "
               f"grid exact {res['aggregate']['grid_exact']:.4f}, "
               f"header attribution {res['aggregate']['header_acc']:.4f}")
-        print(f"(compare the committed run; large movement = content-specific overfitting)")
+        print("(compare the committed run; large movement = content-specific overfitting)")
         return 0
     if args.freeze:
         from test_table_corpus import freeze_floors
