@@ -1,0 +1,91 @@
+%PDF-1.5
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R /F2 6 0 R /F3 7 0 R /F4 8 0 R /F5 9 0 R >> /ColorSpace << /CS0 [/Separation /Spot /DeviceRGB 10 0 R] >> >> >>
+endobj
+4 0 obj
+<< /Length 1745 >>
+stream
+BT /F2 13 Tf 72.00 680.00 Td (Groundwater quality benchmarks) Tj ET
+/CS0 cs
+1 scn 72.00 640.00 464.00 20.00 re f
+BT /F2 9 Tf 76.00 646.00 Td (Constituent) Tj ET
+BT /F2 9 Tf 192.00 646.00 Td (Benchmark) Tj ET
+BT /F2 9 Tf 308.00 646.00 Td (Value) Tj ET
+BT /F2 9 Tf 424.00 646.00 Td (Units) Tj ET
+BT /F1 9 Tf 76.00 626.00 Td (Arsenic) Tj ET
+BT /F1 9 Tf 192.00 626.00 Td (Federal MCL) Tj ET
+BT /F1 9 Tf 308.00 626.00 Td (2,659) Tj ET
+BT /F1 9 Tf 424.00 626.00 Td (pCi) Tj ET
+BT /F1 9 Tf 76.00 606.00 Td (Boron) Tj ET
+BT /F1 9 Tf 192.00 606.00 Td (Federal HAL) Tj ET
+BT /F1 9 Tf 308.00 606.00 Td (8,050) Tj ET
+BT /F1 9 Tf 424.00 606.00 Td (pCi) Tj ET
+BT /F1 9 Tf 76.00 586.00 Td (Radon-222) Tj ET
+BT /F1 9 Tf 192.00 586.00 Td (Proposed MCL) Tj ET
+BT /F1 9 Tf 308.00 586.00 Td (4,201) Tj ET
+BT /F1 9 Tf 424.00 586.00 Td (pCi) Tj ET
+BT /F1 9 Tf 76.00 566.00 Td (Nitrate) Tj ET
+BT /F1 9 Tf 192.00 566.00 Td (State MCL) Tj ET
+BT /F1 9 Tf 308.00 566.00 Td (3,773) Tj ET
+BT /F1 9 Tf 424.00 566.00 Td (pCi) Tj ET
+BT /F1 9 Tf 76.00 546.00 Td (Selenium) Tj ET
+BT /F1 9 Tf 192.00 546.00 Td (Federal MCL) Tj ET
+BT /F1 9 Tf 308.00 546.00 Td (3,784) Tj ET
+BT /F1 9 Tf 424.00 546.00 Td (pCi) Tj ET
+q 0.6 w 0 G 72.00 660.00 m 536.00 660.00 l S Q
+q 0.6 w 0 G 72.00 640.00 m 536.00 640.00 l S Q
+q 0.6 w 0 G 72.00 620.00 m 536.00 620.00 l S Q
+q 0.6 w 0 G 72.00 600.00 m 536.00 600.00 l S Q
+q 0.6 w 0 G 72.00 580.00 m 536.00 580.00 l S Q
+q 0.6 w 0 G 72.00 560.00 m 536.00 560.00 l S Q
+q 0.6 w 0 G 72.00 540.00 m 536.00 540.00 l S Q
+q 0.6 w 0 G 72.00 540.00 m 72.00 660.00 l S Q
+q 0.6 w 0 G 188.00 540.00 m 188.00 660.00 l S Q
+q 0.6 w 0 G 304.00 540.00 m 304.00 660.00 l S Q
+q 0.6 w 0 G 420.00 540.00 m 420.00 660.00 l S Q
+q 0.6 w 0 G 536.00 540.00 m 536.00 660.00 l S Q
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+7 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>
+endobj
+8 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman /Encoding /WinAnsiEncoding >>
+endobj
+9 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique /Encoding /WinAnsiEncoding >>
+endobj
+10 0 obj
+<< /FunctionType 2 /Domain [0 1] /C0 [1 1 1] /C1 [0.776 0.776 0.878] /N 1 >>
+endobj
+xref
+0 11
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000145 00000 n 
+0000000348 00000 n 
+0000002145 00000 n 
+0000002242 00000 n 
+0000002344 00000 n 
+0000002439 00000 n 
+0000002538 00000 n 
+0000002643 00000 n 
+trailer
+<< /Size 11 /Root 1 0 R >>
+startxref
+2736
+%%EOF

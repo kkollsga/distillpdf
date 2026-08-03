@@ -1,0 +1,70 @@
+%PDF-1.5
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R /F2 6 0 R /F3 7 0 R /F4 8 0 R /F5 9 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 1144 >>
+stream
+BT /F2 17 Tf 72.00 730.00 Td (A Callout Panel Around A Real Table) Tj ET
+BT /F1 10 Tf 72.00 700.00 Td (The panel below is a figure; the grid inside it is a table.) Tj ET
+q 0.93 0.95 0.90 rg 72 400 468 240 re f Q
+q 0 0 0 RG 1.2 w 72 400 468 240 re S Q
+q 0.6 w 0 G 88.00 566.00 m 500.00 566.00 l S Q
+q 0.6 w 0 G 88.00 494.00 m 500.00 494.00 l S Q
+q 0.20 0.45 0.70 rg 470 420 m 500 438 500 462 470 450 c f Q
+q 0.20 0.45 0.70 rg 470 450 m 500 468 500 492 470 480 c f Q
+q 0 0 0 RG 0.8 w 470 420 m 512 462 l S Q
+BT /F2 11 Tf 88.00 594.00 Td (Benchmarks for evaluating groundwater quality) Tj ET
+BT /F1 9 Tf 96.00 572.00 Td (Constituent) Tj ET
+BT /F1 9 Tf 260.00 572.00 Td (Benchmark) Tj ET
+BT /F1 9 Tf 410.00 572.00 Td (Value) Tj ET
+BT /F1 9 Tf 96.00 548.00 Td (Arsenic) Tj ET
+BT /F1 9 Tf 260.00 548.00 Td (Federal MCL) Tj ET
+BT /F1 9 Tf 410.00 548.00 Td (10 ppb) Tj ET
+BT /F1 9 Tf 96.00 524.00 Td (Boron) Tj ET
+BT /F1 9 Tf 260.00 524.00 Td (Federal HAL) Tj ET
+BT /F1 9 Tf 410.00 524.00 Td (6,000 ppb) Tj ET
+BT /F1 9 Tf 96.00 500.00 Td (Radon-222) Tj ET
+BT /F1 9 Tf 260.00 500.00 Td (Proposed MCL) Tj ET
+BT /F1 9 Tf 410.00 500.00 Td (4,000 pCi) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+7 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>
+endobj
+8 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman /Encoding /WinAnsiEncoding >>
+endobj
+9 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique /Encoding /WinAnsiEncoding >>
+endobj
+xref
+0 10
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000145 00000 n 
+0000000287 00000 n 
+0000001483 00000 n 
+0000001580 00000 n 
+0000001682 00000 n 
+0000001777 00000 n 
+0000001876 00000 n 
+trailer
+<< /Size 10 /Root 1 0 R >>
+startxref
+1981
+%%EOF
