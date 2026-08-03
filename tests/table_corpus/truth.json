@@ -39,7 +39,7 @@
     ]
    },
    "family": "neg_form_grid",
-   "note": "WATCH: scored and reported, NOT gated. Emitted rule census h=71 v=151 fills=0 against the measured medians 92/111/0. Whether a field grid is a table is an open policy question; the 38% header statistic is the evidence that decision cites.",
+   "note": "WATCH: scored and reported, NOT gated. Emitted rule census h=92 v=111 fills=0 against the measured medians 92/111/0. Whether a field grid is a table is an open policy question; the 38% header statistic is the evidence that decision cites.",
    "pages": 1,
    "source": {
     "corpus": "bench88",

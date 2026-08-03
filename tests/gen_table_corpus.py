@@ -504,19 +504,30 @@ def t0_negatives():
             c.rect(bx, by, cw - 12, rh - 24)             # entry box: 2 h + 2 v
             h_drawn += 2
             v_drawn += 2
-            c.line(bx, by + rh - 26, bx + cw - 12, by + rh - 26)   # caption rule
-            h_drawn += 1
-            for k in range(1, 6):                        # the money-column tick marks
-                c.line(bx + k * (cw - 12) / 6.0, by, bx + k * (cw - 12) / 6.0, by + rh - 24)
+            # Two rules per field (caption underline + subtotal rule) and three money-column
+            # ticks: the counts are chosen so the EMITTED census lands on the measured
+            # medians 92 h / 111 v exactly (8 + 21*4 = 92; 4 + 21*5 + 2 = 111), asserted below.
+            c.line(bx, by + rh - 26, bx + cw - 12, by + rh - 26)
+            c.line(bx, by + 2, bx + cw - 12, by + 2)
+            h_drawn += 2
+            for k in range(1, 4):
+                c.line(bx + k * (cw - 12) / 4.0, by, bx + k * (cw - 12) / 4.0, by + rh - 24)
                 v_drawn += 1
             c.setFont("Helvetica", 6.5)
             c.drawString(bx + 2, by + rh - 22, f"{i * 3 + j + 1}  {HEADERS[(i + j) % 7]}")
             c.setFont("Helvetica", 9)
             c.drawString(bx + 4, by + 5, f"{r.randint(1, 999):,}")
+    for k in range(2):                                   # the two remaining verticals
+        c.line(72 + k * 3 * cw / 2.0, 282, 72 + k * 3 * cw / 2.0, 296)
     c.setFont("Helvetica", 8)
     c.drawString(72, 270, "Attach to Form 1065. See separate instructions.")
     c.save()
     got = RAW.stroke_census(os.path.join(OUT, "t0_neg_form_grid.pdf"))
+    if (got["h"], got["v"], got["fills"]) != (92, 111, 0):
+        raise AssertionError(
+            f"neg_form_grid must carry the MEASURED forms.irs rule census 92 h / 111 v / 0 "
+            f"fills (§4.2) — emitted {got['h']}/{got['v']}/{got['fills']}. This case exists to "
+            f"be built to the measurement, not to a plausible number.")
     emit("t0_neg_form_grid.pdf", tier=0, family="neg_form_grid", variant="watch", tagged=False,
          tables=[], expect={"table_count_any": [0, 1]},
          source=src("forms.irs", "IRS field grid at the measured shape: 7x3, no header row "
@@ -1421,8 +1432,9 @@ def parity(outdir=OUT):
             c_real = None
         elif rec.get("parity") == "unrunnable" or not s or s.get("corpus") != "bench88":
             corp = (s or {}).get("corpus", "?")
-            key = (rec["family"], f"{corp}: {(s or {}).get('doc', '?')}"
-                                  + (f" p{s['page']}" if s and s.get("page") else ""))
+            doc = (s or {}).get("doc", "?")
+            label = (corp if doc == corp else f"{corp}: {doc}")
+            key = (rec["family"], label + (f" p{s['page']}" if s and s.get("page") else ""))
             c_real = None
         else:
             page_key = f'{s["doc"]}#{s["page"]}'
@@ -1531,6 +1543,17 @@ source lives in the 25-document `corpus_tests` corpus, which has cell truth but 
                         f"{', '.join(files)}\n\n{OVERSIMPLIFIED[fam]}\n\n")
         else:
             f.write("None.\n")
+        covered = sorted({r["family"] for r in rows
+                          if r["verdict"] == "ok" and r["C_real"] is not None})
+        not_covered = sorted({r["family"] for r in rows if r["verdict"] != "ok"})
+        f.write("\n## The coverage claim, stated exactly\n\n"
+                "**Claimed as source-covered** — a real bench88 page was scored with the same "
+                "function and the generated case is not materially easier than it:\n\n"
+                + "".join(f"* `{f}`\n" for f in covered)
+                + "\n**NOT claimed as source coverage** — invented (no measured analogue), "
+                  "parity unrunnable (the source is outside the 88-document corpus), or "
+                  "oversimplified and accepted as such:\n\n"
+                + "".join(f"* `{f}`\n" for f in not_covered))
     print(f"parity report -> {PARITY_REPORT}")
 
 
