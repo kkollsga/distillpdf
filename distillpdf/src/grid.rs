@@ -138,6 +138,56 @@ pub(crate) fn reconcile_preferred<T>(
     );
 }
 
+fn overlaps_half(a: Rect, b: Rect) -> bool {
+    let lo = a.y0.max(b.y0);
+    let hi = a.y1.min(b.y1);
+    let span = a.height().min(b.height()).max(1.0);
+    (hi - lo) >= span * 0.5
+}
+
+/// Rejoin two table streams that a page gutter split, preserving unmatched items in order.
+///
+/// `redetect` receives the combined vertical band. If it cannot produce an answer, both
+/// original halves survive. The `enabled` bit is independent evidence that a full-width table
+/// can exist; without it, side-by-side tables are never merged merely because their rows align.
+pub(crate) fn rejoin_split_pairs<T: Clone>(
+    left: &[T],
+    right: Vec<T>,
+    enabled: bool,
+    region_of: impl Fn(&T) -> Rect,
+    mut redetect: impl FnMut(f32, f32) -> Vec<T>,
+) -> Vec<T> {
+    let mut out = Vec::new();
+    let mut used_right = vec![false; right.len()];
+    for l in left {
+        let lr = region_of(l);
+        match right
+            .iter()
+            .enumerate()
+            .find(|(j, r)| enabled && !used_right[*j] && overlaps_half(lr, region_of(r)))
+        {
+            Some((j, r)) => {
+                used_right[j] = true;
+                let rr = region_of(r);
+                let merged = redetect(lr.y0.min(rr.y0), lr.y1.max(rr.y1));
+                if merged.is_empty() {
+                    out.push(l.clone());
+                    out.push(r.clone());
+                } else {
+                    out.extend(merged);
+                }
+            }
+            None => out.push(l.clone()),
+        }
+    }
+    for (j, r) in right.into_iter().enumerate() {
+        if !used_right[j] {
+            out.push(r);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +245,40 @@ mod tests {
             existing.iter().map(|t| t.id).collect::<Vec<_>>(),
             ["longer"]
         );
+    }
+
+    #[test]
+    fn a_split_pair_rejoins_only_with_independent_full_width_evidence() {
+        #[derive(Clone, Debug, PartialEq)]
+        struct Item {
+            id: &'static str,
+            rect: Rect,
+        }
+        let item = |id, x0, x1| Item {
+            id,
+            rect: Rect::new(x0, 0.0, x1, 10.0),
+        };
+        let left = vec![item("left", 0.0, 10.0)];
+        let right = vec![item("right", 10.0, 20.0)];
+        let kept = rejoin_split_pairs(
+            &left,
+            right.clone(),
+            false,
+            |t| t.rect,
+            |_, _| vec![item("merged", 0.0, 20.0)],
+        );
+        assert_eq!(
+            kept.iter().map(|t| t.id).collect::<Vec<_>>(),
+            ["left", "right"]
+        );
+
+        let joined = rejoin_split_pairs(
+            &left,
+            right,
+            true,
+            |t| t.rect,
+            |_, _| vec![item("merged", 0.0, 20.0)],
+        );
+        assert_eq!(joined.iter().map(|t| t.id).collect::<Vec<_>>(), ["merged"]);
     }
 }

@@ -1682,43 +1682,25 @@ fn detect_aligned_tables(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTa
             // (prose outside the band can't interfere) to recover the whole table. A
             // single-column table beside prose has no mate (prose isn't a table), so
             // it is kept as-is — no cross-column bleed.
-            let overlaps = |a: &PosTable, b: &PosTable| {
-                let lo = a.y_bottom.max(b.y_bottom);
-                let hi = a.y_top.min(b.y_top);
-                let span = (a.y_top - a.y_bottom).min(b.y_top - b.y_bottom).max(1.0);
-                (hi - lo) >= span * 0.5
-            };
-            let mut out: Vec<PosTable> = Vec::new();
-            let mut used_r = vec![false; rt.len()];
-            for l in &lt {
-                // ...but only where a full-width element can EXIST at all — see
-                // [`central_split`]. On a page whose gutter no row crosses, an overlapping pair
-                // is two tables set side by side, and this re-detection would rebuild the
-                // interleaved grid the split just prevented.
-                match rt.iter().enumerate().find(|(j, r)| rejoin && !used_r[*j] && overlaps(l, r)) {
-                    Some((j, r)) => {
-                        used_r[j] = true;
-                        let (yb, yt) = (l.y_bottom.min(r.y_bottom), l.y_top.max(r.y_top));
-                        let pad = 2.0;
-                        let band: Vec<Span> =
-                            spans.iter().filter(|s| s.y >= yb - pad && s.y <= yt + pad).map(clone_span).collect();
-                        let merged = detect_tables_region(&band, bands);
-                        if merged.is_empty() {
-                            out.push(l.clone());
-                            out.push(r.clone());
-                        } else {
-                            out.extend(merged);
-                        }
-                    }
-                    None => out.push(l.clone()),
-                }
-            }
-            for (j, r) in rt.into_iter().enumerate() {
-                if !used_r[j] {
-                    out.push(r);
-                }
-            }
-            out
+            // ...but only where a full-width element can EXIST at all — see
+            // [`central_split`]. On a page whose gutter no row crosses, an overlapping pair is
+            // two tables set side by side, and this re-detection would rebuild the interleaved
+            // grid the split just prevented.
+            crate::grid::rejoin_split_pairs(
+                &lt,
+                rt,
+                rejoin,
+                |t| crate::geom::Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top),
+                |yb, yt| {
+                    let pad = 2.0;
+                    let band: Vec<Span> = spans
+                        .iter()
+                        .filter(|s| s.y >= yb - pad && s.y <= yt + pad)
+                        .map(clone_span)
+                        .collect();
+                    detect_tables_region(&band, bands)
+                },
+            )
         }
     }
 }
