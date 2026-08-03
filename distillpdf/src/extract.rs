@@ -778,6 +778,34 @@ fn clone_span(s: &Span) -> Span {
     }
 }
 
+/// How clear of text the centre lane must be, as a share of the page's rows, for the
+/// **prose-free** split route (the prose route keeps its own, looser 0.88 — it has a second
+/// witness). Swept — see the note on [`BASELINE_AGREE`].
+const GUTTER_CLEAR: f32 = 1.0;
+/// How far apart two baselines may sit, in ems of the page's mean type size, and still count
+/// as ONE row for [`shared_baselines`]. Swept — see [`BASELINE_AGREE`].
+const BASELINE_EPS: f32 = 0.05;
+/// The share of gutter-crossing rows that must sit on one baseline for the lane to be a
+/// TABLE's internal gutter rather than a page split.
+///
+/// **Swept on our own two corpora, not adopted from anywhere.** Measured over every page
+/// whose centre lane is fully clear: the 51 two-column pages of the 100-document
+/// `pdf-parse-bench` tables corpus reach **at most 0.400**, while the 52 World Bank
+/// full-page ruled tables of bench100 — the hardest same-baseline case we own, because their
+/// wrapped cells put continuation lines on one side only — bottom out at **0.467**. The two
+/// populations do not overlap, and 0.45 sits inside the gap. On the content metric the
+/// choice is a plateau (0.5214 md at 0.42/0.45/0.46, 0.5204 at 0.35, 0.5142 at 0.25) and the
+/// bench100 floor gate is GREEN across it; at 0.7 the World Bank pages split and two FP
+/// ceilings breach (`full-grid|paragraphs` 0.550 -> 0.576).
+///
+/// The tolerance matters as much as the share: at [`BASELINE_EPS`] = 0.15 em the two
+/// populations OVERLAP (0.571 vs 0.500) and no threshold separates them. 0.05 em is "the
+/// producer painted these on one baseline", which is the thing being asked.
+const BASELINE_AGREE: f32 = 0.45;
+/// How many rows must straddle the lane before [`shared_baselines`] is allowed to judge it.
+/// Swept over {1, 2, 4, 8, 12}: flat at 0.5214 md up to 4, then 0.5185 at 8 and 0.5135 at 12.
+const GUTTER_MIN_ROWS: usize = 4;
+
 /// The x of the central gutter when the page is a two-column layout, else None.
 ///
 /// A two-column page is split down the middle by a vertical whitespace lane that
@@ -788,6 +816,21 @@ fn clone_span(s: &Span) -> Span {
 /// element (a spanning figure/table) sits across the centre has no clean gutter,
 /// returns None, and is handled whole.
 pub(crate) fn central_gutter(spans: &[Span]) -> Option<f32> {
+    central_split(spans).map(|(g, _)| g)
+}
+
+/// [`central_gutter`] plus the ONE fact its caller cannot re-derive: **whether a table may still
+/// span the two sides.**
+///
+/// The split tolerates a handful of rows crossing the lane, which is what lets a two-column page
+/// carrying one full-width table still be split — and the caller's rejoin then exists to put
+/// that table back together. But when the lane is clear in **every** row, no element on the page
+/// crosses it *at all*, so there is nothing to rejoin and an overlapping left/right pair is two
+/// tables set side by side. Re-detecting across the full width there hands back exactly the
+/// interleaved grid the split just prevented — `pdf-parse-bench` doc 001, whose page splits
+/// cleanly and is then re-merged into
+/// `| None | 68.7 | 64.4 | | | | Target Model | 0% | 100% Ratio |`.
+fn central_split(spans: &[Span]) -> Option<(f32, bool)> {
     let rows = rows_of(spans.iter().map(clone_span).collect());
     if rows.len() < 6 {
         return None;
@@ -832,10 +875,54 @@ pub(crate) fn central_gutter(spans: &[Span]) -> Option<f32> {
         && prose_lines(true, (g - x0) * 0.5) >= 3
         && prose_lines(false, (x1 - g) * 0.5) >= 3
     {
-        Some(g)
-    } else {
-        None
+        // A table may still span the two sides — but only if some row actually crosses the
+        // lane. Where NOT ONE does, there is nothing to rejoin, whichever route got here.
+        return Some((g, best.0 < rows.len()));
     }
+    // The SECOND route, for the page the prose test structurally cannot see: two columns
+    // that both carry TABLES. There is no wrapping prose to count, so the test above never
+    // fires and the page is read whole — `rows_of` then clusters a line from the left
+    // column with a line from the right into one row and the two tables come out
+    // interleaved. See [`shared_baselines`] for the evidence that replaces the prose count.
+    let size = spans.iter().map(|s| s.size).sum::<f32>() / spans.len().max(1) as f32;
+    if best.0 as f32 >= rows.len() as f32 * GUTTER_CLEAR && !shared_baselines(&rows, g, size) {
+        return Some((g, best.0 < rows.len()));
+    }
+    None
+}
+
+/// Share of the rows crossing `g` whose two sides sit on ONE baseline — the test that tells a
+/// table's internal gutter from a page's column gutter without asking for prose.
+///
+/// A table row is painted as a single baseline: every cell of it, left of the gutter and right
+/// of it, has the same `y`, because that is what makes it a row. Two facing text columns have
+/// **independent** vertical rhythms — each column's leading starts where its own content
+/// starts — so a left line and a right line share a baseline only by accident. So where
+/// [`rows_of`]'s half-line band has already bound spans from both sides into one row, the
+/// question "is this really one row?" has a direct answer in the geometry, and it needs no
+/// prose anywhere on the page.
+///
+/// Returns `true` (→ do not split) when too few rows straddle `g` to judge, so the test can
+/// only ever *add* a split where the evidence is present.
+fn shared_baselines(rows: &[Vec<Span>], g: f32, size: f32) -> bool {
+    let side = |s: &Span| s.x + s.width.max(0.0) * 0.5 < g;
+    let (mut both, mut agree) = (0usize, 0usize);
+    for r in rows {
+        let l: Vec<f32> = r.iter().filter(|s| side(s)).map(|s| s.y).collect();
+        let rr: Vec<f32> = r.iter().filter(|s| !side(s)).map(|s| s.y).collect();
+        if l.is_empty() || rr.is_empty() {
+            continue;
+        }
+        both += 1;
+        let d = l
+            .iter()
+            .flat_map(|a| rr.iter().map(move |b| (a - b).abs()))
+            .fold(f32::INFINITY, f32::min);
+        if d <= size * BASELINE_EPS {
+            agree += 1;
+        }
+    }
+    both < GUTTER_MIN_ROWS || agree as f32 >= both as f32 * BASELINE_AGREE
 }
 
 /// Why a declared table was refused. Reported per page so a rejection is evidence, not a
@@ -1416,9 +1503,9 @@ pub fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Ve
 
 /// L1a — the text-alignment detector: the whole page, or one lane per text column.
 fn detect_aligned_tables(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTable> {
-    match central_gutter(spans) {
+    match central_split(spans) {
         None => detect_lanes(spans, bands),
-        Some(g) => {
+        Some((g, rejoin)) => {
             // Split down the gutter and detect each side independently (this is what
             // stops adjacent-column prose from merging into a phantom wide table).
             let side = |left: bool| -> Vec<Span> {
@@ -1442,7 +1529,11 @@ fn detect_aligned_tables(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTa
             let mut out: Vec<PosTable> = Vec::new();
             let mut used_r = vec![false; rt.len()];
             for l in &lt {
-                match rt.iter().enumerate().find(|(j, r)| !used_r[*j] && overlaps(l, r)) {
+                // ...but only where a full-width element can EXIST at all — see
+                // [`central_split`]. On a page whose gutter no row crosses, an overlapping pair
+                // is two tables set side by side, and this re-detection would rebuild the
+                // interleaved grid the split just prevented.
+                match rt.iter().enumerate().find(|(j, r)| rejoin && !used_r[*j] && overlaps(l, r)) {
                     Some((j, r)) => {
                         used_r[j] = true;
                         let (yb, yt) = (l.y_bottom.min(r.y_bottom), l.y_top.max(r.y_top));
@@ -2336,6 +2427,57 @@ mod tests {
         let tables = detect_fixture("three_column_prose.pdf");
         assert_eq!(tables.len(), 1, "exactly one table, got {}: {:?}", tables.len(), tables.iter().map(|t| t.grid.len()).collect::<Vec<_>>());
         assert_eq!(tables[0].grid[0][0].trim(), "Zone", "and it is the ruled one: {:?}", tables[0].grid);
+    }
+
+    #[test]
+    fn two_facing_columns_of_tables_are_two_tables_not_one_wide_one() {
+        // `tests/gen_fixtures.py::gen_two_column_tables`, the `pdf-parse-bench` doc-001 class.
+        // `central_gutter` would split this page — but only where each side shows wrapping
+        // PROSE, and a page whose two columns are both tables has none to show. So the page
+        // was read whole and `rows_of`'s half-line band bound a left-column line to a
+        // right-column line: `| Model | BLEU | Rate | Corpus | Size | Split |`, one 7x6 grid
+        // interleaving two unrelated 7x3 tables.
+        let tables = detect_fixture("two_column_tables.pdf");
+        assert_eq!(
+            tables.len(),
+            2,
+            "two tables, got {}: {:?}",
+            tables.len(),
+            tables.iter().map(|t| (t.grid.len(), t.grid[0].len())).collect::<Vec<_>>()
+        );
+        for t in &tables {
+            assert_eq!(t.grid[0].len(), 3, "three columns each, not six: {:?}", t.grid[0]);
+        }
+        let heads: Vec<&str> = tables.iter().map(|t| t.grid[0][0].trim()).collect();
+        assert!(heads.contains(&"Model") && heads.contains(&"Corpus"), "one table per column: {heads:?}");
+    }
+
+    #[test]
+    fn a_split_page_is_not_re_merged_where_nothing_crosses_the_gutter() {
+        // `tests/gen_fixtures.py::gen_two_column_tables_prose`, and the ACTUAL doc-001 defect.
+        // This page has prose, so it always split correctly — and was then handed straight
+        // back by the rejoin that recovers a table the gutter cut in half. Measured: with the
+        // rejoin unguarded this fixture returns one 6x6 grid.
+        let tables = detect_fixture("two_column_tables_prose.pdf");
+        assert_eq!(tables.len(), 2, "two tables, got {}: {:?}", tables.len(), tables.iter().map(|t| (t.grid.len(), t.grid[0].len())).collect::<Vec<_>>());
+        for t in &tables {
+            assert_eq!(t.grid[0].len(), 3, "three columns each, not six: {:?}", t.grid[0]);
+        }
+    }
+
+    #[test]
+    fn a_wide_tables_own_gutter_is_not_a_page_split() {
+        // The other side of the same test. `booktabs_wrapped.pdf` is ONE table whose middle
+        // column leaves a lane that is clear in every row — the exact geometry the split
+        // route keys on — but its rows are painted on one baseline, so `shared_baselines`
+        // refuses. A wrapped continuation line sits on a baseline of its own and must not be
+        // enough to flip that.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/booktabs_wrapped.pdf");
+        let doc = Document::load(path).expect("booktabs_wrapped.pdf must load");
+        let raw = std::fs::read(path).expect("fixture readable");
+        let page = *doc.get_pages().get(&1).expect("page 1");
+        let spans = crate::text::extract_spans(&doc, page, &raw);
+        assert_eq!(central_gutter(&spans), None, "a table's own gutter is not a page split");
     }
 
     #[test]

@@ -167,11 +167,96 @@
       "Figure 2: A dense scatter field of three hundred marks."
     ]
   },
+  "map_label_grid.pdf": {
+    "page1_figures": 1,
+    "page2_figures": 0
+  },
+  "glyph_run_labels.pdf": {
+    "joined": [
+      "Cloverdale",
+      "Sonoma"
+    ],
+    "whole_already": [
+      "Healdsburg"
+    ],
+    "must_stay_apart": [
+      "Santa",
+      "Rosa",
+      "Napa"
+    ]
+  },
+  "ink_gate.pdf": {
+    "page1_figures": 1,
+    "page2_figures": 0,
+    "page3_figures": 0,
+    "page4_figures": 1
+  },
+  "damaged_streams.pdf": {
+    "pages": 3,
+    "issues": {
+      "6": "flate-truncated",
+      "7": "filter-unapplied"
+    },
+    "intact_object": 8,
+    "rects_authored": 10
+  },
+  "textstate_q.pdf": {
+    "word": "Cloverdale",
+    "occurrences": 2
+  },
+  "caption_bleed.pdf": {
+    "svg_labels": [
+      "256",
+      "512",
+      "RGB"
+    ],
+    "must_stay_in_body": [
+      "Mildenhall",
+      "Residual connections",
+      "Sim1a network only",
+      "0.33"
+    ]
+  },
   "inherited_mediabox.pdf": {
     "page_width": 842,
     "page_height": 595,
     "figure_width": 300,
     "caption": "Figure 1: A grid spanning 300 of the 842 point page.",
+    "n_figures": 1
+  },
+  "indirect_mediabox.pdf": {
+    "page_width": 1008,
+    "page_height": 612,
+    "crop_width": 400,
+    "crop_height": 650,
+    "figure_width": 504,
+    "caption": "Figure 1: A grid spanning 504 of the 1008 point page.",
+    "n_figures": 1,
+    "crop_page_text": "This page states no MediaBox anywhere up the tree, only a CropBox."
+  },
+  "indirect_numbers.pdf": {
+    "uri": "https://example.com/indirect",
+    "rect": [
+      72,
+      696,
+      420,
+      714
+    ],
+    "fill_alpha": 0.85,
+    "stroke_alpha": 0.6,
+    "dest_xyz": {
+      "name": "fig.indirect",
+      "page": 2,
+      "y": 700
+    },
+    "dest_fith": {
+      "name": "sec.indirect",
+      "page": 2,
+      "y": 640
+    },
+    "n_bars": 8,
+    "n_paths": 10,
+    "caption": "Figure 1: Bars painted under an indirect alpha.",
     "n_figures": 1
   },
   "xobject_figure.pdf": {
@@ -331,6 +416,204 @@
     "figures": 2,
     "panel_fill": "#808080"
   },
+  "no_resources_paths.pdf": {
+    "svgs_per_page": [
+      1,
+      1
+    ],
+    "paths_per_page": 9
+  },
+  "dashes.pdf": {
+    "dasharrays": [
+      null,
+      "3 2",
+      "6 3",
+      null,
+      null
+    ],
+    "dashoffsets": [
+      null,
+      null,
+      "2",
+      null,
+      null
+    ],
+    "paths": 7
+  },
+  "alpha_groups.pdf": {
+    "group_opacities": [
+      "0.0039",
+      "0.02",
+      "0.04",
+      "0.5",
+      "0.98"
+    ],
+    "paths": 8,
+    "plain_form_opacity": "0.25"
+  },
+  "rotated_pages.pdf": {
+    "rotations": [
+      0,
+      90,
+      180,
+      270
+    ],
+    "figure_page_bbox": [
+      100,
+      200,
+      300,
+      500
+    ],
+    "labels": [
+      "Alpha",
+      "Beta"
+    ]
+  },
+  "rotated_body.pdf": {
+    "rotations": [
+      0,
+      90,
+      180,
+      270
+    ],
+    "heading": "Turning the page",
+    "paragraphs": [
+      "A page that carries a Rotate key is turned clockwise before it is shown, and its text is authored at the matching angle so that the reader sees ordinary upright prose on an ordinary page.",
+      "Nothing about that page is a figure, so nothing else can carry its words into the output."
+    ],
+    "spine_label": "SPINE LABEL"
+  },
+  "rotated_raster.pdf": {
+    "rotations": [
+      0,
+      90,
+      180,
+      270
+    ],
+    "placement": [
+      100,
+      250,
+      300,
+      350
+    ],
+    "displayed": {
+      "0": [
+        [
+          255,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          255
+        ]
+      ],
+      "90": [
+        [
+          255,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          255
+        ]
+      ],
+      "180": [
+        [
+          0,
+          0,
+          255
+        ],
+        [
+          255,
+          0,
+          0
+        ]
+      ],
+      "270": [
+        [
+          0,
+          0,
+          255
+        ],
+        [
+          255,
+          0,
+          0
+        ]
+      ]
+    }
+  },
+  "separation.pdf": {
+    "pages": [
+      "Separation/Type2",
+      "DeviceN/Type0",
+      "Separation/Type4"
+    ],
+    "solid_tint_rgb": "#c6c6e0",
+    "type4_coverage": {
+      "0.2": "#cccccc",
+      "0.75": "#404040"
+    },
+    "grey_level_misreadings": [
+      "#1a1a1a",
+      "#333333"
+    ],
+    "spot_image_px": {
+      "0,0": [
+        255,
+        255,
+        255
+      ],
+      "2,0": [
+        198,
+        198,
+        224
+      ]
+    },
+    "spot_image_intensity_misreading": {
+      "0,0": [
+        0,
+        0,
+        0
+      ],
+      "2,0": [
+        255,
+        255,
+        255
+      ]
+    }
+  },
+  "render_samples.pdf": {
+    "html_images": 2,
+    "indexed_px": {
+      "0,0": [
+        255,
+        0,
+        0
+      ],
+      "1,0": [
+        0,
+        0,
+        255
+      ]
+    },
+    "gray4_px": {
+      "0,0": [
+        0,
+        0,
+        0
+      ],
+      "1,0": [
+        255,
+        255,
+        255
+      ]
+    }
+  },
   "cmyk_jpeg.pdf": {
     "caption": "Figure 1: Three flat CMYK bands.",
     "bands_rgb": [
@@ -359,6 +642,111 @@
     "width": 96,
     "height": 48
   },
+  "smask_panel.pdf": {
+    "panel_fill": "#339999",
+    "image_rgb": [
+      220,
+      30,
+      40
+    ],
+    "expect_format": "png"
+  },
+  "smask_group_raster.pdf": {
+    "figures": 3,
+    "placement": [
+      140,
+      350,
+      300,
+      470
+    ],
+    "window": [
+      140,
+      350,
+      220,
+      410
+    ],
+    "window_rgb": [
+      40,
+      60,
+      210
+    ]
+  },
+  "clipped_raster.pdf": {
+    "figures": 3,
+    "placement": [
+      140,
+      350,
+      300,
+      470
+    ],
+    "clip": [
+      140,
+      350,
+      220,
+      410
+    ],
+    "window_rgb": [
+      40,
+      60,
+      210
+    ]
+  },
+  "form_bbox.pdf": {
+    "in_box_fill": "#3366cc",
+    "out_of_box_fill": "#cc3333",
+    "clipped_box": [
+      72,
+      500,
+      372,
+      680
+    ],
+    "rasters": 1,
+    "raster_box": [
+      402,
+      270,
+      462,
+      330
+    ]
+  },
+  "form_bbox_text.pdf": {
+    "labels": {
+      "TOPBAND": 1,
+      "BOTBAND": 1
+    },
+    "topband_xy": [
+      92,
+      700
+    ],
+    "botband_xy": [
+      95,
+      371.6
+    ]
+  },
+  "decode_jpeg.pdf": {
+    "gray_rgb": [
+      215,
+      215,
+      215
+    ],
+    "rgb_rgb": [
+      55,
+      225,
+      165
+    ],
+    "width": 64,
+    "height": 48
+  },
+  "form_inherit.pdf": {
+    "word": "INHERIT",
+    "x": 172,
+    "image": {
+      "width": 40,
+      "height": 30,
+      "x_left": 172,
+      "y_bottom": 560
+    },
+    "panel_opacity": 0.5
+  },
   "form_font.pdf": {
     "font_name": "FF1",
     "base_font": "Helvetica",
@@ -366,6 +754,212 @@
     "encoding": "WinAnsiEncoding",
     "n_font_rows": 1,
     "text": "Text drawn inside a form XObject."
+  },
+  "unfiltered_form.pdf": {
+    "form_text": "Unfiltered form ink",
+    "n_bars": 5,
+    "caption": "Figure 1: Five bars painted by a form stream carrying no filter.",
+    "title": "A Form Stream With No Filter"
+  },
+  "annot_appearance.pdf": {
+    "images": [
+      {
+        "index": 0,
+        "width": 40,
+        "height": 30
+      },
+      {
+        "index": 1,
+        "width": 10,
+        "height": 10
+      },
+      {
+        "index": 2,
+        "width": 12,
+        "height": 12
+      },
+      {
+        "index": 3,
+        "width": 15,
+        "height": 15
+      },
+      {
+        "index": 4,
+        "width": 16,
+        "height": 16
+      }
+    ],
+    "never_reported": [
+      {
+        "width": 11,
+        "height": 11,
+        "why": "in the appearance's resources, never drawn"
+      },
+      {
+        "width": 13,
+        "height": 13,
+        "why": "the state /AS did not select"
+      },
+      {
+        "width": 14,
+        "height": 14,
+        "why": "a hidden (/F bit 2) annotation"
+      }
+    ]
+  },
+  "annot_render.pdf": {
+    "rect": [
+      200,
+      400,
+      400,
+      550
+    ],
+    "raster": [
+      208,
+      406,
+      248,
+      436
+    ],
+    "label": "StampInkVisible",
+    "label_xy": [
+      208,
+      520
+    ],
+    "label_size": 12,
+    "must_not_paint": [
+      "HiddenStampMustNotPaint",
+      "UnselectedStateOff",
+      "NoStateSelected"
+    ],
+    "must_paint": [
+      "StampInkVisible",
+      "SelectedStateOn"
+    ]
+  },
+  "glyph_table.pdf": {
+    "cells": [
+      [
+        "Region",
+        "Samples",
+        "Depth"
+      ],
+      [
+        "North",
+        "128",
+        "42.5"
+      ],
+      [
+        "South",
+        "96",
+        "31.0"
+      ],
+      [
+        "East ridge",
+        "77",
+        "18.2"
+      ]
+    ]
+  },
+  "ruled_blank_cells.pdf": {
+    "rows": 6,
+    "cols": 4
+  },
+  "booktabs_wrapped.pdf": {
+    "tables": 1
+  },
+  "three_column_prose.pdf": {
+    "tables": 1
+  },
+  "two_column_tables.pdf": {
+    "tables": 2
+  },
+  "two_column_tables_prose.pdf": {
+    "tables": 2
+  },
+  "panel_table.pdf": {
+    "cells": [
+      [
+        "Constituent",
+        "Benchmark",
+        "Value"
+      ],
+      [
+        "Arsenic",
+        "Federal MCL",
+        "10 ppb"
+      ],
+      [
+        "Boron",
+        "Federal HAL",
+        "6,000 ppb"
+      ],
+      [
+        "Radon-222",
+        "Proposed MCL",
+        "4,000 pCi"
+      ]
+    ],
+    "panel_own_text": "Benchmarks for evaluating groundwater quality"
+  },
+  "tagged_table.pdf": {
+    "declared_grid": [
+      [
+        "Region",
+        "",
+        "Total"
+      ],
+      [
+        "North",
+        "Alpha",
+        "11"
+      ],
+      [
+        "",
+        "Beta",
+        "22"
+      ]
+    ],
+    "declared_rows": 3,
+    "declared_cols": 3,
+    "refused": [
+      "single-row shard",
+      "single-column shard"
+    ],
+    "undeclared_rows": [
+      [
+        "Site",
+        "Depth",
+        "Yield"
+      ],
+      [
+        "Ridge",
+        "18.2",
+        "77"
+      ],
+      [
+        "Basin",
+        "31.0",
+        "96"
+      ],
+      [
+        "Delta",
+        "42.5",
+        "128"
+      ]
+    ]
+  },
+  "undecodable_codec.pdf": {
+    "declined_object": 5,
+    "control_object": 6,
+    "filter": "JPXDecode",
+    "human": "JPEG 2000",
+    "kind": "codec-unsupported"
+  },
+  "codec_basemap.pdf": {
+    "basemap_page": 1,
+    "control_page": 2,
+    "filter": "JPXDecode",
+    "human": "JPEG 2000"
   },
   "no_spurious_figs.pdf": {
     "page1_figures": 0,
@@ -509,6 +1103,31 @@
     ],
     "subset_text": "Hello"
   },
+  "partial_tounicode.pdf": {
+    "winansi_line": "Redding Sacramento EXPLANATION KILOMETERS 42\u00b0",
+    "winansi_words": [
+      "Redding",
+      "Sacramento",
+      "EXPLANATION",
+      "KILOMETERS",
+      "42\u00b0"
+    ],
+    "symbolic_mapped": [
+      "\u2206",
+      "\u2248"
+    ],
+    "symbolic_forbidden": [
+      "a",
+      "^"
+    ],
+    "macroman_text": "\u2022\u2026\u2013\u2019",
+    "macroman_forbidden": [
+      "\u00a5",
+      "\u00c9",
+      "\u00d0",
+      "\u00d5"
+    ]
+  },
   "numeric.pdf": {
     "header": [
       "System",
@@ -610,618 +1229,5 @@
     "control": "form_repeat.pdf",
     "control_repeats": 3,
     "control_word": "REPEAT"
-  },
-  "unfiltered_form.pdf": {
-    "form_text": "Unfiltered form ink",
-    "n_bars": 5,
-    "caption": "Figure 1: Five bars painted by a form stream carrying no filter.",
-    "title": "A Form Stream With No Filter"
-  },
-  "indirect_mediabox.pdf": {
-    "page_width": 1008,
-    "page_height": 612,
-    "crop_width": 400,
-    "crop_height": 650,
-    "figure_width": 504,
-    "caption": "Figure 1: A grid spanning 504 of the 1008 point page.",
-    "n_figures": 1,
-    "crop_page_text": "This page states no MediaBox anywhere up the tree, only a CropBox."
-  },
-  "indirect_numbers.pdf": {
-    "uri": "https://example.com/indirect",
-    "rect": [
-      72,
-      696,
-      420,
-      714
-    ],
-    "fill_alpha": 0.85,
-    "stroke_alpha": 0.6,
-    "dest_xyz": {
-      "name": "fig.indirect",
-      "page": 2,
-      "y": 700
-    },
-    "dest_fith": {
-      "name": "sec.indirect",
-      "page": 2,
-      "y": 640
-    },
-    "n_bars": 8,
-    "n_paths": 10,
-    "caption": "Figure 1: Bars painted under an indirect alpha.",
-    "n_figures": 1
-  },
-  "decode_jpeg.pdf": {
-    "gray_rgb": [
-      215,
-      215,
-      215
-    ],
-    "rgb_rgb": [
-      55,
-      225,
-      165
-    ],
-    "width": 64,
-    "height": 48
-  },
-  "form_inherit.pdf": {
-    "word": "INHERIT",
-    "x": 172,
-    "image": {
-      "width": 40,
-      "height": 30,
-      "x_left": 172,
-      "y_bottom": 560
-    },
-    "panel_opacity": 0.5
-  },
-  "render_samples.pdf": {
-    "html_images": 2,
-    "indexed_px": {
-      "0,0": [
-        255,
-        0,
-        0
-      ],
-      "1,0": [
-        0,
-        0,
-        255
-      ]
-    },
-    "gray4_px": {
-      "0,0": [
-        0,
-        0,
-        0
-      ],
-      "1,0": [
-        255,
-        255,
-        255
-      ]
-    }
-  },
-  "no_resources_paths.pdf": {
-    "svgs_per_page": [
-      1,
-      1
-    ],
-    "paths_per_page": 9
-  },
-  "annot_appearance.pdf": {
-    "images": [
-      {
-        "index": 0,
-        "width": 40,
-        "height": 30
-      },
-      {
-        "index": 1,
-        "width": 10,
-        "height": 10
-      },
-      {
-        "index": 2,
-        "width": 12,
-        "height": 12
-      },
-      {
-        "index": 3,
-        "width": 15,
-        "height": 15
-      },
-      {
-        "index": 4,
-        "width": 16,
-        "height": 16
-      }
-    ],
-    "never_reported": [
-      {
-        "width": 11,
-        "height": 11,
-        "why": "in the appearance's resources, never drawn"
-      },
-      {
-        "width": 13,
-        "height": 13,
-        "why": "the state /AS did not select"
-      },
-      {
-        "width": 14,
-        "height": 14,
-        "why": "a hidden (/F bit 2) annotation"
-      }
-    ]
-  },
-  "rotated_pages.pdf": {
-    "rotations": [
-      0,
-      90,
-      180,
-      270
-    ],
-    "figure_page_bbox": [
-      100,
-      200,
-      300,
-      500
-    ],
-    "labels": [
-      "Alpha",
-      "Beta"
-    ]
-  },
-  "rotated_body.pdf": {
-    "rotations": [
-      0,
-      90,
-      180,
-      270
-    ],
-    "heading": "Turning the page",
-    "paragraphs": [
-      "A page that carries a Rotate key is turned clockwise before it is shown, and its text is authored at the matching angle so that the reader sees ordinary upright prose on an ordinary page.",
-      "Nothing about that page is a figure, so nothing else can carry its words into the output."
-    ],
-    "spine_label": "SPINE LABEL"
-  },
-  "separation.pdf": {
-    "pages": [
-      "Separation/Type2",
-      "DeviceN/Type0",
-      "Separation/Type4"
-    ],
-    "solid_tint_rgb": "#c6c6e0",
-    "type4_coverage": {
-      "0.2": "#cccccc",
-      "0.75": "#404040"
-    },
-    "grey_level_misreadings": [
-      "#1a1a1a",
-      "#333333"
-    ],
-    "spot_image_px": {
-      "0,0": [
-        255,
-        255,
-        255
-      ],
-      "2,0": [
-        198,
-        198,
-        224
-      ]
-    },
-    "spot_image_intensity_misreading": {
-      "0,0": [
-        0,
-        0,
-        0
-      ],
-      "2,0": [
-        255,
-        255,
-        255
-      ]
-    }
-  },
-  "alpha_groups.pdf": {
-    "group_opacities": [
-      "0.0039",
-      "0.02",
-      "0.04",
-      "0.5",
-      "0.98"
-    ],
-    "paths": 8,
-    "plain_form_opacity": "0.25"
-  },
-  "dashes.pdf": {
-    "dasharrays": [
-      null,
-      "3 2",
-      "6 3",
-      null,
-      null
-    ],
-    "dashoffsets": [
-      null,
-      null,
-      "2",
-      null,
-      null
-    ],
-    "paths": 7
-  },
-  "smask_panel.pdf": {
-    "panel_fill": "#339999",
-    "image_rgb": [
-      220,
-      30,
-      40
-    ],
-    "expect_format": "png"
-  },
-  "clipped_raster.pdf": {
-    "figures": 3,
-    "placement": [
-      140,
-      350,
-      300,
-      470
-    ],
-    "clip": [
-      140,
-      350,
-      220,
-      410
-    ],
-    "window_rgb": [
-      40,
-      60,
-      210
-    ]
-  },
-  "form_bbox.pdf": {
-    "in_box_fill": "#3366cc",
-    "out_of_box_fill": "#cc3333",
-    "clipped_box": [
-      72,
-      500,
-      372,
-      680
-    ],
-    "rasters": 1,
-    "raster_box": [
-      402,
-      270,
-      462,
-      330
-    ]
-  },
-  "form_bbox_text.pdf": {
-    "labels": {
-      "TOPBAND": 1,
-      "BOTBAND": 1
-    },
-    "topband_xy": [
-      92,
-      700
-    ],
-    "botband_xy": [
-      95,
-      371.6
-    ]
-  },
-  "rotated_raster.pdf": {
-    "rotations": [
-      0,
-      90,
-      180,
-      270
-    ],
-    "placement": [
-      100,
-      250,
-      300,
-      350
-    ],
-    "displayed": {
-      "0": [
-        [
-          255,
-          0,
-          0
-        ],
-        [
-          0,
-          0,
-          255
-        ]
-      ],
-      "90": [
-        [
-          255,
-          0,
-          0
-        ],
-        [
-          0,
-          0,
-          255
-        ]
-      ],
-      "180": [
-        [
-          0,
-          0,
-          255
-        ],
-        [
-          255,
-          0,
-          0
-        ]
-      ],
-      "270": [
-        [
-          0,
-          0,
-          255
-        ],
-        [
-          255,
-          0,
-          0
-        ]
-      ]
-    }
-  },
-  "partial_tounicode.pdf": {
-    "winansi_line": "Redding Sacramento EXPLANATION KILOMETERS 42\u00b0",
-    "winansi_words": [
-      "Redding",
-      "Sacramento",
-      "EXPLANATION",
-      "KILOMETERS",
-      "42\u00b0"
-    ],
-    "symbolic_mapped": [
-      "\u2206",
-      "\u2248"
-    ],
-    "symbolic_forbidden": [
-      "a",
-      "^"
-    ],
-    "macroman_text": "\u2022\u2026\u2013\u2019",
-    "macroman_forbidden": [
-      "\u00a5",
-      "\u00c9",
-      "\u00d0",
-      "\u00d5"
-    ]
-  },
-  "map_label_grid.pdf": {
-    "page1_figures": 1,
-    "page2_figures": 0
-  },
-  "glyph_run_labels.pdf": {
-    "joined": [
-      "Cloverdale",
-      "Sonoma"
-    ],
-    "whole_already": [
-      "Healdsburg"
-    ],
-    "must_stay_apart": [
-      "Santa",
-      "Rosa",
-      "Napa"
-    ]
-  },
-  "textstate_q.pdf": {
-    "word": "Cloverdale",
-    "occurrences": 2
-  },
-  "caption_bleed.pdf": {
-    "svg_labels": [
-      "256",
-      "512",
-      "RGB"
-    ],
-    "must_stay_in_body": [
-      "Mildenhall",
-      "Residual connections",
-      "Sim1a network only",
-      "0.33"
-    ]
-  },
-  "ink_gate.pdf": {
-    "page1_figures": 1,
-    "page2_figures": 0,
-    "page3_figures": 0,
-    "page4_figures": 1
-  },
-  "damaged_streams.pdf": {
-    "pages": 3,
-    "issues": {
-      "6": "flate-truncated",
-      "7": "filter-unapplied"
-    },
-    "intact_object": 8,
-    "rects_authored": 10
-  },
-  "smask_group_raster.pdf": {
-    "figures": 3,
-    "placement": [
-      140,
-      350,
-      300,
-      470
-    ],
-    "window": [
-      140,
-      350,
-      220,
-      410
-    ],
-    "window_rgb": [
-      40,
-      60,
-      210
-    ]
-  },
-  "annot_render.pdf": {
-    "rect": [
-      200,
-      400,
-      400,
-      550
-    ],
-    "raster": [
-      208,
-      406,
-      248,
-      436
-    ],
-    "label": "StampInkVisible",
-    "label_xy": [
-      208,
-      520
-    ],
-    "label_size": 12,
-    "must_not_paint": [
-      "HiddenStampMustNotPaint",
-      "UnselectedStateOff",
-      "NoStateSelected"
-    ],
-    "must_paint": [
-      "StampInkVisible",
-      "SelectedStateOn"
-    ]
-  },
-  "glyph_table.pdf": {
-    "cells": [
-      [
-        "Region",
-        "Samples",
-        "Depth"
-      ],
-      [
-        "North",
-        "128",
-        "42.5"
-      ],
-      [
-        "South",
-        "96",
-        "31.0"
-      ],
-      [
-        "East ridge",
-        "77",
-        "18.2"
-      ]
-    ]
-  },
-  "panel_table.pdf": {
-    "cells": [
-      [
-        "Constituent",
-        "Benchmark",
-        "Value"
-      ],
-      [
-        "Arsenic",
-        "Federal MCL",
-        "10 ppb"
-      ],
-      [
-        "Boron",
-        "Federal HAL",
-        "6,000 ppb"
-      ],
-      [
-        "Radon-222",
-        "Proposed MCL",
-        "4,000 pCi"
-      ]
-    ],
-    "panel_own_text": "Benchmarks"
-  },
-  "undecodable_codec.pdf": {
-    "declined_object": 5,
-    "control_object": 6,
-    "filter": "JPXDecode",
-    "human": "JPEG 2000",
-    "kind": "codec-unsupported"
-  },
-  "codec_basemap.pdf": {
-    "basemap_page": 1,
-    "control_page": 2,
-    "filter": "JPXDecode",
-    "human": "JPEG 2000"
-  },
-  "tagged_table.pdf": {
-    "declared_grid": [
-      [
-        "Region",
-        "",
-        "Total"
-      ],
-      [
-        "North",
-        "Alpha",
-        "11"
-      ],
-      [
-        "",
-        "Beta",
-        "22"
-      ]
-    ],
-    "declared_rows": 3,
-    "declared_cols": 3,
-    "refused": [
-      "single-row shard",
-      "single-column shard"
-    ],
-    "undeclared_rows": [
-      [
-        "Site",
-        "Depth",
-        "Yield"
-      ],
-      [
-        "Ridge",
-        "18.2",
-        "77"
-      ],
-      [
-        "Basin",
-        "31.0",
-        "96"
-      ],
-      [
-        "Delta",
-        "42.5",
-        "128"
-      ]
-    ]
-  },
-  "ruled_blank_cells.pdf": {
-    "rows": 6,
-    "cols": 4
-  },
-  "booktabs_wrapped.pdf": {
-    "tables": 1
-  },
-  "three_column_prose.pdf": {
-    "tables": 1
   }
 }

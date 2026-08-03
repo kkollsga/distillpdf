@@ -3391,6 +3391,98 @@ def gen_three_column_prose():
     GT["three_column_prose.pdf"] = {"tables": 1}
 
 
+def gen_two_column_tables():
+    """A two-column page whose BOTH columns carry a table — and no prose anywhere.
+
+    `central_gutter` used to admit a page split only where each side showed >=3 lines of
+    wrapping prose. A page like this one has none to show, so it was read whole, and
+    `rows_of`'s half-line band then bound a left-column line to a right-column line into one
+    row: the two tables came out interleaved as a single wide grid. Measured on the
+    `pdf-parse-bench` tables corpus, 46 of 313 emitted tables held cells from two different
+    ground-truth tables with at least one row mixing both.
+
+    The two tables are deliberately set on OFFSET baselines (5pt apart, inside the ~6pt
+    clustering band) so the rows really do bind across the gutter — which is what the fix has
+    to see and refuse. Assert two tables of three columns, not one of six."""
+    pdf = os.path.join(OUT, "two_column_tables.pdf")
+    LX = (60.0, 120.0, 180.0)
+    RX = (330.0, 390.0, 450.0)
+    LROWS = [
+        ["Model", "BLEU", "Rate"],
+        ["Alpha", "18.2", "0.71"],
+        ["Beta", "31.0", "0.64"],
+        ["Gamma", "42.5", "0.58"],
+        ["Delta", "27.4", "0.66"],
+        ["Epsilon", "35.1", "0.60"],
+        ["Zeta", "22.9", "0.69"],
+    ]
+    RROWS = [
+        ["Corpus", "Size", "Split"],
+        ["News", "128", "0.80"],
+        ["Web", "96", "0.75"],
+        ["Books", "77", "0.90"],
+        ["Talks", "54", "0.85"],
+        ["Legal", "63", "0.70"],
+        ["Code", "41", "0.95"],
+    ]
+    body = [b"BT /F2 11 Tf 60 740 Td (Two Tables) Tj ET"]
+    for ri, row in enumerate(LROWS):
+        for ci, cell in enumerate(row):
+            body.append(b"BT /F1 10 Tf %.1f %.1f Td (%s) Tj ET" % (LX[ci], 700.0 - ri * 16.0, cell.encode()))
+    for ri, row in enumerate(RROWS):
+        # 5pt below its left-hand neighbour: inside `rows_of`'s band, so the two sides DO
+        # cluster into one row, and on a different baseline, which is the whole signal.
+        for ci, cell in enumerate(row):
+            body.append(b"BT /F1 10 Tf %.1f %.1f Td (%s) Tj ET" % (RX[ci], 695.0 - ri * 16.0, cell.encode()))
+    stream = b"\n".join(body)
+    _assemble_pdf(_one_page(stream), pdf)
+    GT["two_column_tables.pdf"] = {"tables": 2}
+
+
+def gen_two_column_tables_prose():
+    """The same two tables, on a two-column page that DOES carry prose — `pdf-parse-bench`
+    doc 001's shape.
+
+    Here `central_gutter`'s prose test fires and the page is split correctly. It was then
+    handed straight back: the two-column path re-detects across the full width wherever a
+    left-side table overlaps a right-side one, to recover a table the gutter cut in half, and
+    that re-detection rebuilt the interleaved grid. Doc 001 came back as
+    `| None | 68.7 | 64.4 | | | | Target Model | 0% | 100% Ratio |` for exactly this reason —
+    not, as first supposed, because the page failed to split.
+
+    No row of this page crosses the gutter, so no full-width table can exist on it and there is
+    nothing to rejoin. Assert two tables of three columns."""
+    pdf = os.path.join(OUT, "two_column_tables_prose.pdf")
+    LX = (60.0, 140.0, 210.0)
+    RX = (320.0, 400.0, 470.0)
+    PROSE = [
+        "The retrieval scores below were collected on the",
+        "held-out split after a single pass of fine tuning",
+        "on each of the caption corpora named in the left",
+        "column, with every other setting left untouched.",
+        "Numbers are means over three seeds; the spread",
+        "never exceeded half a point on either benchmark.",
+    ]
+    LROWS = [["Model", "BLEU", "Rate"], ["Alpha", "18.2", "0.71"], ["Beta", "31.0", "0.64"],
+             ["Gamma", "42.5", "0.58"], ["Delta", "27.4", "0.66"], ["Epsilon", "35.1", "0.60"]]
+    RROWS = [["Corpus", "Size", "Split"], ["News", "128", "0.80"], ["Web", "96", "0.75"],
+             ["Books", "77", "0.90"], ["Talks", "54", "0.85"], ["Legal", "63", "0.70"]]
+    body = []
+    for i, line in enumerate(PROSE):
+        y = 730.0 - i * 12.0
+        body.append(b"BT /F1 8 Tf 60 %.1f Td (%s) Tj ET" % (y, line.encode()))
+        body.append(b"BT /F1 8 Tf 320 %.1f Td (%s) Tj ET" % (y, PROSE[(i + 3) % len(PROSE)].encode()))
+    for ri, row in enumerate(LROWS):
+        for ci, cell in enumerate(row):
+            body.append(b"BT /F1 9 Tf %.1f %.1f Td (%s) Tj ET" % (LX[ci], 630.0 - ri * 15.0, cell.encode()))
+    for ri, row in enumerate(RROWS):
+        for ci, cell in enumerate(row):  # 5pt off its neighbour's baseline, as above
+            body.append(b"BT /F1 9 Tf %.1f %.1f Td (%s) Tj ET" % (RX[ci], 625.0 - ri * 15.0, cell.encode()))
+    stream = b"\n".join(body)
+    _assemble_pdf(_one_page(stream), pdf)
+    GT["two_column_tables_prose.pdf"] = {"tables": 2}
+
+
 def _one_page(stream):
     """The five objects a one-page, two-font, letter-size PDF needs around `stream`."""
     return {
@@ -4346,6 +4438,8 @@ def main():
     gen_ruled_blank_cells()
     gen_booktabs_wrapped()
     gen_three_column_prose()
+    gen_two_column_tables()
+    gen_two_column_tables_prose()
     gen_panel_table()
     gen_tagged_table()
     gen_undecodable_codec()
