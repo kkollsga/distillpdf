@@ -72,14 +72,27 @@ step "Accuracy floor gate (per-table-type x per-dimension, bench100)"
 # The 37-metric corpus gate above is a *mechanical* gate: it holds our own extraction
 # counters at-or-above a frozen baseline. It cannot see the thing that matters most here —
 # that a change trades one table population for another. Measured over 84 ground-truth
-# table pages we score 0.587 against pymupdf's 0.043 on booktabs (horizontal rules only)
-# and 0.503 against its 0.805 on full ruled grids; a looser detector wins the grids,
+# table pages we score 0.529 against pymupdf's 0.036 on booktabs (horizontal rules only)
+# and 0.412 against its 0.688 on full ruled grids; a looser detector wins the grids,
 # invents tables on papers, and leaves the aggregate almost unmoved. The floor gate holds
 # every table-type x dimension cell at its own floor and names the pages that moved.
 #
-# It re-scores first (~30 s over 256 pages / 88 docs) because this script has just
+# Those table numbers are a GRID score, not a detection count: since 2026-08-03 the gated
+# `tables` accuracy is 0.5 * table-count agreement + 0.5 * row/col agreement on matched
+# tables. It has to be. A count-only floor cannot see a change that keeps every <table>
+# and halves its columns — measured, that attack moves the count-only score by 0.0000 and
+# the current one by -0.053, three times the aggregate cell's whole slack budget. The
+# count-only value is still printed per table type (--summary, "TABLES, LAYERED") so the
+# detection trendline survives the change.
+#
+# It re-scores first (~65 s over 256 pages / 88 docs) because this script has just
 # reinstalled the wheel: scoring the shipped build is the whole point, and the gate refuses
-# to run on measurements older than the installed module.
+# to run on measurements older than the installed module. Half that time is one extra
+# extraction of each document IN FULL: every page above is scored from a one-page slice,
+# which cannot suppress repeated page furniture, and the gap between the two is reported
+# (--summary, "SLICE vs FULL DOCUMENT") so a fix phase is scoped against the product's
+# residue rather than the harness's artefact — for headings that is a false-positive rate
+# of 0.222, not the 0.815 the slices show.
 #
 # Same local-corpus caveat as above — bench100 lives under the gitignored benchmarking/
 # tree with its ground truth in dev-docs/. The ONLY sanctioned skip is a machine without
