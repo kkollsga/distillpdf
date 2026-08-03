@@ -8,6 +8,7 @@
 
 use lopdf::dictionary;
 use lopdf::Document;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -256,16 +257,30 @@ impl PdfDocument {
 
     /// Extract plain text from all pages (concatenated, page order). Hybrid: our
     /// ToUnicode-aware extractor primary, lopdf fallback per page.
+    ///
+    /// Pages are extracted in PARALLEL — each is an independent read-only walk of the
+    /// document with its own [`crate::WalkBudget`], the same property that already makes the
+    /// span pass in [`crate::html`] parallel. The result is byte-identical to the sequential
+    /// loop by construction, not by luck: nothing crosses pages, and the pieces are re-sorted
+    /// by page number before they are joined, so completion order is never observed.
     pub fn extract_text(&self) -> String {
         let pages = self.doc.get_pages();
+        let mut per_page: Vec<(u32, String)> = pages
+            .par_iter()
+            .map(|(&p, &page_id)| {
+                let mine = text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default();
+                let s = if mine.trim().chars().count() >= 2 {
+                    mine
+                } else {
+                    self.doc.extract_text(&[p]).unwrap_or_default() // per-page lopdf fallback
+                };
+                (p, s)
+            })
+            .collect();
+        per_page.sort_by_key(|(p, _)| *p);
         let mut out = String::new();
-        for (&p, &page_id) in &pages {
-            let mine = text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default();
-            if mine.trim().chars().count() >= 2 {
-                out.push_str(&mine);
-            } else {
-                out.push_str(&self.doc.extract_text(&[p]).unwrap_or_default());
-            }
+        for (_, s) in &per_page {
+            out.push_str(s);
             out.push('\n');
         }
         out
@@ -601,7 +616,7 @@ fn iso8601_now() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The owned encrypted fixtures (`tests/gen_fixtures.py::gen_encrypted`). They live in
@@ -611,6 +626,58 @@ mod tests {
     }
 
     const ENC_SENTENCE: &str = "Encrypted fixture sentinel phrase for distillPDF.";
+
+    /// Every committed fixture PDF, in sorted path order — the sweep corpus a unit test uses
+    /// when its claim is about *all* documents (parallelism agreeing with the sequential path,
+    /// a short-circuit reporting what the full walk reports) rather than one authored shape.
+    /// Shared with `extract`'s sweeps so the list is derived once.
+    pub(crate) fn fixture_pdfs() -> Vec<std::path::PathBuf> {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf");
+        let mut out: Vec<std::path::PathBuf> = Vec::new();
+        for d in [std::path::PathBuf::from(dir), std::path::Path::new(dir).join("adversarial")] {
+            let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(&d)
+                .expect("fixture dir readable")
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("pdf")))
+                .collect();
+            found.sort();
+            out.append(&mut found);
+        }
+        assert!(out.len() > 40, "expected the full fixture corpus, got {}", out.len());
+        out
+    }
+
+    #[test]
+    fn parallel_page_text_joins_exactly_as_the_sequential_loop_did() {
+        // `extract_text` fans its pages out over rayon. The join must not be able to observe
+        // completion order, so compare it against an independent sequential oracle written
+        // here — and repeat it, because a nondeterministic order shows up as an occasional
+        // disagreement, not a permanent one (`img::cluster` cost this project a whole batch
+        // of byte-identical claims by returning a HashMap's values).
+        let mut multipage = 0usize;
+        for path in fixture_pdfs() {
+            let Ok(pdf) = PdfDocument::open(path.to_str().expect("utf-8 fixture path")) else {
+                continue; // encrypted / deliberately damaged
+            };
+            let mut want = String::new();
+            for (&p, &page_id) in &pdf.doc.get_pages() {
+                let mine = text::extract_page(&pdf.doc, page_id, &pdf.raw).unwrap_or_default();
+                if mine.trim().chars().count() >= 2 {
+                    want.push_str(&mine);
+                } else {
+                    want.push_str(&pdf.doc.extract_text(&[p]).unwrap_or_default());
+                }
+                want.push('\n');
+            }
+            if pdf.page_count() > 1 {
+                multipage += 1;
+            }
+            for run in 0..5 {
+                assert_eq!(pdf.extract_text(), want, "run {run} of {} disagrees with the sequential join", path.display());
+            }
+        }
+        assert!(multipage >= 10, "the sweep must cover documents with pages to parallelise, got {multipage}");
+    }
 
     #[test]
     fn owner_password_only_files_open_and_extract() {

@@ -7,6 +7,7 @@ use crate::pdfobj::{deref, filters_of, sub_dict};
 use crate::raster::{assemble_png, codec_payload, filter_to_format, image_bpc, image_color_space, normalized_jpeg_png};
 use crate::text::{self, Span};
 use lopdf::{Dictionary, Document, ObjectId};
+use rayon::prelude::*;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
 /// One extracted raster image. Mirrors the dict `Pdf.extract_images` returns:
@@ -1247,15 +1248,21 @@ fn detect_tables(spans: Vec<Span>) -> Vec<Vec<Vec<String>>> {
 
 
 /// Extract tables from all pages as owned [`TableInfo`] rows (row-major grids).
+///
+/// Detection runs per page in PARALLEL: `extract_spans` is an independent read-only walk with
+/// its own [`crate::WalkBudget`], and `detect_tables` is pure over one page's spans, so no
+/// page can see another. The rows are re-sorted by page number before they are flattened —
+/// completion order decides nothing — which makes the output byte-identical to the sequential
+/// loop, including each page's internal table order.
 pub fn extract_tables(doc: &Document, raw: &[u8]) -> Vec<TableInfo> {
-    let mut out = Vec::new();
-    for (&pno, &page_id) in &doc.get_pages() {
-        let spans = text::extract_spans(doc, page_id, raw);
-        for grid in detect_tables(spans) {
-            out.push(TableInfo { page: pno, cells: grid });
-        }
-    }
-    out
+    let pages = doc.get_pages();
+    let mut per_page: Vec<(u32, Vec<Vec<Vec<String>>>)> =
+        pages.par_iter().map(|(&pno, &page_id)| (pno, detect_tables(text::extract_spans(doc, page_id, raw)))).collect();
+    per_page.sort_by_key(|(pno, _)| *pno);
+    per_page
+        .into_iter()
+        .flat_map(|(pno, grids)| grids.into_iter().map(move |cells| TableInfo { page: pno, cells }))
+        .collect()
 }
 
 /// Does this font dict (or its descendant) carry an embedded font program?
@@ -1405,6 +1412,33 @@ mod tests {
     }
 
     #[test]
+    fn parallel_table_detection_yields_the_sequential_row_order() {
+        // `extract_tables` fans its pages out over rayon. Rows are ordered by page and, within
+        // a page, by detection order — neither may come from completion order, so compare
+        // against an independent sequential oracle and repeat it (a race shows up as an
+        // occasional disagreement, never a permanent one).
+        let mut with_tables = 0usize;
+        for path in crate::doc::tests::fixture_pdfs() {
+            let Ok(raw) = std::fs::read(&path) else { continue };
+            let Ok(doc) = Document::load_mem(&raw) else { continue }; // encrypted / damaged
+            let mut want: Vec<(u32, Vec<Vec<String>>)> = Vec::new();
+            for (&pno, &page_id) in &doc.get_pages() {
+                for grid in detect_tables(text::extract_spans(&doc, page_id, &raw)) {
+                    want.push((pno, grid));
+                }
+            }
+            if !want.is_empty() {
+                with_tables += 1;
+            }
+            for run in 0..5 {
+                let got: Vec<(u32, Vec<Vec<String>>)> = extract_tables(&doc, &raw).into_iter().map(|t| (t.page, t.cells)).collect();
+                assert_eq!(got, want, "run {run} of {} disagrees with the sequential scan", path.display());
+            }
+        }
+        assert!(with_tables >= 3, "the sweep must cover documents that actually detect tables, got {with_tables}");
+    }
+
+    #[test]
     fn the_short_circuit_reports_exactly_what_the_full_walk_reports() {
         // `extract_images` skips the content walk on a page whose resource tree reaches no
         // image XObject. The claim is that this is unobservable, not merely usually right —
@@ -1413,18 +1447,7 @@ mod tests {
         // form XObjects, images reachable but never drawn (`undrawn_image.pdf`), images that
         // exist only in an annotation appearance (`annot_appearance.pdf`), cyclic and
         // repeated forms, and the adversarial form bomb.
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf");
-        let mut paths: Vec<std::path::PathBuf> = Vec::new();
-        for d in [std::path::PathBuf::from(dir), std::path::Path::new(dir).join("adversarial")] {
-            let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(&d)
-                .expect("fixture dir readable")
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("pdf")))
-                .collect();
-            found.sort();
-            paths.append(&mut found);
-        }
-        assert!(paths.len() > 40, "expected the full fixture corpus, got {}", paths.len());
+        let paths = crate::doc::tests::fixture_pdfs();
         let mut with_images = 0usize;
         for p in &paths {
             let Ok(doc) = Document::load(p) else { continue }; // encrypted / deliberately damaged
