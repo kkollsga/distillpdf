@@ -1818,50 +1818,18 @@ fn detect_lanes(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTable> {
     let nlanes = gutters.len() + 1;
     let per_lane: Vec<Vec<PosTable>> =
         (0..nlanes).map(|k| detect_tables_region(&spans.iter().filter(|s| lane_of(s) == k).map(clone_span).collect::<Vec<_>>(), bands)).collect();
-    // A table spanning the columns was cut into pieces occupying the SAME rows — the
-    // two-column path's rejoin, generalised: chain each lane's table to an unused overlapping
-    // one in a lane to its right, then re-detect across the full width within just that
-    // vertical band. A single-column table beside prose has no mate and is kept as it is.
-    let overlaps = |a: (f32, f32), b: &PosTable| {
-        let lo = a.0.max(b.y_bottom);
-        let hi = a.1.min(b.y_top);
-        let span = (a.1 - a.0).min(b.y_top - b.y_bottom).max(1.0);
-        (hi - lo) >= span * 0.5
-    };
-    let mut used: Vec<Vec<bool>> = per_lane.iter().map(|v| vec![false; v.len()]).collect();
-    let mut out: Vec<PosTable> = Vec::new();
-    for k in 0..nlanes {
-        for i in 0..per_lane[k].len() {
-            if used[k][i] {
-                continue;
-            }
-            used[k][i] = true;
-            let t = &per_lane[k][i];
-            let (mut yb, mut yt) = (t.y_bottom, t.y_top);
-            let mut chain: Vec<&PosTable> = vec![t];
-            for (k2, lane) in per_lane.iter().enumerate().skip(k + 1) {
-                if let Some(j) = (0..lane.len()).find(|&j| !used[k2][j] && overlaps((yb, yt), &lane[j])) {
-                    used[k2][j] = true;
-                    yb = yb.min(lane[j].y_bottom);
-                    yt = yt.max(lane[j].y_top);
-                    chain.push(&lane[j]);
-                }
-            }
-            if chain.len() == 1 {
-                out.push(t.clone());
-                continue;
-            }
+    // A table spanning the columns was cut into pieces occupying the SAME rows. Chain each
+    // lane's table to an unused overlapping one to its right, then re-detect across the full
+    // width within only that vertical band. A single-column table has no mate and is retained.
+    crate::grid::rejoin_lane_chains(
+        &per_lane,
+        |t| crate::geom::Rect::new(0.0, t.y_bottom, 1.0, t.y_top),
+        |yb, yt| {
             let pad = 2.0;
             let band: Vec<Span> = spans.iter().filter(|s| s.y >= yb - pad && s.y <= yt + pad).map(clone_span).collect();
-            let merged = detect_tables_region(&band, bands);
-            if merged.is_empty() {
-                out.extend(chain.into_iter().cloned());
-            } else {
-                out.extend(merged);
-            }
-        }
-    }
-    out
+            detect_tables_region(&band, bands)
+        },
+    )
 }
 
 /// Detect tables within a single region (one text column, or the whole page):

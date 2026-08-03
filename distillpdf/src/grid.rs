@@ -188,6 +188,60 @@ pub(crate) fn rejoin_split_pairs<T: Clone>(
     out
 }
 
+/// Rejoin table fragments that a multi-column page split across two or more lanes.
+///
+/// Starting from each unused fragment, take at most one vertically-overlapping fragment from
+/// every lane to its right. Multi-fragment chains are redetected across their combined vertical
+/// band; when redetection has no answer, the original fragments survive in lane order.
+pub(crate) fn rejoin_lane_chains<T: Clone>(
+    per_lane: &[Vec<T>],
+    region_of: impl Fn(&T) -> Rect,
+    mut redetect: impl FnMut(f32, f32) -> Vec<T>,
+) -> Vec<T> {
+    let mut used: Vec<Vec<bool>> = per_lane.iter().map(|v| vec![false; v.len()]).collect();
+    let mut out = Vec::new();
+    for (k, lane) in per_lane.iter().enumerate() {
+        for (i, item) in lane.iter().enumerate() {
+            if used[k][i] {
+                continue;
+            }
+            used[k][i] = true;
+            let region = region_of(item);
+            let (mut y0, mut y1) = (region.y0, region.y1);
+            let mut chain = vec![item];
+            for (k2, next_lane) in per_lane.iter().enumerate().skip(k + 1) {
+                if let Some(j) = (0..next_lane.len()).find(|&j| {
+                    if used[k2][j] {
+                        return false;
+                    }
+                    let next = region_of(&next_lane[j]);
+                    let lo = y0.max(next.y0);
+                    let hi = y1.min(next.y1);
+                    let span = (y1 - y0).min(next.height()).max(1.0);
+                    (hi - lo) >= span * 0.5
+                }) {
+                    used[k2][j] = true;
+                    let next = region_of(&next_lane[j]);
+                    y0 = y0.min(next.y0);
+                    y1 = y1.max(next.y1);
+                    chain.push(&next_lane[j]);
+                }
+            }
+            if chain.len() == 1 {
+                out.push(item.clone());
+                continue;
+            }
+            let merged = redetect(y0, y1);
+            if merged.is_empty() {
+                out.extend(chain.into_iter().cloned());
+            } else {
+                out.extend(merged);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +332,33 @@ mod tests {
             true,
             |t| t.rect,
             |_, _| vec![item("merged", 0.0, 20.0)],
+        );
+        assert_eq!(joined.iter().map(|t| t.id).collect::<Vec<_>>(), ["merged"]);
+    }
+
+    #[test]
+    fn lane_fragments_rejoin_across_the_combined_vertical_band() {
+        #[derive(Clone, Debug, PartialEq)]
+        struct Item {
+            id: &'static str,
+            rect: Rect,
+        }
+        let item = |id, y0, y1| Item {
+            id,
+            rect: Rect::new(0.0, y0, 10.0, y1),
+        };
+        let lanes = vec![
+            vec![item("left", 0.0, 10.0)],
+            vec![item("middle", 1.0, 11.0)],
+            vec![item("right", 2.0, 12.0)],
+        ];
+        let joined = rejoin_lane_chains(
+            &lanes,
+            |t| t.rect,
+            |y0, y1| {
+                assert_eq!((y0, y1), (0.0, 12.0));
+                vec![item("merged", y0, y1)]
+            },
         );
         assert_eq!(joined.iter().map(|t| t.id).collect::<Vec<_>>(), ["merged"]);
     }
