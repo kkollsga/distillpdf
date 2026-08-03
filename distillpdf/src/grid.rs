@@ -102,6 +102,42 @@ pub(crate) fn bind_contained(
     }
 }
 
+/// Reconcile a stronger producer's candidates against an existing table stream.
+///
+/// A preferred candidate replaces every existing answer it owns only when it covers those
+/// answers sufficiently. If it owns an answer but overreaches it, the existing answer wins
+/// and the preferred candidate is discarded. The caller supplies the evidence predicates;
+/// this core owns the once-only, stable-order reconciliation.
+pub(crate) fn reconcile_preferred<T>(
+    existing: &mut Vec<T>,
+    preferred: Vec<T>,
+    region_of: impl Fn(&T) -> Rect,
+    owns: impl Fn(&Rect, &T) -> bool,
+    covers: impl Fn(&Rect, &T) -> bool,
+) {
+    if preferred.is_empty() {
+        return;
+    }
+    let regions: Vec<Rect> = preferred.iter().map(region_of).collect();
+    let overreaches: Vec<bool> = regions
+        .iter()
+        .map(|r| existing.iter().any(|t| owns(r, t) && !covers(r, t)))
+        .collect();
+    existing.retain(|t| {
+        !regions
+            .iter()
+            .zip(&overreaches)
+            .any(|(r, &over)| !over && owns(r, t))
+    });
+    existing.extend(
+        preferred
+            .into_iter()
+            .zip(overreaches)
+            .filter(|(_, over)| !over)
+            .map(|(t, _)| t),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +155,45 @@ mod tests {
         let ys = [0.0, 10.0, 20.0];
         assert_eq!(2 - 1 - band_index(&ys, 15.0), 0);
         assert_eq!(2 - 1 - band_index(&ys, 5.0), 1);
+    }
+
+    #[test]
+    fn preferred_candidates_replace_owned_answers_but_not_when_they_overreach() {
+        #[derive(Debug, PartialEq)]
+        struct Item {
+            id: &'static str,
+            rect: Rect,
+        }
+        let item = |id, y0, y1| Item {
+            id,
+            rect: Rect::new(0.0, y0, 10.0, y1),
+        };
+        let owns = |r: &Rect, t: &Item| r.overlap_area(t.rect) > 0.0;
+
+        let mut existing = vec![item("old", 0.0, 10.0), item("untouched", 20.0, 30.0)];
+        reconcile_preferred(
+            &mut existing,
+            vec![item("preferred", 0.0, 10.0)],
+            |t| t.rect,
+            owns,
+            |r, t| r.overlap_h(t.rect) >= t.rect.height(),
+        );
+        assert_eq!(
+            existing.iter().map(|t| t.id).collect::<Vec<_>>(),
+            ["untouched", "preferred"]
+        );
+
+        let mut existing = vec![item("longer", 0.0, 20.0)];
+        reconcile_preferred(
+            &mut existing,
+            vec![item("short", 0.0, 5.0)],
+            |t| t.rect,
+            owns,
+            |r, t| r.overlap_h(t.rect) >= t.rect.height() * 0.5,
+        );
+        assert_eq!(
+            existing.iter().map(|t| t.id).collect::<Vec<_>>(),
+            ["longer"]
+        );
     }
 }

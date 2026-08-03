@@ -1622,8 +1622,6 @@ pub fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Ve
             }
         }
         if !framed.is_empty() {
-            let regions: Vec<crate::geom::Rect> =
-                framed.iter().map(|t| crate::geom::Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top)).collect();
             // A frame REPLACES the fragments inference made inside it — but only where it
             // actually covers them. A ruled table whose lower rows are not closed on all four
             // sides produces a frame much shorter than the run the alignment path read, and
@@ -1645,10 +1643,13 @@ pub fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Ve
                 let tr = crate::geom::Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
                 owns(r, t) && r.overlap_h(tr) + pad >= FRAME_COVERS * (t.y_top - t.y_bottom)
             };
-            let overreaches: Vec<bool> =
-                regions.iter().map(|r| out.iter().any(|t| owns(r, t) && !covers(r, t))).collect();
-            out.retain(|t| !regions.iter().zip(&overreaches).any(|(r, &over)| !over && owns(r, t)));
-            out.extend(framed.into_iter().zip(overreaches).filter(|(_, over)| !over).map(|(t, _)| t));
+            crate::grid::reconcile_preferred(
+                &mut out,
+                framed,
+                |t| crate::geom::Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top),
+                owns,
+                covers,
+            );
         }
     }
     // Every surviving alignment table goes through the same L2/L3 dispatch, with no frame
