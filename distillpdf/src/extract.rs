@@ -851,6 +851,13 @@ pub struct PosTable {
     /// over MASK/SAME/RND) carries colspan>1; cells over one column carry colspan 1.
     /// Empty when the table has no detached header (the data grid's row 0 is the header).
     pub header: Vec<Vec<(String, usize)>>,
+    /// Number of leading rows in `header + grid` that are semantic header rows.
+    ///
+    /// This is deliberately separate from `header.len()`: `header` records detached rows
+    /// that belong to the table's visible cell sequence, while this field records which of
+    /// those rows should render as `<th>`. Keeping the two independent lets ownership fixes
+    /// correct semantics without dropping, moving, or duplicating cells.
+    pub header_rows: usize,
 }
 
 fn clone_span(s: &Span) -> Span {
@@ -1235,6 +1242,9 @@ pub(crate) fn declared_pos_tables(declared: &[crate::structtree::DeclaredTable],
             x_right: region.x1,
             grid: grid[nhdr..].to_vec(),
             header,
+            // Preserve the legacy renderer's row-0 fallback until the semantic ownership
+            // phase supplies the exact declared depth in its own bisectable change.
+            header_rows: if nhdr == 0 { 1 } else { nhdr },
         });
     }
     out
@@ -1527,6 +1537,7 @@ fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PosTable> {
         x_right: axes.bbox.x1,
         grid,
         header: Vec::new(),
+        header_rows: 1,
     })
 }
 
@@ -2256,6 +2267,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
             x_left,
             x_right,
             grid,
+            header_rows: if header.is_empty() { 1 } else { header.len() },
             header,
         });
     };
@@ -2565,7 +2577,15 @@ mod tests {
         // grid, and show (a) the classifier dispatches to it, (b) the candidates L1 produced
         // are exactly the same ones.
         fn l3_dummy(_c: &Candidate, _s: &[Span]) -> Option<PosTable> {
-            Some(PosTable { y_top: 1.0, y_bottom: 0.0, x_left: 0.0, x_right: 1.0, grid: vec![vec!["dummy".into()]], header: Vec::new() })
+            Some(PosTable {
+                y_top: 1.0,
+                y_bottom: 0.0,
+                x_left: 0.0,
+                x_right: 1.0,
+                grid: vec![vec!["dummy".into()]],
+                header: Vec::new(),
+                header_rows: 1,
+            })
         }
         const EXTENDED: &[TypeRule] = &[
             TypeRule { name: "dummy", matches: |c| c.frame.is_some(), handler: l3_dummy },

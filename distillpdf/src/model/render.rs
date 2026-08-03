@@ -125,6 +125,10 @@ fn elements_from_blocks(blocks: &[&Block]) -> Vec<PageElement> {
                     ElKind::Table {
                         header: b.table_header.clone().unwrap_or_default(),
                         grid: b.table_grid.clone().unwrap_or_default(),
+                        header_rows: b.table_header_rows.unwrap_or_else(|| {
+                            let n = b.table_header.as_ref().map_or(0, Vec::len);
+                            if n == 0 { 1 } else { n }
+                        }),
                         caption: b.table_caption.clone(),
                     },
                     b.bbox,
@@ -354,6 +358,7 @@ mod tests {
             list_ordered: None,
             el_group: None,
             table_header: None,
+            table_header_rows: None,
             table_grid: None,
             table_caption: None,
             el_html: None,
@@ -390,6 +395,7 @@ mod tests {
         let h = Block { heading_level: Some(1), ..blk("b0001", BlockKind::Heading, 1, "Title") };
         let table = Block {
             table_header: Some(vec![vec![("Cell".into(), 1)]]),
+            table_header_rows: Some(1),
             table_grid: Some(vec![]),
             ..blk("b0002", BlockKind::Table, 1, "")
         };
@@ -404,6 +410,22 @@ mod tests {
         assert!(!txt.contains("axis"), "SVG label text is figure-internal, not page prose");
         assert!(!txt.contains('<'), "all markup stripped");
         assert!(txt.ends_with('\n'), "one page per line");
+    }
+
+    #[test]
+    fn legacy_table_models_without_header_depth_keep_the_old_rendering() {
+        let legacy = Block {
+            table_header: Some(vec![vec![("Group".into(), 2)]]),
+            table_grid: Some(vec![vec!["A".into(), "B".into()], vec!["1".into(), "2".into()]]),
+            ..blk("b0001", BlockKind::Table, 1, "")
+        };
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert!(json.get("table_header_rows").is_none(), "None stays absent for old models");
+        let legacy: Block = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.table_header_rows, None);
+        let html = render_html(&model_with_blocks(1, vec![legacy]), Mode::Page, false);
+        assert!(html.contains("<th colspan=\"2\">Group</th>"));
+        assert!(html.contains("<td>A</td><td>B</td>"));
     }
 
     #[test]

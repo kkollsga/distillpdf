@@ -423,10 +423,15 @@ pub(crate) enum ElKind {
     /// A footnote `<aside>` wrapping one `<p>` per note; `notes` are the per-note inner HTML.
     Footnotes { notes: Vec<String> },
     /// A `<table>` (with optional `<caption>`). Carries the full cell structure for projection:
-    /// `header` rows (text + colspan) render as `<th>`, `grid` rows as `<td>` (or `<th>` for
-    /// row 0 when there is no detached header — see [`table_html`]). `caption` is `(num, html,
-    /// below)`.
-    Table { header: Vec<Vec<(String, usize)>>, grid: Vec<Vec<String>>, caption: Option<(String, String, bool)> },
+    /// `header` rows preserve detached cells/colspans, while `header_rows` records how many
+    /// leading rows of `header + grid` render as `<th>`. `caption` is `(num, html, below)`.
+    Table {
+        header: Vec<Vec<(String, usize)>>,
+        grid: Vec<Vec<String>>,
+        /// Number of leading rows in `header + grid` rendered as `<th>`.
+        header_rows: usize,
+        caption: Option<(String, String, bool)>,
+    },
     /// A `<figure>` (raster `<img>`/`<image N>`, vector `<svg>`, or composite). `html` is the
     /// exact fragment; `id` is the `fig-N` number (or empty); `caption` the figcaption inner;
     /// `image` the asset id when a raster placeholder is present; `svg` the inline SVG markup
@@ -479,8 +484,13 @@ impl ElKind {
                 s.push_str("</aside>");
                 s
             }
-            Table { header, grid, caption } => {
-                table_html_from_parts(header, grid, caption.as_ref().map(|(n, c, b)| (n.as_str(), c.as_str(), *b)))
+            Table { header, grid, header_rows, caption } => {
+                table_html_from_parts(
+                    header,
+                    grid,
+                    *header_rows,
+                    caption.as_ref().map(|(n, c, b)| (n.as_str(), c.as_str(), *b)),
+                )
             }
             Figure { html, .. } | Caption { html, .. } => html.clone(),
         }
@@ -502,7 +512,12 @@ pub(crate) fn emit_page_elements(els: &[PageElement]) -> String {
 /// `grid`, optional caption). Shared by [`table_html`] (parse path, from a [`PosTable`]) and
 /// [`PageElement::html`] (model path, from the serialized cell structure) so a `<table>`
 /// renders byte-identically whichever side built it.
-fn table_html_from_parts(header: &[Vec<(String, usize)>], grid: &[Vec<String>], cap: Option<(&str, &str, bool)>) -> String {
+fn table_html_from_parts(
+    header: &[Vec<(String, usize)>],
+    grid: &[Vec<String>],
+    header_rows: usize,
+    cap: Option<(&str, &str, bool)>,
+) -> String {
     let mut tbl = match cap {
         Some((num, _, _)) => format!("<table id=\"tab-{}\">", num_id(num)),
         None => String::from("<table>"),
@@ -518,24 +533,25 @@ fn table_html_from_parts(header: &[Vec<(String, usize)>], grid: &[Vec<String>], 
             tbl.push_str(&format!("<caption>{caption}</caption>"));
         }
     }
-    // Detached grouped/multi-level header rows (mapped onto the data column grid with
-    // colspans) render first as <th>. When present, the data grid is ALL <td> (its row
-    // 0 is data, not the header). When absent, fall back to treating grid row 0 as <th>.
-    for hrow in header {
+    // Detached rows render before the regular grid, but ownership and semantics are distinct:
+    // `header` preserves the visible cell sequence/colspans while `header_rows` alone decides
+    // which leading rows are `<th>`. This permits exact no-header and multi-tier declarations,
+    // and lets inference reclassify over-attached rows without moving or dropping content.
+    for (ri, hrow) in header.iter().enumerate() {
         tbl.push_str("<tr>");
+        let tag = if ri < header_rows { "th" } else { "td" };
         for (text, span) in hrow {
             if *span > 1 {
-                tbl.push_str(&format!("<th colspan=\"{span}\">{}</th>", esc(text.trim())));
+                tbl.push_str(&format!("<{tag} colspan=\"{span}\">{}</{tag}>", esc(text.trim())));
             } else {
-                tbl.push_str(&format!("<th>{}</th>", esc(text.trim())));
+                tbl.push_str(&format!("<{tag}>{}</{tag}>", esc(text.trim())));
             }
         }
         tbl.push_str("</tr>");
     }
-    let has_header = !header.is_empty();
     for (ri, row) in grid.iter().enumerate() {
         tbl.push_str("<tr>");
-        let tag = if ri == 0 && !has_header { "th" } else { "td" };
+        let tag = if header.len() + ri < header_rows { "th" } else { "td" };
         for cell in row {
             tbl.push_str(&format!("<{tag}>{}</{tag}>", esc(cell.trim())));
         }
@@ -2147,6 +2163,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                     els.push(PageElement::at(ElKind::Table {
                         header: tables[*j].header.clone(),
                         grid: tables[*j].grid.clone(),
+                        header_rows: tables[*j].header_rows,
                         caption,
                     }, ibox));
                 }
@@ -2525,6 +2542,32 @@ mod tests {
         let long = "One two three four five six seven eight nine ten eleven twelve thirteen";
         let promote_long: Vec<(String, u8)> = vec![(title_key(long), 1)];
         assert!(heading_tags(&promote_long, &[long]).is_empty());
+    }
+
+    #[test]
+    fn semantic_header_depth_is_independent_of_detached_row_storage() {
+        // The visible table parts and their colspans are one axis; which leading rows are
+        // semantic headers is another. This is the contract G7 needs in order to correct
+        // over-attached rows without deleting, moving, or flattening any cell.
+        let header = vec![
+            vec![("All columns".to_string(), 2)],
+            vec![("A".to_string(), 1), ("B".to_string(), 1)],
+        ];
+        let grid = vec![vec!["1".to_string(), "2".to_string()]];
+
+        let none = table_html_from_parts(&header, &grid, 0, None);
+        assert_eq!(none.matches("<th").count(), 0);
+        assert_eq!(none.matches("<td").count(), 5);
+        assert!(none.contains("<td colspan=\"2\">All columns</td>"));
+
+        let two = table_html_from_parts(&header, &grid, 2, None);
+        assert_eq!(two.matches("<th").count(), 3);
+        assert_eq!(two.matches("<td").count(), 2);
+        assert!(two.contains("<th colspan=\"2\">All columns</th>"));
+
+        let through_grid = table_html_from_parts(&header, &grid, 3, None);
+        assert_eq!(through_grid.matches("<th").count(), 5);
+        assert_eq!(through_grid.matches("<td").count(), 0);
     }
 
     /// `tests/gen_fixtures.py::gen_rotated_body` — the same displayed page at `/Rotate`

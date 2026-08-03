@@ -601,7 +601,7 @@ fn project_blocks(
                         }
                     }
                 }
-                ElKind::Table { header, grid, caption } => {
+                ElKind::Table { header, grid, header_rows, caption } => {
                     // Consume the table's `tab-N` id (post-dedup) in walk order, carrying the
                     // deduped caption number so re-emit lands the same `<table id>`.
                     let mut deduped_tab: Option<String> = None;
@@ -619,6 +619,7 @@ fn project_blocks(
                     // grid, and the caption `(number, html, below)` with the number re-keyed to
                     // its post-dedup `tab-N` form.
                     b.table_header = Some(header.clone());
+                    b.table_header_rows = Some(*header_rows);
                     b.table_grid = Some(grid.clone());
                     b.table_caption = caption.as_ref().map(|(num, c, below)| {
                         let n = deduped_tab.as_deref().map(strip_tab_prefix).unwrap_or_else(|| num.clone());
@@ -773,6 +774,7 @@ fn mk_block(id: String, kind: BlockKind, text: String, page: u32, bbox: Option<B
         list_ordered: None,
         el_group: None,
         table_header: None,
+        table_header_rows: None,
         table_grid: None,
         table_caption: None,
         el_html: None,
@@ -902,6 +904,7 @@ mod tests {
             ElKind::Table {
                 header: vec![vec![("A".into(), 1), ("B".into(), 1)]],
                 grid: vec![vec!["1".into(), "2".into()]],
+                header_rows: 1,
                 caption: None,
             },
             None,
@@ -919,6 +922,7 @@ mod tests {
         let (blocks, _) = project(&[(1, vec![table, fig], vec![])]);
         let table = blocks.iter().find(|b| b.kind == BlockKind::Table).unwrap();
         assert_eq!(table.cells.as_ref().unwrap(), &vec![vec!["A".to_string(), "B".into()], vec!["1".into(), "2".into()]]);
+        assert_eq!(table.table_header_rows, Some(1));
         let fig = blocks.iter().find(|b| b.kind == BlockKind::Figure).unwrap();
         assert_eq!(fig.caption.as_deref(), Some("Figure 3: A chart."));
         assert_eq!(fig.label.as_deref(), Some("Figure 3"));

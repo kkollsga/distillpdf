@@ -43,6 +43,7 @@ IoU would matter most (`t3_interleaved`, `t3_adjacent_no_fuse`) are additionally
 from __future__ import annotations
 
 import json
+import html as html_module
 import os
 import re
 import unicodedata
@@ -81,6 +82,40 @@ def detect(path):
         rows = [[norm(c) for c in row] for row in t["cells"]]
         out.append({"page": int(t["page"]) - 1, "rows": trim(rows),
                     "raw_rows": rows, "n_rows": t["n_rows"], "n_cols": t["n_cols"]})
+    return out
+
+
+def detect_html_semantics(path):
+    """Detected HTML tables with their real leading all-``th`` depth.
+
+    ``extract_tables()`` deliberately exposes cells only and cannot observe either semantic
+    tags or declared L0 tables. This companion reads the shipped HTML surface, so a header
+    gate cannot accidentally pass while checking the geometric API again.
+    """
+    import distillpdf
+
+    body = distillpdf.Pdf.open(path).to_html(return_string=True)
+    out = []
+    for table in re.findall(r"<table\b.*?</table>", body, re.DOTALL):
+        rows = []
+        header_rows = 0
+        still_leading = True
+        for tr in re.findall(r"<tr\b.*?</tr>", table, re.DOTALL):
+            cells = re.findall(r"<(t[dh])\b([^>]*)>(.*?)</t[dh]>", tr, re.DOTALL)
+            if not cells:
+                continue
+            row = []
+            for _, attrs, inner in cells:
+                text = html_module.unescape(re.sub(r"<[^>]+>", "", inner))
+                span = re.search(r'\bcolspan="(\d+)"', attrs)
+                row.extend([norm(text)] * (int(span.group(1)) if span else 1))
+            all_th = all(tag == "th" for tag, _, _ in cells)
+            if still_leading and all_th:
+                header_rows += 1
+            else:
+                still_leading = False
+            rows.append(row)
+        out.append({"page": 0, "rows": trim(rows), "header_rows": header_rows})
     return out
 
 
@@ -460,6 +495,10 @@ FLOORS = json.load(open(os.path.join(CORPUS, "floors.json"))) \
     if os.path.exists(os.path.join(CORPUS, "floors.json")) else {"t1": {}, "t2": {}, "t3": {}}
 T0 = [f for f, r in sorted(TRUTH["files"].items()) if r["tier"] == 0]
 T3 = [f for f, r in sorted(TRUTH["files"].items()) if r["tier"] == 3]
+SEMANTIC_HEADER_LOCKS = [
+    f for f, r in sorted(TRUTH["files"].items())
+    if r["tier"] == 1 or r["family"] == "tagged_only_signal"
+]
 
 
 def test_truth_schema():
@@ -484,6 +523,26 @@ def test_every_structural_type_exists_tagged_and_untagged():
     untagged = {r["family"] for r in TRUTH["files"].values()
                 if r["tier"] == 1 and not r["tagged"]}
     assert tagged == untagged and len(tagged) == 5, (sorted(tagged), sorted(untagged))
+
+
+@pytest.mark.parametrize("fname", SEMANTIC_HEADER_LOCKS)
+def test_html_semantic_header_depth(fname):
+    """Actual ``th`` depth, through both inferred HTML and declared L0, is exact.
+
+    G5's original ``header_acc`` compares top-row *content* through ``extract_tables()``;
+    it neither sees HTML tags nor reaches L0. Keep that positional metric, but lock semantics
+    independently on every clean T1 shape plus the two tagged-only L0 cases.
+    """
+    rec = TRUTH["files"][fname]
+    assert all(t["page"] == 0 for t in rec["tables"]), "semantic helper is page-local"
+    det = detect_html_semantics(os.path.join(CORPUS, fname))
+    pairs = align(det, rec["tables"])
+    assert len(pairs) == len(rec["tables"]), (
+        f"{fname}: matched {len(pairs)} of {len(rec['tables'])} semantic tables")
+    for di, gi in pairs:
+        want = rec["tables"][gi].get("header_rows", 1)
+        assert det[di]["header_rows"] == want, (
+            f"{fname} table {gi}: {det[di]['header_rows']} leading all-th rows != {want}")
 
 
 def test_booktabs_has_zero_vertical_rules():

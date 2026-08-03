@@ -234,7 +234,7 @@ fn map_inline_html(e: &mut PageElement, f: impl Fn(&str) -> String) {
                 *n = f(n);
             }
         }
-        Table { header, grid, caption } => {
+        Table { header, grid, caption, .. } => {
             for row in header.iter_mut() {
                 for (t, _) in row.iter_mut() {
                     *t = f(t);
