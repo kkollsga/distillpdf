@@ -498,6 +498,9 @@
       ]
     ]
   },
+  "heading_ends_table.pdf": {
+    "tables": 2
+  },
   "heading_traps.pdf": {
     "headings": [
       {
@@ -992,6 +995,9 @@
     "genuine": [
       "Financial Overview"
     ]
+  },
+  "section_heading_table.pdf": {
+    "tables": 1
   },
   "separation.pdf": {
     "grey_level_misreadings": [

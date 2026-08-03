@@ -2845,6 +2845,72 @@ mod tests {
         );
     }
 
+    /// RED LEDGER (phase G3) — the contained-duplicate defect, root-caused and measured, with a
+    /// fix that is not landed because it breaches a gated bench100 cell.
+    ///
+    /// A one-cell SECTION HEADING set inside a table on its own leading ends the aligned run, and
+    /// the header walk above the NEXT run has no lower bound — so it climbs over the heading and
+    /// over every row the previous run already emitted, and each run below the first re-publishes
+    /// all of them as *header* rows. The page comes out as NESTED tables, each a strict row-prefix
+    /// of the next. `pdf-parse-bench` doc 033 publishes one 27-row table five times over, at 7,
+    /// 12, 17, 23 and 27 rows; the trace is `dev-docs/bench/out/g3/trace/033.flush`. Corpus-wide:
+    /// 17 emissions in 22 containment pairs over 12 documents, 21 of the 22 a strict row-prefix,
+    /// 16 of the 17 pure phantoms the matcher never used.
+    ///
+    /// Reading such a row as INTERIOR to the run (`dev-docs/bench/out/g3/spanning_row.patch`)
+    /// fixes it and is a large measured win — micro md 0.7061 → 0.7545, table precision 0.4323 →
+    /// **0.5184**, containment 22 pairs → 1, phantoms 51 → 9, and the torture corpus's worst
+    /// class `t2|band_rows` 0.0417 → 0.4861 — but it costs three gated bench100 cells:
+    /// `full-grid|paragraphs` recall 0.450 → 0.438 and the FP ceilings of `full-grid|paragraphs`
+    /// (0.550 → 0.576) and `ALL|paragraphs` (0.624 → 0.632), on four pages (World Bank
+    /// wbD34466311#17, wbD34466295#17, wbD34466172#12 and IRS f1040#2), where a table the run
+    /// change alters spills rows back into the body as prose. A floor breach is a failed phase,
+    /// not a trade-off (plan §0.4), and two fix-forward attempts did not close it: an
+    /// emit-nothing fallback (recall −0.016 → −0.012, breach stands) and a ruled-row guard (no
+    /// effect on the breach, and it costs `booktabs|tables` 0.660 → 0.593).
+    ///
+    /// The fixtures stay so the evidence does; the day the paragraph regression is closed,
+    /// promotion is deleting two `#[ignore]` lines. See `dev-docs/plans/consider-for-future.md`.
+    #[test]
+    #[ignore = "G3 red ledger: fixed by spanning_row.patch, which breaches full-grid|paragraphs"]
+    fn a_section_heading_inside_a_table_does_not_publish_it_three_times() {
+        let tables = detect_fixture("section_heading_table.pdf");
+        assert_eq!(
+            tables.len(),
+            1,
+            "one table, got {}: {:?}",
+            tables.len(),
+            tables.iter().map(|t| (t.grid.len(), t.grid[0].len())).collect::<Vec<_>>()
+        );
+        let t = &tables[0];
+        assert_eq!(t.grid.len(), 10, "header, six data rows and all three headings: {:?}", t.grid);
+        // Including the one in the FIRST body position, which has no run pitch above it — the
+        // torture corpus's `band_rows` shape.
+        for want in ["Upper sequence", "Encoder Stack", "Decoder Stack", "Zeta"] {
+            assert!(t.grid.iter().any(|r| r[0].trim() == want), "{want} is inside it: {:?}", t.grid);
+        }
+    }
+
+    /// The negative twin of the entry above, and it passes TODAY — a one-cell line with air on
+    /// both sides (2.7x the body pitch) ends the run, which is the behaviour any future
+    /// spanning-row rule must keep. It is not in the red ledger: it locks the bound, not the fix.
+    #[test]
+    fn a_heading_with_air_around_it_still_ends_the_table() {
+        let tables = detect_fixture("heading_ends_table.pdf");
+        assert_eq!(
+            tables.len(),
+            2,
+            "two tables, got {}: {:?}",
+            tables.len(),
+            tables.iter().map(|t| (t.grid.len(), t.grid[0].len())).collect::<Vec<_>>()
+        );
+        assert!(
+            !tables.iter().any(|t| t.grid.iter().any(|r| r[0].trim() == "Second Study")),
+            "the heading is not a row of either: {:?}",
+            tables.iter().map(|t| t.grid.clone()).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn a_split_page_is_not_re_merged_where_nothing_crosses_the_gutter() {
         // `tests/gen_fixtures.py::gen_two_column_tables_prose`, and the ACTUAL doc-001 defect.

@@ -3727,6 +3727,80 @@ def gen_split_survivor_table():
     GT["split_survivor_table.pdf"] = {"tables": 1}
 
 
+def _span_rows(body, rows, x2, x1, y0, pitch, gaps=()):
+    """Draw `rows` (1- or 2-cell tuples) at `pitch`, adding `gaps[i]` extra leading before row i."""
+    y = y0
+    for ri, row in enumerate(rows):
+        y -= dict(gaps).get(ri, 0.0)
+        xs = x1 if len(row) == 1 else x2
+        for ci, cell in enumerate(row):
+            body.append(b"BT /F1 10 Tf %.1f %.1f Td (%s) Tj ET" % (xs[ci], y, cell.encode()))
+        y -= pitch
+    return body
+
+
+def gen_section_heading_table():
+    """ONE table whose body is grouped under one-cell SECTION HEADINGS set on its own leading.
+
+    A borderless table often reads `Encoder Stack (6 Layers)` across its width and then goes on
+    in the same two columns. The run-builder took every one-cell row as the end of the run, so
+    this page became three runs — and because the header walk above a run had no lower bound, it
+    climbed over the heading AND over every row the previous run had already emitted. Each run
+    below the first therefore re-published all the rows above it as *header* rows, so the page
+    came out as three NESTED tables, each a row-prefix of the next.
+
+    Measured on the 100-document `pdf-parse-bench` tables corpus this was the whole
+    contained-duplicate class: 17 emissions in 22 containment pairs across 12 documents, 21 of
+    the 22 a strict row-prefix, and 16 of the 17 pure phantoms the matcher never used. Doc 033
+    published one 27-row table five times over, at 7, 12, 17, 23 and 27 rows. The trace is
+    `dev-docs/bench/out/g3/trace/033.flush`.
+
+    The headings here sit at the body's own 15pt pitch (1.0x, well inside the swept 1.6x); the
+    negative twin `gen_heading_ends_table` puts the same line at 2.7x and must still end the
+    run. The FIRST one sits immediately under the header row, where the run has no pitch of its
+    own yet — the case the torture corpus's `band_rows` class is made of, and the reason the
+    pitch is read off the rows below when there are none above.
+
+    Assert ONE table, with all three headings inside it."""
+    pdf = os.path.join(OUT, "section_heading_table.pdf")
+    X2, X1 = (60.0, 190.0), (95.0,)
+    rows = [
+        ("Model", "V(%)"),
+        ("Upper sequence",),                      # first body position — no pitch above it yet
+        ("Alpha", "12.2"), ("Beta", "31.0"),
+        ("Encoder Stack",),                       # interior heading, on the pitch
+        ("Gamma", "42.5"), ("Delta", "27.4"),
+        ("Decoder Stack",),                       # a second one, so the chain is three deep
+        ("Epsilon", "35.1"), ("Zeta", "18.7"),
+    ]
+    body = _span_rows([b"BT /F2 11 Tf 60 740 Td (Section Headings) Tj ET"], rows, X2, X1, 700.0, 15.0)
+    _assemble_pdf(_one_page(b"\n".join(body)), pdf)
+    GT["section_heading_table.pdf"] = {"tables": 1}
+
+
+def gen_heading_ends_table():
+    """The NEGATIVE twin of `gen_section_heading_table`: the one-cell line ENDS the table.
+
+    Same page, same words, one difference — the lone line is given air on both sides (40pt
+    against the 15pt body pitch, 2.7x, past the swept `SPAN_ROW_PITCH` of 1.6). A heading with
+    space around it is a heading BETWEEN two tables, not a row inside one, and reading it as a
+    row would fuse them: this is the failure direction the spanning-row rule has to be bounded
+    against, and it brackets the constant from the side `gen_section_heading_table` cannot.
+
+    Assert TWO tables."""
+    pdf = os.path.join(OUT, "heading_ends_table.pdf")
+    X2, X1 = (60.0, 190.0), (95.0,)
+    rows = [
+        ("Model", "V(%)"), ("Alpha", "12.2"), ("Beta", "31.0"), ("Gamma", "42.5"),
+        ("Second Study",),                        # 40pt of air above it and below it
+        ("Corpus", "Size"), ("News", "128"), ("Web", "96"), ("Books", "77"),
+    ]
+    body = _span_rows([b"BT /F2 11 Tf 60 740 Td (Two Studies) Tj ET"], rows, X2, X1, 700.0, 15.0,
+                      gaps=((4, 25.0), (5, 25.0)))  # 15 + 25 = 40pt across both wide gaps
+    _assemble_pdf(_one_page(b"\n".join(body)), pdf)
+    GT["heading_ends_table.pdf"] = {"tables": 2}
+
+
 def _one_page(stream):
     """The five objects a one-page, two-font, letter-size PDF needs around `stream`."""
     return {
@@ -4689,6 +4763,8 @@ def main():
     gen_alpha_header_data_table()
     gen_display_equation_block()
     gen_split_survivor_table()
+    gen_section_heading_table()
+    gen_heading_ends_table()
     gen_panel_table()
     gen_tagged_table()
     gen_undecodable_codec()
