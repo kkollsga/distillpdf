@@ -55,6 +55,25 @@ echo "built: $WHEEL"
 step "Install wheel into run env ($RUN_PY)"
 "$UV" pip install --python "$RUN_PY" --force-reinstall --no-deps -q "$WHEEL"
 
+# Everything below measures "distillpdf" — but nothing so far has checked that the name
+# resolves to the wheel we just built. `PYTHONPATH=/tmp/fake` with a stub package scored
+# through the whole accuracy gate without a complaint. So bind the name to this
+# interpreter's site-packages, once, loudly, before any of it runs.
+"$RUN_PY" - <<'PY'
+import os, site, sys, sysconfig
+import distillpdf
+real = os.path.realpath(distillpdf.__file__)
+roots = {os.path.realpath(p) for p in
+         (sysconfig.get_paths()["purelib"], sysconfig.get_paths()["platlib"],
+          *site.getsitepackages())}
+if not any(real == r or real.startswith(r + os.sep) for r in roots):
+    sys.exit(f"FAILED — distillpdf resolves to {real}, outside the site-packages of "
+             f"{sys.executable} ({sorted(roots)}). That is a PYTHONPATH shim or a source "
+             f"tree, not the wheel just built: every test and gate below would be measuring "
+             f"a different program wearing the name.")
+print(f"bound: distillpdf {distillpdf.__version__} at {real}")
+PY
+
 step "Owned test suite (pytest tests/ — CI parity)"
 "$RUN_PY" -m pytest tests/ -q
 
@@ -95,36 +114,50 @@ step "Accuracy floor gate (per-table-type x per-dimension, bench100)"
 # of 0.222, not the 0.815 the slices show.
 #
 # Same local-corpus caveat as above — bench100 lives under the gitignored benchmarking/
-# tree with its ground truth in dev-docs/. The ONLY sanctioned skip is a machine without
-# the bench100 corpus at all; that machine is already blocked from releasing by the corpus
-# gate above. Everything else is a hard failure, because the failure modes are identical
-# from here: "the floors file is gone" and "the floors file says we are green" cannot be
-# told apart by a step that treats a missing baseline as a skip. Deleting the baseline is
-# not a way to pass this script.
+# tree with its ground truth in dev-docs/. The ONLY sanctioned skip is a machine with no
+# benchmarking/ tree AT ALL, and that machine has already exited 2 at the corpus gate
+# above. Everything else is a hard failure, because the failure modes are identical from
+# here: "the floors file is gone" and "the floors file says we are green" cannot be told
+# apart by a step that treats a missing baseline as a skip. Deleting the baseline is not a
+# way to pass this script — and neither is `mv benchmarking/bench100 /tmp`, which used to
+# print SKIPPED, then "All checks passed", then exit 0. The justification printed there
+# ("the corpus gate above already blocks a release from such a machine") was FALSE: that
+# gate reads benchmarking/corpus_tests/, a different directory, and a machine can have one
+# without the other.
 GATE="dev-docs/bench/scripts/bench100_gate.py"
 FLOORS="dev-docs/bench/results/bench100_floors.json"
+ANCHORS="accuracy/bench100_anchors.json"
 if [ -d benchmarking/bench100 ]; then
   missing=""
-  [ -f "$GATE" ]   || missing="$missing\n           - the gate script $GATE"
-  [ -f "$FLOORS" ] || missing="$missing\n           - the frozen floors $FLOORS"
+  [ -f "$GATE" ]    || missing="$missing\n           - the gate script $GATE"
+  [ -f "$FLOORS" ]  || missing="$missing\n           - the frozen floors $FLOORS"
+  [ -f "$ANCHORS" ] || missing="$missing\n           - the committed anchors $ANCHORS"
   "$RUN_PY" -c "import fitz" 2>/dev/null \
-                   || missing="$missing\n           - PyMuPDF (fitz) in $RUN_PY"
+                    || missing="$missing\n           - PyMuPDF (fitz) in $RUN_PY"
   if [ -n "$missing" ]; then
     echo "FAILED — the bench100 corpus is present, so this gate MUST run, but it cannot."
     printf '         missing:%b\n' "$missing"
-    echo "         Restore it — an archived predecessor (dev-docs/bench/results/"
-    echo "         bench100_floors_*.json) or a signed re-baseline:"
+    echo "         Restore it — from git ($ANCHORS is committed), an archived predecessor"
+    echo "         (dev-docs/bench/results/bench100_floors_*.json), or a signed re-baseline:"
     echo "           $GATE --rescore --rebaseline --owner-note \"<why>\""
     echo "         Deleting the baseline is not a skip. A release must NOT proceed."
     exit 2
   fi
   # set -e makes a non-zero gate exit (1 breached, 2 could not run) fail the script here.
   "$RUN_PY" "$GATE" --rescore --summary
-else
-  echo "SKIPPED — benchmarking/bench100/ is not present on this machine."
-  echo "         The corpus is local-only (gitignored, license-encumbered), and the"
-  echo "         corpus gate above already blocks a release from such a machine."
+elif [ ! -d benchmarking ]; then
+  echo "SKIPPED — there is no benchmarking/ tree on this machine at all."
+  echo "         The corpora are local-only (gitignored, license-encumbered)."
+  echo "         (Unreachable in practice: the corpus gate above already exited 2.)"
   echo "         Behaviour phases MUST run it: $GATE --rescore"
+else
+  echo "FAILED — benchmarking/ exists on this machine but benchmarking/bench100/ does not."
+  echo "         A corpus that can be moved aside to turn a red gate into 'All checks"
+  echo "         passed' is not a gate. The bench100 corpus is part of this machine's"
+  echo "         release capability, so its absence here is a broken setup, not a skip:"
+  echo "         restore benchmarking/bench100/ (88 documents, digest recorded in"
+  echo "         $ANCHORS). A release must NOT proceed."
+  exit 2
 fi
 
 step "All checks passed — safe to bump + push (with the user's go-ahead)."
