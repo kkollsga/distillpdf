@@ -258,6 +258,28 @@ fn drawn_images(doc: &Document, page_id: ObjectId) -> Option<HashSet<ObjectId>> 
     Some(out)
 }
 
+/// Does any of these resource dictionaries name an **image** XObject?
+///
+/// Dict-only, exactly like the walk that produced `dicts`: it resolves references and reads
+/// `/Subtype`, and decompresses nothing. The predicate is deliberately the *same* one
+/// [`extract_images`]'s enumeration loop applies to decide whether a `/XObject` entry can
+/// become a row — a named reference whose object is a stream with `/Subtype /Image` — so
+/// "false here" means "that loop would push nothing for this page, whatever the drawn set
+/// says". That is what makes the short-circuit semantics-preserving rather than a heuristic.
+fn reaches_image_xobject(doc: &Document, dicts: &[&Dictionary]) -> bool {
+    dicts.iter().any(|res| {
+        sub_dict(doc, res, b"XObject").is_some_and(|xobjects| {
+            xobjects.iter().any(|(_, v)| {
+                v.as_reference()
+                    .ok()
+                    .and_then(|id| doc.get_object(id).ok())
+                    .and_then(|o| o.as_stream().ok())
+                    .is_some_and(|s| crate::walker::subtype_of(s) == b"Image")
+            })
+        })
+    })
+}
+
 /// The `/Filter` chain as display names, in application order — the `String` view of
 /// [`pdfobj::filters_of`] that [`ImageInfo::filters`] reports.
 fn image_filters(dict: &Dictionary) -> Vec<String> {
@@ -291,8 +313,29 @@ fn image_filters(dict: &Dictionary) -> Vec<String> {
 /// `format:"raw"` — and those now carry `color_space` and `bits_per_component`, which is
 /// what a caller needs to reassemble them by hand.
 pub fn extract_images(doc: &Document) -> Vec<ImageInfo> {
+    extract_images_inner(doc, true)
+}
+
+/// The body of [`extract_images`], with the resource-tree short-circuit switchable so a test
+/// can assert the two paths agree ([`tests::the_short_circuit_reports_exactly_what_the_full_walk_reports`]).
+/// Production always passes `true`; `false` is the full-walk oracle.
+fn extract_images_inner(doc: &Document, short_circuit: bool) -> Vec<ImageInfo> {
     let mut out = Vec::new();
     for (&pno, &page_id) in &doc.get_pages() {
+        // The page's own resource tree first, so every `(page, index)` a page already
+        // reported keeps it; the annotation appearances are appended after.
+        let mut dicts = page_resource_dicts(doc, page_id);
+        dicts.extend(appearance_resource_dicts(doc, page_id));
+        // A page whose resource tree reaches no image XObject cannot report one, because
+        // enumeration below runs over exactly these dictionaries and `drawn` can only
+        // *remove* candidates from it — so the content walk is pure cost. On a 102-page
+        // regulation with zero images that walk was lexing 2.4 MB of content streams (77% of
+        // the operation, in lopdf's lexer) to conclude nothing. Both dict walks above parse
+        // no operator and decompress no stream, and the scan is the enumeration loop's own
+        // predicate, so skipping is by construction unobservable — not an approximation.
+        if short_circuit && !reaches_image_xobject(doc, &dicts) {
+            continue;
+        }
         let mut index = 0usize;
         let drawn = drawn_images(doc, page_id);
         // Dedup is across resource dictionaries only: an image the page's own /XObject
@@ -301,10 +344,6 @@ pub fn extract_images(doc: &Document) -> Vec<ImageInfo> {
         // before this walk existed is unchanged.
         let mut seen: HashSet<ObjectId> = HashSet::new();
         let mut from_this_dict: Vec<ObjectId> = Vec::new();
-        // The page's own resource tree first, so every `(page, index)` a page already
-        // reported keeps it; the annotation appearances are appended after.
-        let mut dicts = page_resource_dicts(doc, page_id);
-        dicts.extend(appearance_resource_dicts(doc, page_id));
         for res in dicts {
             seen.extend(from_this_dict.drain(..));
             let Some(xobjects) = sub_dict(doc, res, b"XObject") else {
@@ -1351,6 +1390,52 @@ mod tests {
         for (g, w) in got.iter().zip(want) {
             assert_eq!(g.as_slice(), w.map(String::from).as_slice(), "grid: {got:?}");
         }
+    }
+
+    /// A row reduced to everything a caller can observe, so two runs can be compared.
+    fn image_rows(rows: &[ImageInfo]) -> Vec<(u32, usize, i64, i64, Option<String>, Option<i64>, &'static str, usize, u64)> {
+        rows.iter()
+            .map(|i| {
+                // A cheap order-sensitive checksum over the payload: comparing the bytes
+                // themselves would make the failure message unreadable.
+                let sum = i.data.iter().fold(1469598103934665603u64, |h, &b| (h ^ b as u64).wrapping_mul(1099511628211));
+                (i.page, i.index, i.width, i.height, i.color_space.clone(), i.bits_per_component, i.format, i.data.len(), sum)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_short_circuit_reports_exactly_what_the_full_walk_reports() {
+        // `extract_images` skips the content walk on a page whose resource tree reaches no
+        // image XObject. The claim is that this is unobservable, not merely usually right —
+        // so assert it against the full-walk oracle over EVERY committed fixture, which
+        // spans the cases that could break it: pages with no images at all, images nested in
+        // form XObjects, images reachable but never drawn (`undrawn_image.pdf`), images that
+        // exist only in an annotation appearance (`annot_appearance.pdf`), cyclic and
+        // repeated forms, and the adversarial form bomb.
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf");
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for d in [std::path::PathBuf::from(dir), std::path::Path::new(dir).join("adversarial")] {
+            let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(&d)
+                .expect("fixture dir readable")
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("pdf")))
+                .collect();
+            found.sort();
+            paths.append(&mut found);
+        }
+        assert!(paths.len() > 40, "expected the full fixture corpus, got {}", paths.len());
+        let mut with_images = 0usize;
+        for p in &paths {
+            let Ok(doc) = Document::load(p) else { continue }; // encrypted / deliberately damaged
+            let short = extract_images_inner(&doc, true);
+            let full = extract_images_inner(&doc, false);
+            assert_eq!(image_rows(&short), image_rows(&full), "short-circuit changed the rows of {}", p.display());
+            if !short.is_empty() {
+                with_images += 1;
+            }
+        }
+        assert!(with_images >= 10, "the comparison must actually cover image-bearing docs, got {with_images}");
     }
 
     #[test]
