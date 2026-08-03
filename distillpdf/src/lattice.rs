@@ -71,6 +71,14 @@ pub(crate) struct Frame {
     pub bbox: Rect,
 }
 
+impl Frame {
+    /// Borrow this producer's result through the shared geometric grid contract.
+    pub(crate) fn axes(&self) -> crate::grid::GridAxes<'_> {
+        crate::grid::GridAxes::new(&self.xs, &self.ys, self.bbox)
+            .expect("lattice frames publish finite, strictly ascending axes")
+    }
+}
+
 /// One grid line: its position on the perpendicular axis, and the disjoint intervals it
 /// actually covers along its own axis.
 struct Line {

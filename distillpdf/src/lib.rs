@@ -25,6 +25,7 @@ mod extract;
 mod frontmatter;
 mod function;
 mod geom;
+mod grid;
 mod headings;
 mod html;
 mod img;
