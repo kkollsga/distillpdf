@@ -1031,18 +1031,311 @@ fn lay_out_grid(rows: &[&Vec<(String, crate::geom::Rect, bool)>], spans: &[Vec<(
     grid
 }
 
+/// A word's painted x-extent. `width` is the glyph advance the text walker measured; a span
+/// that arrived without one (no font metrics) is given a half-em per character so it still
+/// occupies the page rather than collapsing to a point.
+pub(crate) fn span_extent(s: &Span) -> (f32, f32) {
+    let t = s.text.trim();
+    let w = if s.width > 0.1 { s.width } else { t.chars().count() as f32 * s.size * 0.5 };
+    (s.x, s.x + w)
+}
+
+/// Cut one span at every boundary in `bounds` that falls strictly inside its painted extent,
+/// returning the pieces left to right (one piece — a clone — when nothing cuts it).
+///
+/// **This is the binding primitive a ruled grid needs.** A cell boundary the producer *drew*
+/// does not care where the text walker chose to end a run: it can fall in the middle of one.
+/// Placing such a run by its centroid puts every character of it on the side the midpoint
+/// happened to fall, which is how a grid that is exactly right can be filled with the wrong
+/// contents. Cutting it puts each character where the page put it.
+///
+/// **Why a splitting operation and not a wider `Span`.** [`crate::text::decode_words`] already
+/// splits each show operator at spaces and at visible kerns, so a `Span` is a *word*, not a
+/// text run — and a word is short. Retaining a per-glyph offset vector on every span would
+/// cost one allocation per word on every page of every document, for an exactness that was
+/// measured and is not there: across the 100-document `pdf-parse-bench` tables corpus, of the
+/// 1074 emitted cells that were two ground-truth cells run together, **1067 separate at a
+/// space and 7 inside a token** — and those 7 are punctuation artefacts (`0.3,` `-622`), not
+/// column cuts. So the character positions inside a word are interpolated across the word's
+/// own measured advance, which is exact at every space (where the cuts are) and off by at most
+/// a fraction of one glyph anywhere else.
+fn split_span_at(s: &Span, bounds: &[f32]) -> Vec<Span> {
+    let (x0, x1) = span_extent(s);
+    let n = s.text.chars().count();
+    if n < 2 || x1 <= x0 {
+        return vec![clone_span(s)];
+    }
+    let per = (x1 - x0) / n as f32;
+    // Character index at which each interior boundary falls, ascending and deduplicated.
+    let mut cuts: Vec<usize> = bounds
+        .iter()
+        .filter(|&&b| b > x0 && b < x1)
+        .map(|&b| (((b - x0) / per).round() as usize).clamp(1, n - 1))
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    if cuts.is_empty() {
+        return vec![clone_span(s)];
+    }
+    let chars: Vec<char> = s.text.chars().collect();
+    let mut out = Vec::with_capacity(cuts.len() + 1);
+    let mut from = 0usize;
+    for &c in cuts.iter().chain(std::iter::once(&n)) {
+        let text: String = chars[from..c].iter().collect();
+        if !text.trim().is_empty() {
+            out.push(Span {
+                x: x0 + per * from as f32,
+                width: per * (c - from) as f32,
+                text,
+                ..clone_span(s)
+            });
+        }
+        from = c;
+    }
+    if out.is_empty() { vec![clone_span(s)] } else { out }
+}
+
+/// The text of one lattice cell: its pieces read as lines (top-down, left-to-right), each
+/// line's words joined by the same typographic rules the inference path uses.
+fn lattice_cell_text(pieces: &[Span]) -> String {
+    if pieces.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for row in rows_of(pieces.iter().map(clone_span).collect()) {
+        let line = row_cells(&row).into_iter().map(|c| c.text).collect::<Vec<_>>().join(" ");
+        if !line.trim().is_empty() {
+            parts.push(line.trim().to_string());
+        }
+    }
+    parts.join(" ")
+}
+
+/// **L1 → L2** — one candidate table region and the evidence it carries, with no opinion
+/// about which type it is.
+///
+/// Detection never reads this struct's *interpretation*: L1 decides that a region is a
+/// candidate, and only then does [`classify`] read the evidence to pick an L3 handler. That
+/// separation is the structural guarantee — adding a type below cannot change what is
+/// detected, because nothing in L1 consults the type table.
+pub(crate) struct Candidate<'a> {
+    /// The ruling frame that vouched for this region (`None` for a region only text alignment
+    /// found).
+    pub frame: Option<&'a crate::lattice::Frame>,
+    /// Long horizontal rules crossing this region — the booktabs signal.
+    pub long_h: usize,
+    /// Vertical rules inside it.
+    pub v_rules: usize,
+    /// The grid the ALIGNMENT path already built here, when it built one.
+    pub aligned: Option<PosTable>,
+}
+
+/// An **L3 grid handler**: turn one candidate into a table, or refuse it.
+type L3 = fn(&Candidate, &[Span]) -> Option<PosTable>;
+
+/// **L2 — the table types, as DATA.**
+///
+/// One row per type: a name, the rule that recognises it, and the L3 handler it dispatches to.
+/// Rows are read in order and the first match wins, so the last row must accept everything.
+///
+/// Adding a type is a row here, the handler it names, and a gate cell — *nothing else*. In
+/// particular nothing in L1 reads this table, so a new row cannot change detection recall;
+/// [`tests::a_new_type_reaches_l3_without_touching_l1`] executes that claim.
+pub(crate) struct TypeRule {
+    pub name: &'static str,
+    pub matches: fn(&Candidate) -> bool,
+    pub handler: L3,
+}
+
+pub(crate) const TABLE_TYPES: &[TypeRule] = &[
+    // full-grid — the producer published the cell boundaries geometrically, both ways. The
+    // rules ARE the grid, so blank cells and in-grid band titles are as visible as any other.
+    TypeRule { name: "full-grid", matches: |c| c.frame.is_some(), handler: l3_ruled },
+    // column-ruled — verticals with no row-band rule. MEASURED ABSENT from the corpus (the
+    // gate records the null result); declared so a later reader knows it was measured, not
+    // overlooked, and served by the alignment path until a real one turns up.
+    TypeRule { name: "column-ruled", matches: |c| c.v_rules >= 2 && c.long_h < 2, handler: l3_aligned },
+    // booktabs — horizontal rules band the rows, alignment gives the columns. Our largest lead
+    // over pymupdf; the handler is the untouched alignment path, which is how it is protected.
+    TypeRule { name: "booktabs", matches: |c| c.long_h >= 2, handler: l3_aligned },
+    // borderless — alignment is the only signal there is.
+    TypeRule { name: "borderless", matches: |_| true, handler: l3_aligned },
+];
+
+/// The first type rule that accepts this candidate. The table's last row accepts everything,
+/// so this cannot fail for a well-formed table; a truncated one falls back to alignment.
+pub(crate) fn classify<'t>(types: &'t [TypeRule], c: &Candidate) -> Option<&'t TypeRule> {
+    types.iter().find(|t| (t.matches)(c))
+}
+
+/// L2 + L3 for one candidate: classify, then dispatch.
+fn build_table(types: &[TypeRule], c: &Candidate, spans: &[Span]) -> Option<PosTable> {
+    (classify(types, c)?.handler)(c, spans)
+}
+
+/// **L3, alignment** — the type-agnostic text path's own answer, handed back unchanged.
+///
+/// booktabs and borderless publish nothing geometric, so there is nothing here to read but
+/// where the words sit; that work already happened in [`detect_tables_region`]. Keeping this
+/// handler an identity is deliberate: it is what makes "outside any frame, behaviour is
+/// byte-identical" a property of the code rather than a hope.
+fn l3_aligned(c: &Candidate, _spans: &[Span]) -> Option<PosTable> {
+    c.aligned.clone()
+}
+
+/// Index of the band `bounds[k]..bounds[k+1]` containing `v`, clamped to the ends.
+fn band_index(bounds: &[f32], v: f32) -> usize {
+    match bounds.iter().position(|&b| v < b) {
+        Some(0) => 0,
+        Some(k) => k - 1,
+        None => bounds.len().saturating_sub(2),
+    }
+}
+
+/// A lattice bigger than this is a chart's gridlines or a calendar of nothing; building a grid
+/// of that size from spans is pure cost.
+const MAX_LATTICE_CELLS: usize = 4096;
+/// Fewer populated cells than this and the lattice is decoration, not a table.
+const MIN_LATTICE_FILLED: usize = 4;
+/// The share of a frame's words a column line may pass THROUGH before the frame is refused as
+/// not-a-table's-ruling, in percent.
+///
+/// SWEPT on our own corpora, not adopted from anywhere. The 88-document bench100 corpus offers
+/// 444 closed-cell frames: **237 cut no word at all and 302 cut fewer than 5 %** — a real
+/// table's ruling does not cross its own text — while 52 cut 60 % or more (chart gridlines,
+/// decorative borders, a map's graticule). Between 5 % and 20 % sit 59 frames, and the
+/// committed fixture `tests/fixtures_pdf/map_label_grid.pdf` page 2 — a ruling whose columns
+/// are narrower than the labels inside them — sits at 4/16 = 25 %. 10 is inside the sparse
+/// band, 2.5× clear of that fixture, and it is where both corpora score best: bench100
+/// `full-grid|tables` 0.642 at 10 vs 0.638 at 5 and 0.629 at 0, with the pdf-parse-bench
+/// content metric flat (0.4928 / 0.4938 / 0.4943 — a 0.0015 spread).
+const LATTICE_CUT_PCT: usize = 10;
+/// How much of an inferred table's HEIGHT a ruling frame must span before it may replace it.
+/// Swept — see the note at the L1b replacement in [`detect_tables_pos`].
+const FRAME_COVERS: f32 = 0.5;
+
+/// **L3, ruled** — read the grid straight off the frame's lattice, binding text by GEOMETRIC
+/// CONTAINMENT.
+///
+/// Every cell is a band × band rectangle the producer drew, so a cell nobody typed into is
+/// still a cell and a full-width band title is still one row — the two things text clustering
+/// cannot see.
+///
+/// Binding is containment, not centroid: a run is filtered to its row band, then **cut at
+/// every column boundary that falls inside it** ([`split_span_at`]) so each piece lands in the
+/// cell that actually contains it. A run straddling a column rule is split between the two
+/// cells rather than dumped wholly into the one its midpoint fell in — which is the whole
+/// reason this handler was held back when the lattice geometry landed.
+///
+/// The only judgement is admission: a lattice with almost no text in it is a figure's
+/// gridlines or a form's decorative border, not a table.
+fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PosTable> {
+    let f = c.frame?;
+    let (ncols, nrows) = (f.xs.len() - 1, f.ys.len() - 1);
+    if ncols < 2 || nrows < 2 || ncols * nrows > MAX_LATTICE_CELLS {
+        return None;
+    }
+    let mut cells: Vec<Vec<Span>> = vec![Vec::new(); ncols * nrows];
+    let (mut seen, mut cut) = (0usize, 0usize);
+    let tol = 1.0f32;
+    for s in spans {
+        if s.angle.abs() >= 0.01 || s.text.trim().is_empty() {
+            continue;
+        }
+        // Text sits ON its cell's baseline, a little above the rule below it; nudge to the
+        // glyph body's middle so a baseline that grazes the boundary lands in its own row.
+        let cy = s.y + s.size * 0.25;
+        if cy < f.ys[0] - tol || cy > f.ys[nrows] + tol {
+            continue;
+        }
+        let (x0, x1) = span_extent(s);
+        if x1 < f.xs[0] - tol || x0 > f.xs[ncols] + tol {
+            continue;
+        }
+        // `ys` is ascending with y up, so the first READING-ORDER row is the last band.
+        let r = nrows - 1 - band_index(&f.ys, cy);
+        let pieces = split_span_at(s, &f.xs);
+        seen += 1;
+        cut += usize::from(pieces.len() > 1);
+        for piece in pieces {
+            let (px0, px1) = span_extent(&piece);
+            cells[r * ncols + band_index(&f.xs, (px0 + px1) * 0.5)].push(piece);
+        }
+    }
+    // A grid line THROUGH a word is evidence against the lattice, not for it. Containment is
+    // only meaningful where the producer meant the line to bound a cell; a map's graticule, a
+    // chart's gridlines and a decorative rule all cross whatever text is under them, and
+    // splitting words on them turns readable labels into shrapnel
+    // (`tests/fixtures_pdf/map_label_grid.pdf`: `Guerneville` → `Guernevil` + `le`). A real
+    // table's ruling essentially never cuts a word, so the tolerance is a floor against
+    // measurement noise rather than a budget.
+    if seen > 0 && cut * 100 > seen * LATTICE_CUT_PCT {
+        return None;
+    }
+    let grid: Vec<Vec<String>> =
+        (0..nrows).map(|r| (0..ncols).map(|k| lattice_cell_text(&cells[r * ncols + k])).collect()).collect();
+    // ADMISSION. A lattice is evidence of cell boundaries, not of a table: a chart's gridlines
+    // and a form's decorative border draw one too. Require real content, spread over at least
+    // two rows AND two columns — one populated row is a caption strip, one populated column is
+    // a list in a box.
+    //
+    // DISPROVED, and recorded so it is not re-tried: admitting an EMPTY lattice on the strength
+    // of the ruling alone (the IRS 1040's 24 blank amount boxes, which the ground truth does
+    // count) was built and measured. It moved `full-grid` by -0.002 and added false tables,
+    // because on those pages the declared structure L0 reads already emits several tables and
+    // the empty ladder becomes one more. The ruling-only admission is not the answer there.
+    let filled = grid.iter().flatten().filter(|t| !t.trim().is_empty()).count();
+    let rows_used = grid.iter().filter(|r| r.iter().any(|t| !t.trim().is_empty())).count();
+    let cols_used = (0..ncols).filter(|&k| grid.iter().any(|r| !r[k].trim().is_empty())).count();
+    if filled < MIN_LATTICE_FILLED || rows_used < 2 || cols_used < 2 {
+        return None;
+    }
+    Some(PosTable {
+        y_top: f.bbox.y1,
+        y_bottom: f.bbox.y0,
+        x_left: f.bbox.x0,
+        x_right: f.bbox.x1,
+        grid,
+        header: Vec::new(),
+    })
+}
+
+/// Does a ruling frame own the region an inferred table claims — i.e. are they the same table,
+/// read twice?
+///
+/// Two tests, because inference fails in two directions. **Area**: half of the smaller region
+/// coincides — the rule L0 applies to a declaration, and it catches both an over-split (several
+/// fragments inside the frame) and an over-merge (the frame's block plus its neighbours read as
+/// one wide grid). **Columns**: the two share a column model and their rows overlap at all —
+/// which catches the partial frame, where the ruling closes only the header band of a table
+/// whose body the alignment path read separately. Emitting both would count one table twice.
+fn owns(outer: &crate::geom::Rect, t: &PosTable) -> bool {
+    let tr = crate::geom::Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
+    let area = outer.overlap_area(tr) >= 0.5 * tr.area().min(outer.area()).max(1.0);
+    let same_columns = outer.overlap_w(tr) >= 0.6 * outer.width().min(tr.width()).max(1.0) && outer.overlap_h(tr) > 0.0;
+    area || same_columns
+}
+
+/// How many merged row bands cross a region — the `long_h` evidence L2 reads to tell a
+/// booktabs candidate from a borderless one.
+fn bands_over(bands: &[(f32, f32, f32)], r: &crate::geom::Rect) -> usize {
+    bands.iter().filter(|&&(a, b, y)| y >= r.y0 && y <= r.y1 && b.min(r.x1) - a.max(r.x0) >= r.width() * 0.7).count()
+}
+
 /// Detect tables. On a two-column page we split down the middle and detect each
 /// side independently — a clean centre gutter guarantees nothing spans it, so the
 /// two sides are genuinely separate (this is what stops adjacent-column prose from
 /// merging into a phantom wide table). Otherwise (single column, or a full-width
 /// element across the centre) the whole page is one region.
 ///
-/// `rules` is the page's ruling ([`crate::vector::PageRules`]) — the second evidence source.
-/// It enters here as **edges only**: [`crate::lattice::h_bands`] merges the horizontal rules
-/// into row bands, and the detector consults them where alignment alone cannot decide (see
-/// [`rule_banded`]). The ruling does NOT build a grid of its own and does not bind text to
-/// cells; [`crate::lattice::frames`] derives the closed-cell geometry a shared grid core will
-/// consume, and until that core exists nothing downstream of these edges is duplicated here.
+/// `rules` is the page's ruling ([`crate::vector::PageRules`]) — L1's SECOND evidence source.
+/// [`crate::lattice::h_bands`] merges the horizontal rules into row bands, which the alignment
+/// detector consults where alignment alone cannot decide (see [`rule_banded`]); and
+/// [`crate::lattice::frames`] derives closed-cell geometry, which seeds a candidate on its own.
+/// That is how a ruled table with blank cells (invisible to text clustering by construction)
+/// and one whose in-grid band titles terminate every text run are found at all. Frame evidence
+/// only ever ADDS a candidate or replaces the fragments inference made inside that same frame;
+/// it never deletes content and never re-splits a cell.
 pub fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Vec<PosTable> {
     // Tables are built from upright text only — rotated labels (axis titles etc.) must
     // not perturb gutter detection or column structure (they're figure labels).
@@ -1052,7 +1345,73 @@ pub fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Ve
     // under the last row, which is all a booktabs table publishes and all the alignment path
     // needs to trust a run too short to trust on alignment alone.
     let bands = if rules.h.is_empty() { Vec::new() } else { crate::lattice::h_bands(rules) };
-    detect_aligned_tables(spans, &bands)
+    let mut out = detect_aligned_tables(spans, &bands);
+    // ── L1b: the ruling ────────────────────────────────────────────────────────────────
+    let frames = if rules.h.is_empty() || rules.v.is_empty() { Vec::new() } else { crate::lattice::frames(rules) };
+    if !frames.is_empty() {
+        let mut framed: Vec<PosTable> = Vec::new();
+        for f in &frames {
+            let c = Candidate { frame: Some(f), long_h: bands_over(&bands, &f.bbox), v_rules: 0, aligned: None };
+            let built = build_table(TABLE_TYPES, &c, spans);
+            // Per-page dispatch trace, off unless asked for (`DPDF_TABLES=1`), the same idiom
+            // as `DPDF_L0`: which type each frame classified as and whether L3 kept it. A
+            // dispatch nobody can see is a dispatch nobody audits.
+            if std::env::var_os("DPDF_TABLES").is_some() {
+                eprintln!(
+                    "  L2 frame {}x{} @[{:.0},{:.0}]-[{:.0},{:.0}] -> {} {}",
+                    f.xs.len() - 1,
+                    f.ys.len() - 1,
+                    f.bbox.x0,
+                    f.bbox.y0,
+                    f.bbox.x1,
+                    f.bbox.y1,
+                    classify(TABLE_TYPES, &c).map(|t| t.name).unwrap_or("-"),
+                    if built.is_some() { "kept" } else { "refused" }
+                );
+            }
+            if let Some(t) = built {
+                framed.push(t);
+            }
+        }
+        if !framed.is_empty() {
+            let regions: Vec<crate::geom::Rect> =
+                framed.iter().map(|t| crate::geom::Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top)).collect();
+            // A frame REPLACES the fragments inference made inside it — but only where it
+            // actually covers them. A ruled table whose lower rows are not closed on all four
+            // sides produces a frame much shorter than the run the alignment path read, and
+            // letting that frame evict the longer table drops the uncovered rows out of the
+            // table and back into the body as prose (measured: World Bank status pages 17 of
+            // wbD34466311 and wbD34466295, two paragraphs each where the ground truth wants
+            // none — the false-positive breach that held this dispatch back). So the frame's
+            // answer stands only where it spans at least FRAME_COVERS of the aligned table's
+            // height; where the aligned table reaches well past the ruling, the aligned answer
+            // is the one that keeps every row, and the frame's is dropped rather than emitted
+            // beside it — emitting both is the doc-002 duplicate defect, not a compromise.
+            //
+            // 0.5 swept over {0, 0.5, 0.75, 0.9, 1.0}: bench100 `full-grid|tables` peaks there
+            // (0.647, vs 0.632 at 0.75 and 0.642 at 0.9/1.0) and the pdf-parse-bench content
+            // metric is within 0.0006 of its unguarded value (0.4925 vs 0.4928 md), while 0.75
+            // and above cost it 0.007. Below 0.5 `owns` is already the binding constraint.
+            let pad = 2.0;
+            let covers = |r: &crate::geom::Rect, t: &PosTable| {
+                let tr = crate::geom::Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
+                owns(r, t) && r.overlap_h(tr) + pad >= FRAME_COVERS * (t.y_top - t.y_bottom)
+            };
+            let overreaches: Vec<bool> =
+                regions.iter().map(|r| out.iter().any(|t| owns(r, t) && !covers(r, t))).collect();
+            out.retain(|t| !regions.iter().zip(&overreaches).any(|(r, &over)| !over && owns(r, t)));
+            out.extend(framed.into_iter().zip(overreaches).filter(|(_, over)| !over).map(|(t, _)| t));
+        }
+    }
+    // Every surviving alignment table goes through the same L2/L3 dispatch, with no frame
+    // evidence to offer — so it reaches an alignment handler, which hands it back unchanged.
+    // The round trip is not ceremony: it is what makes the identity a property of the code.
+    out.into_iter()
+        .filter_map(|t| {
+            let c = Candidate { frame: None, long_h: 0, v_rules: 0, aligned: Some(t) };
+            build_table(TABLE_TYPES, &c, spans)
+        })
+        .collect()
 }
 
 /// L1a — the text-alignment detector: the whole page, or one lane per text column.
@@ -1843,9 +2202,7 @@ mod tests {
         // clustering *by construction*: a column nobody typed in (nothing aligns there) and a
         // full-width band title (a ONE-cell row, which ends the run of multi-cell rows and cuts
         // the table in two). The RULING states both plainly — six row bands, four column bands,
-        // every cell closed on all four sides — and that geometry is what a shared grid core
-        // consumes. This test pins the derivation, not a binding: see the `lattice` module note
-        // on why the cell assembly is not here.
+        // every cell closed on all four sides — and the ruled handler reads it, cell for cell.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/ruled_blank_cells.pdf");
         let doc = Document::load(path).expect("ruled_blank_cells.pdf must load");
         let raw = std::fs::read(path).expect("fixture readable");
@@ -1856,15 +2213,101 @@ mod tests {
         assert_eq!(frames[0].xs.len(), 5, "4 column bands: {:?}", frames[0].xs);
         assert_eq!(frames[0].ys.len(), 7, "6 row bands, band titles included: {:?}", frames[0].ys);
 
-        // And the repro this fixture exists for, kept live rather than described: the text path
-        // — which is all that runs today — cannot produce that shape from this page.
+        // The whole page, through the production entry point: ONE table, 6x4 — the blank third
+        // column is a column and each band title is its own row, neither of which text
+        // clustering can see.
         let spans = crate::text::extract_spans(&doc, page, &raw);
-        let text_only = detect_tables_pos(&spans, &rules);
-        assert!(
-            text_only.len() != 1 || text_only[0].grid.len() != 6 || text_only[0].grid[0].len() != 4,
-            "if the text path already got this right the fixture proves nothing: {shape:?}",
-            shape = text_only.iter().map(|t| (t.grid.len(), t.grid[0].len())).collect::<Vec<_>>()
-        );
+        let tables = detect_tables_pos(&spans, &rules);
+        assert_eq!(tables.len(), 1, "one table, got {shape:?}", shape = tables.iter().map(|t| (t.grid.len(), t.grid[0].len())).collect::<Vec<_>>());
+        assert_eq!((tables[0].grid.len(), tables[0].grid[0].len()), (6, 4));
+        assert_eq!(tables[0].grid[0], vec!["Site", "Depth", "", "Yield"]);
+        assert_eq!(tables[0].grid[1], vec!["Northern district", "", "", ""]);
+        assert_eq!(tables[0].grid[5], vec!["Delta", "42.5", "", "128"]);
+    }
+
+    #[test]
+    fn a_run_that_straddles_a_column_rule_is_split_between_the_two_cells() {
+        // The binding primitive, on its own. A cell boundary the producer DREW does not care
+        // where the text walker ended a run; placing the run by its centroid puts every
+        // character on one side of a line that visibly crosses it.
+        let s = Span {
+            x: 100.0,
+            y: 0.0,
+            size: 10.0,
+            width: 40.0, // 8 chars, 5pt each
+            text: "ABCDEFGH".into(),
+            bold: false,
+            italic: false,
+            mono: false,
+            angle: 0.0,
+            font: 0,
+            mcid: None,
+        };
+        // A boundary at 120 is 4 characters in.
+        let pieces = split_span_at(&s, &[100.0, 120.0, 140.0]);
+        assert_eq!(pieces.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), vec!["ABCD", "EFGH"]);
+        assert_eq!(pieces[1].x, 120.0, "the second piece starts at the boundary");
+        assert_eq!(pieces[0].width + pieces[1].width, 40.0, "the advance is conserved");
+        // The frame's own edges are not interior, so a run inside one cell is left whole.
+        assert_eq!(split_span_at(&s, &[100.0, 140.0]).len(), 1);
+        // A single character cannot be cut.
+        let one = Span { text: "X".into(), width: 5.0, ..clone_span(&s) };
+        assert_eq!(split_span_at(&one, &[102.0]).len(), 1);
+    }
+
+    #[test]
+    fn a_lattice_whose_lines_run_through_its_words_is_not_a_table() {
+        // `map_label_grid.pdf` page 2: a 4x4 label grid inside a ruling whose 62pt columns are
+        // narrower than the labels in them, so a column line passes through 4 of the 16 words.
+        // Binding by containment there splits `Guerneville` into `Guernevil` + `le`, which is
+        // how the fixture's own "no extracted word goes unrendered" check catches it. Lines
+        // through a quarter of the words are evidence the cells are not the cells, so the
+        // frame is refused and the alignment reading — which keeps every word whole — stands.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/map_label_grid.pdf");
+        let doc = Document::load(path).expect("map_label_grid.pdf must load");
+        let raw = std::fs::read(path).expect("fixture readable");
+        let page = *doc.get_pages().get(&2).expect("page 2");
+        let rules = crate::vector::page_rules(&doc, page);
+        let frames = crate::lattice::frames(&rules);
+        assert!(!frames.is_empty(), "the ruling does close cells — that is the point");
+        let spans = crate::text::extract_spans(&doc, page, &raw);
+        let c = Candidate { frame: Some(&frames[0]), long_h: 0, v_rules: 0, aligned: None };
+        assert_eq!(classify(TABLE_TYPES, &c).map(|t| t.name), Some("full-grid"), "it classifies");
+        assert!(l3_ruled(&c, &spans).is_none(), "…and the handler refuses it");
+    }
+
+    #[test]
+    fn a_new_type_reaches_l3_without_touching_l1() {
+        // The structural guarantee, executed: adding a type is a row in the data table plus an
+        // L3 handler, and it cannot change DETECTION — nothing in L1 reads the type table.
+        // Register a dummy type that claims every framed candidate and returns a fixed 1x1
+        // grid, and show (a) the classifier dispatches to it, (b) the candidates L1 produced
+        // are exactly the same ones.
+        fn l3_dummy(_c: &Candidate, _s: &[Span]) -> Option<PosTable> {
+            Some(PosTable { y_top: 1.0, y_bottom: 0.0, x_left: 0.0, x_right: 1.0, grid: vec![vec!["dummy".into()]], header: Vec::new() })
+        }
+        const EXTENDED: &[TypeRule] = &[
+            TypeRule { name: "dummy", matches: |c| c.frame.is_some(), handler: l3_dummy },
+            TypeRule { name: "borderless", matches: |_| true, handler: l3_aligned },
+        ];
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/ruled_blank_cells.pdf");
+        let doc = Document::load(path).expect("ruled_blank_cells.pdf must load");
+        let raw = std::fs::read(path).expect("fixture readable");
+        let page = *doc.get_pages().get(&1).expect("page 1");
+        let spans = crate::text::extract_spans(&doc, page, &raw);
+        let rules = crate::vector::page_rules(&doc, page);
+        let frames = crate::lattice::frames(&rules);
+        assert_eq!(frames.len(), 1, "L1 found one frame");
+
+        let framed = Candidate { frame: Some(&frames[0]), long_h: 0, v_rules: 0, aligned: None };
+        assert_eq!(classify(TABLE_TYPES, &framed).map(|t| t.name), Some("full-grid"));
+        assert_eq!(classify(EXTENDED, &framed).map(|t| t.name), Some("dummy"), "the new row wins");
+        assert_eq!(build_table(EXTENDED, &framed, &spans).map(|t| t.grid), Some(vec![vec!["dummy".to_string()]]));
+
+        // L1 is untouched: the same page, detected with the production table, still produces
+        // the same frame — the type table changed what a candidate BECOMES, never what is found.
+        assert_eq!(crate::lattice::frames(&rules).len(), frames.len());
+        assert_eq!(crate::lattice::frames(&rules)[0].xs, frames[0].xs);
     }
 
     #[test]

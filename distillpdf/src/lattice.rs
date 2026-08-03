@@ -14,17 +14,13 @@
 //!
 //! Everything here is in page space (y up), the space [`crate::vector::PageRules`] arrives in.
 //!
-//! **What consumes what, today.** [`h_bands`] is live: the alignment detector reads merged row
+//! **What consumes what.** [`h_bands`] feeds the alignment detector, which reads merged row
 //! bands to decide whether a two-row run is a booktabs table. [`frames`] — the closed-cell
-//! derivation below — is *edge geometry with no consumer yet*, and deliberately so.
-//!
-//! Binding text into those cells belongs to the shared grid core, not here. Our table CONTENT
-//! score is dominated by the assignment primitive: a span placed by its centroid lands wholly
-//! in one cell, so a glyph run that straddles a column boundary is put entirely on the side its
-//! midpoint fell — the grid can be right while the contents are wrong. Standing up a second
-//! binder in this module would multiply that defect, not fix it, so the geometry lands tested
-//! and reusable and the cell assembly waits for a core that binds per character. The measured
-//! case is in `dev-docs/plans/pymupdf-table-algorithm-study.md`.
+//! derivation below — feeds `extract`'s L2/L3 dispatch, whose `l3_ruled` handler binds text
+//! into those cells by GEOMETRIC CONTAINMENT: a run is filtered to its row band and then cut at
+//! every column boundary that falls inside it, so a run straddling a rule is split between the
+//! two cells rather than placed wholly on the side its midpoint fell. That binder lives in
+//! `extract` and is shared; this module stays pure geometry and knows nothing about text.
 //!
 //! Every tolerance below was chosen against THIS corpus's ruled documents and is documented
 //! with what it was measured on. Nothing here is ported: no external table implementation was
@@ -49,7 +45,6 @@ const SNAP: f32 = 1.6;
 /// begins at 503.8) and the narrowest real gap inside a rule — the World Bank tables' unruled
 /// column gutters — is over 60 pt.
 const JOIN: f32 = 2.5;
-#[allow(dead_code)] // frame derivation — see the module note
 /// How much shorter than the cell edge a rule may fall and still be said to bound it.
 ///
 /// Measured on our own ruled documents: a World Bank status table draws a row rule from
@@ -62,9 +57,7 @@ const COVER: f32 = 2.5;
 /// table's frame survives a page that also carries ruling clutter.
 const MAX_LINES: usize = 96;
 /// A frame narrower/shorter than this is a rule pair or a check-box, not a table.
-#[allow(dead_code)] // frame derivation — see the module note
 const MIN_FRAME_W: f32 = 36.0;
-#[allow(dead_code)] // frame derivation — see the module note
 const MIN_FRAME_H: f32 = 12.0;
 
 /// One closed ruling frame: the grid lines that bound its cells.
@@ -72,7 +65,6 @@ const MIN_FRAME_H: f32 = 12.0;
 /// `xs` and `ys` are both ascending, so with y up `ys[0]` is the frame's BOTTOM edge and the
 /// first *reading-order* row is the band `ys[len-2]..ys[len-1]`. `xs.len() - 1` columns by
 /// `ys.len() - 1` rows, both ≥ 2 by construction.
-#[allow(dead_code)] // frame derivation — see the module note
 pub(crate) struct Frame {
     pub xs: Vec<f32>,
     pub ys: Vec<f32>,
@@ -88,8 +80,7 @@ struct Line {
 
 impl Line {
     /// Does this line bound the edge `lo..hi`? Tolerant at both ends by [`COVER`].
-    #[allow(dead_code)] // frame derivation — see the module note
-    fn covers(&self, lo: f32, hi: f32) -> bool {
+        fn covers(&self, lo: f32, hi: f32) -> bool {
         self.iv.iter().any(|&(a, b)| a <= lo + COVER && b >= hi - COVER)
     }
     fn extent(&self) -> f32 {
@@ -147,7 +138,6 @@ fn grid_lines(mut raw: Vec<(f32, f32, f32)>) -> Vec<Line> {
 /// columns by 2 rows, spanning the rectangular hull of its cells and carrying every row line
 /// any of them used. The hull is deliberate: a merged cell leaves a hole in the component, and
 /// the table it belongs to still has that column and that row.
-#[allow(dead_code)] // frame derivation — see the module note
 pub(crate) fn frames(rules: &PageRules) -> Vec<Frame> {
     let vs = grid_lines(rules.v.iter().map(|&(x, y0, y1)| (y0, y1, x)).collect());
     let hs = grid_lines(rules.h.iter().map(|&(x0, x1, y)| (x0, x1, y)).collect());
@@ -260,7 +250,6 @@ pub(crate) fn frames(rules: &PageRules) -> Vec<Frame> {
 }
 
 /// Positions merged and deduplicated at [`SNAP`], ascending.
-#[allow(dead_code)] // frame derivation — see the module note
 fn union_axis(a: &[f32], b: &[f32]) -> Vec<f32> {
     let mut all: Vec<f32> = a.iter().chain(b).copied().collect();
     all.sort_by(|p, q| p.total_cmp(q));
@@ -286,7 +275,6 @@ fn union_axis(a: &[f32], b: &[f32]) -> Vec<f32> {
 /// This is the ruled twin of the alignment path's stranded-header machinery. On World Bank
 /// tables it is the difference between one 13×8 table and the five 2×3 shards its band rows
 /// leave behind.
-#[allow(dead_code)] // frame derivation — see the module note
 fn join_shards(frames: &mut Vec<Frame>) {
     /// Shards of one lattice are separated by the rule they share; a hair of slack absorbs
     /// the rule's own thickness.
