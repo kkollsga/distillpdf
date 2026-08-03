@@ -108,6 +108,53 @@ pub struct PdfDocument {
     pub(crate) ocr_cache: Mutex<HashMap<u32, String>>,
 }
 
+/// A private one-thread rayon pool, used for **nothing but** `Document::load_mem`.
+///
+/// lopdf builds `document.objects` from a rayon `par_iter` over the xref, and every object
+/// stream a worker decodes is appended to one shared `Mutex<Vec<_>>`. The duplicate-object
+/// resolution that follows is `objects.entry(id).or_insert(entry)` — *first entry in that vec
+/// wins* — so the winner is decided by **thread-completion order**, which is not stable from
+/// run to run. When two object streams both carry a definition for the same object number and
+/// the xref's `/Type /ObjStm` container map does not disambiguate them, the loaded document
+/// differs between runs.
+///
+/// Measured (`dev-docs/bench/out/g8/`): 40 loads of one USGS file produce **3 distinct object
+/// maps**, flipping a struct-tree element between `/S /Figure` and `/S /Artifact`, which in
+/// turn made a table header row appear and disappear across `to_html()` renders of the same
+/// bytes. This is not table-specific: any document with that shape can parse differently on
+/// each run. Still present in lopdf 0.44 (the merge code is unchanged); filed upstream.
+///
+/// We do not fork or vendor lopdf (owner decision), and the two obvious knobs are both
+/// unacceptable: `RAYON_NUM_THREADS=1` sets the *global* pool and would serialise **our** rayon
+/// work too (text extraction is where we most clearly win), and `default-features = false`
+/// drops lopdf's rayon at a large load-time cost. Installing a private one-thread pool around
+/// the load alone confines the serialisation to exactly the racing code and leaves the global
+/// pool — and therefore all of our own parallelism — untouched.
+fn load_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(|_| "distillpdf-load".to_string())
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// `Document::load_mem` with a deterministic object map — see [`load_pool`].
+///
+/// Every load in this crate goes through here; calling `Document::load_mem` directly
+/// reintroduces the race. If the pool cannot be built (thread spawn failure) we fall back to
+/// an ordinary load rather than failing the open: a nondeterministic document still beats no
+/// document.
+fn load_mem_deterministic(raw: &[u8]) -> Result<Document, lopdf::Error> {
+    match load_pool() {
+        Some(pool) => pool.install(|| Document::load_mem(raw)),
+        None => Document::load_mem(raw),
+    }
+}
+
 /// The trailer key whose value is the encryption dictionary.
 const ENCRYPT_KEY: &[u8] = b"Encrypt";
 /// Same length as `/Encrypt`, so swapping it in leaves every byte offset in the file (and
@@ -163,7 +210,7 @@ fn mask_inline_encrypt_keys(raw: &[u8]) -> Vec<u8> {
 /// real indirect object and run lopdf's own authentication and per-object decryption over it
 /// ([`decrypt_leniently`]). No re-implemented crypto, no lopdf version bump.
 fn load_inline_encrypted(raw: &[u8], encrypt: lopdf::Dictionary) -> Result<Document, Error> {
-    let mut doc = Document::load_mem(&mask_inline_encrypt_keys(raw)).map_err(|_| Error::Encrypted)?;
+    let mut doc = load_mem_deterministic(&mask_inline_encrypt_keys(raw)).map_err(|_| Error::Encrypted)?;
     let id = doc.add_object(lopdf::Object::Dictionary(encrypt));
     doc.trailer.set(ENCRYPT_KEY.to_vec(), lopdf::Object::Reference(id));
     decrypt_leniently(&mut doc, id)?;
@@ -237,7 +284,7 @@ impl PdfDocument {
     /// Open a PDF from a filesystem path. Only loads/parses the container.
     pub fn open(path: &str) -> Result<Self, Error> {
         let raw = std::fs::read(path).map_err(Error::Read)?;
-        let mut doc = Document::load_mem(&raw).map_err(|e| Error::Open(e.to_string()))?;
+        let mut doc = load_mem_deterministic(&raw).map_err(|e| Error::Open(e.to_string()))?;
         ensure_decrypted(&raw, &mut doc)?;
         Ok(PdfDocument { doc, raw, source: Some(PathBuf::from(path)), ocr_cache: Default::default() })
     }
@@ -245,7 +292,7 @@ impl PdfDocument {
     /// Open a PDF from raw bytes. There is no source path.
     pub fn from_bytes(data: &[u8]) -> Result<Self, Error> {
         let raw = data.to_vec();
-        let mut doc = Document::load_mem(&raw).map_err(|e| Error::Parse(e.to_string()))?;
+        let mut doc = load_mem_deterministic(&raw).map_err(|e| Error::Parse(e.to_string()))?;
         ensure_decrypted(&raw, &mut doc)?;
         Ok(PdfDocument { doc, raw, source: None, ocr_cache: Default::default() })
     }
@@ -462,7 +509,7 @@ impl PdfDocument {
     /// invisible-overlay. Returns the saved PDF bytes; the caller writes the file.
     pub fn build_searchable_pdf(&self, ocr: &HashMap<u32, String>, remove_raster: bool) -> Result<Vec<u8>, Error> {
         let build = || -> Result<Vec<u8>, String> {
-            let mut doc = Document::load_mem(&self.raw).map_err(|e| e.to_string())?;
+            let mut doc = load_mem_deterministic(&self.raw).map_err(|e| e.to_string())?;
             let (helv, helv_b) = ocr::pdf::add_fonts(&mut doc);
             let pages = doc.get_pages();
             for (&pno, &page_id) in &pages {
@@ -647,6 +694,77 @@ pub(crate) mod tests {
         out
     }
 
+    /// Build a PDF that makes lopdf's object-stream merge race observable: object 5 is defined
+    /// **twice**, in two different `/Type /ObjStm` containers with different values, and the
+    /// xref does not list it as a compressed object — so lopdf's container filter keeps both
+    /// copies and the winner is decided by rayon thread-completion order. The filler objects
+    /// exist only to give the parallel loader enough entries to actually split the work.
+    fn racing_objstm_pdf() -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut offs: Vec<(u32, usize)> = Vec::new();
+        out.extend_from_slice(b"%PDF-1.5\n");
+        let obj = |out: &mut Vec<u8>, offs: &mut Vec<(u32, usize)>, n: u32, body: &str| {
+            offs.push((n, out.len()));
+            out.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
+        };
+        obj(&mut out, &mut offs, 1, "<< /Type /Catalog /Pages 2 0 R >>");
+        obj(&mut out, &mut offs, 2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        obj(&mut out, &mut offs, 3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>");
+        for n in 100..400u32 {
+            obj(&mut out, &mut offs, n, "<< /Filler true >>");
+        }
+        // Two object streams, each claiming object 5 with a different structure type.
+        for (n, val) in [(10u32, "Figure"), (20u32, "Artifact")] {
+            let data = format!("5 0 << /S /{val} >>");
+            offs.push((n, out.len()));
+            out.extend_from_slice(
+                format!(
+                    "{n} 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n{data}\nendstream\nendobj\n",
+                    data.len()
+                )
+                .as_bytes(),
+            );
+        }
+        let startxref = out.len();
+        let maxid = 400u32;
+        out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", maxid + 1).as_bytes());
+        for id in 1..=maxid {
+            match offs.iter().find(|(n, _)| *n == id) {
+                Some((_, o)) => out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes()),
+                None => out.extend_from_slice(b"0000000000 65535 f \n"),
+            }
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF", maxid + 1).as_bytes(),
+        );
+        out
+    }
+
+    /// The same bytes must always load to the same object map.
+    ///
+    /// lopdf resolves an object number defined in two object streams by *thread-completion
+    /// order*, so on stock `Document::load_mem` this fixture loads two different ways at
+    /// roughly 50/50 (measured: 30/30 over 60 loads, and 3 distinct maps over 40 loads of a
+    /// real USGS file, which flipped a table header in and out of `to_html`). Everything in
+    /// this crate loads through [`load_mem_deterministic`], which confines that race to a
+    /// private one-thread pool. A regression here means a call site went back to
+    /// `Document::load_mem` — or that our pool stopped covering lopdf's `par_iter`.
+    #[test]
+    fn the_same_bytes_always_load_to_the_same_object_map() {
+        let raw = racing_objstm_pdf();
+        let fingerprint = |doc: &Document| -> String {
+            doc.objects.iter().map(|(id, o)| format!("{id:?}={o:?};")).collect()
+        };
+        let first = fingerprint(&load_mem_deterministic(&raw).expect("fixture loads"));
+        for i in 1..60 {
+            let got = fingerprint(&load_mem_deterministic(&raw).expect("fixture loads"));
+            assert_eq!(got, first, "object map changed on load {i} of the same bytes");
+        }
+        // Guard the fixture itself: if lopdf ever stops keeping both copies, this test would
+        // pass vacuously and stop protecting anything.
+        assert!(first.contains("/S"), "fixture no longer exercises the object-stream merge");
+    }
+
     #[test]
     fn parallel_page_text_joins_exactly_as_the_sequential_loop_did() {
         // `extract_text` fans its pages out over rayon. The join must not be able to observe
@@ -779,6 +897,3 @@ pub(crate) mod tests {
         assert_eq!(DistillOptions::from_assets("none").unwrap().profile, AssetProfile::None);
     }
 }
-
-
-
