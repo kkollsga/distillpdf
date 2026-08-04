@@ -32,6 +32,9 @@ RUN_PY="${RUN_PY:-$HOME/labenv/bin/python}"
 UV="${UV:-$HOME/.local/bin/uv}"
 BUILD_VENV="${BUILD_VENV:-.build-venv}"
 
+# shellcheck source=scripts/release-wheel.sh
+source scripts/release-wheel.sh
+
 step() { printf '\n\033[1;34m==> %s\033[0m\n' "$1"; }
 
 step "Rust unit tests (cargo test -p distillpdf --lib)"
@@ -47,9 +50,15 @@ if [ ! -x "$BUILD_VENV/bin/maturin" ]; then
   "$UV" venv --python "$BUILD_PY" "$BUILD_VENV"
   "$UV" pip install --python "$BUILD_VENV/bin/python" maturin
 fi
-"$BUILD_VENV/bin/maturin" build --release --features extension-module -i "$BUILD_PY"
-
-WHEEL="$(ls -t target/wheels/distillpdf-*-abi3-*.whl | head -1)"
+mkdir -p target/release-check
+WHEEL_OUT="$(mktemp -d target/release-check/wheels.XXXXXX)"
+cleanup_wheel_out() {
+  if [ -n "${WHEEL_OUT:-}" ] && [ -d "$WHEEL_OUT" ]; then
+    rm -rf -- "$WHEEL_OUT"
+  fi
+}
+trap cleanup_wheel_out EXIT
+WHEEL="$(build_release_wheel "$BUILD_VENV/bin/maturin" "$BUILD_PY" "$WHEEL_OUT")"
 echo "built: $WHEEL"
 
 step "Install wheel into run env ($RUN_PY)"
