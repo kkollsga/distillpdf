@@ -7,6 +7,8 @@
 //! not parallel interpretations of a table.
 
 use crate::geom::Rect;
+use crate::text::SourceSlice;
+use std::ops::Range;
 
 /// One table reported by [`crate::PdfDocument::analyze_tables`].
 ///
@@ -388,11 +390,120 @@ impl TableAnalysis {
     }
 }
 
+/// Which private detector produced a page-local candidate. This is diagnostic identity, not
+/// evidence ranking: Phase 5A records existing decisions without changing them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CandidateProducer {
+    Aligned,
+    Frame,
+    Declared,
+    Synthetic,
+}
+
+impl CandidateProducer {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Aligned => "aligned",
+            Self::Frame => "frame",
+            Self::Declared => "declared",
+            Self::Synthetic => "synthetic",
+        }
+    }
+}
+
+/// Stable identity within one page detection call. Ordinals follow the producer's existing,
+/// deterministic iteration order and never participate in reconciliation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CandidateKey {
+    pub(crate) producer: CandidateProducer,
+    pub(crate) ordinal: u32,
+}
+
+impl CandidateKey {
+    pub(crate) const fn new(producer: CandidateProducer, ordinal: u32) -> Self {
+        Self { producer, ordinal }
+    }
+
+    pub(crate) const fn synthetic() -> Self {
+        Self::new(CandidateProducer::Synthetic, 0)
+    }
+
+    pub(crate) fn label(self) -> String {
+        format!("{}:{}", self.producer.name(), self.ordinal)
+    }
+}
+
+/// Exact painted text owned by a private table candidate. `slices` is the globally sorted
+/// union used for deterministic comparison/hashing; `row_slices` plus `row_ranges` preserves
+/// the detector's row partition without allocating one vector per public cell.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TableClaim {
+    pub(crate) slices: Vec<SourceSlice>,
+    row_slices: Vec<SourceSlice>,
+    row_ranges: Vec<Range<usize>>,
+}
+
+impl TableClaim {
+    pub(crate) fn from_rows(rows: Vec<Vec<SourceSlice>>) -> Self {
+        let mut row_slices = Vec::new();
+        let mut row_ranges = Vec::with_capacity(rows.len());
+        for mut row in rows {
+            row.sort_unstable();
+            row.dedup();
+            let start = row_slices.len();
+            row_slices.extend(row);
+            row_ranges.push(start..row_slices.len());
+        }
+        let mut raw_slices = row_slices.clone();
+        raw_slices.sort_unstable();
+        let mut slices: Vec<SourceSlice> = Vec::with_capacity(raw_slices.len());
+        for slice in raw_slices {
+            if let Some(last) = slices.last_mut() {
+                if let Some(merged) = last.merge_if_touching(slice) {
+                    *last = merged;
+                    continue;
+                }
+            }
+            slices.push(slice);
+        }
+        Self { slices, row_slices, row_ranges }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.slices.len()
+    }
+
+    pub(crate) fn row_count(&self) -> usize {
+        self.row_ranges.len()
+    }
+
+    /// Fixed FNV-1a over numeric provenance only. Unlike `DefaultHasher`, this is explicitly
+    /// stable across runs and Rust versions and cannot leak table text into diagnostics.
+    pub(crate) fn stable_hash(&self) -> u64 {
+        let mut hash = 0xcbf29ce484222325u64;
+        for slice in &self.slices {
+            for value in [
+                slice.source().ordinal(),
+                slice.char_start(),
+                slice.char_end(),
+            ] {
+                for byte in value.to_le_bytes() {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+        hash
+    }
+}
+
 /// A table while it still participates in page-space ownership and reading-order decisions.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PositionedTableAnalysis {
     pub(crate) bbox: Rect,
     pub(crate) table: TableAnalysis,
+    pub(crate) key: CandidateKey,
+    pub(crate) claim: TableClaim,
 }
 
 impl PositionedTableAnalysis {
@@ -406,7 +517,15 @@ impl PositionedTableAnalysis {
         Self {
             bbox,
             table: TableAnalysis::from_parts(header, grid, header_rows, None, evidence),
+            key: CandidateKey::synthetic(),
+            claim: TableClaim::default(),
         }
+    }
+
+    pub(crate) fn with_ownership(mut self, key: CandidateKey, claim: TableClaim) -> Self {
+        self.key = key;
+        self.claim = claim;
+        self
     }
 
     pub(crate) fn into_public<F>(self, page: u32, normalize: F) -> AnalyzedTable
@@ -574,6 +693,8 @@ mod tests {
         let positioned = PositionedTableAnalysis {
             bbox,
             table: TableAnalysis::from_cells(Vec::new(), vec![vec![cell]], 0, Vec::new()),
+            key: CandidateKey::synthetic(),
+            claim: TableClaim::default(),
         };
         assert_eq!(positioned.table.grid[0][0].bbox, Some(bbox));
         assert_eq!(positioned.bbox, bbox);
@@ -595,6 +716,18 @@ mod tests {
             table.evidence,
             vec![TableEvidence::Ruled, TableEvidence::Aligned]
         );
+    }
+
+    #[test]
+    fn claim_union_canonicalizes_a_whole_span_and_adjacent_split_pieces_identically() {
+        let whole = SourceSlice::test_occurrence(12, 6);
+        let pieces = vec![whole.sub_slice(0, 2), whole.sub_slice(2, 5), whole.sub_slice(5, 6)];
+        let whole_claim = TableClaim::from_rows(vec![vec![whole]]);
+        let split_claim = TableClaim::from_rows(vec![pieces]);
+
+        assert_eq!(whole_claim.slices, split_claim.slices);
+        assert_eq!(whole_claim.stable_hash(), split_claim.stable_hash());
+        assert_eq!(split_claim.slices, vec![whole]);
     }
 
     #[test]

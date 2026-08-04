@@ -1196,7 +1196,8 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
     // page-LOCAL `\0<idx>\0` sentinels (so the string passes never touch the base64) and
     // remapped to global indices during the sequential merge below.
     let t = std::time::Instant::now();
-    let renders: Vec<(u32, Vec<PageElement>, Vec<String>)> = page_spans
+    let owner_diagnostics_enabled = extract::table_owner_diagnostics_enabled();
+    let renders: Vec<(u32, Vec<PageElement>, Vec<String>, String)> = page_spans
         .par_iter()
         .enumerate()
         .map(|(pidx, (pno, _pid, spans))| {
@@ -1258,6 +1259,11 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         let (raw_vectors, weak_vectors, page_rules) = vector::positioned_vectors_ruled(doc, *_pid);
         let page_rules = turn_rules(turn, page_rules);
         let mut tables = extract::detect_tables_pos(dspans, &page_rules);
+        let mut owner_diagnostics = if owner_diagnostics_enabled {
+            extract::table_owner_diagnostics(*pno, "detected", &tables)
+        } else {
+            String::new()
+        };
         // Vector figures that carry a "Figure N" caption — their *internal* text (a diagram's
         // node labels: "E[CLS] E1 … EN", "Trm Trm … Trm") now lands in the page span stream
         // (extract_spans recurses into Form XObjects), where detect_tables_pos reads the
@@ -1378,6 +1384,13 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                 })
                 .collect();
             let found = extract::declared_pos_tables(decl, dspans, &annots);
+            if owner_diagnostics_enabled {
+                owner_diagnostics.push_str(&extract::table_owner_diagnostics(
+                    *pno,
+                    "declared",
+                    &found.tables,
+                ));
+            }
             // Per-page L0 trace, off unless asked for (`DPDF_L0=1`), same idiom as
             // `DPDF_PROFILE`: which declarations were accepted and which the trust rule
             // refused, and why. A refusal that is never visible is a refusal nobody audits.
@@ -2303,8 +2316,20 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         // list. The cross-page element transforms run on the assembled `Vec<Vec<PageElement>>`
         // below, then each page is emitted and the bodies merged. Keeping the IR un-rendered
         // here is what lets the cross-page passes operate on the elements, not on a string.
-        (*pno, els, img_uris)
+        (*pno, els, img_uris, owner_diagnostics)
         })
+        .collect();
+    if owner_diagnostics_enabled {
+        extract::emit_ordered_table_owner_diagnostics(
+            renders
+                .iter()
+                .map(|(pno, _, _, diagnostics)| (*pno, diagnostics.clone()))
+                .collect(),
+        );
+    }
+    let renders: Vec<(u32, Vec<PageElement>, Vec<String>)> = renders
+        .into_iter()
+        .map(|(pno, elements, uris, _)| (pno, elements, uris))
         .collect();
     phase("02_render", t);
 
@@ -2457,6 +2482,7 @@ pub(crate) fn clone_span(s: &Span) -> Span {
         angle: s.angle,
         font: s.font,
         mcid: s.mcid,
+        source: s.source,
     }
 }
 

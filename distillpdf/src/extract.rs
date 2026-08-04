@@ -5,8 +5,11 @@
 
 use crate::pdfobj::{deref, filters_of, sub_dict};
 use crate::raster::{assemble_png, codec_payload, filter_to_format, image_bpc, image_color_space, normalized_jpeg_png};
-use crate::table::{AnalyzedTable, CellAnalysis, CellRole, PositionedTableAnalysis, TableAnalysis, TableEvidence};
-use crate::text::{self, Span};
+use crate::table::{
+    AnalyzedTable, CandidateKey, CandidateProducer, CellAnalysis, CellRole,
+    PositionedTableAnalysis, TableAnalysis, TableClaim, TableEvidence,
+};
+use crate::text::{self, SourceSlice, Span};
 use lopdf::{Dictionary, Document, ObjectId};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -838,6 +841,7 @@ fn clone_span(s: &Span) -> Span {
         angle: s.angle,
         font: s.font,
         mcid: s.mcid,
+        source: s.source,
     }
 }
 
@@ -1136,14 +1140,17 @@ pub(crate) fn declared_pos_tables(declared: &[crate::structtree::DeclaredTable],
         Rect::new(s.x, s.y, s.x + s.width.max(s.size * 0.3), s.y + s.size)
     };
 
-    for t in declared {
+    for (declared_ordinal, t) in declared.iter().enumerate() {
         let cols = t.cols();
+        let mut declared_claim_rows: Vec<Vec<SourceSlice>> = Vec::with_capacity(t.rows.len());
         // Resolve every cell: its span set, its box, and whether it resolved at all.
         let rows: Vec<Vec<(String, Rect, bool)>> = t
             .rows
             .iter()
             .map(|r| {
-                r.iter()
+                let mut row_claim = Vec::new();
+                let resolved = r
+                    .iter()
                     .map(|c| {
                         let mut idx: Vec<usize> = c.mcids.iter().filter_map(|m| by_mcid.get(m)).flatten().copied().collect();
                         let mut bx = Rect::EMPTY;
@@ -1159,10 +1166,13 @@ pub(crate) fn declared_pos_tables(declared: &[crate::structtree::DeclaredTable],
                         }
                         idx.sort_unstable();
                         idx.dedup();
+                        row_claim.extend(idx.iter().map(|&i| spans[i].source));
                         bx = idx.iter().fold(bx, |a, &i| a.union(sbox(i)));
                         (cell_text(spans, &idx), bx, resolved)
                     })
-                    .collect()
+                    .collect();
+                declared_claim_rows.push(row_claim);
+                resolved
             })
             .collect();
         // Rows the page really carries. `structtree` filtered by what the tree *claims*;
@@ -1211,6 +1221,13 @@ pub(crate) fn declared_pos_tables(declared: &[crate::structtree::DeclaredTable],
         out.tables.push(PositionedTableAnalysis {
             bbox: region,
             table: TableAnalysis::from_cells(rows, grid, nhdr, vec![TableEvidence::Declared]),
+            key: CandidateKey::new(
+                CandidateProducer::Declared,
+                u32::try_from(declared_ordinal).expect("declared table ordinal must fit u32"),
+            ),
+            claim: TableClaim::from_rows(
+                live.iter().map(|&i| declared_claim_rows[i].clone()).collect(),
+            ),
         });
     }
     out
@@ -1311,6 +1328,7 @@ pub(crate) fn span_extent(s: &Span) -> (f32, f32) {
 fn split_span_at(s: &Span, bounds: &[f32]) -> Vec<Span> {
     let (x0, x1) = span_extent(s);
     let n = s.text.chars().count();
+    debug_assert_eq!(s.source.char_len() as usize, n, "source range must cover the span text");
     if n < 2 || x1 <= x0 {
         return vec![clone_span(s)];
     }
@@ -1336,6 +1354,7 @@ fn split_span_at(s: &Span, bounds: &[f32]) -> Vec<Span> {
                 x: x0 + per * from as f32,
                 width: per * (c - from) as f32,
                 text,
+                source: s.source.sub_slice(from, c),
                 ..clone_span(s)
             });
         }
@@ -1556,6 +1575,18 @@ fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PositionedTableAnalysis> {
     if filled < MIN_LATTICE_FILLED || rows_used < 2 || cols_used < 2 {
         return None;
     }
+    let claim = TableClaim::from_rows(
+        (0..bound.nrows)
+            .map(|r| {
+                bound.cells[r * bound.ncols..(r + 1) * bound.ncols]
+                    .iter()
+                    .flatten()
+                    .filter(|span| !span.text.trim().is_empty())
+                    .map(|span| span.source)
+                    .collect()
+            })
+            .collect(),
+    );
     let header_rows = c.aligned.as_ref().map_or(ruled_header_rows, |t| {
         ruled_header_rows.max(t.table.header_rows)
     });
@@ -1594,6 +1625,8 @@ fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PositionedTableAnalysis> {
                 vec![TableEvidence::Ruled]
             },
         ),
+        key: CandidateKey::synthetic(),
+        claim,
     })
 }
 
@@ -1617,6 +1650,55 @@ fn owns(outer: &crate::geom::Rect, t: &PositionedTableAnalysis) -> bool {
 /// booktabs candidate from a borderless one.
 fn bands_over(bands: &[(f32, f32, f32)], r: &crate::geom::Rect) -> usize {
     bands.iter().filter(|&&(a, b, y)| y >= r.y0 && y <= r.y1 && b.min(r.x1) - a.max(r.x0) >= r.width() * 0.7).count()
+}
+
+/// Deterministic, text-free ownership inventory for Phase 5 diagnostics. Coordinates are
+/// encoded as IEEE-754 bits so locale/rounding cannot change the trace, and the claim digest
+/// hashes only occurrence ids and character ranges.
+pub(crate) fn table_owner_diagnostics(
+    page: u32,
+    scope: &str,
+    tables: &[PositionedTableAnalysis],
+) -> String {
+    let mut out = String::new();
+    for table in tables {
+        let evidence = table
+            .table
+            .evidence
+            .iter()
+            .map(|item| item.as_str())
+            .collect::<Vec<_>>()
+            .join("+");
+        out.push_str(&format!(
+            "DPDF_TABLE_OWNERS page={page} scope={scope} candidate={} bbox={:08x},{:08x},{:08x},{:08x} evidence={} rows={} claim_rows={} slices={} hash={:016x}\n",
+            table.key.label(),
+            table.bbox.x0.to_bits(),
+            table.bbox.y0.to_bits(),
+            table.bbox.x1.to_bits(),
+            table.bbox.y1.to_bits(),
+            if evidence.is_empty() { "none" } else { &evidence },
+            table.table.header.len() + table.table.grid.len(),
+            table.claim.row_count(),
+            table.claim.len(),
+            table.claim.stable_hash(),
+        ));
+    }
+    out
+}
+
+pub(crate) fn table_owner_diagnostics_enabled() -> bool {
+    std::env::var_os("DPDF_TABLE_OWNERS").is_some()
+}
+
+fn ordered_table_owner_diagnostics(mut pages: Vec<(u32, String)>) -> String {
+    pages.sort_by_key(|(page, _)| *page);
+    pages.into_iter().map(|(_, diagnostics)| diagnostics).collect()
+}
+
+pub(crate) fn emit_ordered_table_owner_diagnostics(pages: Vec<(u32, String)>) {
+    if table_owner_diagnostics_enabled() {
+        eprint!("{}", ordered_table_owner_diagnostics(pages));
+    }
 }
 
 /// Detect tables. On a two-column page we split down the middle and detect each
@@ -1643,11 +1725,17 @@ pub(crate) fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules
     // needs to trust a run too short to trust on alignment alone.
     let bands = if rules.h.is_empty() { Vec::new() } else { crate::lattice::h_bands(rules) };
     let mut out = detect_aligned_tables(spans, &bands);
+    for (ordinal, table) in out.iter_mut().enumerate() {
+        table.key = CandidateKey::new(
+            CandidateProducer::Aligned,
+            u32::try_from(ordinal).expect("aligned table ordinal must fit u32"),
+        );
+    }
     // ── L1b: the ruling ────────────────────────────────────────────────────────────────
     let frames = if rules.h.is_empty() || rules.v.is_empty() { Vec::new() } else { crate::lattice::frames(rules) };
     if !frames.is_empty() {
         let mut framed: Vec<PositionedTableAnalysis> = Vec::new();
-        for f in &frames {
+        for (frame_ordinal, f) in frames.iter().enumerate() {
             let aligned = out
                 .iter()
                 .filter(|t| owns(&f.bbox, t))
@@ -1688,7 +1776,11 @@ pub(crate) fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules
                     if built.is_some() { "kept" } else { "refused" }
                 );
             }
-            if let Some(t) = built {
+            if let Some(mut t) = built {
+                t.key = CandidateKey::new(
+                    CandidateProducer::Frame,
+                    u32::try_from(frame_ordinal).expect("frame ordinal must fit u32"),
+                );
                 framed.push(t);
             }
         }
@@ -1726,12 +1818,13 @@ pub(crate) fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules
     // Every surviving alignment table goes through the same L2/L3 dispatch, with no frame
     // evidence to offer — so it reaches an alignment handler, which hands it back unchanged.
     // The round trip is not ceremony: it is what makes the identity a property of the code.
-    out.into_iter()
+    let out: Vec<PositionedTableAnalysis> = out.into_iter()
         .filter_map(|t| {
             let c = Candidate { frame: None, long_h: 0, v_rules: 0, aligned: Some(t) };
             build_table(TABLE_TYPES, &c, spans)
         })
-        .collect()
+        .collect();
+    out
 }
 
 /// L1a — the text-alignment detector: the whole page, or one lane per text column.
@@ -2259,6 +2352,16 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
         if trace {
             eprintln!("  ADMIT {}x{}", grid.len(), kept_x.len());
         }
+        let data_claim_rows: Vec<Vec<SourceSlice>> = run
+            .iter()
+            .map(|(_, _, spans)| {
+                spans
+                    .iter()
+                    .filter(|span| !span.text.trim().is_empty())
+                    .map(|span| span.source)
+                    .collect()
+            })
+            .collect();
 
         // Now that the data table is ACCEPTED (past every prose/equation guard), attach
         // the grouped/multi-level HEADER rows the run-builder skipped — they don't form
@@ -2271,6 +2374,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
         let m = tol * 0.5;
         let mut y_top = run.first().map(|(y, _, _)| *y).unwrap_or(0.0);
         let mut header: Vec<Vec<(String, usize)>> = Vec::new();
+        let mut header_claim_rows: Vec<Vec<SourceSlice>> = Vec::new();
         for hr in headers.iter() {
             let (hx0, hx1) = hr.1.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), c| (a.min(c.x), b.max(c.end)));
             if hx1 < x_left - m || hx0 > x_right + m {
@@ -2339,6 +2443,13 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
                 }
             }
             header.push(hrow);
+            header_claim_rows.push(
+                hr.2
+                    .iter()
+                    .filter(|span| !span.text.trim().is_empty())
+                    .map(|span| span.source)
+                    .collect(),
+            );
             y_top = y_top.max(hr.0);
         }
         // The upward attachment walk deliberately preserves visible content even when it
@@ -2363,6 +2474,8 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
         } else {
             header.len()
         };
+        header_claim_rows.extend(data_claim_rows);
+        let claim = TableClaim::from_rows(header_claim_rows);
         tables.push(PositionedTableAnalysis::from_parts(
             crate::geom::Rect::new(
                 x_left,
@@ -2378,7 +2491,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
             } else {
                 vec![TableEvidence::Aligned]
             },
-        ));
+        ).with_ownership(CandidateKey::synthetic(), claim));
     };
 
     let n = celled.len();
@@ -2454,31 +2567,43 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
     tables
 }
 
-fn detect_tables(spans: Vec<Span>, rules: &crate::vector::PageRules) -> Vec<Vec<Vec<String>>> {
-    detect_tables_pos(&spans, rules).into_iter().map(|t| t.table.into_grid_parts()).collect()
-}
-
-
 /// Extract tables from all pages as owned [`TableInfo`] rows (row-major grids).
 ///
 /// Detection runs per page in PARALLEL: `extract_spans` is an independent read-only walk with
-/// its own [`crate::WalkBudget`], and `detect_tables` is pure over one page's spans, so no
+/// its own [`crate::WalkBudget`], and table detection is pure over one page's spans, so no
 /// page can see another. The rows are re-sorted by page number before they are flattened —
 /// completion order decides nothing — which makes the output byte-identical to the sequential
 /// loop, including each page's internal table order.
 pub fn extract_tables(doc: &Document, raw: &[u8]) -> Vec<TableInfo> {
     let pages = doc.get_pages();
-    let mut per_page: Vec<(u32, Vec<Vec<Vec<String>>>)> = pages
+    let diagnostics_enabled = table_owner_diagnostics_enabled();
+    let mut per_page: Vec<(u32, Vec<Vec<Vec<String>>>, String)> = pages
         .par_iter()
         .map(|(&pno, &page_id)| {
             let rules = crate::vector::page_rules(doc, page_id);
-            (pno, detect_tables(text::extract_spans(doc, page_id, raw), &rules))
+            let spans = text::extract_spans(doc, page_id, raw);
+            let tables = detect_tables_pos(&spans, &rules);
+            let diagnostics = if diagnostics_enabled {
+                table_owner_diagnostics(pno, "detected", &tables)
+            } else {
+                String::new()
+            };
+            let grids = tables.into_iter().map(|t| t.table.into_grid_parts()).collect();
+            (pno, grids, diagnostics)
         })
         .collect();
-    per_page.sort_by_key(|(pno, _)| *pno);
+    per_page.sort_by_key(|(pno, _, _)| *pno);
+    if diagnostics_enabled {
+        emit_ordered_table_owner_diagnostics(
+            per_page
+                .iter()
+                .map(|(pno, _, diagnostics)| (*pno, diagnostics.clone()))
+                .collect(),
+        );
+    }
     per_page
         .into_iter()
-        .flat_map(|(pno, grids)| grids.into_iter().map(move |cells| TableInfo { page: pno, cells }))
+        .flat_map(|(pno, grids, _)| grids.into_iter().map(move |cells| TableInfo { page: pno, cells }))
         .collect()
 }
 
@@ -2487,7 +2612,8 @@ pub fn extract_tables(doc: &Document, raw: &[u8]) -> Vec<TableInfo> {
 /// structure-tree or caption reconciliation.
 pub fn analyze_tables(doc: &Document, raw: &[u8]) -> Vec<AnalyzedTable> {
     let pages = doc.get_pages();
-    let mut per_page: Vec<(u32, Vec<AnalyzedTable>)> = pages
+    let diagnostics_enabled = table_owner_diagnostics_enabled();
+    let mut per_page: Vec<(u32, Vec<AnalyzedTable>, String)> = pages
         .par_iter()
         .map(|(&pno, &page_id)| {
             let spans = text::extract_spans(doc, page_id, raw);
@@ -2501,15 +2627,29 @@ pub fn analyze_tables(doc: &Document, raw: &[u8]) -> Vec<AnalyzedTable> {
                     crate::pdfobj::DEFAULT_PAGE_PTS.1,
                 ]),
             );
-            let tables = detect_tables_pos(&spans, &rules)
+            let detected = detect_tables_pos(&spans, &rules);
+            let diagnostics = if diagnostics_enabled {
+                table_owner_diagnostics(pno, "detected", &detected)
+            } else {
+                String::new()
+            };
+            let tables = detected
                 .into_iter()
                 .map(|table| table.into_public(pno, |rect| turn.normalized_rect(rect)))
                 .collect();
-            (pno, tables)
+            (pno, tables, diagnostics)
         })
         .collect();
-    per_page.sort_by_key(|(pno, _)| *pno);
-    per_page.into_iter().flat_map(|(_, tables)| tables).collect()
+    per_page.sort_by_key(|(pno, _, _)| *pno);
+    if diagnostics_enabled {
+        emit_ordered_table_owner_diagnostics(
+            per_page
+                .iter()
+                .map(|(pno, _, diagnostics)| (*pno, diagnostics.clone()))
+                .collect(),
+        );
+    }
+    per_page.into_iter().flat_map(|(_, tables, _)| tables).collect()
 }
 
 /// Does this font dict (or its descendant) carry an embedded font program?
@@ -2651,6 +2791,10 @@ mod tests {
             angle: 0.0,
             font: 0,
             mcid: None,
+            source: SourceSlice::test_occurrence(
+                (x.to_bits() ^ y.to_bits()).wrapping_add(1),
+                text.chars().count(),
+            ),
         };
         let spans = vec![
             span(10.0, 100.0, "Name"),
@@ -2662,11 +2806,42 @@ mod tests {
         ];
         let tables = detect_tables_region(&spans, &[(0.0, 250.0, 112.0), (0.0, 250.0, 68.0)]);
         assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].claim.row_count(), 2);
+        assert_eq!(tables[0].claim.len(), 6);
+        assert_eq!(tables[0].claim.stable_hash(), 0xcc2445d4ebe2b52c);
+        let diagnostics = table_owner_diagnostics(7, "test", &tables);
+        assert_eq!(diagnostics, table_owner_diagnostics(7, "test", &tables));
+        assert!(diagnostics.contains("page=7 scope=test"));
+        assert!(diagnostics.contains("candidate=synthetic:0"));
+        assert!(diagnostics.contains("claim_rows=2 slices=6 hash=cc2445d4ebe2b52c"));
+        for text in ["Name", "Count", "Rate", "Alpha"] {
+            assert!(!diagnostics.contains(text), "ownership diagnostics leaked cell text");
+        }
         assert_eq!(
             tables[0].table.evidence,
             vec![TableEvidence::Aligned, TableEvidence::Ruled]
         );
         assert!(tables[0].table.grid.iter().flatten().all(|cell| cell.bbox.is_none()));
+    }
+
+    #[test]
+    fn owner_diagnostics_are_page_tagged_and_aggregated_in_page_order() {
+        let table = PositionedTableAnalysis::from_parts(
+            crate::geom::Rect::new(1.0, 2.0, 3.0, 4.0),
+            Vec::new(),
+            vec![vec!["private cell text".into(), "42".into()]],
+            0,
+            vec![TableEvidence::Aligned],
+        );
+        let page_nine = table_owner_diagnostics(9, "detected", std::slice::from_ref(&table));
+        let page_two = table_owner_diagnostics(2, "declared", std::slice::from_ref(&table));
+
+        let report = ordered_table_owner_diagnostics(vec![(9, page_nine), (2, page_two)]);
+        let lines: Vec<&str> = report.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("DPDF_TABLE_OWNERS page=2 scope=declared "));
+        assert!(lines[1].starts_with("DPDF_TABLE_OWNERS page=9 scope=detected "));
+        assert!(!report.contains("private cell text"), "ordered diagnostics leaked table text");
     }
 
     /// The owned form-XObject raster fixture (`tests/gen_fixtures.py::gen_form_image`).
@@ -2748,23 +2923,34 @@ mod tests {
             y: 0.0,
             size: 10.0,
             width: 40.0, // 8 chars, 5pt each
-            text: "ABCDEFGH".into(),
+            text: "Aé文🙂EFGH".into(),
             bold: false,
             italic: false,
             mono: false,
             angle: 0.0,
             font: 0,
             mcid: None,
+            source: SourceSlice::test_occurrence(7, 8),
         };
         // A boundary at 120 is 4 characters in.
         let pieces = split_span_at(&s, &[100.0, 120.0, 140.0]);
-        assert_eq!(pieces.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), vec!["ABCD", "EFGH"]);
+        assert_eq!(pieces.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), vec!["Aé文🙂", "EFGH"]);
+        assert_eq!(pieces[0].source.source(), s.source.source());
+        assert_eq!(pieces[1].source.source(), s.source.source());
+        assert_eq!((pieces[0].source.char_start(), pieces[0].source.char_end()), (0, 4));
+        assert_eq!((pieces[1].source.char_start(), pieces[1].source.char_end()), (4, 8));
+        assert_eq!(pieces[0].source.char_len() + pieces[1].source.char_len(), s.source.char_len());
         assert_eq!(pieces[1].x, 120.0, "the second piece starts at the boundary");
         assert_eq!(pieces[0].width + pieces[1].width, 40.0, "the advance is conserved");
         // The frame's own edges are not interior, so a run inside one cell is left whole.
         assert_eq!(split_span_at(&s, &[100.0, 140.0]).len(), 1);
         // A single character cannot be cut.
-        let one = Span { text: "X".into(), width: 5.0, ..clone_span(&s) };
+        let one = Span {
+            text: "X".into(),
+            width: 5.0,
+            source: SourceSlice::test_occurrence(8, 1),
+            ..clone_span(&s)
+        };
         assert_eq!(split_span_at(&one, &[102.0]).len(), 1);
     }
 
@@ -3160,7 +3346,14 @@ mod tests {
             let Ok(doc) = Document::load_mem(&raw) else { continue }; // encrypted / damaged
             let mut want: Vec<(u32, Vec<Vec<String>>)> = Vec::new();
             for (&pno, &page_id) in &doc.get_pages() {
-                for grid in detect_tables(text::extract_spans(&doc, page_id, &raw), &crate::vector::page_rules(&doc, page_id)) {
+                let spans = text::extract_spans(&doc, page_id, &raw);
+                for grid in detect_tables_pos(
+                    &spans,
+                    &crate::vector::page_rules(&doc, page_id),
+                )
+                .into_iter()
+                .map(|table| table.table.into_grid_parts())
+                {
                     want.push((pno, grid));
                 }
             }
