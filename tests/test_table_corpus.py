@@ -541,9 +541,16 @@ FLOORS = json.load(open(os.path.join(CORPUS, "floors.json"))) \
     if os.path.exists(os.path.join(CORPUS, "floors.json")) else {"t1": {}, "t2": {}, "t3": {}}
 T0 = [f for f, r in sorted(TRUTH["files"].items()) if r["tier"] == 0]
 T3 = [f for f, r in sorted(TRUTH["files"].items()) if r["tier"] == 3]
+COMPLEX_SEMANTIC_HEADER_FAMILIES = {
+    "merged_colspan",
+    "multitier_header",
+    "t3_kitchen_sink",
+}
 SEMANTIC_HEADER_LOCKS = [
     f for f, r in sorted(TRUTH["files"].items())
-    if r["tier"] == 1 or r["family"] == "tagged_only_signal"
+    if (r["tier"] == 1
+        or r["family"] == "tagged_only_signal"
+        or r["family"] in COMPLEX_SEMANTIC_HEADER_FAMILIES)
 ]
 
 
@@ -577,7 +584,8 @@ def test_html_semantic_header_depth(fname):
 
     G5's original ``header_acc`` compares top-row *content* through ``extract_tables()``;
     it neither sees HTML tags nor reaches L0. Keep that positional metric, but lock semantics
-    independently on every clean T1 shape plus the two tagged-only L0 cases.
+    independently on every clean T1 shape, the two tagged-only L0 cases, and the T2/T3
+    complex-header families whose committed per-file truth declares more than one tier.
     """
     rec = TRUTH["files"][fname]
     assert all(t["page"] == 0 for t in rec["tables"]), "semantic helper is page-local"
