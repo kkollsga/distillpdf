@@ -601,7 +601,7 @@ fn project_blocks(
                         }
                     }
                 }
-                ElKind::Table { header, grid, header_rows, caption } => {
+                ElKind::Table(table) => {
                     // Consume the table's `tab-N` id (post-dedup) in walk order, carrying the
                     // deduped caption number so re-emit lands the same `<table id>`.
                     let mut deduped_tab: Option<String> = None;
@@ -612,18 +612,18 @@ fn project_blocks(
                         }
                     }
                     let mut b = text_block(next_id(&mut ord), BlockKind::Table, String::new(), page, bbox, &stack);
-                    b.cells = Some(table_cells(header, grid));
-                    b.caption = caption.as_ref().map(|(_, c, _)| nav::strip_inline(c).trim().to_string());
+                    b.cells = Some(table.expanded_cells());
+                    b.caption = table.caption.as_ref().map(|caption| nav::strip_inline(&caption.html).trim().to_string());
                     b.label = b.caption.as_deref().and_then(caption_label);
                     // Fidelity parts for byte-exact re-emit: the detached header rows, the data
                     // grid, and the caption `(number, html, below)` with the number re-keyed to
                     // its post-dedup `tab-N` form.
-                    b.table_header = Some(header.clone());
-                    b.table_header_rows = Some(*header_rows);
-                    b.table_grid = Some(grid.clone());
-                    b.table_caption = caption.as_ref().map(|(num, c, below)| {
-                        let n = deduped_tab.as_deref().map(strip_tab_prefix).unwrap_or_else(|| num.clone());
-                        (n, c.clone(), *below)
+                    b.table_header = Some(table.header_parts());
+                    b.table_header_rows = Some(table.header_rows);
+                    b.table_grid = Some(table.grid_parts());
+                    b.table_caption = table.caption.as_ref().map(|caption| {
+                        let n = deduped_tab.as_deref().map(strip_tab_prefix).unwrap_or_else(|| caption.number.clone());
+                        (n, caption.html.clone(), caption.below)
                     });
                     blocks.push(b);
                 }
@@ -731,26 +731,6 @@ fn finalize_fragment(
         i += c.len_utf8();
     }
     out
-}
-
-/// A table's row-major cell grid for the block projection: detached header rows (text only,
-/// colspans expanded to one cell per spanned column) followed by the data grid — the same cell
-/// sequence the rendered `<table>` shows, so `find`/markdown over `cells` matches the HTML.
-fn table_cells(header: &[Vec<(String, usize)>], grid: &[Vec<String>]) -> Vec<Vec<String>> {
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    for hrow in header {
-        let mut row = Vec::new();
-        for (text, span) in hrow {
-            for _ in 0..(*span).max(1) {
-                row.push(text.trim().to_string());
-            }
-        }
-        rows.push(row);
-    }
-    for r in grid {
-        rows.push(r.iter().map(|c| c.trim().to_string()).collect());
-    }
-    rows
 }
 
 /// Make a block carrying the common fields (the kind-specific fields are filled by the caller),
@@ -901,12 +881,13 @@ mod tests {
     #[test]
     fn projects_table_and_figure() {
         let table = PageElement::at(
-            ElKind::Table {
-                header: vec![vec![("A".into(), 1), ("B".into(), 1)]],
-                grid: vec![vec!["1".into(), "2".into()]],
-                header_rows: 1,
-                caption: None,
-            },
+            ElKind::Table(crate::table::TableAnalysis::from_parts(
+                vec![vec![("A".into(), 1), ("B".into(), 1)]],
+                vec![vec!["1".into(), "2".into()]],
+                1,
+                None,
+                Vec::new(),
+            )),
             None,
         );
         let fig = PageElement::at(

@@ -234,19 +234,19 @@ fn map_inline_html(e: &mut PageElement, f: impl Fn(&str) -> String) {
                 *n = f(n);
             }
         }
-        Table { header, grid, caption, .. } => {
-            for row in header.iter_mut() {
-                for (t, _) in row.iter_mut() {
-                    *t = f(t);
+        Table(table) => {
+            for row in table.header.iter_mut() {
+                for cell in row.iter_mut() {
+                    cell.text = f(&cell.text);
                 }
             }
-            for row in grid.iter_mut() {
-                for c in row.iter_mut() {
-                    *c = f(c);
+            for row in table.grid.iter_mut() {
+                for cell in row.iter_mut() {
+                    cell.text = f(&cell.text);
                 }
             }
-            if let Some((_, cap, _)) = caption {
-                *cap = f(cap);
+            if let Some(caption) = &mut table.caption {
+                caption.html = f(&caption.html);
             }
         }
         Figure { html, .. } | Caption { html, .. } => *html = f(html),

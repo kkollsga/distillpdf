@@ -15,6 +15,7 @@ use crate::links;
 use crate::nav::*;
 use crate::postprocess::*;
 use crate::profile::{DocProfile, HeadingTier};
+use crate::table::TableAnalysis;
 use crate::text::{self, Span};
 use crate::vector;
 use lopdf::{Document, ObjectId};
@@ -425,13 +426,7 @@ pub(crate) enum ElKind {
     /// A `<table>` (with optional `<caption>`). Carries the full cell structure for projection:
     /// `header` rows preserve detached cells/colspans, while `header_rows` records how many
     /// leading rows of `header + grid` render as `<th>`. `caption` is `(num, html, below)`.
-    Table {
-        header: Vec<Vec<(String, usize)>>,
-        grid: Vec<Vec<String>>,
-        /// Number of leading rows in `header + grid` rendered as `<th>`.
-        header_rows: usize,
-        caption: Option<(String, String, bool)>,
-    },
+    Table(TableAnalysis),
     /// A `<figure>` (raster `<img>`/`<image N>`, vector `<svg>`, or composite). `html` is the
     /// exact fragment; `id` is the `fig-N` number (or empty); `caption` the figcaption inner;
     /// `image` the asset id when a raster placeholder is present; `svg` the inline SVG markup
@@ -484,14 +479,7 @@ impl ElKind {
                 s.push_str("</aside>");
                 s
             }
-            Table { header, grid, header_rows, caption } => {
-                table_html_from_parts(
-                    header,
-                    grid,
-                    *header_rows,
-                    caption.as_ref().map(|(n, c, b)| (n.as_str(), c.as_str(), *b)),
-                )
-            }
+            Table(table) => table_html(table),
             Figure { html, .. } | Caption { html, .. } => html.clone(),
         }
     }
@@ -509,15 +497,11 @@ pub(crate) fn emit_page_elements(els: &[PageElement]) -> String {
 }
 
 /// The table-emit core, over the bare parts (`header` rows of `(text, colspan)`, the data
-/// `grid`, optional caption). Shared by [`table_html`] (parse path, from a [`PosTable`]) and
-/// [`PageElement::html`] (model path, from the serialized cell structure) so a `<table>`
-/// renders byte-identically whichever side built it.
-fn table_html_from_parts(
-    header: &[Vec<(String, usize)>],
-    grid: &[Vec<String>],
-    header_rows: usize,
-    cap: Option<(&str, &str, bool)>,
-) -> String {
+/// `grid`, optional caption). The parse and model paths now both construct the canonical
+/// analysis before reaching this emitter, so a `<table>` renders byte-identically whichever
+/// side built it.
+fn table_html(table: &TableAnalysis) -> String {
+    let cap = table.caption.as_ref().map(|c| (c.number.as_str(), c.html.as_str(), c.below));
     let mut tbl = match cap {
         Some((num, _, _)) => format!("<table id=\"tab-{}\">", num_id(num)),
         None => String::from("<table>"),
@@ -537,23 +521,23 @@ fn table_html_from_parts(
     // `header` preserves the visible cell sequence/colspans while `header_rows` alone decides
     // which leading rows are `<th>`. This permits exact no-header and multi-tier declarations,
     // and lets inference reclassify over-attached rows without moving or dropping content.
-    for (ri, hrow) in header.iter().enumerate() {
+    for (ri, hrow) in table.header.iter().enumerate() {
         tbl.push_str("<tr>");
-        let tag = if ri < header_rows { "th" } else { "td" };
-        for (text, span) in hrow {
-            if *span > 1 {
-                tbl.push_str(&format!("<{tag} colspan=\"{span}\">{}</{tag}>", esc(text.trim())));
+        let tag = if ri < table.header_rows { "th" } else { "td" };
+        for cell in hrow {
+            if cell.render_colspan > 1 {
+                tbl.push_str(&format!("<{tag} colspan=\"{}\">{}</{tag}>", cell.render_colspan, esc(cell.text.trim())));
             } else {
-                tbl.push_str(&format!("<{tag}>{}</{tag}>", esc(text.trim())));
+                tbl.push_str(&format!("<{tag}>{}</{tag}>", esc(cell.text.trim())));
             }
         }
         tbl.push_str("</tr>");
     }
-    for (ri, row) in grid.iter().enumerate() {
+    for (ri, row) in table.grid.iter().enumerate() {
         tbl.push_str("<tr>");
-        let tag = if header.len() + ri < header_rows { "th" } else { "td" };
+        let tag = if table.header.len() + ri < table.header_rows { "th" } else { "td" };
         for cell in row {
-            tbl.push_str(&format!("<{tag}>{}</{tag}>", esc(cell.trim())));
+            tbl.push_str(&format!("<{tag}>{}</{tag}>", esc(cell.text.trim())));
         }
         tbl.push_str("</tr>");
     }
@@ -1318,7 +1302,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         // suppresses the overlapping vector, fragmenting a raster+vector plot (a Vp-depth
         // crossplot) into a lone raster plus loose axis text.
         tables.retain(|t| {
-            let tr = Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
+            let tr = t.bbox;
             let ta = tr.area().max(1.0);
             let raster_covered = images.iter().any(|im| {
                 let (ixl, ixr, iyb, iyt) = dibox(im);
@@ -1352,11 +1336,11 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
             //     vector-ink bbox didn't quite cover (a scatter's top-edge legend).
             // A REAL data table that merely sits near a figure is column-offset or vertically
             // separated from the ink, so neither shape matches and it survives.
-            let (tcx, tcy) = ((t.x_left + t.x_right) * 0.5, (t.y_bottom + t.y_top) * 0.5);
+            let (tcx, tcy) = ((t.bbox.x0 + t.bbox.x1) * 0.5, (t.bbox.y0 + t.bbox.y1) * 0.5);
             let label_grid_in_fig = captioned_fig_boxes.iter().any(|&(xl, xr, yb, yt)| {
                 let fr = Rect::new(xl, yb, xr, yt);
                 let center_in = fr.contains(tcx, tcy);
-                let v_overlap = yt.min(t.y_top) > yb.max(t.y_bottom);
+                let v_overlap = yt.min(t.bbox.y1) > yb.max(t.bbox.y0);
                 let x_aligned = tcx >= xl && tcx <= xr;
                 let va = fr.area().max(1.0);
                 // The table blankets the figure horizontally: its x-extent covers most of the
@@ -1401,7 +1385,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                 eprintln!("  L0 page {pno}: declared={} accepted={} refused={:?}", decl.len(), found.tables.len(), found.refused);
             }
             if !found.tables.is_empty() {
-                let regions: Vec<Rect> = found.tables.iter().map(|t| Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top)).collect();
+                let regions: Vec<Rect> = found.tables.iter().map(|t| t.bbox).collect();
                 // An inferred table that substantially coincides with a declared region is
                 // the same table read worse — the USGS grid inference splits six ways is
                 // declared once — so it goes. "Substantially" is measured against the
@@ -1411,7 +1395,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                 // wide grid). Either way the declaration owns the structure there. A table
                 // that merely clips a corner of the region is a different table and survives.
                 tables.retain(|t| {
-                    let tr = Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
+                    let tr = t.bbox;
                     !regions.iter().any(|r| r.overlap_area(tr) >= 0.5 * tr.area().min(r.area()).max(1.0))
                 });
                 tables.extend(found.tables);
@@ -1517,10 +1501,10 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
             let vr = Rect::new(vxl, vyb, vxr, vyt);
             let va = vr.area().max(1.0);
             !tables.iter().any(|t| {
-                if !(vxl < t.x_right && vxr > t.x_left && vyb < t.y_top && vyt > t.y_bottom) {
+                if !(vxl < t.bbox.x1 && vxr > t.bbox.x0 && vyb < t.bbox.y1 && vyt > t.bbox.y0) {
                     return false;
                 }
-                let tr = Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
+                let tr = t.bbox;
                 !(v.graphic_ink() && vr.overlap_area(tr) < va * 0.5)
             })
         };
@@ -1588,7 +1572,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         // all table filtering so it sees the final table set.
         let in_table = |x0: f32, x1: f32, y: f32| {
             tables.iter().any(|t| {
-                y <= t.y_top + body && y >= t.y_bottom - body && x1 > t.x_left && x0 < t.x_right
+                y <= t.bbox.y1 + body && y >= t.bbox.y0 - body && x1 > t.bbox.x0 && x0 < t.bbox.x1
             })
         };
         // A vector figure's bbox — used to attach its labels and to keep that text
@@ -1828,7 +1812,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
             // `vector::PlacedSvg::attach`. Display space, like every other box test here.
             let mut label_in_table: Vec<bool> = Vec::new();
             let in_table = |x: f32, y: f32| {
-                tables.iter().any(|t| x >= t.x_left && x <= t.x_right && y >= t.y_bottom && y <= t.y_top)
+                tables.iter().any(|t| x >= t.bbox.x0 && x <= t.bbox.x1 && y >= t.bbox.y0 && y <= t.bbox.y1)
             };
             // Which spans a figure claims is decided in DISPLAY space (`ds`), against the
             // display-space figure boxes; what is HANDED to the figure is the PAGE-space span
@@ -1994,9 +1978,9 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
             } else {
                 tables.iter().enumerate()
                     .filter(|(j, _)| tab_cap[*j].is_none())
-                    .min_by(|(_, a), (_, b)| (a.y_top - cy).abs().partial_cmp(&(b.y_top - cy).abs()).unwrap_or(std::cmp::Ordering::Equal))
+                    .min_by(|(_, a), (_, b)| (a.bbox.y1 - cy).abs().partial_cmp(&(b.bbox.y1 - cy).abs()).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(j, t)| {
-                        let below = cy < (t.y_top + t.y_bottom) * 0.5; // caption sits below the table (y up)
+                        let below = cy < (t.bbox.y1 + t.bbox.y0) * 0.5; // caption sits below the table (y up)
                         tab_cap[j] = Some((num.clone(), html.clone(), below));
                     })
                     .is_some()
@@ -2074,7 +2058,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         }
         for (j, t) in tables.iter().enumerate() {
             items.push(Item::T(j));
-            boxes.push((t.x_left, t.x_right.max(t.x_left + 0.1), t.y_bottom, t.y_top));
+            boxes.push((t.bbox.x0, t.bbox.x1.max(t.bbox.x0 + 0.1), t.bbox.y0, t.bbox.y1));
         }
         // Pair an overlapping raster + vector into ONE composite figure (only inline, so
         // the raster actually renders). The direction depends on which mostly contains the
@@ -2160,12 +2144,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                 Item::T(j) => {
                     flush(&mut run, &mut els);
                     let caption = tab_cap[*j].as_ref().map(|(n, c, b)| (n.clone(), c.clone(), *b));
-                    els.push(PageElement::at(ElKind::Table {
-                        header: tables[*j].header.clone(),
-                        grid: tables[*j].grid.clone(),
-                        header_rows: tables[*j].header_rows,
-                        caption,
-                    }, ibox));
+                    els.push(PageElement::at(ElKind::Table(tables[*j].table.clone().with_caption(caption)), ibox));
                 }
                 Item::Img(j) => {
                     flush(&mut run, &mut els);
@@ -2554,18 +2533,23 @@ mod tests {
             vec![("A".to_string(), 1), ("B".to_string(), 1)],
         ];
         let grid = vec![vec!["1".to_string(), "2".to_string()]];
+        let render = |header_rows| {
+            table_html(&TableAnalysis::from_parts(
+                header.clone(), grid.clone(), header_rows, None, Vec::new(),
+            ))
+        };
 
-        let none = table_html_from_parts(&header, &grid, 0, None);
+        let none = render(0);
         assert_eq!(none.matches("<th").count(), 0);
         assert_eq!(none.matches("<td").count(), 5);
         assert!(none.contains("<td colspan=\"2\">All columns</td>"));
 
-        let two = table_html_from_parts(&header, &grid, 2, None);
+        let two = render(2);
         assert_eq!(two.matches("<th").count(), 3);
         assert_eq!(two.matches("<td").count(), 2);
         assert!(two.contains("<th colspan=\"2\">All columns</th>"));
 
-        let through_grid = table_html_from_parts(&header, &grid, 3, None);
+        let through_grid = render(3);
         assert_eq!(through_grid.matches("<th").count(), 5);
         assert_eq!(through_grid.matches("<td").count(), 0);
     }

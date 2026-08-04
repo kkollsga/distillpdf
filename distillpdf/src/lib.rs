@@ -38,6 +38,7 @@ mod postprocess;
 mod profile;
 mod raster;
 mod structtree;
+mod table;
 mod text;
 mod textutil;
 mod vector;

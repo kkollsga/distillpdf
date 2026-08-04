@@ -5,6 +5,7 @@
 
 use crate::pdfobj::{deref, filters_of, sub_dict};
 use crate::raster::{assemble_png, codec_payload, filter_to_format, image_bpc, image_color_space, normalized_jpeg_png};
+use crate::table::{CellAnalysis, CellRole, PositionedTableAnalysis, TableAnalysis, TableEvidence};
 use crate::text::{self, Span};
 use lopdf::{Dictionary, Document, ObjectId};
 use rayon::prelude::*;
@@ -824,31 +825,6 @@ fn incoherent_reason(grid: &[Vec<String>]) -> Option<&'static str> {
     None
 }
 
-/// Detect tables: runs of >=3 consecutive rows that each have >=2 gutter-separated
-/// cells and share >=2 columns occupied in a majority of rows. This rejects
-/// word-positioned prose (whose words merge into a single cell).
-/// A detected table with its vertical extent (PDF user space, y increases up).
-#[derive(Clone)]
-pub struct PosTable {
-    pub y_top: f32,
-    pub y_bottom: f32,
-    pub x_left: f32,
-    pub x_right: f32,
-    pub grid: Vec<Vec<String>>,
-    /// Grouped/multi-level HEADER rows mapped onto the data column grid, each cell as
-    /// (text, colspan): a header cell spanning several data columns ("Masking Rates"
-    /// over MASK/SAME/RND) carries colspan>1; cells over one column carry colspan 1.
-    /// Empty when the table has no detached header (the data grid's row 0 is the header).
-    pub header: Vec<Vec<(String, usize)>>,
-    /// Number of leading rows in `header + grid` that are semantic header rows.
-    ///
-    /// This is deliberately separate from `header.len()`: `header` records detached rows
-    /// that belong to the table's visible cell sequence, while this field records which of
-    /// those rows should render as `<th>`. Keeping the two independent lets ownership fixes
-    /// correct semantics without dropping, moving, or duplicating cells.
-    pub header_rows: usize,
-}
-
 fn clone_span(s: &Span) -> Span {
     Span {
         x: s.x,
@@ -1111,7 +1087,7 @@ pub(crate) enum Refusal {
 /// A page's declared tables after the trust rule has run.
 pub(crate) struct Declared {
     /// Accepted declarations, ready to place like any other detected table.
-    pub tables: Vec<PosTable>,
+    pub tables: Vec<PositionedTableAnalysis>,
     /// Refusals, in declaration order.
     pub refused: Vec<Refusal>,
 }
@@ -1213,7 +1189,16 @@ pub(crate) fn declared_pos_tables(declared: &[crate::structtree::DeclaredTable],
         let kept: Vec<&Vec<(String, Rect, bool)>> = live.iter().map(|&i| &rows[i]).collect();
         let spans_of: Vec<Vec<(usize, usize)>> =
             live.iter().map(|&i| t.rows[i].iter().map(|c| (c.rowspan, c.colspan)).collect()).collect();
-        let grid = lay_out_grid(&kept, &spans_of, cols);
+        let roles: Vec<Vec<CellRole>> = live
+            .iter()
+            .map(|&i| {
+                t.rows[i]
+                    .iter()
+                    .map(|c| if c.header { CellRole::Header } else { CellRole::Data })
+                    .collect()
+            })
+            .collect();
+        let mut rows = lay_out_grid(&kept, &spans_of, &roles, cols);
         // Leading rows that are entirely header cells become the table's `<th>` rows; a
         // header cell further down stays a `<td>`, which is the same simplification the
         // inference path makes and costs nothing the scorer sees.
@@ -1221,17 +1206,11 @@ pub(crate) fn declared_pos_tables(declared: &[crate::structtree::DeclaredTable],
             .iter()
             .take_while(|&&i| !t.rows[i].is_empty() && t.rows[i].iter().all(|c| c.header))
             .count()
-            .min(grid.len().saturating_sub(1));
-        let header: Vec<Vec<(String, usize)>> =
-            grid[..nhdr].iter().map(|r| r.iter().map(|c| (c.clone(), 1usize)).collect()).collect();
-        out.tables.push(PosTable {
-            y_top: region.y1,
-            y_bottom: region.y0,
-            x_left: region.x0,
-            x_right: region.x1,
-            grid: grid[nhdr..].to_vec(),
-            header,
-            header_rows: nhdr,
+            .min(rows.len().saturating_sub(1));
+        let grid = rows.split_off(nhdr);
+        out.tables.push(PositionedTableAnalysis {
+            bbox: region,
+            table: TableAnalysis::from_cells(rows, grid, nhdr, vec![TableEvidence::Declared]),
         });
     }
     out
@@ -1259,10 +1238,17 @@ fn cell_text(spans: &[Span], idx: &[usize]) -> String {
 /// it continues over are empty. The declared merge is preserved as *shape* — the grid is the
 /// one a reader sees — while the emitted HTML stays a plain cell matrix; scoring merges needs
 /// a ground-truth extension this phase does not have.
-fn lay_out_grid(rows: &[&Vec<(String, crate::geom::Rect, bool)>], spans: &[Vec<(usize, usize)>], cols: usize) -> Vec<Vec<String>> {
+fn lay_out_grid(
+    rows: &[&Vec<(String, crate::geom::Rect, bool)>],
+    spans: &[Vec<(usize, usize)>],
+    roles: &[Vec<CellRole>],
+    cols: usize,
+) -> Vec<Vec<CellAnalysis>> {
     let cols = cols.max(1);
     let mut occupied: Vec<Vec<bool>> = vec![vec![false; cols]; rows.len()];
-    let mut grid: Vec<Vec<String>> = vec![vec![String::new(); cols]; rows.len()];
+    let mut grid: Vec<Vec<CellAnalysis>> = (0..rows.len())
+        .map(|r| (0..cols).map(|c| CellAnalysis::new(String::new(), r, c, 1, 1, None)).collect())
+        .collect();
     for (r, row) in rows.iter().enumerate() {
         let mut c = 0usize;
         for (i, cell) in row.iter().enumerate() {
@@ -1273,11 +1259,18 @@ fn lay_out_grid(rows: &[&Vec<(String, crate::geom::Rect, bool)>], spans: &[Vec<(
                 break;
             }
             let (rs, cs) = spans[r].get(i).copied().unwrap_or((1, 1));
-            grid[r][c] = cell.0.clone();
+            let role = roles[r].get(i).copied().unwrap_or(CellRole::Data);
+            let content_bbox = (cell.2 && cell.1.is_valid()).then_some(cell.1);
+            grid[r][c] = CellAnalysis::declared(
+                cell.0.clone(), r, c, rs.max(1), cs.max(1), role, content_bbox,
+            );
             for dr in 0..rs.max(1) {
                 for dc in 0..cs.max(1) {
                     if let Some(slot) = occupied.get_mut(r + dr).and_then(|row| row.get_mut(c + dc)) {
                         *slot = true;
+                        if dr != 0 || dc != 0 {
+                            grid[r + dr][c + dc] = CellAnalysis::covered(r + dr, c + dc);
+                        }
                     }
                 }
             }
@@ -1383,11 +1376,11 @@ pub(crate) struct Candidate<'a> {
     /// Vertical rules inside it.
     pub v_rules: usize,
     /// The grid the ALIGNMENT path already built here, when it built one.
-    pub aligned: Option<PosTable>,
+    pub aligned: Option<PositionedTableAnalysis>,
 }
 
 /// An **L3 grid handler**: turn one candidate into a table, or refuse it.
-type L3 = fn(&Candidate, &[Span]) -> Option<PosTable>;
+type L3 = fn(&Candidate, &[Span]) -> Option<PositionedTableAnalysis>;
 
 /// **L2 — the table types, as DATA.**
 ///
@@ -1425,7 +1418,7 @@ pub(crate) fn classify<'t>(types: &'t [TypeRule], c: &Candidate) -> Option<&'t T
 }
 
 /// L2 + L3 for one candidate: classify, then dispatch.
-fn build_table(types: &[TypeRule], c: &Candidate, spans: &[Span]) -> Option<PosTable> {
+fn build_table(types: &[TypeRule], c: &Candidate, spans: &[Span]) -> Option<PositionedTableAnalysis> {
     (classify(types, c)?.handler)(c, spans)
 }
 
@@ -1435,7 +1428,7 @@ fn build_table(types: &[TypeRule], c: &Candidate, spans: &[Span]) -> Option<PosT
 /// where the words sit; that work already happened in [`detect_tables_region`]. Keeping this
 /// handler an identity is deliberate: it is what makes "outside any frame, behaviour is
 /// byte-identical" a property of the code rather than a hope.
-fn l3_aligned(c: &Candidate, _spans: &[Span]) -> Option<PosTable> {
+fn l3_aligned(c: &Candidate, _spans: &[Span]) -> Option<PositionedTableAnalysis> {
     c.aligned.clone()
 }
 
@@ -1516,7 +1509,7 @@ const FRAME_COVERS: f32 = 0.5;
 ///
 /// The only judgement is admission: a lattice with almost no text in it is a figure's
 /// gridlines or a form's decorative border, not a table.
-fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PosTable> {
+fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PositionedTableAnalysis> {
     let f = c.frame?;
     let axes = f.axes();
     let (ncols, nrows) = (axes.ncols(), axes.nrows());
@@ -1563,20 +1556,44 @@ fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PosTable> {
     if filled < MIN_LATTICE_FILLED || rows_used < 2 || cols_used < 2 {
         return None;
     }
-    Some(PosTable {
-        y_top: axes.bbox.y1,
-        y_bottom: axes.bbox.y0,
-        x_left: axes.bbox.x0,
-        x_right: axes.bbox.x1,
-        grid,
-        header: Vec::new(),
-        // A merged top tier can leave no closed cells and therefore sit just outside the
-        // lattice frame.  Where alignment independently found the same region, its uniform
-        // tier chain supplies semantic ownership only; the ruled grid/cells/bbox stay exact.
-        header_rows: c
-            .aligned
-            .as_ref()
-            .map_or(ruled_header_rows, |t| ruled_header_rows.max(t.header_rows)),
+    let header_rows = c.aligned.as_ref().map_or(ruled_header_rows, |t| {
+        ruled_header_rows.max(t.table.header_rows)
+    });
+    let analyzed_grid = grid
+        .into_iter()
+        .enumerate()
+        .map(|(r, row)| {
+            row.into_iter()
+                .enumerate()
+                .map(|(col, text)| {
+                    let band = nrows - 1 - r;
+                    let bbox = crate::geom::Rect::new(
+                        axes.xs[col], axes.ys[band], axes.xs[col + 1], axes.ys[band + 1],
+                    );
+                    let mut cell = CellAnalysis::new(text, r, col, 1, 1, Some(bbox));
+                    if r < header_rows {
+                        cell.role = CellRole::Header;
+                    }
+                    cell
+                })
+                .collect()
+        })
+        .collect();
+    Some(PositionedTableAnalysis {
+        bbox: axes.bbox,
+        table: TableAnalysis::from_cells(
+            Vec::new(),
+            analyzed_grid,
+            // A merged top tier can leave no closed cells and therefore sit just outside the
+            // lattice frame. Where alignment independently found the same region, its uniform
+            // tier chain supplies semantic ownership only; ruled cells/bbox stay exact.
+            header_rows,
+            if c.aligned.is_some() {
+                vec![TableEvidence::Ruled, TableEvidence::Aligned]
+            } else {
+                vec![TableEvidence::Ruled]
+            },
+        ),
     })
 }
 
@@ -1589,8 +1606,8 @@ fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PosTable> {
 /// one wide grid). **Columns**: the two share a column model and their rows overlap at all —
 /// which catches the partial frame, where the ruling closes only the header band of a table
 /// whose body the alignment path read separately. Emitting both would count one table twice.
-fn owns(outer: &crate::geom::Rect, t: &PosTable) -> bool {
-    let tr = crate::geom::Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
+fn owns(outer: &crate::geom::Rect, t: &PositionedTableAnalysis) -> bool {
+    let tr = t.bbox;
     let area = outer.overlap_area(tr) >= 0.5 * tr.area().min(outer.area()).max(1.0);
     let same_columns = outer.overlap_w(tr) >= 0.6 * outer.width().min(tr.width()).max(1.0) && outer.overlap_h(tr) > 0.0;
     area || same_columns
@@ -1616,7 +1633,7 @@ fn bands_over(bands: &[(f32, f32, f32)], r: &crate::geom::Rect) -> usize {
 /// and one whose in-grid band titles terminate every text run are found at all. Frame evidence
 /// only ever ADDS a candidate or replaces the fragments inference made inside that same frame;
 /// it never deletes content and never re-splits a cell.
-pub fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Vec<PosTable> {
+pub(crate) fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Vec<PositionedTableAnalysis> {
     // Tables are built from upright text only — rotated labels (axis titles etc.) must
     // not perturb gutter detection or column structure (they're figure labels).
     let upright: Vec<Span> = spans.iter().filter(|s| s.angle.abs() < 0.01).map(clone_span).collect();
@@ -1629,21 +1646,19 @@ pub fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Ve
     // ── L1b: the ruling ────────────────────────────────────────────────────────────────
     let frames = if rules.h.is_empty() || rules.v.is_empty() { Vec::new() } else { crate::lattice::frames(rules) };
     if !frames.is_empty() {
-        let mut framed: Vec<PosTable> = Vec::new();
+        let mut framed: Vec<PositionedTableAnalysis> = Vec::new();
         for f in &frames {
             let aligned = out
                 .iter()
                 .filter(|t| owns(&f.bbox, t))
                 .max_by(|a, b| {
-                    let region = |t: &PosTable| {
-                        crate::geom::Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top)
-                    };
+                    let region = |t: &PositionedTableAnalysis| t.bbox;
                     // Header ownership comes from the candidate at the TOP of the ruled
                     // frame.  A band row can split alignment into several owned fragments;
                     // choosing the largest would select a body fragment and discard the
                     // independent header evidence (the kitchen-sink fixture is exactly this
                     // shape).  Overlap area breaks ties without iteration-order dependence.
-                    a.y_top.total_cmp(&b.y_top).then(
+                    a.bbox.y1.total_cmp(&b.bbox.y1).then(
                         f.bbox
                             .overlap_area(region(a))
                             .total_cmp(&f.bbox.overlap_area(region(b))),
@@ -1695,14 +1710,14 @@ pub fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Ve
             // metric is within 0.0006 of its unguarded value (0.4925 vs 0.4928 md), while 0.75
             // and above cost it 0.007. Below 0.5 `owns` is already the binding constraint.
             let pad = 2.0;
-            let covers = |r: &crate::geom::Rect, t: &PosTable| {
-                let tr = crate::geom::Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
-                owns(r, t) && r.overlap_h(tr) + pad >= FRAME_COVERS * (t.y_top - t.y_bottom)
+            let covers = |r: &crate::geom::Rect, t: &PositionedTableAnalysis| {
+                let tr = t.bbox;
+                owns(r, t) && r.overlap_h(tr) + pad >= FRAME_COVERS * t.bbox.height()
             };
             crate::grid::reconcile_preferred(
                 &mut out,
                 framed,
-                |t| crate::geom::Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top),
+                |t| t.bbox,
                 owns,
                 covers,
             );
@@ -1720,7 +1735,7 @@ pub fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Ve
 }
 
 /// L1a — the text-alignment detector: the whole page, or one lane per text column.
-fn detect_aligned_tables(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTable> {
+fn detect_aligned_tables(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PositionedTableAnalysis> {
     match central_split(spans) {
         None => detect_lanes(spans, bands),
         Some((g, rejoin)) => {
@@ -1746,7 +1761,7 @@ fn detect_aligned_tables(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTa
                 &lt,
                 rt,
                 rejoin,
-                |t| crate::geom::Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top),
+                |t| t.bbox,
                 |yb, yt| {
                     let pad = 2.0;
                     let band: Vec<Span> = spans
@@ -1865,21 +1880,21 @@ pub(crate) fn column_gutters(spans: &[Span]) -> Vec<f32> {
 /// Detect tables on a page that has no clean CENTRE gutter: either three-or-more prose columns
 /// (each detected independently, then rejoined where one table spans them) or, far more often,
 /// a single region.
-fn detect_lanes(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTable> {
+fn detect_lanes(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PositionedTableAnalysis> {
     let gutters = column_gutters(spans);
     if gutters.len() < 2 {
         return detect_tables_region(spans, bands);
     }
     let lane_of = |s: &Span| gutters.iter().filter(|&&g| s.x + s.width.max(0.0) * 0.5 >= g).count();
     let nlanes = gutters.len() + 1;
-    let per_lane: Vec<Vec<PosTable>> =
+    let per_lane: Vec<Vec<PositionedTableAnalysis>> =
         (0..nlanes).map(|k| detect_tables_region(&spans.iter().filter(|s| lane_of(s) == k).map(clone_span).collect::<Vec<_>>(), bands)).collect();
     // A table spanning the columns was cut into pieces occupying the SAME rows. Chain each
     // lane's table to an unused overlapping one to its right, then re-detect across the full
     // width within only that vertical band. A single-column table has no mate and is retained.
     crate::grid::rejoin_lane_chains(
         &per_lane,
-        |t| crate::geom::Rect::new(0.0, t.y_bottom, 1.0, t.y_top),
+        |t| crate::geom::Rect::new(0.0, t.bbox.y0, 1.0, t.bbox.y1),
         |yb, yt| {
             let pad = 2.0;
             let band: Vec<Span> = spans.iter().filter(|s| s.y >= yb - pad && s.y <= yt + pad).map(clone_span).collect();
@@ -1891,7 +1906,7 @@ fn detect_lanes(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTable> {
 /// Detect tables within a single region (one text column, or the whole page):
 /// runs of >=3 consecutive multi-cell rows sharing >=2 aligned columns (occupied
 /// in a majority of rows). Rejects word-positioned prose (words merge to a cell).
-fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTable> {
+fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PositionedTableAnalysis> {
     let avg_size = if spans.is_empty() {
         10.0
     } else {
@@ -2000,7 +2015,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
         }
     }
 
-    let flush = |run: &Vec<&(f32, Vec<Cell>, Vec<Span>)>, headers: &[&(f32, Vec<Cell>, Vec<Span>)], tables: &mut Vec<PosTable>| {
+    let flush = |run: &Vec<&(f32, Vec<Cell>, Vec<Span>)>, headers: &[&(f32, Vec<Cell>, Vec<Span>)], tables: &mut Vec<PositionedTableAnalysis>| {
         if trace {
             eprintln!(
                 "FLUSH run={} hdr={} y={:.1}..{:.1}",
@@ -2035,6 +2050,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
         // IS, and the ruling is not accidental. Measured: five World Bank status pages publish
         // their disbursement and key-dates tables as header + one data row between two rules,
         // and no amount of alignment work can reach them.
+        let mut rule_banded_evidence = false;
         if run.len() < 3 {
             // …and at least three columns in every row. Two rows and two columns is a BOX, and
             // a boxed pair of fields is the commonest ruled thing on a page that is not a
@@ -2056,6 +2072,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
                 }
                 return;
             }
+            rule_banded_evidence = true;
         }
         // Build a grid from the RAW SPANS for a candidate set of kept columns (expressed as
         // x-bands) by assigning each span to the band containing its CENTRE, then ADMIT it
@@ -2346,15 +2363,22 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
         } else {
             header.len()
         };
-        tables.push(PosTable {
-            y_top,
-            y_bottom: run.last().map(|(y, _, _)| *y).unwrap_or(0.0),
-            x_left,
-            x_right,
+        tables.push(PositionedTableAnalysis::from_parts(
+            crate::geom::Rect::new(
+                x_left,
+                run.last().map(|(y, _, _)| *y).unwrap_or(0.0),
+                x_right,
+                y_top,
+            ),
+            header,
             grid,
             header_rows,
-            header,
-        });
+            if rule_banded_evidence {
+                vec![TableEvidence::Aligned, TableEvidence::Ruled]
+            } else {
+                vec![TableEvidence::Aligned]
+            },
+        ));
     };
 
     let n = celled.len();
@@ -2420,7 +2444,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
         // than silence. So the truncate is now conditional on the re-flush actually replacing
         // what it discards.
         if tables.len() - before < 2 {
-            let survivors: Vec<PosTable> = tables.split_off(before);
+            let survivors: Vec<PositionedTableAnalysis> = tables.split_off(before);
             flush(&run_slice, &headers, &mut tables);
             if tables.len() == before {
                 tables.extend(survivors);
@@ -2431,7 +2455,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
 }
 
 fn detect_tables(spans: Vec<Span>, rules: &crate::vector::PageRules) -> Vec<Vec<Vec<String>>> {
-    detect_tables_pos(&spans, rules).into_iter().map(|t| t.grid).collect()
+    detect_tables_pos(&spans, rules).into_iter().map(|t| t.table.into_grid_parts()).collect()
 }
 
 
@@ -2583,6 +2607,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn two_row_booktabs_records_the_rule_evidence_that_admits_it() {
+        let span = |x: f32, y: f32, text: &str| Span {
+            x,
+            y,
+            size: 10.0,
+            width: 30.0,
+            text: text.into(),
+            bold: y > 90.0,
+            italic: false,
+            mono: false,
+            angle: 0.0,
+            font: 0,
+            mcid: None,
+        };
+        let spans = vec![
+            span(10.0, 100.0, "Name"),
+            span(110.0, 100.0, "Count"),
+            span(210.0, 100.0, "Rate"),
+            span(10.0, 80.0, "Alpha"),
+            span(110.0, 80.0, "12"),
+            span(210.0, 80.0, "4.2"),
+        ];
+        let tables = detect_tables_region(&spans, &[(0.0, 250.0, 112.0), (0.0, 250.0, 68.0)]);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(
+            tables[0].table.evidence,
+            vec![TableEvidence::Aligned, TableEvidence::Ruled]
+        );
+        assert!(tables[0].table.grid.iter().flatten().all(|cell| cell.bbox.is_none()));
+    }
+
     /// The owned form-XObject raster fixture (`tests/gen_fixtures.py::gen_form_image`).
     fn form_image_doc() -> Document {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/form_image.pdf");
@@ -2591,7 +2647,7 @@ mod tests {
 
     /// One committed fixture's page 1, detected exactly as the product detects it: spans and
     /// ruling from the same page, through the same entry point.
-    fn detect_fixture(name: &str) -> Vec<PosTable> {
+    fn detect_fixture(name: &str) -> Vec<PositionedTableAnalysis> {
         let path = format!("{}/../tests/fixtures_pdf/{name}", env!("CARGO_MANIFEST_DIR"));
         let doc = Document::load(&path).unwrap_or_else(|e| panic!("{name} must load: {e}"));
         let raw = std::fs::read(&path).expect("fixture readable");
@@ -2621,12 +2677,35 @@ mod tests {
         // column is a column and each band title is its own row, neither of which text
         // clustering can see.
         let spans = crate::text::extract_spans(&doc, page, &raw);
+        let direct = l3_ruled(
+            &Candidate { frame: Some(&frames[0]), long_h: 0, v_rules: 0, aligned: None },
+            &spans,
+        ).expect("the owned lattice is admitted");
+        assert_eq!(direct.evidence, vec![TableEvidence::Ruled]);
+        let corroborated = l3_ruled(
+            &Candidate { frame: Some(&frames[0]), long_h: 0, v_rules: 0, aligned: Some(direct.clone()) },
+            &spans,
+        ).expect("aligned header evidence does not change lattice admission");
+        assert_eq!(corroborated.evidence, vec![TableEvidence::Ruled, TableEvidence::Aligned]);
         let tables = detect_tables_pos(&spans, &rules);
         assert_eq!(tables.len(), 1, "one table, got {shape:?}", shape = tables.iter().map(|t| (t.grid.len(), t.grid[0].len())).collect::<Vec<_>>());
         assert_eq!((tables[0].grid.len(), tables[0].grid[0].len()), (6, 4));
         assert_eq!(tables[0].grid[0], vec!["Site", "Depth", "", "Yield"]);
         assert_eq!(tables[0].grid[1], vec!["Northern district", "", "", ""]);
         assert_eq!(tables[0].grid[5], vec!["Delta", "42.5", "", "128"]);
+        let axes = frames[0].axes();
+        assert_eq!(tables[0].grid[0][0].row, 0);
+        assert_eq!(tables[0].grid[0][0].col, 0);
+        assert_eq!(
+            tables[0].grid[0][0].bbox,
+            Some(crate::geom::Rect::new(axes.xs[0], axes.ys[5], axes.xs[1], axes.ys[6])),
+            "the first reading-order row is the lattice's top band"
+        );
+        assert_eq!(
+            tables[0].grid[5][3].bbox,
+            Some(crate::geom::Rect::new(axes.xs[3], axes.ys[0], axes.xs[4], axes.ys[1])),
+            "the last reading-order row is the lattice's bottom band"
+        );
     }
 
     #[test]
@@ -2687,16 +2766,14 @@ mod tests {
         // Register a dummy type that claims every framed candidate and returns a fixed 1x1
         // grid, and show (a) the classifier dispatches to it, (b) the candidates L1 produced
         // are exactly the same ones.
-        fn l3_dummy(_c: &Candidate, _s: &[Span]) -> Option<PosTable> {
-            Some(PosTable {
-                y_top: 1.0,
-                y_bottom: 0.0,
-                x_left: 0.0,
-                x_right: 1.0,
-                grid: vec![vec!["dummy".into()]],
-                header: Vec::new(),
-                header_rows: 1,
-            })
+        fn l3_dummy(_c: &Candidate, _s: &[Span]) -> Option<PositionedTableAnalysis> {
+            Some(PositionedTableAnalysis::from_parts(
+                crate::geom::Rect::new(0.0, 0.0, 1.0, 1.0),
+                Vec::new(),
+                vec![vec!["dummy".into()]],
+                1,
+                vec![TableEvidence::Aligned],
+            ))
         }
         const EXTENDED: &[TypeRule] = &[
             TypeRule { name: "dummy", matches: |c| c.frame.is_some(), handler: l3_dummy },
@@ -2714,7 +2791,10 @@ mod tests {
         let framed = Candidate { frame: Some(&frames[0]), long_h: 0, v_rules: 0, aligned: None };
         assert_eq!(classify(TABLE_TYPES, &framed).map(|t| t.name), Some("full-grid"));
         assert_eq!(classify(EXTENDED, &framed).map(|t| t.name), Some("dummy"), "the new row wins");
-        assert_eq!(build_table(EXTENDED, &framed, &spans).map(|t| t.grid), Some(vec![vec!["dummy".to_string()]]));
+        assert_eq!(
+            build_table(EXTENDED, &framed, &spans).map(|t| t.table.into_grid_parts()),
+            Some(vec![vec!["dummy".to_string()]])
+        );
 
         // L1 is untouched: the same page, detected with the production table, still produces
         // the same frame — the type table changed what a candidate BECOMES, never what is found.
@@ -3517,6 +3597,37 @@ mod tests {
             vec!["North".to_string(), "Alpha".into(), "11".into()],
             vec![String::new(), "Beta".into(), "22".into()],
         ], "the /RowSpan 2 cell holds column 0 of the row below it");
+        assert_eq!(t.evidence, vec![TableEvidence::Declared]);
+        let anchors: Vec<_> = t
+            .header
+            .iter()
+            .chain(&t.grid)
+            .flatten()
+            .filter(|cell| !cell.covered)
+            .map(|cell| (cell.text.as_str(), cell.row, cell.col, cell.rowspan, cell.colspan, cell.role))
+            .collect();
+        assert_eq!(
+            anchors,
+            vec![
+                ("Region", 0, 0, 1, 2, CellRole::Header),
+                ("Total", 0, 2, 1, 1, CellRole::Header),
+                ("North", 1, 0, 2, 1, CellRole::Data),
+                ("Alpha", 1, 1, 1, 1, CellRole::Data),
+                ("11", 1, 2, 1, 1, CellRole::Data),
+                ("Beta", 2, 1, 1, 1, CellRole::Data),
+                ("22", 2, 2, 1, 1, CellRole::Data),
+            ],
+            "canonical anchors retain declared span and TH/TD semantics"
+        );
+        assert!(
+            t.header
+                .iter()
+                .chain(&t.grid)
+                .flatten()
+                .filter(|cell| !cell.covered)
+                .all(|cell| cell.bbox.is_none() && cell.content_bbox.is_some()),
+            "declared glyph unions are content geometry, not exact cell boundaries"
+        );
     }
 
     #[test]

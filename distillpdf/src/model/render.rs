@@ -29,6 +29,7 @@
 use crate::html::{self, ElKind, Mode, PageElement, PageIR};
 use crate::links::OutlineEntry;
 use crate::markdown::{self, ImgMode};
+use crate::table::TableAnalysis;
 
 use super::{Block, BlockKind, DocModel, TocEntry};
 
@@ -122,15 +123,16 @@ fn elements_from_blocks(blocks: &[&Block]) -> Vec<PageElement> {
             }
             BlockKind::Table => {
                 out.push(PageElement::at(
-                    ElKind::Table {
-                        header: b.table_header.clone().unwrap_or_default(),
-                        grid: b.table_grid.clone().unwrap_or_default(),
-                        header_rows: b.table_header_rows.unwrap_or_else(|| {
+                    ElKind::Table(TableAnalysis::from_parts(
+                        b.table_header.clone().unwrap_or_default(),
+                        b.table_grid.clone().unwrap_or_default(),
+                        b.table_header_rows.unwrap_or_else(|| {
                             let n = b.table_header.as_ref().map_or(0, Vec::len);
                             if n == 0 { 1 } else { n }
                         }),
-                        caption: b.table_caption.clone(),
-                    },
+                        b.table_caption.clone(),
+                        Vec::new(),
+                    )),
                     b.bbox,
                 ));
                 i += 1;
