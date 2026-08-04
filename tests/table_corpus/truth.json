@@ -11567,6 +11567,8 @@
    },
    "family": "wide_shallow",
    "note": "found at 2x7 \u2014 not merged into the surrounding prose, not read column-major; a 5x5 default never produces this shape",
+   "oversimplified": true,
+   "oversimplified_why": "The frozen \u00a74.1 source is the World Bank family-median-score page. Visual and ground-truth inspection shows its difficulty comes from a 13-column ruled table with three merged header tiers; distillPDF currently duplicates it as two 3x13 emissions. The generated ruled carrier deliberately isolates the T2 `wide_shallow` challenge at the family's measured 2x7 shape. Adding merged/multitier headers or producer-specific duplicate triggers would import a second confound and violate \u00a76.3's exactly-one-challenge contract. The source cannot be changed without violating the frozen median rule, so this file remains a regression lock but is excluded from source coverage; its borderless sibling is adjudicated independently.",
    "pages": 1,
    "source": {
     "corpus": "bench88",
@@ -11929,6 +11931,8 @@
    },
    "family": "wrapped_cells",
    "note": "a wrapped cell is ONE logical string; wrap points are presentation and compare space-joined (\u00a77)",
+   "oversimplified": true,
+   "oversimplified_why": "The frozen \u00a74.1 source is the World Bank family-median-score page. Visual and ground-truth inspection shows its difficulty comes from a 13-column ruled table with three merged header tiers; distillPDF currently duplicates it as two 3x13 emissions. This generated ruled carrier deliberately isolates the T2 `wrapped_cells` challenge. Adding the source's merged/multitier header structure or producer-specific duplicate triggers would import a second confound and violate \u00a76.3's exactly-one-challenge contract. The source cannot be changed without violating the frozen median rule, so this file remains a regression lock but is excluded from source coverage; its borderless sibling is adjudicated independently.",
    "pages": 1,
    "source": {
     "corpus": "bench88",

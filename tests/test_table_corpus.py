@@ -59,6 +59,52 @@ WORD = re.compile(r"\w+", re.UNICODE)
 EXPECT_KEYS = {"table_count", "table_count_any", "cols_any", "must_not_merge", "exactly_once"}
 
 
+def test_parity_adjudicates_each_file_before_family_summary():
+    """A perfect/easy sibling cannot be cancelled by a deliberately hard sibling."""
+    from gen_table_corpus import _family_parity_summary, adjudicate_parity
+
+    cases = [
+        {"file": "easy.pdf", "family": "siblings", "source": "real p1", "tier": 2,
+         "C_gen": 0.4, "C_real": 0.2, "invented": False, "accepted_reason": None},
+        {"file": "hard.pdf", "family": "siblings", "source": "real p1", "tier": 2,
+         "C_gen": 0.0, "C_real": 0.2, "invented": False, "accepted_reason": None},
+    ]
+
+    rows, over, accepted = adjudicate_parity(cases)
+    summary = _family_parity_summary(rows)[0]
+
+    assert {r["file"]: r["verdict"] for r in rows} == {
+        "easy.pdf": "OVERSIMPLIFIED", "hard.pdf": "ok"}
+    assert [r["file"] for r in over] == ["easy.pdf"]
+    assert accepted == []
+    assert summary["mean_C_gen"] == 0.2       # old implementation passed this mean
+    assert summary["max_gap"] == 0.2
+    assert summary["verdict"] == "OVERSIMPLIFIED — unexplained"
+
+
+def test_parity_preserves_exact_accepted_exclusion_without_exempting_siblings():
+    """Existing evidence accepts only the named case; the family remains a truthful mix."""
+    from gen_table_corpus import OVERSIMPLIFIED, _family_parity_summary, adjudicate_parity
+
+    accepted_file = "t1_borderless_small.pdf"
+    cases = [
+        {"file": accepted_file, "family": "borderless", "source": "real p35", "tier": 1,
+         "C_gen": 1.0, "C_real": 0.7786, "invented": False,
+         "accepted_reason": OVERSIMPLIFIED[accepted_file]},
+        {"file": "unflagged_sibling.pdf", "family": "borderless", "source": "real p35",
+         "tier": 1, "C_gen": 0.7, "C_real": 0.7786, "invented": False,
+         "accepted_reason": None},
+    ]
+
+    rows, over, accepted = adjudicate_parity(cases)
+    summary = _family_parity_summary(rows)[0]
+
+    assert over == []
+    assert [r["file"] for r in accepted] == [accepted_file]
+    assert {r["file"]: r["verdict"] for r in rows}["unflagged_sibling.pdf"] == "ok"
+    assert summary["verdict"] == "partial — accepted exclusion(s)"
+
+
 # ------------------------------------------------------------------------- normalisation
 
 def norm(s) -> str:

@@ -96,13 +96,14 @@ SRC = {
 }
 
 
-#: §4.3/§7 — families measured OVERSIMPLIFIED against their named source and, after
-#: enrichment was attempted and failed, kept with the flag and **excluded from the coverage
-#: claim for their type**. Recorded in `truth.json` so the coverage claim is computable
-#: offline, and reproduced with its reason in the §4.4 report. A row that appears in the
-#: parity run and NOT here is an *unexplained* oversimplification and fails the run.
-OVERSIMPLIFIED = {
-    "borderless":
+#: §4.3/§7 — individual generated cases measured OVERSIMPLIFIED against their named source
+#: and, after enrichment was attempted and failed, kept with the flag and **excluded from
+#: the coverage claim**. The disposition is deliberately per file: a hard sibling must not
+#: license an easy one, and an accepted easy case must not erase a sibling that is honestly
+#: within band. Recorded in `truth.json` so the claim is computable offline and reproduced
+#: with its reason in the §4.4 report. A per-file violation not named here is unexplained and
+#: fails the run.
+_BORDERLESS_OVERSIMPLIFIED = (
         "Enrichment attempted (measured 12x6 shape, then multi-word crowding so the gutters "
         "nearly close — the gutter IS the structure in a whitespace-only table) and the "
         "extractor still reads it exactly: C_gen 0.9952 vs C_real 0.7786 on "
@@ -111,8 +112,9 @@ OVERSIMPLIFIED = {
         "near perfection, while the source page's 0.7786 comes from confounds T1 forbids. "
         "The two requirements cannot both hold for this family, so the flag stays and "
         "`borderless` is NOT claimed as source-covered. The untagged/tagged borderless "
-        "carriers remain valid REGRESSION locks — which is what T1 is for.",
-    "multitier_header":
+        "carriers remain valid REGRESSION locks — which is what T1 is for."
+)
+_MULTITIER_OVERSIMPLIFIED = (
         "Enrichment attempted (widened 5 -> 9 columns at the source page's own width, then "
         "deepened 3 -> 4 header tiers) and the extractor still scores C_gen 1.0000 vs C_real "
         "0.7917 on gov_nasa_ntrs20240002628 p326. Root cause of the gap, measured: that "
@@ -120,7 +122,39 @@ OVERSIMPLIFIED = {
         "shape, not header tiers. Enriching toward it would mean importing a different "
         "confound and destroying §5's 'exactly ONE challenge per case' property that makes a "
         "T2 failure name its cause. Flag kept; `multitier_header` is not claimed as "
-        "source-covered.",
+        "source-covered."
+)
+_WIDE_SHALLOW_RULED_OVERSIMPLIFIED = (
+    "The frozen §4.1 source is the World Bank family-median-score page. Visual and ground-"
+    "truth inspection shows its difficulty comes from a 13-column ruled table with three "
+    "merged header tiers; distillPDF currently duplicates it as two 3x13 emissions. The "
+    "generated ruled carrier deliberately isolates the T2 `wide_shallow` challenge at the "
+    "family's measured 2x7 shape. Adding merged/multitier headers or producer-specific "
+    "duplicate triggers would import a second confound and violate §6.3's exactly-one-"
+    "challenge contract. The source cannot be changed without violating the frozen median "
+    "rule, so this file remains a regression lock but is excluded from source coverage; "
+    "its borderless sibling is adjudicated independently."
+)
+_WRAPPED_GRID_OVERSIMPLIFIED = (
+    "The frozen §4.1 source is the World Bank family-median-score page. Visual and ground-"
+    "truth inspection shows its difficulty comes from a 13-column ruled table with three "
+    "merged header tiers; distillPDF currently duplicates it as two 3x13 emissions. This "
+    "generated ruled carrier deliberately isolates the T2 `wrapped_cells` challenge. "
+    "Adding the source's merged/multitier header structure or producer-specific duplicate "
+    "triggers would import a second confound and violate §6.3's exactly-one-challenge "
+    "contract. The source cannot be changed without violating the frozen median rule, so "
+    "this file remains a regression lock but is excluded from source coverage; its "
+    "borderless sibling is adjudicated independently."
+)
+
+OVERSIMPLIFIED = {
+    **{fname: _BORDERLESS_OVERSIMPLIFIED for fname in (
+        "t1_borderless_source_median.pdf", "t1_borderless_small.pdf",
+        "t1_borderless_in_prose.pdf", "t1_borderless_tagged.pdf")},
+    **{fname: _MULTITIER_OVERSIMPLIFIED for fname in (
+        "t2_multitier_header_two_tier.pdf", "t2_multitier_header_four_tier.pdf")},
+    "t2_wide_shallow_ruled.pdf": _WIDE_SHALLOW_RULED_OVERSIMPLIFIED,
+    "t2_wrapped_cells_in_grid.pdf": _WRAPPED_GRID_OVERSIMPLIFIED,
 }
 
 
@@ -290,9 +324,9 @@ def emit(fname, *, tier, family, variant, tagged, tables, expect,
         rec["note"] = note
     if parity:
         rec["parity"] = parity          # "unrunnable" — flagged, never silently skipped
-    if family in OVERSIMPLIFIED:
+    if fname in OVERSIMPLIFIED:
         rec["oversimplified"] = True
-        rec["oversimplified_why"] = OVERSIMPLIFIED[family]
+        rec["oversimplified_why"] = OVERSIMPLIFIED[fname]
     TRUTH[fname] = rec
     return rec
 
@@ -1394,28 +1428,85 @@ def _bench100():
     return bench100_score, json.load(open(acc_path))["pages"]
 
 
+def adjudicate_parity(cases):
+    """Apply the §4.3 threshold to every generated file, never to a sibling average.
+
+    ``cases`` contains already-scored rows. Keeping this decision pure makes the trust
+    property regression-testable without loading PDFs or the licence-encumbered corpus.
+    A disposition is accepted only when that exact file carries a non-empty recorded reason.
+    """
+    rows, over, accepted = [], [], []
+    for case in cases:
+        row = dict(case)
+        if row.get("invented"):
+            verdict, gap = "no analogue", None
+        elif row.get("C_real") is None:
+            verdict, gap = "parity unrunnable", None
+        else:
+            gap = row["C_gen"] - row["C_real"]
+            if gap <= PARITY_BAND:
+                verdict = "ok"
+            elif row.get("accepted_reason"):
+                verdict = "OVERSIMPLIFIED (accepted, excluded from coverage)"
+            else:
+                verdict = "OVERSIMPLIFIED"
+        row["gap"] = round(gap, 4) if gap is not None else None
+        row["C_gen"] = round(row["C_gen"], 4)
+        if row.get("C_real") is not None:
+            row["C_real"] = round(row["C_real"], 4)
+        row["verdict"] = verdict
+        rows.append(row)
+        if verdict.startswith("OVERSIMPLIFIED (accepted"):
+            accepted.append(row)
+        elif verdict == "OVERSIMPLIFIED":
+            over.append(row)
+    return rows, over, accepted
+
+
+def _family_parity_summary(rows):
+    """Diagnostic family roll-up; verdicts remain the union of per-file decisions."""
+    groups = {}
+    for row in rows:
+        g = groups.setdefault((row["family"], row["source"]), [])
+        g.append(row)
+    out = []
+    for (family, source), files in sorted(groups.items()):
+        checkable = [r for r in files if r["C_real"] is not None]
+        verdicts = {r["verdict"] for r in files}
+        if "OVERSIMPLIFIED" in verdicts:
+            verdict = "OVERSIMPLIFIED — unexplained"
+        elif any(v.startswith("OVERSIMPLIFIED (accepted") for v in verdicts):
+            verdict = "partial — accepted exclusion(s)"
+        elif checkable:
+            verdict = "ok"
+        elif verdicts == {"no analogue"}:
+            verdict = "no analogue"
+        else:
+            verdict = "parity unrunnable"
+        gaps = [r["gap"] for r in checkable]
+        out.append({
+            "family": family, "source": source, "n_files": len(files),
+            "mean_C_gen": round(sum(r["C_gen"] for r in files) / len(files), 4),
+            "C_real": checkable[0]["C_real"] if checkable else None,
+            "max_gap": max(gaps) if gaps else None,
+            "verdict": verdict,
+        })
+    return out
+
+
 def parity(outdir=OUT):
-    """Score the extractor on the generated PDF and on its named real source page with the
-    SAME function, and brand any case that is materially EASIER than reality.
+    """Score every generated PDF and its named real page through the same scorer.
 
-    > If the generated case passes while the real page fails, the generated case is
-    > oversimplified and must be enriched until the two behave alike.
-
-    Numerically: **oversimplified iff `C_gen - C_real > 0.15`**. Harder than reality passes
-    trivially (`C_gen <= C_real`), which is the asymmetry the gate wants — the failure mode of
-    a generated corpus is being CLEANER than the wild, never dirtier.
-
-    `C` is the bench100 count+dims score, i.e. the **position-blind** metric. It is used only
-    because it is the one metric computable on real pages, where no cell truth exists. Parity
-    on `C` is therefore NECESSARY, NOT SUFFICIENT: the cell-level gates of §8 remain the real
-    measurement. This docstring says so rather than laundering `C` into a claim."""
+    Oversimplification is adjudicated **per generated file**: ``C_gen - C_real > 0.15``.
+    Family means are reported only as diagnostics and can never alter a file's verdict.
+    """
     import distillpdf
 
     b100, acc = _bench100()
     C_real_by_page = {f'{p["slug"]}#{p["page"]}': p["dpacc_tables"] for p in acc}
     truth = json.load(open(os.path.join(outdir, "truth.json")))["files"]
 
-    rows, groups = [], {}
+    cases = []
     for fname, rec in sorted(truth.items()):
         html = distillpdf.Pdf.open(os.path.join(outdir, fname)).to_html(
             return_string=True, image_mode="drop")
@@ -1426,53 +1517,31 @@ def parity(outdir=OUT):
 
         s = rec.get("source")
         if rec.get("invented"):
-            key = (rec["family"], "(invented — measured absent)")
-            c_real = None
+            source, c_real = "(invented — measured absent)", None
         elif rec.get("parity") == "unrunnable" or not s or s.get("corpus") != "bench88":
             corp = (s or {}).get("corpus", "?")
             doc = (s or {}).get("doc", "?")
-            label = (corp if doc == corp else f"{corp}: {doc}")
-            key = (rec["family"], label + (f" p{s['page']}" if s and s.get("page") else ""))
+            label = corp if doc == corp else f"{corp}: {doc}"
+            source = label + (f" p{s['page']}" if s and s.get("page") else "")
             c_real = None
         else:
             page_key = f'{s["doc"]}#{s["page"]}'
             c_real = C_real_by_page.get(page_key)
-            key = (rec["family"], f"{s['doc']} p{s['page']}")
-        g = groups.setdefault(key, {"gen": [], "real": c_real, "files": [], "tier": rec["tier"],
-                                    "invented": bool(rec.get("invented")),
-                                    "unrunnable": c_real is None and not rec.get("invented")})
-        g["gen"].append(c_gen)
-        g["files"].append(fname)
+            source = f"{s['doc']} p{s['page']}"
+        cases.append({
+            "file": fname, "family": rec["family"], "source": source,
+            "C_gen": c_gen, "C_real": c_real, "tier": rec["tier"],
+            "invented": bool(rec.get("invented")),
+            "accepted_reason": (rec.get("oversimplified_why")
+                                if rec.get("oversimplified") else None),
+        })
 
-    over, accepted = [], []
-    for (fam, source), g in sorted(groups.items()):
-        c_gen = sum(g["gen"]) / len(g["gen"])
-        if g["invented"]:
-            verdict, gap = "no analogue", None
-        elif g["real"] is None:
-            verdict, gap = "parity unrunnable", None
-        else:
-            gap = c_gen - g["real"]
-            if gap <= PARITY_BAND:
-                verdict = "ok"
-            elif fam in OVERSIMPLIFIED:
-                # Accepted: enrichment was attempted and recorded, the flag stays in
-                # truth.json, and the type is EXCLUDED from the coverage claim (§4.3).
-                verdict = "OVERSIMPLIFIED (accepted, excluded from coverage)"
-                accepted.append((fam, source, c_gen, g["real"], gap, g["files"]))
-            else:
-                verdict = "OVERSIMPLIFIED"
-                over.append((fam, source, c_gen, g["real"], gap, g["files"]))
-        rows.append({"family": fam, "source": source, "C_gen": round(c_gen, 4),
-                     "C_real": round(g["real"], 4) if g["real"] is not None else None,
-                     "gap": round(gap, 4) if gap is not None else None,
-                     "verdict": verdict, "n_files": len(g["files"]), "tier": g["tier"]})
-
-    _write_parity_report(rows, over, accepted)
+    rows, over, accepted = adjudicate_parity(cases)
+    _write_parity_report(rows, _family_parity_summary(rows), over, accepted)
     return rows, over
 
 
-def _write_parity_report(rows, over, accepted):
+def _write_parity_report(rows, family_rows, over, accepted):
     os.makedirs(os.path.dirname(PARITY_REPORT), exist_ok=True)
     n_checked = sum(1 for r in rows if r["C_real"] is not None)
     n_unrun = sum(1 for r in rows if r["verdict"] == "parity unrunnable")
@@ -1480,13 +1549,17 @@ def _write_parity_report(rows, over, accepted):
     with open(PARITY_REPORT, "w") as f:
         f.write(f"""# Table torture corpus — source-fidelity parity report
 
-Generated by `tests/gen_table_corpus.py --parity`. One row per **type x named source**.
+Generated by `tests/gen_table_corpus.py --parity`. One verdict per **generated file**;
+family rows are diagnostic roll-ups only.
 
 **What this measures.** For every case with a `bench88` source, the extractor is scored on the
 generated PDF and on the named real source page **with the same function** — bench100's
 `table_score` (`0.5 * count-agreement + 0.5 * rows x cols on matched tables`). A case is
 **oversimplified iff `C_gen - C_real > {PARITY_BAND}`**. Harder than reality always passes:
 the failure mode of a generated corpus is being *cleaner* than the wild, never dirtier.
+
+**No sibling averaging in the gate.** Every file is thresholded independently. Family means
+below are useful diagnostics, but a hard sibling cannot cancel an oversimplified sibling.
 
 **What this does NOT measure.** `C` is the **position-blind** metric — the one that scores 1.0
 when the grid is right and every value sits under the wrong header. It is used here only
@@ -1503,29 +1576,40 @@ source lives in the 25-document `corpus_tests` corpus, which has cell truth but 
 
 | rows | count |
 |---|---|
-| parity-checked against a real bench88 page | {n_checked} |
+| generated files parity-checked against a real bench88 page | {n_checked} |
 | parity unrunnable (bench54 / external / bench25 source) | {n_unrun} |
 | invented — no measured analogue, never claimed as coverage | {n_inv} |
 | OVERSIMPLIFIED — accepted, excluded from the coverage claim | {len(accepted)} |
 | **OVERSIMPLIFIED — unexplained (blocks citing the corpus)** | **{len(over)}** |
 
-## Rows
+## Per-file verdicts
 
-| tier | family | source | C_gen | C_real | gap | verdict |
-|---|---|---|---|---|---|---|
+| tier | file | family | source | C_gen | C_real | gap | verdict |
+|---|---|---|---|---|---|---|---|
 """)
-        for r in sorted(rows, key=lambda r: (r["tier"], r["family"])):
+        for r in sorted(rows, key=lambda r: (r["tier"], r["family"], r["file"])):
             cr = f"{r['C_real']:.4f}" if r["C_real"] is not None else "—"
             gp = f"{r['gap']:+.4f}" if r["gap"] is not None else "—"
-            f.write(f"| T{r['tier']} | `{r['family']}` | {r['source']} | {r['C_gen']:.4f} | "
-                    f"{cr} | {gp} | {r['verdict']} |\n")
+            f.write(f"| T{r['tier']} | `{r['file']}` | `{r['family']}` | {r['source']} | "
+                    f"{r['C_gen']:.4f} | {cr} | {gp} | {r['verdict']} |\n")
+        f.write("\n## Family summary (diagnostic only)\n\n"
+                "`mean C_gen` is never used for adjudication; `max gap` exposes the easiest "
+                "checkable sibling.\n\n"
+                "| family | source | files | mean C_gen | C_real | max gap | disposition |\n"
+                "|---|---|---:|---:|---:|---:|---|\n")
+        for r in family_rows:
+            cr = f"{r['C_real']:.4f}" if r["C_real"] is not None else "—"
+            gp = f"{r['max_gap']:+.4f}" if r["max_gap"] is not None else "—"
+            f.write(f"| `{r['family']}` | {r['source']} | {r['n_files']} | "
+                    f"{r['mean_C_gen']:.4f} | {cr} | {gp} | {r['verdict']} |\n")
         if over:
             f.write("\n## Oversimplified — disposition required\n\n"
                     "A release with an unexplained `OVERSIMPLIFIED` row is a release whose "
                     "torture-corpus numbers may not be cited (spec §4.4).\n\n")
-            for fam, source, cg, cr, gap, files in over:
-                f.write(f"* **`{fam}`** vs {source}: C_gen {cg:.4f} vs C_real {cr:.4f} "
-                        f"(gap {gap:+.4f}) — files: {', '.join(files)}\n")
+            for r in over:
+                f.write(f"* **`{r['file']}`** (`{r['family']}`) vs {r['source']}: C_gen "
+                        f"{r['C_gen']:.4f} vs C_real {r['C_real']:.4f} "
+                        f"(gap {r['gap']:+.4f})\n")
         else:
             f.write("\n## Oversimplified — unexplained\n\nNone.\n")
         f.write("\n## Oversimplified — accepted, excluded from the coverage claim\n\n"
@@ -1535,20 +1619,21 @@ source lives in the 25-document `corpus_tests` corpus, which has cell truth but 
                 "valid REGRESSION locks — they are excluded from the *coverage* claim, not "
                 "from the gate.\n\n")
         if accepted:
-            for fam, source, cg, cr, gap, files in accepted:
-                f.write(f"### `{fam}` vs {source}\n\n"
-                        f"C_gen {cg:.4f} vs C_real {cr:.4f} (gap {gap:+.4f}); files: "
-                        f"{', '.join(files)}\n\n{OVERSIMPLIFIED[fam]}\n\n")
+            for r in accepted:
+                f.write(f"### `{r['file']}` (`{r['family']}`) vs {r['source']}\n\n"
+                        f"C_gen {r['C_gen']:.4f} vs C_real {r['C_real']:.4f} "
+                        f"(gap {r['gap']:+.4f}).\n\n{r['accepted_reason']}\n\n")
         else:
             f.write("None.\n")
-        covered = sorted({r["family"] for r in rows
-                          if r["verdict"] == "ok" and r["C_real"] is not None})
-        not_covered = sorted({r["family"] for r in rows if r["verdict"] != "ok"})
+        covered = sorted(r["file"] for r in rows
+                         if r["verdict"] == "ok" and r["C_real"] is not None)
+        not_covered = sorted(r["file"] for r in rows if r["verdict"] != "ok")
         f.write("\n## The coverage claim, stated exactly\n\n"
-                "**Claimed as source-covered** — a real bench88 page was scored with the same "
+                "**Generated cases claimed as source-covered** — a real bench88 page was "
+                "scored with the same "
                 "function and the generated case is not materially easier than it:\n\n"
                 + "".join(f"* `{f}`\n" for f in covered)
-                + "\n**NOT claimed as source coverage** — invented (no measured analogue), "
+                + "\n**Generated cases NOT claimed as source coverage** — invented (no measured analogue), "
                   "parity unrunnable (the source is outside the 88-document corpus), or "
                   "oversimplified and accepted as such:\n\n"
                 + "".join(f"* `{f}`\n" for f in not_covered))
@@ -1619,10 +1704,11 @@ def main(argv=None):
         freeze_floors(OUT)
     if args.parity:
         rows, over = parity(OUT)
-        for r in sorted(rows, key=lambda r: (r["tier"], r["family"])):
+        for r in sorted(rows, key=lambda r: (r["tier"], r["family"], r["file"])):
             cr = f"{r['C_real']:.4f}" if r["C_real"] is not None else "  —   "
             gp = f"{r['gap']:+.4f}" if r["gap"] is not None else "   —   "
-            print(f"{r['family']:22s} {r['source']:38s} C_gen {r['C_gen']:.4f}  "
+            print(f"{r['file']:44s} {r['family']:22s} {r['source']:38s} "
+                  f"C_gen {r['C_gen']:.4f}  "
                   f"C_real {cr}  gap {gp}  {r['verdict']}")
         if over:
             print(f"\n{len(over)} OVERSIMPLIFIED row(s) — each must be enriched toward its "
