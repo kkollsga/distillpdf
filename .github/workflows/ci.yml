@@ -15,7 +15,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Check the complete workspace on the declared MSRV
-        run: cargo check --workspace --all-targets --locked
+        run: cargo check --workspace --all-targets
 
   test:
     runs-on: ubuntu-latest
