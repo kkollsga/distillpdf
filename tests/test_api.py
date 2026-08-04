@@ -22,6 +22,7 @@ COLORSPACE_IMAGES = os.path.join(FIX, "colorspace_images.pdf")
 CMYK_JPEG = os.path.join(FIX, "cmyk_jpeg.pdf")
 DECODE_JPEG = os.path.join(FIX, "decode_jpeg.pdf")
 ANNOT_APPEARANCE = os.path.join(FIX, "annot_appearance.pdf")
+RULED_BLANK = os.path.join(FIX, "ruled_blank_cells.pdf")
 
 
 def test_open_and_page_count():
@@ -327,6 +328,52 @@ def test_extract_tables():
         assert key in t, f"table dict missing {key!r}"
     flat = [c for row in t["cells"] for c in row]
     assert "System" in " ".join(flat) and "84.6" in " ".join(flat), "table cells wrong"
+
+
+def test_analyze_tables_surface_and_document_delegation():
+    direct = distillpdf.Pdf.open(NUMERIC).analyze_tables()
+    assert direct == distillpdf.open(NUMERIC).analyze_tables()
+    assert direct
+    table_keys = {
+        "page", "bbox_norm", "n_rows", "n_cols", "header_rows", "cells",
+        "caption", "evidence",
+    }
+    cell_keys = {
+        "text", "row", "col", "rowspan", "colspan", "bbox_norm", "role",
+        "header_path",
+    }
+    for table in direct:
+        assert set(table) == table_keys
+        assert table["page"] >= 1
+        assert table["bbox_norm"] is None or len(table["bbox_norm"]) == 4
+        assert table["n_rows"] >= 2 and table["n_cols"] >= 2
+        assert table["header_rows"] <= table["n_rows"]
+        assert table["evidence"] and set(table["evidence"]) <= {"ruled", "aligned"}
+        anchors = {(cell["row"], cell["col"]) for cell in table["cells"]}
+        for cell in table["cells"]:
+            assert set(cell) == cell_keys
+            assert cell["rowspan"] >= 1 and cell["colspan"] >= 1
+            assert cell["role"] in {"header", "data"}
+            assert all(tuple(anchor) in anchors for anchor in cell["header_path"])
+            assert cell["bbox_norm"] is None or len(cell["bbox_norm"]) == 4
+            assert "confidence" not in cell and "rejection" not in cell
+        assert "confidence" not in table and "rejections" not in table
+
+
+def test_analyze_tables_only_claims_exact_ruled_cell_boundaries():
+    tables = distillpdf.Pdf.open(RULED_BLANK).analyze_tables()
+    assert len(tables) == 1
+    assert "ruled" in tables[0]["evidence"]
+    assert tables[0]["cells"]
+    assert all(cell["bbox_norm"] is not None for cell in tables[0]["cells"])
+
+    inferred = distillpdf.Pdf.open(NUMERIC).analyze_tables()
+    assert any("aligned" in table["evidence"] for table in inferred)
+    assert all(
+        cell["bbox_norm"] is None
+        for table in inferred if "ruled" not in table["evidence"]
+        for cell in table["cells"]
+    )
 
 
 def test_extract_links_shapes():

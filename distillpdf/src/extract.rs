@@ -5,7 +5,7 @@
 
 use crate::pdfobj::{deref, filters_of, sub_dict};
 use crate::raster::{assemble_png, codec_payload, filter_to_format, image_bpc, image_color_space, normalized_jpeg_png};
-use crate::table::{CellAnalysis, CellRole, PositionedTableAnalysis, TableAnalysis, TableEvidence};
+use crate::table::{AnalyzedTable, CellAnalysis, CellRole, PositionedTableAnalysis, TableAnalysis, TableEvidence};
 use crate::text::{self, Span};
 use lopdf::{Dictionary, Document, ObjectId};
 use rayon::prelude::*;
@@ -2482,6 +2482,36 @@ pub fn extract_tables(doc: &Document, raw: &[u8]) -> Vec<TableInfo> {
         .collect()
 }
 
+/// Analyze the same raw detector results as [`extract_tables`], adding detector-owned
+/// topology and normalized display geometry without applying the renderer's later figure,
+/// structure-tree or caption reconciliation.
+pub fn analyze_tables(doc: &Document, raw: &[u8]) -> Vec<AnalyzedTable> {
+    let pages = doc.get_pages();
+    let mut per_page: Vec<(u32, Vec<AnalyzedTable>)> = pages
+        .par_iter()
+        .map(|(&pno, &page_id)| {
+            let spans = text::extract_spans(doc, page_id, raw);
+            let rules = crate::vector::page_rules(doc, page_id);
+            let turn = crate::geom::PageTurn::new(
+                crate::pdfobj::page_rotation(doc, page_id),
+                crate::pdfobj::page_box(doc, page_id).unwrap_or([
+                    0.0,
+                    0.0,
+                    crate::pdfobj::DEFAULT_PAGE_PTS.0,
+                    crate::pdfobj::DEFAULT_PAGE_PTS.1,
+                ]),
+            );
+            let tables = detect_tables_pos(&spans, &rules)
+                .into_iter()
+                .map(|table| table.into_public(pno, |rect| turn.normalized_rect(rect)))
+                .collect();
+            (pno, tables)
+        })
+        .collect();
+    per_page.sort_by_key(|(pno, _)| *pno);
+    per_page.into_iter().flat_map(|(_, tables)| tables).collect()
+}
+
 /// Does this font dict (or its descendant) carry an embedded font program?
 fn font_embedded(doc: &Document, dict: &Dictionary) -> bool {
     // Type0: descriptor lives on the descendant font.
@@ -3658,5 +3688,37 @@ mod tests {
         let out = declared_pos_tables(&declared[&page], &[], &[]);
         assert!(out.tables.is_empty());
         assert!(out.refused.iter().all(|r| *r == Refusal::TooFewRows), "got {:?}", out.refused);
+    }
+
+    #[test]
+    fn rich_raw_analysis_keeps_the_exact_legacy_projection() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/numeric.pdf");
+        let raw = std::fs::read(path).expect("numeric fixture bytes");
+        let doc = Document::load_mem(&raw).expect("numeric fixture loads");
+        let pages = doc.get_pages();
+        let (&page, &page_id) = pages.first_key_value().expect("one page");
+        let expected: Vec<Vec<Vec<String>>> = detect_tables_pos(
+            &text::extract_spans(&doc, page_id, &raw),
+            &crate::vector::page_rules(&doc, page_id),
+        )
+        .into_iter()
+        .map(|table| table.table.into_grid_parts())
+        .collect();
+        let legacy = extract_tables(&doc, &raw);
+        assert_eq!(
+            legacy.iter().map(|table| table.cells.clone()).collect::<Vec<_>>(),
+            expected
+        );
+        let analyzed = analyze_tables(&doc, &raw);
+        assert_eq!(legacy.len(), analyzed.len());
+        for (old, rich) in legacy.iter().zip(&analyzed) {
+            assert_eq!(old.page, rich.page);
+            assert_eq!(old.page, page);
+            let mut dense = vec![vec![String::new(); rich.n_cols]; rich.n_rows];
+            for cell in &rich.cells {
+                dense[cell.row][cell.col] = cell.text.clone();
+            }
+            assert_eq!(old.cells, dense, "numeric.pdf has no detached header ambiguity");
+        }
     }
 }

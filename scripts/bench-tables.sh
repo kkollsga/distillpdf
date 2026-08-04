@@ -20,7 +20,7 @@ PY
 fi
 
 "$RUN_PY" -m pytest tests/test_table_corpus.py \
-  -q -k 'scorer_rejects or optional_geometry_and_span_attacks'
+  -q -k 'scorer_rejects or optional_geometry_and_span_attacks or rich_scorer or bbox_segmentation or authored_numeric'
 
 # Isolate the measured DistillPDF install from the source tree and from any older wheel in
 # RUN_PY. Comparator packages remain inherited from the explicitly selected pinned run env.

@@ -165,6 +165,9 @@ pub use model::{AssetProfile, DocModel};
 // those public method signatures are legal (the types are already `pub`, just held in
 // crate-private modules) without exposing the modules' internal helper fns.
 pub use extract::{FontInfo, ImageInfo, TableInfo};
+pub use table::{
+    AnalyzedCaption, AnalyzedCell, AnalyzedTable, TableCellRole, TableEvidence,
+};
 pub use frontmatter::{Author, FrontMatter};
 pub use html::Mode;
 pub use links::Link;

@@ -26,7 +26,8 @@ hash, manifest hash, corpus hashes, runner identity, and raw timings. Heavy raw 
 under `dev-docs/bench/out/table-analysis/`; the compact JSON and Markdown summaries are written
 under `dev-docs/bench/results/`.
 
-`extract_tables()` does not expose bbox or span topology. The lock therefore records these as
-unsupported on the legacy surface; synthetic optional-field attacks prove that the helpers
-reject geometry/span corruption when such fields are present, without claiming a product
-metric before the additive analysis API exists.
+The timing report keeps `distillpdf` for byte-compatible legacy `extract_tables()` and adds
+`distillpdf-analysis` for `analyze_tables()`; both observe the emitted table count. Geometry,
+topology, header, numeric, blank and segmentation attacks run against the additive analysis
+payload. The owned topology/localization scores are explicitly anchor-key precision/recall/F1
+proxies, not canonical GriTS row/column alignment. Legacy bbox/span capabilities remain false.

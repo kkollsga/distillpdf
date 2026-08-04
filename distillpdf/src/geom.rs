@@ -137,6 +137,51 @@ impl PageTurn {
         }
     }
 
+    /// Convert a page-space rectangle into `[left, top, right, bottom]` fractions of the
+    /// post-rotation display box. Both input and the intermediate display space use y-up;
+    /// only this public-facing projection flips y to top-left/y-down convention.
+    pub(crate) fn normalized_rect(self, rect: Rect) -> Option<[f32; 4]> {
+        if ![rect.x0, rect.y0, rect.x1, rect.y1]
+            .into_iter()
+            .all(f32::is_finite)
+            || rect.x1 <= rect.x0
+            || rect.y1 <= rect.y0
+        {
+            return None;
+        }
+        let page_w = self.x1 - self.x0;
+        let page_h = self.y1 - self.y0;
+        let (display_w, display_h) = if matches!(self.rot, 90 | 270) {
+            (page_h, page_w)
+        } else {
+            (page_w, page_h)
+        };
+        if !display_w.is_finite()
+            || !display_h.is_finite()
+            || display_w <= 0.0
+            || display_h <= 0.0
+        {
+            return None;
+        }
+        let (mut left, mut right, mut bottom, mut top) =
+            self.rect(rect.x0, rect.x1, rect.y0, rect.y1);
+        // `rot == 0` is intentionally an exact identity for the layout engine. Public
+        // normalization, unlike layout, is relative to a possibly non-zero page-box origin.
+        if self.rot == 0 {
+            left -= self.x0;
+            right -= self.x0;
+            bottom -= self.y0;
+            top -= self.y0;
+        }
+        let out = [
+            left / display_w,
+            1.0 - top / display_h,
+            right / display_w,
+            1.0 - bottom / display_h,
+        ];
+        out.iter().all(|v| v.is_finite()).then_some(out)
+    }
+
     /// A page-space baseline angle (radians, PDF CCW-positive) in display orientation,
     /// **wrapped into `(-π, π]`**.
     ///
@@ -298,6 +343,37 @@ mod tests {
         assert_eq!(t.pt(137.25, 612.5), (137.25, 612.5));
         assert_eq!(t.rect(1.5, 2.5, 3.5, 4.5), (1.5, 2.5, 3.5, 4.5));
         assert_eq!(t.angle(0.75), 0.75);
+    }
+
+    #[test]
+    fn public_rect_normalization_is_top_left_and_post_rotation() {
+        let upright = PageTurn::new(0, [10.0, 20.0, 410.0, 620.0]);
+        let got = upright
+            .normalized_rect(Rect::new(50.0, 80.0, 250.0, 380.0))
+            .expect("valid display box");
+        for (actual, expected) in got.into_iter().zip([0.1, 0.4, 0.6, 0.9]) {
+            approx(actual, expected);
+        }
+        let rotated = turn(90);
+        let got = rotated
+            .normalized_rect(Rect::new(40.0, 60.0, 240.0, 360.0))
+            .expect("valid display box");
+        for (actual, expected) in got.into_iter().zip([0.1, 0.1, 0.6, 0.6]) {
+            approx(actual, expected);
+        }
+        assert_eq!(
+            PageTurn::new(0, [0.0; 4]).normalized_rect(Rect::new(0.0, 0.0, 1.0, 1.0)),
+            None
+        );
+        assert_eq!(
+            turn(0).normalized_rect(Rect::new(0.0, 2.0, 1.0, 1.0)),
+            None,
+            "an inverted y extent is not a public box"
+        );
+        assert_eq!(
+            turn(0).normalized_rect(Rect::new(0.0, 0.0, f32::NAN, 1.0)),
+            None
+        );
     }
 
     #[test]

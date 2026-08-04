@@ -67,6 +67,9 @@
     "threads": 1
   },
   "capabilities": {
+    "analysis_bbox_iou": true,
+    "analysis_cell_localization": true,
+    "analysis_span_topology": true,
     "legacy_bbox_iou": false,
     "legacy_span_topology": false,
     "semantic_header_depth": true,

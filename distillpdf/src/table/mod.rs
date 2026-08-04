@@ -8,6 +8,59 @@
 
 use crate::geom::Rect;
 
+/// One table reported by [`crate::PdfDocument::analyze_tables`].
+///
+/// This is the structured view of the raw detector used by
+/// [`crate::PdfDocument::extract_tables`]. HTML/Markdown rendering performs additional figure
+/// filtering, structure-tree reconciliation and caption attachment, so its final table set is
+/// intentionally a different surface.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct AnalyzedTable {
+    /// One-based PDF page number, matching [`crate::TableInfo::page`].
+    pub page: u32,
+    /// Detected table region as `[left, top, right, bottom]` in normalized display
+    /// coordinates, or `None` when the effective page box is degenerate.
+    pub bbox_norm: Option<[f32; 4]>,
+    /// Logical row count across detached headers and the body grid. This may exceed the row
+    /// count of legacy `TableInfo::cells`, which intentionally omits detached header rows.
+    pub n_rows: usize,
+    /// Logical column count after accounting for spans.
+    pub n_cols: usize,
+    pub header_rows: usize,
+    /// Cell anchors in stable row-major order. Slots covered by a span are not repeated.
+    pub cells: Vec<AnalyzedCell>,
+    /// Normally `None`: the raw detector does not currently attach renderer captions.
+    pub caption: Option<AnalyzedCaption>,
+    pub evidence: Vec<TableEvidence>,
+}
+
+/// One semantic cell anchor in an [`AnalyzedTable`].
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct AnalyzedCell {
+    pub text: String,
+    pub row: usize,
+    pub col: usize,
+    pub rowspan: usize,
+    pub colspan: usize,
+    /// Exact physical cell boundary in normalized display coordinates. `None` means the
+    /// detector did not observe a boundary; glyph/content extents are never substituted.
+    pub bbox_norm: Option<[f32; 4]>,
+    pub role: TableCellRole,
+    /// Header anchor coordinates `[row, col]`, outermost to innermost, whose spans cover this
+    /// data cell's column. Empty for header cells and zero-header tables.
+    pub header_path: Vec<[usize; 2]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AnalyzedCaption {
+    pub number: String,
+    pub text: String,
+    pub below: bool,
+}
+
 /// One cell in stable row-major table order.
 ///
 /// `row` and `col` address the cell's anchor.  A dense legacy slot covered by that anchor is
@@ -27,7 +80,7 @@ pub(crate) struct CellAnalysis {
     /// `colspan` only for declared cells: the existing declared renderer expands spans into
     /// dense slots even though the declaration itself retains the exact topology above.
     pub(crate) render_colspan: usize,
-    pub(crate) role: CellRole,
+    pub(crate) role: TableCellRole,
     /// This dense slot is covered by an earlier row/column-spanning anchor.
     pub(crate) covered: bool,
     pub(crate) bbox: Option<Rect>,
@@ -35,10 +88,24 @@ pub(crate) struct CellAnalysis {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CellRole {
+#[non_exhaustive]
+pub enum TableCellRole {
+    /// A column-header cell owned by the detector's leading header region.
     Header,
+    /// A data cell. Row-header semantics are not inferred by this API.
     Data,
 }
+
+impl TableCellRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Header => "header",
+            Self::Data => "data",
+        }
+    }
+}
+
+pub(crate) type CellRole = TableCellRole;
 
 impl CellAnalysis {
     pub(crate) fn new(
@@ -56,7 +123,7 @@ impl CellAnalysis {
             rowspan,
             colspan,
             render_colspan: colspan,
-            role: CellRole::Data,
+            role: TableCellRole::Data,
             covered: false,
             bbox,
             content_bbox: None,
@@ -69,7 +136,7 @@ impl CellAnalysis {
         col: usize,
         rowspan: usize,
         colspan: usize,
-        role: CellRole,
+        role: TableCellRole,
         content_bbox: Option<Rect>,
     ) -> Self {
         Self {
@@ -94,7 +161,7 @@ impl CellAnalysis {
             rowspan: 1,
             colspan: 1,
             render_colspan: 1,
-            role: CellRole::Data,
+            role: TableCellRole::Data,
             covered: true,
             bbox: None,
             content_bbox: None,
@@ -165,10 +232,24 @@ pub(crate) struct TableAnalysis {
 
 /// Positive evidence that contributed to an accepted table, in stable strength/arrival order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TableEvidence {
+#[non_exhaustive]
+pub enum TableEvidence {
+    /// Accepted PDF structure-tree declaration.
     Declared,
+    /// Observed closed ruling lattice or supporting horizontal rules.
     Ruled,
+    /// Repeated text-row alignment.
     Aligned,
+}
+
+impl TableEvidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Declared => "declared",
+            Self::Ruled => "ruled",
+            Self::Aligned => "aligned",
+        }
+    }
 }
 
 impl TableAnalysis {
@@ -187,7 +268,7 @@ impl TableAnalysis {
             for (text, colspan) in cells {
                 let mut cell = CellAnalysis::new(text, row, col, 1, colspan, None);
                 if row < header_rows {
-                    cell.role = CellRole::Header;
+                    cell.role = TableCellRole::Header;
                 }
                 analyzed.push(cell);
                 col += colspan.max(1);
@@ -206,7 +287,7 @@ impl TableAnalysis {
                         let row = row_offset + ri;
                         let mut cell = CellAnalysis::new(text, row, col, 1, 1, None);
                         if row < header_rows {
-                            cell.role = CellRole::Header;
+                            cell.role = TableCellRole::Header;
                         }
                         cell
                     })
@@ -291,6 +372,20 @@ impl TableAnalysis {
             .map(|row| row.into_iter().map(|cell| cell.text).collect())
             .collect()
     }
+
+    fn logical_shape(&self) -> (usize, usize) {
+        self.header
+            .iter()
+            .chain(&self.grid)
+            .flatten()
+            .filter(|cell| !cell.covered)
+            .fold((0, 0), |(rows, cols), cell| {
+                (
+                    rows.max(cell.row.saturating_add(cell.rowspan.max(1))),
+                    cols.max(cell.col.saturating_add(cell.colspan.max(1))),
+                )
+            })
+    }
 }
 
 /// A table while it still participates in page-space ownership and reading-order decisions.
@@ -311,6 +406,69 @@ impl PositionedTableAnalysis {
         Self {
             bbox,
             table: TableAnalysis::from_parts(header, grid, header_rows, None, evidence),
+        }
+    }
+
+    pub(crate) fn into_public<F>(self, page: u32, normalize: F) -> AnalyzedTable
+    where
+        F: Fn(Rect) -> Option<[f32; 4]>,
+    {
+        let bbox_norm = normalize(self.bbox);
+        let (n_rows, n_cols) = self.table.logical_shape();
+        let mut cells: Vec<AnalyzedCell> = self
+            .table
+            .header
+            .iter()
+            .chain(&self.table.grid)
+            .flatten()
+            .filter(|cell| !cell.covered)
+            .map(|cell| AnalyzedCell {
+                text: cell.text.clone(),
+                row: cell.row,
+                col: cell.col,
+                rowspan: cell.rowspan.max(1),
+                colspan: cell.colspan.max(1),
+                bbox_norm: cell.bbox.and_then(&normalize),
+                role: if cell.role == TableCellRole::Header || cell.row < self.table.header_rows {
+                    TableCellRole::Header
+                } else {
+                    TableCellRole::Data
+                },
+                header_path: Vec::new(),
+            })
+            .collect();
+        let headers: Vec<(usize, usize, usize)> = cells
+            .iter()
+            .filter(|cell| cell.role == TableCellRole::Header)
+            .map(|cell| (cell.row, cell.col, cell.colspan))
+            .collect();
+        for cell in &mut cells {
+            if cell.role == TableCellRole::Data {
+                cell.header_path = headers
+                    .iter()
+                    .filter(|&&(row, col, colspan)| {
+                        row < cell.row
+                            && cell.col >= col
+                            && cell.col < col.saturating_add(colspan.max(1))
+                    })
+                    .map(|&(row, col, _)| [row, col])
+                    .collect();
+            }
+        }
+        cells.sort_by_key(|cell| (cell.row, cell.col));
+        AnalyzedTable {
+            page,
+            bbox_norm,
+            n_rows,
+            n_cols,
+            header_rows: self.table.header_rows,
+            cells,
+            caption: self.table.caption.map(|caption| AnalyzedCaption {
+                number: caption.number,
+                text: crate::nav::strip_inline(&caption.html).trim().to_string(),
+                below: caption.below,
+            }),
+            evidence: self.table.evidence,
         }
     }
 }
@@ -437,5 +595,24 @@ mod tests {
             table.evidence,
             vec![TableEvidence::Ruled, TableEvidence::Aligned]
         );
+    }
+
+    #[test]
+    fn public_projection_keeps_anchors_paths_and_legacy_body_distinct() {
+        let table = PositionedTableAnalysis::from_parts(
+            Rect::new(10.0, 20.0, 90.0, 80.0),
+            vec![
+                vec![("Group".into(), 2)],
+                vec![("A".into(), 1), ("B".into(), 1)],
+            ],
+            vec![vec!["1".into(), "2".into()]],
+            2,
+            vec![TableEvidence::Aligned],
+        )
+        .into_public(3, |rect| Some(rect.into()));
+        assert_eq!((table.page, table.n_rows, table.n_cols), (3, 3, 2));
+        assert_eq!(table.cells[0].colspan, 2);
+        assert_eq!(table.cells[3].header_path, vec![[0, 0], [1, 0]]);
+        assert_eq!(table.cells[4].header_path, vec![[0, 0], [1, 1]]);
     }
 }

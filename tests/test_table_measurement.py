@@ -22,6 +22,8 @@ def test_table_measurement_lock_is_closed_and_hashed():
         "system": "Darwin", "machine": "arm64", "repeats": 5, "warmups": 1,
         "pythonhashseed": "0", "threads": 1}
     assert lock["capabilities"] == {
+        "analysis_bbox_iou": True, "analysis_cell_localization": True,
+        "analysis_span_topology": True,
         "legacy_bbox_iou": False, "legacy_span_topology": False,
         "semantic_header_depth": True, "pymupdf_layout": False}
 

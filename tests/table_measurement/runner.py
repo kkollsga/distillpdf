@@ -152,6 +152,12 @@ def extract_distillpdf(path: Path) -> int:
     return len(distillpdf.Pdf.open(str(path)).extract_tables())
 
 
+def extract_distillpdf_analysis(path: Path) -> int:
+    import distillpdf
+
+    return len(distillpdf.Pdf.open(str(path)).analyze_tables())
+
+
 def extract_pymupdf(path: Path) -> int:
     import pymupdf
 
@@ -178,7 +184,9 @@ def extract_pymupdf4llm(path: Path) -> int:
     return text.count("\n|")
 
 
-EXTRACTORS = {"distillpdf": extract_distillpdf, "pymupdf": extract_pymupdf,
+EXTRACTORS = {"distillpdf": extract_distillpdf,
+              "distillpdf-analysis": extract_distillpdf_analysis,
+              "pymupdf": extract_pymupdf,
               "pdfplumber": extract_pdfplumber, "pymupdf4llm": extract_pymupdf4llm}
 
 
@@ -236,7 +244,8 @@ def write_outputs(result: dict, label: str) -> tuple[Path, Path]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--wheel", type=Path, required=True)
-    ap.add_argument("--extractors", default="distillpdf,pymupdf,pymupdf4llm")
+    ap.add_argument("--extractors",
+                    default="distillpdf,distillpdf-analysis,pymupdf,pymupdf4llm")
     ap.add_argument("--repeats", type=int, default=LOCK["runner"]["repeats"])
     ap.add_argument("--warmups", type=int, default=LOCK["runner"]["warmups"])
     ap.add_argument("--limit", type=int, help="smoke-test prefix; not acceptance evidence")
