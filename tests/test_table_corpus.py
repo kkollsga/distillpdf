@@ -58,6 +58,16 @@ WORD = re.compile(r"\w+", re.UNICODE)
 #: silently-ignored expectation.
 EXPECT_KEYS = {"table_count", "table_count_any", "cols_any", "must_not_merge", "exactly_once"}
 
+# The legacy extraction payload has cell text and dimensions, but not table/cell geometry or
+# span topology. Keep the capability declaration executable so reports cannot silently claim
+# metrics that this API cannot support. Phase 3 can flip these only with the corresponding
+# additive fields and attack tests.
+SCORER_CAPABILITIES = {
+    "bbox_iou": False,
+    "span_topology": False,
+    "semantic_header_depth": True,
+}
+
 
 def test_parity_adjudicates_each_file_before_family_summary():
     """A perfect/easy sibling cannot be cancelled by a deliberately hard sibling."""
@@ -297,6 +307,52 @@ def score_pair(d, g):
             "det_dims": [det_r, det_c], "gt_dims": [n_r, n_c], "wrong": wrong[:6]}
 
 
+def score_is_perfect(res, truth_table_count):
+    """One fail-closed predicate for scorer attack tests and local measurement reports."""
+    if res.get("detected") != truth_table_count:
+        return False
+    if res.get("false_positives", 0) or res.get("spurious", 0):
+        return False
+    if len(res.get("tables", [])) != truth_table_count:
+        return False
+    return all(t["grid_exact"] and t["cell_acc"] == 1.0
+               and t.get("header_acc") in (None, 1.0) for t in res["tables"])
+
+
+def score_semantic_header_depth(detected, truth):
+    """Exact semantic header-depth accuracy for already matched synthetic tables."""
+    n = max(len(detected), len(truth))
+    if not n:
+        return 1.0
+    ok = sum(
+        detected[i].get("header_rows") == truth[i].get("header_rows", 1)
+        for i in range(min(len(detected), len(truth)))
+    )
+    return ok / n
+
+
+def bbox_iou_if_available(detected, truth):
+    """Return IoU only when both payloads carry geometry; legacy detections return None."""
+    a, b = detected.get("bbox_norm"), truth.get("bbox_norm")
+    if a is None or b is None:
+        return None
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    inter = max(0.0, min(ax1, bx1) - max(ax0, bx0)) * max(
+        0.0, min(ay1, by1) - max(ay0, by0)
+    )
+    union = ((ax1 - ax0) * (ay1 - ay0) + (bx1 - bx0) * (by1 - by0) - inter)
+    return inter / union if union > 0 else 0.0
+
+
+def span_topology_if_available(detected, truth):
+    """Exact span signature only when a future analysis payload supplies explicit spans."""
+    if "spans" not in detected or "spans" not in truth:
+        return None
+    key = lambda s: (s["r"], s["c"], s.get("rowspan", 1), s.get("colspan", 1))
+    return sorted(map(key, detected["spans"])) == sorted(map(key, truth["spans"]))
+
+
 def score_file(path, rec):
     det = detect(path)
     tables = rec["tables"]
@@ -418,6 +474,93 @@ def group_scores(scored, tier):
         g["grid_exact"] = g["grid_ok"] / g["grid_n"] if g["grid_n"] else 1.0
         g["header_acc"] = g["hdr_ok"] / g["hdr_n"] if g["hdr_n"] else None
     return out
+
+
+# -------------------------------------------------------------- scorer attack locks
+
+def _attack_truth(rows, *, header_rows=1):
+    cells = [
+        {"r": r, "c": c, "text": value}
+        for r, row in enumerate(rows)
+        for c, value in enumerate(row)
+    ]
+    return {
+        "page": 0,
+        "n_rows": len(rows),
+        "n_cols": len(rows[0]),
+        "header_rows": header_rows,
+        "bbox_norm": [0.1, 0.1, 0.9, 0.9],
+        "cells": cells,
+    }
+
+
+def _attack_detection(rows, *, page=0):
+    return {"page": page, "rows": rows, "raw_rows": rows,
+            "n_rows": len(rows), "n_cols": len(rows[0]) if rows else 0}
+
+
+def test_scorer_rejects_column_permutation_and_header_reassignment():
+    truth = _attack_truth([["Region", "Revenue"], ["North", "-12.50"],
+                           ["South", "9.75"]])
+    perfect = _attack_detection([["Region", "Revenue"], ["North", "-12.50"],
+                                 ["South", "9.75"]])
+    swapped = _attack_detection([["Revenue", "Region"], ["-12.50", "North"],
+                                 ["9.75", "South"]])
+    assert score_pair(perfect, truth)["cell_acc"] == 1.0
+    attacked = score_pair(swapped, truth)
+    assert attacked["cell_acc"] < 1.0
+    assert attacked["header_acc"] < 1.0
+    assert attacked["tok_recall"] == 1.0, "attack must preserve every token"
+
+
+@pytest.mark.parametrize("value", ["12.50", "-1250"])
+def test_scorer_rejects_lost_sign_or_decimal(value):
+    truth = _attack_truth([["Amount"], ["-12.50"]])
+    attacked = score_pair(_attack_detection([["Amount"], [value]]), truth)
+    assert attacked["cell_acc"] < 1.0
+
+
+def test_scorer_rejects_duplicate_fused_split_and_phantom(monkeypatch):
+    a = _attack_truth([["A"], ["alpha"]])
+    b = _attack_truth([["B"], ["bravo"]])
+    rec = {"tables": [a, b], "expect": {}}
+    clean = [_attack_detection([["A"], ["alpha"]]),
+             _attack_detection([["B"], ["bravo"]])]
+
+    def measure(detections, tables=rec["tables"]):
+        monkeypatch.setattr(__import__(__name__), "detect", lambda _path: detections)
+        return score_file("synthetic.pdf", {"tables": tables, "expect": {}})
+
+    assert score_is_perfect(measure(clean), 2)
+    assert not score_is_perfect(measure(clean + [clean[0]]), 2), "duplicate survived"
+    fused = [_attack_detection([["A", "B"], ["alpha", "bravo"]])]
+    assert not score_is_perfect(measure(fused), 2), "fusion survived"
+    split = [_attack_detection([["A"], ["alpha"]]), _attack_detection([["B"]]),
+             _attack_detection([["bravo"]])]
+    assert not score_is_perfect(measure(split), 2), "split survived"
+    phantom = _attack_detection([["PHANTOM"], ["noise"]])
+    assert not score_is_perfect(measure(clean + [phantom]), 2), "phantom survived"
+    assert not score_is_perfect(measure([phantom], tables=[]), 0), "negative phantom survived"
+
+
+def test_scorer_rejects_invented_zero_header():
+    truth = [{"header_rows": 0}]
+    assert score_semantic_header_depth([{"header_rows": 0}], truth) == 1.0
+    assert score_semantic_header_depth([{"header_rows": 1}], truth) == 0.0
+
+
+def test_optional_geometry_and_span_attacks_fail_closed():
+    truth = {"bbox_norm": [0.1, 0.1, 0.9, 0.9],
+             "spans": [{"r": 0, "c": 0, "colspan": 2}]}
+    assert bbox_iou_if_available({}, truth) is None
+    assert span_topology_if_available({}, truth) is None
+    assert bbox_iou_if_available({"bbox_norm": truth["bbox_norm"]}, truth) == 1.0
+    assert bbox_iou_if_available({"bbox_norm": [0.5, 0.5, 1.0, 1.0]}, truth) < 0.5
+    assert span_topology_if_available({"spans": truth["spans"]}, truth) is True
+    corrupt = {"spans": [{"r": 0, "c": 0, "rowspan": 2}]}
+    assert span_topology_if_available(corrupt, truth) is False
+    assert SCORER_CAPABILITIES == {
+        "bbox_iou": False, "span_topology": False, "semantic_header_depth": True}
 
 
 # ------------------------------------------------------------------------------- the gates
