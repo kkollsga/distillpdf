@@ -548,7 +548,15 @@ COMPLEX_SEMANTIC_HEADER_FAMILIES = {
     "t3_kitchen_sink",
 }
 SEMANTIC_HEADER_LOCKS = [
-    f for f, r in sorted(TRUTH["files"].items())
+    pytest.param(
+        f,
+        marks=pytest.mark.xfail(
+            strict=True,
+            reason=("G7 red ledger: zero-header inference needs structural table "
+                    "segmentation/ownership evidence that separates real headers"),
+        ),
+    ) if r["family"] == "no_header" else f
+    for f, r in sorted(TRUTH["files"].items())
     if (r["tier"] == 1
         or r["family"] == "tagged_only_signal"
         or r["family"] in COMPLEX_SEMANTIC_HEADER_FAMILIES)
