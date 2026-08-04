@@ -650,21 +650,10 @@ const EQ_DATAVAL_DENOM: usize = 3;
 /// guard exists to stop. A corpus-gate breach is not a trade, so 2 stands.
 const EQ_OP_DENSE: usize = 2;
 
-/// Structural ADMISSION test: is this region a genuine data table, or prose / an
-/// equation / a symbolic matrix that merely happens to have aligned tokens?
-///
-/// This is the single backstop that keeps false positives out. It is deliberately
-/// kept SEPARATE from column-keeping (how many columns survive) so that recovering a
-/// sparse column can never silently re-admit a prose/equation block: admission reads
-/// the region's content, column-keeping reads its geometry, and the two no longer
-/// interfere. Returns true to accept the region as a table.
-fn is_coherent_grid(grid: &[Vec<String>]) -> bool {
-    incoherent_reason(grid).is_none()
-}
-
-/// Why [`is_coherent_grid`] refused, or `None` if it did not. Split out from the
-/// predicate so a refusal is auditable under `DPDF_FLUSH` — a guard nobody can see
-/// firing is a guard nobody can sweep.
+/// Structural ADMISSION test: why this region is not a genuine data table, or `None` when it
+/// is coherent. Kept separate from column-keeping so recovering a sparse column cannot
+/// silently re-admit prose/equations. Returning the reason also keeps every refusal auditable
+/// under `DPDF_FLUSH` — a guard nobody can see firing is a guard nobody can sweep.
 fn incoherent_reason(grid: &[Vec<String>]) -> Option<&'static str> {
     // Prose guard: real tabular cells are terse. A 2-column block averaging >4
     // words/cell is running prose (wrapped body lines), not a table.
@@ -2207,7 +2196,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
         //
         // Neither order is therefore correct, and picking by *columns resolved* is: a column
         // boundary is positive evidence, both answers have already passed their own admission
-        // test (`is_coherent_grid`, and a ≥0.5 density bar on left-x that keeps a sparse symbol
+        // test (`incoherent_reason`, and a ≥0.5 density bar on left-x that keeps a sparse symbol
         // scatter out), so the model that found more real boundaries is the model that read the
         // table. On a tie the lane answer stands, which is what keeps the sparse-column lock.
         //
@@ -3457,7 +3446,7 @@ mod tests {
             &["North", "12.5", "13.1", "11.9"],
             &["South", "9.4", "10.2", "8.8"],
         ]);
-        assert!(is_coherent_grid(&g));
+        assert!(incoherent_reason(&g).is_none());
     }
 
     #[test]
@@ -3468,7 +3457,7 @@ mod tests {
             &["beta", "the second letter often denoting a coefficient or a regression slope"],
             &["gamma", "the third letter frequently used for the Lorentz factor in physics"],
         ]);
-        assert!(!is_coherent_grid(&g));
+        assert!(incoherent_reason(&g).is_some());
     }
 
     #[test]
@@ -3480,7 +3469,7 @@ mod tests {
             &["", "x", "3 12", "", ""],
             &["2", "4", "", "", ""],
         ]);
-        assert!(!is_coherent_grid(&g));
+        assert!(incoherent_reason(&g).is_some());
     }
 
     // ---------------------------------------------------------------- L0: the trust rule
