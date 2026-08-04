@@ -1450,6 +1450,46 @@ fn l3_aligned(c: &Candidate, _spans: &[Span]) -> Option<PosTable> {
     c.aligned.clone()
 }
 
+/// Infer a leading stack of uniform header tiers from structure and ownership evidence.
+///
+/// A grouped header refines from a sparse parent tier into progressively more occupied child
+/// tiers, ending at the fully named leaf columns.  Every row in that chain has explicit header
+/// styling somewhere in the row.  Requiring every span to share the style would discard valid
+/// mixed-content headers: a nested paragraph can retain its own font while its sibling cells
+/// carry the table's header face.  The refinement chain is what makes one styled cell safe.
+/// This deliberately stops at the first full row, so later full-width bold band titles are
+/// body rows, and it refuses a sparse first data row when the producer supplied no header
+/// styling.  There are no text/style cut-offs here: the evidence is the exact grid occupancy,
+/// strict refinement, and the span parser's binary bold ownership.
+fn uniform_header_depth(
+    grid: &[Vec<String>],
+    row_is_header_styled: impl Fn(usize) -> bool,
+) -> usize {
+    let Some(first) = grid.first() else {
+        return 1;
+    };
+    let ncols = first.len();
+    if ncols < 2 {
+        return 1;
+    }
+    let occupied = |row: &[String]| row.iter().filter(|cell| !cell.trim().is_empty()).count();
+    let mut previous = occupied(first);
+    if previous == 0 || previous == ncols || !row_is_header_styled(0) {
+        return 1;
+    }
+    for (ri, row) in grid.iter().enumerate().skip(1) {
+        let current = occupied(row);
+        if current <= previous || !row_is_header_styled(ri) {
+            return 1;
+        }
+        if current == ncols {
+            return ri + 1;
+        }
+        previous = current;
+    }
+    1
+}
+
 /// A lattice bigger than this is a chart's gridlines or a calendar of nothing; building a grid
 /// of that size from spans is pure cost.
 const MAX_LATTICE_CELLS: usize = 4096;
@@ -1512,6 +1552,12 @@ fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PosTable> {
                 .collect()
         })
         .collect();
+    let ruled_header_rows = uniform_header_depth(&grid, |ri| {
+        let row = &bound.cells[ri * bound.ncols..(ri + 1) * bound.ncols];
+        row.iter()
+            .flatten()
+            .any(|span| !span.text.trim().is_empty() && span.bold)
+    });
     // ADMISSION. A lattice is evidence of cell boundaries, not of a table: a chart's gridlines
     // and a form's decorative border draw one too. Require real content, spread over at least
     // two rows AND two columns — one populated row is a caption strip, one populated column is
@@ -1535,7 +1581,13 @@ fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PosTable> {
         x_right: axes.bbox.x1,
         grid,
         header: Vec::new(),
-        header_rows: 1,
+        // A merged top tier can leave no closed cells and therefore sit just outside the
+        // lattice frame.  Where alignment independently found the same region, its uniform
+        // tier chain supplies semantic ownership only; the ruled grid/cells/bbox stay exact.
+        header_rows: c
+            .aligned
+            .as_ref()
+            .map_or(ruled_header_rows, |t| ruled_header_rows.max(t.header_rows)),
     })
 }
 
@@ -1590,7 +1642,31 @@ pub fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Ve
     if !frames.is_empty() {
         let mut framed: Vec<PosTable> = Vec::new();
         for f in &frames {
-            let c = Candidate { frame: Some(f), long_h: bands_over(&bands, &f.bbox), v_rules: 0, aligned: None };
+            let aligned = out
+                .iter()
+                .filter(|t| owns(&f.bbox, t))
+                .max_by(|a, b| {
+                    let region = |t: &PosTable| {
+                        crate::geom::Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top)
+                    };
+                    // Header ownership comes from the candidate at the TOP of the ruled
+                    // frame.  A band row can split alignment into several owned fragments;
+                    // choosing the largest would select a body fragment and discard the
+                    // independent header evidence (the kitchen-sink fixture is exactly this
+                    // shape).  Overlap area breaks ties without iteration-order dependence.
+                    a.y_top.total_cmp(&b.y_top).then(
+                        f.bbox
+                            .overlap_area(region(a))
+                            .total_cmp(&f.bbox.overlap_area(region(b))),
+                    )
+                })
+                .cloned();
+            let c = Candidate {
+                frame: Some(f),
+                long_h: bands_over(&bands, &f.bbox),
+                v_rules: 0,
+                aligned,
+            };
             let built = build_table(TABLE_TYPES, &c, spans);
             // Per-page dispatch trace, off unless asked for (`DPDF_TABLES=1`), the same idiom
             // as `DPDF_L0`: which type each frame classified as and whether L3 kept it. A
@@ -2267,10 +2343,17 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
         // its existing depth (genuine grouped/multi-tier headers), while an attachment that
         // reclaimed any >=2-cell run has exactly the original leading header row.
         let reclaimed_prior_run = headers.iter().any(|(_, cells, _)| cells.len() >= 2);
+        let uniform_header_rows = uniform_header_depth(&grid, |ri| {
+            run.get(ri).is_some_and(|(_, _, spans)| {
+                spans
+                    .iter()
+                    .any(|span| !span.text.trim().is_empty() && span.bold)
+            })
+        });
         let header_rows = if reclaimed_prior_run {
             1
         } else if header.is_empty() {
-            1
+            uniform_header_rows
         } else {
             header.len()
         };
@@ -2484,6 +2567,32 @@ pub fn extract_fonts(doc: &Document) -> Vec<FontInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uniform_header_tiers_refine_to_the_leaf_columns_and_stop_there() {
+        let grid = vec![
+            vec!["".into(), "Campaign".into(), "".into(), "".into()],
+            vec!["".into(), "Site A".into(), "".into(), "Site B".into()],
+            vec!["ID".into(), "Min".into(), "Mean".into(), "Max".into()],
+            vec!["R1".into(), "1".into(), "2".into(), "3".into()],
+        ];
+        assert_eq!(uniform_header_depth(&grid, |ri| ri <= 2), 3);
+        assert_eq!(
+            uniform_header_depth(&grid, |_| false),
+            1,
+            "style owns the tiers"
+        );
+
+        let full_first = vec![
+            vec!["A".into(), "B".into()],
+            vec!["bold band".into(), "".into()],
+        ];
+        assert_eq!(
+            uniform_header_depth(&full_first, |_| true),
+            1,
+            "a later styled band cannot extend a complete leaf header"
+        );
+    }
 
     /// The owned form-XObject raster fixture (`tests/gen_fixtures.py::gen_form_image`).
     fn form_image_doc() -> Document {
