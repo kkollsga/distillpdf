@@ -9,6 +9,7 @@ resolver = "2"
 # PyPI release, and both member crates inherit it via `version.workspace = true`.
 version = "0.0.34"
 edition = "2021"
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/kkollsga/distillpdf"
 homepage = "https://github.com/kkollsga/distillpdf"
