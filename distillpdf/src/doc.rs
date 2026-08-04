@@ -11,7 +11,7 @@ use lopdf::Document;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use crate::error::Error;
 use crate::extract::{self, FontInfo, ImageInfo, TableInfo};
@@ -130,29 +130,77 @@ pub struct PdfDocument {
 /// drops lopdf's rayon at a large load-time cost. Installing a private one-thread pool around
 /// the load alone confines the serialisation to exactly the racing code and leaves the global
 /// pool — and therefore all of our own parallelism — untouched.
-fn load_pool() -> Option<&'static rayon::ThreadPool> {
-    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
-    POOL.get_or_init(|| {
+struct LoadPool {
+    pool: OnceLock<rayon::ThreadPool>,
+    init: Mutex<()>,
+}
+
+impl LoadPool {
+    const fn new() -> Self {
+        Self { pool: OnceLock::new(), init: Mutex::new(()) }
+    }
+
+    /// Return the loader pool, creating it exactly once.
+    ///
+    /// `OnceLock::get_or_try_init` is unstable, so an initialization mutex supplies its
+    /// fallible equivalent. The fast path is lock-free; the slow path is serialized so a burst
+    /// of first loads cannot worsen thread exhaustion by all trying to create a pool at once.
+    /// A failed build leaves the cell empty, allowing a later load to retry.
+    fn get_or_build(
+        &self,
+        build: impl FnOnce() -> Result<rayon::ThreadPool, rayon::ThreadPoolBuildError>,
+    ) -> Result<&rayon::ThreadPool, lopdf::Error> {
+        if let Some(pool) = self.pool.get() {
+            return Ok(pool);
+        }
+        let guard = self.init.lock().map_err(|_| {
+            lopdf::Error::IO(std::io::Error::other("deterministic PDF loader initialization lock was poisoned"))
+        })?;
+        if let Some(pool) = self.pool.get() {
+            drop(guard);
+            return Ok(pool);
+        }
+        let pool = build().map_err(|e| {
+            lopdf::Error::IO(std::io::Error::other(format!("failed to initialize deterministic PDF loader: {e}")))
+        })?;
+        // Every initializer holds `init`, so no other caller can win this set.
+        if self.pool.set(pool).is_err() {
+            drop(guard);
+            return self.pool.get().ok_or_else(|| {
+                lopdf::Error::IO(std::io::Error::other("deterministic PDF loader initialization raced"))
+            });
+        }
+        let pool = self.pool.get().ok_or_else(|| {
+            lopdf::Error::IO(std::io::Error::other("deterministic PDF loader was not initialized"))
+        })?;
+        drop(guard);
+        Ok(pool)
+    }
+}
+
+fn load_mem_with_pool(
+    raw: &[u8],
+    pool: &LoadPool,
+    build: impl FnOnce() -> Result<rayon::ThreadPool, rayon::ThreadPoolBuildError>,
+) -> Result<Document, lopdf::Error> {
+    let pool = pool.get_or_build(build)?;
+    pool.install(|| Document::load_mem(raw))
+}
+
+/// `Document::load_mem` with a deterministic object map — see [`LoadPool`].
+///
+/// Every production load in this crate goes through here; calling `Document::load_mem`
+/// directly reintroduces the race. Pool creation therefore fails closed: a thread-spawn
+/// failure is returned to the caller and a later load may retry, but the known-racy unscoped
+/// loader is never used.
+fn load_mem_deterministic(raw: &[u8]) -> Result<Document, lopdf::Error> {
+    static POOL: LoadPool = LoadPool::new();
+    load_mem_with_pool(raw, &POOL, || {
         rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .thread_name(|_| "distillpdf-load".to_string())
             .build()
-            .ok()
     })
-    .as_ref()
-}
-
-/// `Document::load_mem` with a deterministic object map — see [`load_pool`].
-///
-/// Every load in this crate goes through here; calling `Document::load_mem` directly
-/// reintroduces the race. If the pool cannot be built (thread spawn failure) we fall back to
-/// an ordinary load rather than failing the open: a nondeterministic document still beats no
-/// document.
-fn load_mem_deterministic(raw: &[u8]) -> Result<Document, lopdf::Error> {
-    match load_pool() {
-        Some(pool) => pool.install(|| Document::load_mem(raw)),
-        None => Document::load_mem(raw),
-    }
 }
 
 /// The trailer key whose value is the encryption dictionary.
@@ -763,6 +811,52 @@ pub(crate) mod tests {
         // Guard the fixture itself: if lopdf ever stops keeping both copies, this test would
         // pass vacuously and stop protecting anything.
         assert!(first.contains("/S"), "fixture no longer exercises the object-stream merge");
+    }
+
+    #[test]
+    fn loader_pool_failure_is_fail_closed_retryable_reused_and_rayon_safe() {
+        let raw = racing_objstm_pdf();
+        let pool = LoadPool::new();
+
+        // Rayon exposes a spawn hook, so fail construction directly and deterministically
+        // instead of hoping to exhaust the machine's real thread allowance. Parsing must not
+        // proceed unscoped, and the failed attempt must not poison/cache the empty cell.
+        let failed = load_mem_with_pool(&raw, &pool, || {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .spawn_handler(|_| Err(std::io::Error::other("injected loader thread failure")))
+                .build()
+        });
+        let err = failed.err().expect("pool creation failure must fail the load");
+        assert!(matches!(err, lopdf::Error::IO(_)), "pool failure must remain an IO error: {err}");
+        assert!(err.to_string().contains("injected loader thread failure"));
+        assert!(pool.pool.get().is_none(), "a transient build failure must leave the pool retryable");
+
+        // Initialize while already executing in another rayon registry. `ThreadPool::install`
+        // has an explicit cross-registry path; importantly, get_or_build releases `init` before
+        // entering it, so the private one-thread pool cannot wait while holding our mutex.
+        let outer = rayon::ThreadPoolBuilder::new().num_threads(2).build().expect("outer pool builds");
+        let first = outer
+            .install(|| {
+                load_mem_with_pool(&raw, &pool, || {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(1)
+                        .thread_name(|_| "distillpdf-test-load".to_string())
+                        .build()
+                })
+            })
+            .expect("a later load retries successfully inside rayon");
+        assert!(pool.pool.get().is_some(), "successful retry must cache the pool");
+
+        // Once initialized, the lock-free fast path must not invoke another builder.
+        let again = load_mem_with_pool(&raw, &pool, || -> Result<_, rayon::ThreadPoolBuildError> {
+            panic!("cached loader pool should be reused")
+        })
+        .expect("cached pool loads");
+        let fingerprint = |doc: &Document| -> String {
+            doc.objects.iter().map(|(id, o)| format!("{id:?}={o:?};")).collect()
+        };
+        assert_eq!(fingerprint(&again), fingerprint(&first));
     }
 
     #[test]
