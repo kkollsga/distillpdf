@@ -64,6 +64,9 @@ echo "built: $WHEEL"
 step "Install wheel into run env ($RUN_PY)"
 "$UV" pip install --python "$RUN_PY" --force-reinstall --no-deps -q "$WHEEL"
 
+step "Install test dependencies into run env ($RUN_PY)"
+"$UV" pip install --python "$RUN_PY" -q -r tests/requirements-dev.txt
+
 # Everything below measures "distillpdf" — but nothing so far has checked that the name
 # resolves to the wheel we just built. `PYTHONPATH=/tmp/fake` with a stub package scored
 # through the whole accuracy gate without a complaint. So bind the name to this
