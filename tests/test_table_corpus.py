@@ -544,6 +544,7 @@ T3 = [f for f, r in sorted(TRUTH["files"].items()) if r["tier"] == 3]
 COMPLEX_SEMANTIC_HEADER_FAMILIES = {
     "merged_colspan",
     "multitier_header",
+    "no_header",
     "t3_kitchen_sink",
 }
 SEMANTIC_HEADER_LOCKS = [
@@ -585,11 +586,21 @@ def test_html_semantic_header_depth(fname):
     G5's original ``header_acc`` compares top-row *content* through ``extract_tables()``;
     it neither sees HTML tags nor reaches L0. Keep that positional metric, but lock semantics
     independently on every clean T1 shape, the two tagged-only L0 cases, and the T2/T3
-    complex-header families whose committed per-file truth declares more than one tier.
+    complex-header families whose committed per-file truth declares zero or multiple tiers.
     """
     rec = TRUTH["files"][fname]
     assert all(t["page"] == 0 for t in rec["tables"]), "semantic helper is page-local"
     det = detect_html_semantics(os.path.join(CORPUS, fname))
+    truth_depths = {t.get("header_rows", 1) for t in rec["tables"]}
+    if truth_depths == {0}:
+        # Count/segmentation is gated independently (and these stacked T2 cases carry an
+        # existing known-fail ledger).  Semantically, a fused emission made exclusively from
+        # zero-header owners is still zero-header: never turn its first data row into `<th>`.
+        assert det, f"{fname}: no semantic table emitted"
+        assert all(t["header_rows"] == 0 for t in det), (
+            f"{fname}: zero-header truth emitted depths "
+            f"{[t['header_rows'] for t in det]}")
+        return
     pairs = align(det, rec["tables"])
     assert len(pairs) == len(rec["tables"]), (
         f"{fname}: matched {len(pairs)} of {len(rec['tables'])} semantic tables")
