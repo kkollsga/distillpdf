@@ -53,7 +53,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet      # noqa
 from reportlab.lib.units import inch                                      # noqa: E402
 from reportlab.pdfgen import canvas as rl_canvas                          # noqa: E402
 from reportlab.platypus import (BaseDocTemplate, Frame, PageTemplate,     # noqa: E402
-                                Paragraph, SimpleDocTemplate, Spacer,
+                                PageBreak, Paragraph, SimpleDocTemplate, Spacer,
                                 Table, TableStyle)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1315,6 +1315,166 @@ def t3_adversarial():
                        "every page and must not become a body row"),
              note=f"{npages} pages; cells in row order, no dropped boundary rows. Placement "
                   f"is gated, the stitching POLICY is not (`table_count_any`).")
+
+    # --- Phase 7A cross-page preregistration -------------------------------------------
+    # These four cases freeze the continuation proof boundary before any product change:
+    # three accepted-parent negatives and one deliberately red genuine continuation.  All
+    # are two-page, four-column controlled pairs so a future stitcher cannot hide behind a
+    # page-count, shape, or column-count distinction.
+
+    cid = "t3_crosspage_independent_geometry"
+    first = [["Site", "Region", "Depth", "Grade"],
+             ["Aster", "North", "12.4", "2.1"],
+             ["Birch", "North", "18.0", "1.7"],
+             ["Cedar", "West", "24.8", "3.0"],
+             ["Dune", "South", "31.6", "2.6"],
+             ["Elm", "East", "37.3", "1.9"]]
+    second = [["Model", "Family", "Params", "Score"],
+              ["Atlas", "Linear", "12M", "31.4"],
+              ["Beacon", "Tree", "48M", "35.2"],
+              ["Cobalt", "Kernel", "27M", "33.8"],
+              ["Drift", "Linear", "19M", "32.6"],
+              ["Ember", "Tree", "61M", "36.1"]]
+    first_widths = [1.10 * inch, 1.10 * inch, 0.85 * inch, 0.85 * inch]
+    second_widths = [0.80 * inch, 1.35 * inch, 0.70 * inch, 1.25 * inch]
+    pieces = build_doc(
+        f"{cid}.pdf",
+        [Spacer(1, 430),
+         Paragraph("Table A. Northern field observations", CELL), Spacer(1, 6),
+         flow(first, "full_grid", tid=cid + "_a", colw=first_widths),
+         PageBreak(),
+         Paragraph("Table B. Independent model evaluation", CELL), Spacer(1, 6),
+         flow(second, "full_grid", tid=cid + "_b", colw=second_widths)],
+    )
+    emit(f"{cid}.pdf", tier=3, family=cid, variant="only", tagged=False, pages=2,
+         tables=[tbl(pieces[0]["draws"], first, style="full_grid"),
+                 tbl(pieces[1]["draws"], second, style="full_grid")],
+         expect={"table_count": 2, "must_not_merge": True},
+         invented="Phase 7 preregistered negative: independent tables on adjacent pages "
+                  "have the same four-column count but different x-edges and ownership",
+         note="accepted parent contract: exactly two tables; cross-page shape similarity "
+              "alone never licenses a merge")
+
+    cid = "t3_crosspage_independent_caption"
+    headers = ["Item", "Region", "Value", "Status"]
+    first = [headers,
+             ["Permit A", "North", "14", "open"],
+             ["Permit B", "South", "19", "closed"],
+             ["Permit C", "East", "23", "open"],
+             ["Permit D", "West", "28", "review"],
+             ["Permit E", "North", "34", "closed"]]
+    second = [headers,
+              ["Audit D", "North", "71", "passed"],
+              ["Audit E", "South", "64", "passed"],
+              ["Audit F", "West", "58", "review"],
+              ["Audit G", "East", "76", "passed"],
+              ["Audit H", "North", "69", "review"]]
+    widths = [1.25 * inch, 1.15 * inch, 0.85 * inch, 1.15 * inch]
+    pieces = build_doc(
+        f"{cid}.pdf",
+        [Spacer(1, 430),
+         flow(first, "full_grid", tid=cid + "_a", colw=widths), Spacer(1, 6),
+         Paragraph("Table 7. Permit register", CELL),
+         PageBreak(),
+         Paragraph("Table 8. Audit outcomes", CELL), Spacer(1, 6),
+         flow(second, "full_grid", tid=cid + "_b", colw=widths)],
+    )
+    emit(f"{cid}.pdf", tier=3, family=cid, variant="only", tagged=False, pages=2,
+         tables=[tbl(pieces[0]["draws"], first, style="full_grid"),
+                 tbl(pieces[1]["draws"], second, style="full_grid")],
+         expect={"table_count": 2, "must_not_merge": True},
+         invented="Phase 7 preregistered negative: adjacent-page tables deliberately share "
+                  "literal headers and exact x-edges but have distinct captions/ownership",
+         note="accepted parent contract: both tables retain their identical header row and "
+              "their caption-distinguished contents remain separate")
+
+    cid = "t3_crosspage_aligned_prose"
+    grid = [["Station", "Region", "Depth", "Status"],
+            ["Delta-1", "North", "11.2", "active"],
+            ["Delta-2", "South", "16.8", "active"],
+            ["Delta-3", "West", "22.5", "closed"],
+            ["Delta-4", "East", "27.9", "active"],
+            ["Delta-5", "North", "33.1", "closed"]]
+    x0, x1, top, row_h = 72.0, 540.0, 210.0, 20.0
+    col_w = (x1 - x0) / 4
+    c = rl_canvas.Canvas(os.path.join(OUT, f"{cid}.pdf"), pagesize=(PW, PH))
+    c.setFont("Helvetica", 8)
+    c.drawString(x0, top + 18, "Table 11. Stations at the end of the reporting page")
+    c.setLineWidth(1.0)
+    c.line(x0, top, x1, top)
+    c.setLineWidth(0.5)
+    c.line(x0, top - row_h, x1, top - row_h)
+    c.setLineWidth(1.0)
+    c.line(x0, top - len(grid) * row_h, x1, top - len(grid) * row_h)
+    for ri, row in enumerate(grid):
+        c.setFont("Helvetica-Bold" if ri == 0 else "Helvetica", 8.5)
+        y = top - (ri + 1) * row_h + 6
+        for ci, value in enumerate(row):
+            c.drawString(x0 + ci * col_w + 4, y, value)
+    c.showPage()
+    c.setFont("Helvetica", 9)
+    aligned = ["The field team", "continued its", "regional survey", "after dawn."]
+    for ci, value in enumerate(aligned):
+        c.drawString(x0 + ci * col_w + 4, 724, value)
+    prose = [
+        "These four aligned fragments form one sentence, not a continuation row.",
+        "The narrative then resumes across the full text width on the second page.",
+        "No word on this page belongs to the station table on the previous page.",
+    ]
+    for i, line in enumerate(prose):
+        c.drawString(x0, 694 - i * 18, line)
+    c.save()
+    bbox = [round(x0 / PW, 4), round((PH - top) / PH, 4), round(x1 / PW, 4),
+            round((PH - (top - len(grid) * row_h)) / PH, 4)]
+    emit(f"{cid}.pdf", tier=3, family=cid, variant="only", tagged=False, pages=2,
+         tables=[{"page": 0, "bbox_norm": bbox, "n_rows": len(grid), "n_cols": 4,
+                  "style": "booktabs", "header_rows": 1, "cells": to_cells(grid),
+                  "col_edges_norm": [round((x0 + i * col_w) / PW, 4) for i in range(5)],
+                  "row_edges_norm": [round((PH - top + i * row_h) / PH, 4)
+                                     for i in range(len(grid) + 1)]}],
+         expect={"table_count": 1},
+         invented="Phase 7 preregistered negative: a bottom-page table is followed by a "
+                  "top-page sentence whose four fragments align with the table columns",
+         note="accepted parent contract: one table only; exact page-2 prose survives once "
+              "and creates neither a continuation row nor a phantom table")
+
+    cid = "t3_crosspage_header_text_data"
+    headers = ["Metric", "Region", "Value", "Status"]
+    first = [headers,
+             ["Yield", "North", "41.2", "final"],
+             ["Moisture", "South", "8.7", "final"],
+             ["Density", "East", "2.4", "draft"],
+             ["Purity", "West", "97.1", "final"]]
+    # Row zero on page 2 is intentionally text-equal to the header, but it is ordinary body
+    # data: no bold/fill and no header separator.  A stitcher may suppress only independently
+    # evidenced repeated headers, never strings that merely compare equal.
+    second = [headers,
+              ["Recovery", "North", "88.0", "final"],
+              ["Loss", "South", "4.1", "draft"],
+              ["Variance", "East", "1.8", "final"],
+              ["Output", "West", "73.6", "final"]]
+    widths = [1.25 * inch, 1.15 * inch, 0.85 * inch, 1.15 * inch]
+    pieces = build_doc(
+        f"{cid}.pdf",
+        [Spacer(1, 410),
+         Paragraph("Table 14. Production measures (continued on next page)", CELL),
+         Spacer(1, 6),
+         flow(first, "full_grid", tid=cid + "_a", colw=widths),
+         PageBreak(),
+         flow(second, "full_grid", tid=cid + "_b", colw=widths, header_rows=0)],
+    )
+    logical = first + second
+    d0 = pieces[0]["draws"][0]
+    emit(f"{cid}.pdf", tier=3, family=cid, variant="only", tagged=False, pages=2,
+         tables=[{"page": d0["page"], "bbox_norm": _norm_bbox(d0),
+                  "n_rows": len(logical), "n_cols": 4, "style": "full_grid",
+                  "header_rows": 1, "cells": to_cells(logical, header_rows=1)}],
+         expect={"table_count": 1},
+         invented="Phase 7 preregistered positive: one genuine adjacent-page continuation "
+                  "whose first page-2 data row is text-equal to the four headers",
+         note="KNOWN FAIL until continuation lands: merge to one 10x4 table, retain the "
+              "text-equal page-2 row as data, and suppress no row without independent "
+              "header styling/separator ownership")
 
     # --- t3_tagged_degenerate -----------------------------------------------------------
     cid = "t3_tagged_degenerate"

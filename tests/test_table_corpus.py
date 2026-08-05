@@ -35,6 +35,7 @@ they do not silently replace or lower that older gate.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import html as html_module
 import math
@@ -1261,6 +1262,151 @@ def test_truth_schema():
                 assert set(cell.get("value_traits", ())) <= {
                     "numeric", "signed", "decimal", "percent", "unit"}
                 assert (cell["r"], cell["c"]) in anchors
+
+
+def _truth_rows(table):
+    rows = [["" for _ in range(table["n_cols"])] for _ in range(table["n_rows"])]
+    for cell in table["cells"]:
+        rows[cell["r"]][cell["c"]] = cell["text"]
+    return rows
+
+
+def test_phase7_crosspage_fixture_truth_and_provenance_are_exact():
+    """Freeze the four pre-candidate continuation controls, not just their filenames."""
+    import distillpdf
+
+    names = {
+        "t3_crosspage_independent_geometry.pdf":
+            "169a02c11f55a40e54cac8ea94633997da015d4e0bd356d09fd106725cf65e92",
+        "t3_crosspage_independent_caption.pdf":
+            "848398731a3bdbc8c83e639b7501cf5e4405d918a5745dd55dc0c4b3acc626ec",
+        "t3_crosspage_aligned_prose.pdf":
+            "2e1a9c759d4fce9442ac2b91eca209910a77c27a5af70d25862e4672f6a8fead",
+        "t3_crosspage_header_text_data.pdf":
+            "a4f13f5b619249fcec01989761a612151aabb585cf742b21360201920fcbea18",
+    }
+    for fname, expected_sha in names.items():
+        path = os.path.join(CORPUS, fname)
+        rec = TRUTH["files"][fname]
+        assert hashlib.sha256(open(path, "rb").read()).hexdigest() == expected_sha
+        assert distillpdf.Pdf.open(path).page_count() == 2
+        assert rec["tier"] == 3 and rec["pages"] == 2 and rec.get("invented") is True
+        assert rec["why"].startswith("Phase 7 preregistered")
+        assert all(table["n_cols"] == 4 for table in rec["tables"])
+
+    geometry = TRUTH["files"]["t3_crosspage_independent_geometry.pdf"]["tables"]
+    assert [(table["page"], table["n_rows"]) for table in geometry] == [(0, 6), (1, 6)]
+    assert geometry[0]["col_edges_norm"] != geometry[1]["col_edges_norm"]
+
+    caption = TRUTH["files"]["t3_crosspage_independent_caption.pdf"]["tables"]
+    assert [(table["page"], table["n_rows"]) for table in caption] == [(0, 6), (1, 6)]
+    assert caption[0]["col_edges_norm"] == caption[1]["col_edges_norm"]
+    assert _truth_rows(caption[0])[0] == _truth_rows(caption[1])[0]
+
+    prose = TRUTH["files"]["t3_crosspage_aligned_prose.pdf"]["tables"]
+    assert [(table["page"], table["n_rows"]) for table in prose] == [(0, 6)]
+
+    continuation = TRUTH["files"]["t3_crosspage_header_text_data.pdf"]["tables"]
+    assert [(table["page"], table["n_rows"]) for table in continuation] == [(0, 10)]
+    table = continuation[0]
+    assert _truth_rows(table)[5] == _truth_rows(table)[0]
+    assert all(cell["role"] == "data" for cell in table["cells"] if cell["r"] == 5)
+    assert [cell["header_path"] for cell in table["cells"] if cell["r"] == 5] == [
+        [[0, 0]], [[0, 1]], [[0, 2]], [[0, 3]],
+    ]
+
+
+@pytest.mark.parametrize(
+    "fname,expected_shapes",
+    [
+        ("t3_crosspage_independent_geometry.pdf", [(1, 6, 4), (2, 6, 4)]),
+        ("t3_crosspage_independent_caption.pdf", [(1, 6, 4), (2, 6, 4)]),
+        ("t3_crosspage_aligned_prose.pdf", [(1, 6, 4)]),
+    ],
+)
+def test_phase7_crosspage_negatives_lock_accepted_parent_behavior(fname, expected_shapes):
+    """The three hard negatives are exact accepted behavior before stitching exists."""
+    import distillpdf
+
+    path = os.path.join(CORPUS, fname)
+    rec = TRUTH["files"][fname]
+    pdf = distillpdf.Pdf.open(path)
+    assert pdf.page_count() == 2
+    expected = [
+        {"page": table["page"] + 1, "n_rows": table["n_rows"],
+         "n_cols": table["n_cols"], "cells": _truth_rows(table)}
+        for table in rec["tables"]
+    ]
+    assert pdf.extract_tables() == expected
+    analyzed = pdf.analyze_tables()
+    assert [(table["page"], table["n_rows"], table["n_cols"])
+            for table in analyzed] == expected_shapes
+
+    html = pdf.to_html(return_string=True, image_mode="drop")
+    markdown = pdf.to_markdown(return_string=True, image_mode="drop")
+    assert html.count("<table>") == len(expected)
+    assert markdown.count("| --- | --- | --- | --- |") == len(expected)
+
+    if fname == "t3_crosspage_independent_caption.pdf":
+        captions = ["Table 7. Permit register", "Table 8. Audit outcomes"]
+        assert [table["caption"] for table in analyzed] == [None, None]
+        for caption, count in zip(captions, (2, 1)):
+            assert html.count(caption) == count
+            assert markdown.count(caption) == count
+        spans = [pdf._dbg_spans_xy(page) for page in (1, 2)]
+        assert [
+            hashlib.sha256(json.dumps(page, sort_keys=True, separators=(",", ":")).encode())
+            .hexdigest()
+            for page in spans
+        ] == [
+            "11d53c20c27733f0b37b05b2b793de3f3b20c31cd03aea48f54a3a5a88c0474d",
+            "926ddef7c571ffe35c4bcc66669b2a181f26daf3b939927c0b86dff9b8852d6e",
+        ]
+        assert spans[0][-4:] == [
+            ("Table ", 78.0, 188.39999389648438, 20.007999420166016, 8.0),
+            ("7. ", 100.23199462890625, 188.39999389648438, 6.672000885009766, 8.0),
+            ("Permit ", 109.12799835205078, 188.39999389648438, 23.11199951171875, 8.0),
+            ("register", 134.4639892578125, 188.39999389648438, 26.6719970703125, 8.0),
+        ]
+        assert spans[1][:4] == [
+            ("Table ", 78.0, 720.4000244140625, 20.007999420166016, 8.0),
+            ("8. ", 100.23199462890625, 720.4000244140625, 6.672000885009766, 8.0),
+            ("Audit ", 109.12799835205078, 720.4000244140625, 18.23199462890625, 8.0),
+            ("outcomes", 129.583984375, 720.4000244140625, 34.67999267578125, 8.0),
+        ]
+    elif fname == "t3_crosspage_aligned_prose.pdf":
+        prose = [
+            "The field team continued its regional survey after dawn.",
+            "These four aligned fragments form one sentence, not a continuation row.",
+            "The narrative then resumes across the full text width on the second page.",
+            "No word on this page belongs to the station table on the previous page.",
+        ]
+        for sentence in prose:
+            assert html.count(sentence) == markdown.count(sentence) == 1
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Phase 7 red ledger: genuine cross-page continuation is not implemented yet",
+)
+def test_phase7_header_text_data_desired_continuation_contract():
+    """Text equality alone must not suppress the first page-2 row: it is authored data."""
+    import distillpdf
+
+    fname = "t3_crosspage_header_text_data.pdf"
+    table = TRUTH["files"][fname]["tables"][0]
+    rows = _truth_rows(table)
+    pdf = distillpdf.Pdf.open(os.path.join(CORPUS, fname))
+    assert pdf.extract_tables() == [
+        {"page": 1, "n_rows": 10, "n_cols": 4, "cells": rows}
+    ]
+    analyzed = pdf.analyze_tables()
+    assert len(analyzed) == 1
+    assert (analyzed[0]["page"], analyzed[0]["n_rows"], analyzed[0]["n_cols"],
+            analyzed[0]["header_rows"]) == (1, 10, 4, 1)
+    row_five = [cell for cell in analyzed[0]["cells"] if cell["row"] == 5]
+    assert [cell["text"] for cell in row_five] == rows[5]
+    assert [cell["role"] for cell in row_five] == ["data"] * 4
 
 
 def _rounded_analysis_report(value):

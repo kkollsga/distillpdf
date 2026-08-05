@@ -26579,6 +26579,2062 @@
    "tier": 3,
    "variant": "only"
   },
+  "t3_crosspage_aligned_prose.pdf": {
+   "expect": {
+    "table_count": 1
+   },
+   "family": "t3_crosspage_aligned_prose",
+   "invented": true,
+   "note": "accepted parent contract: one table only; exact page-2 prose survives once and creates neither a continuation row nor a phantom table",
+   "pages": 2,
+   "tables": [
+    {
+     "bbox_norm": [
+      0.1176,
+      0.7348,
+      0.8824,
+      0.8864
+     ],
+     "cells": [
+      {
+       "c": 0,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Station"
+      },
+      {
+       "c": 1,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Region"
+      },
+      {
+       "c": 2,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Depth"
+      },
+      {
+       "c": 3,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Status"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "Delta-1"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "North"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "11.2"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "active"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "Delta-2"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "South"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "16.8"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "active"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "Delta-3"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "West"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "22.5"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "closed"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "Delta-4"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "East"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "27.9"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "active"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "Delta-5"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "North"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "33.1"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "closed"
+      }
+     ],
+     "col_edges_norm": [
+      0.1176,
+      0.3088,
+      0.5,
+      0.6912,
+      0.8824
+     ],
+     "header_rows": 1,
+     "n_cols": 4,
+     "n_rows": 6,
+     "page": 0,
+     "row_edges_norm": [
+      0.7348,
+      0.7601,
+      0.7854,
+      0.8106,
+      0.8359,
+      0.8611,
+      0.8864
+     ],
+     "style": "booktabs"
+    }
+   ],
+   "tagged": false,
+   "tier": 3,
+   "variant": "only",
+   "why": "Phase 7 preregistered negative: a bottom-page table is followed by a top-page sentence whose four fragments align with the table columns"
+  },
+  "t3_crosspage_header_text_data.pdf": {
+   "expect": {
+    "table_count": 1
+   },
+   "family": "t3_crosspage_header_text_data",
+   "invented": true,
+   "note": "KNOWN FAIL until continuation lands: merge to one 10x4 table, retain the text-equal page-2 row as data, and suppress no row without independent header styling/separator ownership",
+   "pages": 2,
+   "tables": [
+    {
+     "bbox_norm": [
+      0.2412,
+      0.6176,
+      0.7588,
+      0.7186
+     ],
+     "cells": [
+      {
+       "c": 0,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Metric"
+      },
+      {
+       "c": 1,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Region"
+      },
+      {
+       "c": 2,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Value"
+      },
+      {
+       "c": 3,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Status"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "Yield"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "North"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "41.2"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "final"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "Moisture"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "South"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "8.7"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "final"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "Density"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "East"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "2.4"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "draft"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "Purity"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "West"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "97.1"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "final"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "Metric"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "Region"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "Value"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "Status"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 6,
+       "role": "data",
+       "text": "Recovery"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 6,
+       "role": "data",
+       "text": "North"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 6,
+       "role": "data",
+       "text": "88.0"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 6,
+       "role": "data",
+       "text": "final"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 7,
+       "role": "data",
+       "text": "Loss"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 7,
+       "role": "data",
+       "text": "South"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 7,
+       "role": "data",
+       "text": "4.1"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 7,
+       "role": "data",
+       "text": "draft"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 8,
+       "role": "data",
+       "text": "Variance"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 8,
+       "role": "data",
+       "text": "East"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 8,
+       "role": "data",
+       "text": "1.8"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 8,
+       "role": "data",
+       "text": "final"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 9,
+       "role": "data",
+       "text": "Output"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 9,
+       "role": "data",
+       "text": "West"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 9,
+       "role": "data",
+       "text": "73.6"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 9,
+       "role": "data",
+       "text": "final"
+      }
+     ],
+     "header_rows": 1,
+     "n_cols": 4,
+     "n_rows": 10,
+     "page": 0,
+     "style": "full_grid"
+    }
+   ],
+   "tagged": false,
+   "tier": 3,
+   "variant": "only",
+   "why": "Phase 7 preregistered positive: one genuine adjacent-page continuation whose first page-2 data row is text-equal to the four headers"
+  },
+  "t3_crosspage_independent_caption.pdf": {
+   "expect": {
+    "must_not_merge": true,
+    "table_count": 2
+   },
+   "family": "t3_crosspage_independent_caption",
+   "invented": true,
+   "note": "accepted parent contract: both tables retain their identical header row and their caption-distinguished contents remain separate",
+   "pages": 2,
+   "tables": [
+    {
+     "bbox_norm": [
+      0.2412,
+      0.6232,
+      0.7588,
+      0.7444
+     ],
+     "cells": [
+      {
+       "c": 0,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Item"
+      },
+      {
+       "c": 1,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Region"
+      },
+      {
+       "c": 2,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Value"
+      },
+      {
+       "c": 3,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Status"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "Permit A"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "North"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "14"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "open"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "Permit B"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "South"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "19"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "closed"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "Permit C"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "East"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "23"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "open"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "Permit D"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "West"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "28"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "review"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "Permit E"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "North"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "34"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "closed"
+      }
+     ],
+     "col_edges_norm": [
+      0.2412,
+      0.3882,
+      0.5235,
+      0.6235,
+      0.7588
+     ],
+     "header_rows": 1,
+     "n_cols": 4,
+     "n_rows": 6,
+     "page": 0,
+     "row_edges_norm": [
+      0.6232,
+      0.6434,
+      0.6636,
+      0.6838,
+      0.704,
+      0.7242,
+      0.7444
+     ],
+     "style": "full_grid"
+    },
+    {
+     "bbox_norm": [
+      0.2412,
+      0.0999,
+      0.7588,
+      0.2211
+     ],
+     "cells": [
+      {
+       "c": 0,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Item"
+      },
+      {
+       "c": 1,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Region"
+      },
+      {
+       "c": 2,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Value"
+      },
+      {
+       "c": 3,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Status"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "Audit D"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "North"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "71"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "passed"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "Audit E"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "South"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "64"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "passed"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "Audit F"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "West"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "58"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "review"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "Audit G"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "East"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "76"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "passed"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "Audit H"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "North"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "69"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "review"
+      }
+     ],
+     "col_edges_norm": [
+      0.2412,
+      0.3882,
+      0.5235,
+      0.6235,
+      0.7588
+     ],
+     "header_rows": 1,
+     "n_cols": 4,
+     "n_rows": 6,
+     "page": 1,
+     "row_edges_norm": [
+      0.0999,
+      0.1201,
+      0.1403,
+      0.1605,
+      0.1807,
+      0.2009,
+      0.2211
+     ],
+     "style": "full_grid"
+    }
+   ],
+   "tagged": false,
+   "tier": 3,
+   "variant": "only",
+   "why": "Phase 7 preregistered negative: adjacent-page tables deliberately share literal headers and exact x-edges but have distinct captions/ownership"
+  },
+  "t3_crosspage_independent_geometry.pdf": {
+   "expect": {
+    "must_not_merge": true,
+    "table_count": 2
+   },
+   "family": "t3_crosspage_independent_geometry",
+   "invented": true,
+   "note": "accepted parent contract: exactly two tables; cross-page shape similarity alone never licenses a merge",
+   "pages": 2,
+   "tables": [
+    {
+     "bbox_norm": [
+      0.2706,
+      0.6428,
+      0.7294,
+      0.764
+     ],
+     "cells": [
+      {
+       "c": 0,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Site"
+      },
+      {
+       "c": 1,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Region"
+      },
+      {
+       "c": 2,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Depth"
+      },
+      {
+       "c": 3,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Grade"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "Aster"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "North"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "12.4"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "2.1"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "Birch"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "North"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "18.0"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "1.7"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "Cedar"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "West"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "24.8"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "3.0"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "Dune"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "South"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "31.6"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "2.6"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "Elm"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "East"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "37.3"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "1.9"
+      }
+     ],
+     "col_edges_norm": [
+      0.2706,
+      0.4,
+      0.5294,
+      0.6294,
+      0.7294
+     ],
+     "header_rows": 1,
+     "n_cols": 4,
+     "n_rows": 6,
+     "page": 0,
+     "row_edges_norm": [
+      0.6428,
+      0.663,
+      0.6832,
+      0.7034,
+      0.7236,
+      0.7438,
+      0.764
+     ],
+     "style": "full_grid"
+    },
+    {
+     "bbox_norm": [
+      0.2588,
+      0.0999,
+      0.7412,
+      0.2211
+     ],
+     "cells": [
+      {
+       "c": 0,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Model"
+      },
+      {
+       "c": 1,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Family"
+      },
+      {
+       "c": 2,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Params"
+      },
+      {
+       "c": 3,
+       "header": true,
+       "header_path": [],
+       "r": 0,
+       "role": "header",
+       "text": "Score"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "Atlas"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "Linear"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "12M"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 1,
+       "role": "data",
+       "text": "31.4"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "Beacon"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "Tree"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "48M"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 2,
+       "role": "data",
+       "text": "35.2"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "Cobalt"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "Kernel"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "27M"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 3,
+       "role": "data",
+       "text": "33.8"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "Drift"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "Linear"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "19M"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 4,
+       "role": "data",
+       "text": "32.6"
+      },
+      {
+       "c": 0,
+       "header_path": [
+        [
+         0,
+         0
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "Ember"
+      },
+      {
+       "c": 1,
+       "header_path": [
+        [
+         0,
+         1
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "Tree"
+      },
+      {
+       "c": 2,
+       "header_path": [
+        [
+         0,
+         2
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "61M"
+      },
+      {
+       "c": 3,
+       "header_path": [
+        [
+         0,
+         3
+        ]
+       ],
+       "r": 5,
+       "role": "data",
+       "text": "36.1"
+      }
+     ],
+     "col_edges_norm": [
+      0.2588,
+      0.3529,
+      0.5118,
+      0.5941,
+      0.7412
+     ],
+     "header_rows": 1,
+     "n_cols": 4,
+     "n_rows": 6,
+     "page": 1,
+     "row_edges_norm": [
+      0.0999,
+      0.1201,
+      0.1403,
+      0.1605,
+      0.1807,
+      0.2009,
+      0.2211
+     ],
+     "style": "full_grid"
+    }
+   ],
+   "tagged": false,
+   "tier": 3,
+   "variant": "only",
+   "why": "Phase 7 preregistered negative: independent tables on adjacent pages have the same four-column count but different x-edges and ownership"
+  },
   "t3_interleaved.pdf": {
    "expect": {
     "must_not_merge": true,

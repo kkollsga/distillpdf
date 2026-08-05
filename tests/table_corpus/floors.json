@@ -363,6 +363,40 @@
     "grid_exact": true
    }
   },
+  "t3_crosspage_aligned_prose.pdf": {
+   "expected": "pass",
+   "measured": {
+    "cell_acc": 1.0,
+    "expect_fails": [],
+    "grid_exact": true
+   }
+  },
+  "t3_crosspage_header_text_data.pdf": {
+   "expected": "known_fail",
+   "measured": {
+    "cell_acc": 0.5,
+    "expect_fails": [
+     "table_count 2 != 1"
+    ],
+    "grid_exact": false
+   }
+  },
+  "t3_crosspage_independent_caption.pdf": {
+   "expected": "pass",
+   "measured": {
+    "cell_acc": 1.0,
+    "expect_fails": [],
+    "grid_exact": true
+   }
+  },
+  "t3_crosspage_independent_geometry.pdf": {
+   "expected": "pass",
+   "measured": {
+    "cell_acc": 1.0,
+    "expect_fails": [],
+    "grid_exact": true
+   }
+  },
   "t3_interleaved.pdf": {
    "expected": "known_fail",
    "measured": {
