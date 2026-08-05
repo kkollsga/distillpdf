@@ -84,12 +84,39 @@ pub(crate) fn introduces_list(inner: &str) -> bool {
     t.trim_end().ends_with(':')
 }
 
-/// Guarantee unique `id=` attributes: the first use of an id keeps it, later uses
-/// are suffixed ("tab-3" → "tab-3-2"). The inline-cross-reference guard removes the
-/// common cause (phantom figures), but genuine same-number elements (sub-tables on
-/// different pages) can still collide — an HTML document must not repeat an id.
+/// Document-order allocator shared by the final HTML pass and model projection. It preserves
+/// the legacy `id`, `id-2`, `id-3` sequence while also skipping suffixes already occupied by a
+/// literal source id (`id`, `id`, `id-2` becomes `id`, `id-2`, `id-2-2`).
+#[derive(Default)]
+pub(crate) struct IdDeduper {
+    next_suffix: std::collections::HashMap<String, u32>,
+    used: std::collections::HashSet<String>,
+}
+
+impl IdDeduper {
+    pub(crate) fn allocate(&mut self, raw: &str) -> String {
+        let next = self.next_suffix.entry(raw.to_string()).or_insert(1);
+        if *next == 1 && self.used.insert(raw.to_string()) {
+            *next = 2;
+            return raw.to_string();
+        }
+        let mut suffix = (*next).max(2);
+        loop {
+            let candidate = format!("{raw}-{suffix}");
+            suffix += 1;
+            if self.used.insert(candidate.clone()) {
+                *next = suffix;
+                return candidate;
+            }
+        }
+    }
+}
+
+/// Guarantee unique `id=` attributes. The inline-cross-reference guard removes the common
+/// cause (phantom figures), but genuine same-number elements (sub-tables on different pages)
+/// can still collide — an HTML document must not repeat an id.
 pub(crate) fn dedup_ids(html: &str) -> String {
-    let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut deduper = IdDeduper::default();
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
     while let Some(pos) = rest.find("id=\"") {
@@ -100,13 +127,7 @@ pub(crate) fn dedup_ids(html: &str) -> String {
             None => break,
         };
         let id = &rest[..end];
-        let n = seen.entry(id.to_string()).or_insert(0);
-        *n += 1;
-        if *n == 1 {
-            out.push_str(id);
-        } else {
-            out.push_str(&format!("{id}-{n}"));
-        }
+        out.push_str(&deduper.allocate(id));
         out.push('"');
         rest = &rest[end + 1..];
     }
@@ -234,4 +255,19 @@ pub(crate) fn substitute_images(html: String, uris: &[String], inline: bool) -> 
             o.push_str(&(idx + 1).to_string());
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dedup_ids;
+
+    #[test]
+    fn suffix_collision_ids_are_unique_and_final_output_is_idempotent() {
+        let input = r#"<i id="tab-3"></i><i id="tab-3"></i><i id="tab-3-2"></i>"#;
+        let expected =
+            r#"<i id="tab-3"></i><i id="tab-3-2"></i><i id="tab-3-2-2"></i>"#;
+        let output = dedup_ids(input);
+        assert_eq!(output, expected);
+        assert_eq!(dedup_ids(&output), output);
+    }
 }

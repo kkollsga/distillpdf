@@ -237,6 +237,10 @@ pub(crate) struct TableAnalysis {
     /// Exact provenance bit for the same proven tier. HTML carries this as an internal marker
     /// so only this table expands colspans when transformed to Markdown.
     proven_leading_tier: bool,
+    /// Exact emitted table fragment when semantic topology cannot be reconstructed from the
+    /// public model's legacy header/grid fidelity fields. This is private render state populated
+    /// only while rebuilding a model block whose existing `el_html` carrier is present.
+    fidelity_html: Option<String>,
     /// Non-wire, proof-carrying continuation state. It is absent for inferred/declared/model
     /// tables and is never serialized or projected onto the public API.
     continuation: Option<ContinuationProof>,
@@ -364,6 +368,7 @@ impl TableAnalysis {
             evidence: dedup_evidence(evidence),
             legacy_prepend_header: false,
             proven_leading_tier: false,
+            fidelity_html: None,
             continuation: None,
             ownership: None,
         }
@@ -461,6 +466,7 @@ impl TableAnalysis {
             evidence: dedup_evidence(evidence),
             legacy_prepend_header: false,
             proven_leading_tier: false,
+            fidelity_html: None,
             continuation: None,
             ownership: None,
         }
@@ -621,6 +627,14 @@ impl TableAnalysis {
         self.proven_leading_tier
     }
 
+    pub(crate) fn fidelity_html(&self) -> Option<&str> {
+        self.fidelity_html.as_deref()
+    }
+
+    pub(crate) fn restore_fidelity_html(&mut self, html: String) {
+        self.fidelity_html = Some(html);
+    }
+
     pub(crate) fn with_caption(mut self, caption: Option<(String, String, bool)>) -> Self {
         self.caption = caption.map(TableCaption::from);
         self
@@ -644,6 +658,14 @@ impl TableAnalysis {
             .iter()
             .map(|row| row.iter().map(|cell| cell.text.clone()).collect())
             .collect()
+    }
+
+    pub(crate) fn has_semantic_spans(&self) -> bool {
+        self.header.iter().chain(&self.grid).flatten().any(|cell| {
+            !cell.covered
+                && (cell.rowspan.max(1) > 1
+                    || cell.colspan.max(1) != cell.render_colspan.max(1))
+        })
     }
 
     /// Existing query-grid projection: detached colspans repeat their trimmed anchor text.

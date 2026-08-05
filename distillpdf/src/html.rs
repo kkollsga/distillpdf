@@ -619,15 +619,25 @@ pub(crate) fn emit_page_elements(els: &[PageElement]) -> String {
 /// analysis before reaching this emitter, so a `<table>` renders byte-identically whichever
 /// side built it.
 fn table_html(table: &TableAnalysis) -> String {
+    if let Some(html) = table.fidelity_html() {
+        return html.to_string();
+    }
     let cap = table.caption.as_ref().map(|c| (c.number.as_str(), c.html.as_str(), c.below));
     let provenance = if table.has_proven_leading_tier() {
         " data-dpdf-proven-leading-tier"
     } else {
         ""
     };
+    let semantic_spans = if table.has_semantic_spans() {
+        " data-dpdf-semantic-spans"
+    } else {
+        ""
+    };
     let mut tbl = match cap {
-        Some((num, _, _)) => format!("<table id=\"tab-{}\"{provenance}>", num_id(num)),
-        None => format!("<table{provenance}>"),
+        Some((num, _, _)) => {
+            format!("<table id=\"tab-{}\"{provenance}{semantic_spans}>", num_id(num))
+        }
+        None => format!("<table{provenance}{semantic_spans}>"),
     };
     // Caption as the table's own `<caption>` (the required first child) so it is
     // semantically LINKED to the table for an LLM reader — a sibling block can't be
@@ -644,25 +654,35 @@ fn table_html(table: &TableAnalysis) -> String {
     // `header` preserves the visible cell sequence/colspans while `header_rows` alone decides
     // which leading rows are `<th>`. This permits exact no-header and multi-tier declarations,
     // and lets inference reclassify over-attached rows without moving or dropping content.
-    for (ri, hrow) in table.header.iter().enumerate() {
+    let mut emit_row = |row: &[crate::table::CellAnalysis], semantic_header: bool| {
         tbl.push_str("<tr>");
-        let tag = if ri < table.header_rows { "th" } else { "td" };
-        for cell in hrow {
-            if cell.render_colspan > 1 {
-                tbl.push_str(&format!("<{tag} colspan=\"{}\">{}</{tag}>", cell.render_colspan, esc(cell.text.trim())));
-            } else {
-                tbl.push_str(&format!("<{tag}>{}</{tag}>", esc(cell.text.trim())));
+        for cell in row {
+            if cell.covered {
+                continue;
             }
+            let tag = if semantic_header { "th" } else { "td" };
+            let mut attrs = String::new();
+            let colspan = cell.colspan.max(1);
+            let rowspan = cell.rowspan.max(1);
+            if semantic_header {
+                let scope = if colspan > 1 { "colgroup" } else { "col" };
+                attrs.push_str(&format!(" scope=\"{scope}\""));
+            }
+            if colspan > 1 {
+                attrs.push_str(&format!(" colspan=\"{colspan}\""));
+            }
+            if rowspan > 1 {
+                attrs.push_str(&format!(" rowspan=\"{rowspan}\""));
+            }
+            tbl.push_str(&format!("<{tag}{attrs}>{}</{tag}>", esc(cell.text.trim())));
         }
         tbl.push_str("</tr>");
+    };
+    for (ri, hrow) in table.header.iter().enumerate() {
+        emit_row(hrow, ri < table.header_rows);
     }
     for (ri, row) in table.grid.iter().enumerate() {
-        tbl.push_str("<tr>");
-        let tag = if table.header.len() + ri < table.header_rows { "th" } else { "td" };
-        for cell in row {
-            tbl.push_str(&format!("<{tag}>{}</{tag}>", esc(cell.text.trim())));
-        }
-        tbl.push_str("</tr>");
+        emit_row(row, table.header.len() + ri < table.header_rows);
     }
     tbl.push_str("</table>");
     tbl
@@ -2629,6 +2649,7 @@ pub(crate) fn clone_span(s: &Span) -> Span {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table::{CellAnalysis, TableCellRole, TableEvidence};
 
     fn line(text: &str, y: f32) -> Line {
         Line {
@@ -2815,11 +2836,50 @@ mod tests {
         let two = render(2);
         assert_eq!(two.matches("<th").count(), 3);
         assert_eq!(two.matches("<td").count(), 2);
-        assert!(two.contains("<th colspan=\"2\">All columns</th>"));
+        assert!(two.contains(
+            "<th scope=\"colgroup\" colspan=\"2\">All columns</th>"
+        ));
 
         let through_grid = render(3);
         assert_eq!(through_grid.matches("<th").count(), 5);
         assert_eq!(through_grid.matches("<td").count(), 0);
+    }
+
+    #[test]
+    fn canonical_table_cells_emit_column_scope_and_materialized_spans() {
+        let mut group = CellAnalysis::declared(
+            "Group".into(), 0, 0, 1, 2, TableCellRole::Header, None,
+        );
+        group.role = TableCellRole::Header;
+        let mut solo = CellAnalysis::declared(
+            "Solo".into(), 0, 2, 1, 1, TableCellRole::Header, None,
+        );
+        solo.role = TableCellRole::Header;
+        let grid = vec![
+            vec![group, CellAnalysis::covered(0, 1), solo],
+            vec![
+                CellAnalysis::declared(
+                    "North".into(), 1, 0, 2, 1, TableCellRole::Data, None,
+                ),
+                CellAnalysis::new("10".into(), 1, 1, 1, 1, None),
+                CellAnalysis::new("20".into(), 1, 2, 1, 1, None),
+            ],
+            vec![
+                CellAnalysis::covered(2, 0),
+                CellAnalysis::new("11".into(), 2, 1, 1, 1, None),
+                CellAnalysis::new("21".into(), 2, 2, 1, 1, None),
+            ],
+        ];
+        let html = table_html(&TableAnalysis::from_cells(
+            Vec::new(), grid, 1, vec![TableEvidence::Declared],
+        ));
+
+        assert_eq!(
+            html,
+            "<table data-dpdf-semantic-spans><tr><th scope=\"colgroup\" colspan=\"2\">Group</th>\
+             <th scope=\"col\">Solo</th></tr><tr><td rowspan=\"2\">North</td>\
+             <td>10</td><td>20</td></tr><tr><td>11</td><td>21</td></tr></table>"
+        );
     }
 
     /// `tests/gen_fixtures.py::gen_rotated_body` — the same displayed page at `/Rotate`

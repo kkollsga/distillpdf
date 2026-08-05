@@ -26,7 +26,7 @@ use super::{
     SCHEMA_VERSION,
 };
 use crate::html::{Bbox, ElKind, PageIR};
-use crate::{frontmatter, html, links, nav, ocr};
+use crate::{frontmatter, html, links, nav, ocr, postprocess};
 
 /// Build the document model from a parsed PDF plus its raw bytes (the raw bytes back the
 /// source hash and lenient stream recovery). `file` is the display name recorded in
@@ -414,18 +414,17 @@ fn image_dims(bytes: &[u8]) -> (Option<u32>, Option<u32>) {
 /// return, for each occurrence index of a base id, its post-dedup form. Keyed `(base_id ->
 /// Vec<deduped_id>)` in occurrence order; the projection consumes them in the same walk order.
 fn post_dedup_id_map(pages_ir: &[PageIR]) -> BTreeMap<String, Vec<String>> {
-    let mut seen: BTreeMap<String, u32> = BTreeMap::new();
+    let mut deduper = postprocess::IdDeduper::default();
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut bump = |raw: &str, out: &mut BTreeMap<String, Vec<String>>| {
-        let n = seen.entry(raw.to_string()).or_insert(0);
-        *n += 1;
-        let deduped = if *n == 1 { raw.to_string() } else { format!("{raw}-{n}") };
-        out.entry(raw.to_string()).or_default().push(deduped);
-    };
-    for (_pno, els, _uris) in pages_ir {
+    for (pno, els, _uris) in pages_ir {
+        // Page-mode emission inserts this wrapper immediately before the page's elements. It
+        // participates in the live global id namespace, but is framing rather than a block id,
+        // so reserve it without adding an occurrence to the element lookup map.
+        deduper.allocate(&format!("page-{pno}"));
         for e in els {
             for raw in ids_in_fragment(&e.html()) {
-                bump(&raw, &mut out);
+                let deduped = deduper.allocate(&raw);
+                out.entry(raw).or_default().push(deduped);
             }
         }
     }
@@ -516,9 +515,16 @@ fn project_blocks(
             let bbox = e.bbox;
             match &e.kind {
                 ElKind::DestAnchors(s) => {
-                    // Page-head named-destination anchors: a fidelity-only chrome carrier. Store
-                    // its FINAL (deduped, image-substituted) fragment so render reproduces it.
-                    let frag = finalize_fragment(s, &mut dedup_cursor, &mut global_img, &deduped);
+                    // Page-head destination anchors can collide with the Page-mode wrapper,
+                    // which Section mode does not emit. Consume their Page-mode ids for model
+                    // addressing, but retain the raw fragment so each mode crosses its own exact
+                    // global dedup boundary. Generated destination anchors have no image sentinels.
+                    let (frag, _) = prepare_fidelity_fragment(
+                        s,
+                        &mut dedup_cursor,
+                        &mut global_img,
+                        &deduped,
+                    );
                     let mut b = text_block(next_id(&mut ord), BlockKind::DestAnchors, String::new(), page, bbox, &stack);
                     b.el_html = Some(frag);
                     blocks.push(b);
@@ -526,8 +532,13 @@ fn project_blocks(
                 ElKind::Header(_) => {
                     // The first-page front-matter `<header>`: a fidelity carrier (rebuilding it
                     // from `metadata` is lossy — sup author markers, the affiliation `<ol>`), so
-                    // store its FINAL fragment verbatim.
-                    let frag = finalize_fragment(&e.html(), &mut dedup_cursor, &mut global_img, &deduped);
+                    // store its raw-id fidelity fragment verbatim.
+                    let (frag, _) = prepare_fidelity_fragment(
+                        &e.html(),
+                        &mut dedup_cursor,
+                        &mut global_img,
+                        &deduped,
+                    );
                     let mut b = text_block(next_id(&mut ord), BlockKind::Header, String::new(), page, bbox, &stack);
                     b.el_html = Some(frag);
                     blocks.push(b);
@@ -602,13 +613,31 @@ fn project_blocks(
                     }
                 }
                 ElKind::Table(table) => {
-                    // Consume the table's `tab-N` id (post-dedup) in walk order, carrying the
-                    // deduped caption number so re-emit lands the same `<table id>`.
-                    let mut deduped_tab: Option<String> = None;
-                    for raw in ids_in_fragment(&e.html()) {
-                        let d = deduped(&raw, &mut dedup_cursor);
-                        if raw.starts_with("tab-") {
-                            deduped_tab = Some(d);
+                    // Semantic-only spans are not added to the public model. When the legacy
+                    // structured fields cannot reconstruct them, use the existing exact-fragment
+                    // carrier and keep that fallback private in `TableAnalysis` during rebuild.
+                    let raw_frag = e.html();
+                    // Preserve raw ids for the requested render mode; consume Page-mode final ids
+                    // separately for the block's structured address fields.
+                    let fidelity = table.has_semantic_spans().then(|| {
+                        prepare_fidelity_fragment(
+                            &raw_frag,
+                            &mut dedup_cursor,
+                            &mut global_img,
+                            &deduped,
+                        )
+                    });
+                    let mut deduped_tab = fidelity.as_ref().and_then(|(_, ids)| {
+                        ids.iter()
+                            .find(|(raw, _)| raw.starts_with("tab-"))
+                            .map(|(_, final_id)| final_id.clone())
+                    });
+                    if fidelity.is_none() {
+                        for raw in ids_in_fragment(&raw_frag) {
+                            let d = deduped(&raw, &mut dedup_cursor);
+                            if raw.starts_with("tab-") {
+                                deduped_tab = Some(d);
+                            }
                         }
                     }
                     let mut b = text_block(next_id(&mut ord), BlockKind::Table, String::new(), page, bbox, &stack);
@@ -627,16 +656,23 @@ fn project_blocks(
                         let n = deduped_tab.as_deref().map(strip_tab_prefix).unwrap_or_else(|| caption.number.clone());
                         (n, caption.html.clone(), caption.below)
                     });
+                    b.el_html = fidelity.map(|(frag, _)| frag);
                     blocks.push(b);
                 }
                 ElKind::Figure { id, caption, .. } => {
-                    // Store the figure's FINAL (deduped, image-substituted) fragment as the
-                    // fidelity surface, and re-key the image asset id to the figure's post-dedup
-                    // `fig-N`. `finalize_fragment` applies the SAME dedup + image substitution the
-                    // body does, so the stored fragment is byte-identical to its place in the body.
+                    // Store the figure's raw-id, image-substituted fidelity fragment, and re-key
+                    // the image asset id to the figure's Page-mode post-dedup `fig-N`.
                     let raw_frag = e.html();
-                    let frag = finalize_fragment(&raw_frag, &mut dedup_cursor, &mut global_img, &deduped);
-                    let deduped_fig = ids_in_fragment(&frag).into_iter().find(|d| d.starts_with("fig-"));
+                    let (frag, ids) = prepare_fidelity_fragment(
+                        &raw_frag,
+                        &mut dedup_cursor,
+                        &mut global_img,
+                        &deduped,
+                    );
+                    let deduped_fig = ids
+                        .iter()
+                        .find(|(raw, _)| raw.starts_with("fig-"))
+                        .map(|(_, final_id)| final_id.clone());
                     let mut b = text_block(next_id(&mut ord), BlockKind::Figure, String::new(), page, bbox, &stack);
                     b.caption = caption.as_ref().map(|c| nav::strip_inline(c).trim().to_string());
                     b.label = b.caption.as_deref().and_then(caption_label);
@@ -649,7 +685,12 @@ fn project_blocks(
                     blocks.push(b);
                 }
                 ElKind::Caption { text, .. } => {
-                    let frag = finalize_fragment(&e.html(), &mut dedup_cursor, &mut global_img, &deduped);
+                    let (frag, _) = prepare_fidelity_fragment(
+                        &e.html(),
+                        &mut dedup_cursor,
+                        &mut global_img,
+                        &deduped,
+                    );
                     let cap_text = nav::strip_inline(text).trim().to_string();
                     let mut b = text_block(next_id(&mut ord), BlockKind::Caption, text.clone(), page, bbox, &stack);
                     b.label = caption_label(&cap_text);
@@ -680,59 +721,29 @@ fn strip_tab_prefix(id: &str) -> String {
     id.strip_prefix("tab-").unwrap_or(id).to_string()
 }
 
-/// Finalize an element's emitted HTML fragment into the FORM IT TAKES IN THE FINAL BODY, so the
-/// model can store it as a byte-exact fidelity surface (and a model-only re-render reproduces it
-/// even though `emit_and_merge`/`assemble` are idempotent over already-finalized fragments):
-/// (1) every `id="…"` is renamed to its post-dedup form (via the running `dedup_cursor` over the
-/// document-order `dedup_map`), exactly as `dedup_ids` does; (2) every page-local `\0idx\0` image
-/// sentinel becomes its FINAL `<image N>` placeholder (drop mode), with `N` the 1-based GLOBAL
-/// image index — `global_img` is the running count of images seen in document order, which
-/// reproduces `emit_and_merge`'s per-page offset accumulation.
-fn finalize_fragment(
+/// Prepare an opaque fidelity fragment for the model while preserving its raw `id` attributes.
+/// The returned id pairs separately consume the Page-mode replay and expose `(raw, final)` for
+/// address fields. Keeping raw ids in the fragment lets Page and Section renderers apply their
+/// own document-wide dedup order. Image sentinels are mode-independent and become their final
+/// global `<image N>` placeholders here.
+fn prepare_fidelity_fragment(
     frag: &str,
     dedup_cursor: &mut BTreeMap<String, usize>,
     global_img: &mut usize,
     deduped: &impl Fn(&str, &mut BTreeMap<String, usize>) -> String,
-) -> String {
-    let mut out = String::with_capacity(frag.len());
-    let bytes = frag.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // An `id="…"` literal → emit the deduped id.
-        if frag[i..].starts_with("id=\"") {
-            out.push_str("id=\"");
-            i += 4;
-            let start = i;
-            while i < bytes.len() && bytes[i] != b'"' {
-                i += 1;
-            }
-            let raw = &frag[start..i];
-            out.push_str(&deduped(raw, dedup_cursor));
-            // keep the closing quote
-            if i < bytes.len() {
-                out.push('"');
-                i += 1;
-            }
-            continue;
-        }
-        // A `\0idx\0` image sentinel → its final global `<image N>` number (drop mode).
-        if bytes[i] == 0 {
-            let start = i + 1;
-            let mut j = start;
-            while j < bytes.len() && bytes[j] != 0 {
-                j += 1;
-            }
-            // (idx is page-local; the number we emit is the running global index + 1.)
-            out.push_str(&(*global_img + 1).to_string());
-            *global_img += 1;
-            i = j + 1; // skip past the closing NUL
-            continue;
-        }
-        let c = frag[i..].chars().next().unwrap();
-        out.push(c);
-        i += c.len_utf8();
-    }
-    out
+) -> (String, Vec<(String, String)>) {
+    let ids = ids_in_fragment(frag)
+        .into_iter()
+        .map(|raw| {
+            let final_id = deduped(&raw, dedup_cursor);
+            (raw, final_id)
+        })
+        .collect();
+    let out = postprocess::rewrite_sentinels(frag, 0, |_idx, out| {
+        out.push_str(&(*global_img + 1).to_string());
+        *global_img += 1;
+    });
+    (out, ids)
 }
 
 /// Make a block carrying the common fields (the kind-specific fields are filled by the caller),
@@ -852,6 +863,40 @@ mod tests {
         PageElement::at(ElKind::Para { text: text.into() }, None)
     }
 
+    fn model_with_blocks(npages: u32, blocks: Vec<Block>) -> DocModel {
+        DocModel {
+            schema_version: SCHEMA_VERSION,
+            source: Source {
+                file: "x.pdf".into(),
+                sha256: "ab".into(),
+                pages: npages,
+                distillpdf: "0".into(),
+                generated_at: "t".into(),
+            },
+            metadata: Metadata::default(),
+            pages: (1..=npages)
+                .map(|n| Page {
+                    n,
+                    width_pts: crate::pdfobj::DEFAULT_PAGE_PTS.0,
+                    height_pts: crate::pdfobj::DEFAULT_PAGE_PTS.1,
+                    labels: BTreeMap::new(),
+                    ocr_decision: None,
+                    active_ocr_pass: None,
+                })
+                .collect(),
+            ocr_passes: Vec::new(),
+            sections: Vec::new(),
+            indexes: derive_indexes(&blocks),
+            blocks,
+            assets: Vec::new(),
+            chunks: None,
+            embedding_spaces: Vec::new(),
+            links: Vec::new(),
+            named_dests: Vec::new(),
+            toc: Vec::new(),
+        }
+    }
+
     #[test]
     fn projects_sections_blocks_and_pages() {
         let ir: Vec<PageIR> = vec![
@@ -911,6 +956,229 @@ mod tests {
         assert_eq!(fig.caption.as_deref(), Some("Figure 3: A chart."));
         assert_eq!(fig.label.as_deref(), Some("Figure 3"));
         assert_eq!(fig.image.as_deref(), Some("img/fig_3.png"));
+    }
+
+    #[test]
+    fn page_wrapper_destination_collisions_round_trip_exactly() {
+        let pages = vec![
+            (
+                1,
+                vec![PageElement::at(
+                    ElKind::DestAnchors(
+                        "<a id=\"page-1\"></a><a id=\"page-1\"></a>".into(),
+                    ),
+                    None,
+                )],
+                vec![],
+            ),
+            (2, vec![para("Ordinary page two.")], vec![]),
+        ];
+        let (blocks, _) = project(&pages);
+        assert_eq!(
+            blocks[0].el_html.as_deref(),
+            Some("<a id=\"page-1\"></a><a id=\"page-1\"></a>")
+        );
+
+        let (live_body, image_uris) = html::emit_and_merge(&pages, html::Mode::Page);
+        let live_html = html::assemble(
+            live_body,
+            html::Mode::Page,
+            false,
+            &[],
+            &image_uris,
+            false,
+        );
+        assert_eq!(
+            ids_in_fragment(&live_html),
+            ["page-1", "page-1-2", "page-1-3", "page-2"]
+        );
+        assert_eq!(live_html.matches("<section data-page=\"2\" id=\"page-2\">").count(), 1);
+        assert!(live_html.contains("<p>Ordinary page two.</p>"));
+
+        let model = model_with_blocks(2, blocks);
+        let model_html = crate::model::render::render_html(&model, html::Mode::Page, false);
+        assert_eq!(model_html, live_html);
+        let live_markdown = crate::markdown::html_to_markdown(
+            &live_html,
+            false,
+            crate::markdown::ImgMode::Placeholder,
+        )
+        .0;
+        let model_markdown = crate::model::render::render_markdown(
+            &model,
+            html::Mode::Page,
+            false,
+            "drop",
+        )
+        .unwrap()
+        .0;
+        assert_eq!(model_markdown, live_markdown);
+        assert_eq!(model_markdown, "Ordinary page two.\n");
+
+        let (live_section_body, section_image_uris) =
+            html::emit_and_merge(&pages, html::Mode::Section);
+        let live_section_html = html::assemble(
+            live_section_body,
+            html::Mode::Section,
+            false,
+            &[],
+            &section_image_uris,
+            false,
+        );
+        assert_eq!(
+            ids_in_fragment(&live_section_html),
+            ["page-1", "page-1-2"]
+        );
+        assert!(!live_section_html.contains("data-page="));
+        assert_eq!(live_section_html.matches("<p>Ordinary page two.</p>").count(), 1);
+        let model_section_html =
+            crate::model::render::render_html(&model, html::Mode::Section, false);
+        assert_eq!(model_section_html, live_section_html);
+        let live_section_markdown = crate::markdown::html_to_markdown(
+            &live_section_html,
+            false,
+            crate::markdown::ImgMode::Placeholder,
+        )
+        .0;
+        let model_section_markdown = crate::model::render::render_markdown(
+            &model,
+            html::Mode::Section,
+            false,
+            "drop",
+        )
+        .unwrap()
+        .0;
+        assert_eq!(model_section_markdown, live_section_markdown);
+        assert_eq!(model_section_markdown, "Ordinary page two.\n");
+    }
+
+    #[test]
+    fn semantic_table_fidelity_uses_el_html_and_dedupes_caption_ids() {
+        let make_table = |number: &str| {
+            let mut table = crate::table::TableAnalysis::from_parts(
+                Vec::new(),
+                vec![
+                    vec![
+                        "Group A".into(),
+                        String::new(),
+                        String::new(),
+                        "Group B".into(),
+                        String::new(),
+                        String::new(),
+                    ],
+                    vec![
+                        "A".into(), "B".into(), "C".into(), "D".into(), "E".into(),
+                        "F".into(),
+                    ],
+                    vec![
+                        "1".into(), "2".into(), "3".into(), "4".into(), "5".into(),
+                        "6".into(),
+                    ],
+                ],
+                2,
+                None,
+                vec![crate::table::TableEvidence::Aligned],
+            );
+            table.compress_aligned_leading_group_header(&[
+                true, false, false, true, false, false,
+            ]);
+            table.with_caption(Some((
+                number.into(),
+                format!("Table {number}: <b>Grouped</b>"),
+                false,
+            )))
+        };
+        let pages = vec![(
+            1,
+            vec![
+                PageElement::at(ElKind::Table(make_table("3")), None),
+                PageElement::at(ElKind::Table(make_table("3")), None),
+                PageElement::at(ElKind::Table(make_table("3-2")), None),
+            ],
+            vec![],
+        )];
+
+        let (blocks, _) = project(&pages);
+        assert_eq!(blocks.len(), 3);
+        let first = blocks[0].el_html.as_deref().unwrap();
+        let second = blocks[1].el_html.as_deref().unwrap();
+        let third = blocks[2].el_html.as_deref().unwrap();
+        assert!(first.starts_with(
+            "<table id=\"tab-3\" data-dpdf-semantic-spans><caption>Table 3: <b>Grouped</b></caption>"
+        ));
+        assert!(second.starts_with(
+            "<table id=\"tab-3\" data-dpdf-semantic-spans><caption>Table 3: <b>Grouped</b></caption>"
+        ));
+        assert!(third.starts_with(
+            "<table id=\"tab-3-2\" data-dpdf-semantic-spans><caption>Table 3-2: <b>Grouped</b></caption>"
+        ));
+        assert_eq!(blocks[0].table_caption.as_ref().unwrap().0, "3");
+        assert_eq!(blocks[1].table_caption.as_ref().unwrap().0, "3-2");
+        assert_eq!(blocks[2].table_caption.as_ref().unwrap().0, "3-2-2");
+        assert_eq!(serde_json::to_value(&blocks[0]).unwrap().get("table_semantic_spans"), None);
+
+        let (live_body, image_uris) = html::emit_and_merge(&pages, html::Mode::Page);
+        let live_html = html::assemble(
+            live_body,
+            html::Mode::Page,
+            false,
+            &[],
+            &image_uris,
+            false,
+        );
+        assert_eq!(
+            ids_in_fragment(&live_html)
+                .into_iter()
+                .filter(|id| id.starts_with("tab-"))
+                .collect::<Vec<_>>(),
+            ["tab-3", "tab-3-2", "tab-3-2-2"]
+        );
+        let model = DocModel {
+            schema_version: SCHEMA_VERSION,
+            source: Source {
+                file: "x.pdf".into(),
+                sha256: "ab".into(),
+                pages: 1,
+                distillpdf: "0".into(),
+                generated_at: "t".into(),
+            },
+            metadata: Metadata::default(),
+            pages: vec![Page {
+                n: 1,
+                width_pts: crate::pdfobj::DEFAULT_PAGE_PTS.0,
+                height_pts: crate::pdfobj::DEFAULT_PAGE_PTS.1,
+                labels: BTreeMap::new(),
+                ocr_decision: None,
+                active_ocr_pass: None,
+            }],
+            ocr_passes: Vec::new(),
+            sections: Vec::new(),
+            indexes: derive_indexes(&blocks),
+            blocks,
+            assets: Vec::new(),
+            chunks: None,
+            embedding_spaces: Vec::new(),
+            links: Vec::new(),
+            named_dests: Vec::new(),
+            toc: Vec::new(),
+        };
+        let model_html = crate::model::render::render_html(&model, html::Mode::Page, false);
+        assert_eq!(model_html, live_html);
+        let live_markdown = crate::markdown::html_to_markdown(
+            &live_html,
+            false,
+            crate::markdown::ImgMode::Placeholder,
+        )
+        .0;
+        let model_markdown = crate::model::render::render_markdown(
+            &model,
+            html::Mode::Page,
+            false,
+            "drop",
+        )
+        .unwrap()
+        .0;
+        assert_eq!(model_markdown, live_markdown);
     }
 
     #[test]

@@ -362,11 +362,14 @@ pub struct Block {
     /// `<caption>` parts (separate from the plain-text `caption` query field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_caption: Option<(String, String, bool)>,
-    /// The EXACT emitted HTML fragment for constructs not faithfully reconstructible from the
+    /// The exact element HTML fragment for constructs not faithfully reconstructible from the
     /// structured fields alone — `figure`/`caption` (SVG, overlays, composite, captions) and the
-    /// page-chrome `header`/`dest_anchors` carriers. SVG subtrees are pulled out to `\0svg:ID\0`
-    /// sentinels (the bytes live in a `kind = svg` asset); render splices them back. `None` for
-    /// the structured kinds (heading/para/list_item/code/table/footnote).
+    /// page-chrome `header`/`dest_anchors` carriers, plus tables whose semantic spans cannot be
+    /// reconstructed from the structured table fields. SVG subtrees are pulled out to `\0svg:ID\0`
+    /// sentinels (the bytes live in a `kind = svg` asset); render splices them back. Destination
+    /// anchor IDs remain pre-dedup so Page and Section rendering can apply their mode-specific
+    /// global namespace. `None` for the structured kinds
+    /// (heading/para/list_item/code/ordinary table/footnote).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub el_html: Option<String>,
 }

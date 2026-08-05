@@ -398,7 +398,7 @@ def test_analyze_tables_only_claims_exact_ruled_cell_boundaries():
     )
 
 
-def test_analyze_tables_recovers_aligned_group_header_topology_only():
+def test_analyze_tables_recovers_aligned_group_header_topology_only(tmp_path):
     path = os.path.join(TABLE_CORPUS, "t2_merged_colspan_over_booktabs.pdf")
     pdf = distillpdf.Pdf.open(path)
     tables = pdf.analyze_tables()
@@ -418,22 +418,31 @@ def test_analyze_tables_recovers_aligned_group_header_topology_only():
         cell for cell in table["cells"] if (cell["row"], cell["col"]) == (2, 4)
     )["header_path"] == [[0, 3], [1, 4]]
 
-    # The logical annotation must not alter any existing dense consumer projection.
+    # The logical annotation must not alter the legacy raw projection. Semantic HTML consumes
+    # the canonical anchors, suppresses covered slots, and identifies grouped column headers.
     assert pdf.extract_tables()[0]["cells"][0] == [
         "Geochemistry", "", "", "Location", "", "",
     ]
-    html_table = "<table" + pdf.to_html(return_string=True).split("<table", 1)[1].split(
+    html = pdf.to_html(return_string=True)
+    html_table = "<table" + html.split("<table", 1)[1].split(
         "</table>", 1
     )[0] + "</table>"
     assert html_table.startswith(
-        "<table><tr><th>Geochemistry</th><th></th><th></th>"
-        "<th>Location</th><th></th><th></th></tr>"
+        '<table data-dpdf-semantic-spans><tr><th scope="colgroup" colspan="3">Geochemistry</th>'
+        '<th scope="colgroup" colspan="3">Location</th></tr>'
     )
-    assert 'colspan="3"' not in html_table
-    assert pdf.to_markdown(return_string=True).startswith(
+    markdown = pdf.to_markdown(return_string=True)
+    assert markdown.startswith(
         "| Geochemistry |  |  | Location |  |  |\n"
         "| --- | --- | --- | --- | --- | --- |\n"
     )
+
+    dpdf = pdf.distill(str(tmp_path / "aligned-semantic.dpdf"))
+    assert distillpdf.render_html(dpdf) == html
+    assert distillpdf.render_markdown(dpdf, image_mode="drop") == markdown
+    block = json.loads(distillpdf.load_model(dpdf))["blocks"][0]
+    assert block["el_html"] == html_table
+    assert "table_semantic_spans" not in block
 
 
 def test_ruled_group_header_moves_into_table_prose_and_model_atomically(tmp_path):
@@ -468,8 +477,9 @@ def test_ruled_group_header_moves_into_table_prose_and_model_atomically(tmp_path
     )
     html_table = "<table" + html.split("<table", 1)[1].split("</table>", 1)[0] + "</table>"
     assert html_table.startswith(
-        '<table data-dpdf-proven-leading-tier><tr><th colspan="3">Geochemistry</th>'
-        '<th colspan="3">Location</th></tr>'
+        '<table data-dpdf-proven-leading-tier><tr>'
+        '<th scope="colgroup" colspan="3">Geochemistry</th>'
+        '<th scope="colgroup" colspan="3">Location</th></tr>'
     )
     for label in ("Geochemistry", "Location"):
         assert html.count(label) == 1
@@ -511,6 +521,8 @@ def test_ruled_group_header_moves_into_table_prose_and_model_atomically(tmp_path
     assert block["table_header_rows"] == 2
     assert block["table_proven_leading_tier"] is True
     assert block["table_grid"] == legacy[1:]
+    assert "el_html" not in block
+    assert "table_semantic_spans" not in block
     assert not any(item["kind"] == "heading" for item in model["blocks"])
     assert model["sections"] == []
     assert model["toc"] == []
@@ -639,7 +651,7 @@ def test_persistent_internal_gutter_targets_are_exact_on_every_public_projection
 
     expected_html = "<table>" + "".join(
         "<tr>" + "".join(
-            f"<{('th' if row == 0 else 'td')}>{text}</{('th' if row == 0 else 'td')}>"
+            (f'<th scope="col">{text}</th>' if row == 0 else f"<td>{text}</td>")
             for text in cells
         ) + "</tr>"
         for row, cells in enumerate(rows)
@@ -737,6 +749,11 @@ def _surface_sha(value):
         value = json.dumps(
             value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         )
+    else:
+        # Phase 8 intentionally enriches every proven column header. The exact hard-negative
+        # locks continue to protect all pre-existing bytes after removing only that separately
+        # tested semantic attribute; their registered hashes do not need a baseline rewrite.
+        value = re.sub(r' scope="(?:col|colgroup)"', "", value)
     return hashlib.sha256(value.encode()).hexdigest()
 
 

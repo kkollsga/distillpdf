@@ -21,7 +21,7 @@
 //! The blocks are BOTH the queryable structure / index source of truth AND the render source of
 //! truth — there is no separate stored body. The query-lossy parts are carried as dedicated
 //! fidelity fields on the block (see [`crate::model::Block`]): figures/captions and the
-//! page-chrome `header`/`dest_anchors` carriers keep their exact emitted `el_html` fragment;
+//! page-chrome `header`/`dest_anchors` carriers keep their exact element `el_html` fragment;
 //! tables keep their header/grid/caption parts; consecutive `list_item`/`footnote` blocks carry
 //! an `el_group` so they regroup into the single `<ul>/<ol>` / `<aside>` they came from; and
 //! `block.text` is the element's minimal inline HTML. One structure, two faces.
@@ -38,10 +38,11 @@ use super::{Block, BlockKind, DocModel, TocEntry};
 /// stored `body_html`). Each block reconstructs the [`crate::html::PageElement`] it was projected
 /// from in [`crate::model::build`]; consecutive `list_item` / `footnote` blocks sharing an
 /// `el_group` regroup into the single `<ul>/<ol>` / `<aside>` element they came from; figures,
-/// captions, and the page-chrome carriers re-emit their stored `el_html` fragment verbatim
-/// (already in its FINAL deduped + image-substituted form, so [`crate::html::emit_and_merge`]'s
-/// `dedup_ids` is idempotent over it). Pages are emitted in `n` order (the model stores them
-/// sorted); a page with no blocks renders as an empty section, matching an empty source page.
+/// captions, and the page-chrome carriers re-emit their stored `el_html` fragment verbatim.
+/// Image-bearing fragments are already image-substituted; destination IDs remain pre-dedup so
+/// Page and Section modes can cross their distinct global ID boundaries. Pages are emitted in
+/// `n` order (the model stores them sorted); a page with no blocks renders as an empty section,
+/// matching an empty source page.
 fn rebuild_ir(model: &DocModel) -> Vec<PageIR> {
     // Group blocks by their page, preserving reading order.
     let mut by_page: std::collections::BTreeMap<u32, Vec<&Block>> = std::collections::BTreeMap::new();
@@ -135,6 +136,9 @@ fn elements_from_blocks(blocks: &[&Block]) -> Vec<PageElement> {
                 if b.table_proven_leading_tier == Some(true) {
                     table.restore_proven_leading_tier();
                 }
+                if let Some(fidelity_html) = b.el_html.clone() {
+                    table.restore_fidelity_html(fidelity_html);
+                }
                 out.push(PageElement::at(
                     ElKind::Table(table),
                     b.bbox,
@@ -218,9 +222,8 @@ pub fn render_html(model: &DocModel, mode: Mode, include_toc: bool) -> String {
     // Rebuild the post-transform element IR from the blocks, then run the SAME emit + merge +
     // assemble path the PDF parse path runs — so a model-only re-render is the identical code,
     // only the IR source differs (blocks, not a fresh parse). The rebuilt figure/chrome fragments
-    // are already in their final deduped + image-substituted form, so `emit_and_merge`'s
-    // `dedup_ids` is idempotent over them and the merge carries no `\0idx\0` sentinels (the URI
-    // list comes back empty → `assemble`'s `substitute_images` is a no-op).
+    // keep raw ids for this mode's global `dedup_ids` pass, while image sentinels have already
+    // been substituted (the URI list comes back empty → `assemble` is a no-op for images).
     let mut pages_ir = rebuild_ir(model);
     // The blocks are projected from the PAGE-mode IR, so they carry the page-LOCAL transforms but
     // NOT the SECTION-mode cross-page merges (a list / display equation straddling a page break is
@@ -431,7 +434,7 @@ mod tests {
         let legacy: Block = serde_json::from_value(json).unwrap();
         assert_eq!(legacy.table_header_rows, None);
         let html = render_html(&model_with_blocks(1, vec![legacy]), Mode::Page, false);
-        assert!(html.contains("<th colspan=\"2\">Group</th>"));
+        assert!(html.contains("<th scope=\"colgroup\" colspan=\"2\">Group</th>"));
         assert!(html.contains("<td>A</td><td>B</td>"));
     }
 
