@@ -16,11 +16,129 @@ use crate::nav::*;
 use crate::postprocess::*;
 use crate::profile::{DocProfile, HeadingTier};
 use crate::table::TableAnalysis;
-use crate::text::{self, Span};
+use crate::text::{self, SourceId, SourceSlice, Span};
 use crate::vector;
 use lopdf::{Document, ObjectId};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashSet};
+
+/// Canonical per-page lookup from one painted occurrence to its accepted table intervals.
+/// Built once from the final winning table set; prose-span splitting never rescans tables.
+struct TableClaimIndex {
+    by_source: BTreeMap<SourceId, Vec<(u32, u32)>>,
+}
+
+impl TableClaimIndex {
+    fn new(tables: &[crate::table::PositionedTableAnalysis]) -> Self {
+        let mut by_source: BTreeMap<SourceId, Vec<(u32, u32)>> = BTreeMap::new();
+        for claim in tables.iter().flat_map(|table| &table.claim.slices) {
+            by_source
+                .entry(claim.source())
+                .or_default()
+                .push((claim.char_start(), claim.char_end()));
+        }
+        for ranges in by_source.values_mut() {
+            ranges.sort_unstable();
+            let mut union: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+            for &(start, end) in ranges.iter() {
+                if let Some((_, previous_end)) = union.last_mut() {
+                    if start <= *previous_end {
+                        *previous_end = (*previous_end).max(end);
+                        continue;
+                    }
+                }
+                union.push((start, end));
+            }
+            *ranges = union;
+        }
+        Self { by_source }
+    }
+
+    fn overlapping(&self, source: SourceSlice) -> &[(u32, u32)] {
+        let Some(ranges) = self.by_source.get(&source.source()) else {
+            return &[];
+        };
+        let first = ranges.partition_point(|&(_, end)| end <= source.char_start());
+        let tail = &ranges[first..];
+        let count = tail.partition_point(|&(start, _)| start < source.char_end());
+        &tail[..count]
+    }
+}
+
+/// Push only the unclaimed fragments of one painted span into the page's prose input.
+/// Geometry advances along the span's baseline, so this is valid for both page-space rotated
+/// text and display-space upright prose. Untouched spans remain value-for-value clones; a
+/// wholly claimed span returns without cloning, visiting, or allocating.
+fn push_unclaimed_fragments(
+    span: &Span,
+    claims: &TableClaimIndex,
+    out: &mut Vec<Span>,
+) {
+    let source = span.source;
+    let overlapping = claims.overlapping(source);
+    if overlapping.is_empty() {
+        out.push(clone_span(span));
+        return;
+    }
+    if overlapping.len() == 1
+        && overlapping[0].0 <= source.char_start()
+        && overlapping[0].1 >= source.char_end()
+    {
+        return;
+    }
+
+    let chars: Vec<char> = span.text.chars().collect();
+    debug_assert_eq!(source.char_len() as usize, chars.len());
+    let mut cuts = vec![source.char_start(), source.char_end()];
+    for &(start, end) in overlapping {
+        cuts.push(start.max(source.char_start()));
+        cuts.push(end.min(source.char_end()));
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    let width = if span.width > 0.1 {
+        span.width
+    } else {
+        chars.len() as f32 * span.size * 0.5
+    };
+    let per_char = if chars.is_empty() { 0.0 } else { width / chars.len() as f32 };
+    let (dx, dy) = (span.angle.cos() * per_char, span.angle.sin() * per_char);
+    for range in cuts.windows(2) {
+        let (start, end) = (range[0], range[1]);
+        if start == end {
+            continue;
+        }
+        let from = (start - source.char_start()) as usize;
+        let to = (end - source.char_start()) as usize;
+        let owned = overlapping.iter().any(|&(lo, hi)| start >= lo && end <= hi);
+        if owned {
+            continue;
+        }
+        let text: String = chars[from..to].iter().collect();
+        out.push(Span {
+            x: span.x + dx * from as f32,
+            y: span.y + dy * from as f32,
+            width: per_char * (to - from) as f32,
+            text,
+            source: source.sub_slice(from, to),
+            ..clone_span(span)
+        });
+    }
+}
+
+fn prose_spans_without_table_claims(
+    spans: &[Span],
+    claims: &TableClaimIndex,
+) -> Vec<Span> {
+    if claims.by_source.is_empty() {
+        return spans.iter().map(clone_span).collect();
+    }
+    let mut out = Vec::with_capacity(spans.len());
+    for span in spans {
+        push_unclaimed_fragments(span, claims, &mut out);
+    }
+    out
+}
 
 /// A PDF named-destination name (e.g. "cite.devlin2018", "section.3.1") → a valid,
 /// stable HTML id/fragment: keep [A-Za-z0-9._-], map anything else to '-'. Used for
@@ -1427,7 +1545,18 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                 .collect()
         });
         let plinks: &[LinkBox] = turned_links.as_deref().unwrap_or(page_links.as_slice());
-        let mut lines = lines_of(dspans.iter().map(clone_span).collect(), plinks);
+        // The final accepted table set owns exact painted source intervals. Remove precisely
+        // that union before prose line assembly: a partial ruled-cell cut keeps its unclaimed
+        // Unicode fragments, while neighbouring prose inside the table bbox/margin survives.
+        // This happens only after declared-table replacement and false-table filtering, so a
+        // rejected/stale candidate can never consume a surface.
+        let table_claims = TableClaimIndex::new(&tables);
+        debug_assert!(
+            tables.iter().all(|table| !table.claim.slices.is_empty()),
+            "every accepted table must carry exact source ownership"
+        );
+        let prose_spans = prose_spans_without_table_claims(dspans, &table_claims);
+        let mut lines = lines_of(prose_spans, plinks);
         // Drop running page numbers: a line that is just a 1–4 digit number sitting
         // in the top or bottom margin band of the page (a running footer/header
         // number). Structural — keyed on position + lone-number shape, not per-doc.
@@ -2064,7 +2193,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                 && !in_prose(fig_cx, l.y)
                 && (axis_label || detect_header(l, body, Some(&profile)).is_none()))
                 || in_captioned_fig;
-            if !in_table(l.x0, l.x1, l.y) && !consumed_caption.contains(&idx) && !fig_label {
+            if !consumed_caption.contains(&idx) && !fig_label {
                 items.push(Item::L(l));
                 boxes.push((l.x0, l.x1.max(l.x0 + 0.1), l.y, l.y + l.size.max(1.0)));
             }
@@ -2502,6 +2631,109 @@ mod tests {
             tot_w: text.chars().count(),
             runs: vec![Run { text: text.to_string(), bold: false, italic: false, href: None, script: 0 }],
             font: 1,
+        }
+    }
+
+    fn claimed_table(claim: SourceSlice) -> crate::table::PositionedTableAnalysis {
+        crate::table::PositionedTableAnalysis::from_parts(
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            Vec::new(),
+            vec![vec!["owned".to_string()]],
+            0,
+            Vec::new(),
+        )
+        .with_ownership(
+            crate::table::CandidateKey::synthetic(),
+            crate::table::TableClaim::from_rows(vec![vec![claim]]),
+        )
+    }
+
+    #[test]
+    fn exact_table_claim_splitting_is_unicode_safe_and_follows_the_baseline() {
+        let source = SourceSlice::test_occurrence(7, 4);
+        let span = Span {
+            x: 10.0,
+            y: 20.0,
+            size: 10.0,
+            width: 40.0,
+            text: "Aé中Z".to_string(),
+            bold: false,
+            italic: false,
+            mono: false,
+            angle: std::f32::consts::FRAC_PI_2,
+            font: 1,
+            mcid: None,
+            source,
+        };
+        let tables = [claimed_table(source.sub_slice(1, 3))];
+        let claims = TableClaimIndex::new(&tables);
+        let mut pieces = Vec::new();
+        push_unclaimed_fragments(&span, &claims, &mut pieces);
+        assert_eq!(pieces.iter().map(|piece| piece.text.as_str()).collect::<Vec<_>>(), vec!["A", "Z"]);
+        assert!((pieces[1].x - 10.0).abs() < 0.001);
+        assert!((pieces[1].y - 50.0).abs() < 0.001);
+        assert_eq!((pieces[1].source.char_start(), pieces[1].source.char_end()), (3, 4));
+    }
+
+    #[test]
+    fn table_claim_index_handles_empty_whole_overlapping_and_sub_sliced_sources() {
+        let source = SourceSlice::test_occurrence(19, 5);
+        let span = Span {
+            x: 10.0,
+            y: 20.0,
+            size: 10.0,
+            width: 50.0,
+            text: "Aé中Z!".to_string(),
+            bold: true,
+            italic: false,
+            mono: false,
+            angle: 0.0,
+            font: 4,
+            mcid: Some(8),
+            source,
+        };
+
+        let empty = TableClaimIndex::new(&[]);
+        let unchanged = prose_spans_without_table_claims(std::slice::from_ref(&span), &empty);
+        assert_eq!(unchanged.len(), 1);
+        assert_eq!(unchanged[0].text, span.text);
+        assert_eq!((unchanged[0].x, unchanged[0].y, unchanged[0].width), (span.x, span.y, span.width));
+        assert_eq!(unchanged[0].source, span.source);
+
+        let whole = TableClaimIndex::new(&[claimed_table(source)]);
+        assert!(prose_spans_without_table_claims(std::slice::from_ref(&span), &whole).is_empty());
+
+        let overlapping = TableClaimIndex::new(&[
+            claimed_table(source.sub_slice(1, 3)),
+            claimed_table(source.sub_slice(2, 4)),
+        ]);
+        let survivors = prose_spans_without_table_claims(std::slice::from_ref(&span), &overlapping);
+        assert_eq!(survivors.iter().map(|piece| piece.text.as_str()).collect::<Vec<_>>(), vec!["A", "!"]);
+        assert_eq!(
+            survivors.iter().map(|piece| (piece.source.char_start(), piece.source.char_end())).collect::<Vec<_>>(),
+            vec![(0, 1), (4, 5)]
+        );
+
+        let sub_source = source.sub_slice(2, 5);
+        let sub_span = Span { x: 30.0, width: 30.0, text: "中Z!".to_string(), source: sub_source, ..clone_span(&span) };
+        let sub_claim = TableClaimIndex::new(&[claimed_table(source.sub_slice(2, 4))]);
+        let sub_survivors = prose_spans_without_table_claims(&[sub_span], &sub_claim);
+        assert_eq!(sub_survivors.len(), 1);
+        assert_eq!(sub_survivors[0].text, "!");
+        assert_eq!((sub_survivors[0].source.char_start(), sub_survivors[0].source.char_end()), (4, 5));
+        assert!((sub_survivors[0].x - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn prose_below_a_table_survives_when_the_table_does_not_claim_it() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/three_column_prose.pdf");
+        let raw = std::fs::read(path).expect("fixture bytes");
+        let doc = Document::load(path).expect("fixture loads");
+        let html = to_html(&doc, &raw, Mode::Page, false, false);
+        assert_eq!(html.matches("for this reach is incomplete before").count(), 3, "all three columns keep the disjoint line below the middle-column table");
+        assert_eq!(html.matches("<table").count(), 1, "the real table is unchanged");
+        for cell in ["Zone", "Depth", "18.2", "42.5", "128"] {
+            assert_eq!(html.matches(cell).count(), 1, "{cell:?} is emitted exactly once");
         }
     }
 
