@@ -2253,6 +2253,230 @@ fn detect_lanes(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PositionedTabl
     )
 }
 
+/// Split one already-admitted aligned column only when its source geometry proves two
+/// persistent lanes.  This is deliberately a refinement of a chosen model, not another model
+/// producer: every row must publish the same maximal open corridor, both sides must remain
+/// populated and horizontally aligned, and rebinding must preserve the exact source multiset
+/// of every row.
+fn persistent_internal_gutter(
+    bands: &[(f32, f32)],
+    raw_rows: &[&[Span]],
+) -> Option<Vec<(f32, f32)>> {
+    if bands.len() < 2 || raw_rows.len() < 3 {
+        return None;
+    }
+    let extent = |span: &Span| -> Option<(f32, f32)> {
+        if !span.angle.is_finite()
+            || span.angle.abs() >= 0.01
+            || span.text.trim().is_empty()
+            || !span.width.is_finite()
+            || span.width <= 0.1
+        {
+            return None;
+        }
+        let hi = span.x + span.width;
+        (span.x.is_finite() && hi.is_finite() && hi > span.x).then_some((span.x, hi))
+    };
+    // A proof may not repair missing geometry from the text itself. Every painted source in
+    // the candidate rows must publish one finite positive extent, and every raw row must be a
+    // real single baseline rather than vertically stacked lines coalesced by the table-row
+    // model. PDF coordinates are stored as f32, so exact bits are categorical evidence here;
+    // a tolerance would merely retune which multi-line layouts are allowed to masquerade as a
+    // row.
+    if raw_rows.iter().any(|row| {
+        let mut baseline: Option<u32> = None;
+        row.iter()
+            .filter(|span| !span.text.trim().is_empty())
+            .any(|span| {
+                if extent(span).is_none() || !span.y.is_finite() {
+                    return true;
+                }
+                let y = span.y.to_bits();
+                match baseline {
+                    Some(expected) => expected != y,
+                    None => {
+                        baseline = Some(y);
+                        false
+                    }
+                }
+            })
+    }) {
+        return None;
+    }
+    let center = |span: &Span| {
+        extent(span)
+            .map(|(lo, hi)| (lo + hi) * 0.5)
+            .unwrap_or(span.x)
+    };
+    let original = crate::grid::bind_rows_by_center(bands, raw_rows, center);
+    let expected_sources: Vec<Vec<SourceSlice>> = raw_rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .filter(|span| !span.text.trim().is_empty())
+                .map(|span| span.source)
+                .collect()
+        })
+        .collect();
+
+    let mut proven: Option<(usize, f32)> = None;
+    for col in 0..bands.len() {
+        let mut corridor: Option<(f32, f32)> = None;
+        let mut row_extents: Vec<Vec<(f32, f32)>> = Vec::with_capacity(original.len());
+        let mut invalid = false;
+        for row in &original {
+            let mut extents = Vec::new();
+            for span in &row[col] {
+                let Some(pair) = extent(span) else {
+                    invalid = true;
+                    break;
+                };
+                extents.push(pair);
+            }
+            if invalid {
+                break;
+            }
+            extents.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let gaps: Vec<(f32, f32)> = extents
+                .windows(2)
+                .filter_map(|pair| (pair[0].1 < pair[1].0).then_some((pair[0].1, pair[1].0)))
+                .collect();
+            if gaps.is_empty() {
+                invalid = true;
+                break;
+            }
+            let max_width = gaps
+                .iter()
+                .map(|&(lo, hi)| hi - lo)
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .expect("a nonempty finite gap set has a maximum");
+            let mut maximal = gaps
+                .iter()
+                .copied()
+                .filter(|&(lo, hi)| hi - lo == max_width);
+            let gap = maximal.next().expect("the maximum came from one gap");
+            if maximal.next().is_some() {
+                // Equal maxima do not prove which corridor carries the latent boundary.
+                invalid = true;
+                break;
+            }
+            if let Some(expected) = corridor {
+                // PDF coordinates enter Span as f32, and extent arithmetic is also f32. The
+                // owned fixtures publish identical endpoint bits in every row, so exact bits
+                // are the proof: an epsilon would turn nearby, drifting whitespace into a
+                // tunable acceptance threshold. Finite positive extents above exclude NaNs.
+                if expected.0.to_bits() != gap.0.to_bits()
+                    || expected.1.to_bits() != gap.1.to_bits()
+                {
+                    invalid = true;
+                    break;
+                }
+            } else {
+                corridor = Some(gap);
+            }
+            row_extents.push(extents);
+        }
+        if invalid {
+            continue;
+        }
+        let corridor = corridor.expect("every valid row published one exact maximal gap");
+        let cut = (corridor.0 + corridor.1) * 0.5;
+        if !cut.is_finite() || cut <= bands[col].0 || cut >= bands[col].1 {
+            continue;
+        }
+        // The candidate-column binding is only a way to discover a possible corridor. Its
+        // emptiness is a page-space fact, so prove it against every source in every row. A
+        // wide span whose centre belongs to a neighbouring column still paints this corridor
+        // and must veto the split.
+        if raw_rows.iter().any(|row| {
+            row.iter().filter(|span| !span.text.trim().is_empty()).any(|span| {
+                let (lo, hi) = extent(span).expect("all nonempty source extents were validated");
+                (lo < corridor.1 && hi > corridor.0) || (lo < cut && hi > cut)
+            })
+        }) {
+            continue;
+        }
+
+        // Each side is a lane, rather than merely a row-local pair: its painted hulls have a
+        // non-zero common horizontal overlap across every row.  The corridor itself proves
+        // ordering and that no source span crosses the cut.
+        let mut left_overlap = (f32::NEG_INFINITY, f32::INFINITY);
+        let mut right_overlap = (f32::NEG_INFINITY, f32::INFINITY);
+        for extents in &row_extents {
+            let left: Vec<(f32, f32)> = extents.iter().copied().filter(|&(_, hi)| hi <= cut).collect();
+            let right: Vec<(f32, f32)> = extents.iter().copied().filter(|&(lo, _)| lo >= cut).collect();
+            if left.is_empty()
+                || right.is_empty()
+                || extents.iter().any(|&(lo, hi)| lo < cut && cut < hi)
+            {
+                invalid = true;
+                break;
+            }
+            let hull = |items: &[(f32, f32)]| {
+                items.iter().fold(
+                    (f32::INFINITY, f32::NEG_INFINITY),
+                    |(lo, hi), &(a, b)| (lo.min(a), hi.max(b)),
+                )
+            };
+            let l = hull(&left);
+            let r = hull(&right);
+            left_overlap = (left_overlap.0.max(l.0), left_overlap.1.min(l.1));
+            right_overlap = (right_overlap.0.max(r.0), right_overlap.1.min(r.1));
+        }
+        if invalid
+            || left_overlap.0 >= left_overlap.1
+            || right_overlap.0 >= right_overlap.1
+            || proven.is_some()
+        {
+            // More than one column carrying a complete proof is ambiguous: the refinement is
+            // atomic, so do not select one by position or text.
+            if !invalid && left_overlap.0 < left_overlap.1 && right_overlap.0 < right_overlap.1 {
+                return None;
+            }
+            continue;
+        }
+        proven = Some((col, cut));
+    }
+
+    let (col, cut) = proven?;
+    let mut refined = Vec::with_capacity(bands.len() + 1);
+    refined.extend_from_slice(&bands[..col]);
+    refined.push((bands[col].0, cut));
+    refined.push((cut, bands[col].1));
+    refined.extend_from_slice(&bands[col + 1..]);
+
+    let rebound = crate::grid::bind_rows_by_center(&refined, raw_rows, center);
+    let actual_sources: Vec<Vec<SourceSlice>> = rebound
+        .iter()
+        .map(|row| {
+            row.iter()
+                .flatten()
+                .filter(|span| !span.text.trim().is_empty())
+                .map(|span| span.source)
+                .collect()
+        })
+        .collect();
+    if !exact_source_partition(&expected_sources, &actual_sources)
+        || rebound
+            .iter()
+            .any(|row| row[col].is_empty() || row[col + 1].is_empty())
+    {
+        return None;
+    }
+    Some(refined)
+}
+
+fn exact_source_partition(expected: &[Vec<SourceSlice>], actual: &[Vec<SourceSlice>]) -> bool {
+    expected.len() == actual.len()
+        && expected.iter().zip(actual).all(|(expected, actual)| {
+            let mut expected = expected.clone();
+            let mut actual = actual.clone();
+            expected.sort_unstable();
+            actual.sort_unstable();
+            expected == actual
+        })
+}
+
 /// Detect tables within a single region (one text column, or the whole page):
 /// runs of >=3 consecutive multi-cell rows sharing >=2 aligned columns (occupied
 /// in a majority of rows). Rejects word-positioned prose (words merge to a cell).
@@ -2431,7 +2655,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
         // 0 for the band model (its header-named keep legitimately produces sparse wide
         // tables), but raised for the left-x fallback so a sparse symbol SCATTER (a
         // commutative diagram, a math array) isn't clustered into a spurious table.
-        type BoundModel = (Vec<Vec<String>>, Vec<f32>, Vec<bool>);
+        type BoundModel = (Vec<Vec<String>>, Vec<f32>, Vec<bool>, Vec<(f32, f32)>);
         let try_model = |kept: Vec<(f32, f32)>, min_fill: f32| -> Option<BoundModel> {
             if kept.len() < 2 {
                 return None;
@@ -2500,6 +2724,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
                     grid,
                     kept.iter().map(|b| b.0).collect(),
                     top_anchor_styled,
+                    kept,
                 )),
                 Some(why) => {
                     if trace {
@@ -2603,7 +2828,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
         //
         // The 0.008 micro that "left-x first" buys over this is bought by giving up a committed
         // structural guarantee, so it is not taken.
-        let (grid, kept_x, top_anchor_styled) = match {
+        let (mut grid, mut kept_x, mut top_anchor_styled, kept_bands) = match {
             let (lx, nb) = (leftx_kept(), band_kept.len());
             let nl = lx.len();
             let by_alignment = try_model(lx, 0.5);
@@ -2628,6 +2853,34 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
                 return;
             }
         };
+        // The general models are intentionally conservative about column creation. Once one
+        // has been admitted, allow one stricter operation: recover an internal boundary whose
+        // empty corridor and two source lanes are independently present in every row. This is
+        // aligned-only evidence; two-row rule-banded admission and the ruled/declared grid
+        // producers retain their own topology byte for byte.
+        if !rule_banded_evidence && headers.is_empty() {
+            let raw_rows: Vec<&[Span]> = run.iter().map(|(_, _, spans)| spans.as_slice()).collect();
+            if let Some(refined_bands) = persistent_internal_gutter(&kept_bands, &raw_rows) {
+                if let Some((refined_grid, refined_x, refined_style, _)) =
+                    try_model(refined_bands, 0.0)
+                {
+                    let depth = |candidate: &[Vec<String>]| {
+                        uniform_header_depth(candidate, |ri| {
+                            run.get(ri).is_some_and(|(_, _, spans)| {
+                                spans.iter().any(|span| {
+                                    !span.text.trim().is_empty() && span.bold
+                                })
+                            })
+                        })
+                    };
+                    if depth(&refined_grid) == depth(&grid) {
+                        grid = refined_grid;
+                        kept_x = refined_x;
+                        top_anchor_styled = refined_style;
+                    }
+                }
+            }
+        }
         if trace {
             eprintln!("  ADMIT {}x{}", grid.len(), kept_x.len());
         }
@@ -3077,6 +3330,328 @@ mod tests {
             ("A", false),
         ]));
         assert!(!all_nonempty_contributors_bold([(" ", true)]));
+    }
+
+    #[test]
+    fn persistent_internal_gutter_requires_one_complete_source_geometric_proof() {
+        let span = |ordinal: u32, x: f32, text: &str| Span {
+            x,
+            y: 100.0 - ordinal as f32,
+            size: 10.0,
+            width: 8.0,
+            text: text.into(),
+            bold: false,
+            italic: false,
+            mono: false,
+            angle: 0.0,
+            font: 0,
+            mcid: None,
+            source: SourceSlice::test_occurrence(ordinal, text.chars().count()),
+        };
+        let rows = |right_x: &[f32]| -> Vec<Vec<Span>> {
+            right_x
+                .iter()
+                .enumerate()
+                .map(|(row, &right)| {
+                    let id = row as u32 * 10;
+                    let mut spans = vec![
+                        span(id + 1, 2.0, "id"),
+                        span(id + 2, 30.0, "31.2"),
+                        span(id + 3, right, "0"),
+                    ];
+                    let baseline = 100.0 - row as f32;
+                    for span in &mut spans {
+                        span.y = baseline;
+                    }
+                    spans
+                })
+                .collect()
+        };
+        let bands = [(0.0, 20.0), (20.0, 90.0)];
+        let numeric = rows(&[60.0, 60.0, 60.0, 60.0]);
+        fn refs(rows: &[Vec<Span>]) -> Vec<&[Span]> {
+            rows.iter().map(Vec::as_slice).collect()
+        }
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(&numeric)),
+            Some(vec![(0.0, 20.0), (20.0, 49.0), (49.0, 90.0)]),
+            "text-free proof accepts exact single-baseline numeric lanes"
+        );
+
+        let mut exact_edges = numeric.clone();
+        for (row, spans) in exact_edges.iter_mut().enumerate() {
+            spans[1].x += row as f32;
+            spans[1].width -= row as f32;
+            spans[2].width += row as f32;
+        }
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(&exact_edges)),
+            Some(vec![(0.0, 20.0), (20.0, 49.0), (49.0, 90.0)]),
+            "varying lane geometry is accepted when both maximal gap edges remain exact"
+        );
+
+        let mut left_edge_drift = numeric.clone();
+        left_edge_drift[1][1].width = 9.0;
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(&left_edge_drift)),
+            None,
+            "an overlapping corridor with one drifting painted-left edge is not persistent"
+        );
+
+        let mut both_edges_drift = rows(&[60.0, 61.0, 62.0, 61.0]);
+        for (row, spans) in both_edges_drift.iter_mut().enumerate() {
+            spans[1].width += (row % 3) as f32;
+        }
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(&both_edges_drift)),
+            None,
+            "a wide common intersection cannot substitute for exact row-local edges"
+        );
+
+        let mut multi_baseline = numeric.clone();
+        multi_baseline[1][2].y += 1.0;
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(&multi_baseline)),
+            None,
+            "one coalesced off-baseline source invalidates the row proof"
+        );
+
+        let chart_like: Vec<Vec<Span>> = (0..3)
+            .map(|row| {
+                let id = 800 + row * 10;
+                let baseline = 100.0 - row as f32 * 10.0;
+                let mut id_span = span(id, 2.0, "anchor");
+                id_span.y = baseline;
+                let mut upper_left = span(id + 1, 30.0, "label");
+                upper_left.y = baseline + 3.0;
+                let mut lower_left = span(id + 2, 30.0, "label");
+                lower_left.y = baseline - 3.0;
+                let mut upper_right = span(id + 3, 60.0, "1");
+                upper_right.y = baseline + 3.0;
+                let mut lower_right = span(id + 4, 60.0, "2");
+                lower_right.y = baseline - 3.0;
+                vec![id_span, upper_left, lower_left, upper_right, lower_right]
+            })
+            .collect();
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(&chart_like)),
+            None,
+            "stacked chart labels cannot use their exact repeated x-gap as a column proof"
+        );
+
+        let mut missing = numeric.clone();
+        missing[2].pop();
+        assert_eq!(persistent_internal_gutter(&bands, &refs(&missing)), None);
+        let mut missing_header_lane = numeric.clone();
+        missing_header_lane[0].pop();
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(&missing_header_lane)),
+            None
+        );
+
+        let mut empty = numeric.clone();
+        empty[1][2].text = " ".into();
+        assert_eq!(persistent_internal_gutter(&bands, &refs(&empty)), None);
+
+        let drifting = rows(&[48.0, 48.0, 78.0, 78.0]);
+        assert_eq!(persistent_internal_gutter(&bands, &refs(&drifting)), None);
+
+        let mut crossing = numeric.clone();
+        let crossing_y = crossing[1][0].y;
+        crossing[1].insert(2, {
+            let mut s = span(901, 36.0, "bridge");
+            s.width = 30.0;
+            s.y = crossing_y;
+            s
+        });
+        assert_eq!(persistent_internal_gutter(&bands, &refs(&crossing)), None);
+
+        let mut rotated = numeric.clone();
+        rotated[0][2].angle = 0.5;
+        assert_eq!(persistent_internal_gutter(&bands, &refs(&rotated)), None);
+
+        for invalid_angle in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut invalid_geometry = numeric.clone();
+            invalid_geometry[0][2].angle = invalid_angle;
+            assert_eq!(
+                persistent_internal_gutter(&bands, &refs(&invalid_geometry)),
+                None,
+                "non-finite angle {invalid_angle:?} cannot prove source geometry"
+            );
+        }
+
+        for invalid_y in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut invalid_geometry = numeric.clone();
+            invalid_geometry[0][2].y = invalid_y;
+            assert_eq!(
+                persistent_internal_gutter(&bands, &refs(&invalid_geometry)),
+                None,
+                "non-finite y {invalid_y:?} cannot prove a source baseline"
+            );
+        }
+
+        for invalid_width in [0.0, 0.1, f32::NAN, f32::INFINITY] {
+            let mut invalid_geometry = numeric.clone();
+            invalid_geometry[0][1].width = invalid_width;
+            assert_eq!(
+                persistent_internal_gutter(&bands, &refs(&invalid_geometry)),
+                None,
+                "unusable width {invalid_width:?} cannot be synthesized from text"
+            );
+        }
+
+        let mut adjacent_crossing = numeric.clone();
+        let mut wide = span(925, -30.0, "adjacent");
+        wide.width = 100.0; // centre 20: first band; paint reaches through the second's gap
+        wide.y = adjacent_crossing[1][0].y;
+        adjacent_crossing[1].insert(1, wide);
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(&adjacent_crossing)),
+            None,
+            "a source center-bound to an adjacent column still paints the corridor"
+        );
+
+        let mut ambiguous = numeric.clone();
+        for (row, spans) in ambiguous.iter_mut().enumerate() {
+            let mut middle = span(950 + row as u32, 45.0, "middle");
+            middle.y = spans[0].y;
+            spans.insert(2, middle);
+        }
+        assert_eq!(persistent_internal_gutter(&bands, &refs(&ambiguous)), None);
+
+        let short = &numeric[..2];
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(short)),
+            None,
+            "non-aligned two-row input is outside this proof"
+        );
+
+        let two_split_columns: Vec<Vec<Span>> = (0..3)
+            .map(|row| {
+                let id = 1_000 + row * 10;
+                let mut spans = vec![
+                    span(id, 2.0, "a"),
+                    span(id + 1, 12.0, "b"),
+                    span(id + 2, 30.0, "c"),
+                    span(id + 3, 60.0, "d"),
+                ];
+                for span in &mut spans {
+                    span.y = 100.0 - row as f32;
+                }
+                spans
+            })
+            .collect();
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(&two_split_columns)),
+            None,
+            "two independently splittable columns are ambiguous"
+        );
+
+        let expected = vec![vec![numeric[0][0].source, numeric[0][1].source]];
+        let mut lost = expected.clone();
+        lost[0].pop();
+        assert!(!exact_source_partition(&expected, &lost));
+        let mut duplicated = expected.clone();
+        duplicated[0].push(expected[0][0]);
+        assert!(!exact_source_partition(&expected, &duplicated));
+    }
+
+    #[test]
+    fn footnote_marker_fixtures_recover_the_persistent_notes_lane_exactly() {
+        for (name, expected_claim_hash) in [
+            ("t2_footnote_markers_asterisks.pdf", 0xfdb5ddf0e65392d4),
+            ("t2_footnote_markers_daggers.pdf", 0x6f8fe00d70bd9f46),
+        ] {
+            let path = format!(
+                "{}/../tests/table_corpus/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("{name} readable: {e}"));
+            let doc = Document::load_mem(&raw).unwrap_or_else(|e| panic!("{name} loads: {e}"));
+            let page = *doc.get_pages().get(&1).expect("page 1");
+            let spans = crate::text::extract_spans(&doc, page, &raw);
+            let tables = detect_tables_pos(&spans, &crate::vector::page_rules(&doc, page));
+            assert_eq!(tables.len(), 1, "{name}");
+            let table = &tables[0];
+            assert_eq!(table.table.evidence, vec![TableEvidence::Aligned], "{name}");
+            assert_eq!(table.table.header_rows, 1, "{name}");
+            assert_eq!((table.table.grid.len(), table.table.grid[0].len()), (5, 4), "{name}");
+            assert_eq!(
+                table.table.grid[0].iter().map(|cell| cell.text.as_str()).collect::<Vec<_>>(),
+                vec!["Model", "Params", "BLEU", "Notes"],
+                "{name}"
+            );
+            for (row, expected_note) in ["seed 0", "seed 1", "seed 2", "seed 3"].iter().enumerate() {
+                assert_eq!(table.table.grid[row + 1][3].text, *expected_note, "{name} row {row}");
+            }
+            assert_eq!(table.claim.row_count(), 5, "{name}");
+            assert!(
+                (0..5).all(|row| table.claim.row(row).is_some_and(|sources| !sources.is_empty())),
+                "{name} keeps exact per-row ownership"
+            );
+            let mut expected_sources: Vec<SourceSlice> = spans
+                .iter()
+                .filter(|span| {
+                    !span.text.trim().is_empty()
+                        && span.x >= table.bbox.x0
+                        && span.x <= table.bbox.x1
+                        && span.y >= table.bbox.y0
+                        && span.y <= table.bbox.y1
+                })
+                .map(|span| span.source)
+                .collect();
+            expected_sources.sort_unstable();
+            assert_eq!(table.claim.slices, expected_sources, "{name} source union");
+            assert_eq!(table.claim.stable_hash(), expected_claim_hash, "{name} claim hash");
+            assert_eq!(
+                table_owner_diagnostics(1, "detected", &tables),
+                format!(
+                    "DPDF_TABLE_OWNERS page=1 scope=detected candidate=aligned:0 \
+                     bbox=429f3333,4423799a,43e15bc7,4433799a evidence=aligned \
+                     rows=5 claim_rows=5 slices=24 hash={expected_claim_hash:016x}\n"
+                ),
+                "{name} ownership diagnostic"
+            );
+            assert!(table.table.grid.iter().flatten().all(|cell| cell.bbox.is_none()), "{name}");
+        }
+    }
+
+    #[test]
+    fn rule_banded_admission_does_not_use_the_aligned_internal_gutter_refinement() {
+        let span = |ordinal: u32, x: f32, y: f32, text: &str| Span {
+            x,
+            y,
+            size: 10.0,
+            width: 8.0,
+            text: text.into(),
+            bold: y > 90.0,
+            italic: false,
+            mono: false,
+            angle: 0.0,
+            font: 0,
+            mcid: None,
+            source: SourceSlice::test_occurrence(ordinal, text.chars().count()),
+        };
+        let spans = vec![
+            span(1, 10.0, 100.0, "Name"),
+            span(2, 110.0, 100.0, "Count"),
+            span(3, 210.0, 100.0, "Rate"),
+            span(4, 225.0, 100.0, "Note"),
+            span(5, 10.0, 80.0, "Alpha"),
+            span(6, 110.0, 80.0, "12"),
+            span(7, 210.0, 80.0, "4.2"),
+            span(8, 225.0, 80.0, "seed"),
+        ];
+        let tables = detect_tables_region(
+            &spans,
+            &[(0.0, 250.0, 112.0), (0.0, 250.0, 68.0)],
+        );
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].table.evidence, vec![TableEvidence::Aligned, TableEvidence::Ruled]);
+        assert_eq!((tables[0].table.grid.len(), tables[0].table.grid[0].len()), (2, 3));
+        assert_eq!(tables[0].table.grid[0][2].text, "Rate Note");
+        assert_eq!(tables[0].table.grid[1][2].text, "4.2 seed");
+        assert_eq!(tables[0].claim.len(), 8);
     }
 
     #[test]

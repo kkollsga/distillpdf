@@ -569,6 +569,169 @@ def test_group_header_topology_proof_leaves_hard_negatives_unchanged(name, expec
     assert signature == expected
 
 
+@pytest.mark.parametrize(
+    "name, rows",
+    [
+        (
+            "t2_footnote_markers_asterisks.pdf",
+            [
+                ["Model", "Params", "BLEU", "Notes"],
+                ["Alpha-1*", "80M", "31.2", "seed 0"],
+                ["Calcite-2**", "68M", "21.2", "seed 1"],
+                ["East-3***", "36M", "26.5", "seed 2"],
+                ["Quartz-4*", "17M", "25.1", "seed 3"],
+            ],
+        ),
+        (
+            "t2_footnote_markers_daggers.pdf",
+            [
+                ["Model", "Params", "BLEU", "Notes"],
+                ["Layer-1†", "22M", "37.9", "seed 0"],
+                ["Shale-2‡", "90M", "31.0", "seed 1"],
+                ["East-3§", "16M", "21.7", "seed 2"],
+                ["East-4†", "6M", "36.4", "seed 3"],
+            ],
+        ),
+    ],
+)
+def test_persistent_internal_gutter_targets_are_exact_on_every_public_projection(
+    name, rows, tmp_path,
+):
+    frozen = {
+        "t2_footnote_markers_asterisks.pdf": {
+            "file_sha": "61ccf865eebce7d0e51380150267e587d68e42ed9b2cd7b77a7b3976f82033b2",
+            "spans_sha": "33f55098914ba5efb91156ae281faa988e676e8d2715ca507221886c83684173",
+        },
+        "t2_footnote_markers_daggers.pdf": {
+            "file_sha": "b59575e5213e1f50815cf9870f2826702d86aff92cefe74831bad3252074b181",
+            "spans_sha": "d71d1096b3124ab496daa28a0043ce9f5723b685f51f4d2e228c9699b2f2c45b",
+        },
+    }[name]
+    pdf = distillpdf.Pdf.open(os.path.join(TABLE_CORPUS, name))
+    assert pdf.extract_tables() == [
+        {"page": 1, "n_rows": 5, "n_cols": 4, "cells": rows}
+    ]
+
+    analyzed = pdf.analyze_tables()
+    assert len(analyzed) == 1
+    table = analyzed[0]
+    assert table["bbox_norm"] == [
+        0.13006535172462463,
+        0.09356057643890381,
+        0.7364656925201416,
+        0.17436867952346802,
+    ]
+    assert (
+        table["n_rows"],
+        table["n_cols"],
+        table["header_rows"],
+        table["evidence"],
+        table["caption"],
+    ) == (5, 4, 1, ["aligned"], None)
+    assert [cell["text"] for cell in table["cells"]] == sum(rows, [])
+    assert all(cell["bbox_norm"] is None for cell in table["cells"])
+    assert all(cell["rowspan"] == cell["colspan"] == 1 for cell in table["cells"])
+    assert [cell["role"] for cell in table["cells"]] == ["header"] * 4 + ["data"] * 16
+    assert [cell["header_path"] for cell in table["cells"][:4]] == [[], [], [], []]
+    assert [cell["header_path"] for cell in table["cells"][4:8]] == [
+        [[0, 0]], [[0, 1]], [[0, 2]], [[0, 3]],
+    ]
+
+    expected_html = "<table>" + "".join(
+        "<tr>" + "".join(
+            f"<{('th' if row == 0 else 'td')}>{text}</{('th' if row == 0 else 'td')}>"
+            for text in cells
+        ) + "</tr>"
+        for row, cells in enumerate(rows)
+    ) + "</table>"
+    html = pdf.to_html(image_mode="drop", return_string=True)
+    html_table = "<table" + html.split("<table", 1)[1].split("</table>", 1)[0] + "</table>"
+    assert html_table == expected_html
+    assert html == (
+        '<!doctype html>\n<html>\n<head>\n<meta charset="utf-8">\n<style>\n'
+        'body{max-width:48rem;margin:auto;padding:1rem}\n'
+        'img,svg{max-width:100%;height:auto}\n</style>\n</head>\n<body>\n'
+        + expected_html
+        + '<ul><li>trained for 100 epochs. ** ablation. *** ours.</li></ul>'
+        '</body>\n</html>\n'
+    )
+
+    expected_markdown = "\n".join(
+        [
+            "| " + " | ".join(rows[0]) + " |",
+            "| --- | --- | --- | --- |",
+            *("| " + " | ".join(row) + " |" for row in rows[1:]),
+        ]
+    )
+    markdown = pdf.to_markdown(image_mode="drop", return_string=True)
+    assert markdown == (
+        expected_markdown
+        + "\n\n- trained for 100 epochs. ** ablation. *** ours.\n"
+    )
+    assert _surface_sha(pdf._dbg_spans_xy(1)) == frozen["spans_sha"]
+
+    dpdf = pdf.distill(str(tmp_path / f"{name}.dpdf"))
+    model = json.loads(distillpdf.load_model(dpdf))
+    model["source"].pop("generated_at", None)
+    table_block = {
+        "bbox": [
+            79.5999984741211,
+            653.9000244140625,
+            450.7170104980469,
+            717.9000244140625,
+        ],
+        "cells": rows,
+        "confidence": 1.0,
+        "id": "b0001",
+        "kind": "table",
+        "page": 1,
+        "table_grid": rows,
+        "table_header": [],
+        "table_header_rows": 1,
+    }
+    prose_block = {
+        "bbox": [
+            78.0,
+            632.4000244140625,
+            237.6399688720703,
+            640.4000244140625,
+        ],
+        "confidence": 1.0,
+        "el_group": 1,
+        "id": "b0002",
+        "kind": "list_item",
+        "list_ordered": False,
+        "page": 1,
+        "text": "trained for 100 epochs. ** ablation. *** ours.",
+    }
+    assert model == {
+        "assets": [],
+        "blocks": [table_block, prose_block],
+        "indexes": {
+            "coverage": {"sectioned": 0.0, "unsectioned_blocks": ["b0001", "b0002"]},
+            "kinds": {"table": [{"id": "b0001", "page": 1}]},
+            "pages": {"1": ["b0001", "b0002"]},
+            "sections": {},
+        },
+        "links": [],
+        "metadata": {"title": "BLEU Notes"},
+        "named_dests": [],
+        "ocr_passes": [],
+        "pages": [{"height_pts": 792.0, "n": 1, "width_pts": 612.0}],
+        "schema_version": 0,
+        "sections": [],
+        "source": {
+            "distillpdf": "0.1.0",
+            "file": name,
+            "pages": 1,
+            "sha256": frozen["file_sha"],
+        },
+        "toc": [],
+    }
+    assert distillpdf.render_html(dpdf) == html
+    assert distillpdf.render_markdown(dpdf, image_mode="drop") == markdown
+
+
 def _surface_sha(value):
     if not isinstance(value, str):
         value = json.dumps(
