@@ -23,6 +23,7 @@ CMYK_JPEG = os.path.join(FIX, "cmyk_jpeg.pdf")
 DECODE_JPEG = os.path.join(FIX, "decode_jpeg.pdf")
 ANNOT_APPEARANCE = os.path.join(FIX, "annot_appearance.pdf")
 RULED_BLANK = os.path.join(FIX, "ruled_blank_cells.pdf")
+TABLE_CORPUS = os.path.join(os.path.dirname(__file__), "table_corpus")
 
 
 def test_open_and_page_count():
@@ -374,6 +375,79 @@ def test_analyze_tables_only_claims_exact_ruled_cell_boundaries():
         for table in inferred if "ruled" not in table["evidence"]
         for cell in table["cells"]
     )
+
+
+def test_analyze_tables_recovers_aligned_group_header_topology_only():
+    path = os.path.join(TABLE_CORPUS, "t2_merged_colspan_over_booktabs.pdf")
+    pdf = distillpdf.Pdf.open(path)
+    tables = pdf.analyze_tables()
+    assert len(tables) == 1
+    table = tables[0]
+    assert (table["n_rows"], table["n_cols"], table["header_rows"]) == (8, 6, 2)
+    assert table["evidence"] == ["aligned"]
+    assert len(table["cells"]) == 44
+    assert [
+        (cell["col"], cell["colspan"], cell["text"])
+        for cell in table["cells"] if cell["row"] == 0
+    ] == [(0, 3, "Geochemistry"), (3, 3, "Location")]
+    assert next(
+        cell for cell in table["cells"] if (cell["row"], cell["col"]) == (2, 2)
+    )["header_path"] == [[0, 0], [1, 2]]
+    assert next(
+        cell for cell in table["cells"] if (cell["row"], cell["col"]) == (2, 4)
+    )["header_path"] == [[0, 3], [1, 4]]
+
+    # The logical annotation must not alter any existing dense consumer projection.
+    assert pdf.extract_tables()[0]["cells"][0] == [
+        "Geochemistry", "", "", "Location", "", "",
+    ]
+    html_table = "<table" + pdf.to_html(return_string=True).split("<table", 1)[1].split(
+        "</table>", 1
+    )[0] + "</table>"
+    assert html_table.startswith(
+        "<table><tr><th>Geochemistry</th><th></th><th></th>"
+        "<th>Location</th><th></th><th></th></tr>"
+    )
+    assert 'colspan="3"' not in html_table
+    assert pdf.to_markdown(return_string=True).startswith(
+        "| Geochemistry |  |  | Location |  |  |\n"
+        "| --- | --- | --- | --- | --- | --- |\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("t2_blank_cells_grid_10pct.pdf", [(10, 6, 1, ("ruled", "aligned"), 60, 0)]),
+        ("t2_blank_cells_grid_30pct.pdf", [(10, 6, 1, ("ruled", "aligned"), 60, 0)]),
+        ("t3_blank_borderless.pdf", [(8, 5, 1, ("aligned",), 40, 0)]),
+        ("t3_spacer_cols.pdf", [(6, 11, 1, ("aligned",), 66, 0)]),
+        ("t1_booktabs_in_prose.pdf", [(5, 4, 1, ("aligned",), 20, 0)]),
+        ("t1_booktabs_small.pdf", [(5, 4, 1, ("aligned",), 20, 0)]),
+        ("t1_booktabs_tagged.pdf", [(5, 5, 1, ("aligned",), 25, 0)]),
+        ("t1_booktabs_source_median.pdf", [(6, 5, 1, ("aligned",), 28, 1)]),
+        ("t2_multitier_header_two_tier.pdf", [(7, 7, 2, ("ruled", "aligned"), 49, 0)]),
+        ("t2_multitier_header_three_tier.pdf", [(8, 9, 3, ("ruled", "aligned"), 72, 0)]),
+        ("t2_multitier_header_four_tier.pdf", [(9, 9, 4, ("ruled", "aligned"), 81, 0)]),
+        ("t2_no_header_borderless.pdf", [(27, 4, 1, ("aligned",), 108, 0)]),
+        ("t2_no_header_grid.pdf", [(28, 4, 1, ("ruled", "aligned"), 112, 0)]),
+        ("t2_merged_colspan_over_grid.pdf", [(7, 6, 2, ("ruled", "aligned"), 42, 0)]),
+    ],
+)
+def test_group_header_topology_proof_leaves_hard_negatives_unchanged(name, expected):
+    tables = distillpdf.Pdf.open(os.path.join(TABLE_CORPUS, name)).analyze_tables()
+    signature = [
+        (
+            table["n_rows"],
+            table["n_cols"],
+            table["header_rows"],
+            tuple(table["evidence"]),
+            len(table["cells"]),
+            sum(cell["rowspan"] > 1 or cell["colspan"] > 1 for cell in table["cells"]),
+        )
+        for table in tables
+    ]
+    assert signature == expected
 
 
 def test_extract_links_shapes():

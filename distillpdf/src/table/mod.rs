@@ -78,9 +78,9 @@ pub(crate) struct CellAnalysis {
     pub(crate) col: usize,
     pub(crate) rowspan: usize,
     pub(crate) colspan: usize,
-    /// Colspan of the current byte-stable HTML/model projection.  This differs from
-    /// `colspan` only for declared cells: the existing declared renderer expands spans into
-    /// dense slots even though the declaration itself retains the exact topology above.
+    /// Colspan of the current byte-stable HTML/model projection.  This can differ from
+    /// `colspan` when a producer retains a dense legacy row while the analysis surface has
+    /// stronger logical topology (declared cells and conservatively proven grouped headers).
     pub(crate) render_colspan: usize,
     pub(crate) role: TableCellRole,
     /// This dense slot is covered by an earlier row/column-spanning anchor.
@@ -302,6 +302,84 @@ impl TableAnalysis {
             header_rows,
             caption: caption.map(TableCaption::from),
             evidence: dedup_evidence(evidence),
+        }
+    }
+
+    /// Recover logical colspans from a conservatively proven dense projection emitted by the
+    /// alignment detector: a leading grouped-header row whose labels each own a non-empty run
+    /// of leaf headers in the next tier.
+    ///
+    /// This is deliberately an analysis-only annotation.  The cells stay in their original
+    /// vectors, their text and `render_colspan` stay untouched, and covered slots are merely
+    /// hidden from [`AnalyzedTable`].  Consequently the legacy grid, HTML/Markdown, and durable
+    /// model projections remain byte-for-byte the alignment detector's answer.
+    pub(crate) fn compress_aligned_leading_group_header(
+        &mut self,
+        top_anchor_styled: &[bool],
+    ) {
+        if !self.header.is_empty()
+            || self.header_rows < 2
+            || self.grid.len() <= self.header_rows
+            || self.evidence.as_slice() != [TableEvidence::Aligned]
+        {
+            return;
+        }
+        let Some(top) = self.grid.first() else {
+            return;
+        };
+        let Some(leaves) = self.grid.get(1) else {
+            return;
+        };
+        let width = top.len();
+        let is_dense_header_row = |cells: &[CellAnalysis], logical_row: usize| {
+            cells.len() == width
+                && cells.iter().enumerate().all(|(col, cell)| {
+                    cell.row == logical_row
+                        && cell.col == col
+                        && cell.rowspan == 1
+                        && cell.colspan == 1
+                        && cell.render_colspan == 1
+                        && !cell.covered
+                        && cell.role == TableCellRole::Header
+                })
+        };
+        if width < 4
+            || top_anchor_styled.len() != width
+            || !is_dense_header_row(top, 0)
+            || !is_dense_header_row(leaves, 1)
+            || leaves.iter().any(|cell| cell.text.trim().is_empty())
+        {
+            return;
+        }
+
+        let starts: Vec<usize> = top
+            .iter()
+            .enumerate()
+            .filter_map(|(col, cell)| (!cell.text.trim().is_empty()).then_some(col))
+            .collect();
+        if starts.len() < 2 || starts[0] != 0 {
+            return;
+        }
+        if starts.iter().any(|&col| !top_anchor_styled[col]) {
+            return;
+        }
+        let groups: Vec<(usize, usize)> = starts
+            .iter()
+            .copied()
+            .zip(starts.iter().copied().skip(1).chain(std::iter::once(width)))
+            .collect();
+        // Every label must own at least one following blank slot.  Because `starts` contains
+        // every non-empty top-tier cell, this also proves that all intervening slots are blank.
+        if groups.iter().any(|&(start, end)| end.saturating_sub(start) < 2) {
+            return;
+        }
+
+        let top = &mut self.grid[0];
+        for (start, end) in groups {
+            top[start].colspan = end - start;
+            for cell in &mut top[start + 1..end] {
+                cell.covered = true;
+            }
         }
     }
 
@@ -747,5 +825,167 @@ mod tests {
         assert_eq!(table.cells[0].colspan, 2);
         assert_eq!(table.cells[3].header_path, vec![[0, 0], [1, 0]]);
         assert_eq!(table.cells[4].header_path, vec![[0, 0], [1, 1]]);
+    }
+
+    fn dense_grouped_header(evidence: Vec<TableEvidence>, header_rows: usize) -> TableAnalysis {
+        TableAnalysis::from_parts(
+            Vec::new(),
+            vec![
+                vec![
+                    "Group A".into(),
+                    String::new(),
+                    String::new(),
+                    "Group B".into(),
+                    String::new(),
+                    String::new(),
+                ],
+                vec!["A".into(), "B".into(), "C".into(), "D".into(), "E".into(), "F".into()],
+                vec!["1".into(), "2".into(), "3".into(), "4".into(), "5".into(), "6".into()],
+            ],
+            header_rows,
+            None,
+            evidence,
+        )
+    }
+
+    #[test]
+    fn aligned_group_header_gets_logical_spans_without_changing_dense_projections() {
+        let dense = vec![
+            vec![
+                "Group A".to_string(),
+                String::new(),
+                String::new(),
+                "Group B".to_string(),
+                String::new(),
+                String::new(),
+            ],
+            vec!["A".into(), "B".into(), "C".into(), "D".into(), "E".into(), "F".into()],
+            vec!["1".into(), "2".into(), "3".into(), "4".into(), "5".into(), "6".into()],
+        ];
+        let mut table = dense_grouped_header(vec![TableEvidence::Aligned], 2);
+        table.compress_aligned_leading_group_header(&[true, false, false, true, false, false]);
+
+        assert_eq!(table.grid_parts(), dense);
+        assert!(table.header_parts().is_empty());
+        assert_eq!(table.grid[0].len(), 6, "dense render slots remain present");
+        assert_eq!(table.grid[0][0].colspan, 3);
+        assert_eq!(table.grid[0][3].colspan, 3);
+        assert!(table.grid[0][1..3].iter().all(|cell| cell.covered));
+        assert!(table.grid[0][4..6].iter().all(|cell| cell.covered));
+        assert!(table.grid[0].iter().all(|cell| cell.render_colspan == 1));
+
+        let public = PositionedTableAnalysis {
+            bbox: Rect::new(0.0, 0.0, 60.0, 30.0),
+            table,
+            key: CandidateKey::synthetic(),
+            claim: TableClaim::default(),
+        }
+        .into_public(1, |rect| Some(rect.into()));
+        assert_eq!((public.n_rows, public.n_cols, public.cells.len()), (3, 6, 14));
+        assert_eq!(
+            public
+                .cells
+                .iter()
+                .filter(|cell| cell.row == 0)
+                .map(|cell| (cell.col, cell.colspan, cell.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, 3, "Group A"), (3, 3, "Group B")]
+        );
+        assert_eq!(public.cells[8].header_path, vec![[0, 0], [1, 0]]);
+        assert_eq!(public.cells[10].header_path, vec![[0, 0], [1, 2]]);
+        assert_eq!(public.cells[11].header_path, vec![[0, 3], [1, 3]]);
+        assert_eq!(public.cells[13].header_path, vec![[0, 3], [1, 5]]);
+    }
+
+    #[test]
+    fn grouped_header_proof_refuses_non_aligned_or_shallow_candidates() {
+        for (evidence, header_rows) in [
+            (vec![TableEvidence::Ruled, TableEvidence::Aligned], 2),
+            (vec![TableEvidence::Declared], 2),
+            (vec![TableEvidence::Aligned], 1),
+        ] {
+            let mut table = dense_grouped_header(evidence, header_rows);
+            table.compress_aligned_leading_group_header(&[
+                true, false, false, true, false, false,
+            ]);
+            assert!(table.grid.iter().flatten().all(|cell| cell.colspan == 1));
+            assert!(table.grid.iter().flatten().all(|cell| !cell.covered));
+        }
+    }
+
+    #[test]
+    fn grouped_header_proof_requires_full_leaf_ownership_and_blank_runs() {
+        let cases = [
+            vec![
+                vec!["Group A".into(), String::new(), "Group B".into(), String::new()],
+                vec!["A".into(), String::new(), "C".into(), "D".into()],
+            ],
+            vec![
+                vec!["Group A".into(), "Ungrouped".into(), "Group B".into(), String::new()],
+                vec!["A".into(), "B".into(), "C".into(), "D".into()],
+            ],
+            vec![
+                vec![String::new(), "Group A".into(), String::new(), "Group B".into()],
+                vec!["A".into(), "B".into(), "C".into(), "D".into()],
+            ],
+        ];
+        for grid in cases {
+            let mut table = TableAnalysis::from_parts(
+                Vec::new(),
+                grid,
+                2,
+                None,
+                vec![TableEvidence::Aligned],
+            );
+            table.compress_aligned_leading_group_header(&[true, false, true, false]);
+            assert!(table.grid.iter().flatten().all(|cell| cell.colspan == 1));
+            assert!(table.grid.iter().flatten().all(|cell| !cell.covered));
+        }
+
+        let mut unstyled = dense_grouped_header(vec![TableEvidence::Aligned], 2);
+        unstyled.compress_aligned_leading_group_header(&[
+            true, false, false, false, false, false,
+        ]);
+        assert!(unstyled.grid.iter().flatten().all(|cell| cell.colspan == 1));
+        assert!(unstyled.grid.iter().flatten().all(|cell| !cell.covered));
+
+        let mut no_body = dense_grouped_header(vec![TableEvidence::Aligned], 2);
+        no_body.grid.pop();
+        no_body.compress_aligned_leading_group_header(&[
+            true, false, false, true, false, false,
+        ]);
+        assert!(no_body.grid.iter().flatten().all(|cell| cell.colspan == 1));
+        assert!(no_body.grid.iter().flatten().all(|cell| !cell.covered));
+
+        let mut existing = dense_grouped_header(vec![TableEvidence::Aligned], 2);
+        existing.grid[0][0].colspan = 3;
+        existing.compress_aligned_leading_group_header(&[
+            true, false, false, true, false, false,
+        ]);
+        assert_eq!(existing.grid[0][3].colspan, 1);
+        assert!(existing.grid[0].iter().all(|cell| !cell.covered));
+
+        let mut detached = TableAnalysis::from_parts(
+            vec![vec![
+                ("Group A".into(), 1),
+                (String::new(), 1),
+                (String::new(), 1),
+                ("Group B".into(), 1),
+                (String::new(), 1),
+                (String::new(), 1),
+            ]],
+            vec![
+                vec!["A".into(), "B".into(), "C".into(), "D".into(), "E".into(), "F".into()],
+                vec!["1".into(), "2".into(), "3".into(), "4".into(), "5".into(), "6".into()],
+            ],
+            2,
+            None,
+            vec![TableEvidence::Aligned],
+        );
+        detached.compress_aligned_leading_group_header(&[
+            true, false, false, true, false, false,
+        ]);
+        assert!(detached.header.iter().flatten().all(|cell| cell.colspan == 1));
+        assert!(detached.header.iter().flatten().all(|cell| !cell.covered));
     }
 }

@@ -1491,6 +1491,22 @@ fn uniform_header_depth(
     1
 }
 
+fn all_nonempty_contributors_bold<'a>(
+    contributors: impl IntoIterator<Item = (&'a str, bool)>,
+) -> bool {
+    let mut found = false;
+    for (text, bold) in contributors {
+        if text.trim().is_empty() {
+            continue;
+        }
+        found = true;
+        if !bold {
+            return false;
+        }
+    }
+    found
+}
+
 /// A lattice bigger than this is a chart's gridlines or a calendar of nothing; building a grid
 /// of that size from spans is pure cost.
 const MAX_LATTICE_CELLS: usize = 4096;
@@ -2174,7 +2190,8 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
         // 0 for the band model (its header-named keep legitimately produces sparse wide
         // tables), but raised for the left-x fallback so a sparse symbol SCATTER (a
         // commutative diagram, a math array) isn't clustered into a spurious table.
-        let try_model = |kept: Vec<(f32, f32)>, min_fill: f32| -> Option<(Vec<Vec<String>>, Vec<f32>)> {
+        type BoundModel = (Vec<Vec<String>>, Vec<f32>, Vec<bool>);
+        let try_model = |kept: Vec<(f32, f32)>, min_fill: f32| -> Option<BoundModel> {
             if kept.len() < 2 {
                 return None;
             }
@@ -2213,6 +2230,23 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
                         .collect()
                 })
                 .collect();
+            // Retain only the minimum style proof needed after model selection: whether every
+            // contributing non-empty span in each top-row cell is bold.  The strings alone
+            // cannot distinguish a genuine grouped header from a sparse data row, and
+            // recomputing this after `kept` is discarded would no longer follow the chosen
+            // binding.
+            let top_anchor_styled: Vec<bool> = bound
+                .first()
+                .map(|row| {
+                    row.iter()
+                        .map(|spans| {
+                            all_nonempty_contributors_bold(
+                                spans.iter().map(|span| (span.text.as_str(), span.bold)),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             if min_fill > 0.0 {
                 let total = grid.len() * kept.len();
                 let filled = grid.iter().flatten().filter(|c| !c.trim().is_empty()).count();
@@ -2221,7 +2255,11 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
                 }
             }
             match incoherent_reason(&grid) {
-                None => Some((grid, kept.iter().map(|b| b.0).collect())),
+                None => Some((
+                    grid,
+                    kept.iter().map(|b| b.0).collect(),
+                    top_anchor_styled,
+                )),
                 Some(why) => {
                     if trace {
                         eprintln!("    INCOHERENT[{why}] {}x{} :: {:?}", grid.len(), kept.len(), &grid[..grid.len().min(3)]);
@@ -2324,7 +2362,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
         //
         // The 0.008 micro that "left-x first" buys over this is bought by giving up a committed
         // structural guarantee, so it is not taken.
-        let (grid, kept_x) = match {
+        let (grid, kept_x, top_anchor_styled) = match {
             let (lx, nb) = (leftx_kept(), band_kept.len());
             let nl = lx.len();
             let by_alignment = try_model(lx, 0.5);
@@ -2474,9 +2512,11 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
         } else {
             header.len()
         };
+        let uniform_depth_selected =
+            header.is_empty() && header_rows >= 2 && header_rows == uniform_header_rows;
         header_claim_rows.extend(data_claim_rows);
         let claim = TableClaim::from_rows(header_claim_rows);
-        tables.push(PositionedTableAnalysis::from_parts(
+        let mut table = PositionedTableAnalysis::from_parts(
             crate::geom::Rect::new(
                 x_left,
                 run.last().map(|(y, _, _)| *y).unwrap_or(0.0),
@@ -2491,7 +2531,14 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
             } else {
                 vec![TableEvidence::Aligned]
             },
-        ).with_ownership(CandidateKey::synthetic(), claim));
+        )
+        .with_ownership(CandidateKey::synthetic(), claim);
+        if uniform_depth_selected {
+            table
+                .table
+                .compress_aligned_leading_group_header(&top_anchor_styled);
+        }
+        tables.push(table);
     };
 
     let n = celled.len();
@@ -2775,6 +2822,20 @@ mod tests {
             1,
             "a later styled band cannot extend a complete leaf header"
         );
+    }
+
+    #[test]
+    fn grouped_header_style_proof_rejects_a_mixed_bold_anchor() {
+        assert!(all_nonempty_contributors_bold([
+            ("Group", true),
+            (" ", false),
+            ("A", true),
+        ]));
+        assert!(!all_nonempty_contributors_bold([
+            ("Group", true),
+            ("A", false),
+        ]));
+        assert!(!all_nonempty_contributors_bold([(" ", true)]));
     }
 
     #[test]
@@ -3913,5 +3974,51 @@ mod tests {
             }
             assert_eq!(old.cells, dense, "numeric.pdf has no detached header ambiguity");
         }
+    }
+
+    #[test]
+    fn aligned_grouped_header_is_logical_only_and_keeps_the_dense_legacy_grid() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/table_corpus/t2_merged_colspan_over_booktabs.pdf"
+        );
+        let raw = std::fs::read(path).expect("owned grouped-header fixture bytes");
+        let doc = Document::load_mem(&raw).expect("owned grouped-header fixture loads");
+
+        let analyzed = analyze_tables(&doc, &raw);
+        assert_eq!(analyzed.len(), 1);
+        let table = &analyzed[0];
+        assert_eq!((table.n_rows, table.n_cols, table.header_rows), (8, 6, 2));
+        assert_eq!(table.evidence, vec![TableEvidence::Aligned]);
+        assert_eq!(table.cells.len(), 44);
+        assert_eq!(
+            table
+                .cells
+                .iter()
+                .filter(|cell| cell.row == 0)
+                .map(|cell| (cell.col, cell.colspan, cell.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, 3, "Geochemistry"), (3, 3, "Location")]
+        );
+        let data = table
+            .cells
+            .iter()
+            .find(|cell| cell.row == 2 && cell.col == 2)
+            .expect("first data row, third column");
+        assert_eq!(data.header_path, vec![[0, 0], [1, 2]]);
+        let data = table
+            .cells
+            .iter()
+            .find(|cell| cell.row == 2 && cell.col == 4)
+            .expect("first data row, fifth column");
+        assert_eq!(data.header_path, vec![[0, 3], [1, 4]]);
+
+        let legacy = extract_tables(&doc, &raw);
+        assert_eq!(legacy.len(), 1);
+        assert_eq!((legacy[0].cells.len(), legacy[0].cells[0].len()), (8, 6));
+        assert_eq!(
+            legacy[0].cells[0],
+            vec!["Geochemistry", "", "", "Location", "", ""]
+        );
     }
 }
