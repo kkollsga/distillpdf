@@ -6,8 +6,8 @@
 //! `table_header` / `table_grid` fields.  Those surfaces are projections of this analysis,
 //! not parallel interpretations of a table.
 
-use crate::geom::Rect;
-use crate::text::SourceSlice;
+use crate::geom::{PageTurn, Rect};
+use crate::text::{SourceSlice, Span};
 use std::ops::Range;
 
 /// One table reported by [`crate::PdfDocument::analyze_tables`].
@@ -237,6 +237,59 @@ pub(crate) struct TableAnalysis {
     /// Exact provenance bit for the same proven tier. HTML carries this as an internal marker
     /// so only this table expands colspans when transformed to Markdown.
     proven_leading_tier: bool,
+    /// Non-wire, proof-carrying continuation state. It is absent for inferred/declared/model
+    /// tables and is never serialized or projected onto the public API.
+    continuation: Option<ContinuationProof>,
+    /// Final accepted source owner. Unlike `TableClaim`, this remains exact after a table
+    /// crosses a page boundary because every slice carries its originating page.
+    ownership: Option<ProvenOwnership>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PageSourceSlice {
+    page: u32,
+    slice: SourceSlice,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ContinuationDraft {
+    cell_boxes: Vec<Vec<Rect>>,
+    leading_styled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ContinuationProof {
+    Draft(ContinuationDraft),
+    Proven(ProvenContinuation),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProvenContinuation {
+    last_page: u32,
+    turn: i32,
+    page_box_bits: [u32; 4],
+    column_bits: Vec<u32>,
+    cell_x_bits: Vec<(u32, u32)>,
+    leading_styled: bool,
+    terminal_owner: bool,
+    leading_owner: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProvenOwnership {
+    anchor_page: u32,
+    key: CandidateKey,
+    row_claims: Vec<Vec<PageSourceSlice>>,
+    union_claims: Vec<PageSourceSlice>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OwnershipDiagnostic {
+    pub(crate) anchor_page: u32,
+    pub(crate) key: CandidateKey,
+    pub(crate) claim_rows: usize,
+    pub(crate) slices: usize,
+    pub(crate) hash: u64,
 }
 
 /// Positive evidence that contributed to an accepted table, in stable strength/arrival order.
@@ -311,6 +364,8 @@ impl TableAnalysis {
             evidence: dedup_evidence(evidence),
             legacy_prepend_header: false,
             proven_leading_tier: false,
+            continuation: None,
+            ownership: None,
         }
     }
 
@@ -406,7 +461,147 @@ impl TableAnalysis {
             evidence: dedup_evidence(evidence),
             legacy_prepend_header: false,
             proven_leading_tier: false,
+            continuation: None,
+            ownership: None,
         }
+    }
+
+    /// Attach only the exact L3 lattice facts. Page/turn, final producer and boundary
+    /// ownership are intentionally unavailable until page reconciliation has finished.
+    pub(crate) fn set_ruled_continuation_draft(
+        &mut self,
+        cell_boxes: Vec<Vec<Rect>>,
+        leading_styled: bool,
+    ) {
+        self.continuation = Some(ContinuationProof::Draft(ContinuationDraft {
+            cell_boxes,
+            leading_styled,
+        }));
+    }
+
+    fn proven_continuation(&self) -> Option<&ProvenContinuation> {
+        match self.continuation.as_ref()? {
+            ContinuationProof::Proven(proof) => Some(proof),
+            ContinuationProof::Draft(_) => None,
+        }
+    }
+
+    pub(crate) fn ownership_diagnostic(&self) -> Option<OwnershipDiagnostic> {
+        let ownership = self.ownership.as_ref()?;
+        let multi_page = ownership
+            .union_claims
+            .iter()
+            .any(|claim| claim.page != ownership.anchor_page);
+        let mut hash = 0xcbf29ce484222325u64;
+        for claim in &ownership.union_claims {
+            let mut values = Vec::with_capacity(4);
+            if multi_page {
+                values.push(claim.page);
+            }
+            values.extend([
+                claim.slice.source().ordinal(),
+                claim.slice.char_start(),
+                claim.slice.char_end(),
+            ]);
+            for value in values {
+                for byte in value.to_le_bytes() {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+        Some(OwnershipDiagnostic {
+            anchor_page: ownership.anchor_page,
+            key: ownership.key,
+            claim_rows: ownership.row_claims.len(),
+            slices: ownership.union_claims.len(),
+            hash,
+        })
+    }
+
+    fn dense_row_signature(row: &[CellAnalysis]) -> Option<Vec<(&str, usize, usize)>> {
+        (!row.is_empty()
+            && row.iter().enumerate().all(|(col, cell)| {
+                cell.col == col
+                    && cell.rowspan == 1
+                    && cell.colspan == 1
+                    && cell.render_colspan == 1
+                    && !cell.covered
+            }))
+        .then(|| row.iter().map(|cell| (cell.text.as_str(), cell.rowspan, cell.colspan)).collect())
+    }
+
+    /// Merge one already-proven fragment. The proof decides whether the leading row is a
+    /// repeated header; text equality by itself never suppresses data.
+    pub(crate) fn merge_proven_fragment(&mut self, next: &TableAnalysis) -> bool {
+        let (Some(anchor), Some(follow)) = (
+            self.proven_continuation().cloned(),
+            next.proven_continuation().cloned(),
+        ) else {
+            return false;
+        };
+        if anchor.last_page.checked_add(1) != Some(follow.last_page)
+            || !anchor.terminal_owner
+            || !follow.leading_owner
+            || anchor.turn != follow.turn
+            || anchor.page_box_bits != follow.page_box_bits
+            || anchor.column_bits != follow.column_bits
+            || anchor.cell_x_bits != follow.cell_x_bits
+            || !anchor.leading_styled
+            || self.header.len() != 0
+            || next.header.len() != 0
+            || self.grid.is_empty()
+            || next.grid.is_empty()
+        {
+            return false;
+        }
+        let skip = if follow.leading_styled {
+            let (Some(a), Some(b)) = (
+                Self::dense_row_signature(&self.grid[0]),
+                Self::dense_row_signature(&next.grid[0]),
+            ) else {
+                return false;
+            };
+            if a != b {
+                return false;
+            }
+            1
+        } else {
+            0
+        };
+        let (Some(mut ownership), Some(follow_ownership)) =
+            (self.ownership.clone(), next.ownership.as_ref())
+        else {
+            return false;
+        };
+        if next.grid.len() <= skip || follow_ownership.row_claims.len() != next.grid.len() {
+            return false;
+        }
+        let row_offset = self.grid.len();
+        for (ri, row) in next.grid.iter().skip(skip).enumerate() {
+            let mut row = row.clone();
+            for cell in &mut row {
+                cell.row = row_offset + ri;
+                cell.role = TableCellRole::Data;
+            }
+            self.grid.push(row);
+        }
+        if skip == 1 {
+            ownership.row_claims[0].extend(follow_ownership.row_claims[0].iter().cloned());
+        }
+        ownership
+            .row_claims
+            .extend(follow_ownership.row_claims.iter().skip(skip).cloned());
+        ownership
+            .union_claims
+            .extend(follow_ownership.union_claims.iter().cloned());
+        let Some(ContinuationProof::Proven(proof)) = self.continuation.as_mut() else {
+            unreachable!();
+        };
+        proof.last_page = follow.last_page;
+        proof.terminal_owner = follow.terminal_owner;
+        self.ownership = Some(ownership);
+        true
     }
 
     /// Mark the exact ruled leading tier as part of the legacy physical grid projection.
@@ -670,6 +865,10 @@ impl PositionedTableAnalysis {
         self
     }
 
+    pub(crate) fn merge_proven_fragment(&mut self, next: &PositionedTableAnalysis) -> bool {
+        self.table.merge_proven_fragment(&next.table)
+    }
+
     pub(crate) fn into_public<F>(self, page: u32, normalize: F) -> AnalyzedTable
     where
         F: Fn(Rect) -> Option<[f32; 4]>,
@@ -730,6 +929,204 @@ impl PositionedTableAnalysis {
                 below: caption.below,
             }),
             evidence: self.table.evidence,
+        }
+    }
+}
+
+/// Complete the private ruled proof only after the page's accepted owner set is final. A
+/// declaration or an inference survivor cannot borrow a discarded frame's geometry.
+fn accepted_page_ownership(
+    page: u32,
+    table: &PositionedTableAnalysis,
+) -> Option<ProvenOwnership> {
+    let row_claims = (0..table.claim.row_count())
+        .map(|row| {
+            table.claim.row(row).map(|slices| {
+                slices
+                    .iter()
+                    .copied()
+                    .map(|slice| PageSourceSlice { page, slice })
+                    .collect()
+            })
+        })
+        .collect::<Option<Vec<Vec<PageSourceSlice>>>>()?;
+    Some(ProvenOwnership {
+        anchor_page: page,
+        key: table.key,
+        row_claims,
+        union_claims: table
+            .claim
+            .slices
+            .iter()
+            .copied()
+            .map(|slice| PageSourceSlice { page, slice })
+            .collect(),
+    })
+}
+
+pub(crate) fn finalize_continuation_proofs(
+    page: u32,
+    spans: &[Span],
+    tables: &mut [PositionedTableAnalysis],
+    turn: PageTurn,
+    inputs_are_display_space: bool,
+) {
+    let diagnostics_enabled = std::env::var_os("DPDF_TABLE_OWNERS").is_some();
+    let eligible = |table: &PositionedTableAnalysis| {
+        matches!(
+            table.table.continuation.as_ref(),
+            Some(ContinuationProof::Draft(draft))
+                if table.key.producer == CandidateProducer::Frame
+                    && table.table.evidence.contains(&TableEvidence::Ruled)
+                    && table.table.header.is_empty()
+                    && draft.cell_boxes.len() == table.table.grid.len()
+                    && table.claim.row_count() == table.table.grid.len()
+                    && !table.claim.slices.is_empty()
+        )
+    };
+    if !tables.iter().any(eligible) {
+        for table in tables {
+            table.table.continuation = None;
+            table.table.ownership = diagnostics_enabled
+                .then(|| accepted_page_ownership(page, table))
+                .flatten();
+        }
+        return;
+    }
+    let claimed = |source: SourceSlice| tables.iter().any(|table| table.claim.covers(source));
+    let map_rect = |rect: Rect| {
+        if inputs_are_display_space {
+            rect
+        } else {
+            let (x0, x1, y0, y1) = turn.rect(rect.x0, rect.x1, rect.y0, rect.y1);
+            Rect::new(x0, y0, x1, y1)
+        }
+    };
+    let unclaimed: Option<Vec<Rect>> = spans
+        .iter()
+        .filter(|span| !span.text.trim().is_empty() && !claimed(span.source))
+        .map(|span| {
+            let width = if span.width > 0.1 {
+                span.width
+            } else {
+                span.text.trim().chars().count() as f32 * span.size * 0.5
+            };
+            let rect = map_rect(Rect::new(
+                span.x,
+                span.y - span.size * 0.25,
+                span.x + width,
+                span.y + span.size * 0.75,
+            ));
+            [rect.x0, rect.y0, rect.x1, rect.y1]
+                .into_iter()
+                .all(f32::is_finite)
+                .then_some(rect)
+        })
+        .collect();
+    let (turn_code, page_box_bits) = turn.proof_geometry();
+    for table in tables {
+        table.table.ownership = diagnostics_enabled
+            .then(|| accepted_page_ownership(page, table))
+            .flatten();
+        let draft = match table.table.continuation.take() {
+            Some(ContinuationProof::Draft(draft)) => draft,
+            _ => continue,
+        };
+        if table.key.producer != CandidateProducer::Frame
+            || !table.table.evidence.contains(&TableEvidence::Ruled)
+            || table.table.header.len() != 0
+            || draft.cell_boxes.len() != table.table.grid.len()
+            || table.claim.row_count() != table.table.grid.len()
+            || table.claim.slices.is_empty()
+        {
+            continue;
+        }
+        let bbox = map_rect(table.bbox);
+        if ![bbox.x0, bbox.y0, bbox.x1, bbox.y1]
+            .into_iter()
+            .all(f32::is_finite)
+        {
+            continue;
+        }
+        let mut canonical: Option<Vec<(u32, u32)>> = None;
+        let mut stable = true;
+        for row in draft.cell_boxes {
+            let edges: Option<Vec<(u32, u32)>> = row
+                .into_iter()
+                .map(|cell| {
+                    let cell = map_rect(cell);
+                    [cell.x0, cell.y0, cell.x1, cell.y1]
+                        .into_iter()
+                        .all(f32::is_finite)
+                        .then_some((cell.x0.to_bits(), cell.x1.to_bits()))
+                })
+                .collect();
+            let Some(edges) = edges else {
+                stable = false;
+                break;
+            };
+            if canonical.as_ref().is_some_and(|first| first != &edges) {
+                stable = false;
+                break;
+            }
+            canonical.get_or_insert(edges);
+        }
+        let Some(cell_x_bits) = canonical.filter(|edges| stable && edges.len() >= 2) else {
+            continue;
+        };
+        let mut column_bits = Vec::with_capacity(cell_x_bits.len() + 1);
+        column_bits.push(cell_x_bits[0].0);
+        column_bits.extend(cell_x_bits.iter().map(|edge| edge.1));
+        if cell_x_bits.windows(2).any(|pair| pair[0].1 != pair[1].0) {
+            continue;
+        }
+        let Some(unclaimed) = unclaimed.as_ref() else {
+            continue;
+        };
+        if table.table.ownership.is_none() {
+            table.table.ownership = accepted_page_ownership(page, table);
+        }
+        if table.table.ownership.is_none() {
+            continue;
+        }
+        table.table.continuation = Some(ContinuationProof::Proven(ProvenContinuation {
+            last_page: page,
+            turn: turn_code,
+            page_box_bits,
+            column_bits,
+            cell_x_bits,
+            leading_styled: draft.leading_styled,
+            terminal_owner: !unclaimed.iter().any(|span| span.y1 < bbox.y0),
+            leading_owner: !unclaimed.iter().any(|span| span.y0 > bbox.y1),
+        }));
+    }
+}
+
+/// Group at most one exact terminal→leading pair per consecutive page boundary. Removing the
+/// later fragment only after the shared merge succeeds preserves emit-once ownership.
+pub(crate) fn group_positioned_continuations(
+    pages: &mut [(u32, Vec<PositionedTableAnalysis>)],
+) {
+    for current in 1..pages.len() {
+        if pages[current - 1].0.checked_add(1) != Some(pages[current].0) {
+            continue;
+        }
+        let mut matches = Vec::new();
+        for (next_i, next) in pages[current].1.iter().enumerate() {
+            for anchor_page in 0..current {
+                for (anchor_i, anchor) in pages[anchor_page].1.iter().enumerate() {
+                    let mut merged = anchor.clone();
+                    if merged.merge_proven_fragment(next) {
+                        matches.push((anchor_page, anchor_i, next_i, merged));
+                    }
+                }
+            }
+        }
+        if let Some((anchor_page, anchor_i, next_i, merged)) =
+            (matches.len() == 1).then(|| matches.pop().unwrap())
+        {
+            pages[anchor_page].1[anchor_i] = merged;
+            pages[current].1.remove(next_i);
         }
     }
 }
@@ -1082,5 +1479,167 @@ mod tests {
         ]);
         assert!(detached.header.iter().flatten().all(|cell| cell.colspan == 1));
         assert!(detached.header.iter().flatten().all(|cell| !cell.covered));
+    }
+
+    fn proven_table(
+        page: u32,
+        styled: bool,
+        terminal: bool,
+        leading: bool,
+        rows: &[&[&str]],
+    ) -> TableAnalysis {
+        let mut table = TableAnalysis::from_parts(
+            Vec::new(),
+            rows.iter()
+                .map(|row| row.iter().map(|text| (*text).to_string()).collect())
+                .collect(),
+            1,
+            None,
+            vec![TableEvidence::Ruled],
+        );
+        table.continuation = Some(ContinuationProof::Proven(ProvenContinuation {
+            last_page: page,
+            turn: 0,
+            page_box_bits: [0.0f32.to_bits(), 0.0f32.to_bits(), 100.0f32.to_bits(), 100.0f32.to_bits()],
+            column_bits: vec![0.0f32.to_bits(), 10.0f32.to_bits(), 20.0f32.to_bits()],
+            cell_x_bits: vec![(0.0f32.to_bits(), 10.0f32.to_bits()), (10.0f32.to_bits(), 20.0f32.to_bits())],
+            leading_styled: styled,
+            terminal_owner: terminal,
+            leading_owner: leading,
+        }));
+        let row_claims: Vec<Vec<PageSourceSlice>> = rows.iter().enumerate().map(|(row, _)| vec![PageSourceSlice {
+                page,
+                slice: SourceSlice::test_occurrence(row as u32, 1),
+            }]).collect();
+        table.ownership = Some(ProvenOwnership {
+            anchor_page: page,
+            key: CandidateKey::new(CandidateProducer::Frame, 0),
+            union_claims: row_claims.iter().flatten().cloned().collect(),
+            row_claims,
+        });
+        table
+    }
+
+    #[test]
+    fn continuation_style_controls_exact_header_suppression_and_claim_union() {
+        let mut anchor = proven_table(1, true, true, false, &[&["H1", "H2"], &["a", "b"]]);
+        let repeated = proven_table(2, true, true, true, &[&["H1", "H2"], &["c", "d"]]);
+        assert!(anchor.merge_proven_fragment(&repeated));
+        assert_eq!(
+            anchor.grid_parts(),
+            vec![
+                vec![String::from("H1"), String::from("H2")],
+                vec![String::from("a"), String::from("b")],
+                vec![String::from("c"), String::from("d")],
+            ]
+        );
+        let ownership = anchor.ownership.as_ref().unwrap();
+        assert_eq!(ownership.row_claims.len(), 3);
+        assert_eq!(ownership.row_claims[0].iter().map(|claim| claim.page).collect::<Vec<_>>(), vec![1, 2]);
+
+        let mut data_anchor = proven_table(1, true, true, false, &[&["H1", "H2"], &["a", "b"]]);
+        let text_equal_data = proven_table(2, false, true, true, &[&["H1", "H2"], &["c", "d"]]);
+        assert!(data_anchor.merge_proven_fragment(&text_equal_data));
+        assert_eq!(data_anchor.grid.len(), 4, "unstyled text-equal row is data, never a repeated header");
+        assert!(data_anchor.grid[2].iter().all(|cell| cell.role == TableCellRole::Data));
+        let claims = &data_anchor.ownership.as_ref().unwrap().row_claims;
+        assert_eq!(claims.iter().map(Vec::len).sum::<usize>(), 4, "no source is lost or duplicated");
+    }
+
+    #[test]
+    fn continuation_refuses_independent_headers_barriers_aligned_and_unstable_geometry() {
+        let anchor = proven_table(1, true, true, false, &[&["H1", "H2"], &["a", "b"]]);
+        let attacks = [
+            proven_table(2, true, true, true, &[&["X1", "X2"], &["c", "d"]]),
+            proven_table(2, true, true, false, &[&["H1", "H2"], &["c", "d"]]),
+            proven_table(3, true, true, true, &[&["H1", "H2"], &["c", "d"]]),
+        ];
+        for attack in attacks {
+            let mut attempt = anchor.clone();
+            assert!(!attempt.merge_proven_fragment(&attack));
+        }
+        let mut rotated = proven_table(2, true, true, true, &[&["H1", "H2"], &["c", "d"]]);
+        if let Some(ContinuationProof::Proven(proof)) = rotated.continuation.as_mut() {
+            proof.turn = 90;
+        }
+        assert!(!anchor.clone().merge_proven_fragment(&rotated));
+        let aligned = TableAnalysis::from_parts(
+            Vec::new(),
+            vec![vec!["H1".into(), "H2".into()], vec!["c".into(), "d".into()]],
+            1,
+            None,
+            vec![TableEvidence::Aligned],
+        );
+        assert!(!anchor.clone().merge_proven_fragment(&aligned), "aligned prose has no ruled proof");
+    }
+
+    #[test]
+    fn exact_unclaimed_boundary_and_nonfinite_geometry_withhold_proof() {
+        let make = |bad_geometry: bool| {
+            let mut table = TableAnalysis::from_parts(
+                Vec::new(),
+                vec![vec!["H1".into(), "H2".into()], vec!["a".into(), "b".into()]],
+                1,
+                None,
+                vec![TableEvidence::Ruled],
+            );
+            let x0 = if bad_geometry { f32::NAN } else { 10.0 };
+            table.set_ruled_continuation_draft(
+                vec![
+                    vec![Rect::new(x0, 30.0, 20.0, 40.0), Rect::new(20.0, 30.0, 30.0, 40.0)],
+                    vec![Rect::new(x0, 20.0, 20.0, 30.0), Rect::new(20.0, 20.0, 30.0, 30.0)],
+                ],
+                true,
+            );
+            PositionedTableAnalysis {
+                bbox: Rect::new(10.0, 20.0, 30.0, 40.0),
+                table,
+                key: CandidateKey::new(CandidateProducer::Frame, 0),
+                claim: TableClaim::from_rows(vec![
+                    vec![SourceSlice::test_occurrence(0, 1)],
+                    vec![SourceSlice::test_occurrence(1, 1)],
+                ]),
+            }
+        };
+        let barrier = Span {
+            x: 10.0,
+            y: 5.0,
+            size: 8.0,
+            width: 20.0,
+            text: "caption barrier".into(),
+            bold: false,
+            italic: false,
+            mono: false,
+            angle: 0.0,
+            font: 0,
+            mcid: None,
+            source: SourceSlice::test_occurrence(9, 15),
+        };
+        let turn = PageTurn::new(0, [0.0, 0.0, 100.0, 100.0]);
+        let mut blocked = vec![make(false)];
+        finalize_continuation_proofs(1, &[barrier], &mut blocked, turn, true);
+        assert!(!blocked[0].table.proven_continuation().unwrap().terminal_owner);
+
+        let mut nonfinite = vec![make(true)];
+        finalize_continuation_proofs(1, &[], &mut nonfinite, turn, true);
+        assert!(nonfinite[0].table.proven_continuation().is_none());
+    }
+
+    #[test]
+    fn positioned_grouping_chains_across_more_than_two_pages() {
+        let positioned = |table| PositionedTableAnalysis {
+            bbox: Rect::new(0.0, 0.0, 20.0, 20.0),
+            table,
+            key: CandidateKey::new(CandidateProducer::Frame, 0),
+            claim: TableClaim::default(),
+        };
+        let mut pages = vec![
+            (1, vec![positioned(proven_table(1, true, true, false, &[&["H1", "H2"], &["a", "b"]]))]),
+            (2, vec![positioned(proven_table(2, false, true, true, &[&["c", "d"]]))]),
+            (3, vec![positioned(proven_table(3, false, true, true, &[&["e", "f"]]))]),
+        ];
+        group_positioned_continuations(&mut pages);
+        assert_eq!(pages[0].1[0].table.grid.len(), 4);
+        assert!(pages[1].1.is_empty() && pages[2].1.is_empty());
     }
 }

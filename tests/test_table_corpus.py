@@ -41,6 +41,8 @@ import html as html_module
 import math
 import os
 import re
+import subprocess
+import sys
 import unicodedata
 
 import pytest
@@ -1385,10 +1387,6 @@ def test_phase7_crosspage_negatives_lock_accepted_parent_behavior(fname, expecte
             assert html.count(sentence) == markdown.count(sentence) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 7 red ledger: genuine cross-page continuation is not implemented yet",
-)
 def test_phase7_header_text_data_desired_continuation_contract():
     """Text equality alone must not suppress the first page-2 row: it is authored data."""
     import distillpdf
@@ -1407,6 +1405,98 @@ def test_phase7_header_text_data_desired_continuation_contract():
     row_five = [cell for cell in analyzed[0]["cells"] if cell["row"] == 5]
     assert [cell["text"] for cell in row_five] == rows[5]
     assert [cell["role"] for cell in row_five] == ["data"] * 4
+
+
+@pytest.mark.parametrize(
+    ("fname", "shape"),
+    [
+        ("t3_page_break.pdf", (40, 4)),
+        ("t3_page_break_repeat.pdf", (40, 4)),
+        ("t3_long_multipage.pdf", (60, 6)),
+        ("t3_crosspage_header_text_data.pdf", (10, 4)),
+    ],
+)
+def test_phase7_ruled_continuations_share_raw_rich_render_and_model_proof(
+        fname, shape, tmp_path):
+    import distillpdf
+
+    pdf = distillpdf.Pdf.open(os.path.join(CORPUS, fname))
+    extracted = pdf.extract_tables()
+    assert [(table["page"], table["n_rows"], table["n_cols"])
+            for table in extracted] == [(1, *shape)]
+    analyzed = pdf.analyze_tables()
+    assert [(table["page"], table["n_rows"], table["n_cols"])
+            for table in analyzed] == [(1, *shape)]
+
+    html = pdf.to_html(
+        return_string=True, mode="page", toc=False, image_mode="drop",
+    )
+    markdown = pdf.to_markdown(
+        return_string=True, mode="page", toc=False, image_mode="drop",
+    )
+    dpdf = pdf.distill(str(tmp_path / f"{fname}.dpdf"), assets="none")
+    assert distillpdf.render_html(dpdf, mode="page", toc=False) == html
+    assert distillpdf.render_markdown(
+        dpdf, mode="page", toc=False, image_mode="drop",
+    ) == markdown
+    model = json.loads(distillpdf.load_model(dpdf))
+    blocks = [block for block in model["blocks"] if block["kind"] == "table"]
+    assert len(blocks) == 1
+    assert (blocks[0]["page"], blocks[0]["cells"]) == (1, extracted[0]["cells"])
+
+
+_PHASE7_OWNER_DIAGNOSTICS = {
+    "t3_page_break.pdf": [(1, 40, 40, 161, "17ef928b8338e401")],
+    "t3_page_break_repeat.pdf": [(1, 40, 40, 166, "30961bb22d6c7916")],
+    "t3_long_multipage.pdf": [(1, 60, 60, 362, "5a31b64a7a796987")],
+    "t3_crosspage_header_text_data.pdf": [(1, 10, 10, 40, "5d6993f37e3563ab")],
+    "t3_crosspage_independent_geometry.pdf": [
+        (1, 6, 6, 24, "c9c749902847616f"),
+        (2, 6, 6, 24, "52931512b1d967a9"),
+    ],
+    "t3_crosspage_independent_caption.pdf": [
+        (1, 6, 6, 29, "ab7f940ce626e56f"),
+        (2, 6, 6, 29, "61b482c9cefb5042"),
+    ],
+}
+
+
+@pytest.mark.parametrize("surface", ["raw", "rich", "render"])
+@pytest.mark.parametrize("fname", _PHASE7_OWNER_DIAGNOSTICS)
+def test_phase7_grouped_owner_diagnostic_is_exact_and_emitted_once(fname, surface):
+    code = r"""
+import distillpdf, sys
+pdf = distillpdf.Pdf.open(sys.argv[1])
+action = {
+    "raw": pdf.extract_tables,
+    "rich": pdf.analyze_tables,
+    "render": lambda: pdf.to_html(return_string=True, image_mode="drop"),
+}[sys.argv[2]]
+action()
+"""
+    env = os.environ.copy()
+    env["DPDF_TABLE_OWNERS"] = "1"
+    run = subprocess.run(
+        [sys.executable, "-c", code, os.path.join(CORPUS, fname), surface],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    lines = [line for line in run.stderr.splitlines()
+             if line.startswith("DPDF_TABLE_OWNERS ")]
+    parsed = []
+    for line in lines:
+        match = re.fullmatch(
+            r"DPDF_TABLE_OWNERS page=(\d+) scope=detected candidate=frame:\d+ "
+            r"bbox=[0-9a-f,]+ evidence=ruled(?:\+aligned)? rows=(\d+) "
+            r"claim_rows=(\d+) slices=(\d+) hash=([0-9a-f]{16})",
+            line,
+        )
+        assert match, line
+        parsed.append((int(match[1]), int(match[2]), int(match[3]),
+                       int(match[4]), match[5]))
+    assert parsed == _PHASE7_OWNER_DIAGNOSTICS[fname]
 
 
 def _rounded_analysis_report(value):

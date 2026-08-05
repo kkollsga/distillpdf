@@ -1815,7 +1815,7 @@ fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PositionedTableAnalysis> {
     );
     let row_offset = usize::from(insertion.is_some());
     let final_header_rows = if insertion.is_some() { 2 } else { header_rows };
-    let analyzed_grid = grid
+    let analyzed_grid: Vec<Vec<CellAnalysis>> = grid
         .into_iter()
         .enumerate()
         .map(|(r, row)| {
@@ -1843,6 +1843,10 @@ fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PositionedTableAnalysis> {
         }
         None => (Vec::new(), axes.bbox),
     };
+    let cell_boxes = analyzed_grid
+        .iter()
+        .map(|row| row.iter().filter_map(|cell| cell.bbox).collect())
+        .collect();
     let mut table = TableAnalysis::from_cells(
         header,
         analyzed_grid,
@@ -1856,6 +1860,16 @@ fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PositionedTableAnalysis> {
             vec![TableEvidence::Ruled]
         },
     );
+    let leading_styled = bound.cells[..bound.ncols]
+        .iter()
+        .flatten()
+        .filter(|span| !span.text.trim().is_empty())
+        .all(|span| span.bold)
+        && bound.cells[..bound.ncols]
+            .iter()
+            .flatten()
+            .any(|span| !span.text.trim().is_empty());
+    table.set_ruled_continuation_draft(cell_boxes, leading_styled);
     if row_offset == 1 {
         table.project_header_into_legacy_grid();
     }
@@ -1899,28 +1913,80 @@ pub(crate) fn table_owner_diagnostics(
 ) -> String {
     let mut out = String::new();
     for table in tables {
-        let evidence = table
-            .table
-            .evidence
-            .iter()
-            .map(|item| item.as_str())
-            .collect::<Vec<_>>()
-            .join("+");
-        out.push_str(&format!(
-            "DPDF_TABLE_OWNERS page={page} scope={scope} candidate={} bbox={:08x},{:08x},{:08x},{:08x} evidence={} rows={} claim_rows={} slices={} hash={:016x}\n",
-            table.key.label(),
-            table.bbox.x0.to_bits(),
-            table.bbox.y0.to_bits(),
-            table.bbox.x1.to_bits(),
-            table.bbox.y1.to_bits(),
-            if evidence.is_empty() { "none" } else { &evidence },
-            table.table.header.len() + table.table.grid.len(),
-            table.claim.row_count(),
-            table.claim.len(),
-            table.claim.stable_hash(),
-        ));
+        if let Some(diagnostic) = table.table.ownership_diagnostic() {
+            out.push_str(&table_analysis_owner_diagnostic(
+                diagnostic.anchor_page,
+                scope,
+                table.bbox,
+                &table.table,
+            ));
+        } else {
+            out.push_str(&format_table_owner_diagnostic(
+                page,
+                scope,
+                table.key,
+                table.bbox,
+                &table.table,
+                table.claim.row_count(),
+                table.claim.len(),
+                table.claim.stable_hash(),
+            ));
+        }
     }
     out
+}
+
+fn format_table_owner_diagnostic(
+    page: u32,
+    scope: &str,
+    key: CandidateKey,
+    bbox: crate::geom::Rect,
+    table: &TableAnalysis,
+    claim_rows: usize,
+    slices: usize,
+    hash: u64,
+) -> String {
+    let evidence = table
+        .evidence
+        .iter()
+        .map(|item| item.as_str())
+        .collect::<Vec<_>>()
+        .join("+");
+    format!(
+        "DPDF_TABLE_OWNERS page={page} scope={scope} candidate={} bbox={:08x},{:08x},{:08x},{:08x} evidence={} rows={} claim_rows={} slices={} hash={:016x}\n",
+        key.label(),
+        bbox.x0.to_bits(),
+        bbox.y0.to_bits(),
+        bbox.x1.to_bits(),
+        bbox.y1.to_bits(),
+        if evidence.is_empty() { "none" } else { &evidence },
+        table.header.len() + table.grid.len(),
+        claim_rows,
+        slices,
+        hash,
+    )
+}
+
+pub(crate) fn table_analysis_owner_diagnostic(
+    page: u32,
+    scope: &str,
+    bbox: crate::geom::Rect,
+    table: &TableAnalysis,
+) -> String {
+    let Some(diagnostic) = table.ownership_diagnostic() else {
+        return String::new();
+    };
+    debug_assert_eq!(page, diagnostic.anchor_page);
+    format_table_owner_diagnostic(
+        diagnostic.anchor_page,
+        scope,
+        diagnostic.key,
+        bbox,
+        table,
+        diagnostic.claim_rows,
+        diagnostic.slices,
+        diagnostic.hash,
+    )
 }
 
 pub(crate) fn table_owner_diagnostics_enabled() -> bool {
@@ -3118,23 +3184,38 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
 pub fn extract_tables(doc: &Document, raw: &[u8]) -> Vec<TableInfo> {
     let pages = doc.get_pages();
     let diagnostics_enabled = table_owner_diagnostics_enabled();
-    let mut per_page: Vec<(u32, Vec<Vec<Vec<String>>>, String)> = pages
+    let mut per_page: Vec<(u32, Vec<PositionedTableAnalysis>, String)> = pages
         .par_iter()
         .map(|(&pno, &page_id)| {
             let rules = crate::vector::page_rules(doc, page_id);
             let spans = text::extract_spans(doc, page_id, raw);
-            let tables = detect_tables_pos(&spans, &rules);
-            let diagnostics = if diagnostics_enabled {
-                table_owner_diagnostics(pno, "detected", &tables)
-            } else {
-                String::new()
-            };
-            let grids = tables.into_iter().map(|t| t.table.into_grid_parts()).collect();
-            (pno, grids, diagnostics)
+            let turn = crate::geom::PageTurn::new(
+                crate::pdfobj::page_rotation(doc, page_id),
+                crate::pdfobj::page_box(doc, page_id).unwrap_or([
+                    0.0,
+                    0.0,
+                    crate::pdfobj::DEFAULT_PAGE_PTS.0,
+                    crate::pdfobj::DEFAULT_PAGE_PTS.1,
+                ]),
+            );
+            let mut tables = detect_tables_pos(&spans, &rules);
+            crate::table::finalize_continuation_proofs(pno, &spans, &mut tables, turn, false);
+            (pno, tables, String::new())
         })
         .collect();
     per_page.sort_by_key(|(pno, _, _)| *pno);
+    let mut grouped: Vec<(u32, Vec<PositionedTableAnalysis>)> = per_page
+        .iter_mut()
+        .map(|(pno, tables, _)| (*pno, std::mem::take(tables)))
+        .collect();
+    crate::table::group_positioned_continuations(&mut grouped);
+    for ((_, tables, _), (_, grouped_tables)) in per_page.iter_mut().zip(grouped) {
+        *tables = grouped_tables;
+    }
     if diagnostics_enabled {
+        for (pno, tables, diagnostics) in &mut per_page {
+            *diagnostics = table_owner_diagnostics(*pno, "detected", tables);
+        }
         emit_ordered_table_owner_diagnostics(
             per_page
                 .iter()
@@ -3144,7 +3225,12 @@ pub fn extract_tables(doc: &Document, raw: &[u8]) -> Vec<TableInfo> {
     }
     per_page
         .into_iter()
-        .flat_map(|(pno, grids, _)| grids.into_iter().map(move |cells| TableInfo { page: pno, cells }))
+        .flat_map(|(pno, tables, _)| {
+            tables.into_iter().map(move |table| TableInfo {
+                page: pno,
+                cells: table.table.into_grid_parts(),
+            })
+        })
         .collect()
 }
 
@@ -3154,7 +3240,7 @@ pub fn extract_tables(doc: &Document, raw: &[u8]) -> Vec<TableInfo> {
 pub fn analyze_tables(doc: &Document, raw: &[u8]) -> Vec<AnalyzedTable> {
     let pages = doc.get_pages();
     let diagnostics_enabled = table_owner_diagnostics_enabled();
-    let mut per_page: Vec<(u32, Vec<AnalyzedTable>, String)> = pages
+    let mut per_page: Vec<(u32, crate::geom::PageTurn, Vec<PositionedTableAnalysis>, String)> = pages
         .par_iter()
         .map(|(&pno, &page_id)| {
             let spans = text::extract_spans(doc, page_id, raw);
@@ -3168,29 +3254,39 @@ pub fn analyze_tables(doc: &Document, raw: &[u8]) -> Vec<AnalyzedTable> {
                     crate::pdfobj::DEFAULT_PAGE_PTS.1,
                 ]),
             );
-            let detected = detect_tables_pos(&spans, &rules);
-            let diagnostics = if diagnostics_enabled {
-                table_owner_diagnostics(pno, "detected", &detected)
-            } else {
-                String::new()
-            };
-            let tables = detected
-                .into_iter()
-                .map(|table| table.into_public(pno, |rect| turn.normalized_rect(rect)))
-                .collect();
-            (pno, tables, diagnostics)
+            let mut detected = detect_tables_pos(&spans, &rules);
+            crate::table::finalize_continuation_proofs(pno, &spans, &mut detected, turn, false);
+            (pno, turn, detected, String::new())
         })
         .collect();
-    per_page.sort_by_key(|(pno, _, _)| *pno);
+    per_page.sort_by_key(|(pno, _, _, _)| *pno);
+    let mut grouped: Vec<(u32, Vec<PositionedTableAnalysis>)> = per_page
+        .iter_mut()
+        .map(|(pno, _, tables, _)| (*pno, std::mem::take(tables)))
+        .collect();
+    crate::table::group_positioned_continuations(&mut grouped);
+    for ((_, _, tables, _), (_, grouped_tables)) in per_page.iter_mut().zip(grouped) {
+        *tables = grouped_tables;
+    }
     if diagnostics_enabled {
+        for (pno, _, tables, diagnostics) in &mut per_page {
+            *diagnostics = table_owner_diagnostics(*pno, "detected", tables);
+        }
         emit_ordered_table_owner_diagnostics(
             per_page
                 .iter()
-                .map(|(pno, _, diagnostics)| (*pno, diagnostics.clone()))
+                .map(|(pno, _, _, diagnostics)| (*pno, diagnostics.clone()))
                 .collect(),
         );
     }
-    per_page.into_iter().flat_map(|(_, tables, _)| tables).collect()
+    per_page
+        .into_iter()
+        .flat_map(|(pno, turn, tables, _)| {
+            tables
+                .into_iter()
+                .map(move |table| table.into_public(pno, |rect| turn.normalized_rect(rect)))
+        })
+        .collect()
 }
 
 /// Does this font dict (or its descendant) carry an embedded font program?

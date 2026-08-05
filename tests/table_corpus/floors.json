@@ -372,7 +372,7 @@
    }
   },
   "t3_crosspage_header_text_data.pdf": {
-   "expected": "known_fail",
+   "expected": "pass",
    "measured": {
     "cell_acc": 0.5,
     "expect_fails": [
@@ -417,7 +417,7 @@
    }
   },
   "t3_long_multipage.pdf": {
-   "expected": "known_fail",
+   "expected": "pass",
    "measured": {
     "cell_acc": 0.6306,
     "expect_fails": [],
@@ -425,7 +425,7 @@
    }
   },
   "t3_page_break.pdf": {
-   "expected": "known_fail",
+   "expected": "pass",
    "measured": {
     "cell_acc": 0.95,
     "expect_fails": [],
@@ -433,7 +433,7 @@
    }
   },
   "t3_page_break_repeat.pdf": {
-   "expected": "known_fail",
+   "expected": "pass",
    "measured": {
     "cell_acc": 0.95,
     "expect_fails": [],

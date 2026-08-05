@@ -98,6 +98,14 @@ pub(crate) struct PageTurn {
 }
 
 impl PageTurn {
+    /// Exact private fingerprint used by proof-carrying cross-page layout.  These are the
+    /// normalized page-space turn inputs, not a public geometry contract.
+    pub(crate) fn proof_geometry(self) -> (i32, [u32; 4]) {
+        (
+            self.rot,
+            [self.x0.to_bits(), self.y0.to_bits(), self.x1.to_bits(), self.y1.to_bits()],
+        )
+    }
     /// `rot` is [`crate::pdfobj::page_rotation`]'s normalized 0/90/180/270; `page_box` is
     /// [`crate::pdfobj::page_box`] as authored (it may be inverted, so the corners are
     /// sorted here — a turn about an inverted box would mirror the page).
