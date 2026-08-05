@@ -459,10 +459,18 @@ fn render_list(children: &[Node], out: &mut String, ctx: &mut Ctx, ordered: bool
 }
 
 fn render_table(children: &[Node], attrs: &[(String, String)], out: &mut String, ctx: &mut Ctx) {
+    const MAX_MARKDOWN_COLSPAN: usize = 4096;
+    let expand_colspans = attr(attrs, "data-dpdf-proven-leading-tier").is_some();
     // Optional <caption> before the grid.
     let mut caption = String::new();
     let mut rows: Vec<Vec<String>> = Vec::new();
-    fn walk_rows(nodes: &[Node], rows: &mut Vec<Vec<String>>, caption: &mut String, ctx: &mut Ctx) {
+    fn walk_rows(
+        nodes: &[Node],
+        rows: &mut Vec<Vec<String>>,
+        caption: &mut String,
+        ctx: &mut Ctx,
+        expand_colspans: bool,
+    ) {
         for n in nodes {
             if let Node::Elem { tag, children, .. } = n {
                 match tag.as_str() {
@@ -470,23 +478,35 @@ fn render_table(children: &[Node], attrs: &[(String, String)], out: &mut String,
                     "tr" => {
                         let mut cells = Vec::new();
                         for c in children {
-                            if let Node::Elem { tag: ct, children: cc, .. } = c {
+                            if let Node::Elem { tag: ct, attrs, children: cc, .. } = c {
                                 if ct == "td" || ct == "th" {
                                     let v = inline(cc, ctx).replace('|', "\\|").replace('\n', " ");
                                     cells.push(v.trim().to_string());
+                                    let colspan = if expand_colspans {
+                                        attr(attrs, "colspan")
+                                            .and_then(|value| value.parse::<usize>().ok())
+                                            .filter(|&span| {
+                                                (1..=MAX_MARKDOWN_COLSPAN).contains(&span)
+                                            })
+                                            .unwrap_or(1)
+                                    } else {
+                                        1
+                                    };
+                                    cells.extend(std::iter::repeat_n(String::new(), colspan - 1));
                                 }
                             }
                         }
                         rows.push(cells);
                     }
-                    "thead" | "tbody" | "tfoot" => walk_rows(children, rows, caption, ctx),
+                    "thead" | "tbody" | "tfoot" => {
+                        walk_rows(children, rows, caption, ctx, expand_colspans)
+                    }
                     _ => {}
                 }
             }
         }
     }
-    let _ = attrs;
-    walk_rows(children, &mut rows, &mut caption, ctx);
+    walk_rows(children, &mut rows, &mut caption, ctx, expand_colspans);
     rows.retain(|r| !r.is_empty());
     if rows.is_empty() {
         return;
@@ -845,5 +865,76 @@ mod md_tests {
         let html = "<body><p>Antes</p><svg><text>Inválido Ré Ção</text></svg><p>Depois</p></body>";
         let (md, _) = html_to_markdown(html, false, ImgMode::Placeholder);
         assert!(md.contains("Antes") && md.contains("Depois"));
+    }
+
+    #[test]
+    fn table_colspans_expand_to_anchor_and_blank_markdown_slots() {
+        let html = concat!(
+            "<table data-dpdf-proven-leading-tier><tr><th colspan=\"3\">Geochemistry</th>",
+            "<th colspan=\"3\">Location</th></tr>",
+            "<tr><th>Sample</th><th>Depth</th><th>Grade</th>",
+            "<th>Lat</th><th>Lon</th><th>Zone</th></tr></table>"
+        );
+        let (md, _) = html_to_markdown(html, false, ImgMode::Placeholder);
+        assert_eq!(
+            md,
+            concat!(
+                "| Geochemistry |  |  | Location |  |  |\n",
+                "| --- | --- | --- | --- | --- | --- |\n",
+                "| Sample | Depth | Grade | Lat | Lon | Zone |\n"
+            )
+        );
+    }
+
+    #[test]
+    fn ordinary_colspan_tables_keep_the_legacy_markdown_projection() {
+        let html = concat!(
+            "<table><tr><th colspan=\"3\">Geochemistry</th>",
+            "<th colspan=\"3\">Location</th></tr>",
+            "<tr><th>Sample</th><th>Depth</th><th>Grade</th>",
+            "<th>Lat</th><th>Lon</th><th>Zone</th></tr></table>"
+        );
+        let (md, _) = html_to_markdown(html, false, ImgMode::Placeholder);
+        assert_eq!(
+            md,
+            concat!(
+                "| Geochemistry | Location |  |  |  |  |\n",
+                "| --- | --- | --- | --- | --- | --- |\n",
+                "| Sample | Depth | Grade | Lat | Lon | Zone |\n"
+            )
+        );
+    }
+
+    #[test]
+    fn unmarked_external_colspan_shapes_retain_one_slot_per_html_cell() {
+        let cases = [
+            (
+                concat!(
+                    "<table><tr><th></th><th colspan=\"2\">Partition 1</th>",
+                    "<th colspan=\"2\">Partition 2</th><th colspan=\"2\">Partition 4</th></tr>",
+                    "<tr><td>A</td><td>B</td><td>C</td><td>D</td><td>E</td><td>F</td><td>G</td></tr></table>"
+                ),
+                "|  | Partition 1 | Partition 2 | Partition 4 |",
+            ),
+            (
+                concat!(
+                    "<table><tr><th></th><th>Easy</th><th></th>",
+                    "<th colspan=\"2\">Medium</th><th>Hard</th><th></th></tr>",
+                    "<tr><td>A</td><td>B</td><td>C</td><td>D</td><td>E</td><td>F</td><td>G</td></tr></table>"
+                ),
+                "|  | Easy |  | Medium | Hard |  |",
+            ),
+        ];
+        for (html, expected_prefix) in cases {
+            let (md, _) = html_to_markdown(html, false, ImgMode::Placeholder);
+            assert!(md.lines().next().is_some_and(|line| line.starts_with(expected_prefix)));
+        }
+    }
+
+    #[test]
+    fn hostile_or_invalid_table_colspans_are_not_expanded() {
+        let html = "<table data-dpdf-proven-leading-tier><tr><th colspan=\"4097\">A</th><th colspan=\"0\">B</th><th colspan=\"x\">C</th></tr></table>";
+        let (md, _) = html_to_markdown(html, false, ImgMode::Placeholder);
+        assert_eq!(md, "| A | B | C |\n| --- | --- | --- |\n");
     }
 }

@@ -122,17 +122,21 @@ fn elements_from_blocks(blocks: &[&Block]) -> Vec<PageElement> {
                 out.push(PageElement::at(ElKind::Footnotes { notes }, bbox));
             }
             BlockKind::Table => {
+                let mut table = TableAnalysis::from_parts(
+                    b.table_header.clone().unwrap_or_default(),
+                    b.table_grid.clone().unwrap_or_default(),
+                    b.table_header_rows.unwrap_or_else(|| {
+                        let n = b.table_header.as_ref().map_or(0, Vec::len);
+                        if n == 0 { 1 } else { n }
+                    }),
+                    b.table_caption.clone(),
+                    Vec::new(),
+                );
+                if b.table_proven_leading_tier == Some(true) {
+                    table.restore_proven_leading_tier();
+                }
                 out.push(PageElement::at(
-                    ElKind::Table(TableAnalysis::from_parts(
-                        b.table_header.clone().unwrap_or_default(),
-                        b.table_grid.clone().unwrap_or_default(),
-                        b.table_header_rows.unwrap_or_else(|| {
-                            let n = b.table_header.as_ref().map_or(0, Vec::len);
-                            if n == 0 { 1 } else { n }
-                        }),
-                        b.table_caption.clone(),
-                        Vec::new(),
-                    )),
+                    ElKind::Table(table),
                     b.bbox,
                 ));
                 i += 1;
@@ -361,6 +365,7 @@ mod tests {
             el_group: None,
             table_header: None,
             table_header_rows: None,
+            table_proven_leading_tier: None,
             table_grid: None,
             table_caption: None,
             el_html: None,

@@ -620,9 +620,14 @@ pub(crate) fn emit_page_elements(els: &[PageElement]) -> String {
 /// side built it.
 fn table_html(table: &TableAnalysis) -> String {
     let cap = table.caption.as_ref().map(|c| (c.number.as_str(), c.html.as_str(), c.below));
+    let provenance = if table.has_proven_leading_tier() {
+        " data-dpdf-proven-leading-tier"
+    } else {
+        ""
+    };
     let mut tbl = match cap {
-        Some((num, _, _)) => format!("<table id=\"tab-{}\">", num_id(num)),
-        None => String::from("<table>"),
+        Some((num, _, _)) => format!("<table id=\"tab-{}\"{provenance}>", num_id(num)),
+        None => format!("<table{provenance}>"),
     };
     // Caption as the table's own `<caption>` (the required first child) so it is
     // semantically LINKED to the table for an LLM reader — a sibling block can't be

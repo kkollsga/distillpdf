@@ -69,6 +69,19 @@ pub(crate) struct Frame {
     pub xs: Vec<f32>,
     pub ys: Vec<f32>,
     pub bbox: Rect,
+    /// One geometry-only merged band immediately above this frame.  Text and semantic
+    /// ownership are deliberately absent: [`crate::extract`] must independently prove that
+    /// the closed band is a grouped table header before it may enlarge the table.
+    pub(crate) abutting_band: Option<AbuttingBand>,
+}
+
+/// A fully enclosed row band whose verticals partition an existing frame's leaf columns.
+///
+/// Ranges are exhaustive, ordered leaf-column intervals.  Every interval spans at least two
+/// columns; a one-column cell is not evidence of a grouped tier.
+pub(crate) struct AbuttingBand {
+    pub(crate) bbox: Rect,
+    pub(crate) groups: Vec<std::ops::Range<usize>>,
 }
 
 impl Frame {
@@ -249,12 +262,83 @@ pub(crate) fn frames(rules: &PageRules) -> Vec<Frame> {
         if bbox.width() < MIN_FRAME_W || bbox.height() < MIN_FRAME_H {
             continue;
         }
-        out.push(Frame { xs, ys, bbox });
+        out.push(Frame { xs, ys, bbox, abutting_band: None });
     }
     join_shards(&mut out);
+    for frame in &mut out {
+        frame.abutting_band = leading_abutting_band(frame, &vs, &hs);
+    }
     // Reading order (top-down), so a page's frames arrive in the order a reader meets them.
     out.sort_by(|a, b| b.bbox.y1.total_cmp(&a.bbox.y1).then(a.bbox.x0.total_cmp(&b.bbox.x0)));
     out
+}
+
+/// Prove one closed, exhaustive multi-column band starting at horizontal line `bottom`.
+///
+/// The immediately following snapped horizontal must be its top: skipping a partial rule to
+/// reach a farther full-width line would silently swallow an intervening structure.  Likewise,
+/// every vertical that enters the open band must either close it for the full height at an
+/// existing leaf boundary or make the answer ambiguous.
+fn closed_group_band_at(
+    frame: &Frame,
+    vs: &[Line],
+    hs: &[Line],
+    bottom: usize,
+) -> Option<AbuttingBand> {
+    let (lower, upper) = (hs.get(bottom)?, hs.get(bottom + 1)?);
+    let (x0, x1, y0, y1) = (frame.bbox.x0, frame.bbox.x1, lower.p, upper.p);
+    if y1 - y0 <= COVER * 2.0 || !lower.covers(x0, x1) || !upper.covers(x0, x1) {
+        return None;
+    }
+
+    let mut boundaries = Vec::new();
+    for line in vs.iter().filter(|line| line.p >= x0 - SNAP && line.p <= x1 + SNAP) {
+        let leaf = frame.xs.iter().position(|&x| (x - line.p).abs() <= SNAP);
+        let covers = line.covers(y0, y1);
+        // Ignore a row seam ending at the shared boundary, but reject every vertical that
+        // actually enters the band's interior without closing it completely.
+        let enters_interior = line
+            .iv
+            .iter()
+            .any(|&(a, b)| b > y0 + COVER && a < y1 - COVER);
+        match (leaf, covers, enters_interior) {
+            (Some(col), true, _) => boundaries.push(col),
+            (_, false, true) | (None, true, _) => return None,
+            _ => {}
+        }
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let ncols = frame.xs.len().saturating_sub(1);
+    if boundaries.first() != Some(&0)
+        || boundaries.last() != Some(&ncols)
+        || boundaries.len() < 3
+    {
+        return None;
+    }
+    let groups: Vec<std::ops::Range<usize>> = boundaries
+        .windows(2)
+        .map(|pair| pair[0]..pair[1])
+        .collect();
+    if groups.iter().any(|group| group.end - group.start < 2) {
+        return None;
+    }
+    Some(AbuttingBand {
+        bbox: Rect::new(x0, y0, x1, y1),
+        groups,
+    })
+}
+
+/// Find exactly one grouped band immediately above a final joined frame.
+fn leading_abutting_band(frame: &Frame, vs: &[Line], hs: &[Line]) -> Option<AbuttingBand> {
+    let bottom = hs.iter().position(|line| (line.p - frame.bbox.y1).abs() <= SNAP)?;
+    let band = closed_group_band_at(frame, vs, hs, bottom)?;
+    // A second compatible band would be a multi-tier structure.  Phase 6B owns exactly one
+    // leading tier and refuses to guess which stacked bands are semantic headers.
+    if closed_group_band_at(frame, vs, hs, bottom + 1).is_some() {
+        return None;
+    }
+    Some(band)
 }
 
 /// Positions merged and deduplicated at [`SNAP`], ascending.
@@ -307,6 +391,7 @@ fn join_shards(frames: &mut Vec<Frame>) {
                     xs: union_axis(&fa.xs, &fb.xs),
                     ys: union_axis(&fa.ys, &fb.ys),
                     bbox: fa.bbox.union(fb.bbox),
+                    abutting_band: None,
                 };
                 frames[a] = joined;
                 frames.remove(b);
@@ -406,6 +491,63 @@ mod tests {
         let f = frames(&r);
         assert_eq!(f.len(), 1, "one frame, got {}", f.len());
         assert_eq!(f[0].xs.len(), 4, "the merged column is still a column: {:?}", f[0].xs);
+    }
+
+    fn with_grouped_band(mut rules: PageRules) -> PageRules {
+        let (x0, x1, bottom, top) = (50.0, 410.0, 160.0, 180.0);
+        rules.h.push((x0, x1, top));
+        for x in [x0, 230.0, x1] {
+            rules.v.push((x, bottom, top));
+        }
+        rules
+    }
+
+    #[test]
+    fn one_exact_grouped_band_is_published_without_enlarging_the_frame() {
+        let f = frames(&with_grouped_band(grid(50.0, 100.0, 60.0, 20.0, 6, 3)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].bbox, Rect::new(50.0, 100.0, 410.0, 160.0));
+        let band = f[0].abutting_band.as_ref().expect("the closed 3+3 band is producer evidence");
+        assert_eq!(band.bbox, Rect::new(50.0, 160.0, 410.0, 180.0));
+        assert_eq!(band.groups, vec![0..3, 3..6]);
+    }
+
+    #[test]
+    fn ambiguous_or_non_grouped_leading_bands_are_not_published() {
+        let base = || grid(50.0, 100.0, 60.0, 20.0, 6, 3);
+
+        let mut off_axis = with_grouped_band(base());
+        off_axis.v.retain(|&(x, y0, _)| !((x - 230.0).abs() < 0.1 && (y0 - 160.0).abs() < 0.1));
+        off_axis.v.push((240.0, 160.0, 180.0));
+
+        let mut singleton = with_grouped_band(base());
+        singleton.v.push((110.0, 160.0, 180.0));
+
+        let mut partial = with_grouped_band(base());
+        partial.v.push((170.0, 165.0, 175.0));
+
+        let mut stacked = with_grouped_band(base());
+        stacked.h.push((50.0, 410.0, 200.0));
+        for x in [50.0, 230.0, 410.0] {
+            stacked.v.push((x, 180.0, 200.0));
+        }
+
+        for (name, rules) in [
+            ("off-axis separator", off_axis),
+            ("singleton group", singleton),
+            ("partial separator", partial),
+            ("stacked band", stacked),
+        ] {
+            let f = frames(&rules);
+            assert!(
+                f.iter().any(|frame| frame.bbox.y0 <= 100.0 && frame.bbox.y1 >= 160.0),
+                "{name} leaves the base lattice represented"
+            );
+            assert!(
+                f.iter().all(|frame| frame.abutting_band.is_none()),
+                "{name} is ambiguous, not a grouped tier"
+            );
+        }
     }
 
     #[test]

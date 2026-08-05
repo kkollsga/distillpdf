@@ -230,6 +230,13 @@ pub(crate) struct TableAnalysis {
     pub(crate) header_rows: usize,
     pub(crate) caption: Option<TableCaption>,
     pub(crate) evidence: Vec<TableEvidence>,
+    /// The proven Phase 6B ruled tier is physically part of the table even though it remains
+    /// in `header` for exact colspan rendering/model fidelity.  Only that producer opts into
+    /// prepending its anchor-plus-blank expansion to the legacy raw grid.
+    legacy_prepend_header: bool,
+    /// Exact provenance bit for the same proven tier. HTML carries this as an internal marker
+    /// so only this table expands colspans when transformed to Markdown.
+    proven_leading_tier: bool,
 }
 
 /// Positive evidence that contributed to an accepted table, in stable strength/arrival order.
@@ -302,6 +309,8 @@ impl TableAnalysis {
             header_rows,
             caption: caption.map(TableCaption::from),
             evidence: dedup_evidence(evidence),
+            legacy_prepend_header: false,
+            proven_leading_tier: false,
         }
     }
 
@@ -395,7 +404,26 @@ impl TableAnalysis {
             header_rows,
             caption: None,
             evidence: dedup_evidence(evidence),
+            legacy_prepend_header: false,
+            proven_leading_tier: false,
         }
+    }
+
+    /// Mark the exact ruled leading tier as part of the legacy physical grid projection.
+    /// No shape heuristic reaches this bit; the Phase 6B proof is its only production caller.
+    pub(crate) fn project_header_into_legacy_grid(&mut self) {
+        self.legacy_prepend_header = true;
+        self.proven_leading_tier = true;
+    }
+
+    /// Restore the durable provenance marker when reconstructing a rendered table model.
+    /// Legacy raw projection is irrelevant on this path and intentionally remains disabled.
+    pub(crate) fn restore_proven_leading_tier(&mut self) {
+        self.proven_leading_tier = true;
+    }
+
+    pub(crate) fn has_proven_leading_tier(&self) -> bool {
+        self.proven_leading_tier
     }
 
     pub(crate) fn with_caption(mut self, caption: Option<(String, String, bool)>) -> Self {
@@ -444,13 +472,30 @@ impl TableAnalysis {
         rows
     }
 
-    /// Consume only the data grid for the legacy raw extraction path.  Detached headers remain
-    /// absent there exactly as before.
+    /// Consume the legacy raw extraction projection. Ordinary detached headers remain absent;
+    /// a proven ruled leading tier expands to its anchor followed by blank covered slots.
     pub(crate) fn into_grid_parts(self) -> Vec<Vec<String>> {
-        self.grid
+        let mut rows = Vec::with_capacity(
+            self.grid.len() + usize::from(self.legacy_prepend_header && !self.header.is_empty()),
+        );
+        if self.legacy_prepend_header {
+            rows.extend(self.header.into_iter().map(|header| {
+                let width = header.iter().map(|cell| cell.render_colspan.max(1)).sum();
+                let mut row = Vec::with_capacity(width);
+                for cell in header {
+                    row.push(cell.text);
+                    row.extend(std::iter::repeat_n(
+                        String::new(),
+                        cell.render_colspan.max(1) - 1,
+                    ));
+                }
+                row
+            }));
+        }
+        rows.extend(self.grid
             .into_iter()
-            .map(|row| row.into_iter().map(|cell| cell.text).collect())
-            .collect()
+            .map(|row| row.into_iter().map(|cell| cell.text).collect()));
+        rows
     }
 
     fn logical_shape(&self) -> (usize, usize) {
@@ -553,6 +598,25 @@ impl TableClaim {
 
     pub(crate) fn row_count(&self) -> usize {
         self.row_ranges.len()
+    }
+
+    /// Exact source intervals attributed to one detector row, before global unioning.
+    pub(crate) fn row(&self, index: usize) -> Option<&[SourceSlice]> {
+        self.row_ranges
+            .get(index)
+            .map(|range| &self.row_slices[range.clone()])
+    }
+
+    /// Whether this candidate owns every character in one painted source interval.
+    ///
+    /// Claims store a normalized union, so a ruled cell's sub-slice can be corroborated by an
+    /// aligned candidate that owns the original whole span.
+    pub(crate) fn covers(&self, source: SourceSlice) -> bool {
+        self.slices.iter().any(|&owned| {
+            owned.source() == source.source()
+                && owned.char_start() <= source.char_start()
+                && owned.char_end() >= source.char_end()
+        })
     }
 
     /// Fixed FNV-1a over numeric provenance only. Unlike `DefaultHasher`, this is explicitly
@@ -765,6 +829,34 @@ mod tests {
     }
 
     #[test]
+    fn detached_headers_stay_out_of_legacy_grid_unless_the_producer_marks_them() {
+        let make = || {
+            TableAnalysis::from_parts(
+                vec![vec![("Group A".into(), 2), ("Group B".into(), 2)]],
+                vec![vec!["A".into(), "B".into(), "C".into(), "D".into()]],
+                1,
+                None,
+                vec![TableEvidence::Aligned],
+            )
+        };
+        assert_eq!(
+            make().into_grid_parts(),
+            vec![vec!["A", "B", "C", "D"]],
+            "ordinary detached headers retain the legacy projection"
+        );
+
+        let mut marked = make();
+        marked.project_header_into_legacy_grid();
+        assert_eq!(
+            marked.into_grid_parts(),
+            vec![
+                vec!["Group A", "", "Group B", ""],
+                vec!["A", "B", "C", "D"],
+            ]
+        );
+    }
+
+    #[test]
     fn exact_cell_geometry_is_optional_and_preserved() {
         let bbox = Rect::new(10.0, 20.0, 30.0, 40.0);
         let cell = CellAnalysis::new("x".into(), 0, 0, 1, 1, Some(bbox));
@@ -806,6 +898,9 @@ mod tests {
         assert_eq!(whole_claim.slices, split_claim.slices);
         assert_eq!(whole_claim.stable_hash(), split_claim.stable_hash());
         assert_eq!(split_claim.slices, vec![whole]);
+        assert!(whole_claim.covers(whole.sub_slice(2, 5)));
+        assert!(split_claim.covers(whole));
+        assert!(!whole_claim.covers(SourceSlice::test_occurrence(13, 1)));
     }
 
     #[test]

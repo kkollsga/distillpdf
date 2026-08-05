@@ -351,6 +351,10 @@ pub struct Block {
     /// `None` preserves the legacy model interpretation during deserialization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_header_rows: Option<usize>,
+    /// True only when exact ruled geometry and independent aligned ownership proved a detached
+    /// leading tier. This preserves its representation-scoped Markdown projection on re-render.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_proven_leading_tier: Option<bool>,
     /// A `kind = table`'s data grid (without the detached header rows), for faithful re-emit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_grid: Option<Vec<Vec<String>>>,
@@ -719,6 +723,7 @@ mod tests {
             el_group: None,
             table_header: None,
             table_header_rows: None,
+            table_proven_leading_tier: None,
             table_grid: None,
             table_caption: None,
             el_html: None,
