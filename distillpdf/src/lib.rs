@@ -189,6 +189,11 @@ pub use pdfobj::StreamIssue;
 mod structure {
     use std::path::{Path, PathBuf};
 
+    // L1's eager-surface snapshot is a test-only consumer of the public core API. Keeping it
+    // independent of the Python binding gives resolver migrations a checked-in behavior lock.
+    #[path = "eager_oracle.rs"]
+    mod eager_oracle;
+
     fn core_src() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
     }
