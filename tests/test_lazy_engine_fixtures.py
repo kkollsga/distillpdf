@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 import distillpdf
-from lazy_engine_fixtures import generate_small, verify
+from lazy_engine_fixtures import SCALE_AXES, generate_scale, generate_small, verify
 
 
 EXPECTED_SMALL = {
@@ -94,3 +94,50 @@ def test_verifier_rejects_mutation(tmp_path):
     target.write_bytes(target.read_bytes() + b"corrupt")
     with pytest.raises(ValueError, match="size mismatch: classic.pdf"):
         verify(tmp_path)
+
+
+@pytest.mark.parametrize("axis", SCALE_AXES)
+def test_scale_profiles_are_axis_isolated_deterministic_and_openable(tmp_path, axis):
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    first = generate_scale(left, axis, 17)
+    second = generate_scale(right, axis, 17)
+
+    assert first == second
+    assert verify(left) == first
+    row = first["fixtures"][0]
+    assert row["facts"] == {
+        "axis": axis,
+        "unique_count": 17,
+        "pages": 17 if axis == "pages" else 1,
+        "generated_on_demand": True,
+        "output_retained_by_generator": False,
+    }
+    assert (left / row["name"]).read_bytes() == (right / row["name"]).read_bytes()
+    pdf = distillpdf.Pdf.open(str(left / row["name"]))
+    assert pdf.page_count() == row["facts"]["pages"]
+
+
+def test_cli_scale_profile(tmp_path):
+    script = Path(__file__).with_name("lazy_engine_fixtures.py")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "generate",
+            "--profile",
+            "scale",
+            "--axis",
+            "pages",
+            "--count",
+            "23",
+            "--out",
+            str(tmp_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {"fixtures": 1, "profile": "scale"}
+    manifest = verify(tmp_path)
+    assert manifest["fixtures"][0]["facts"]["unique_count"] == 23

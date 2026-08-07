@@ -17,7 +17,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 
 HEADER = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"
@@ -88,7 +88,6 @@ class PdfWriter:
             % (size, root_number, root_generation, suffix, startxref)
         )
         return RenderedPdf(bytes(body), startxref)
-
     def render_xref_stream(
         self,
         compressed: dict[int, tuple[int, int]] | None = None,
@@ -131,6 +130,44 @@ class PdfWriter:
         body += f"{xref_number} 0 obj\n".encode("ascii") + xref_body + b"\nendobj\n"
         body += b"startxref\n%d\n%%%%EOF\n" % startxref
         return RenderedPdf(bytes(body), startxref)
+
+
+def _write_classic_streaming(
+    path: Path,
+    objects: Iterable[tuple[int, int, bytes]],
+    root: tuple[int, int] = (1, 0),
+) -> int:
+    """Write ordered objects without retaining their bodies or the finished PDF."""
+    entries: list[tuple[int, int, bool]] = [(0, 65_535, False)]
+    previous = 0
+    with path.open("wb") as output:
+        output.write(HEADER)
+        for number, generation, body in objects:
+            if number <= previous:
+                raise ValueError("streaming objects must be strictly increasing")
+            if not 0 <= generation <= 65_534:
+                raise ValueError(f"invalid generation: {generation}")
+            while len(entries) < number:
+                entries.append((0, 0, False))
+            offset = output.tell()
+            if offset > 9_999_999_999:
+                raise OverflowError("classic xref offset exceeds ten digits")
+            output.write(f"{number} {generation} obj\n".encode("ascii"))
+            output.write(body)
+            output.write(b"\nendobj\n")
+            entries.append((offset, generation, True))
+            previous = number
+        startxref = output.tell()
+        output.write(f"xref\n0 {len(entries)}\n".encode("ascii"))
+        for offset, generation, live in entries:
+            marker = "n" if live else "f"
+            output.write(f"{offset:010d} {generation:05d} {marker} \n".encode("ascii"))
+        root_number, root_generation = root
+        output.write(
+            b"trailer\n<< /Size %d /Root %d %d R >>\nstartxref\n%d\n%%%%EOF\n"
+            % (len(entries), root_number, root_generation, startxref)
+        )
+    return startxref
 
 
 def _base_writer(probe: bytes, text: str = "lazy fixture") -> PdfWriter:
@@ -246,6 +283,138 @@ def _small_fixtures() -> Iterable[tuple[str, RenderedPdf, dict]]:
     }
 
 
+SCALE_AXES = ("pages", "objects", "links", "headings", "tags", "assets")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _scale_objects(axis: str, count: int) -> Iterator[tuple[int, int, bytes]]:
+    if axis == "pages":
+        first_page = 3
+        first_content = first_page + count
+        font = first_content + count
+        kids = b" ".join(f"{first_page + i} 0 R".encode("ascii") for i in range(count))
+        yield 1, 0, b"<< /Type /Catalog /Pages 2 0 R >>"
+        yield 2, 0, b"<< /Type /Pages /Kids [" + kids + b"] /Count %d >>" % count
+        for index in range(count):
+            yield first_page + index, 0, (
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                b"/Resources << /Font << /F1 %d 0 R >> >> /Contents %d 0 R >>"
+                % (font, first_content + index)
+            )
+        for index in range(count):
+            yield first_content + index, 0, _text_stream(f"unique page {index:05d}")
+        yield font, 0, FONT
+        return
+
+    if axis == "objects":
+        refs = b" ".join(f"{6 + i} 0 R".encode("ascii") for i in range(count))
+        writer = _base_writer(b"[" + refs + b"]", f"{count} unique objects")
+        for number, (generation, body) in sorted(writer._objects.items()):
+            yield number, generation, body
+        for index in range(count):
+            yield 6 + index, 0, b"<< /Ordinal %d /Token (object-%05d) >>" % (index, index)
+        return
+
+    if axis == "links":
+        first_annot = 6
+        refs = b" ".join(f"{first_annot + i} 0 R".encode("ascii") for i in range(count))
+        yield 1, 0, b"<< /Type /Catalog /Pages 2 0 R >>"
+        yield 2, 0, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"
+        yield 3, 0, (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R /Annots ["
+            + refs + b"] >>"
+        )
+        yield 4, 0, _text_stream(f"{count} unique links")
+        yield 5, 0, FONT
+        for index in range(count):
+            x = index % 500
+            y = (index // 500) % 700
+            yield first_annot + index, 0, (
+                b"<< /Type /Annot /Subtype /Link /Rect [%d %d %d %d] "
+                b"/A << /S /URI /URI (https://example.invalid/%05d) >> >>"
+                % (x, y, x + 1, y + 1, index)
+            )
+        return
+
+    if axis == "headings":
+        operations = []
+        for index in range(count):
+            x = 36 + (index % 8) * 70
+            y = 756 - (index % 50) * 15
+            operations.append(
+                b"BT /F1 18 Tf %d %d Td (Heading %05d) Tj ET" % (x, y, index)
+            )
+        writer = _base_writer(b"(headings)", f"{count} unique headings")
+        writer._objects[4] = (0, _stream(b"\n".join(operations)))
+        for number, (generation, body) in sorted(writer._objects.items()):
+            yield number, generation, body
+        return
+
+    if axis == "tags":
+        first_elem = 8
+        refs = b" ".join(f"{first_elem + i} 0 R".encode("ascii") for i in range(count))
+        operations = []
+        for index in range(count):
+            x = 36 + (index % 8) * 70
+            y = 756 - (index % 50) * 15
+            operations.append(
+                b"/P <</MCID %d>> BDC BT /F1 10 Tf %d %d Td (Tag %05d) Tj ET EMC"
+                % (index, x, y, index)
+            )
+        yield 1, 0, b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 6 0 R >>"
+        yield 2, 0, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"
+        yield 3, 0, (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /StructParents 0 "
+            b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+        )
+        yield 4, 0, _stream(b"\n".join(operations))
+        yield 5, 0, FONT
+        yield 6, 0, (
+            b"<< /Type /StructTreeRoot /K [" + refs + b"] /ParentTree 7 0 R /ParentTreeNextKey 1 >>"
+        )
+        yield 7, 0, b"<< /Nums [0 [" + refs + b"]] >>"
+        for index in range(count):
+            yield first_elem + index, 0, (
+                b"<< /Type /StructElem /S /P /P 6 0 R /Pg 3 0 R /K %d >>" % index
+            )
+        return
+
+    if axis == "assets":
+        first_image = 5
+        resources = b" ".join(
+            b"/Im%d %d 0 R" % (index, first_image + index) for index in range(count)
+        )
+        draws = b"\n".join(
+            b"q 1 0 0 1 %d %d cm /Im%d Do Q" % (index % 612, (index // 612) % 792, index)
+            for index in range(count)
+        )
+        yield 1, 0, b"<< /Type /Catalog /Pages 2 0 R >>"
+        yield 2, 0, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"
+        yield 3, 0, (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /XObject << " + resources + b" >> >> /Contents 4 0 R >>"
+        )
+        yield 4, 0, _stream(draws)
+        for index in range(count):
+            samples = index.to_bytes(4, "big")[1:]
+            yield first_image + index, 0, _stream(
+                samples,
+                b"/Type /XObject /Subtype /Image /Width 1 /Height 1 "
+                b"/ColorSpace /DeviceRGB /BitsPerComponent 8",
+            )
+        return
+
+    raise ValueError(f"unknown scale axis: {axis}")
+
+
 def generate_small(output: Path) -> dict:
     output.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -260,6 +429,36 @@ def generate_small(output: Path) -> dict:
             "facts": facts,
         })
     manifest = {"schema": 1, "profile": "small", "fixtures": rows}
+    (output / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return manifest
+
+
+def generate_scale(output: Path, axis: str, count: int) -> dict:
+    if axis not in SCALE_AXES:
+        raise ValueError(f"unknown scale axis: {axis}")
+    if not 1 <= count <= 100_000:
+        raise ValueError("scale count must be between 1 and 100000")
+    output.mkdir(parents=True, exist_ok=True)
+    name = f"{axis}-{count}.pdf"
+    path = output / name
+    startxref = _write_classic_streaming(path, _scale_objects(axis, count))
+    facts = {
+        "axis": axis,
+        "unique_count": count,
+        "pages": count if axis == "pages" else 1,
+        "generated_on_demand": True,
+        "output_retained_by_generator": False,
+    }
+    row = {
+        "name": name,
+        "bytes": path.stat().st_size,
+        "sha256": _sha256_file(path),
+        "startxref": startxref,
+        "facts": facts,
+    }
+    manifest = {"schema": 1, "profile": "scale", "fixtures": [row]}
     (output / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -290,9 +489,18 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("generate", "verify"))
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--profile", choices=("small",), default="small")
+    parser.add_argument("--profile", choices=("small", "scale"), default="small")
+    parser.add_argument("--axis", choices=SCALE_AXES)
+    parser.add_argument("--count", type=int)
     args = parser.parse_args()
-    manifest = generate_small(args.out) if args.command == "generate" else verify(args.out)
+    if args.command == "verify":
+        manifest = verify(args.out)
+    elif args.profile == "small":
+        manifest = generate_small(args.out)
+    else:
+        if args.axis is None or args.count is None:
+            parser.error("scale generation requires --axis and --count")
+        manifest = generate_scale(args.out, args.axis, args.count)
     print(json.dumps({"profile": manifest["profile"], "fixtures": len(manifest["fixtures"])}, sort_keys=True))
 
 
