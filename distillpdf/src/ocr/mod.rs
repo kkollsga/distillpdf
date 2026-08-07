@@ -18,6 +18,7 @@ pub mod doctags;
 pub mod engine;
 pub mod pdf;
 pub mod render;
+pub(crate) mod searchable;
 pub(crate) mod tess_synth;
 #[cfg(feature = "tesseract")]
 pub mod tesseract;

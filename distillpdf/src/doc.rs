@@ -6,7 +6,6 @@
 //! typed [`DistillOptions`]. NO pyo3 appears here — the binding does all Python-object
 //! assembly and maps [`Error`] → `PyValueError`.
 
-use lopdf::dictionary;
 use lopdf::Document;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -100,6 +99,7 @@ pub struct OcrPlanEntry {
 
 /// A loaded PDF document — the reusable pure-Rust handle.
 pub struct PdfDocument {
+    #[cfg(test)]
     pub(crate) doc: Arc<Document>,
     /// Raw PDF bytes, kept for lenient recovery of malformed streams.
     pub(crate) raw: Arc<[u8]>,
@@ -197,7 +197,7 @@ fn load_mem_with_pool(
 /// directly reintroduces the race. Pool creation therefore fails closed: a thread-spawn
 /// failure is returned to the caller and a later load may retry, but the known-racy unscoped
 /// loader is never used.
-fn load_mem_deterministic(raw: &[u8]) -> Result<Document, lopdf::Error> {
+pub(crate) fn load_mem_deterministic(raw: &[u8]) -> Result<Document, lopdf::Error> {
     static POOL: LoadPool = LoadPool::new();
     load_mem_with_pool(raw, &POOL, || {
         rayon::ThreadPoolBuilder::new()
@@ -351,6 +351,7 @@ impl PdfDocument {
         let doc = Arc::new(doc);
         let access = make_access(Arc::clone(&doc), Arc::clone(&raw));
         PdfDocument {
+            #[cfg(test)]
             doc,
             raw,
             access,
@@ -404,17 +405,17 @@ impl PdfDocument {
     /// loop by construction, not by luck: nothing crosses pages, and the pieces are re-sorted
     /// by page number before they are joined, so completion order is never observed.
     pub fn extract_text(&self) -> String {
-        let pages = self.doc.get_pages();
+        let pages = self.access.pages().unwrap_or_default();
         let mut per_page: Vec<(u32, String)> = pages
             .par_iter()
-            .map(|(&p, &page_id)| {
-                let mine = text::extract_page(self.access.as_ref(), page_id, &self.raw).unwrap_or_default();
+            .map(|page| {
+                let mine = text::extract_page(self.access.as_ref(), page.id, &self.raw).unwrap_or_default();
                 let s = if mine.trim().chars().count() >= 2 {
                     mine
                 } else {
-                    self.doc.extract_text(&[p]).unwrap_or_default() // per-page lopdf fallback
+                    self.access.fallback_page_text(page.number).unwrap_or_default()
                 };
-                (p, s)
+                (page.number, s)
             })
             .collect();
         per_page.sort_by_key(|(p, _)| *p);
@@ -428,20 +429,22 @@ impl PdfDocument {
 
     /// Extract text from a single 1-indexed page (hybrid).
     pub fn extract_page_text(&self, page: u32) -> Result<String, Error> {
-        let page_id = *self.doc.get_pages().get(&page).ok_or(Error::NoPage(Some(page)))?;
+        let page_id = self.access.pages().unwrap_or_default().into_iter()
+            .find(|entry| entry.number == page).map(|entry| entry.id)
+            .ok_or(Error::NoPage(Some(page)))?;
         let mine = text::extract_page(self.access.as_ref(), page_id, &self.raw).unwrap_or_default();
         Ok(if mine.trim().chars().count() >= 2 {
             mine
         } else {
-            self.doc.extract_text(&[page]).unwrap_or_default()
+            self.access.fallback_page_text(page).unwrap_or_default()
         })
     }
 
     /// Diagnostic: force our ToUnicode extractor for all pages.
     pub fn mine_text(&self) -> String {
         let mut out = String::new();
-        for &page_id in self.doc.get_pages().values() {
-            out.push_str(&text::extract_page(self.access.as_ref(), page_id, &self.raw).unwrap_or_default());
+        for page in self.access.pages().unwrap_or_default() {
+            out.push_str(&text::extract_page(self.access.as_ref(), page.id, &self.raw).unwrap_or_default());
             out.push('\n');
         }
         out
@@ -449,7 +452,9 @@ impl PdfDocument {
 
     /// Diagnostic: raw spans (text, x, width, size) for a 1-indexed page.
     pub fn dbg_spans(&self, page: u32) -> Result<Vec<(String, f32, f32, f32)>, Error> {
-        let page_id = *self.doc.get_pages().get(&page).ok_or(Error::NoPage(None))?;
+        let page_id = self.access.pages().unwrap_or_default().into_iter()
+            .find(|entry| entry.number == page).map(|entry| entry.id)
+            .ok_or(Error::NoPage(None))?;
         Ok(text::extract_spans(self.access.as_ref(), page_id, &self.raw)
             .into_iter()
             .map(|s| (s.text, s.x, s.width, s.size))
@@ -459,7 +464,9 @@ impl PdfDocument {
     /// Diagnostic: spans with y for a 1-indexed page (text, x, y, width, size).
     #[allow(clippy::type_complexity)] // a flat diagnostic tuple mirroring the Python `_dbg_spans_xy`
     pub fn dbg_spans_xy(&self, page: u32) -> Result<Vec<(String, f32, f32, f32, f32)>, Error> {
-        let page_id = *self.doc.get_pages().get(&page).ok_or(Error::NoPage(None))?;
+        let page_id = self.access.pages().unwrap_or_default().into_iter()
+            .find(|entry| entry.number == page).map(|entry| entry.id)
+            .ok_or(Error::NoPage(None))?;
         Ok(text::extract_spans(self.access.as_ref(), page_id, &self.raw)
             .into_iter()
             .map(|s| (s.text, s.x, s.y, s.width, s.size))
@@ -479,16 +486,15 @@ impl PdfDocument {
     /// document, so a filter can never quietly start eating real figures.
     pub fn figure_gate_stats(&self) -> (u32, u32, Vec<u32>) {
         let (mut accepted, mut suppressed, mut pages) = (0u32, 0u32, Vec::new());
-        let map = self.doc.get_pages();
-        let mut nums: Vec<u32> = map.keys().copied().collect();
-        nums.sort_unstable();
-        for n in nums {
-            let (strong, weak) = crate::vector::positioned_vectors(self.access.as_ref(), map[&n]);
+        let mut page_map = self.access.pages().unwrap_or_default();
+        page_map.sort_by_key(|page| page.number);
+        for page in page_map {
+            let (strong, weak) = crate::vector::positioned_vectors(self.access.as_ref(), page.id);
             let dropped = weak.iter().filter(|v| v.demoted()).count() as u32;
             accepted += strong.len() as u32;
             suppressed += dropped;
             if dropped > 0 {
-                pages.push(n);
+                pages.push(page.number);
             }
         }
         (accepted, suppressed, pages)
@@ -512,7 +518,9 @@ impl PdfDocument {
 
     /// Diagnostic for one 1-indexed page.
     pub fn debug_page(&self, page: u32) -> Result<String, Error> {
-        let page_id = *self.doc.get_pages().get(&page).ok_or(Error::NoPage(Some(page)))?;
+        let page_id = self.access.pages().unwrap_or_default().into_iter()
+            .find(|entry| entry.number == page).map(|entry| entry.id)
+            .ok_or(Error::NoPage(Some(page)))?;
         Ok(text::debug_page(self.access.as_ref(), page_id, &self.raw))
     }
 
@@ -567,16 +575,16 @@ impl PdfDocument {
     /// OCR plan: per page, whether OCR is needed and (if so) the page raster bytes.
     pub fn ocr_plan(&self) -> Vec<OcrPlanEntry> {
         let mut out = Vec::new();
-        for (&pno, &page_id) in &self.doc.get_pages() {
-            let decision = ocr::detect::decide(self.access.as_ref(), page_id, &self.raw);
+        for page in self.access.pages().unwrap_or_default() {
+            let decision = ocr::detect::decide(self.access.as_ref(), page.id, &self.raw);
             let needs = !matches!(decision, ocr::detect::OcrDecision::NotNeeded);
-            let (w, h) = ocr::page_size_pts(self.access.as_ref(), page_id);
+            let (w, h) = ocr::page_size_pts(self.access.as_ref(), page.id);
             let image = if needs {
-                ocr::page_main_image(self.access.as_ref(), page_id).map(|(b, _)| b)
+                ocr::page_main_image(self.access.as_ref(), page.id).map(|(b, _)| b)
             } else {
                 None
             };
-            out.push(OcrPlanEntry { page: pno, needs_ocr: needs, reason: format!("{decision:?}"), width_pts: w, height_pts: h, image });
+            out.push(OcrPlanEntry { page: page.number, needs_ocr: needs, reason: format!("{decision:?}"), width_pts: w, height_pts: h, image });
         }
         out
     }
@@ -601,48 +609,8 @@ impl PdfDocument {
     /// Build a searchable PDF from OCR results. `remove_raster` selects clean-reflow vs
     /// invisible-overlay. Returns the saved PDF bytes; the caller writes the file.
     pub fn build_searchable_pdf(&self, ocr: &HashMap<u32, String>, remove_raster: bool) -> Result<Vec<u8>, Error> {
-        let build = || -> Result<Vec<u8>, String> {
-            let mut doc = load_mem_deterministic(&self.raw).map_err(|e| e.to_string())?;
-            let (helv, helv_b) = ocr::pdf::add_fonts(&mut doc);
-            let pages = doc.get_pages();
-            for (&pno, &page_id) in &pages {
-                let Some(dt) = ocr.get(&pno) else { continue };
-                let (w, h) = ocr::page_size_pts(self.access.as_ref(), page_id);
-                if remove_raster {
-                    // Clean reflow: replace the page's content with our text + cropped figures.
-                    let image = ocr::page_main_image(self.access.as_ref(), page_id).map(|(_, img)| img);
-                    let pin = ocr::pdf::PageInput { page: ocr::doctags::parse(dt), width: w, height: h, image };
-                    let (content, xobjs) = ocr::pdf::build_page_content(&mut doc, &pin)?;
-                    let data = content.encode().map_err(|e| e.to_string())?;
-                    let stream_id = doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), data));
-                    let mut xo = lopdf::Dictionary::new();
-                    for (name, id) in &xobjs {
-                        xo.set(name.as_bytes().to_vec(), lopdf::Object::Reference(*id));
-                    }
-                    let res = dictionary! {
-                        "Font" => dictionary! { "F1" => helv, "F2" => helv_b },
-                        "XObject" => xo,
-                    };
-                    let page = doc.get_object_mut(page_id).map_err(|e| e.to_string())?.as_dict_mut().map_err(|e| e.to_string())?;
-                    page.set("Contents", lopdf::Object::Reference(stream_id));
-                    page.set("Resources", lopdf::Object::Dictionary(res));
-                } else {
-                    // Keep the scan: append an invisible OCR text layer over the original page.
-                    let pin = ocr::pdf::PageInput { page: ocr::doctags::parse(dt), width: w, height: h, image: None };
-                    let data = ocr::pdf::build_text_overlay(&pin).encode().map_err(|e| e.to_string())?;
-                    let stream_id = doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), data));
-                    append_page_content(&mut doc, page_id, stream_id);
-                    add_overlay_fonts(&mut doc, page_id, helv, helv_b);
-                }
-            }
-            if remove_raster {
-                doc.prune_objects();
-            }
-            let mut buf = Vec::new();
-            doc.save_to(&mut buf).map_err(|e| e.to_string())?;
-            Ok(buf)
-        };
-        build().map_err(Error::Model)
+        ocr::searchable::build(&self.raw, self.access.as_ref(), ocr, remove_raster)
+            .map_err(Error::Model)
     }
 
     /// Resolve where rendered output is written for the given default extension.
@@ -700,42 +668,6 @@ impl PdfDocument {
         }
         model::container::save(&model, &dest, &asset_bytes, None).map_err(Error::Model)?;
         Ok(dest.to_string_lossy().into_owned())
-    }
-}
-
-/// Append `stream_id` to a page's `/Contents` so an extra content stream (the invisible OCR
-/// text overlay) draws after the page's own content while leaving it untouched.
-fn append_page_content(doc: &mut Document, page_id: lopdf::ObjectId, stream_id: lopdf::ObjectId) {
-    let Ok(page) = doc.get_object_mut(page_id).and_then(|o| o.as_dict_mut()) else { return };
-    let new = match page.get(b"Contents").ok().cloned() {
-        Some(lopdf::Object::Array(mut a)) => {
-            a.push(lopdf::Object::Reference(stream_id));
-            lopdf::Object::Array(a)
-        }
-        Some(existing @ lopdf::Object::Reference(_)) => lopdf::Object::Array(vec![existing, lopdf::Object::Reference(stream_id)]),
-        _ => lopdf::Object::Reference(stream_id),
-    };
-    page.set("Contents", new);
-}
-
-/// Give a page its own `/Resources` carrying the OCR overlay fonts (under names distinct from
-/// the page's own fonts), preserving its existing resources. Used by the keep-raster path.
-fn add_overlay_fonts(doc: &mut Document, page_id: lopdf::ObjectId, helv: lopdf::ObjectId, helv_b: lopdf::ObjectId) {
-    let mut res = match doc.get_page_resources(page_id) {
-        Ok((Some(d), _)) => d.clone(),
-        Ok((None, ids)) => ids.first().and_then(|id| doc.get_dictionary(*id).ok()).cloned().unwrap_or_default(),
-        Err(_) => lopdf::Dictionary::new(),
-    };
-    let mut fonts = match res.get(b"Font").ok().cloned() {
-        Some(lopdf::Object::Dictionary(d)) => d,
-        Some(lopdf::Object::Reference(r)) => doc.get_dictionary(r).cloned().unwrap_or_default(),
-        _ => lopdf::Dictionary::new(),
-    };
-    fonts.set(ocr::pdf::OVERLAY_FONT, lopdf::Object::Reference(helv));
-    fonts.set(ocr::pdf::OVERLAY_FONT_BOLD, lopdf::Object::Reference(helv_b));
-    res.set("Font", fonts);
-    if let Ok(page) = doc.get_object_mut(page_id).and_then(|o| o.as_dict_mut()) {
-        page.set("Resources", lopdf::Object::Dictionary(res));
     }
 }
 

@@ -305,6 +305,8 @@ pub(crate) trait DocumentAccess: Send + Sync {
         StreamHandle::new(id, self.object(id)?)
     }
     fn pages(&self) -> Result<Vec<PageRef>, AccessError>;
+    /// Backend-compatible fallback text for one 1-indexed page.
+    fn fallback_page_text(&self, page: u32) -> Result<String, AccessError>;
     /// Every indexed indirect object id in deterministic order.
     fn object_ids(&self) -> Vec<ObjectId>;
     /// Page `/Resources` dictionaries in outermost-to-page overlay order.
@@ -384,6 +386,12 @@ impl DocumentAccess for EagerDocumentAdapter {
             .into_iter()
             .map(|(number, id)| PageRef { number, id })
             .collect())
+    }
+
+    fn fallback_page_text(&self, page: u32) -> Result<String, AccessError> {
+        self.document
+            .extract_text(&[page])
+            .map_err(|error| AccessError::object((0, 0), error))
     }
 
     fn object_ids(&self) -> Vec<ObjectId> {
@@ -470,6 +478,7 @@ pub(crate) mod tests {
         pub(crate) object_reads: AtomicU64,
         pub(crate) object_lists: AtomicU64,
         pub(crate) page_reads: AtomicU64,
+        pub(crate) fallback_text_reads: AtomicU64,
         pub(crate) resource_reads: AtomicU64,
         pub(crate) source_requests: AtomicU64,
         pub(crate) source_reads: AtomicU64,
@@ -514,6 +523,7 @@ pub(crate) mod tests {
         Trailer,
         PageContent,
         Pages,
+        FallbackText,
         Resources,
         Source,
     }
@@ -574,6 +584,12 @@ pub(crate) mod tests {
             self.counts.page_reads.fetch_add(1, Ordering::Relaxed);
             self.failure(FaultPoint::Pages, (0, 0))?;
             self.inner.pages()
+        }
+
+        fn fallback_page_text(&self, page: u32) -> Result<String, AccessError> {
+            self.counts.fallback_text_reads.fetch_add(1, Ordering::Relaxed);
+            self.failure(FaultPoint::FallbackText, (page, 0))?;
+            self.inner.fallback_page_text(page)
         }
 
         fn object_ids(&self) -> Vec<ObjectId> {
@@ -765,6 +781,10 @@ pub(crate) mod tests {
             Ok(Vec::new())
         }
 
+        fn fallback_page_text(&self, page: u32) -> Result<String, AccessError> {
+            Err(AccessError::object((page, 0), "unexpected fallback text read"))
+        }
+
         fn object_ids(&self) -> Vec<ObjectId> {
             Vec::new()
         }
@@ -844,6 +864,7 @@ pub(crate) mod tests {
             FaultPoint::Trailer,
             FaultPoint::PageContent,
             FaultPoint::Pages,
+            FaultPoint::FallbackText,
             FaultPoint::Resources,
             FaultPoint::Source,
         ] {
@@ -855,6 +876,7 @@ pub(crate) mod tests {
                 FaultPoint::Trailer => fault.trailer_entry(b"Root").err().unwrap(),
                 FaultPoint::PageContent => fault.page_content(ids[0]).err().unwrap(),
                 FaultPoint::Pages => fault.pages().err().unwrap(),
+                FaultPoint::FallbackText => fault.fallback_page_text(1).err().unwrap(),
                 FaultPoint::Resources => fault.page_resource_chain(ids[0]).err().unwrap(),
                 FaultPoint::Source => {
                     let source_error = fault.source().read_range(0, 1, 1).err().unwrap();
