@@ -170,27 +170,7 @@
     "clone-call|8a28850777355049b2ac8e474be686b978d7db179ea83a797481ff2c9bf93fa9|f . scope . resources . clone ()",
     "clone-call|97fef2ae607f36a9f08af22c080e123fa8ab68e45af7072902a2fa7443a12680|t . seq . clone ()",
     "clone-call|97fef2ae607f36a9f08af22c080e123fa8ab68e45af7072902a2fa7443a12680|t . seq . clone ()",
-    "clone-call|fbd6d0a0a26ee8cb2d75234f4ac3c2ab346a2b06f1859b726cd5c50dbcc9bbae|tiles . iter () . map (| t | & t . seq) . min () . cloned ()",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "direct-backend-method|1ce438097720e9c62c918178da91b562f423480b779a61a87dd4ed07f0381a84|doc . get_object (sid)",
-    "direct-backend-method|4d5ff9f8c5e1ed13c304a54c8cbaac95d59ae406fb9d9930e7e6554466048c83|doc . get_and_decode_page_content (page_id)",
-    "direct-backend-method|b85ae0326f8c7b07a9582ef06f8ce37e3d2424abe78471f8a64cdf9abaf2faae|doc . get_object (id)",
-    "direct-backend-method|b85ae0326f8c7b07a9582ef06f8ce37e3d2424abe78471f8a64cdf9abaf2faae|doc . get_object (id)",
-    "direct-backend-method|b85ae0326f8c7b07a9582ef06f8ce37e3d2424abe78471f8a64cdf9abaf2faae|doc . get_object (id)",
-    "direct-backend-method|b85ae0326f8c7b07a9582ef06f8ce37e3d2424abe78471f8a64cdf9abaf2faae|doc . get_object (id)",
-    "direct-backend-method|b85ae0326f8c7b07a9582ef06f8ce37e3d2424abe78471f8a64cdf9abaf2faae|doc . get_object (id)",
-    "direct-backend-method|d1855dcfb5d5c9dfd5b4f1b3bec88d3b8606601ea308b876baf27492637a3bae|doc . get_object (t . id)"
+    "clone-call|fbd6d0a0a26ee8cb2d75234f4ac3c2ab346a2b06f1859b726cd5c50dbcc9bbae|tiles . iter () . map (| t | & t . seq) . min () . cloned ()"
   ],
   "layout.rs": [
     "clone-call|af39dbf5a6608c91f5f667ee77e13b7dffe48160f02afa59c8d69348e8be3b07|h . clone ()",
@@ -301,7 +281,6 @@
   "ocr/detect.rs": [
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "direct-backend-field|0734cfb74bd1f1186928639dfa0d9f0aef3065af8d4441e57322ab0a9f3bf4c8|doc . trailer",
     "direct-backend-method|8a92211c57687fe572f2113de238cf4d9539ab8ffd1fc4b602703b9c08d13cdc|doc . get_object (* id)"
   ],
@@ -315,9 +294,6 @@
     "clone-call|0884cc10c4172bc101ac4b9c0f810345a010c89874b8eaee94d30b5f68916598|cfg . prompt . clone ()",
     "clone-call|2f089a12ec605aa6e4ea4f587eef37bf0736eb4eff4fb90034613d430718b1b7|self . pages . get (i) . cloned ()",
     "clone-call|9af436d8298e0c59e93536a2b9cfa16497001c980f436c78f6a8cbbb938a863b|cfg . host . clone ()"
-  ],
-  "ocr/mod.rs": [
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document"
   ],
   "ocr/pdf.rs": [
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
@@ -348,13 +324,7 @@
     "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
     "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
     "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
-    "clone-call|d464785f33c28e362b13fe8a296253bb378b1dcdf9dde5a4c669a2172564eccb|bytes . clone ()",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document"
+    "clone-call|d464785f33c28e362b13fe8a296253bb378b1dcdf9dde5a4c669a2172564eccb|bytes . clone ()"
   ],
   "structtree.rs": [
     "clone-call|1940026b4cd992b1aee631e6b2d26751634d69f32fb31cc455cf03fb957456ae|element . clone ()",
@@ -382,16 +352,7 @@
     "clone-call|c08285b199d650a1b5018845452a9b162a62889824e2a0a292186c8457695a4c|s . text . clone ()",
     "clone-call|c08285b199d650a1b5018845452a9b162a62889824e2a0a292186c8457695a4c|s . text . clone ()",
     "clone-call|cc52c2c177fc9bfca77c1ed74cce2f748362c9922e510c606ad6157d59ba11ba|p . seq . clone ()",
-    "clone-call|debed18217d5434a22184e26395be868524f4331461b7b0e2a9fd287aa6e1320|egmap . clone ()",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "direct-backend-method|4d5ff9f8c5e1ed13c304a54c8cbaac95d59ae406fb9d9930e7e6554466048c83|doc . get_and_decode_page_content (page_id)"
+    "clone-call|debed18217d5434a22184e26395be868524f4331461b7b0e2a9fd287aa6e1320|egmap . clone ()"
   ],
   "walker.rs": [
     "clone-call|1b328262b779300ca6b82ac4de0be39372984529ad9b979980367c9268878af6|name . clone ()",

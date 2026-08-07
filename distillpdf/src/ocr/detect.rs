@@ -78,7 +78,7 @@ pub(crate) fn decide(
     page_id: ObjectId,
     raw: &[u8],
 ) -> OcrDecision {
-    let coverage = image_coverage(doc, access, page_id);
+    let coverage = image_coverage(access, page_id);
     if coverage <= 0.0 {
         return OcrDecision::NotNeeded; // no renderable image → leave the page alone
     }
@@ -93,11 +93,10 @@ pub(crate) fn decide(
 /// renderable figure-sized image — the same view the OCR image extractor (`page_main_image`)
 /// has, so detection never flags a page whose image we couldn't actually read.
 fn image_coverage(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     page_id: ObjectId,
 ) -> f32 {
-    let placed = crate::img::positioned_images(doc, access, page_id, false);
+    let placed = crate::img::positioned_images(access, page_id, false);
     if placed.is_empty() {
         return 0.0;
     }

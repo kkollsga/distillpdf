@@ -15,7 +15,9 @@ use crate::geom::{Mat, Rect};
 use crate::access::read_resolved;
 use crate::pdfobj::{num, num_resolved};
 use crate::walker::{descend_form, overlay_xobjects, page_resource_chain, Descend, PaintSeq, ScopePolicy, XMap};
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use lopdf::{Dictionary, Object, ObjectId};
+#[cfg(test)]
+use lopdf::Document;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -72,7 +74,6 @@ const MAX_COLORANTS: usize = 32;
 /// Parse one colour-space object. `None` means "not a space this path models" — the caller
 /// then leaves the active space unset, which is precisely today's behaviour.
 fn parse_cs(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     res: &crate::walker::ResourceScope,
     o: &Object,
@@ -113,7 +114,7 @@ fn parse_cs(
                 }
                 // The alternate space reduces to a component count — and an `/Indexed`
                 // alternate is illegal, so it degrades rather than being read as gray.
-                let alt = crate::raster::cs_model(doc, access, res, a.get(2)?, depth + 1).and_then(|c| match c {
+                let alt = crate::raster::cs_model(access, res, a.get(2)?, depth + 1).and_then(|c| match c {
                     // An `/Indexed` or spot alternate is illegal (§8.6.6.4), so it degrades
                     // rather than being read as gray or as another space's tint count.
                     crate::raster::Cs::Indexed { .. } | crate::raster::Cs::Tint { .. } => None,
@@ -132,7 +133,7 @@ fn parse_cs(
             _ => {}
             }
         }
-        crate::raster::cs_model(doc, access, res, o, depth).map(|_| PaintCs::Device)
+        crate::raster::cs_model(access, res, o, depth).map(|_| PaintCs::Device)
     })?
 }
 
@@ -140,7 +141,6 @@ fn parse_cs(
 /// what `cs`/`CS` resolve against, folded over the page's resource chain exactly as the
 /// `/ExtGState` map is.
 fn colorspaces_of(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     scope: &crate::walker::ResourceScope,
     resources: &Dictionary,
@@ -152,7 +152,7 @@ fn colorspaces_of(
                 return;
             };
             for (name, value) in color_spaces.iter() {
-                if let Some(color_space) = parse_cs(doc, access, scope, value, 0) {
+                if let Some(color_space) = parse_cs(access, scope, value, 0) {
                     map.insert(name.clone(), Rc::new(color_space));
                 }
             }
@@ -1158,44 +1158,40 @@ fn rules_of(painted: &[Painted]) -> PageRules {
 /// Returns `(strong, weak)` placed vector figures. STRONG are emitted unconditionally; WEAK
 /// are sub-threshold candidates html.rs promotes only when a figure caption anchors to one.
 pub fn positioned_vectors(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     page_id: ObjectId,
 ) -> (Vec<PlacedSvg>, Vec<PlacedSvg>) {
-    let (s, w, _) = positioned_vectors_capped(doc, access, page_id, MAX_OPS);
+    let (s, w, _) = positioned_vectors_capped(access, page_id, MAX_OPS);
     (s, w)
 }
 
 /// [`positioned_vectors`] plus the page's ruling — one walk, two answers, for the caller
 /// (`html.rs`) that needs both. The ruling is the table pillar's second evidence source.
 pub fn positioned_vectors_ruled(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     page_id: ObjectId,
 ) -> (Vec<PlacedSvg>, Vec<PlacedSvg>, PageRules) {
-    positioned_vectors_capped(doc, access, page_id, MAX_OPS)
+    positioned_vectors_capped(access, page_id, MAX_OPS)
 }
 
 /// Just the page's ruling, for the table pillar's own entry point (`extract_tables`), which
 /// has no use for the figures.
 pub fn page_rules(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     page_id: ObjectId,
 ) -> PageRules {
-    rules_of(&painted_page(doc, access, page_id, MAX_OPS))
+    rules_of(&painted_page(access, page_id, MAX_OPS))
 }
 
 /// [`positioned_vectors`] with an explicit operation budget (the public entry point passes
 /// [`MAX_OPS`]). Exposed internally so the truncation behaviour is unit-testable with a tiny
 /// cap instead of a half-million-operation fixture.
 fn positioned_vectors_capped(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     page_id: ObjectId,
     cap: usize,
 ) -> (Vec<PlacedSvg>, Vec<PlacedSvg>, PageRules) {
-    let painted = painted_page(doc, access, page_id, cap);
+    let painted = painted_page(access, page_id, cap);
     let rules = rules_of(&painted);
     // Paint order is stamped by the walk itself (`PaintSeq`, the operation's address in the
     // content tree) rather than re-derived from this vector's order here. The two are the
@@ -1228,7 +1224,6 @@ fn positioned_vectors_capped(
 /// Interpret one page's content (and its annotation appearances) into painted paths — the
 /// shared front half of [`positioned_vectors_capped`] and [`page_rules`].
 fn painted_page(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     page_id: ObjectId,
     cap: usize,
@@ -1242,9 +1237,13 @@ fn painted_page(
     // the graphics state starts at the spec defaults (opaque, black) — which is exactly
     // what a page with no `/ExtGState` is entitled to.
     let chain = page_resource_chain(access, page_id);
-    let content = match doc.get_and_decode_page_content(page_id) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
+    let content = match access
+        .page_content(page_id)
+        .ok()
+        .and_then(|bytes| lopdf::content::Content::decode(&bytes).ok())
+    {
+        Some(content) => content,
+        None => return Vec::new(),
     };
     // Over-budget pages DEGRADE, they do not vanish: interpret the first `cap` operations and
     // keep whatever was painted by then. Returning empty here made a dense page look like a page
@@ -1262,12 +1261,12 @@ fn painted_page(
         let _ = res.read(|dictionary| {
             overlay_xobjects(access, dictionary, &mut xmap);
             egmap.extend(extgstates_of(access, dictionary));
-            csmap.extend(colorspaces_of(doc, access, &resource_scope, dictionary));
+            csmap.extend(colorspaces_of(access, &resource_scope, dictionary));
         });
     }
     let mut painted = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
-    walk(doc, access, ops, &xmap, &egmap, &csmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget, &[]);
+    walk(access, ops, &xmap, &egmap, &csmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget, &[]);
     // §12.5.5: an annotation's appearance is page content, painted on top of the content
     // stream and reachable from neither it nor the page's `/Resources`. Its ink is this
     // walk's business exactly as a form's is — see `walker::placed_appearances` for the
@@ -1292,7 +1291,6 @@ fn painted_page(
             let _ = fr.read(|resources| {
                 aeg.extend(extgstates_of(access, resources));
                 acs.extend(colorspaces_of(
-                    doc,
                     access,
                     &crate::walker::ResourceScope::own(fr.clone()),
                     resources,
@@ -1307,7 +1305,7 @@ fn painted_page(
             g.clip = Some(intersect_clip(g.clip, (bb.x0, bb.y0, bb.x1, bb.y1)));
         }
         let here = PaintSeq::at(&[], content.operations.len() + k);
-        walk(doc, access, &f.ops, &f.scope.xobjects, &aeg, &acs, g, &mut painted, 1, &mut budget, here.as_slice());
+        walk(access, &f.ops, &f.scope.xobjects, &aeg, &acs, g, &mut painted, 1, &mut budget, here.as_slice());
     }
     painted
 }
@@ -1440,7 +1438,6 @@ fn clone_label(s: &LabelSpan) -> LabelSpan {
 /// left to [`crate::img`].
 #[allow(clippy::too_many_arguments)]
 fn walk(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     ops: &[lopdf::content::Operation],
     xmap: &XMap,
@@ -1623,7 +1620,6 @@ fn walk(
                             child_eg.insert(k, v);
                         }
                         for (k, v) in colorspaces_of(
-                            doc,
                             access,
                             &crate::walker::ResourceScope::own(fr.clone()),
                             resources,
@@ -1655,7 +1651,7 @@ fn walk(
                 {
                     sub.clip = Some(intersect_clip(sub.clip, (bb.x0, bb.y0, bb.x1, bb.y1)));
                 }
-                walk(doc, access, &f.ops, &f.scope.xobjects, &child_eg, &child_cs, sub, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice());
+                walk(access, &f.ops, &f.scope.xobjects, &child_eg, &child_cs, sub, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice());
             }
             _ => {}
         }
@@ -2031,7 +2027,7 @@ mod tests {
     /// is orthogonal to what they assert and has its own fixtures
     /// (`the_ink_gate_*`), so they read the size-bar view instead of the gated one.
     fn size_bar_figures(doc: &Document, page_id: ObjectId) -> Vec<PlacedSvg> {
-        let (strong, weak) = positioned_vectors(doc, &test_adapter(doc), page_id);
+        let (strong, weak) = positioned_vectors(&test_adapter(doc), page_id);
         let mut all: Vec<PlacedSvg> = strong.into_iter().chain(weak.into_iter().filter(|v| v.demoted())).collect();
         all.sort_by(|a, b| b.y_top.partial_cmp(&a.y_top).unwrap_or(std::cmp::Ordering::Equal));
         all
@@ -2058,7 +2054,6 @@ mod tests {
                 overlay_xobjects(&access, dictionary, &mut xmap);
                 egmap.extend(extgstates_of(&access, dictionary));
                 csmap.extend(colorspaces_of(
-                    doc,
                     &access,
                     &resource_scope,
                     dictionary,
@@ -2067,7 +2062,7 @@ mod tests {
         }
         let mut painted = Vec::new();
         let mut budget = crate::WalkBudget::new(budget);
-        walk(doc, &access, &content.operations, &xmap, &egmap, &csmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget, &[]);
+        walk(&access, &content.operations, &xmap, &egmap, &csmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget, &[]);
         painted
     }
 
@@ -2082,7 +2077,7 @@ mod tests {
         assert!(painted.is_empty(), "the bomb paints no ink, so nothing may be invented for it");
         // The full render entry point must be bounded too, not just the raw walker.
         let t = std::time::Instant::now();
-        let _ = positioned_vectors(&doc, &test_adapter(&doc), page_id);
+        let _ = positioned_vectors(&test_adapter(&doc), page_id);
         assert!(t.elapsed().as_secs() < 10, "positioned_vectors ran for {:?}", t.elapsed());
     }
 
@@ -2158,7 +2153,7 @@ mod tests {
             (3, false, "a white-on-white layer paints nothing at all"),
         ] {
             let (doc, page_id) = ink_gate_page(n);
-            let (strong, weak) = positioned_vectors(&doc, &test_adapter(&doc), page_id);
+            let (strong, weak) = positioned_vectors(&test_adapter(&doc), page_id);
             let demoted: Vec<&PlacedSvg> = weak.iter().filter(|v| v.demoted()).collect();
             // Every page draws exactly one cluster over the strong size bar; the gate decides
             // which side of the line it lands on.
@@ -2174,7 +2169,7 @@ mod tests {
         // as it would a small hand-drawn diagram — a rejection is never a deletion, and the
         // count is reported (`PdfDocument::figure_gate_stats`).
         let (doc, page_id) = ink_gate_page(2);
-        let (strong, weak) = positioned_vectors(&doc, &test_adapter(&doc), page_id);
+        let (strong, weak) = positioned_vectors(&test_adapter(&doc), page_id);
         assert!(strong.is_empty(), "the shaded table is not a figure");
         let d = weak.iter().find(|v| v.demoted()).expect("the rejected cluster is still a candidate");
         assert!(d.ink().contains("<path"), "and it kept its geometry, ready to be promoted");
@@ -2189,10 +2184,10 @@ mod tests {
         // keeps the gate from deleting those pages. `ink_gate.pdf` p2 and p4 draw the same
         // shaded table, so the turn is the only difference between the two verdicts.
         let (doc, page_id) = ink_gate_page(2);
-        let (upright, uweak) = positioned_vectors(&doc, &test_adapter(&doc), page_id);
+        let (upright, uweak) = positioned_vectors(&test_adapter(&doc), page_id);
         assert!(upright.is_empty() && uweak.iter().any(|v| v.demoted()), "upright: the gate applies");
         let (doc, page_id) = ink_gate_page(4);
-        let (turned, tweak) = positioned_vectors(&doc, &test_adapter(&doc), page_id);
+        let (turned, tweak) = positioned_vectors(&test_adapter(&doc), page_id);
         assert_eq!(turned.len(), 1, "a quarter-turned page keeps its figure");
         assert!(!tweak.iter().any(|v| v.demoted()), "and nothing was demoted on it");
     }
@@ -2358,7 +2353,7 @@ mod tests {
         let (doc, page_id) = dense_page();
         // Size-bar view (see `size_bar_figures`): the fixture's grid is 12 black rules, so
         // the ink gate demotes it — what this test is about is that the CAP does not delete it.
-        let (strong, weak, _) = positioned_vectors_capped(&doc, &test_adapter(&doc), page_id, 50);
+        let (strong, weak, _) = positioned_vectors_capped(&test_adapter(&doc), page_id, 50);
         let strong: Vec<PlacedSvg> = strong.into_iter().chain(weak.into_iter().filter(|v| v.demoted())).collect();
         assert_eq!(strong.len(), 1, "the early-painted grid figure must survive a tripped cap");
         let grid = &strong[0];
@@ -2544,7 +2539,7 @@ mod tests {
         let page_id = *doc.get_pages().get(&1).expect("page 1");
         let strong = size_bar_figures(&doc, page_id);
         assert_eq!(strong.len(), 2, "the two bands must cluster as two figures");
-        let images = crate::img::positioned_images(&doc, &test_adapter(&doc), page_id, true);
+        let images = crate::img::positioned_images(&test_adapter(&doc), page_id, true);
         assert_eq!(images.len(), 2, "one raster per figure");
 
         // Pair each figure with the raster inside it, exactly as html.rs's absorb does.
@@ -2837,7 +2832,7 @@ mod tests {
         let (doc, ids) = rotated_pages();
         // Upright: the exact rect the raster occupies in local coords, plain form.
         let strong = size_bar_figures(&doc, ids[0]);
-        let images = crate::img::positioned_images(&doc, &test_adapter(&doc), ids[0], true);
+        let images = crate::img::positioned_images(&test_adapter(&doc), ids[0], true);
         assert_eq!(images.len(), 1, "one raster per page");
         assert!(images[0].ctm.is_none(), "the fixture's placement is axis-aligned");
         fn raster(im: &crate::img::Placed) -> Raster<'_> {
@@ -2855,7 +2850,7 @@ mod tests {
         // `matrix(0 40 -30 0 250 20)`: the same box with the rotation baked into the matrix,
         // which was right for a composite and wrong for the `<img>` sharing the same URI.)
         let strong = size_bar_figures(&doc, ids[1]);
-        let images = crate::img::positioned_images(&doc, &test_adapter(&doc), ids[1], true);
+        let images = crate::img::positioned_images(&test_adapter(&doc), ids[1], true);
         assert!(images[0].ctm.is_some(), "a turned raster must carry the matrix for its turned unit square");
         let turned = strong[0].composite_svg(&[raster(&images[0])]);
         assert!(turned.contains("transform=\"matrix(30 0 0 40 220 20)\""), "/Rotate 90: {turned}");
@@ -2925,7 +2920,6 @@ mod tests {
         let egmap: HashMap<Vec<u8>, (Option<f32>, Option<f32>)> = HashMap::new();
         let csmap: HashMap<Vec<u8>, Rc<PaintCs>> = HashMap::new();
         walk(
-            doc,
             &test_adapter(doc),
             &content.operations,
             &XMap::new(),

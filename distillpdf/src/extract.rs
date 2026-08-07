@@ -424,7 +424,7 @@ fn extract_images_inner(
                                 let filters = image_filters(dict);
                                 let mut format = filter_to_format(&Some(filters));
                                 let mut data = if format == "raw" {
-                                    match assemble_png(doc, access, &scope, stream) {
+                                    match assemble_png(access, &scope, stream) {
                                         Some(png) => {
                                             format = "png";
                                             png
@@ -445,9 +445,7 @@ fn extract_images_inner(
                                     index,
                                     width,
                                     height,
-                                    color_space: image_color_space(
-                                        doc, access, &scope, dict,
-                                    ),
+                                    color_space: image_color_space(access, &scope, dict),
                                     bits_per_component: image_bpc(access, dict),
                                     format,
                                     data,
@@ -2502,7 +2500,7 @@ pub fn extract_tables(
     let mut per_page: Vec<(u32, Vec<Vec<Vec<String>>>)> = pages
         .par_iter()
         .map(|(&pno, &page_id)| {
-            let rules = crate::vector::page_rules(doc, access, page_id);
+            let rules = crate::vector::page_rules(access, page_id);
             (pno, detect_tables(text::extract_spans(access, page_id, raw), &rules))
         })
         .collect();
@@ -2689,7 +2687,7 @@ mod tests {
         let raw = std::fs::read(&path).expect("fixture readable");
         let page = *doc.get_pages().get(&1).expect("page 1");
         let spans = crate::text::extract_spans(&test_adapter(&doc), page, &raw);
-        detect_tables_pos(&spans, &crate::vector::page_rules(&doc, &test_adapter(&doc), page))
+        detect_tables_pos(&spans, &crate::vector::page_rules(&test_adapter(&doc), page))
     }
 
     #[test]
@@ -2703,7 +2701,7 @@ mod tests {
         let doc = Document::load(path).expect("ruled_blank_cells.pdf must load");
         let raw = std::fs::read(path).expect("fixture readable");
         let page = *doc.get_pages().get(&1).expect("page 1");
-        let rules = crate::vector::page_rules(&doc, &test_adapter(&doc), page);
+        let rules = crate::vector::page_rules(&test_adapter(&doc), page);
         let frames = crate::lattice::frames(&rules);
         assert_eq!(frames.len(), 1, "one ruled frame, got {}", frames.len());
         assert_eq!(frames[0].xs.len(), 5, "4 column bands: {:?}", frames[0].xs);
@@ -2763,7 +2761,7 @@ mod tests {
         let doc = Document::load(path).expect("map_label_grid.pdf must load");
         let raw = std::fs::read(path).expect("fixture readable");
         let page = *doc.get_pages().get(&2).expect("page 2");
-        let rules = crate::vector::page_rules(&doc, &test_adapter(&doc), page);
+        let rules = crate::vector::page_rules(&test_adapter(&doc), page);
         let frames = crate::lattice::frames(&rules);
         assert!(!frames.is_empty(), "the ruling does close cells — that is the point");
         let spans = crate::text::extract_spans(&test_adapter(&doc), page, &raw);
@@ -2799,7 +2797,7 @@ mod tests {
         let raw = std::fs::read(path).expect("fixture readable");
         let page = *doc.get_pages().get(&1).expect("page 1");
         let spans = crate::text::extract_spans(&test_adapter(&doc), page, &raw);
-        let rules = crate::vector::page_rules(&doc, &test_adapter(&doc), page);
+        let rules = crate::vector::page_rules(&test_adapter(&doc), page);
         let frames = crate::lattice::frames(&rules);
         assert_eq!(frames.len(), 1, "L1 found one frame");
 
@@ -2823,7 +2821,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/booktabs_wrapped.pdf");
         let doc = Document::load(path).expect("booktabs_wrapped.pdf must load");
         let page = *doc.get_pages().get(&1).expect("page 1");
-        let rules = crate::vector::page_rules(&doc, &test_adapter(&doc), page);
+        let rules = crate::vector::page_rules(&test_adapter(&doc), page);
         assert!(crate::lattice::frames(&rules).is_empty(), "horizontal rules alone close no cell");
         let tables = detect_fixture("booktabs_wrapped.pdf");
         assert_eq!(tables.len(), 1, "one table, got {}", tables.len());
@@ -3103,7 +3101,7 @@ mod tests {
         let raw = std::fs::read(path).expect("fixture readable");
         let page = *doc.get_pages().get(&1).expect("page 1");
         let spans = crate::text::extract_spans(&test_adapter(&doc), page, &raw);
-        let tables = detect_tables_pos(&spans, &crate::vector::page_rules(&doc, &test_adapter(&doc), page));
+        let tables = detect_tables_pos(&spans, &crate::vector::page_rules(&test_adapter(&doc), page));
         assert_eq!(tables.len(), 1, "one table, got {}", tables.len());
         let want = [
             ["Region", "Samples", "Depth"],
@@ -3142,7 +3140,7 @@ mod tests {
             let Ok(doc) = Document::load_mem(&raw) else { continue }; // encrypted / damaged
             let mut want: Vec<(u32, Vec<Vec<String>>)> = Vec::new();
             for (&pno, &page_id) in &doc.get_pages() {
-                for grid in detect_tables(text::extract_spans(&test_adapter(&doc), page_id, &raw), &crate::vector::page_rules(&doc, &test_adapter(&doc), page_id)) {
+                for grid in detect_tables(text::extract_spans(&test_adapter(&doc), page_id, &raw), &crate::vector::page_rules(&test_adapter(&doc), page_id)) {
                     want.push((pno, grid));
                 }
             }

@@ -483,7 +483,7 @@ impl PdfDocument {
         let mut nums: Vec<u32> = map.keys().copied().collect();
         nums.sort_unstable();
         for n in nums {
-            let (strong, weak) = crate::vector::positioned_vectors(&self.doc, self.access.as_ref(), map[&n]);
+            let (strong, weak) = crate::vector::positioned_vectors(self.access.as_ref(), map[&n]);
             let dropped = weak.iter().filter(|v| v.demoted()).count() as u32;
             accepted += strong.len() as u32;
             suppressed += dropped;
@@ -572,7 +572,7 @@ impl PdfDocument {
             let needs = !matches!(decision, ocr::detect::OcrDecision::NotNeeded);
             let (w, h) = ocr::page_size_pts(self.access.as_ref(), page_id);
             let image = if needs {
-                ocr::page_main_image(&self.doc, self.access.as_ref(), page_id).map(|(b, _)| b)
+                ocr::page_main_image(self.access.as_ref(), page_id).map(|(b, _)| b)
             } else {
                 None
             };
@@ -610,7 +610,7 @@ impl PdfDocument {
                 let (w, h) = ocr::page_size_pts(self.access.as_ref(), page_id);
                 if remove_raster {
                     // Clean reflow: replace the page's content with our text + cropped figures.
-                    let image = ocr::page_main_image(&self.doc, self.access.as_ref(), page_id).map(|(_, img)| img);
+                    let image = ocr::page_main_image(self.access.as_ref(), page_id).map(|(_, img)| img);
                     let pin = ocr::pdf::PageInput { page: ocr::doctags::parse(dt), width: w, height: h, image };
                     let (content, xobjs) = ocr::pdf::build_page_content(&mut doc, &pin)?;
                     let data = content.encode().map_err(|e| e.to_string())?;

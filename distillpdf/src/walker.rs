@@ -938,7 +938,7 @@ mod tests {
         let (doc, page) = annot_render();
 
         // 1. the raster. Form (2,2)+10x10 -> page (208, 406) 40x30.
-        let tiles = crate::img::positioned_images(&doc, &test_adapter(&doc), page, true);
+        let tiles = crate::img::positioned_images(&test_adapter(&doc), page, true);
         assert_eq!(tiles.len(), 1, "the page's only raster lives in the stamp's appearance");
         let t = &tiles[0];
         for (got, want, what) in [
@@ -949,7 +949,7 @@ mod tests {
         }
 
         // 2. the vector ink — the appearance's panel and frame fill the whole `/Rect`.
-        let (strong, _) = crate::vector::positioned_vectors(&doc, &test_adapter(&doc), page);
+        let (strong, _) = crate::vector::positioned_vectors(&test_adapter(&doc), page);
         let fig = strong.iter().find(|f| f.x_left < 205.0 && f.x_right > 395.0).unwrap_or_else(|| {
             panic!("no figure spans the stamp's /Rect; got {:?}", strong.iter().map(|f| (f.x_left, f.x_right)).collect::<Vec<_>>())
         });

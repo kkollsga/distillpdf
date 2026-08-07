@@ -30,7 +30,9 @@
 use crate::access::{read_resolved, DocumentAccess};
 use crate::pdfobj::{content_bytes, filters_of, is_generic_filter, num};
 use crate::walker::ResourceScope;
-use lopdf::{Dictionary, Document, Object};
+use lopdf::{Dictionary, Object};
+#[cfg(test)]
+use lopdf::Document;
 
 pub(crate) fn filter_to_format(filters: &Option<Vec<String>>) -> &'static str {
     match filters {
@@ -154,7 +156,6 @@ fn canonical_cs_name(n: &[u8]) -> String {
 /// after [`resolve_cs`]. The family is what pymupdf reports too; the component count an
 /// `ICCBased`/`Indexed` space implies is what [`cs_model`] derives for PNG assembly.
 pub(crate) fn image_color_space(
-    _doc: &Document,
     access: &dyn DocumentAccess,
     res: &ResourceScope,
     dict: &Dictionary,
@@ -263,7 +264,6 @@ fn tint_lut(k: usize, f: &crate::function::Function, alt: &Cs) -> Vec<[u8; 3]> {
 }
 
 pub(crate) fn cs_model(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     res: &ResourceScope,
     o: &Object,
@@ -308,7 +308,7 @@ pub(crate) fn cs_model(
             b"CalGray" => Some(Cs::Gray),
             b"CalRGB" => Some(Cs::Rgb),
             b"Indexed" | b"I" => {
-                let base = cs_model(doc, access, res, a.get(1)?, depth + 1)?;
+                let base = cs_model(access, res, a.get(1)?, depth + 1)?;
                 if matches!(base, Cs::Indexed { .. }) {
                     return None; // an Indexed base is illegal (§8.6.6.3); don't guess
                 }
@@ -342,7 +342,7 @@ pub(crate) fn cs_model(
                 if k == 0 || k > MAX_TINT_COLORANTS {
                     return None;
                 }
-                let alt = cs_model(doc, access, res, a.get(2)?, depth + 1)?;
+                let alt = cs_model(access, res, a.get(2)?, depth + 1)?;
                 if matches!(alt, Cs::Indexed { .. } | Cs::Tint { .. }) {
                     return None; // an Indexed or spot alternate is illegal (§8.6.6.4)
                 }
@@ -411,7 +411,6 @@ struct SamplePlan {
 /// The dictionary-only half of the decode gate — see [`SamplePlan`]. Touches no stream
 /// bytes, so a caller may ask it about every image on a page for free.
 fn sample_plan(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     res: &ResourceScope,
     dict: &Dictionary,
@@ -434,7 +433,7 @@ fn sample_plan(
     let (cs, bpc) = if is_mask {
         (Cs::Gray, 1i64)
     } else {
-        let cs = cs_model(doc, access, res, dict.get(b"ColorSpace").ok()?, 0)?;
+        let cs = cs_model(access, res, dict.get(b"ColorSpace").ok()?, 0)?;
         let bpc = image_bpc(access, dict)?;
         (cs, bpc)
     };
@@ -451,12 +450,11 @@ fn sample_plan(
 /// Only ever over-reports (a truncated stream still says `true`), never under-reports —
 /// which is the direction a placeholder count can afford to be wrong in.
 pub(crate) fn samples_decodable(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     res: &ResourceScope,
     dict: &Dictionary,
 ) -> bool {
-    sample_plan(doc, access, res, dict).is_some()
+    sample_plan(access, res, dict).is_some()
 }
 
 /// A decoded sample block, in the narrowest form that holds it without loss: an achromatic
@@ -503,13 +501,12 @@ impl Samples {
 /// keeps its bytes — `decompressed_content()` alone errors when a stream has no `/Filter`,
 /// which is how the render path's own copy silently lost every uncompressed image.
 pub(crate) fn decode_samples(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     res: &ResourceScope,
     stream: &lopdf::Stream,
 ) -> Option<Samples> {
     let dict = &stream.dict;
-    let SamplePlan { cs, bpc, w: wu, h: hu } = sample_plan(doc, access, res, dict)?;
+    let SamplePlan { cs, bpc, w: wu, h: hu } = sample_plan(access, res, dict)?;
     let nc = cs.components();
 
     let samples = content_bytes(stream);
@@ -606,12 +603,11 @@ pub(crate) fn decode_samples(
 /// which opened as an image file before (the caller got back compressed samples with no
 /// container at all).
 pub(crate) fn assemble_png(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     res: &ResourceScope,
     stream: &lopdf::Stream,
 ) -> Option<Vec<u8>> {
-    png_bytes(decode_samples(doc, access, res, stream)?.into_dynamic())
+    png_bytes(decode_samples(access, res, stream)?.into_dynamic())
 }
 
 /// The `i`-th `bpc`-bit sample of a packed row.
@@ -823,23 +819,23 @@ mod tests {
     use lopdf::{dictionary, Stream, StringFormat};
 
     fn cs_model(doc: &Document, resources: &Dictionary, object: &Object, depth: u32) -> Option<Cs> {
-        super::cs_model(doc, &test_adapter(doc), &ResourceScope::test_owned(resources), object, depth)
+        super::cs_model(&test_adapter(doc), &ResourceScope::test_owned(resources), object, depth)
     }
 
     fn samples_decodable(doc: &Document, resources: &Dictionary, dict: &Dictionary) -> bool {
-        super::samples_decodable(doc, &test_adapter(doc), &ResourceScope::test_owned(resources), dict)
+        super::samples_decodable(&test_adapter(doc), &ResourceScope::test_owned(resources), dict)
     }
 
     fn decode_samples(doc: &Document, resources: &Dictionary, stream: &Stream) -> Option<Samples> {
-        super::decode_samples(doc, &test_adapter(doc), &ResourceScope::test_owned(resources), stream)
+        super::decode_samples(&test_adapter(doc), &ResourceScope::test_owned(resources), stream)
     }
 
     fn assemble_png(doc: &Document, resources: &Dictionary, stream: &Stream) -> Option<Vec<u8>> {
-        super::assemble_png(doc, &test_adapter(doc), &ResourceScope::test_owned(resources), stream)
+        super::assemble_png(&test_adapter(doc), &ResourceScope::test_owned(resources), stream)
     }
 
     fn image_color_space(doc: &Document, resources: &Dictionary, dict: &Dictionary) -> Option<String> {
-        super::image_color_space(doc, &test_adapter(doc), &ResourceScope::test_owned(resources), dict)
+        super::image_color_space(&test_adapter(doc), &ResourceScope::test_owned(resources), dict)
     }
 
     fn resolve_cs(doc: &Document, resources: &Dictionary, object: &Object, depth: u32) -> Option<Object> {

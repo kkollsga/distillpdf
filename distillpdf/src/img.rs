@@ -23,7 +23,9 @@ use crate::walker::{
     xobject_at, Descend, PaintSeq, ResourceScope,
     ScopePolicy, SoftMask, XMap,
 };
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use lopdf::{Dictionary, Object, ObjectId};
+#[cfg(test)]
+use lopdf::Document;
 use std::rc::Rc;
 
 /// True if a DCTDecode stream is a 4-component (CMYK) JPEG — these cannot be passed
@@ -159,64 +161,64 @@ fn decode_ccitt(
 /// `res` is the resource scope the image was drawn in; a `/ColorSpace /CS0` names an entry
 /// there and describes nothing without it (§8.6.3).
 fn decode_rgb(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     res: &ResourceScope,
     id: ObjectId,
 ) -> Option<image::RgbImage> {
-    let stream = doc.get_object(id).ok()?.as_stream().ok()?;
-    let dict = &stream.dict;
-    let filters = filters_of(dict);
-    if filters.iter().any(|f| f == b"DCTDecode") {
-        return decode_dct_rgb(&codec_payload(stream), decode_inverts(access, dict));
-    }
-    if filters.iter().any(|f| f == b"CCITTFaxDecode") {
-        // Fax bitstreams are 1-bpc gray; lopdf can't apply the filter, so decode the codec
-        // payload here (peeling any Flate wrapper first), then widen gray → RGB.
-        return decode_ccitt(access, dict, &codec_payload(stream))
-            .map(|g| image::DynamicImage::ImageLuma8(g).to_rgb8());
-    }
-    if filters.iter().any(|f| f == b"JPXDecode" || f == b"JBIG2Decode") {
-        return None;
-    }
-    // Plain samples. This used to be a private, weaker decoder: 8 bpc only, no palette, no
-    // `/Decode`, no stencil, and — when the colour space was anything it did not model — a
-    // channel count GUESSED from `raw.len() / (w*h)`, which renders an Indexed image's
-    // palette indices as gray levels. It also read the bytes with `decompressed_content()`,
-    // which errors on an unfiltered stream, so every uncompressed raster vanished.
-    Some(decode_samples(doc, access, res, stream)?.into_rgb8())
+    access.stream(id).ok()?.read(|stream| {
+        let dict = &stream.dict;
+        let filters = filters_of(dict);
+        if filters.iter().any(|f| f == b"DCTDecode") {
+            return decode_dct_rgb(&codec_payload(stream), decode_inverts(access, dict));
+        }
+        if filters.iter().any(|f| f == b"CCITTFaxDecode") {
+            // Fax bitstreams are 1-bpc gray; lopdf can't apply the filter, so decode the codec
+            // payload here (peeling any Flate wrapper first), then widen gray → RGB.
+            return decode_ccitt(access, dict, &codec_payload(stream))
+                .map(|g| image::DynamicImage::ImageLuma8(g).to_rgb8());
+        }
+        if filters.iter().any(|f| f == b"JPXDecode" || f == b"JBIG2Decode") {
+            return None;
+        }
+        // Plain samples. This used to be a private, weaker decoder: 8 bpc only, no palette, no
+        // `/Decode`, no stencil, and — when the colour space was anything it did not model — a
+        // channel count GUESSED from `raw.len() / (w*h)`, which renders an Indexed image's
+        // palette indices as gray levels. It also read the bytes with `decompressed_content()`,
+        // which errors on an unfiltered stream, so every uncompressed raster vanished.
+        Some(decode_samples(access, res, stream)?.into_rgb8())
+    })?
 }
 
 /// Decode the soft mask (`/SMask`) of an image to a grayscale alpha channel.
 fn decode_smask(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     res: &ResourceScope,
     dict: &Dictionary,
 ) -> Option<image::GrayImage> {
     let sid = dict.get(b"SMask").ok().and_then(|o| o.as_reference().ok())?;
-    let stream = doc.get_object(sid).ok()?.as_stream().ok()?;
-    let sd = &stream.dict;
-    let filters = filters_of(sd);
-    if filters.iter().any(|f| f == b"DCTDecode") {
-        let mut g = image::load_from_memory_with_format(&codec_payload(stream), image::ImageFormat::Jpeg)
-            .ok()?
-            .to_luma8();
-        // A soft mask carries its own `/Decode`, and `[1 0]` flips the alpha ramp
-        // (§8.9.5.2) — a polarity the JPEG file cannot express, so it is applied here.
-        if decode_inverts(access, sd) {
-            for v in g.iter_mut() {
-                *v = 255 - *v;
+    access.stream(sid).ok()?.read(|stream| {
+        let sd = &stream.dict;
+        let filters = filters_of(sd);
+        if filters.iter().any(|f| f == b"DCTDecode") {
+            let mut g = image::load_from_memory_with_format(&codec_payload(stream), image::ImageFormat::Jpeg)
+                .ok()?
+                .to_luma8();
+            // A soft mask carries its own `/Decode`, and `[1 0]` flips the alpha ramp
+            // (§8.9.5.2) — a polarity the JPEG file cannot express, so it is applied here.
+            if decode_inverts(access, sd) {
+                for v in g.iter_mut() {
+                    *v = 255 - *v;
+                }
             }
+            return Some(g);
         }
-        return Some(g);
-    }
-    if filters.iter().any(|f| f == b"JPXDecode" || f == b"CCITTFaxDecode" || f == b"JBIG2Decode") {
-        return None;
-    }
-    // The shared decoder applies the mask's own `/Decode` on this path too, and handles the
-    // sub-byte depths a soft mask is often written at (a 1-bpc knockout mask).
-    Some(decode_samples(doc, access, res, stream)?.into_luma8())
+        if filters.iter().any(|f| f == b"JPXDecode" || f == b"CCITTFaxDecode" || f == b"JBIG2Decode") {
+            return None;
+        }
+        // The shared decoder applies the mask's own `/Decode` on this path too, and handles the
+        // sub-byte depths a soft mask is often written at (a 1-bpc knockout mask).
+        Some(decode_samples(access, res, stream)?.into_luma8())
+    })?
 }
 
 /// Cheap (no-decode) test that an image XObject is a format we can render — used in
@@ -228,24 +230,21 @@ fn decode_smask(
 /// independently-written `bpc == 8` guess that disagreed with the decoder in both
 /// directions.
 fn decodable(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     res: &ResourceScope,
     id: ObjectId,
 ) -> bool {
-    let stream = match doc.get_object(id).ok().and_then(|o| o.as_stream().ok()) {
-        Some(s) => s,
-        None => return false,
-    };
-    let dict = &stream.dict;
-    let filters = filters_of(dict);
-    if filters.iter().any(|f| f == b"JPXDecode" || f == b"JBIG2Decode") {
-        return false;
-    }
-    if filters.iter().any(|f| f == b"DCTDecode" || f == b"CCITTFaxDecode") {
-        return true; // JPEG / CCITT fax: renderable (fax via decode_ccitt)
-    }
-    samples_decodable(doc, access, res, dict)
+    access.stream(id).ok().and_then(|stream| stream.read(|stream| {
+        let dict = &stream.dict;
+        let filters = filters_of(dict);
+        if filters.iter().any(|f| f == b"JPXDecode" || f == b"JBIG2Decode") {
+            return false;
+        }
+        if filters.iter().any(|f| f == b"DCTDecode" || f == b"CCITTFaxDecode") {
+            return true; // JPEG / CCITT fax: renderable (fax via decode_ccitt)
+        }
+        samples_decodable(access, res, dict)
+    })).unwrap_or(false)
 }
 
 /// Build a base64 data URI for an image stream, or None if unsupported.
@@ -254,14 +253,13 @@ fn decodable(
 /// preserved — without this, masked figures (whose visible content lives in the
 /// mask, over a flat-colour/black base) render as solid black boxes.
 fn data_uri(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     res: &ResourceScope,
     id: ObjectId,
     window: Option<(f32, f32, f32, f32)>,
     turn: i32,
 ) -> Option<String> {
-    let stream = doc.get_object(id).ok()?.as_stream().ok()?;
+    access.stream(id).ok()?.read(|stream| {
     let dict = &stream.dict;
     let b64 = base64::engine::general_purpose::STANDARD;
     let has_smask = dict.get(b"SMask").and_then(|o| o.as_reference()).is_ok();
@@ -295,15 +293,15 @@ fn data_uri(
             return None;
         }
         // CCITTFax falls through to decode_rgb (which decodes it via decode_ccitt) → PNG.
-        let rgb = turn_pixels(crop_window(decode_rgb(doc, access, res, id)?, window), turn);
+        let rgb = turn_pixels(crop_window(decode_rgb(access, res, id)?, window), turn);
         let png = png_bytes(image::DynamicImage::ImageRgb8(rgb))?;
         return Some(format!("data:image/png;base64,{}", b64.encode(&png)));
     }
 
     // Soft mask present: decode base + mask, composite to RGBA, emit PNG.
-    let base = decode_rgb(doc, access, res, id)?;
+    let base = decode_rgb(access, res, id)?;
     let (w, h) = (base.width(), base.height());
-    let mask = decode_smask(doc, access, res, dict);
+    let mask = decode_smask(access, res, dict);
     let mut rgba = image::RgbaImage::new(w, h);
     let resized;
     let mask_ref = match &mask {
@@ -357,6 +355,7 @@ fn data_uri(
     // Match the source format: a JPEG base with a trivial (all-opaque) mask becomes a
     // compact JPEG; a mask with real transparency stays a lossless PNG.
     rgba_uri(turn_pixels(crop_window(rgba, window), turn), filters.iter().any(|f| f == b"DCTDecode"))
+    })?
 }
 
 /// Turn a decoded raster CLOCKWISE by a page's `/Rotate`, so the emitted pixels are the ones a
@@ -447,11 +446,10 @@ where
 }
 
 /// True if the image XObject is DCTDecode (a JPEG) at source.
-fn jpeg_source(doc: &Document, id: ObjectId) -> bool {
-    doc.get_object(id)
+fn jpeg_source(access: &dyn crate::access::DocumentAccess, id: ObjectId) -> bool {
+    access.stream(id)
         .ok()
-        .and_then(|o| o.as_stream().ok())
-        .map(|s| filters_of(&s.dict).iter().any(|f| f == b"DCTDecode"))
+        .and_then(|stream| stream.read(|stream| filters_of(&stream.dict).iter().any(|f| f == b"DCTDecode")))
         .unwrap_or(false)
 }
 
@@ -602,14 +600,17 @@ const MIN_GRID_TILES: usize = 4;
 /// or base64-encoded — `uri` is left empty. Decoding/encoding the raster is by far the
 /// dominant cost on image-heavy PDFs, so this makes `images=False` near-free.
 pub fn positioned_images(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     page_id: ObjectId,
     want_uris: bool,
 ) -> Vec<Placed> {
-    let content = match doc.get_and_decode_page_content(page_id) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
+    let content = match access
+        .page_content(page_id)
+        .ok()
+        .and_then(|bytes| lopdf::content::Content::decode(&bytes).ok())
+    {
+        Some(content) => content,
+        None => return Vec::new(),
     };
     // The page's XObjects over its WHOLE resource chain, not just the nearest dictionary
     // (see `walker::page_resource_chain`) — a raster a producer left on an outer node of
@@ -620,7 +621,7 @@ pub fn positioned_images(
     let res = Rc::new(page_resources(access, page_id));
     let mut raws: Vec<RawTile> = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
-    walk(doc, access, &content.operations, &xmap, &res, Mat::ID, None, None, &mut raws, 0, &mut budget, &[]);
+    walk(access, &content.operations, &xmap, &res, Mat::ID, None, None, &mut raws, 0, &mut budget, &[]);
     // §12.5.5: an annotation's appearance stream is page content a viewer paints ON TOP of
     // the content stream — and it is reachable from neither that stream nor the page's
     // `/Resources`. Addressed past the last page operation so paint order puts it there.
@@ -645,7 +646,7 @@ pub fn positioned_images(
                     .unwrap_or_default(),
             );
             let here = PaintSeq::at(&[], content.operations.len() + k);
-            walk(doc, access, &f.ops, &f.scope.xobjects, &ares, sub_ctm, clip, None, &mut raws, 1, &mut budget, here.as_slice());
+            walk(access, &f.ops, &f.scope.xobjects, &ares, sub_ctm, clip, None, &mut raws, 1, &mut budget, here.as_slice());
             false
         });
         if outcome == Some(true) {
@@ -656,7 +657,7 @@ pub fn positioned_images(
     // (see `turn_pixels`): every bbox this module hands out stays in page space, because every
     // cross-subsystem comparison in `html.rs` — captions, containment, reading order — is
     // page-space, exactly as `vector::positioned_vectors_capped` reasons.
-    finalize(doc, access, raws, want_uris, crate::pdfobj::page_rotation(access, page_id))
+    finalize(access, raws, want_uris, crate::pdfobj::page_rotation(access, page_id))
 }
 
 /// Grow `out` by the part of `bb` its clip leaves visible. A rectangle entirely outside the
@@ -687,7 +688,6 @@ fn add_ink(bb: Rect, clip: Option<ClipRect>, out: &mut Rect) {
 /// same `q`/`Q` stack, same deferred `W`/`W*`, same `/BBox` clip on a descended form.
 #[allow(clippy::too_many_arguments)]
 fn mask_extent(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     ops: &[lopdf::content::Operation],
     xmap: &XMap,
@@ -777,7 +777,7 @@ fn mask_extent(
                                 Some(bb) => Some(crate::vector::intersect_clip(clip, (bb.x0, bb.y0, bb.x1, bb.y1))),
                                 None => clip,
                             };
-                            if !mask_extent(doc, access, &f.ops, &f.scope.xobjects, sub_ctm, sub_clip, depth + 1, budget, out) {
+                            if !mask_extent(access, &f.ops, &f.scope.xobjects, sub_ctm, sub_clip, depth + 1, budget, out) {
                                 return false;
                             }
                         }
@@ -813,7 +813,6 @@ fn mask_extent(
 /// walk failed to follow than an authored erasure, and "we could not read this" must cost
 /// nothing rather than delete a figure.
 fn mask_window(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     form: &crate::access::StreamHandle,
     xmap: &XMap,
@@ -831,7 +830,7 @@ fn mask_window(
         .flatten()
         .map(|bb| (bb.x0, bb.y0, bb.x1, bb.y1));
     let mut ink = Rect::EMPTY;
-    if !mask_extent(doc, access, &f.ops, &f.scope.xobjects, sub_ctm, sub_clip, depth + 1, budget, &mut ink) {
+    if !mask_extent(access, &f.ops, &f.scope.xobjects, sub_ctm, sub_clip, depth + 1, budget, &mut ink) {
         return None;
     }
     (ink.is_valid() && ink.x1 > ink.x0 && ink.y1 > ink.y0).then_some((ink.x0, ink.y0, ink.x1, ink.y1))
@@ -843,7 +842,6 @@ fn mask_window(
 // the shared budget).
 #[allow(clippy::too_many_arguments)]
 fn walk(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     ops: &[lopdf::content::Operation],
     xmap: &XMap,
@@ -925,7 +923,7 @@ fn walk(
                 match mask {
                     SoftMask::Cleared => smask = None,
                     SoftMask::Group(group) => {
-                        smask = mask_window(doc, access, &group, xmap, ctm, depth, budget)
+                        smask = mask_window(access, &group, xmap, ctm, depth, budget)
                     }
                 }
             }
@@ -1043,7 +1041,7 @@ fn walk(
                                 Some(bb) => Some(crate::vector::intersect_clip(clip, (bb.x0, bb.y0, bb.x1, bb.y1))),
                                 None => clip,
                             };
-                            walk(doc, access, &f.ops, &f.scope.xobjects, &child, sub_ctm, sub_clip, smask, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice());
+                            walk(access, &f.ops, &f.scope.xobjects, &child, sub_ctm, sub_clip, smask, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice());
                             false
                         }
                         Descend::Skip => false,
@@ -1119,7 +1117,6 @@ fn round2(v: f32) -> String {
 /// other image is emitted on its own. In placeholder mode (`!want_uris`) the same
 /// grouping applies with no pixel decode — a grid becomes one empty-uri slot.
 fn finalize(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     raws: Vec<RawTile>,
     want_uris: bool,
@@ -1134,14 +1131,14 @@ fn finalize(
         if tiles.len() >= MIN_GRID_TILES && is_grid(&tiles) {
             // A stitched grid is composed axis-aligned, so it carries no rotation.
             if want_uris {
-                if let Some(uri) = stitch_grid(doc, access, &tiles, (x0, x1, y0, y1), rot) {
+                if let Some(uri) = stitch_grid(access, &tiles, (x0, x1, y0, y1), rot) {
                     let ctm = turned_placement(None, (x0, y0, x1, y1), rot);
                     out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri, ctm, seq: grid_seq(), clip: None });
                     continue;
                 }
                 // stitch failed → fall through to per-tile emission
             } else {
-                if tiles.iter().any(|t| decodable(doc, access, &t.res, t.id)) {
+                if tiles.iter().any(|t| decodable(access, &t.res, t.id)) {
                     out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri: String::new(), ctm: turned_placement(None, (x0, y0, x1, y1), rot), seq: grid_seq(), clip: None });
                 }
                 continue;
@@ -1164,19 +1161,19 @@ fn finalize(
                 // can never fire for an image we can decode: a decodable stream never reaches
                 // it, and `raster::declined_codec` is the same list the four decline points
                 // on this path read.
-                let uri = match data_uri(doc, access, &t.res, t.id, window, rot) {
+                let uri = match data_uri(access, &t.res, t.id, window, rot) {
                     Some(uri) => Some(uri),
-                    None => doc
-                        .get_object(t.id)
+                    None => access
+                        .stream(t.id)
                         .ok()
-                        .and_then(|o| o.as_stream().ok())
-                        .and_then(|s| crate::raster::declined_codec(&s.dict))
+                        .and_then(|stream| stream.read(|stream| crate::raster::declined_codec(&stream.dict)))
+                        .flatten()
                         .map(|(filter, human)| placeholder_uri(filter, human, t.x1 - t.x0, t.y1 - t.y0)),
                 };
                 if let Some(uri) = uri {
                     out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri, ctm, seq: t.seq.clone(), clip: mask });
                 }
-            } else if decodable(doc, access, &t.res, t.id) {
+            } else if decodable(access, &t.res, t.id) {
                 out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri: String::new(), ctm, seq: t.seq.clone(), clip: mask });
             }
         }
@@ -1277,15 +1274,17 @@ fn is_grid(tiles: &[&RawTile]) -> bool {
 /// Decode an image XObject to RGBA, compositing its soft mask (`/SMask`) into the alpha
 /// channel when present. Used by the grid stitcher.
 fn decode_rgba(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     res: &ResourceScope,
     id: ObjectId,
 ) -> Option<image::RgbaImage> {
-    let base = decode_rgb(doc, access, res, id)?;
+    let base = decode_rgb(access, res, id)?;
     let (w, h) = (base.width(), base.height());
-    let dict = &doc.get_object(id).ok()?.as_stream().ok()?.dict;
-    match decode_smask(doc, access, res, dict) {
+    let mask = access
+        .stream(id)
+        .ok()?
+        .read(|stream| decode_smask(access, res, &stream.dict))?;
+    match mask {
         Some(mask) => {
             let resized;
             let m = if mask.width() == w && mask.height() == h {
@@ -1316,7 +1315,6 @@ fn decode_rgba(
 /// opaque white so any uncovered seams stay opaque (and JPEG-encodable). None if nothing
 /// decodes.
 fn stitch_grid(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     tiles: &[&RawTile],
     bbox: (f32, f32, f32, f32),
@@ -1341,7 +1339,7 @@ fn stitch_grid(
     let mut canvas = image::RgbaImage::from_pixel(cw, ch, image::Rgba([255, 255, 255, 255]));
     let mut placed_any = false;
     for t in tiles {
-        let tile = match decode_rgba(doc, access, &t.res, t.id).map(|im| crop_window(im, t.window())) {
+        let tile = match decode_rgba(access, &t.res, t.id).map(|im| crop_window(im, t.window())) {
             Some(im) => im,
             None => continue,
         };
@@ -1358,7 +1356,7 @@ fn stitch_grid(
     if !placed_any {
         return None;
     }
-    rgba_uri(turn_pixels(canvas, turn), tiles.iter().all(|t| jpeg_source(doc, t.id)))
+    rgba_uri(turn_pixels(canvas, turn), tiles.iter().all(|t| jpeg_source(access, t.id)))
 }
 
 #[cfg(test)]
@@ -1408,7 +1406,7 @@ mod tests {
         // `MAX_FORM_DEPTH` alone allowed ~2^40 descents. This call never returned.
         let (doc, page_id) = adversarial("form_bomb.pdf");
         let t = std::time::Instant::now();
-        let placed = positioned_images(&doc, &test_adapter(&doc), page_id, true);
+        let placed = positioned_images(&test_adapter(&doc), page_id, true);
         assert!(t.elapsed().as_secs() < 10, "form bomb ran for {:?} — the budget is not bounding it", t.elapsed());
         assert!(placed.is_empty(), "the bomb draws no image, so none may be invented for it");
     }
@@ -1419,7 +1417,7 @@ mod tests {
         // holding one image, invoked at three offsets, is three placed rasters. An
         // `ObjectId` dedupe would return 1 and silently drop two real figures.
         let (doc, page_id) = adversarial("form_repeat.pdf");
-        let placed = positioned_images(&doc, &test_adapter(&doc), page_id, false);
+        let placed = positioned_images(&test_adapter(&doc), page_id, false);
         assert_eq!(placed.len(), 3, "a repeated form must place one tile per invocation");
         let mut ys: Vec<i32> = placed.iter().map(|p| p.y_top.round() as i32).collect();
         ys.sort_unstable();
@@ -1436,7 +1434,7 @@ mod tests {
         let mut raws = Vec::new();
         let mut budget = crate::WalkBudget::new(700);
         let res = Rc::new(page_resources(&test_adapter(&doc), page_id));
-        walk(&doc, &test_adapter(&doc), &content.operations, &xmap, &res, Mat::ID, None, None, &mut raws, 0, &mut budget, &[]);
+        walk(&test_adapter(&doc), &content.operations, &xmap, &res, Mat::ID, None, None, &mut raws, 0, &mut budget, &[]);
         assert!(!raws.is_empty(), "a tripped budget must not empty the page");
         assert!(raws.len() < 3, "the budget must really bite, got {} tiles", raws.len());
     }
@@ -1458,7 +1456,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/cmyk_jpeg.pdf");
         let doc = Document::load(path).expect("cmyk_jpeg.pdf fixture must load");
         let page_id = *doc.get_pages().values().next().expect("fixture has a page");
-        let placed = positioned_images(&doc, &test_adapter(&doc), page_id, true);
+        let placed = positioned_images(&test_adapter(&doc), page_id, true);
         assert_eq!(placed.len(), 1, "the fixture places exactly one image");
         let img = uri_rgb(&placed[0].uri);
         assert_eq!(img.dimensions(), (96, 48));
@@ -1537,7 +1535,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/form_inherit.pdf");
         let doc = Document::load(path).expect("form_inherit.pdf fixture must load");
         let page_id = *doc.get_pages().values().next().expect("fixture has a page");
-        let placed = positioned_images(&doc, &test_adapter(&doc), page_id, true);
+        let placed = positioned_images(&test_adapter(&doc), page_id, true);
         assert_eq!(placed.len(), 1, "the grandparent's image must resolve and be placed");
         let p = &placed[0];
         assert!((p.x_left - 172.0).abs() < 0.5, "x_left {} (72 means the indirect /Matrix was lost)", p.x_left);
@@ -1555,7 +1553,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/decode_jpeg.pdf");
         let doc = Document::load(path).expect("decode_jpeg.pdf fixture must load");
         let page_id = *doc.get_pages().values().next().expect("fixture has a page");
-        let placed = positioned_images(&doc, &test_adapter(&doc), page_id, true);
+        let placed = positioned_images(&test_adapter(&doc), page_id, true);
         assert_eq!(placed.len(), 2, "the fixture places two images");
         // Top-to-bottom: the gray image sits above the RGB one.
         let mut order: Vec<&Placed> = placed.iter().collect();
@@ -1574,7 +1572,7 @@ mod tests {
         let path = format!("{}/../tests/fixtures_pdf/{name}", env!("CARGO_MANIFEST_DIR"));
         let doc = Document::load(&path).unwrap_or_else(|e| panic!("{name} fixture must load: {e}"));
         let page_id = *doc.get_pages().get(&page).expect("fixture has that page");
-        let mut placed = positioned_images(&doc, &test_adapter(&doc), page_id, true);
+        let mut placed = positioned_images(&test_adapter(&doc), page_id, true);
         placed.sort_by(|a, b| b.y_top.partial_cmp(&a.y_top).expect("finite"));
         placed
     }
@@ -1850,7 +1848,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/cmyk_jpeg.pdf");
         let doc = Document::load(path).expect("cmyk_jpeg.pdf fixture must load");
         let page_id = *doc.get_pages().values().next().expect("fixture has a page");
-        let placed = positioned_images(&doc, &test_adapter(&doc), page_id, true);
+        let placed = positioned_images(&test_adapter(&doc), page_id, true);
         assert!(placed[0].uri.starts_with("data:image/jpeg;"), "an unmasked JPEG must not become a PNG");
         // Unit-level: the predicate itself, at the 250 noise floor it is written to.
         let opaque = image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]));
@@ -1872,8 +1870,8 @@ mod tests {
             let path = format!("{}/../tests/fixtures_pdf/{name}", env!("CARGO_MANIFEST_DIR"));
             let doc = Document::load(&path).unwrap_or_else(|e| panic!("{name} must load: {e}"));
             for page_id in doc.get_pages().values() {
-                let inline = positioned_images(&doc, &test_adapter(&doc), *page_id, true).len();
-                let placeholders = positioned_images(&doc, &test_adapter(&doc), *page_id, false).len();
+                let inline = positioned_images(&test_adapter(&doc), *page_id, true).len();
+                let placeholders = positioned_images(&test_adapter(&doc), *page_id, false).len();
                 assert_eq!(placeholders, inline, "{name}: placeholder count must match the embedded count");
             }
         }

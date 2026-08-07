@@ -1279,12 +1279,12 @@ pub(crate) fn render_doc_elements(
         // goes through these; `v.x_left`/`im.x_left` stay page-space for the SVG emitters.
         let dvbox = |v: &vector::PlacedSvg| turn.rect(v.x_left, v.x_right, v.y_bottom, v.y_top);
         let dibox = |im: &img::Placed| turn.rect(im.x_left, im.x_right, im.y_bottom, im.y_top);
-        let mut images = img::positioned_images(doc, access, *_pid, inline_images);
+        let mut images = img::positioned_images(access, *_pid, inline_images);
         // One vector walk, two answers: the figures, and the page's RULING — L1's second
         // evidence source for tables (`extract::detect_tables_pos`). The ruling arrives in
         // page space like every other geometry the walk produces, so it takes the same turn
         // the spans did, or a rotated page's lattice lands nowhere.
-        let (raw_vectors, weak_vectors, page_rules) = vector::positioned_vectors_ruled(doc, access, *_pid);
+        let (raw_vectors, weak_vectors, page_rules) = vector::positioned_vectors_ruled(access, *_pid);
         let page_rules = turn_rules(turn, page_rules);
         let mut tables = extract::detect_tables_pos(dspans, &page_rules);
         // Vector figures that carry a "Figure N" caption — their *internal* text (a diagram's
