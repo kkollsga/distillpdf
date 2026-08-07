@@ -82,7 +82,7 @@ pub(crate) fn decide(
     if coverage <= 0.0 {
         return OcrDecision::NotNeeded; // no renderable image → leave the page alone
     }
-    let txt = text::extract_page(doc, access, page_id, raw).unwrap_or_default();
+    let txt = text::extract_page(access, page_id, raw).unwrap_or_default();
     let n = txt.trim().chars().count();
     let producer = doc_producer(doc).unwrap_or_default();
     decide_from(true, coverage, n, &producer, text_is_garbled(&txt))

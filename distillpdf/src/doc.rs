@@ -408,7 +408,7 @@ impl PdfDocument {
         let mut per_page: Vec<(u32, String)> = pages
             .par_iter()
             .map(|(&p, &page_id)| {
-                let mine = text::extract_page(&self.doc, self.access.as_ref(), page_id, &self.raw).unwrap_or_default();
+                let mine = text::extract_page(self.access.as_ref(), page_id, &self.raw).unwrap_or_default();
                 let s = if mine.trim().chars().count() >= 2 {
                     mine
                 } else {
@@ -429,7 +429,7 @@ impl PdfDocument {
     /// Extract text from a single 1-indexed page (hybrid).
     pub fn extract_page_text(&self, page: u32) -> Result<String, Error> {
         let page_id = *self.doc.get_pages().get(&page).ok_or(Error::NoPage(Some(page)))?;
-        let mine = text::extract_page(&self.doc, self.access.as_ref(), page_id, &self.raw).unwrap_or_default();
+        let mine = text::extract_page(self.access.as_ref(), page_id, &self.raw).unwrap_or_default();
         Ok(if mine.trim().chars().count() >= 2 {
             mine
         } else {
@@ -441,7 +441,7 @@ impl PdfDocument {
     pub fn mine_text(&self) -> String {
         let mut out = String::new();
         for &page_id in self.doc.get_pages().values() {
-            out.push_str(&text::extract_page(&self.doc, self.access.as_ref(), page_id, &self.raw).unwrap_or_default());
+            out.push_str(&text::extract_page(self.access.as_ref(), page_id, &self.raw).unwrap_or_default());
             out.push('\n');
         }
         out
@@ -450,7 +450,7 @@ impl PdfDocument {
     /// Diagnostic: raw spans (text, x, width, size) for a 1-indexed page.
     pub fn dbg_spans(&self, page: u32) -> Result<Vec<(String, f32, f32, f32)>, Error> {
         let page_id = *self.doc.get_pages().get(&page).ok_or(Error::NoPage(None))?;
-        Ok(text::extract_spans(&self.doc, self.access.as_ref(), page_id, &self.raw)
+        Ok(text::extract_spans(self.access.as_ref(), page_id, &self.raw)
             .into_iter()
             .map(|s| (s.text, s.x, s.width, s.size))
             .collect())
@@ -460,7 +460,7 @@ impl PdfDocument {
     #[allow(clippy::type_complexity)] // a flat diagnostic tuple mirroring the Python `_dbg_spans_xy`
     pub fn dbg_spans_xy(&self, page: u32) -> Result<Vec<(String, f32, f32, f32, f32)>, Error> {
         let page_id = *self.doc.get_pages().get(&page).ok_or(Error::NoPage(None))?;
-        Ok(text::extract_spans(&self.doc, self.access.as_ref(), page_id, &self.raw)
+        Ok(text::extract_spans(self.access.as_ref(), page_id, &self.raw)
             .into_iter()
             .map(|s| (s.text, s.x, s.y, s.width, s.size))
             .collect())
@@ -513,7 +513,7 @@ impl PdfDocument {
     /// Diagnostic for one 1-indexed page.
     pub fn debug_page(&self, page: u32) -> Result<String, Error> {
         let page_id = *self.doc.get_pages().get(&page).ok_or(Error::NoPage(Some(page)))?;
-        Ok(text::debug_page(&self.doc, self.access.as_ref(), page_id, &self.raw))
+        Ok(text::debug_page(self.access.as_ref(), page_id, &self.raw))
     }
 
     /// Extract images from all pages.
@@ -963,7 +963,7 @@ pub(crate) mod tests {
             };
             let mut want = String::new();
             for (&p, &page_id) in &pdf.doc.get_pages() {
-                let mine = text::extract_page(&pdf.doc, pdf.access.as_ref(), page_id, &pdf.raw).unwrap_or_default();
+                let mine = text::extract_page(pdf.access.as_ref(), page_id, &pdf.raw).unwrap_or_default();
                 if mine.trim().chars().count() >= 2 {
                     want.push_str(&mine);
                 } else {

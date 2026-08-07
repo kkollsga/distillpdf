@@ -957,7 +957,7 @@ mod tests {
 
         // 3. the text. Form (2,40) at 4 pt -> page (208, 520) at 12 pt (the vertical scale).
         let raw = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/annot_render.pdf")).expect("readable");
-        let spans = crate::text::extract_spans(&doc, &test_adapter(&doc), page, &raw);
+        let spans = crate::text::extract_spans(&test_adapter(&doc), page, &raw);
         let label = spans.iter().find(|s| s.text.contains("StampInkVisible")).expect("the stamp's text must reach the span set");
         assert!((label.x - 208.0).abs() < 1.0 && (label.y - 520.0).abs() < 1.0, "label at ({}, {})", label.x, label.y);
         assert!((label.size - 12.0).abs() < 0.5, "label size {} — the /Rect's VERTICAL scale", label.size);

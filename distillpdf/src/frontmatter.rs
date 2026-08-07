@@ -581,7 +581,7 @@ pub(crate) fn extract_front_matter(
         Some((_, id)) => id,
         None => return FrontMatter::default(),
     };
-    let spans = text::extract_spans(doc, access, first, raw);
+    let spans = text::extract_spans(access, first, raw);
     // BTreeMap, for the same reason as `html::render`'s body histogram: `max_by_key`
     // returns the LAST maximum in iteration order, and a `HashMap`'s order varies per map
     // instance — so a tie between two equally-common sizes resolved differently run to run.

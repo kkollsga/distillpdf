@@ -694,7 +694,6 @@ mod tests {
         let doc = Document::load_mem(&bytes).unwrap();
         let page_id = *doc.get_pages().values().next().unwrap();
         let got = crate::text::extract_page(
-            &doc,
             &crate::access::test_adapter(&doc),
             page_id,
             &bytes,

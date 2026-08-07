@@ -473,10 +473,6 @@ pub(crate) fn page_stream_issues(access: &dyn DocumentAccess, page_id: ObjectId)
 ///
 /// Every `/Resources` child (`/XObject`, `/Font`, `/ColorSpace`, `/ExtGState`, …) may be
 /// either, so reading one with `as_dict()` alone silently misses the indirect half.
-pub(crate) fn sub_dict<'a>(doc: &'a Document, d: &'a Dictionary, key: &[u8]) -> Option<&'a Dictionary> {
-    d.get(key).ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,14 +685,12 @@ mod tests {
         // And the per-page diagnostic names it, so the one page-level entry point in the
         // crate does not report `ops=N` as though N were all there was.
         let dbg = crate::text::debug_page(
-            &doc,
             &test_adapter(&doc),
             pages[&1],
             &std::fs::read(path).expect("fixture readable"),
         );
         assert!(dbg.contains("flate-truncated"), "debug_page must surface it: {dbg}");
         let clean = crate::text::debug_page(
-            &doc,
             &test_adapter(&doc),
             pages[&3],
             &std::fs::read(path).expect("fixture readable"),

@@ -1147,7 +1147,7 @@ pub(crate) fn render_doc_elements(
     let t = std::time::Instant::now();
     let mut page_spans: Vec<(u32, ObjectId, Vec<Span>)> = pages
         .par_iter()
-        .map(|(&pno, &pid)| (pno, pid, text::extract_spans(doc, access, pid, raw)))
+        .map(|(&pno, &pid)| (pno, pid, text::extract_spans(access, pid, raw)))
         .collect();
     page_spans.sort_by_key(|(pno, _, _)| *pno);
     phase("01_spans", t);

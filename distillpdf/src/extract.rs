@@ -2503,7 +2503,7 @@ pub fn extract_tables(
         .par_iter()
         .map(|(&pno, &page_id)| {
             let rules = crate::vector::page_rules(doc, access, page_id);
-            (pno, detect_tables(text::extract_spans(doc, access, page_id, raw), &rules))
+            (pno, detect_tables(text::extract_spans(access, page_id, raw), &rules))
         })
         .collect();
     per_page.sort_by_key(|(pno, _)| *pno);
@@ -2678,7 +2678,7 @@ mod tests {
         let doc = Document::load(&path).unwrap_or_else(|e| panic!("{name} must load: {e}"));
         let raw = std::fs::read(&path).expect("fixture readable");
         let page = *doc.get_pages().get(&1).expect("page 1");
-        let spans = crate::text::extract_spans(&doc, &test_adapter(&doc), page, &raw);
+        let spans = crate::text::extract_spans(&test_adapter(&doc), page, &raw);
         detect_tables_pos(&spans, &crate::vector::page_rules(&doc, &test_adapter(&doc), page))
     }
 
@@ -2702,7 +2702,7 @@ mod tests {
         // The whole page, through the production entry point: ONE table, 6x4 — the blank third
         // column is a column and each band title is its own row, neither of which text
         // clustering can see.
-        let spans = crate::text::extract_spans(&doc, &test_adapter(&doc), page, &raw);
+        let spans = crate::text::extract_spans(&test_adapter(&doc), page, &raw);
         let tables = detect_tables_pos(&spans, &rules);
         assert_eq!(tables.len(), 1, "one table, got {shape:?}", shape = tables.iter().map(|t| (t.grid.len(), t.grid[0].len())).collect::<Vec<_>>());
         assert_eq!((tables[0].grid.len(), tables[0].grid[0].len()), (6, 4));
@@ -2756,7 +2756,7 @@ mod tests {
         let rules = crate::vector::page_rules(&doc, &test_adapter(&doc), page);
         let frames = crate::lattice::frames(&rules);
         assert!(!frames.is_empty(), "the ruling does close cells — that is the point");
-        let spans = crate::text::extract_spans(&doc, &test_adapter(&doc), page, &raw);
+        let spans = crate::text::extract_spans(&test_adapter(&doc), page, &raw);
         let c = Candidate { frame: Some(&frames[0]), long_h: 0, v_rules: 0, aligned: None };
         assert_eq!(classify(TABLE_TYPES, &c).map(|t| t.name), Some("full-grid"), "it classifies");
         assert!(l3_ruled(&c, &spans).is_none(), "…and the handler refuses it");
@@ -2788,7 +2788,7 @@ mod tests {
         let doc = Document::load(path).expect("ruled_blank_cells.pdf must load");
         let raw = std::fs::read(path).expect("fixture readable");
         let page = *doc.get_pages().get(&1).expect("page 1");
-        let spans = crate::text::extract_spans(&doc, &test_adapter(&doc), page, &raw);
+        let spans = crate::text::extract_spans(&test_adapter(&doc), page, &raw);
         let rules = crate::vector::page_rules(&doc, &test_adapter(&doc), page);
         let frames = crate::lattice::frames(&rules);
         assert_eq!(frames.len(), 1, "L1 found one frame");
@@ -3075,7 +3075,7 @@ mod tests {
         let doc = Document::load(path).expect("booktabs_wrapped.pdf must load");
         let raw = std::fs::read(path).expect("fixture readable");
         let page = *doc.get_pages().get(&1).expect("page 1");
-        let spans = crate::text::extract_spans(&doc, &test_adapter(&doc), page, &raw);
+        let spans = crate::text::extract_spans(&test_adapter(&doc), page, &raw);
         assert_eq!(central_gutter(&spans), None, "a table's own gutter is not a page split");
     }
 
@@ -3092,7 +3092,7 @@ mod tests {
         let doc = Document::load(path).expect("glyph_table.pdf fixture must load");
         let raw = std::fs::read(path).expect("fixture readable");
         let page = *doc.get_pages().get(&1).expect("page 1");
-        let spans = crate::text::extract_spans(&doc, &test_adapter(&doc), page, &raw);
+        let spans = crate::text::extract_spans(&test_adapter(&doc), page, &raw);
         let tables = detect_tables_pos(&spans, &crate::vector::page_rules(&doc, &test_adapter(&doc), page));
         assert_eq!(tables.len(), 1, "one table, got {}", tables.len());
         let want = [
@@ -3132,7 +3132,7 @@ mod tests {
             let Ok(doc) = Document::load_mem(&raw) else { continue }; // encrypted / damaged
             let mut want: Vec<(u32, Vec<Vec<String>>)> = Vec::new();
             for (&pno, &page_id) in &doc.get_pages() {
-                for grid in detect_tables(text::extract_spans(&doc, &test_adapter(&doc), page_id, &raw), &crate::vector::page_rules(&doc, &test_adapter(&doc), page_id)) {
+                for grid in detect_tables(text::extract_spans(&test_adapter(&doc), page_id, &raw), &crate::vector::page_rules(&doc, &test_adapter(&doc), page_id)) {
                     want.push((pno, grid));
                 }
             }
@@ -3574,7 +3574,7 @@ mod tests {
         let doc = Document::load(path).expect("tagged_table.pdf fixture must load");
         let raw = std::fs::read(path).expect("fixture readable");
         let page = *doc.get_pages().get(&1).expect("page 1");
-        let spans = crate::text::extract_spans(&doc, &test_adapter(&doc), page, &raw);
+        let spans = crate::text::extract_spans(&test_adapter(&doc), page, &raw);
         (doc, spans, page)
     }
 

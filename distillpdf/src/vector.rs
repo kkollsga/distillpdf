@@ -2793,7 +2793,7 @@ mod tests {
         let want: [(&str, [f32; 4]); 2] = [("Alpha", [0.0, 90.0, 180.0, 270.0]), ("Beta", [-90.0, 0.0, 90.0, 180.0])];
         for (i, &page_id) in ids.iter().enumerate() {
             let rot = crate::pdfobj::page_rotation(&test_adapter(&doc), page_id);
-            let spans = crate::text::extract_spans(&doc, &test_adapter(&doc), page_id, &raw);
+            let spans = crate::text::extract_spans(&test_adapter(&doc), page_id, &raw);
             // The premise, asserted not assumed: the two labels really are drawn at 0° and
             // +90° in PAGE space, identically on every page.
             for (t, a) in [("Alpha", 0.0f32), ("Beta", std::f32::consts::FRAC_PI_2)] {
