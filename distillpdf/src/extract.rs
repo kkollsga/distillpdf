@@ -243,22 +243,15 @@ fn drawn_images(
     page_id: ObjectId,
 ) -> Option<HashSet<ObjectId>> {
     let mut xmap = crate::walker::XMap::new();
-    if let Ok((own, inherited)) = doc.get_page_resources(page_id) {
-        // `inherited` runs page → parent → …; apply it outermost-first so the nearest
-        // scope wins, then the page's own inline dictionary last of all.
-        for id in inherited.iter().rev() {
-            if let Ok(d) = doc.get_dictionary(*id) {
-                crate::walker::overlay_xobjects(access, d, &mut xmap);
-            }
-        }
-        if let Some(d) = own {
-            crate::walker::overlay_xobjects(access, d, &mut xmap);
-        }
+    for resources in crate::walker::page_resource_chain(access, page_id) {
+        let _ = resources.read(|dictionary| {
+            crate::walker::overlay_xobjects(access, dictionary, &mut xmap)
+        });
     }
     // lopdf 0.44 made `get_page_content` infallible (returns `Vec<u8>`, empty when the
     // page has no/unreadable content). The old `.ok()?` bailed out on Err; an empty
     // vec now decodes to zero operations, which reaches the same empty result.
-    let content = doc.get_page_content(page_id);
+    let content = access.page_content(page_id).ok()?;
     let ops = lopdf::content::Content::decode(&content).ok()?;
     let mut out = HashSet::new();
     let mut seen = HashSet::new();

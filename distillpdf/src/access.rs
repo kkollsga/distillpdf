@@ -5,7 +5,9 @@
 //! reads therefore happen through [`ObjectHandle::read`], while values that escape a read are
 //! explicitly owned.  The eager implementation remains the compatibility oracle through L9.
 
-use lopdf::{BytesSource, Dictionary, Document, Object, ObjectId, RandomAccessSource, SourceResult};
+use lopdf::{
+    BytesSource, Dictionary, Document, Object, ObjectId, RandomAccessSource, SourceResult,
+};
 use std::fmt;
 use std::sync::Arc;
 
@@ -53,6 +55,10 @@ enum ObjectOwner {
         document: Arc<Document>,
         id: ObjectId,
     },
+    EagerTrailerEntry {
+        document: Arc<Document>,
+        key: Vec<u8>,
+    },
     #[allow(dead_code)] // constructed by the L3 indexed adapter
     Owned { object: Arc<Object>, id: ObjectId },
 }
@@ -86,14 +92,19 @@ impl DictionaryHandle {
     fn new(object: ObjectHandle) -> Result<Self, AccessError> {
         let id = object.root_id();
         if !object.read(|value| value.as_dict().is_ok())? {
-            return Err(AccessError::object(id, "resolved object is not a dictionary"));
+            return Err(AccessError::object(
+                id,
+                "resolved object is not a dictionary",
+            ));
         }
         Ok(Self { object })
     }
 
     pub(crate) fn read<R>(&self, inspect: impl FnOnce(&Dictionary) -> R) -> Result<R, AccessError> {
         let id = self.object.root_id();
-        self.object.read(|value| value.as_dict().map(inspect))?.map_err(|error| AccessError::object(id, error))
+        self.object
+            .read(|value| value.as_dict().map(inspect))?
+            .map_err(|error| AccessError::object(id, error))
     }
 
     #[allow(dead_code)] // resource consumers migrate incrementally through L2b
@@ -132,6 +143,16 @@ impl ObjectHandle {
         }
     }
 
+    fn eager_trailer_entry(document: Arc<Document>, key: &[u8]) -> Self {
+        Self {
+            owner: ObjectOwner::EagerTrailerEntry {
+                document,
+                key: key.to_vec(),
+            },
+            path: Vec::new(),
+        }
+    }
+
     /// Inspect the resolved value without allowing its borrow to escape the handle.
     pub(crate) fn read<R>(&self, inspect: impl FnOnce(&Object) -> R) -> Result<R, AccessError> {
         let (mut object, id) = match &self.owner {
@@ -140,6 +161,13 @@ impl ObjectHandle {
                     .get_object(*id)
                     .map_err(|error| AccessError::object(*id, error))?;
                 (object, *id)
+            }
+            ObjectOwner::EagerTrailerEntry { document, key } => {
+                let object = document
+                    .trailer
+                    .get(key)
+                    .map_err(|error| AccessError::object((0, 0), error))?;
+                (object, (0, 0))
             }
             ObjectOwner::Owned { object, id } => (object.as_ref(), *id),
         };
@@ -157,7 +185,9 @@ impl ObjectHandle {
                     .as_array()
                     .ok()
                     .and_then(|array| array.get(*index))
-                    .ok_or_else(|| AccessError::object(id, format!("array index {index} is out of bounds")))?,
+                    .ok_or_else(|| {
+                        AccessError::object(id, format!("array index {index} is out of bounds"))
+                    })?,
             };
         }
         Ok(inspect(object))
@@ -227,6 +257,7 @@ impl ObjectHandle {
     fn root_id(&self) -> ObjectId {
         match &self.owner {
             ObjectOwner::Eager { id, .. } | ObjectOwner::Owned { id, .. } => *id,
+            ObjectOwner::EagerTrailerEntry { .. } => (0, 0),
         }
     }
 }
@@ -238,6 +269,15 @@ impl ObjectHandle {
 /// source rather than a document-wide `&[u8]`.
 pub(crate) trait DocumentAccess: Send + Sync {
     fn object(&self, id: ObjectId) -> Result<ObjectHandle, AccessError>;
+    fn trailer_entry(&self, key: &[u8]) -> Result<ObjectHandle, AccessError>;
+    fn catalog(&self) -> Result<DictionaryHandle, AccessError> {
+        DictionaryHandle::new(self.trailer_entry(b"Root")?)
+    }
+    fn page(&self, id: ObjectId) -> Result<DictionaryHandle, AccessError> {
+        DictionaryHandle::new(self.object(id)?)
+    }
+    /// Materialize a page's decoded content with the selected backend's exact fallback policy.
+    fn page_content(&self, page: ObjectId) -> Result<Vec<u8>, AccessError>;
     fn stream(&self, id: ObjectId) -> Result<StreamHandle, AccessError> {
         StreamHandle::new(id, self.object(id)?)
     }
@@ -289,6 +329,29 @@ impl DocumentAccess for EagerDocumentAdapter {
             .get_object(id)
             .map_err(|error| AccessError::object(id, error))?;
         Ok(ObjectHandle::eager(Arc::clone(&self.document), id))
+    }
+
+    fn trailer_entry(&self, key: &[u8]) -> Result<ObjectHandle, AccessError> {
+        let value = self
+            .document
+            .trailer
+            .get(key)
+            .map_err(|error| AccessError::object((0, 0), error))?;
+        if let Object::Reference(id) = value {
+            self.object(*id)
+        } else {
+            Ok(ObjectHandle::eager_trailer_entry(
+                Arc::clone(&self.document),
+                key,
+            ))
+        }
+    }
+
+    fn page_content(&self, page: ObjectId) -> Result<Vec<u8>, AccessError> {
+        self.document
+            .get_dictionary(page)
+            .map_err(|error| AccessError::object(page, error))?;
+        Ok(self.document.get_page_content(page))
     }
 
     fn pages(&self) -> Result<Vec<PageRef>, AccessError> {
@@ -425,6 +488,8 @@ pub(crate) mod tests {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) enum FaultPoint {
         Object,
+        Trailer,
+        PageContent,
         Pages,
         Resources,
         Source,
@@ -453,7 +518,10 @@ pub(crate) mod tests {
 
         fn failure(&self, point: FaultPoint, object: ObjectId) -> Result<(), AccessError> {
             if self.fault == Some(point) {
-                Err(AccessError::object(object, format!("injected {point:?} failure")))
+                Err(AccessError::object(
+                    object,
+                    format!("injected {point:?} failure"),
+                ))
             } else {
                 Ok(())
             }
@@ -465,6 +533,18 @@ pub(crate) mod tests {
             self.counts.object_reads.fetch_add(1, Ordering::Relaxed);
             self.failure(FaultPoint::Object, id)?;
             self.inner.object(id)
+        }
+
+        fn trailer_entry(&self, key: &[u8]) -> Result<ObjectHandle, AccessError> {
+            self.counts.object_reads.fetch_add(1, Ordering::Relaxed);
+            self.failure(FaultPoint::Trailer, (0, 0))?;
+            self.inner.trailer_entry(key)
+        }
+
+        fn page_content(&self, page: ObjectId) -> Result<Vec<u8>, AccessError> {
+            self.counts.object_reads.fetch_add(1, Ordering::Relaxed);
+            self.failure(FaultPoint::PageContent, page)?;
+            self.inner.page_content(page)
         }
 
         fn pages(&self) -> Result<Vec<PageRef>, AccessError> {
@@ -558,10 +638,10 @@ pub(crate) mod tests {
 
     #[test]
     fn owned_handle_and_source_range_keep_their_owners_alive() {
-        let handle = ObjectHandle::owned((7, 0), Object::String(
-            b"owned".to_vec(),
-            lopdf::StringFormat::Literal,
-        ));
+        let handle = ObjectHandle::owned(
+            (7, 0),
+            Object::String(b"owned".to_vec(), lopdf::StringFormat::Literal),
+        );
         assert_eq!(
             handle.read(|o| o.as_str().unwrap().to_vec()).unwrap(),
             b"owned"
@@ -599,10 +679,105 @@ pub(crate) mod tests {
         let indirect = root.dictionary_entry(&adapter, b"Indirect").unwrap();
         drop(root);
         assert_eq!(
-            direct.read(|object| object.as_str().unwrap().to_vec()).unwrap(),
+            direct
+                .read(|object| object.as_str().unwrap().to_vec())
+                .unwrap(),
             b"inline"
         );
-        assert_eq!(indirect.read(|object| object.as_i64().unwrap()).unwrap(), 42);
+        assert_eq!(
+            indirect.read(|object| object.as_i64().unwrap()).unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn trailer_and_catalog_handles_pin_direct_values_and_resolve_references() {
+        let mut document = Document::with_version("1.7");
+        let catalog = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Catalog",
+            "Marker" => Object::Integer(42),
+        }));
+        document.trailer.set("Root", Object::Reference(catalog));
+        document.trailer.set(
+            "Info",
+            Object::Dictionary(dictionary! { "Producer" => Object::string_literal("distillPDF") }),
+        );
+        let adapter = EagerDocumentAdapter::new(Arc::new(document), Arc::from(&b""[..]));
+
+        let catalog = adapter.catalog().unwrap();
+        let info = adapter.trailer_entry(b"Info").unwrap();
+        drop(adapter);
+
+        assert_eq!(
+            catalog
+                .read(|dict| dict.get(b"Marker").unwrap().as_i64().unwrap())
+                .unwrap(),
+            42
+        );
+        assert_eq!(
+            info.dictionary_entry(&FaultFreeAccess, b"Producer")
+                .unwrap()
+                .read(|object| object.as_str().unwrap().to_vec())
+                .unwrap(),
+            b"distillPDF"
+        );
+    }
+
+    struct FaultFreeAccess;
+
+    impl DocumentAccess for FaultFreeAccess {
+        fn object(&self, id: ObjectId) -> Result<ObjectHandle, AccessError> {
+            Err(AccessError::object(id, "unexpected reference"))
+        }
+
+        fn trailer_entry(&self, _key: &[u8]) -> Result<ObjectHandle, AccessError> {
+            Err(AccessError::object((0, 0), "unexpected trailer read"))
+        }
+
+        fn page_content(&self, page: ObjectId) -> Result<Vec<u8>, AccessError> {
+            Err(AccessError::object(page, "unexpected page content read"))
+        }
+
+        fn pages(&self) -> Result<Vec<PageRef>, AccessError> {
+            Ok(Vec::new())
+        }
+
+        fn object_ids(&self) -> Vec<ObjectId> {
+            Vec::new()
+        }
+
+        fn page_resource_chain(
+            &self,
+            _page: ObjectId,
+        ) -> Result<Vec<DictionaryHandle>, AccessError> {
+            Ok(Vec::new())
+        }
+
+        fn source(&self) -> Arc<dyn RandomAccessSource> {
+            Arc::new(BytesSource::new(Arc::from(&b""[..])))
+        }
+    }
+
+    #[test]
+    fn page_handle_and_content_preserve_eager_missing_and_decode_behavior() {
+        let mut document = Document::with_version("1.7");
+        let content = document.add_object(lopdf::Stream::new(
+            Dictionary::new(),
+            b"BT (exact) Tj ET".to_vec(),
+        ));
+        let page = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content),
+        }));
+        let adapter = EagerDocumentAdapter::new(Arc::new(document), Arc::from(&b""[..]));
+
+        assert!(adapter
+            .page(page)
+            .unwrap()
+            .read(|dict| dict.has(b"Contents"))
+            .unwrap());
+        assert_eq!(adapter.page_content(page).unwrap(), b"BT (exact) Tj ET\n");
+        assert!(adapter.page_content((999, 0)).is_err());
     }
 
     #[test]
@@ -643,6 +818,8 @@ pub(crate) mod tests {
         let (adapter, ids) = adapter(vec![Object::Integer(7)], b"abcdef");
         for point in [
             FaultPoint::Object,
+            FaultPoint::Trailer,
+            FaultPoint::PageContent,
             FaultPoint::Pages,
             FaultPoint::Resources,
             FaultPoint::Source,
@@ -652,6 +829,8 @@ pub(crate) mod tests {
             let fault = FaultAccess::new(Arc::new(adapter.clone()), Some(point), counts);
             let error = match point {
                 FaultPoint::Object => fault.object(ids[0]).err().unwrap(),
+                FaultPoint::Trailer => fault.trailer_entry(b"Root").err().unwrap(),
+                FaultPoint::PageContent => fault.page_content(ids[0]).err().unwrap(),
                 FaultPoint::Pages => fault.pages().err().unwrap(),
                 FaultPoint::Resources => fault.page_resource_chain(ids[0]).err().unwrap(),
                 FaultPoint::Source => {

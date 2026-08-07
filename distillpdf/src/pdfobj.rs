@@ -144,10 +144,9 @@ pub(crate) fn page_box(access: &dyn DocumentAccess, page_id: ObjectId) -> Option
             return None; // cyclic /Parent chain
         }
         seen.push(node);
-        let handle = access.object(node).ok()?;
+        let handle = access.page(node).ok()?;
         let (found, parent) = handle
-            .read(|object| {
-                let dict = object.as_dict().ok()?;
+            .read(|dict| {
                 let found = dict
                     .get(b"MediaBox")
                     .ok()
@@ -166,10 +165,9 @@ pub(crate) fn page_box(access: &dyn DocumentAccess, page_id: ObjectId) -> Option
                         .flatten()
                     });
                 let parent = dict.get(b"Parent").ok().and_then(|value| value.as_reference().ok());
-                Some((found, parent))
+                (found, parent)
             })
-            .ok()
-            .flatten()?;
+            .ok()?;
         if found.is_some() {
             return found;
         }
@@ -201,16 +199,14 @@ pub(crate) fn page_rotation(access: &dyn DocumentAccess, page_id: ObjectId) -> i
             return 0; // cyclic /Parent chain
         }
         seen.push(node);
-        let Some((rotation, parent)) = access.object(node).ok().and_then(|handle| {
+        let Some((rotation, parent)) = access.page(node).ok().and_then(|handle| {
             handle
-                .read(|object| {
-                    let dict = object.as_dict().ok()?;
+                .read(|dict| {
                     let rotation = dict.get(b"Rotate").ok().map(|value| num_resolved(access, value));
                     let parent = dict.get(b"Parent").ok().and_then(|value| value.as_reference().ok());
-                    Some((rotation, parent))
+                    (rotation, parent)
                 })
                 .ok()
-                .flatten()
         }) else {
             return 0;
         };

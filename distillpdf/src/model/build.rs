@@ -49,7 +49,7 @@ pub(crate) fn build_model(
 
     // Per-page geometry + OCR decision + PDF page labels. Built first so blocks can be
     // attributed and the page index is complete even for pages with no extracted blocks.
-    let labels = page_labels(doc, page_count);
+    let labels = page_labels(access, page_count);
     let pages: Vec<Page> = page_map
         .iter()
         .map(|(&n, &pid)| {
@@ -158,53 +158,94 @@ pub(crate) fn build_model(
 /// it handles the standard label dictionary (`/S` style `D`/`r`/`R`/`a`/`A`, `/P` prefix,
 /// `/St` start) over the `/Nums` array; ranges it can't interpret are simply left unlabeled
 /// (a missing label is an honest absence, not a wrong one).
-fn page_labels(doc: &Document, page_count: u32) -> BTreeMap<u32, String> {
+fn page_labels(
+    access: &dyn crate::access::DocumentAccess,
+    page_count: u32,
+) -> BTreeMap<u32, String> {
     let mut out = BTreeMap::new();
-    let Ok(catalog) = doc.catalog() else { return out };
-    let Ok(pl) = catalog.get(b"PageLabels") else { return out };
-    let pl = match resolve(doc, pl) {
-        Some(Object::Dictionary(d)) => d,
-        _ => return out,
+    let Ok(catalog) = access.catalog() else {
+        return out;
     };
-    let nums = match pl.get(b"Nums").ok().and_then(|o| resolve(doc, o)) {
-        Some(Object::Array(a)) => a,
-        _ => return out,
+    let Ok(Some(mut ranges)) = catalog.read(|catalog| {
+        let page_labels = catalog.get(b"PageLabels").ok()?;
+        crate::access::read_resolved(access, page_labels, |page_labels| {
+            let page_labels = page_labels.as_dict().ok()?;
+            let nums = page_labels.get(b"Nums").ok()?;
+            crate::access::read_resolved(access, nums, |nums| {
+                let nums = nums.as_array().ok()?;
+                // /Nums is alternating [start_index, label_dict, start_index, …]. Keep
+                // only interpreted scalars; no source-owned array or dictionary escapes.
+                let mut ranges: Vec<(i64, String, String, i64)> = Vec::new();
+                let mut i = 0;
+                while i + 1 < nums.len() {
+                    let Object::Integer(start) = &nums[i] else {
+                        i += 2;
+                        continue;
+                    };
+                    if let Ok(Some(range)) = crate::access::read_resolved(
+                        access,
+                        &nums[i + 1],
+                        |label| {
+                            let label = label.as_dict().ok()?;
+                            let style = label
+                                .get(b"S")
+                                .ok()
+                                .and_then(|value| {
+                                    crate::access::read_resolved(access, value, |value| {
+                                        value.as_name().ok().map(|name| {
+                                            String::from_utf8_lossy(name).into_owned()
+                                        })
+                                    })
+                                    .ok()
+                                    .flatten()
+                                })
+                                .unwrap_or_default();
+                            let prefix = label
+                                .get(b"P")
+                                .ok()
+                                .and_then(|value| {
+                                    crate::access::read_resolved(access, value, |value| {
+                                        let bytes = value.as_str().ok()?;
+                                        Some(crate::pdfobj::decode_text_string(bytes))
+                                    })
+                                    .ok()
+                                    .flatten()
+                                })
+                                .unwrap_or_default();
+                            let counter = label
+                                .get(b"St")
+                                .ok()
+                                .and_then(|value| {
+                                    crate::access::read_resolved(access, value, |value| {
+                                        value.as_i64().ok()
+                                    })
+                                    .ok()
+                                    .flatten()
+                                })
+                                .unwrap_or(1);
+                            Some((*start, style, prefix, counter))
+                        },
+                    ) {
+                        ranges.push(range);
+                    }
+                    i += 2;
+                }
+                Some(ranges)
+            })
+            .ok()
+            .flatten()
+        })
+        .ok()
+        .flatten()
+    }) else {
+        return out;
     };
-    // /Nums is a flat array of alternating [start_index, label_dict, start_index, …].
-    // Collect (start_page0, dict) pairs, sorted by start.
-    let mut ranges: Vec<(i64, lopdf::Dictionary)> = Vec::new();
-    let mut i = 0;
-    while i + 1 < nums.len() {
-        let start = match &nums[i] {
-            Object::Integer(n) => *n,
-            _ => {
-                i += 2;
-                continue;
-            }
-        };
-        if let Some(Object::Dictionary(d)) = resolve(doc, &nums[i + 1]) {
-            ranges.push((start, d.clone()));
-        }
-        i += 2;
-    }
-    ranges.sort_by_key(|(s, _)| *s);
-    for (ri, (start0, d)) in ranges.iter().enumerate() {
-        let end0 = ranges.get(ri + 1).map(|(s, _)| *s).unwrap_or(page_count as i64);
-        let style = match d.get(b"S").ok().and_then(|o| resolve(doc, o)) {
-            Some(Object::Name(n)) => String::from_utf8_lossy(&n).to_string(),
-            _ => String::new(),
-        };
-        // `/P` is a PDF **text string**, so it needs the one decoder: a non-ASCII prefix is
-        // routinely written UTF-16BE behind a BOM, which `from_utf8_lossy` turns into
-        // NUL-interleaved replacement characters.
-        let prefix = match d.get(b"P").ok().and_then(|o| resolve(doc, o)) {
-            Some(Object::String(s, _)) => crate::pdfobj::decode_text_string(&s),
-            _ => String::new(),
-        };
-        let st = match d.get(b"St").ok().and_then(|o| resolve(doc, o)) {
-            Some(Object::Integer(n)) => n,
-            _ => 1,
-        };
+    ranges.sort_by_key(|(start, _, _, _)| *start);
+    for (ri, (start0, style, prefix, st)) in ranges.iter().enumerate() {
+        let end0 = ranges
+            .get(ri + 1)
+            .map(|(start, _, _, _)| *start)
+            .unwrap_or(page_count as i64);
         for p0 in *start0..end0 {
             if p0 < 0 {
                 continue;
@@ -1008,7 +1049,7 @@ mod tests {
         // "\u{FFFD}\u{FFFD}\0A\0p…" and every label in the range was unusable.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/pagelabels.pdf");
         let doc = Document::load(path).expect("pagelabels.pdf fixture must load");
-        let labels = page_labels(&doc, 6);
+        let labels = page_labels(&crate::access::test_adapter(&doc), 6);
         assert_eq!(labels.get(&1).map(String::as_str), Some("i"));
         assert_eq!(labels.get(&4).map(String::as_str), Some("2"));
         assert_eq!(labels.get(&5).map(String::as_str), Some("Apêndice 1"), "UTF-16BE /P prefix mangled");

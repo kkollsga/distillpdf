@@ -3,17 +3,24 @@
     "clone-call|49733a8f34f513daeb3fc60d7a3efa1199c52737e6da5beee62d7e9479a80f6f|step . clone ()",
     "clone-call|59d477c3db76e9afcffa0847c7cff1ef5482f0ddc2a2106e2e24db49aa520d49|Arc :: clone (& self . source)",
     "clone-call|910bcfb4b0c1724ad46e37a537cbed887731cd14f9ad807dd95637c02ab2bd4c|Arc :: clone (& self . document)",
+    "clone-call|910bcfb4b0c1724ad46e37a537cbed887731cd14f9ad807dd95637c02ab2bd4c|Arc :: clone (& self . document)",
     "clone-call|be875f50f8e5ce7dc199ab7afe28e4d6b936da24ef158ad3aa90219477212679|self . owner . clone ()",
     "clone-call|be875f50f8e5ce7dc199ab7afe28e4d6b936da24ef158ad3aa90219477212679|self . owner . clone ()",
     "clone-call|dd2998c047431890f19b567e5eca43e779740be3cfe5a83ba74624e5f3ae9e4c|self . path . clone ()",
     "clone-call|dd2998c047431890f19b567e5eca43e779740be3cfe5a83ba74624e5f3ae9e4c|self . path . clone ()",
+    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
+    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "direct-backend-field|12e47b91184eb2dd2395fec394bb2b0ca33ddbcfe08b3fddfe41a3d609b292a9|self . document . objects",
+    "direct-backend-field|7aa2143cdf46e63ffeb8146451a2e0442d7f9dbef149677567b47c4f8d7e4a3c|self . document . trailer",
+    "direct-backend-field|d7cf57876f313a4982e62ddccf00266961aa07da23a30616e964378f2ddab8e6|document . trailer",
+    "direct-backend-method|106f8b79380c387a5b680a373cc07b2aa8b9af8a41c25d3f483dcc250e8b6c7a|self . document . get_dictionary (page)",
     "direct-backend-method|3f20036654ab1d6bbbaa899811842175858dd43f4a1c309d25def7138a778eec|document . get_object (* id)",
     "direct-backend-method|a98845453d40557064b6cb949fab243eb4394789d4869748f1604ad4ec6567f2|self . document . get_object (id)",
+    "direct-backend-method|c60f7278a4267d6a32dc4428b1fd70590786a4ae94cc909d8954f58ab5381016|self . document . get_page_content (page)",
     "direct-backend-method|ec407b8c82f3d7d61e37ee1ab3a83f3ed3127db63af4d0110dab072a73c82f5b|self . document . get_pages ()",
     "direct-backend-method|f2fff51a7156922e31f1d021c6f3d238b59ad5606f0e51d7b00d5323fa17cc08|self . document . get_page_resources (page)"
   ],
@@ -104,12 +111,9 @@
     "direct-backend-function|1dc737dfb5535500dd94f7a61db40d716a44a3ab7672cbb8ed4fdc24749751ec|deref (doc , o)",
     "direct-backend-function|25869064de00b13dff3f898eab78eae59b8aa507670feb350f93926e7eeda519|sub_dict (doc , & res , b\"Font\")",
     "direct-backend-function|664a92e3e62752508988698f1b4593bc695925bf56053c3a43530752b00e3b2f|deref (doc , v)",
-    "direct-backend-method|19b978b5460525b32dbb6a8708de89b7e63cf4bdc5d724c6b7843b0505b03e65|doc . get_page_resources (page_id)",
-    "direct-backend-method|837189d391cfd7b96261363db6ddebdfd524c5eb04c4add551b4c52060b5ed31|doc . get_page_content (page_id)",
     "direct-backend-method|dd6ce4098685d3fac6d61782032203c250ba8af906122ddeac0fa32f2f4e904f|doc . get_pages ()",
     "direct-backend-method|dd6ce4098685d3fac6d61782032203c250ba8af906122ddeac0fa32f2f4e904f|doc . get_pages ()",
-    "direct-backend-method|dd6ce4098685d3fac6d61782032203c250ba8af906122ddeac0fa32f2f4e904f|doc . get_pages ()",
-    "direct-backend-method|f439839a34eb34b9e5e583508fd6b2e9ad92dde3055726554df7ea10cb1349ac|doc . get_dictionary (* id)"
+    "direct-backend-method|dd6ce4098685d3fac6d61782032203c250ba8af906122ddeac0fa32f2f4e904f|doc . get_pages ()"
   ],
   "frontmatter.rs": [
     "clone-call|107137afd2527f3ac8a73238de835166a62f34992148072fc4cbb3d6f358bd5e|order . iter () . cloned ()",
@@ -286,7 +290,6 @@
   "model/build.rs": [
     "clone-call|025243e0b15f2b6c6f6ced7a8323c753d5a3c31d6296bc1384933f61f7430002|s . parent . clone ()",
     "clone-call|1140b1d343bcb34d54123743ecf18dd69ddb90f496b2d46a96369669115f0f0e|crate :: pdfobj :: deref (doc , o) . cloned ()",
-    "clone-call|11cc002ed60fe6a4d70b1d670eea56cd4df4e03015426db1d15c5a28ed2af02d|d . clone ()",
     "clone-call|13b30fcc00b2def2a66502ea62db1698f8b5bf57862c334b1bcea524347a9a1d|header . clone ()",
     "clone-call|26e925a53852d7c42582343131a2a0dbb547b1b229c0a2fb0957bd05ccbf966e|id . clone ()",
     "clone-call|26e925a53852d7c42582343131a2a0dbb547b1b229c0a2fb0957bd05ccbf966e|id . clone ()",
@@ -329,9 +332,8 @@
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "direct-backend-function|d0ca8f536869576c833ce6410da011d68402d40d8e672de9a54dccfad418f246|crate :: pdfobj :: deref (doc , o)",
-    "direct-backend-method|4d8b2a177a20f47f5aa6fba70f0dccabad6a5560b9039ddccee8700c46f500fd|doc . catalog ()",
+    "direct-backend-method|04e7f46dfaa5cbfe77b5455425f6ba51c78c0b0549b5451ed52a03aeda09ca9b|access . catalog ()",
     "direct-backend-method|dd6ce4098685d3fac6d61782032203c250ba8af906122ddeac0fa32f2f4e904f|doc . get_pages ()"
   ],
   "model/mod.rs": [
