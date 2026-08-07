@@ -307,7 +307,7 @@ pub(crate) fn cs_model(
                 }
                 let lookup = match deref(doc, a.get(3)?)? {
                     Object::String(s, _) => s.clone(),
-                    Object::Stream(st) => content_bytes(st).into_owned(),
+                    Object::Stream(st) => content_bytes(st),
                     _ => return None,
                 };
                 Some(Cs::Indexed { base: Box::new(base), lookup })

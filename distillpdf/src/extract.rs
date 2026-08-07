@@ -149,7 +149,7 @@ fn resource_bfs(
                 continue;
             };
             stream.read(|stream| {
-                if crate::walker::subtype_of(stream) == b"Form" {
+                if crate::walker::has_subtype(stream, b"Form") {
                     if let Some(resources) = stream.dict.get(b"Resources").ok().and_then(|value| {
                         crate::access::read_resolved(access, value, |o| o.as_dict().ok().cloned())
                             .ok()
@@ -196,11 +196,10 @@ fn walk_drawn(
         let Some((id, stream)) = crate::walker::xobject_at(access, xmap, &op.operands) else {
             continue; // not a name, a dangling name, or not a stream: nothing to draw
         };
-        stream.read(|stream| match crate::walker::subtype_of(stream) {
-            b"Image" => {
+        stream.read(|stream| {
+            if crate::walker::has_subtype(stream, b"Image") {
                 out.insert(id);
-            }
-            b"Form" => {
+            } else if crate::walker::has_subtype(stream, b"Form") {
                 if crate::walker::too_deep(depth) {
                     return; // the one nesting cap
                 }
@@ -215,7 +214,6 @@ fn walk_drawn(
                     walk_drawn(doc, access, &ops, &scope.xobjects, depth + 1, seen, out);
                 }
             }
-            _ => {}
         });
     }
 }
@@ -297,7 +295,9 @@ fn reaches_image_xobject(
                 v.as_reference()
                     .ok()
                     .and_then(|id| access.stream(id).ok())
-                    .and_then(|stream| stream.read(|s| crate::walker::subtype_of(s) == b"Image"))
+                    .and_then(|stream| {
+                        stream.read(|s| crate::walker::has_subtype(s, b"Image"))
+                    })
                     .unwrap_or(false)
             })
         })
@@ -397,7 +397,7 @@ fn extract_images_inner(
                 };
                 let row = stream.read(|stream| {
                     let dict = &stream.dict;
-                    if crate::walker::subtype_of(stream) != b"Image" {
+                    if !crate::walker::has_subtype(stream, b"Image") {
                         return None;
                     }
                     let (Ok(width), Ok(height)) = (

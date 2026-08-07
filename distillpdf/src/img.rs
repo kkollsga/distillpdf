@@ -19,7 +19,8 @@ use crate::raster::{
 };
 use crate::vector::ClipRect;
 use crate::walker::{
-    descend_form, overlay_resources, page_resources, page_xobjects, soft_mask_of, subtype_of, xobject_at, Descend, PaintSeq,
+    descend_form, has_subtype, overlay_resources, page_resources, page_xobjects, soft_mask_of,
+    xobject_at, Descend, PaintSeq,
     ScopePolicy, SoftMask, XMap,
 };
 use lopdf::{Dictionary, Document, Object, ObjectId};
@@ -719,7 +720,7 @@ fn mask_extent(
                     continue;
                 };
                 let completed = stream.read(|stream| {
-                if subtype_of(stream) == b"Image" {
+                if has_subtype(stream, b"Image") {
                     let mut bb = Rect::EMPTY;
                     for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
                         let (px, py) = ctm.apply(u, v);
@@ -921,7 +922,7 @@ fn walk(
                     continue;
                 };
                 let action = stream.read(|stream| {
-                if subtype_of(stream) == b"Image" {
+                if has_subtype(stream, b"Image") {
                     // Placed bbox = image unit square [0,1]^2 through the CTM.
                     let corners = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
                     let mut bb = Rect::EMPTY;

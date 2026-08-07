@@ -347,7 +347,7 @@ impl Sampled {
             Some(d) if d.len() == n_out => d,
             _ => range.to_vec(),
         };
-        let data = content_bytes(stream).into_owned();
+        let data = content_bytes(stream);
         if data.is_empty() {
             return None; // a sampled function with no samples has nothing to say
         }

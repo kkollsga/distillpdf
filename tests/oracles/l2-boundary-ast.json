@@ -413,6 +413,9 @@
   "pdfobj.rs": [
     "clone-call|0196e7bdf620d14b5211a06aa677e198b05b8ca295a794bea1cb3e18a1b2cebc|f . clone ()",
     "clone-call|2c8a89e629d146cfa56130d49a2598d1a30a1f64b0ad95b749d5ebabd2ce8000|s . clone ()",
+    "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
+    "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
+    "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",

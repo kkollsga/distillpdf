@@ -18,7 +18,6 @@
 
 use crate::access::{read_resolved, DocumentAccess};
 use lopdf::{Dictionary, Document, Object, ObjectId};
-use std::borrow::Cow;
 
 /// The page size assumed when a document states no page box at all: US Letter, in points.
 ///
@@ -79,12 +78,13 @@ pub(crate) fn num_resolved(access: &dyn DocumentAccess, object: &Object) -> f32 
 /// returns an *error* for a stream with no `/Filter` key, and some producers store content
 /// and Form XObject streams raw — so calling it bare and taking `unwrap_or_default()`
 /// decodes those streams as **empty**, silently losing every glyph and path inside them.
-/// This reader returns the verbatim content instead. Borrowed when no decode happened, so
-/// the common path allocates nothing.
+/// This reader returns the verbatim content instead. The owned result is the interpreted
+/// leaf payload which may safely outlive a short resolver read.
 ///
 /// The `Err` arm covers the filters lopdf does not implement (JBIG2, CCITT, DCT — image
 /// codecs that reach here only on a malformed content stream), which likewise degrade to
-/// raw bytes. Note what it does **not** cover: lopdf's Flate path swallows a decode error
+/// raw bytes. The result is owned so no stream-derived borrow crosses the resolver boundary.
+/// Note what it does **not** cover: lopdf's Flate path swallows a decode error
 /// and hands back whatever partial output it managed, so a *truncated* Flate stream comes
 /// back short or empty rather than raw. That is lopdf's call, not ours — raw deflate bytes
 /// would not parse as a content stream either — and it is stated here so no caller assumes
@@ -95,9 +95,9 @@ pub(crate) fn num_resolved(access: &dyn DocumentAccess, object: &Object) -> f32 
 /// `PdfDocument::debug_page`), so a caller can ask whether the page it just rendered is the
 /// whole page. The check stays *out* of this function on purpose — it costs a second full
 /// inflate, which no render should pay per stream.
-pub(crate) fn content_bytes(stream: &lopdf::Stream) -> Cow<'_, [u8]> {
+pub(crate) fn content_bytes(stream: &lopdf::Stream) -> Vec<u8> {
     if stream.dict.get(b"Filter").is_err() {
-        return Cow::Borrowed(&stream.content);
+        return stream.content.clone();
     }
     // The L0 fork is based beyond the crates.io 0.44 tag and implements these two filters.
     // The eager compatibility oracle did not: either filter made `decompressed_content`
@@ -105,11 +105,11 @@ pub(crate) fn content_bytes(stream: &lopdf::Stream) -> Cow<'_, [u8]> {
     // raw encoded bytes. Keep that behavior on the eager route through L9; the lazy route
     // may only change it under an explicit, separately-oracled policy.
     if has_legacy_unsupported_filter(&stream.dict) {
-        return Cow::Borrowed(&stream.content);
+        return stream.content.clone();
     }
     match stream.decompressed_content() {
-        Ok(b) => Cow::Owned(b),
-        Err(_) => Cow::Borrowed(&stream.content),
+        Ok(bytes) => bytes,
+        Err(_) => stream.content.clone(),
     }
 }
 
@@ -575,7 +575,7 @@ mod tests {
             Some(&raw[..]),
             "the premise, lopdf 0.44: an unfiltered stream decodes to its raw content",
         );
-        assert_eq!(content_bytes(&s).as_ref(), &raw[..]);
+        assert_eq!(content_bytes(&s).as_slice(), &raw[..]);
     }
 
     #[test]
@@ -584,7 +584,7 @@ mod tests {
         let mut s = Stream::new(dictionary! {}, raw.clone());
         s.compress().expect("flate compress");
         assert_ne!(s.content, raw, "the fixture must really be compressed");
-        assert_eq!(content_bytes(&s).as_ref(), &raw[..]);
+        assert_eq!(content_bytes(&s).as_slice(), &raw[..]);
     }
 
     #[test]
@@ -593,7 +593,7 @@ mod tests {
         // `Unimplemented`, and the caller gets the bytes on disk — garbage it can reject,
         // never a silent empty page.
         let unknown = Stream::new(dictionary! { "Filter" => "JBIG2Decode" }, b"\x00\x01\x02".to_vec());
-        assert_eq!(content_bytes(&unknown).as_ref(), b"\x00\x01\x02");
+        assert_eq!(content_bytes(&unknown).as_slice(), b"\x00\x01\x02");
     }
 
     #[test]
@@ -607,7 +607,7 @@ mod tests {
         let truncated = Stream::new(s.dict.clone(), s.content[..s.content.len() / 2].to_vec());
         assert!(truncated.decompressed_content().is_ok(), "lopdf swallows the zlib error");
         let got = content_bytes(&truncated);
-        assert_ne!(got.as_ref(), &truncated.content[..], "not the raw bytes");
+        assert_ne!(got.as_slice(), &truncated.content[..], "not the raw bytes");
         assert!(got.len() < raw.len(), "a truncated stream decodes short, got {} of {}", got.len(), raw.len());
     }
 

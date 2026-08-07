@@ -233,9 +233,13 @@ pub(crate) fn xobject_at(
     Some((id, access.stream(id).ok()?))
 }
 
-/// A stream's `/Subtype`, or `b""` when it has none.
-pub(crate) fn subtype_of(stream: &lopdf::Stream) -> &[u8] {
-    stream.dict.get(b"Subtype").and_then(|o| o.as_name()).unwrap_or(b"")
+/// Whether a stream has the requested `/Subtype` name.
+pub(crate) fn has_subtype(stream: &lopdf::Stream, expected: &[u8]) -> bool {
+    stream
+        .dict
+        .get(b"Subtype")
+        .and_then(|object| object.as_name())
+        .is_ok_and(|name| name == expected)
 }
 
 /// Is this form XObject a **transparency group** (`/Group << /S /Transparency >>`,
@@ -384,7 +388,7 @@ pub(crate) fn soft_mask_of(access: &dyn DocumentAccess, gs: &Dictionary) -> Opti
         let id = m.get(b"G").ok()?.as_reference().ok()?;
         let stream = access.stream(id).ok()?;
         stream
-            .read(|value| subtype_of(value) == b"Form")
+            .read(|value| has_subtype(value, b"Form"))
             .is_some_and(|is_form| is_form)
             .then_some(SoftMask::Group(stream))
     })
@@ -752,7 +756,7 @@ pub(crate) fn descend_form(
     budget: &mut crate::WalkBudget,
     sibling_cost: usize,
 ) -> Descend {
-    if subtype_of(stream) != b"Form" || too_deep(depth) {
+    if !has_subtype(stream, b"Form") || too_deep(depth) {
         return Descend::Skip;
     }
     // Bill the descent before doing it: cloning the inherited resource maps and decoding

@@ -202,7 +202,7 @@ fn font_info(doc: &Document, dict: &Dictionary, raw: &[u8]) -> FontInfo {
                     .get_object(r)
                     .ok()
                     .and_then(|o| o.as_stream().ok())
-                    .map(|s| crate::pdfobj::content_bytes(s).into_owned())
+                    .map(crate::pdfobj::content_bytes)
                     .filter(|b| !b.is_empty());
                 let bytes = from_lopdf.or_else(|| recover_stream(raw, r.0))?;
                 Some(parse_tounicode(&bytes))
