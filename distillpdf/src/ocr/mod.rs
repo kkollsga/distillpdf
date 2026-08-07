@@ -27,8 +27,12 @@ use lopdf::{Document, ObjectId};
 /// The page's main raster (largest placed image): standard image bytes (PNG/JPEG) plus
 /// the decoded image. Reuses `img::positioned_images`, which handles every PDF image
 /// encoding by emitting a data URI. Used to feed the OCR engine and crop figure regions.
-pub(crate) fn page_main_image(doc: &Document, page_id: ObjectId) -> Option<(Vec<u8>, image::DynamicImage)> {
-    let placed = crate::img::positioned_images(doc, page_id, true);
+pub(crate) fn page_main_image(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    page_id: ObjectId,
+) -> Option<(Vec<u8>, image::DynamicImage)> {
+    let placed = crate::img::positioned_images(doc, access, page_id, true);
     let best = placed
         .into_iter()
         .filter(|p| !p.uri.is_empty())

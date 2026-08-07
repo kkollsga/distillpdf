@@ -72,12 +72,17 @@ fn decide_from(has_image: bool, coverage: f32, n_text: usize, producer: &str, ga
 }
 
 /// Per-page OCR decision against a real document.
-pub(crate) fn decide(doc: &Document, page_id: ObjectId, raw: &[u8]) -> OcrDecision {
-    let coverage = image_coverage(doc, page_id);
+pub(crate) fn decide(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    page_id: ObjectId,
+    raw: &[u8],
+) -> OcrDecision {
+    let coverage = image_coverage(doc, access, page_id);
     if coverage <= 0.0 {
         return OcrDecision::NotNeeded; // no renderable image → leave the page alone
     }
-    let txt = text::extract_page(doc, page_id, raw).unwrap_or_default();
+    let txt = text::extract_page(doc, access, page_id, raw).unwrap_or_default();
     let n = txt.trim().chars().count();
     let producer = doc_producer(doc).unwrap_or_default();
     decide_from(true, coverage, n, &producer, text_is_garbled(&txt))
@@ -87,8 +92,12 @@ pub(crate) fn decide(doc: &Document, page_id: ObjectId, raw: &[u8]) -> OcrDecisi
 /// (recurses into Form XObjects, stitches tile mosaics into one bbox). `0.0` means no
 /// renderable figure-sized image — the same view the OCR image extractor (`page_main_image`)
 /// has, so detection never flags a page whose image we couldn't actually read.
-fn image_coverage(doc: &Document, page_id: ObjectId) -> f32 {
-    let placed = crate::img::positioned_images(doc, page_id, false);
+fn image_coverage(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    page_id: ObjectId,
+) -> f32 {
+    let placed = crate::img::positioned_images(doc, access, page_id, false);
     if placed.is_empty() {
         return 0.0;
     }

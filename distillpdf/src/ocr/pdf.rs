@@ -669,7 +669,14 @@ mod tests {
         let h_a = crate::ocr::render::doctags_to_html(dt);
         let bytes = write_pdf(&[page_from(dt)]).unwrap();
         let doc = Document::load_mem(&bytes).unwrap();
-        let h_b = crate::html::to_html(&doc, &bytes, crate::html::Mode::Page, false, false);
+        let h_b = crate::html::to_html(
+            &doc,
+            &crate::access::test_adapter(&doc),
+            &bytes,
+            crate::html::Mode::Page,
+            false,
+            false,
+        );
         let (ta, tb) = (visible_text(&h_a), visible_text(&h_b));
         // every content word from the direct render must survive the PDF round trip
         for w in ta.split(' ').filter(|w| w.chars().count() > 3) {
@@ -686,7 +693,13 @@ mod tests {
         let bytes = write_pdf(&[page_from(dt)]).unwrap();
         let doc = Document::load_mem(&bytes).unwrap();
         let page_id = *doc.get_pages().values().next().unwrap();
-        let got = crate::text::extract_page(&doc, page_id, &bytes).unwrap_or_default();
+        let got = crate::text::extract_page(
+            &doc,
+            &crate::access::test_adapter(&doc),
+            page_id,
+            &bytes,
+        )
+        .unwrap_or_default();
         let norm = crate::textutil::normalize_ws;
         let got = norm(&got);
         for w in ["TERMO", "DECLARACOES", "outubro", "dezenove"] {

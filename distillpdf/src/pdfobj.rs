@@ -93,10 +93,25 @@ pub(crate) fn content_bytes(stream: &lopdf::Stream) -> Cow<'_, [u8]> {
     if stream.dict.get(b"Filter").is_err() {
         return Cow::Borrowed(&stream.content);
     }
+    // The L0 fork is based beyond the crates.io 0.44 tag and implements these two filters.
+    // The eager compatibility oracle did not: either filter made `decompressed_content`
+    // return `Unimplemented`, and every distillPDF surface deliberately fell back to the
+    // raw encoded bytes. Keep that behavior on the eager route through L9; the lazy route
+    // may only change it under an explicit, separately-oracled policy.
+    if has_legacy_unsupported_filter(&stream.dict) {
+        return Cow::Borrowed(&stream.content);
+    }
     match stream.decompressed_content() {
         Ok(b) => Cow::Owned(b),
         Err(_) => Cow::Borrowed(&stream.content),
     }
+}
+
+/// Filters newly implemented by the pinned fork but unsupported by the prior eager 0.44 route.
+pub(crate) fn has_legacy_unsupported_filter(dict: &Dictionary) -> bool {
+    filters_of(dict)
+        .iter()
+        .any(|name| matches!(name.as_slice(), b"ASCIIHexDecode" | b"AHx" | b"RunLengthDecode" | b"RL"))
 }
 
 /// The page's effective box as `[x0, y0, x1, y1]`: `/MediaBox`, else `/CropBox`, inherited
@@ -375,6 +390,9 @@ fn stream_issue(id: ObjectId, s: &lopdf::Stream) -> Option<StreamIssue> {
     probe.dict.set("Filter", Object::Array(lead));
     probe.dict.remove(b"DecodeParms"); // a codec's parms do not apply to the generic layers
     probe.dict.remove(b"DP");
+    if has_legacy_unsupported_filter(&probe.dict) {
+        return Some(StreamIssue { object: id, kind: "filter-unapplied", filter, recovered: s.content.len() });
+    }
     match probe.decompressed_content() {
         // `Err` IS the honest signal here: it is what makes `content_bytes` and
         // `codec_payload` fall back to the ENCODED bytes, so whatever consumes them is

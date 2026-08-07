@@ -66,26 +66,18 @@ pub struct TableInfo {
 /// directly-referenced resources keep the index they had before recursion existed) and
 /// nested forms are appended breadth-first in `/XObject` dictionary order. A visited-
 /// `ObjectId` set cuts reference cycles; `crate::MAX_FORM_DEPTH` caps nesting.
-fn page_resource_dicts(doc: &Document, page_id: ObjectId) -> Vec<&Dictionary> {
-    let mut queue: VecDeque<(&Dictionary, u32)> = VecDeque::new();
+fn page_resource_dicts(
+    access: &dyn crate::access::DocumentAccess,
+    page_id: ObjectId,
+) -> Vec<Dictionary> {
+    let mut queue: VecDeque<(Dictionary, u32)> = VecDeque::new();
     let mut seen: HashSet<ObjectId> = HashSet::new();
-
-    if let Ok((own, inherited)) = doc.get_page_resources(page_id) {
-        if let Some(d) = own {
-            queue.push_back((d, 0));
-        }
-        // `inherited` is ordered page → parent → …, so the page's own resources (when
-        // written as a reference rather than inline) still lead.
-        for id in inherited {
-            if !seen.insert(id) {
-                continue;
-            }
-            if let Ok(d) = doc.get_dictionary(id) {
-                queue.push_back((d, 0));
-            }
-        }
+    // The adapter returns outermost → page for overlay consumers. Reporting has always
+    // enumerated page → outermost, so reverse it to preserve every existing row index.
+    for resources in access.page_resource_chain(page_id).unwrap_or_default().into_iter().rev() {
+        queue.push_back((resources, 0));
     }
-    resource_bfs(doc, queue, &mut seen)
+    resource_bfs(access, queue, &mut seen)
 }
 
 /// Every resource dictionary reachable from an annotation's **appearance stream**
@@ -98,38 +90,52 @@ fn page_resource_dicts(doc: &Document, page_id: ObjectId) -> Vec<&Dictionary> {
 /// and appearance rows land at the end.
 ///
 /// `extract_fonts` deliberately does **not** consume this — see its doc comment.
-fn appearance_resource_dicts(doc: &Document, page_id: ObjectId) -> Vec<&Dictionary> {
-    let mut queue: VecDeque<(&Dictionary, u32)> = VecDeque::new();
+fn appearance_resource_dicts(
+    access: &dyn crate::access::DocumentAccess,
+    page_id: ObjectId,
+) -> Vec<Dictionary> {
+    let mut queue: VecDeque<(Dictionary, u32)> = VecDeque::new();
     let mut seen: HashSet<ObjectId> = HashSet::new();
-    for (id, stream) in crate::walker::appearance_streams(doc, page_id) {
+    for (id, stream) in crate::walker::appearance_streams(access, page_id) {
         if !seen.insert(id) {
             continue; // one appearance stream shared by several annotations
         }
         // §12.5.5: an appearance stream's resources are its OWN — it inherits nothing from
         // the page, the same rule the nested-form step below applies.
-        if let Some(fr) = sub_dict(doc, &stream.dict, b"Resources") {
-            queue.push_back((fr, 0));
-        }
+        stream.read(|stream| {
+            if let Some(resources) = stream.dict.get(b"Resources").ok().and_then(|value| {
+                crate::access::read_resolved(access, value, |o| o.as_dict().ok().cloned())
+                    .ok()
+                    .flatten()
+            }) {
+                queue.push_back((resources, 0));
+            }
+        });
     }
-    resource_bfs(doc, queue, &mut seen)
+    resource_bfs(access, queue, &mut seen)
 }
 
 /// The shared body of both resource walks: drain `queue` breadth-first, appending each
 /// dictionary and then queueing the own-`/Resources` of every `/Subtype /Form` XObject it
 /// names. `seen` cuts reference cycles (and is pre-seeded by the caller with whatever it
 /// has already visited); [`crate::MAX_FORM_DEPTH`] caps nesting.
-fn resource_bfs<'a>(
-    doc: &'a Document,
-    mut queue: VecDeque<(&'a Dictionary, u32)>,
+fn resource_bfs(
+    access: &dyn crate::access::DocumentAccess,
+    mut queue: VecDeque<(Dictionary, u32)>,
     seen: &mut HashSet<ObjectId>,
-) -> Vec<&'a Dictionary> {
-    let mut out: Vec<&Dictionary> = Vec::new();
+) -> Vec<Dictionary> {
+    let mut out = Vec::new();
     while let Some((res, depth)) = queue.pop_front() {
-        out.push(res);
         if depth >= crate::MAX_FORM_DEPTH {
+            out.push(res);
             continue; // nesting cap (a self-referential form is already cut by `seen`)
         }
-        let Some(xobjects) = sub_dict(doc, res, b"XObject") else {
+        let Some(xobjects) = res.get(b"XObject").ok().and_then(|value| {
+            crate::access::read_resolved(access, value, |o| o.as_dict().ok().cloned())
+                .ok()
+                .flatten()
+        }) else {
+            out.push(res);
             continue;
         };
         for (_, v) in xobjects.iter() {
@@ -137,18 +143,22 @@ fn resource_bfs<'a>(
             if !seen.insert(id) {
                 continue; // already walked: a shared or self-referential form
             }
-            let Ok(stream) = doc.get_object(id).and_then(|o| o.as_stream()) else {
+            let Ok(stream) = access.stream(id) else {
                 continue;
             };
-            if stream.dict.get(b"Subtype").and_then(|o| o.as_name()).unwrap_or(b"") != b"Form" {
-                continue;
-            }
-            // A form's resources live in its OWN /Resources (PDF 32000-1 §8.10.2); a form
-            // without one contributes nothing we could resolve.
-            if let Some(fr) = sub_dict(doc, &stream.dict, b"Resources") {
-                queue.push_back((fr, depth + 1));
-            }
+            stream.read(|stream| {
+                if crate::walker::subtype_of(stream) == b"Form" {
+                    if let Some(resources) = stream.dict.get(b"Resources").ok().and_then(|value| {
+                        crate::access::read_resolved(access, value, |o| o.as_dict().ok().cloned())
+                            .ok()
+                            .flatten()
+                    }) {
+                        queue.push_back((resources, depth + 1));
+                    }
+                }
+            });
         }
+        out.push(res);
     }
     out
 }
@@ -170,6 +180,7 @@ fn resource_bfs<'a>(
 /// `walker::descend_form`, which is the budgeted composition.
 fn walk_drawn(
     doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
     ops: &[lopdf::content::Operation],
     xmap: &crate::walker::XMap,
     depth: u32,
@@ -180,30 +191,30 @@ fn walk_drawn(
         if op.operator != "Do" {
             continue;
         }
-        let Some((id, stream)) = crate::walker::xobject_at(doc, xmap, &op.operands) else {
+        let Some((id, stream)) = crate::walker::xobject_at(access, xmap, &op.operands) else {
             continue; // not a name, a dangling name, or not a stream: nothing to draw
         };
-        match crate::walker::subtype_of(stream) {
+        stream.read(|stream| match crate::walker::subtype_of(stream) {
             b"Image" => {
                 out.insert(id);
             }
             b"Form" => {
                 if crate::walker::too_deep(depth) {
-                    continue; // the one nesting cap
+                    return; // the one nesting cap
                 }
                 if !seen.insert(id) {
-                    continue; // a form already walked on this page: cycle / repeat guard
+                    return; // a form already walked on this page: cycle / repeat guard
                 }
-                let Some(scope) = crate::walker::form_scope(doc, stream, xmap, crate::walker::ScopePolicy::OverlayParent)
+                let Some(scope) = crate::walker::form_scope(access, stream, xmap, crate::walker::ScopePolicy::OverlayParent)
                 else {
-                    continue;
+                    return;
                 };
                 if let Some(ops) = crate::walker::form_ops(stream) {
-                    walk_drawn(doc, &ops, &scope.xobjects, depth + 1, seen, out);
+                    walk_drawn(doc, access, &ops, &scope.xobjects, depth + 1, seen, out);
                 }
             }
             _ => {}
-        }
+        });
     }
 }
 
@@ -224,18 +235,22 @@ fn walk_drawn(
 ///
 /// `None` when the page's content stream can't be read or parsed at all — the caller then
 /// falls back to plain reachability rather than silently reporting an image-less page.
-fn drawn_images(doc: &Document, page_id: ObjectId) -> Option<HashSet<ObjectId>> {
+fn drawn_images(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    page_id: ObjectId,
+) -> Option<HashSet<ObjectId>> {
     let mut xmap = crate::walker::XMap::new();
     if let Ok((own, inherited)) = doc.get_page_resources(page_id) {
         // `inherited` runs page → parent → …; apply it outermost-first so the nearest
         // scope wins, then the page's own inline dictionary last of all.
         for id in inherited.iter().rev() {
             if let Ok(d) = doc.get_dictionary(*id) {
-                crate::walker::overlay_xobjects(doc, d, &mut xmap);
+                crate::walker::overlay_xobjects(access, d, &mut xmap);
             }
         }
         if let Some(d) = own {
-            crate::walker::overlay_xobjects(doc, d, &mut xmap);
+            crate::walker::overlay_xobjects(access, d, &mut xmap);
         }
     }
     // lopdf 0.44 made `get_page_content` infallible (returns `Vec<u8>`, empty when the
@@ -245,19 +260,22 @@ fn drawn_images(doc: &Document, page_id: ObjectId) -> Option<HashSet<ObjectId>> 
     let ops = lopdf::content::Content::decode(&content).ok()?;
     let mut out = HashSet::new();
     let mut seen = HashSet::new();
-    walk_drawn(doc, &ops.operations, &xmap, 0, &mut seen, &mut out);
-    for (id, ap) in crate::walker::appearance_streams(doc, page_id) {
+    walk_drawn(doc, access, &ops.operations, &xmap, 0, &mut seen, &mut out);
+    for (id, ap) in crate::walker::appearance_streams(access, page_id) {
         if !seen.insert(id) {
             continue; // shared between annotations, or already reached from the content
         }
-        let Some(scope) = crate::walker::form_scope(doc, ap, &crate::walker::XMap::new(), crate::walker::ScopePolicy::OwnOnly)
-        else {
-            continue; // no /Resources: nothing its names could resolve against
-        };
-        if let Some(ops) = crate::walker::form_ops(ap) {
-            // The appearance stream is itself one form level below the page's content.
-            walk_drawn(doc, &ops, &scope.xobjects, 1, &mut seen, &mut out);
-        }
+        ap.read(|ap| {
+            let Some(scope) = crate::walker::form_scope(
+                access,
+                ap,
+                &crate::walker::XMap::new(),
+                crate::walker::ScopePolicy::OwnOnly,
+            ) else { return };
+            if let Some(ops) = crate::walker::form_ops(ap) {
+                walk_drawn(doc, access, &ops, &scope.xobjects, 1, &mut seen, &mut out);
+            }
+        });
     }
     Some(out)
 }
@@ -270,15 +288,22 @@ fn drawn_images(doc: &Document, page_id: ObjectId) -> Option<HashSet<ObjectId>> 
 /// become a row — a named reference whose object is a stream with `/Subtype /Image` — so
 /// "false here" means "that loop would push nothing for this page, whatever the drawn set
 /// says". That is what makes the short-circuit semantics-preserving rather than a heuristic.
-fn reaches_image_xobject(doc: &Document, dicts: &[&Dictionary]) -> bool {
+fn reaches_image_xobject(
+    access: &dyn crate::access::DocumentAccess,
+    dicts: &[Dictionary],
+) -> bool {
     dicts.iter().any(|res| {
-        sub_dict(doc, res, b"XObject").is_some_and(|xobjects| {
+        res.get(b"XObject").ok().and_then(|value| {
+            crate::access::read_resolved(access, value, |o| o.as_dict().ok().cloned())
+                .ok()
+                .flatten()
+        }).is_some_and(|xobjects| {
             xobjects.iter().any(|(_, v)| {
                 v.as_reference()
                     .ok()
-                    .and_then(|id| doc.get_object(id).ok())
-                    .and_then(|o| o.as_stream().ok())
-                    .is_some_and(|s| crate::walker::subtype_of(s) == b"Image")
+                    .and_then(|id| access.stream(id).ok())
+                    .and_then(|stream| stream.read(|s| crate::walker::subtype_of(s) == b"Image"))
+                    .unwrap_or(false)
             })
         })
     })
@@ -316,20 +341,27 @@ fn image_filters(dict: &Dictionary) -> Vec<String> {
 /// with `format` reported as `"png"`. Only samples we cannot faithfully reduce keep
 /// `format:"raw"` — and those now carry `color_space` and `bits_per_component`, which is
 /// what a caller needs to reassemble them by hand.
-pub fn extract_images(doc: &Document) -> Vec<ImageInfo> {
-    extract_images_inner(doc, true)
+pub fn extract_images(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+) -> Vec<ImageInfo> {
+    extract_images_inner(doc, access, true)
 }
 
 /// The body of [`extract_images`], with the resource-tree short-circuit switchable so a test
 /// can assert the two paths agree ([`tests::the_short_circuit_reports_exactly_what_the_full_walk_reports`]).
 /// Production always passes `true`; `false` is the full-walk oracle.
-fn extract_images_inner(doc: &Document, short_circuit: bool) -> Vec<ImageInfo> {
+fn extract_images_inner(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    short_circuit: bool,
+) -> Vec<ImageInfo> {
     let mut out = Vec::new();
     for (&pno, &page_id) in &doc.get_pages() {
         // The page's own resource tree first, so every `(page, index)` a page already
         // reported keeps it; the annotation appearances are appended after.
-        let mut dicts = page_resource_dicts(doc, page_id);
-        dicts.extend(appearance_resource_dicts(doc, page_id));
+        let mut dicts = page_resource_dicts(access, page_id);
+        dicts.extend(appearance_resource_dicts(access, page_id));
         // A page whose resource tree reaches no image XObject cannot report one, because
         // enumeration below runs over exactly these dictionaries and `drawn` can only
         // *remove* candidates from it — so the content walk is pure cost. On a 102-page
@@ -337,11 +369,11 @@ fn extract_images_inner(doc: &Document, short_circuit: bool) -> Vec<ImageInfo> {
         // the operation, in lopdf's lexer) to conclude nothing. Both dict walks above parse
         // no operator and decompress no stream, and the scan is the enumeration loop's own
         // predicate, so skipping is by construction unobservable — not an approximation.
-        if short_circuit && !reaches_image_xobject(doc, &dicts) {
+        if short_circuit && !reaches_image_xobject(access, &dicts) {
             continue;
         }
         let mut index = 0usize;
-        let drawn = drawn_images(doc, page_id);
+        let drawn = drawn_images(doc, access, page_id);
         // Dedup is across resource dictionaries only: an image the page's own /XObject
         // already listed is not re-reported when a nested form points at it too. Repeats
         // *within* one dictionary are kept, so the `index` a directly-referenced image had
@@ -350,7 +382,11 @@ fn extract_images_inner(doc: &Document, short_circuit: bool) -> Vec<ImageInfo> {
         let mut from_this_dict: Vec<ObjectId> = Vec::new();
         for res in dicts {
             seen.extend(from_this_dict.drain(..));
-            let Some(xobjects) = sub_dict(doc, res, b"XObject") else {
+            let Some(xobjects) = res.get(b"XObject").ok().and_then(|value| {
+                crate::access::read_resolved(access, value, |o| o.as_dict().ok().cloned())
+                    .ok()
+                    .flatten()
+            }) else {
                 continue;
             };
             for (_, v) in xobjects.iter() {
@@ -361,54 +397,50 @@ fn extract_images_inner(doc: &Document, short_circuit: bool) -> Vec<ImageInfo> {
                 if seen.contains(&id) {
                     continue; // already reported from an outer resource dictionary
                 }
-                let Ok(stream) = doc.get_object(id).and_then(|o| o.as_stream()) else {
+                let Ok(stream) = access.stream(id) else {
                     continue;
                 };
-                let dict = &stream.dict;
-                if dict.get(b"Subtype").and_then(|o| o.as_name()).unwrap_or(b"") != b"Image" {
-                    continue;
-                }
-                let (Ok(width), Ok(height)) = (
-                    dict.get(b"Width").and_then(|o| o.as_i64()),
-                    dict.get(b"Height").and_then(|o| o.as_i64()),
-                ) else {
-                    continue; // not a usable image row without dimensions
-                };
-                let filters = image_filters(dict);
-                let mut format = filter_to_format(&Some(filters.clone()));
-                // Hand back something a caller can actually open. A coded image gives up
-                // its codec payload (a Flate-wrapped JPEG becomes a JPEG file); a `raw`
-                // sample block is assembled into a PNG, and stays `raw` — with the
-                // metadata to reassemble it by hand — only when it cannot be.
-                let mut data = if format == "raw" {
-                    match assemble_png(doc, res, stream) {
-                        Some(png) => {
-                            format = "png";
-                            png
+                let row = stream.read(|stream| {
+                    let dict = &stream.dict;
+                    if crate::walker::subtype_of(stream) != b"Image" {
+                        return None;
+                    }
+                    let (Ok(width), Ok(height)) = (
+                        dict.get(b"Width").and_then(|o| o.as_i64()),
+                        dict.get(b"Height").and_then(|o| o.as_i64()),
+                    ) else { return None };
+                    let filters = image_filters(dict);
+                    let mut format = filter_to_format(&Some(filters));
+                    let mut data = if format == "raw" {
+                        match assemble_png(doc, &res, stream) {
+                            Some(png) => {
+                                format = "png";
+                                png
+                            }
+                            None => stream.content.clone(),
                         }
-                        None => stream.content.clone(),
+                    } else {
+                        codec_payload(stream).into_owned()
+                    };
+                    if format == "jpeg" {
+                        if let Some(png) = normalized_jpeg_png(doc, dict, &data) {
+                            format = "png";
+                            data = png;
+                        }
                     }
-                } else {
-                    codec_payload(stream).into_owned()
-                };
-                // A CMYK JPEG is decoded to the wrong colours by every consumer that reads
-                // it as a standalone file, so it is normalized rather than passed through.
-                if format == "jpeg" {
-                    if let Some(png) = normalized_jpeg_png(doc, dict, &data) {
-                        format = "png";
-                        data = png;
-                    }
-                }
-                out.push(ImageInfo {
-                    page: pno,
-                    index,
-                    width,
-                    height,
-                    color_space: image_color_space(doc, res, dict),
-                    bits_per_component: image_bpc(doc, dict),
-                    format,
-                    data,
-                });
+                    Some(ImageInfo {
+                        page: pno,
+                        index,
+                        width,
+                        height,
+                        color_space: image_color_space(doc, &res, dict),
+                        bits_per_component: image_bpc(doc, dict),
+                        format,
+                        data,
+                    })
+                }).flatten();
+                let Some(row) = row else { continue };
+                out.push(row);
                 index += 1;
                 from_this_dict.push(id);
             }
@@ -2442,13 +2474,17 @@ fn detect_tables(spans: Vec<Span>, rules: &crate::vector::PageRules) -> Vec<Vec<
 /// page can see another. The rows are re-sorted by page number before they are flattened —
 /// completion order decides nothing — which makes the output byte-identical to the sequential
 /// loop, including each page's internal table order.
-pub fn extract_tables(doc: &Document, raw: &[u8]) -> Vec<TableInfo> {
+pub fn extract_tables(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    raw: &[u8],
+) -> Vec<TableInfo> {
     let pages = doc.get_pages();
     let mut per_page: Vec<(u32, Vec<Vec<Vec<String>>>)> = pages
         .par_iter()
         .map(|(&pno, &page_id)| {
-            let rules = crate::vector::page_rules(doc, page_id);
-            (pno, detect_tables(text::extract_spans(doc, page_id, raw), &rules))
+            let rules = crate::vector::page_rules(doc, access, page_id);
+            (pno, detect_tables(text::extract_spans(doc, access, page_id, raw), &rules))
         })
         .collect();
     per_page.sort_by_key(|(pno, _)| *pno);
@@ -2501,25 +2537,28 @@ fn font_embedded(doc: &Document, dict: &Dictionary) -> bool {
 /// widget uses to draw its own tick is a property of the form field, not of the page's
 /// text, and adding it would put this pillar *ahead* of the parity target rather than at
 /// it. [`appearance_resource_dicts`] exists and is one call away if that verdict changes.
-pub fn extract_fonts(doc: &Document) -> Vec<FontInfo> {
+pub fn extract_fonts(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+) -> Vec<FontInfo> {
     let mut out = Vec::new();
     for (&pno, &page_id) in &doc.get_pages() {
         // De-duplicated per page by (resource name, font object id): one font shared by
         // several forms is one row, while the same name bound to different objects in the
         // page and in a form is two. `BTreeMap` keeps rows in resource-name order, which
         // is the order the non-recursive accessor produced them in.
-        let mut fonts: BTreeMap<(Vec<u8>, Option<ObjectId>), &Dictionary> = BTreeMap::new();
-        for res in page_resource_dicts(doc, page_id) {
+        let mut fonts: BTreeMap<(Vec<u8>, Option<ObjectId>), Dictionary> = BTreeMap::new();
+        for res in page_resource_dicts(access, page_id) {
             // A form's fonts live in its OWN /Resources (PDF 32000-1 §8.10.2) — the same
             // rule text.rs:1213 follows when it decodes a form's content.
-            let Some(fdict) = sub_dict(doc, res, b"Font") else {
+            let Some(fdict) = sub_dict(doc, &res, b"Font") else {
                 continue;
             };
             for (name, v) in fdict.iter() {
                 let Some(dict) = deref(doc, v).and_then(|o| o.as_dict().ok()) else {
                     continue;
                 };
-                fonts.entry((name.clone(), v.as_reference().ok())).or_insert(dict);
+                fonts.entry((name.clone(), v.as_reference().ok())).or_insert_with(|| dict.clone());
             }
         }
         for ((name, _), dict) in fonts {
@@ -2545,7 +2584,7 @@ pub fn extract_fonts(doc: &Document) -> Vec<FontInfo> {
                 subtype,
                 base_font,
                 encoding,
-                embedded: font_embedded(doc, dict),
+                embedded: font_embedded(doc, &dict),
                 has_tounicode: dict.has(b"ToUnicode"),
             });
         }
@@ -2556,6 +2595,7 @@ pub fn extract_fonts(doc: &Document) -> Vec<FontInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::test_adapter;
 
     #[test]
     fn uniform_header_tiers_refine_to_the_leaf_columns_and_stop_there() {
@@ -2596,8 +2636,8 @@ mod tests {
         let doc = Document::load(&path).unwrap_or_else(|e| panic!("{name} must load: {e}"));
         let raw = std::fs::read(&path).expect("fixture readable");
         let page = *doc.get_pages().get(&1).expect("page 1");
-        let spans = crate::text::extract_spans(&doc, page, &raw);
-        detect_tables_pos(&spans, &crate::vector::page_rules(&doc, page))
+        let spans = crate::text::extract_spans(&doc, &test_adapter(&doc), page, &raw);
+        detect_tables_pos(&spans, &crate::vector::page_rules(&doc, &test_adapter(&doc), page))
     }
 
     #[test]
@@ -2611,7 +2651,7 @@ mod tests {
         let doc = Document::load(path).expect("ruled_blank_cells.pdf must load");
         let raw = std::fs::read(path).expect("fixture readable");
         let page = *doc.get_pages().get(&1).expect("page 1");
-        let rules = crate::vector::page_rules(&doc, page);
+        let rules = crate::vector::page_rules(&doc, &test_adapter(&doc), page);
         let frames = crate::lattice::frames(&rules);
         assert_eq!(frames.len(), 1, "one ruled frame, got {}", frames.len());
         assert_eq!(frames[0].xs.len(), 5, "4 column bands: {:?}", frames[0].xs);
@@ -2620,7 +2660,7 @@ mod tests {
         // The whole page, through the production entry point: ONE table, 6x4 — the blank third
         // column is a column and each band title is its own row, neither of which text
         // clustering can see.
-        let spans = crate::text::extract_spans(&doc, page, &raw);
+        let spans = crate::text::extract_spans(&doc, &test_adapter(&doc), page, &raw);
         let tables = detect_tables_pos(&spans, &rules);
         assert_eq!(tables.len(), 1, "one table, got {shape:?}", shape = tables.iter().map(|t| (t.grid.len(), t.grid[0].len())).collect::<Vec<_>>());
         assert_eq!((tables[0].grid.len(), tables[0].grid[0].len()), (6, 4));
@@ -2671,10 +2711,10 @@ mod tests {
         let doc = Document::load(path).expect("map_label_grid.pdf must load");
         let raw = std::fs::read(path).expect("fixture readable");
         let page = *doc.get_pages().get(&2).expect("page 2");
-        let rules = crate::vector::page_rules(&doc, page);
+        let rules = crate::vector::page_rules(&doc, &test_adapter(&doc), page);
         let frames = crate::lattice::frames(&rules);
         assert!(!frames.is_empty(), "the ruling does close cells — that is the point");
-        let spans = crate::text::extract_spans(&doc, page, &raw);
+        let spans = crate::text::extract_spans(&doc, &test_adapter(&doc), page, &raw);
         let c = Candidate { frame: Some(&frames[0]), long_h: 0, v_rules: 0, aligned: None };
         assert_eq!(classify(TABLE_TYPES, &c).map(|t| t.name), Some("full-grid"), "it classifies");
         assert!(l3_ruled(&c, &spans).is_none(), "…and the handler refuses it");
@@ -2706,8 +2746,8 @@ mod tests {
         let doc = Document::load(path).expect("ruled_blank_cells.pdf must load");
         let raw = std::fs::read(path).expect("fixture readable");
         let page = *doc.get_pages().get(&1).expect("page 1");
-        let spans = crate::text::extract_spans(&doc, page, &raw);
-        let rules = crate::vector::page_rules(&doc, page);
+        let spans = crate::text::extract_spans(&doc, &test_adapter(&doc), page, &raw);
+        let rules = crate::vector::page_rules(&doc, &test_adapter(&doc), page);
         let frames = crate::lattice::frames(&rules);
         assert_eq!(frames.len(), 1, "L1 found one frame");
 
@@ -2731,7 +2771,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/booktabs_wrapped.pdf");
         let doc = Document::load(path).expect("booktabs_wrapped.pdf must load");
         let page = *doc.get_pages().get(&1).expect("page 1");
-        let rules = crate::vector::page_rules(&doc, page);
+        let rules = crate::vector::page_rules(&doc, &test_adapter(&doc), page);
         assert!(crate::lattice::frames(&rules).is_empty(), "horizontal rules alone close no cell");
         let tables = detect_fixture("booktabs_wrapped.pdf");
         assert_eq!(tables.len(), 1, "one table, got {}", tables.len());
@@ -2993,7 +3033,7 @@ mod tests {
         let doc = Document::load(path).expect("booktabs_wrapped.pdf must load");
         let raw = std::fs::read(path).expect("fixture readable");
         let page = *doc.get_pages().get(&1).expect("page 1");
-        let spans = crate::text::extract_spans(&doc, page, &raw);
+        let spans = crate::text::extract_spans(&doc, &test_adapter(&doc), page, &raw);
         assert_eq!(central_gutter(&spans), None, "a table's own gutter is not a page split");
     }
 
@@ -3010,8 +3050,8 @@ mod tests {
         let doc = Document::load(path).expect("glyph_table.pdf fixture must load");
         let raw = std::fs::read(path).expect("fixture readable");
         let page = *doc.get_pages().get(&1).expect("page 1");
-        let spans = crate::text::extract_spans(&doc, page, &raw);
-        let tables = detect_tables_pos(&spans, &crate::vector::page_rules(&doc, page));
+        let spans = crate::text::extract_spans(&doc, &test_adapter(&doc), page, &raw);
+        let tables = detect_tables_pos(&spans, &crate::vector::page_rules(&doc, &test_adapter(&doc), page));
         assert_eq!(tables.len(), 1, "one table, got {}", tables.len());
         let want = [
             ["Region", "Samples", "Depth"],
@@ -3050,7 +3090,7 @@ mod tests {
             let Ok(doc) = Document::load_mem(&raw) else { continue }; // encrypted / damaged
             let mut want: Vec<(u32, Vec<Vec<String>>)> = Vec::new();
             for (&pno, &page_id) in &doc.get_pages() {
-                for grid in detect_tables(text::extract_spans(&doc, page_id, &raw), &crate::vector::page_rules(&doc, page_id)) {
+                for grid in detect_tables(text::extract_spans(&doc, &test_adapter(&doc), page_id, &raw), &crate::vector::page_rules(&doc, &test_adapter(&doc), page_id)) {
                     want.push((pno, grid));
                 }
             }
@@ -3058,7 +3098,7 @@ mod tests {
                 with_tables += 1;
             }
             for run in 0..5 {
-                let got: Vec<(u32, Vec<Vec<String>>)> = extract_tables(&doc, &raw).into_iter().map(|t| (t.page, t.cells)).collect();
+                let got: Vec<(u32, Vec<Vec<String>>)> = extract_tables(&doc, &test_adapter(&doc), &raw).into_iter().map(|t| (t.page, t.cells)).collect();
                 assert_eq!(got, want, "run {run} of {} disagrees with the sequential scan", path.display());
             }
         }
@@ -3078,8 +3118,8 @@ mod tests {
         let mut with_images = 0usize;
         for p in &paths {
             let Ok(doc) = Document::load(p) else { continue }; // encrypted / deliberately damaged
-            let short = extract_images_inner(&doc, true);
-            let full = extract_images_inner(&doc, false);
+            let short = extract_images_inner(&doc, &test_adapter(&doc), true);
+            let full = extract_images_inner(&doc, &test_adapter(&doc), false);
             assert_eq!(image_rows(&short), image_rows(&full), "short-circuit changed the rows of {}", p.display());
             if !short.is_empty() {
                 with_images += 1;
@@ -3094,7 +3134,7 @@ mod tests {
         // /Resources. lopdf's get_page_images() stops at the page, so this returned
         // nothing — 13 of 54 corpus documents reported no images at all.
         let doc = form_image_doc();
-        let rows = extract_images(&doc);
+        let rows = extract_images(&doc, &test_adapter(&doc));
         let page1: Vec<&ImageInfo> = rows.iter().filter(|i| i.page == 1).collect();
         assert_eq!(page1.len(), 1, "exactly one form-nested image on page 1");
         assert_eq!((page1[0].width, page1[0].height), (240, 160));
@@ -3108,7 +3148,7 @@ mod tests {
         // The ordering contract: recursing must not renumber images that were already
         // reported. Page 2 draws one raster directly and a second inside a form.
         let doc = form_image_doc();
-        let rows = extract_images(&doc);
+        let rows = extract_images(&doc, &test_adapter(&doc));
         let page2: Vec<&ImageInfo> = rows.iter().filter(|i| i.page == 2).collect();
         assert_eq!(page2.len(), 2);
         assert_eq!((page2[0].index, page2[0].width, page2[0].height), (0, 120, 90), "direct image keeps index 0");
@@ -3187,11 +3227,11 @@ mod tests {
         // Without the visited-ObjectId set this recurses until the depth cap (or forever,
         // for a mutual cycle). Each form's /Resources must be visited exactly once.
         let (doc, page_id) = cyclic_form_doc();
-        let dicts = page_resource_dicts(&doc, page_id);
+        let dicts = page_resource_dicts(&test_adapter(&doc), page_id);
         assert_eq!(dicts.len(), 3, "page + the two form resource dicts, each once");
 
         // …and the image inside the cyclic form is still reported, exactly once.
-        let rows = extract_images(&doc);
+        let rows = extract_images(&doc, &test_adapter(&doc));
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].page, rows[0].index, rows[0].width, rows[0].height), (1, 0, 7, 5));
     }
@@ -3204,7 +3244,7 @@ mod tests {
         // A page's images are the ones its content stream paints.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/undrawn_image.pdf");
         let doc = Document::load(path).expect("undrawn_image.pdf fixture must load");
-        let rows = extract_images(&doc);
+        let rows = extract_images(&doc, &test_adapter(&doc));
         let dims: Vec<(u32, usize, i64, i64)> = rows.iter().map(|i| (i.page, i.index, i.width, i.height)).collect();
         // page 1 paints /ImDrawn (40x30) only; page 2 paints only the form, whose content
         // paints /ImInForm (42x32). /ImNever (41x31) and /ImFormNever (43x33) are listed
@@ -3214,7 +3254,7 @@ mod tests {
         // The reachability walk still sees all four — the filter is the `Do` walk, not a
         // narrower resource tree (which extract_fonts shares).
         let page1 = *doc.get_pages().get(&1).expect("page 1");
-        let reachable: usize = page_resource_dicts(&doc, page1)
+        let reachable: usize = page_resource_dicts(&test_adapter(&doc), page1)
             .iter()
             .filter_map(|r| sub_dict(&doc, r, b"XObject"))
             .map(|x| x.iter().count())
@@ -3229,14 +3269,14 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/annot_appearance.pdf");
         let doc = Document::load(path).expect("annot_appearance.pdf fixture must load");
         let dims: Vec<(u32, usize, i64, i64)> =
-            extract_images(&doc).iter().map(|i| (i.page, i.index, i.width, i.height)).collect();
+            extract_images(&doc, &test_adapter(&doc)).iter().map(|i| (i.page, i.index, i.width, i.height)).collect();
         assert_eq!(
             dims,
             vec![(1, 0, 40, 30), (1, 1, 10, 10), (1, 2, 12, 12), (1, 3, 15, 15), (1, 4, 16, 16)],
             "the page's own image keeps index 0; the appearances are appended after it"
         );
         // What must NOT be there, and why each would be a different bug:
-        let sizes: Vec<i64> = extract_images(&doc).iter().map(|i| i.width).collect();
+        let sizes: Vec<i64> = extract_images(&doc, &test_adapter(&doc)).iter().map(|i| i.width).collect();
         assert!(!sizes.contains(&11), "11x11 sits in the appearance's /Resources but is never drawn");
         assert!(!sizes.contains(&13), "13x13 is the appearance state /AS did NOT select");
         assert!(!sizes.contains(&14), "14x14 belongs to a HIDDEN (/F bit 2) annotation");
@@ -3252,12 +3292,12 @@ mod tests {
         let doc = Document::load(path).expect("annot_appearance.pdf fixture must load");
         let page1 = *doc.get_pages().get(&1).expect("page 1");
         assert_eq!(
-            page_resource_dicts(&doc, page1).len(),
+            page_resource_dicts(&test_adapter(&doc), page1).len(),
             1,
             "extract_fonts sees the page's own /Resources only — no appearance dictionary"
         );
         assert_eq!(
-            appearance_resource_dicts(&doc, page1).len(),
+            appearance_resource_dicts(&test_adapter(&doc), page1).len(),
             4,
             "stamp + /AS-selected state + both un-selected-/AS states; the hidden annot contributes none"
         );
@@ -3283,7 +3323,7 @@ mod tests {
         // an ICC profile whose /N is the only component count, a palette, or a name that
         // only means something in the resource dictionary's /ColorSpace sub-dictionary.
         let doc = colorspace_doc();
-        let rows = extract_images(&doc);
+        let rows = extract_images(&doc, &test_adapter(&doc));
         let seen: Vec<(usize, Option<&str>, Option<i64>, &str)> = rows
             .iter()
             .map(|i| (i.index, i.color_space.as_deref(), i.bits_per_component, i.format))
@@ -3304,7 +3344,7 @@ mod tests {
         // The bytes used to be the compressed samples with no container — nothing opened
         // them. Each assembled PNG must carry the authored pixels back.
         let doc = colorspace_doc();
-        let rows = extract_images(&doc);
+        let rows = extract_images(&doc, &test_adapter(&doc));
 
         // 4x2 @ 4bpc through a 4-entry palette: row 0 is red/green/blue/white, row 1 the
         // reverse — sub-byte unpacking AND the palette lookup, in one image.
@@ -3337,7 +3377,7 @@ mod tests {
         // — lopdf errors on `decompressed_content()` there, which must not lose the row.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/undrawn_image.pdf");
         let doc = Document::load(path).expect("undrawn_image.pdf fixture must load");
-        for r in extract_images(&doc) {
+        for r in extract_images(&doc, &test_adapter(&doc)) {
             assert_eq!(r.format, "png", "unfiltered DeviceRGB samples must assemble");
             assert_eq!(r.color_space.as_deref(), Some("DeviceRGB"));
             assert_eq!(r.bits_per_component, Some(8));
@@ -3354,7 +3394,7 @@ mod tests {
         // white band came out black. K is 0 in all three bands, so RGB is just 255 - ink.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/cmyk_jpeg.pdf");
         let doc = Document::load(path).expect("cmyk_jpeg.pdf fixture must load");
-        let rows = extract_images(&doc);
+        let rows = extract_images(&doc, &test_adapter(&doc));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].color_space.as_deref(), Some("DeviceCMYK"));
         assert_eq!(rows[0].format, "png", "a CMYK JPEG is normalized, not passed through");
@@ -3395,7 +3435,7 @@ mod tests {
         let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
         doc.trailer.set("Root", catalog_id);
 
-        let rows = extract_images(&doc);
+        let rows = extract_images(&doc, &test_adapter(&doc));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].format, "raw");
         assert_eq!(rows[0].color_space.as_deref(), Some("DeviceRGB"));
@@ -3411,7 +3451,7 @@ mod tests {
         // is invoked under two names, so the row must appear exactly once.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/form_font.pdf");
         let doc = Document::load(path).expect("form_font.pdf fixture must load");
-        let fonts = extract_fonts(&doc);
+        let fonts = extract_fonts(&doc, &test_adapter(&doc));
         assert_eq!(fonts.len(), 1, "expected one de-duplicated form-nested font, got {fonts:?}",
                    fonts = fonts.iter().map(|f| (f.page, f.name.clone())).collect::<Vec<_>>());
         let f = &fonts[0];
@@ -3431,7 +3471,7 @@ mod tests {
         // what the non-recursive accessor produced, in the same name order.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/mathfonts.pdf");
         let doc = Document::load(path).expect("mathfonts.pdf fixture must load");
-        let names: Vec<String> = extract_fonts(&doc).into_iter().map(|f| f.name).collect();
+        let names: Vec<String> = extract_fonts(&doc, &test_adapter(&doc)).into_iter().map(|f| f.name).collect();
         assert_eq!(names, vec!["F1", "F2", "F3", "F4"]);
     }
 
@@ -3480,7 +3520,7 @@ mod tests {
         let doc = Document::load(path).expect("tagged_table.pdf fixture must load");
         let raw = std::fs::read(path).expect("fixture readable");
         let page = *doc.get_pages().get(&1).expect("page 1");
-        let spans = crate::text::extract_spans(&doc, page, &raw);
+        let spans = crate::text::extract_spans(&doc, &test_adapter(&doc), page, &raw);
         (doc, spans, page)
     }
 
@@ -3506,7 +3546,7 @@ mod tests {
         // table is declared as 1x9 + 1x8 + 4x13 for a single 2x12 grid).
         let (doc, spans, page) = tagged();
         let declared = crate::structtree::declared_tables(&doc);
-        let annots = crate::walker::annot_rects(&doc, page);
+        let annots = crate::walker::annot_rects(&test_adapter(&doc), page);
         let out = declared_pos_tables(&declared[&page], &spans, &annots);
         assert_eq!(out.refused, vec![Refusal::TooFewRows, Refusal::TooFewCols]);
         assert_eq!(out.tables.len(), 1);
@@ -3531,7 +3571,7 @@ mod tests {
                 cell.header = false;
             }
         }
-        let annots = crate::walker::annot_rects(&doc, page);
+        let annots = crate::walker::annot_rects(&test_adapter(&doc), page);
         let out = declared_pos_tables(&declared[&page], &spans, &annots);
         assert_eq!(out.tables.len(), 1);
         assert!(out.tables[0].header.is_empty());

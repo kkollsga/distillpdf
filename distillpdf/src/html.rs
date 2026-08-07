@@ -1099,8 +1099,15 @@ fn build_doc_profile(page_spans: &[(u32, ObjectId, Vec<Span>)], body: f32, title
 /// `include_toc`: when true, an auto-generated `<nav>` table of contents is prepended
 /// to `<body>`. When false it is omitted — heading/section `id=` anchors are still
 /// assigned (so `#sec-…` links and `section()` keep working), only the visible TOC drops.
-pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, include_toc: bool) -> String {
-    let (body, img_uris, outline) = render_doc(doc, raw, mode, inline_images);
+pub fn to_html(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    raw: &[u8],
+    mode: Mode,
+    inline_images: bool,
+    include_toc: bool,
+) -> String {
+    let (body, img_uris, outline) = render_doc(doc, access, raw, mode, inline_images);
     assemble(body, mode, include_toc, &outline, &img_uris, inline_images)
 }
 
@@ -1115,7 +1122,13 @@ pub(crate) type PageIR = (u32, Vec<PageElement>, Vec<String>);
 /// PDF's own outline. [`render_doc`] emits + merges this into the PRE-id, PRE-nav body; the model
 /// build path ([`crate::model::build`]) projects the SAME elements into blocks. Splitting the IR
 /// from the emit is what lets HTML and the model derive from one materialized structure.
-pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool) -> (Vec<PageIR>, Vec<links::OutlineEntry>) {
+pub(crate) fn render_doc_elements(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    raw: &[u8],
+    mode: Mode,
+    inline_images: bool,
+) -> (Vec<PageIR>, Vec<links::OutlineEntry>) {
     // Optional coarse phase profiler: set DPDF_PROFILE=1 to print per-phase WALL time to
     // stderr. `prof_phase(label, ||…)` times a closure; zero cost when unset.
     let prof = std::env::var_os("DPDF_PROFILE").is_some();
@@ -1134,7 +1147,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
     let t = std::time::Instant::now();
     let mut page_spans: Vec<(u32, ObjectId, Vec<Span>)> = pages
         .par_iter()
-        .map(|(&pno, &pid)| (pno, pid, text::extract_spans(doc, pid, raw)))
+        .map(|(&pno, &pid)| (pno, pid, text::extract_spans(doc, access, pid, raw)))
         .collect();
     page_spans.sort_by_key(|(pno, _, _)| *pno);
     phase("01_spans", t);
@@ -1266,12 +1279,12 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         // goes through these; `v.x_left`/`im.x_left` stay page-space for the SVG emitters.
         let dvbox = |v: &vector::PlacedSvg| turn.rect(v.x_left, v.x_right, v.y_bottom, v.y_top);
         let dibox = |im: &img::Placed| turn.rect(im.x_left, im.x_right, im.y_bottom, im.y_top);
-        let mut images = img::positioned_images(doc, *_pid, inline_images);
+        let mut images = img::positioned_images(doc, access, *_pid, inline_images);
         // One vector walk, two answers: the figures, and the page's RULING — L1's second
         // evidence source for tables (`extract::detect_tables_pos`). The ruling arrives in
         // page space like every other geometry the walk produces, so it takes the same turn
         // the spans did, or a rotated page's lattice lands nowhere.
-        let (raw_vectors, weak_vectors, page_rules) = vector::positioned_vectors_ruled(doc, *_pid);
+        let (raw_vectors, weak_vectors, page_rules) = vector::positioned_vectors_ruled(doc, access, *_pid);
         let page_rules = turn_rules(turn, page_rules);
         let mut tables = extract::detect_tables_pos(dspans, &page_rules);
         // Vector figures that carry a "Figure N" caption — their *internal* text (a diagram's
@@ -1386,7 +1399,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         // already answered; running them over a declared table would let a heuristic overrule
         // the file's own statement.
         if let Some(decl) = declared_tables.get(_pid) {
-            let annots: Vec<(ObjectId, Rect)> = crate::walker::annot_rects(doc, *_pid)
+            let annots: Vec<(ObjectId, Rect)> = crate::walker::annot_rects(access, *_pid)
                 .into_iter()
                 .map(|(id, r)| {
                     let (x0, x1, y0, y1) = turn.rect(r.x0, r.x1, r.y0, r.y1);
@@ -2371,8 +2384,14 @@ pub(crate) fn emit_and_merge(pages_els: &[PageIR], mode: Mode) -> (String, Vec<S
 /// merge, producing the PRE-id, PRE-nav `body`, the global image-URI list, and the PDF's own
 /// outline. A thin composition of [`render_doc_elements`] (the IR) + [`emit_and_merge`] (the
 /// HTML), kept so [`to_html`] and the legacy callers have one entry point.
-pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool) -> (String, Vec<String>, Vec<links::OutlineEntry>) {
-    let (pages_els, outline) = render_doc_elements(doc, raw, mode, inline_images);
+pub(crate) fn render_doc(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    raw: &[u8],
+    mode: Mode,
+    inline_images: bool,
+) -> (String, Vec<String>, Vec<links::OutlineEntry>) {
+    let (pages_els, outline) = render_doc_elements(doc, access, raw, mode, inline_images);
     let (body, img_uris) = emit_and_merge(&pages_els, mode);
     (body, img_uris, outline)
 }
@@ -2485,6 +2504,7 @@ pub(crate) fn clone_span(s: &Span) -> Span {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::test_adapter;
 
     fn line(text: &str, y: f32) -> Line {
         Line {
@@ -2583,7 +2603,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/rotated_body.pdf");
         let raw = std::fs::read(path).expect("rotated_body.pdf fixture must exist");
         let doc = Document::load(path).expect("rotated_body.pdf fixture must load");
-        let html = to_html(&doc, &raw, Mode::Page, false, false);
+        let html = to_html(&doc, &test_adapter(&doc), &raw, Mode::Page, false, false);
         let pages: Vec<&str> = html.split("<section data-page=").skip(1).collect();
         assert_eq!(pages.len(), 4, "fixture has one page per rotation");
         let want = [

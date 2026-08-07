@@ -561,6 +561,9 @@ pub(crate) fn codec_payload(stream: &lopdf::Stream) -> Cow<'_, [u8]> {
     s.dict.set("Filter", Object::Array(lead));
     s.dict.remove(b"DecodeParms"); // codec parms don't apply to the generic layers
     s.dict.remove(b"DP");
+    if crate::pdfobj::has_legacy_unsupported_filter(&s.dict) {
+        return Cow::Borrowed(&stream.content);
+    }
     match s.decompressed_content() {
         Ok(b) => Cow::Owned(b),
         Err(_) => Cow::Borrowed(&stream.content),
@@ -765,7 +768,7 @@ mod tests {
         // Pinned here so no later phase claims a decode this stack does not perform.
         let hex = b"ffd8ffe068656c6c6f>".to_vec();
         let s = stream(&["ASCIIHexDecode", "DCTDecode"], hex.clone());
-        assert!(s.decompressed_content().is_err(), "the premise: lopdf cannot apply AHx");
+        assert!(crate::pdfobj::has_legacy_unsupported_filter(&s.dict));
         assert_eq!(codec_payload(&s).as_ref(), hex);
     }
 

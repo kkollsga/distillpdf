@@ -18,6 +18,7 @@ pub mod ocr;
 // result types are surfaced by the root re-exports below rather than by opening the whole
 // module (which would drag their `pub` helper fns into the public API).
 mod afm;
+mod access;
 mod captions;
 mod elem_passes;
 mod encoding;

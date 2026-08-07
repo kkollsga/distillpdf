@@ -37,10 +37,11 @@
 //!   `/Resources` under [`ScopePolicy::OwnOnly`]) yields [`Descend::Skip`]: the walk
 //!   continues with the operators around it. Nothing here panics.
 
+use crate::access::{read_resolved, DocumentAccess, StreamHandle};
 use crate::geom::Mat;
-use crate::pdfobj::{content_bytes, deref, num, num_deref, sub_dict};
+use crate::pdfobj::{content_bytes, num};
 use lopdf::content::Operation;
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use lopdf::{Dictionary, Object, ObjectId};
 use std::collections::HashMap;
 
 /// A resource scope: XObject name → object id, as an unqualified `/Im0` resolves at this
@@ -129,17 +130,21 @@ pub(crate) enum Descend {
 }
 
 /// All XObject entries (images AND forms) of a resources dict: name → object id.
-pub(crate) fn xobjects_of(doc: &Document, resources: &Dictionary) -> XMap {
+pub(crate) fn xobjects_of(access: &dyn DocumentAccess, resources: &Dictionary) -> XMap {
     let mut map = XMap::new();
-    overlay_xobjects(doc, resources, &mut map);
+    overlay_xobjects(access, resources, &mut map);
     map
 }
 
 /// Overlay one resource dictionary's `/XObject` entries onto a name → id map. Later
 /// overlays win, so a nearer scope (a form's own resources, the page's own dictionary)
 /// shadows an outer one — the precedence a renderer applies.
-pub(crate) fn overlay_xobjects(doc: &Document, resources: &Dictionary, map: &mut XMap) {
-    let Some(xd) = sub_dict(doc, resources, b"XObject") else {
+pub(crate) fn overlay_xobjects(access: &dyn DocumentAccess, resources: &Dictionary, map: &mut XMap) {
+    let Some(xd) = resources
+        .get(b"XObject")
+        .ok()
+        .and_then(|value| read_resolved(access, value, |o| o.as_dict().ok().cloned()).ok().flatten())
+    else {
         return;
     };
     for (name, val) in xd.iter() {
@@ -161,27 +166,15 @@ pub(crate) fn overlay_xobjects(doc: &Document, resources: &Dictionary, map: &mut
 /// the whole chain can only ever ADD names — the nearest dictionary is applied last and
 /// still wins every name it defines. `extract::drawn_images` has read the chain this way
 /// since it was written; this is the three interpreters catching up.
-pub(crate) fn page_resource_chain(doc: &Document, page_id: ObjectId) -> Vec<Dictionary> {
-    let Ok((own, inherited)) = doc.get_page_resources(page_id) else {
-        return Vec::new();
-    };
-    // `inherited` runs page -> parent -> ...; reverse it so the outermost is applied first.
-    let mut out: Vec<Dictionary> = inherited
-        .iter()
-        .rev()
-        .filter_map(|id| doc.get_dictionary(*id).ok().cloned())
-        .collect();
-    if let Some(d) = own {
-        out.push(d.clone());
-    }
-    out
+pub(crate) fn page_resource_chain(access: &dyn DocumentAccess, page_id: ObjectId) -> Vec<Dictionary> {
+    access.page_resource_chain(page_id).unwrap_or_default()
 }
 
 /// The XObjects a page can `Do`, resolved over its whole resource chain.
-pub(crate) fn page_xobjects(doc: &Document, page_id: ObjectId) -> XMap {
+pub(crate) fn page_xobjects(access: &dyn DocumentAccess, page_id: ObjectId) -> XMap {
     let mut map = XMap::new();
-    for res in page_resource_chain(doc, page_id) {
-        overlay_xobjects(doc, &res, &mut map);
+    for res in page_resource_chain(access, page_id) {
+        overlay_xobjects(access, &res, &mut map);
     }
     map
 }
@@ -195,9 +188,9 @@ pub(crate) fn page_xobjects(doc: &Document, page_id: ObjectId) -> XMap {
 /// The sub-dictionaries are dereferenced on the way in (they are usually written as
 /// indirect objects) so the merged result is self-contained: a consumer can read it with a
 /// plain `get`, and it stays valid after the scope that produced it is gone.
-pub(crate) fn overlay_resources(doc: &Document, base: &mut Dictionary, inner: &Dictionary) {
+pub(crate) fn overlay_resources(access: &dyn DocumentAccess, base: &mut Dictionary, inner: &Dictionary) {
     for (key, val) in inner.iter() {
-        let Some(kind) = deref(doc, val).and_then(|o| o.as_dict().ok()) else {
+        let Some(kind) = read_resolved(access, val, |o| o.as_dict().ok().cloned()).ok().flatten() else {
             base.set(key.clone(), val.clone()); // /ProcSet and friends: not a name map
             continue;
         };
@@ -219,10 +212,10 @@ pub(crate) fn overlay_resources(doc: &Document, base: &mut Dictionary, inner: &D
 ///
 /// This is what a `/ColorSpace /CS0` on one of the page's images has to be looked up in
 /// (§8.6.3) — the name alone describes nothing.
-pub(crate) fn page_resources(doc: &Document, page_id: ObjectId) -> Dictionary {
+pub(crate) fn page_resources(access: &dyn DocumentAccess, page_id: ObjectId) -> Dictionary {
     let mut out = Dictionary::new();
-    for res in page_resource_chain(doc, page_id) {
-        overlay_resources(doc, &mut out, &res);
+    for res in page_resource_chain(access, page_id) {
+        overlay_resources(access, &mut out, &res);
     }
     out
 }
@@ -230,15 +223,14 @@ pub(crate) fn page_resources(doc: &Document, page_id: ObjectId) -> Dictionary {
 /// Resolve a `Do` operand to the XObject stream it names, in the scope in force.
 /// `None` when the operand is not a name, the name is not in scope (a dangling reference
 /// — nothing to draw), or the object is not a stream.
-pub(crate) fn xobject_at<'a>(
-    doc: &'a Document,
+pub(crate) fn xobject_at(
+    access: &dyn DocumentAccess,
     scope: &XMap,
     operands: &[Object],
-) -> Option<(ObjectId, &'a lopdf::Stream)> {
+) -> Option<(ObjectId, StreamHandle)> {
     let name = operands.first()?.as_name().ok()?;
     let id = *scope.get(name)?;
-    let stream = doc.get_object(id).ok()?.as_stream().ok()?;
-    Some((id, stream))
+    Some((id, access.stream(id).ok()?))
 }
 
 /// A stream's `/Subtype`, or `b""` when it has none.
@@ -255,17 +247,17 @@ pub(crate) fn subtype_of(stream: &lopdf::Stream) -> &[u8] {
 /// **composited result**, and the group's own initial state starts at `ca`/`CA` = 1.0
 /// (§11.4.7.2) — so inheriting the alpha into the group instead lets the group's first
 /// `gs` overwrite it, silently discarding the caller's transparency.
-pub(crate) fn is_transparency_group(doc: &Document, stream: &lopdf::Stream) -> bool {
-    stream
-        .dict
-        .get(b"Group")
+pub(crate) fn is_transparency_group(access: &dyn DocumentAccess, stream: &lopdf::Stream) -> bool {
+    let Some(group) = stream.dict.get(b"Group").ok().and_then(|value| {
+        read_resolved(access, value, |o| o.as_dict().ok().cloned()).ok().flatten()
+    }) else {
+        return false;
+    };
+    group
+        .get(b"S")
         .ok()
-        .and_then(|o| deref(doc, o))
-        .and_then(|o| o.as_dict().ok())
-        .and_then(|d| d.get(b"S").ok())
-        .and_then(|o| deref(doc, o))
-        .and_then(|o| o.as_name().ok())
-        .is_some_and(|n| n == b"Transparency")
+        .and_then(|value| read_resolved(access, value, |o| o.as_name().ok().map(<[u8]>::to_vec)).ok().flatten())
+        .is_some_and(|name| name == b"Transparency")
 }
 
 /// A form XObject's `/BBox` as a page-space clipping rectangle under `ctm`, or `None` when
@@ -284,13 +276,23 @@ pub(crate) fn is_transparency_group(doc: &Document, stream: &lopdf::Stream) -> b
 ///
 /// Lives here, with `is_transparency_group`, because all three walks descend the same forms
 /// and must read the key the same way.
-pub(crate) fn form_bbox_clip(doc: &Document, stream: &lopdf::Stream, ctm: Mat) -> Option<crate::geom::Rect> {
-    let arr = deref(doc, stream.dict.get(b"BBox").ok()?)?;
-    let v = arr.as_array().ok()?;
-    if v.len() < 4 {
-        return None;
-    }
-    let c: Vec<f32> = v.iter().map(|o| deref(doc, o).map(num).unwrap_or(f32::NAN)).collect();
+pub(crate) fn form_bbox_clip(
+    access: &dyn DocumentAccess,
+    stream: &lopdf::Stream,
+    ctm: Mat,
+) -> Option<crate::geom::Rect> {
+    let c = read_resolved(access, stream.dict.get(b"BBox").ok()?, |arr| {
+        let v = arr.as_array().ok()?;
+        if v.len() < 4 {
+            return None;
+        }
+        Some(
+            v.iter()
+                .map(|o| read_resolved(access, o, num).unwrap_or(f32::NAN))
+                .collect::<Vec<_>>(),
+        )
+    })
+    .ok()??;
     if c.iter().any(|x| !x.is_finite()) {
         return None;
     }
@@ -305,12 +307,12 @@ pub(crate) fn form_bbox_clip(doc: &Document, stream: &lopdf::Stream, ctm: Mat) -
 }
 
 /// What a `gs` operator's `/SMask` entry says about the soft mask (§11.6.5.2).
-pub(crate) enum SoftMask<'a> {
+pub(crate) enum SoftMask {
     /// `/SMask /None` — the mask is cleared; whatever was in force stops applying.
     Cleared,
     /// A mask group we are prepared to bound: the `/G` form XObject, to be rendered under
     /// the CTM in force at the `gs` and its painted extent taken as the visible window.
-    Group(&'a lopdf::Stream),
+    Group(StreamHandle),
 }
 
 /// Read the `/SMask` entry of an `/ExtGState` dictionary (§11.6.5.2 — a *soft mask*: the
@@ -332,32 +334,61 @@ pub(crate) enum SoftMask<'a> {
 ///   on what shows. Default `/BC` is black (§11.6.5.2), i.e. transparent, which is the case
 ///   the extent does bound.
 /// - a `/TR` transfer function other than `/Identity`, which may map "no ink" to opaque.
-pub(crate) fn soft_mask_of<'a>(doc: &'a Document, gs: &Dictionary) -> Option<SoftMask<'a>> {
-    let sm = deref(doc, gs.get(b"SMask").ok()?)?;
-    if let Ok(name) = sm.as_name() {
-        return (name == b"None").then_some(SoftMask::Cleared);
-    }
-    let m = sm.as_dict().ok()?;
-    let subtype = m.get(b"S").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_name().ok().map(|n| n.to_vec()));
-    match subtype.as_deref() {
-        Some(b"Alpha") => {}
-        Some(b"Luminosity") => {
-            // A backdrop that is not black paints the group's box outside its own ink.
-            if let Some(bc) = m.get(b"BC").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_array().ok()) {
-                if bc.iter().any(|c| num_deref(doc, c).abs() > 1e-3) {
+pub(crate) fn soft_mask_of(access: &dyn DocumentAccess, gs: &Dictionary) -> Option<SoftMask> {
+    read_resolved(access, gs.get(b"SMask").ok()?, |sm| {
+        if let Ok(name) = sm.as_name() {
+            return (name == b"None").then_some(SoftMask::Cleared);
+        }
+        let m = sm.as_dict().ok()?;
+        let subtype = m.get(b"S").ok().and_then(|value| {
+            read_resolved(access, value, |o| o.as_name().ok().map(|name| name.to_vec()))
+                .ok()
+                .flatten()
+        });
+        match subtype.as_deref() {
+            Some(b"Alpha") => {}
+            Some(b"Luminosity") => {
+                let non_black = m
+                    .get(b"BC")
+                    .ok()
+                    .and_then(|value| {
+                        read_resolved(access, value, |o| {
+                            o.as_array().ok().map(|values| {
+                                values.iter().any(|component| {
+                                    read_resolved(access, component, num).unwrap_or(0.0).abs() > 1e-3
+                                })
+                            })
+                        })
+                        .ok()
+                        .flatten()
+                    })
+                    .unwrap_or(false);
+                if non_black {
                     return None;
                 }
             }
+            _ => return None,
         }
-        _ => return None, // no `/S` at all, or one we do not model
-    }
-    if let Some(tr) = m.get(b"TR").ok().and_then(|o| deref(doc, o)) {
-        if tr.as_name().ok() != Some(b"Identity") {
+        let non_identity = m
+            .get(b"TR")
+            .ok()
+            .and_then(|value| {
+                read_resolved(access, value, |o| o.as_name().ok().map(|name| name != b"Identity"))
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or(false);
+        if non_identity {
             return None;
         }
-    }
-    let g = doc.get_object(m.get(b"G").ok()?.as_reference().ok()?).ok()?.as_stream().ok()?;
-    (subtype_of(g) == b"Form").then_some(SoftMask::Group(g))
+        let id = m.get(b"G").ok()?.as_reference().ok()?;
+        let stream = access.stream(id).ok()?;
+        stream
+            .read(|value| subtype_of(value) == b"Form")
+            .is_some_and(|is_form| is_form)
+            .then_some(SoftMask::Group(stream))
+    })
+    .ok()?
 }
 
 /// The one depth convention: a descent is refused **at** [`crate::MAX_FORM_DEPTH`], so a
@@ -373,26 +404,31 @@ pub(crate) fn too_deep(depth: u32) -> bool {
 /// The child resource scope for a form, per `policy`. `None` under
 /// [`ScopePolicy::OwnOnly`] when the form has no `/Resources` of its own — there is
 /// nothing its names could resolve against, so it is not descended.
-pub(crate) fn form_scope(doc: &Document, stream: &lopdf::Stream, parent: &XMap, policy: ScopePolicy) -> Option<FormScope> {
+pub(crate) fn form_scope(
+    access: &dyn DocumentAccess,
+    stream: &lopdf::Stream,
+    parent: &XMap,
+    policy: ScopePolicy,
+) -> Option<FormScope> {
     let resources = stream
         .dict
         .get(b"Resources")
         .ok()
-        .and_then(|o| deref(doc, o))
-        .and_then(|o| o.as_dict().ok())
-        .cloned();
+        .and_then(|value| {
+            read_resolved(access, value, |o| o.as_dict().ok().cloned()).ok().flatten()
+        });
     match policy {
         ScopePolicy::OverlayParent => {
             let mut xobjects = parent.clone();
             if let Some(fr) = &resources {
-                overlay_xobjects(doc, fr, &mut xobjects);
+                overlay_xobjects(access, fr, &mut xobjects);
             }
             Some(FormScope { xobjects, resources })
         }
         ScopePolicy::OwnOnly => {
             let fr = resources?;
             Some(FormScope {
-                xobjects: xobjects_of(doc, &fr),
+                xobjects: xobjects_of(access, &fr),
                 resources: Some(fr),
             })
         }
@@ -414,21 +450,24 @@ pub(crate) fn form_ops(stream: &lopdf::Stream) -> Option<Vec<Operation>> {
 /// dictionary value, not a content-stream operand, so any part of it may legally be an
 /// indirect reference. A direct-only read turned `[1 0 0 1 0 5 0 R]` into a matrix with a
 /// zero component — which collapses the whole form onto a point or a line, silently.
-pub(crate) fn form_matrix(doc: &Document, stream: &lopdf::Stream) -> Mat {
+pub(crate) fn form_matrix(access: &dyn DocumentAccess, stream: &lopdf::Stream) -> Mat {
     stream
         .dict
         .get(b"Matrix")
         .ok()
-        .and_then(|o| deref(doc, o))
-        .and_then(|o| o.as_array().ok())
-        .filter(|a| a.len() >= 6)
-        .map(|a| Mat {
-            a: num_deref(doc, &a[0]),
-            b: num_deref(doc, &a[1]),
-            c: num_deref(doc, &a[2]),
-            d: num_deref(doc, &a[3]),
-            e: num_deref(doc, &a[4]),
-            f: num_deref(doc, &a[5]),
+        .and_then(|value| {
+            read_resolved(access, value, |o| {
+                o.as_array().ok().filter(|a| a.len() >= 6).map(|a| Mat {
+                    a: read_resolved(access, &a[0], num).unwrap_or(0.0),
+                    b: read_resolved(access, &a[1], num).unwrap_or(0.0),
+                    c: read_resolved(access, &a[2], num).unwrap_or(0.0),
+                    d: read_resolved(access, &a[3], num).unwrap_or(0.0),
+                    e: read_resolved(access, &a[4], num).unwrap_or(0.0),
+                    f: read_resolved(access, &a[5], num).unwrap_or(0.0),
+                })
+            })
+            .ok()
+            .flatten()
         })
         .unwrap_or(Mat::ID)
 }
@@ -446,13 +485,24 @@ fn annotation_hidden(annot: &Dictionary) -> bool {
 
 /// Push the appearance stream `val` resolves to, if it is one, with the annotation it
 /// belongs to (whose `/Rect` places it — see [`appearance_ctm`]).
-fn push_appearance<'a>(doc: &'a Document, annot: &'a Dictionary, val: &Object, out: &mut Vec<(&'a Dictionary, ObjectId, &'a lopdf::Stream)>) {
+fn push_appearance(
+    access: &dyn DocumentAccess,
+    annot: &Dictionary,
+    val: &Object,
+    out: &mut Vec<Appearance>,
+) {
     let Ok(id) = val.as_reference() else {
         return; // a stream is always an indirect object (§7.3.8); nothing else is one
     };
-    if let Ok(stream) = doc.get_object(id).and_then(|o| o.as_stream()) {
-        out.push((annot, id, stream));
+    if let Ok(stream) = access.stream(id) {
+        out.push(Appearance { annotation: annot.clone(), id, stream });
     }
+}
+
+struct Appearance {
+    annotation: Dictionary,
+    id: ObjectId,
+    stream: StreamHandle,
 }
 
 /// The **normal appearance streams** of a page's annotations: `/Annots` → `/AP` → `/N`.
@@ -485,8 +535,14 @@ fn push_appearance<'a>(doc: &'a Document, annot: &'a Dictionary, val: &Object, o
 /// **render** walks (`img`, `vector`, `text`) consume [`placed_appearances`] instead — the
 /// same enumeration under the `Current` state rule, carrying the §12.5.5 placement matrix an
 /// enumerator has no use for.
-pub(crate) fn appearance_streams(doc: &Document, page_id: ObjectId) -> Vec<(ObjectId, &lopdf::Stream)> {
-    annot_appearances(doc, page_id, StateRule::All).into_iter().map(|(_, id, s)| (id, s)).collect()
+pub(crate) fn appearance_streams(
+    access: &dyn DocumentAccess,
+    page_id: ObjectId,
+) -> Vec<(ObjectId, StreamHandle)> {
+    annot_appearances(access, page_id, StateRule::All)
+        .into_iter()
+        .map(|appearance| (appearance.id, appearance.stream))
+        .collect()
 }
 
 /// Which appearance state a walk takes when `/N` is a state dictionary and `/AS` is absent.
@@ -504,49 +560,58 @@ enum StateRule {
 
 /// The `/Annots` → `/AP` → `/N` walk both public enumerators share, with the annotation
 /// dictionary each stream came from (the renderer needs its `/Rect`).
-fn annot_appearances(doc: &Document, page_id: ObjectId, rule: StateRule) -> Vec<(&Dictionary, ObjectId, &lopdf::Stream)> {
+fn annot_appearances(
+    access: &dyn DocumentAccess,
+    page_id: ObjectId,
+    rule: StateRule,
+) -> Vec<Appearance> {
     let mut out = Vec::new();
-    let Ok(page) = doc.get_dictionary(page_id) else {
+    let Ok(page) = access.object(page_id) else {
         return out;
     };
-    let Some(annots) = page
-        .get(b"Annots")
-        .ok()
-        .and_then(|o| deref(doc, o))
-        .and_then(|o| o.as_array().ok())
-    else {
-        return out;
-    };
-    for a in annots {
-        let Some(annot) = deref(doc, a).and_then(|o| o.as_dict().ok()) else {
-            continue;
-        };
-        if annotation_hidden(annot) {
-            continue;
-        }
-        let Some(ap) = annot.get(b"AP").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) else {
-            continue;
-        };
-        let Ok(n) = ap.get(b"N") else { continue };
-        match deref(doc, n) {
-            Some(Object::Stream(_)) => push_appearance(doc, annot, n, &mut out),
-            Some(Object::Dictionary(states)) => match annot.get(b"AS").ok().and_then(|o| o.as_name().ok()) {
-                // `/AS` selects one state; naming an absent one displays nothing.
-                Some(state) => {
-                    if let Ok(v) = states.get(state) {
-                        push_appearance(doc, annot, v, &mut out);
+    let _ = page.read(|page| {
+        let Ok(page) = page.as_dict() else { return };
+        let Ok(annots_value) = page.get(b"Annots") else { return };
+        let _ = read_resolved(access, annots_value, |annots| {
+            let Ok(annots) = annots.as_array() else { return };
+            for annotation_value in annots {
+                let _ = read_resolved(access, annotation_value, |annotation| {
+                    let Ok(annotation) = annotation.as_dict() else { return };
+                    if annotation_hidden(annotation) {
+                        return;
                     }
-                }
-                None if rule == StateRule::All => {
-                    for (_, v) in states.iter() {
-                        push_appearance(doc, annot, v, &mut out);
-                    }
-                }
-                None => {}
-            },
-            _ => {}
-        }
-    }
+                    let Ok(ap_value) = annotation.get(b"AP") else { return };
+                    let _ = read_resolved(access, ap_value, |ap| {
+                        let Ok(ap) = ap.as_dict() else { return };
+                        let Ok(normal) = ap.get(b"N") else { return };
+                        let _ = read_resolved(access, normal, |resolved| match resolved {
+                            Object::Stream(_) => {
+                                push_appearance(access, annotation, normal, &mut out)
+                            }
+                            Object::Dictionary(states) => match annotation
+                                .get(b"AS")
+                                .ok()
+                                .and_then(|value| value.as_name().ok())
+                            {
+                                Some(state) => {
+                                    if let Ok(value) = states.get(state) {
+                                        push_appearance(access, annotation, value, &mut out);
+                                    }
+                                }
+                                None if rule == StateRule::All => {
+                                    for (_, value) in states.iter() {
+                                        push_appearance(access, annotation, value, &mut out);
+                                    }
+                                }
+                                None => {}
+                            },
+                            _ => {}
+                        });
+                    });
+                });
+            }
+        });
+    });
     out
 }
 
@@ -560,10 +625,18 @@ fn annot_appearances(doc: &Document, page_id: ObjectId, rule: StateRule) -> Vec<
 ///
 /// The returned matrix is the CTM the appearance's **invocation** sits under, i.e. it is
 /// composed with the form's own `/Matrix` by the same `f.matrix.mul(ctm)` every `Do` uses.
-pub(crate) fn placed_appearances(doc: &Document, page_id: ObjectId) -> Vec<(ObjectId, &lopdf::Stream, Mat)> {
-    annot_appearances(doc, page_id, StateRule::Current)
+pub(crate) fn placed_appearances(
+    access: &dyn DocumentAccess,
+    page_id: ObjectId,
+) -> Vec<(ObjectId, StreamHandle, Mat)> {
+    annot_appearances(access, page_id, StateRule::Current)
         .into_iter()
-        .filter_map(|(annot, id, s)| appearance_ctm(doc, annot, s).map(|m| (id, s, m)))
+        .filter_map(|appearance| {
+            let matrix = appearance
+                .stream
+                .read(|stream| appearance_ctm(access, &appearance.annotation, stream))??;
+            Some((appearance.id, appearance.stream, matrix))
+        })
         .collect()
 }
 
@@ -576,33 +649,47 @@ pub(crate) fn placed_appearances(doc: &Document, page_id: ObjectId) -> Vec<(Obje
 /// to nothing and the whole declaration would be rejected — which is every IRS form in the
 /// measurement corpus. Hidden annotations are excluded on the same rule as the render walks:
 /// a viewer does not draw them, so they are not on the page.
-pub(crate) fn annot_rects(doc: &Document, page_id: ObjectId) -> Vec<(ObjectId, crate::geom::Rect)> {
+pub(crate) fn annot_rects(
+    access: &dyn DocumentAccess,
+    page_id: ObjectId,
+) -> Vec<(ObjectId, crate::geom::Rect)> {
     let mut out = Vec::new();
-    let Ok(page) = doc.get_dictionary(page_id) else { return out };
-    let Some(annots) = page.get(b"Annots").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_array().ok()) else {
-        return out;
-    };
-    for a in annots {
-        let Object::Reference(id) = a else { continue };
-        let Some(annot) = deref(doc, a).and_then(|o| o.as_dict().ok()) else { continue };
-        if annotation_hidden(annot) {
-            continue;
-        }
-        if let Some(r) = rect_key(doc, annot, b"Rect") {
-            out.push((*id, r));
-        }
-    }
+    let Ok(page) = access.object(page_id) else { return out };
+    let _ = page.read(|page| {
+        let Ok(page) = page.as_dict() else { return };
+        let Ok(annots_value) = page.get(b"Annots") else { return };
+        let _ = read_resolved(access, annots_value, |annots| {
+            let Ok(annots) = annots.as_array() else { return };
+            for annotation_value in annots {
+                let Object::Reference(id) = annotation_value else { continue };
+                let _ = read_resolved(access, annotation_value, |annotation| {
+                    let Ok(annotation) = annotation.as_dict() else { return };
+                    if !annotation_hidden(annotation) {
+                        if let Some(rect) = rect_key(access, annotation, b"Rect") {
+                            out.push((*id, rect));
+                        }
+                    }
+                });
+            }
+        });
+    });
     out
 }
 
 /// A 4-number rectangle from a dictionary key, normalized. Every element is dereferenced:
 /// a `/Rect [344.9 456.1 348.9 5 0 R]` is legal and a direct-only read turns it into 0.
-fn rect_key(doc: &Document, d: &Dictionary, key: &[u8]) -> Option<crate::geom::Rect> {
-    let a = d.get(key).ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_array().ok())?;
-    if a.len() < 4 {
-        return None;
-    }
-    let v: Vec<f32> = a.iter().take(4).map(|o| num_deref(doc, o)).collect();
+fn rect_key(access: &dyn DocumentAccess, d: &Dictionary, key: &[u8]) -> Option<crate::geom::Rect> {
+    let v = read_resolved(access, d.get(key).ok()?, |array| {
+        let array = array.as_array().ok()?;
+        (array.len() >= 4).then(|| {
+            array
+                .iter()
+                .take(4)
+                .map(|value| read_resolved(access, value, num).unwrap_or(0.0))
+                .collect::<Vec<_>>()
+        })
+    })
+    .ok()??;
     Some(crate::geom::Rect::new(v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])))
 }
 
@@ -623,10 +710,14 @@ fn rect_key(doc: &Document, d: &Dictionary, key: &[u8]) -> Option<crate::geom::R
 /// `None` when either rectangle is missing or degenerate. A zero-extent `/Rect` is an
 /// annotation with nowhere to paint, and a zero-extent transformed `/BBox` has no scale that
 /// reaches one.
-fn appearance_ctm(doc: &Document, annot: &Dictionary, stream: &lopdf::Stream) -> Option<Mat> {
-    let rect = rect_key(doc, annot, b"Rect")?;
-    let bbox = rect_key(doc, &stream.dict, b"BBox")?;
-    let m = form_matrix(doc, stream);
+fn appearance_ctm(
+    access: &dyn DocumentAccess,
+    annot: &Dictionary,
+    stream: &lopdf::Stream,
+) -> Option<Mat> {
+    let rect = rect_key(access, annot, b"Rect")?;
+    let bbox = rect_key(access, &stream.dict, b"BBox")?;
+    let m = form_matrix(access, stream);
     let mut a = crate::geom::Rect::EMPTY;
     for (u, v) in [(bbox.x0, bbox.y0), (bbox.x1, bbox.y0), (bbox.x1, bbox.y1), (bbox.x0, bbox.y1)] {
         let (x, y) = m.apply(u, v);
@@ -653,7 +744,7 @@ fn appearance_ctm(doc: &Document, annot: &Dictionary, stream: &lopdf::Stream) ->
 /// The order is load-bearing: the budget is charged first, so a bomb pays for every branch
 /// it attempts even when the branch turns out to be a dead end.
 pub(crate) fn descend_form(
-    doc: &Document,
+    access: &dyn DocumentAccess,
     stream: &lopdf::Stream,
     parent: &XMap,
     policy: ScopePolicy,
@@ -670,10 +761,10 @@ pub(crate) fn descend_form(
     if !budget.spend(crate::FORM_DESCENT_COST + parent.len() + sibling_cost) {
         return Descend::Halt;
     }
-    let Some(scope) = form_scope(doc, stream, parent, policy) else {
+    let Some(scope) = form_scope(access, stream, parent, policy) else {
         return Descend::Skip;
     };
-    let matrix = form_matrix(doc, stream);
+    let matrix = form_matrix(access, stream);
     match form_ops(stream) {
         Some(ops) => Descend::Into(Box::new(FormDescent { ops, scope, matrix })),
         None => Descend::Skip,
@@ -683,7 +774,8 @@ pub(crate) fn descend_form(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lopdf::{dictionary, Stream};
+    use crate::access::test_adapter;
+    use lopdf::{dictionary, Document, Stream};
 
     /// A one-object document holding a stream with `dict` and `content`.
     fn doc_with_form(dict: Dictionary, content: &[u8]) -> (Document, ObjectId) {
@@ -719,19 +811,19 @@ mod tests {
     #[test]
     fn a_missing_or_malformed_matrix_is_the_identity() {
         let (doc, id) = doc_with_form(form_dict(Dictionary::new()), b"");
-        let m = form_matrix(&doc, stream_of(&doc, id));
+        let m = form_matrix(&test_adapter(&doc), stream_of(&doc, id));
         assert_eq!((m.a, m.b, m.c, m.d, m.e, m.f), (1.0, 0.0, 0.0, 1.0, 0.0, 0.0));
 
         let short = form_dict(dictionary! { "Matrix" => vec![2.into(), 0.into()] });
         let (doc2, id2) = doc_with_form(short, b"");
-        assert_eq!(form_matrix(&doc2, stream_of(&doc2, id2)).a, 1.0, "a too-short /Matrix is not read partially");
+        assert_eq!(form_matrix(&test_adapter(&doc2), stream_of(&doc2, id2)).a, 1.0, "a too-short /Matrix is not read partially");
     }
 
     #[test]
     fn the_matrix_is_read_in_operand_order() {
         let d = form_dict(dictionary! { "Matrix" => vec![2.into(), 3.into(), 4.into(), 5.into(), 6.into(), 7.into()] });
         let (doc, id) = doc_with_form(d, b"");
-        let m = form_matrix(&doc, stream_of(&doc, id));
+        let m = form_matrix(&test_adapter(&doc), stream_of(&doc, id));
         assert_eq!((m.a, m.b, m.c, m.d, m.e, m.f), (2.0, 3.0, 4.0, 5.0, 6.0, 7.0));
     }
 
@@ -745,7 +837,7 @@ mod tests {
             "Matrix" => vec![2.into(), 0.into(), 0.into(), 2.into(), Object::Reference(six), 7.into()]
         });
         let id = doc.add_object(Object::Stream(Stream::new(d, b"".to_vec())));
-        let m = form_matrix(&doc, stream_of(&doc, id));
+        let m = form_matrix(&test_adapter(&doc), stream_of(&doc, id));
         assert_eq!((m.a, m.d, m.f), (2.0, 2.0, 7.0));
         assert_eq!(m.e, 6.0, "an INDIRECT /Matrix element used to read as 0.0");
 
@@ -754,7 +846,7 @@ mod tests {
         let arr = doc.add_object(Object::Array(vec![3.into(), 0.into(), 0.into(), 3.into(), 0.into(), 0.into()]));
         let d = form_dict(dictionary! { "Matrix" => Object::Reference(arr) });
         let id = doc.add_object(Object::Stream(Stream::new(d, b"".to_vec())));
-        assert_eq!(form_matrix(&doc, stream_of(&doc, id)).a, 3.0);
+        assert_eq!(form_matrix(&test_adapter(&doc), stream_of(&doc, id)).a, 3.0);
     }
 
     #[test]
@@ -765,7 +857,7 @@ mod tests {
         let (doc, id) = doc_with_form(form_dict(Dictionary::new()), b"0 0 10 10 re f");
         let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
         let at_cap = descend_form(
-            &doc,
+            &test_adapter(&doc),
             stream_of(&doc, id),
             &XMap::new(),
             ScopePolicy::OverlayParent,
@@ -775,7 +867,7 @@ mod tests {
         );
         assert!(matches!(at_cap, Descend::Skip));
         let under = descend_form(
-            &doc,
+            &test_adapter(&doc),
             stream_of(&doc, id),
             &XMap::new(),
             ScopePolicy::OverlayParent,
@@ -805,7 +897,7 @@ mod tests {
         let (doc, page) = annot_render();
 
         // 1. the raster. Form (2,2)+10x10 -> page (208, 406) 40x30.
-        let tiles = crate::img::positioned_images(&doc, page, true);
+        let tiles = crate::img::positioned_images(&doc, &test_adapter(&doc), page, true);
         assert_eq!(tiles.len(), 1, "the page's only raster lives in the stamp's appearance");
         let t = &tiles[0];
         for (got, want, what) in [
@@ -816,7 +908,7 @@ mod tests {
         }
 
         // 2. the vector ink — the appearance's panel and frame fill the whole `/Rect`.
-        let (strong, _) = crate::vector::positioned_vectors(&doc, page);
+        let (strong, _) = crate::vector::positioned_vectors(&doc, &test_adapter(&doc), page);
         let fig = strong.iter().find(|f| f.x_left < 205.0 && f.x_right > 395.0).unwrap_or_else(|| {
             panic!("no figure spans the stamp's /Rect; got {:?}", strong.iter().map(|f| (f.x_left, f.x_right)).collect::<Vec<_>>())
         });
@@ -824,7 +916,7 @@ mod tests {
 
         // 3. the text. Form (2,40) at 4 pt -> page (208, 520) at 12 pt (the vertical scale).
         let raw = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/annot_render.pdf")).expect("readable");
-        let spans = crate::text::extract_spans(&doc, page, &raw);
+        let spans = crate::text::extract_spans(&doc, &test_adapter(&doc), page, &raw);
         let label = spans.iter().find(|s| s.text.contains("StampInkVisible")).expect("the stamp's text must reach the span set");
         assert!((label.x - 208.0).abs() < 1.0 && (label.y - 520.0).abs() < 1.0, "label at ({}, {})", label.x, label.y);
         assert!((label.size - 12.0).abs() < 0.5, "label size {} — the /Rect's VERTICAL scale", label.size);
@@ -843,8 +935,8 @@ mod tests {
         // The one place the two enumerations disagree, kept honest in both directions:
         // `annot_render.pdf`'s fourth annotation is a state dictionary with no `/AS`.
         let (doc, page) = annot_render();
-        let collected = appearance_streams(&doc, page).len();
-        let rendered = placed_appearances(&doc, page).len();
+        let collected = appearance_streams(&test_adapter(&doc), page).len();
+        let rendered = placed_appearances(&test_adapter(&doc), page).len();
         assert_eq!(collected, 3, "a collector takes the stamp, the /AS state and the state with no /AS");
         assert_eq!(rendered, 2, "a renderer draws only the stamp and the /AS-selected state");
     }
@@ -861,11 +953,11 @@ mod tests {
         let mut parent = XMap::new();
         parent.insert(b"Outer".to_vec(), (9, 0));
 
-        let overlay = form_scope(&doc, stream_of(&doc, id), &parent, ScopePolicy::OverlayParent).expect("overlay scope");
+        let overlay = form_scope(&test_adapter(&doc), stream_of(&doc, id), &parent, ScopePolicy::OverlayParent).expect("overlay scope");
         assert!(overlay.xobjects.contains_key(b"Outer".as_slice()), "OverlayParent keeps the inherited name");
         assert!(overlay.xobjects.contains_key(b"Own".as_slice()));
 
-        let own = form_scope(&doc, stream_of(&doc, id), &parent, ScopePolicy::OwnOnly).expect("own scope");
+        let own = form_scope(&test_adapter(&doc), stream_of(&doc, id), &parent, ScopePolicy::OwnOnly).expect("own scope");
         assert!(!own.xobjects.contains_key(b"Outer".as_slice()), "OwnOnly must NOT see the invoking scope");
         assert!(own.xobjects.contains_key(b"Own".as_slice()));
     }
@@ -881,7 +973,7 @@ mod tests {
         let id = doc.add_object(Object::Stream(Stream::new(d, b"".to_vec())));
         let mut parent = XMap::new();
         parent.insert(b"Im0".to_vec(), (99, 0));
-        let scope = form_scope(&doc, stream_of(&doc, id), &parent, ScopePolicy::OverlayParent).expect("scope");
+        let scope = form_scope(&test_adapter(&doc), stream_of(&doc, id), &parent, ScopePolicy::OverlayParent).expect("scope");
         assert_eq!(scope.xobjects[b"Im0".as_slice()], inner, "the form's own /Im0 wins");
     }
 
@@ -889,9 +981,9 @@ mod tests {
     fn own_only_refuses_a_form_that_carries_no_resources() {
         let (doc, id) = doc_with_form(form_dict(Dictionary::new()), b"");
         let parent = XMap::new();
-        assert!(form_scope(&doc, stream_of(&doc, id), &parent, ScopePolicy::OwnOnly).is_none());
+        assert!(form_scope(&test_adapter(&doc), stream_of(&doc, id), &parent, ScopePolicy::OwnOnly).is_none());
         assert!(
-            form_scope(&doc, stream_of(&doc, id), &parent, ScopePolicy::OverlayParent).is_some(),
+            form_scope(&test_adapter(&doc), stream_of(&doc, id), &parent, ScopePolicy::OverlayParent).is_some(),
             "OverlayParent still descends: the inherited scope is what its names resolve against"
         );
     }
@@ -907,7 +999,7 @@ mod tests {
         }));
         let d = form_dict(dictionary! { "Resources" => Object::Reference(res) });
         let id = doc.add_object(Object::Stream(Stream::new(d, b"".to_vec())));
-        let scope = form_scope(&doc, stream_of(&doc, id), &XMap::new(), ScopePolicy::OwnOnly).expect("scope");
+        let scope = form_scope(&test_adapter(&doc), stream_of(&doc, id), &XMap::new(), ScopePolicy::OwnOnly).expect("scope");
         assert_eq!(scope.xobjects[b"Im0".as_slice()], im);
     }
 
@@ -917,7 +1009,7 @@ mod tests {
         let (doc, id) = doc_with_form(d, b"junk");
         let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
         assert!(matches!(
-            descend_form(&doc, stream_of(&doc, id), &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0),
+            descend_form(&test_adapter(&doc), stream_of(&doc, id), &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0),
             Descend::Skip
         ));
     }
@@ -929,7 +1021,7 @@ mod tests {
         let (doc, id) = doc_with_form(form_dict(Dictionary::new()), b"0 0 10 10 re f");
         let mut budget = crate::WalkBudget::new(10); // less than FORM_DESCENT_COST
         assert!(matches!(
-            descend_form(&doc, stream_of(&doc, id), &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0),
+            descend_form(&test_adapter(&doc), stream_of(&doc, id), &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0),
             Descend::Halt
         ));
     }
@@ -944,7 +1036,7 @@ mod tests {
         // Exactly enough for one descent charged FORM_DESCENT_COST + 7 (scope) + 3 (sibling).
         let mut budget = crate::WalkBudget::new(crate::FORM_DESCENT_COST + 10);
         assert!(matches!(
-            descend_form(&doc, stream_of(&doc, id), &parent, ScopePolicy::OverlayParent, 0, &mut budget, 3),
+            descend_form(&test_adapter(&doc), stream_of(&doc, id), &parent, ScopePolicy::OverlayParent, 0, &mut budget, 3),
             Descend::Into(_)
         ));
         assert!(!budget.spend(1), "the descent must have charged the sibling map too");
@@ -958,7 +1050,7 @@ mod tests {
         let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
         for _ in 0..3 {
             assert!(matches!(
-                descend_form(&doc, stream_of(&doc, id), &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0),
+                descend_form(&test_adapter(&doc), stream_of(&doc, id), &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0),
                 Descend::Into(_)
             ));
         }
@@ -985,7 +1077,7 @@ mod tests {
             "AP" => dictionary! { "N" => Object::Reference(ap) }
         }));
         let page = page_with_annots(&mut doc, vec![Object::Reference(annot)]);
-        let found = appearance_streams(&doc, page);
+        let found = appearance_streams(&test_adapter(&doc), page);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, ap, "the /AP /N stream nothing used to walk");
     }
@@ -1000,7 +1092,7 @@ mod tests {
             "AP" => dictionary! { "N" => Object::Reference(ap) }
         }));
         let page = page_with_annots(&mut doc, vec![Object::Reference(annot)]);
-        assert!(appearance_streams(&doc, page).is_empty());
+        assert!(appearance_streams(&test_adapter(&doc), page).is_empty());
 
         // A neighbouring flag (Print, bit 3) must not read as Hidden.
         let annot2 = doc.add_object(Object::Dictionary(dictionary! {
@@ -1008,7 +1100,7 @@ mod tests {
             "AP" => dictionary! { "N" => Object::Reference(ap) }
         }));
         let page2 = page_with_annots(&mut doc, vec![Object::Reference(annot2)]);
-        assert_eq!(appearance_streams(&doc, page2).len(), 1);
+        assert_eq!(appearance_streams(&test_adapter(&doc), page2).len(), 1);
     }
 
     #[test]
@@ -1024,7 +1116,7 @@ mod tests {
             "AP" => dictionary! { "N" => states.clone() }
         }));
         let page = page_with_annots(&mut doc, vec![Object::Reference(sel)]);
-        let found = appearance_streams(&doc, page);
+        let found = appearance_streams(&test_adapter(&doc), page);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, on);
 
@@ -1034,7 +1126,7 @@ mod tests {
             "AP" => dictionary! { "N" => states.clone() }
         }));
         let page = page_with_annots(&mut doc, vec![Object::Reference(missing)]);
-        assert!(appearance_streams(&doc, page).is_empty());
+        assert!(appearance_streams(&test_adapter(&doc), page).is_empty());
 
         // No /AS at all: no state is current, so a collector takes every state.
         let none = doc.add_object(Object::Dictionary(dictionary! {
@@ -1042,7 +1134,7 @@ mod tests {
             "AP" => dictionary! { "N" => states }
         }));
         let page = page_with_annots(&mut doc, vec![Object::Reference(none)]);
-        let mut ids: Vec<ObjectId> = appearance_streams(&doc, page).into_iter().map(|(id, _)| id).collect();
+        let mut ids: Vec<ObjectId> = appearance_streams(&test_adapter(&doc), page).into_iter().map(|(id, _)| id).collect();
         ids.sort();
         assert_eq!(ids, {
             let mut v = vec![off, on];
@@ -1055,14 +1147,14 @@ mod tests {
     fn a_page_without_annots_or_appearances_yields_nothing() {
         let mut doc = Document::with_version("1.5");
         let bare = doc.add_object(Object::Dictionary(dictionary! { "Type" => "Page" }));
-        assert!(appearance_streams(&doc, bare).is_empty());
+        assert!(appearance_streams(&test_adapter(&doc), bare).is_empty());
         // An annotation with no /AP, and one whose /AP has no /N.
         let a1 = doc.add_object(Object::Dictionary(dictionary! { "Type" => "Annot", "Subtype" => "Link" }));
         let a2 = doc.add_object(Object::Dictionary(dictionary! {
             "Type" => "Annot", "Subtype" => "Link", "AP" => dictionary! { "D" => Object::Null }
         }));
         let page = page_with_annots(&mut doc, vec![Object::Reference(a1), Object::Reference(a2)]);
-        assert!(appearance_streams(&doc, page).is_empty());
+        assert!(appearance_streams(&test_adapter(&doc), page).is_empty());
     }
 
     #[test]
@@ -1078,7 +1170,7 @@ mod tests {
         let page = doc.add_object(Object::Dictionary(dictionary! {
             "Type" => "Page", "Annots" => Object::Reference(arr)
         }));
-        assert_eq!(appearance_streams(&doc, page).len(), 1);
+        assert_eq!(appearance_streams(&test_adapter(&doc), page).len(), 1);
     }
 
     #[test]
@@ -1086,10 +1178,10 @@ mod tests {
         let (doc, id) = doc_with_form(form_dict(Dictionary::new()), b"");
         let mut scope = XMap::new();
         scope.insert(b"F".to_vec(), id);
-        assert!(xobject_at(&doc, &scope, &[Object::Name(b"Missing".to_vec())]).is_none());
-        assert!(xobject_at(&doc, &scope, &[Object::Integer(3)]).is_none(), "a non-name operand names nothing");
-        assert!(xobject_at(&doc, &scope, &[]).is_none());
-        let (got_id, _) = xobject_at(&doc, &scope, &[Object::Name(b"F".to_vec())]).expect("in scope");
+        assert!(xobject_at(&test_adapter(&doc), &scope, &[Object::Name(b"Missing".to_vec())]).is_none());
+        assert!(xobject_at(&test_adapter(&doc), &scope, &[Object::Integer(3)]).is_none(), "a non-name operand names nothing");
+        assert!(xobject_at(&test_adapter(&doc), &scope, &[]).is_none());
+        let (got_id, _) = xobject_at(&test_adapter(&doc), &scope, &[Object::Name(b"F".to_vec())]).expect("in scope");
         assert_eq!(got_id, id);
     }
 }

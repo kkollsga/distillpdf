@@ -11,8 +11,9 @@ use lopdf::Document;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::access::{DocumentAccess, EagerDocumentAdapter};
 use crate::error::Error;
 use crate::extract::{self, FontInfo, ImageInfo, TableInfo};
 use crate::model::container::AssetBytes;
@@ -99,9 +100,12 @@ pub struct OcrPlanEntry {
 
 /// A loaded PDF document — the reusable pure-Rust handle.
 pub struct PdfDocument {
-    pub(crate) doc: Document,
+    pub(crate) doc: Arc<Document>,
     /// Raw PDF bytes, kept for lenient recovery of malformed streams.
-    pub(crate) raw: Vec<u8>,
+    pub(crate) raw: Arc<[u8]>,
+    /// Runtime-selectable immutable access route. L2 uses the eager oracle adapter; L3 adds
+    /// the bounded indexed implementation without reopening consumer signatures.
+    pub(crate) access: Arc<dyn DocumentAccess>,
     /// Source path (`open`); `None` when constructed from bytes.
     pub(crate) source: Option<PathBuf>,
     /// Cached OCR results: `{1-based page: DocTags}`, populated once by `set_ocr`.
@@ -201,6 +205,15 @@ fn load_mem_deterministic(raw: &[u8]) -> Result<Document, lopdf::Error> {
             .thread_name(|_| "distillpdf-load".to_string())
             .build()
     })
+}
+
+/// Lopdf-0.44-compatible display for public errors whose nested cause the fork redacts.
+fn eager_error_message(error: &lopdf::Error) -> String {
+    match error {
+        lopdf::Error::Parse(source) => format!("couldn't parse input: {source}"),
+        lopdf::Error::IO(source) => format!("IO error: {source}"),
+        other => other.to_string(),
+    }
 }
 
 /// The trailer key whose value is the encryption dictionary.
@@ -331,23 +344,33 @@ fn ensure_decrypted(raw: &[u8], doc: &mut Document) -> Result<(), Error> {
 impl PdfDocument {
     /// Open a PDF from a filesystem path. Only loads/parses the container.
     pub fn open(path: &str) -> Result<Self, Error> {
-        let raw = std::fs::read(path).map_err(Error::Read)?;
-        let mut doc = load_mem_deterministic(&raw).map_err(|e| Error::Open(e.to_string()))?;
+        let raw: Arc<[u8]> = std::fs::read(path).map_err(Error::Read)?.into();
+        let mut doc = load_mem_deterministic(&raw).map_err(|e| Error::Open(eager_error_message(&e)))?;
         ensure_decrypted(&raw, &mut doc)?;
-        Ok(PdfDocument { doc, raw, source: Some(PathBuf::from(path)), ocr_cache: Default::default() })
+        let doc = Arc::new(doc);
+        let access = Arc::new(EagerDocumentAdapter::new(Arc::clone(&doc), Arc::clone(&raw)));
+        Ok(PdfDocument {
+            doc,
+            raw,
+            access,
+            source: Some(PathBuf::from(path)),
+            ocr_cache: Default::default(),
+        })
     }
 
     /// Open a PDF from raw bytes. There is no source path.
     pub fn from_bytes(data: &[u8]) -> Result<Self, Error> {
-        let raw = data.to_vec();
-        let mut doc = load_mem_deterministic(&raw).map_err(|e| Error::Parse(e.to_string()))?;
+        let raw: Arc<[u8]> = Arc::from(data);
+        let mut doc = load_mem_deterministic(&raw).map_err(|e| Error::Parse(eager_error_message(&e)))?;
         ensure_decrypted(&raw, &mut doc)?;
-        Ok(PdfDocument { doc, raw, source: None, ocr_cache: Default::default() })
+        let doc = Arc::new(doc);
+        let access = Arc::new(EagerDocumentAdapter::new(Arc::clone(&doc), Arc::clone(&raw)));
+        Ok(PdfDocument { doc, raw, access, source: None, ocr_cache: Default::default() })
     }
 
     /// Number of pages.
     pub fn page_count(&self) -> usize {
-        self.doc.get_pages().len()
+        self.access.pages().map_or(0, |pages| pages.len())
     }
 
     /// Extract plain text from all pages (concatenated, page order). Hybrid: our
@@ -363,7 +386,7 @@ impl PdfDocument {
         let mut per_page: Vec<(u32, String)> = pages
             .par_iter()
             .map(|(&p, &page_id)| {
-                let mine = text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default();
+                let mine = text::extract_page(&self.doc, self.access.as_ref(), page_id, &self.raw).unwrap_or_default();
                 let s = if mine.trim().chars().count() >= 2 {
                     mine
                 } else {
@@ -384,7 +407,7 @@ impl PdfDocument {
     /// Extract text from a single 1-indexed page (hybrid).
     pub fn extract_page_text(&self, page: u32) -> Result<String, Error> {
         let page_id = *self.doc.get_pages().get(&page).ok_or(Error::NoPage(Some(page)))?;
-        let mine = text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default();
+        let mine = text::extract_page(&self.doc, self.access.as_ref(), page_id, &self.raw).unwrap_or_default();
         Ok(if mine.trim().chars().count() >= 2 {
             mine
         } else {
@@ -396,7 +419,7 @@ impl PdfDocument {
     pub fn mine_text(&self) -> String {
         let mut out = String::new();
         for &page_id in self.doc.get_pages().values() {
-            out.push_str(&text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default());
+            out.push_str(&text::extract_page(&self.doc, self.access.as_ref(), page_id, &self.raw).unwrap_or_default());
             out.push('\n');
         }
         out
@@ -405,7 +428,7 @@ impl PdfDocument {
     /// Diagnostic: raw spans (text, x, width, size) for a 1-indexed page.
     pub fn dbg_spans(&self, page: u32) -> Result<Vec<(String, f32, f32, f32)>, Error> {
         let page_id = *self.doc.get_pages().get(&page).ok_or(Error::NoPage(None))?;
-        Ok(text::extract_spans(&self.doc, page_id, &self.raw)
+        Ok(text::extract_spans(&self.doc, self.access.as_ref(), page_id, &self.raw)
             .into_iter()
             .map(|s| (s.text, s.x, s.width, s.size))
             .collect())
@@ -415,7 +438,7 @@ impl PdfDocument {
     #[allow(clippy::type_complexity)] // a flat diagnostic tuple mirroring the Python `_dbg_spans_xy`
     pub fn dbg_spans_xy(&self, page: u32) -> Result<Vec<(String, f32, f32, f32, f32)>, Error> {
         let page_id = *self.doc.get_pages().get(&page).ok_or(Error::NoPage(None))?;
-        Ok(text::extract_spans(&self.doc, page_id, &self.raw)
+        Ok(text::extract_spans(&self.doc, self.access.as_ref(), page_id, &self.raw)
             .into_iter()
             .map(|s| (s.text, s.x, s.y, s.width, s.size))
             .collect())
@@ -438,7 +461,7 @@ impl PdfDocument {
         let mut nums: Vec<u32> = map.keys().copied().collect();
         nums.sort_unstable();
         for n in nums {
-            let (strong, weak) = crate::vector::positioned_vectors(&self.doc, map[&n]);
+            let (strong, weak) = crate::vector::positioned_vectors(&self.doc, self.access.as_ref(), map[&n]);
             let dropped = weak.iter().filter(|v| v.demoted()).count() as u32;
             accepted += strong.len() as u32;
             suppressed += dropped;
@@ -473,17 +496,17 @@ impl PdfDocument {
 
     /// Extract images from all pages.
     pub fn extract_images(&self) -> Vec<ImageInfo> {
-        extract::extract_images(&self.doc)
+        extract::extract_images(&self.doc, self.access.as_ref())
     }
 
     /// Extract per-page font info.
     pub fn extract_fonts(&self) -> Vec<FontInfo> {
-        extract::extract_fonts(&self.doc)
+        extract::extract_fonts(&self.doc, self.access.as_ref())
     }
 
     /// Extract tables from all pages.
     pub fn extract_tables(&self) -> Vec<TableInfo> {
-        extract::extract_tables(&self.doc, &self.raw)
+        extract::extract_tables(&self.doc, self.access.as_ref(), &self.raw)
     }
 
     /// Extract hyperlinks from all pages.
@@ -493,12 +516,12 @@ impl PdfDocument {
 
     /// Render the document to HTML.
     pub fn render(&self, mode: html::Mode, images: bool, toc: bool) -> String {
-        html::to_html(&self.doc, &self.raw, mode, images, toc)
+        html::to_html(&self.doc, self.access.as_ref(), &self.raw, mode, images, toc)
     }
 
     /// The detected-heading outline: `(level, title, page, anchor_id)` in reading order.
     pub fn toc(&self, mode: html::Mode) -> Vec<(u8, String, u32, String)> {
-        nav::toc(&html::to_html(&self.doc, &self.raw, mode, false, true))
+        nav::toc(&html::to_html(&self.doc, self.access.as_ref(), &self.raw, mode, false, true))
     }
 
     /// The PDF's OWN `/Outlines` bookmarks as `(level, title, page, anchor)`.
@@ -511,23 +534,23 @@ impl PdfDocument {
 
     /// HTML of a single section resolved by `name`.
     pub fn section(&self, mode: html::Mode, name: &str, images: bool) -> Option<String> {
-        nav::section(&html::to_html(&self.doc, &self.raw, mode, images, true), name)
+        nav::section(&html::to_html(&self.doc, self.access.as_ref(), &self.raw, mode, images, true), name)
     }
 
     /// Structured front-matter of an academic paper (page 1).
     pub fn front_matter(&self) -> frontmatter::FrontMatter {
-        frontmatter::extract_front_matter(&self.doc, &self.raw)
+        frontmatter::extract_front_matter(&self.doc, self.access.as_ref(), &self.raw)
     }
 
     /// OCR plan: per page, whether OCR is needed and (if so) the page raster bytes.
     pub fn ocr_plan(&self) -> Vec<OcrPlanEntry> {
         let mut out = Vec::new();
         for (&pno, &page_id) in &self.doc.get_pages() {
-            let decision = ocr::detect::decide(&self.doc, page_id, &self.raw);
+            let decision = ocr::detect::decide(&self.doc, self.access.as_ref(), page_id, &self.raw);
             let needs = !matches!(decision, ocr::detect::OcrDecision::NotNeeded);
             let (w, h) = ocr::page_size_pts(&self.doc, page_id);
             let image = if needs {
-                ocr::page_main_image(&self.doc, page_id).map(|(b, _)| b)
+                ocr::page_main_image(&self.doc, self.access.as_ref(), page_id).map(|(b, _)| b)
             } else {
                 None
             };
@@ -565,7 +588,7 @@ impl PdfDocument {
                 let (w, h) = ocr::page_size_pts(&doc, page_id);
                 if remove_raster {
                     // Clean reflow: replace the page's content with our text + cropped figures.
-                    let image = ocr::page_main_image(&doc, page_id).map(|(_, img)| img);
+                    let image = ocr::page_main_image(&self.doc, self.access.as_ref(), page_id).map(|(_, img)| img);
                     let pin = ocr::pdf::PageInput { page: ocr::doctags::parse(dt), width: w, height: h, image };
                     let (content, xobjs) = ocr::pdf::build_page_content(&mut doc, &pin)?;
                     let data = content.encode().map_err(|e| e.to_string())?;
@@ -643,7 +666,14 @@ impl PdfDocument {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "document.pdf".to_string());
         let generated_at = iso8601_now();
-        let (model, asset_bytes) = model::build::build_model(&self.doc, &self.raw, &file, generated_at, opts.profile);
+        let (model, asset_bytes) = model::build::build_model(
+            &self.doc,
+            self.access.as_ref(),
+            &self.raw,
+            &file,
+            generated_at,
+            opts.profile,
+        );
         if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(Error::Mkdir)?;
         }
@@ -827,9 +857,10 @@ pub(crate) mod tests {
                 .spawn_handler(|_| Err(std::io::Error::other("injected loader thread failure")))
                 .build()
         });
-        let err = failed.err().expect("pool creation failure must fail the load");
+        let err = failed.expect_err("pool creation failure must fail the load");
         assert!(matches!(err, lopdf::Error::IO(_)), "pool failure must remain an IO error: {err}");
-        assert!(err.to_string().contains("injected loader thread failure"));
+        let lopdf::Error::IO(source) = &err else { unreachable!() };
+        assert!(source.to_string().contains("injected loader thread failure"));
         assert!(pool.pool.get().is_none(), "a transient build failure must leave the pool retryable");
 
         // Initialize while already executing in another rayon registry. `ThreadPool::install`
@@ -873,7 +904,7 @@ pub(crate) mod tests {
             };
             let mut want = String::new();
             for (&p, &page_id) in &pdf.doc.get_pages() {
-                let mine = text::extract_page(&pdf.doc, page_id, &pdf.raw).unwrap_or_default();
+                let mine = text::extract_page(&pdf.doc, pdf.access.as_ref(), page_id, &pdf.raw).unwrap_or_default();
                 if mine.trim().chars().count() >= 2 {
                     want.push_str(&mine);
                 } else {

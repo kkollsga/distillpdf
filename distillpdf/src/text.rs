@@ -1043,30 +1043,41 @@ pub struct Span {
 /// iText-assembled PDFs) where each appended document is a full-page Form XObject —
 /// would otherwise be invisible to the page-direct walk. Page-direct and
 /// form-internal text land in the same page user space.
-pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span> {
+pub fn extract_spans(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    page_id: ObjectId,
+    raw: &[u8],
+) -> Vec<Span> {
     let content = match doc.get_and_decode_page_content(page_id) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
     let fonts = build_fonts(doc, page_id, raw);
-    let xmap = crate::walker::page_xobjects(doc, page_id);
+    let xmap = crate::walker::page_xobjects(access, page_id);
     let mut spans = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
     let props = marked_properties(doc, page_id);
-    decode_spans(doc, &content.operations, &fonts, &xmap, Mat::ID, raw, 0, &mut spans, &mut budget, Some(&props));
+    decode_spans(doc, access, &content.operations, &fonts, &xmap, Mat::ID, raw, 0, &mut spans, &mut budget, Some(&props));
     // §12.5.5: an annotation's appearance stream is page content — a filled form field's
     // value, a stamp's caption — reachable from neither the content stream nor the page's
     // `/Resources`. `walker::placed_appearances` carries the `/BBox`→`/Rect` mapping that
     // puts it where a viewer puts it; its fonts are its own, exactly as a form's are.
-    for (_, ap, actm) in crate::walker::placed_appearances(doc, page_id) {
-        let f = match descend_form(doc, ap, &XMap::new(), ScopePolicy::OwnOnly, 0, &mut budget, fonts.len()) {
-            Descend::Into(f) => f,
-            Descend::Skip => continue,
-            Descend::Halt => break,
-        };
-        let Some(fr) = &f.scope.resources else { continue };
-        let ff = build_fonts_from_resources(doc, fr, raw);
-        decode_spans(doc, &f.ops, &ff, &f.scope.xobjects, f.matrix.mul(actm), raw, 1, &mut spans, &mut budget, None);
+    for (_, ap, actm) in crate::walker::placed_appearances(access, page_id) {
+        let halt = ap.read(|ap| {
+            let f = match descend_form(access, ap, &XMap::new(), ScopePolicy::OwnOnly, 0, &mut budget, fonts.len()) {
+                Descend::Into(f) => f,
+                Descend::Skip => return false,
+                Descend::Halt => return true,
+            };
+            let Some(fr) = &f.scope.resources else { return false };
+            let ff = build_fonts_from_resources(doc, fr, raw);
+            decode_spans(doc, access, &f.ops, &ff, &f.scope.xobjects, f.matrix.mul(actm), raw, 1, &mut spans, &mut budget, None);
+            false
+        });
+        if halt == Some(true) {
+            break;
+        }
     }
     dedup_coincident(&mut spans);
     spans
@@ -1156,7 +1167,19 @@ fn push_positioned_span(spans: &mut Vec<Span>, wtm: &Mat, ctm: &Mat, base_size: 
 /// [`Span::mcid`] for why a form's or an annotation's marked-content ids must not be stamped
 /// with the page's numbering.
 #[allow(clippy::too_many_arguments)]
-fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashMap<Vec<u8>, FontInfo>, xmap: &XMap, base: Mat, raw: &[u8], depth: u32, spans: &mut Vec<Span>, budget: &mut crate::WalkBudget, props: Option<&HashMap<Vec<u8>, u32>>) {
+fn decode_spans(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    ops: &[lopdf::content::Operation],
+    fonts: &HashMap<Vec<u8>, FontInfo>,
+    xmap: &XMap,
+    base: Mat,
+    raw: &[u8],
+    depth: u32,
+    spans: &mut Vec<Span>,
+    budget: &mut crate::WalkBudget,
+    props: Option<&HashMap<Vec<u8>, u32>>,
+) {
     let mut tm = Mat::ID;
     let mut tlm = Mat::ID;
     let mut leading = 0.0f32;
@@ -1333,7 +1356,7 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
             // /Matrix and the CTM in effect at the `Do`). Inline images / non-Form
             // XObjects carry no text and are skipped.
             "Do" => {
-                let Some((_, stream)) = xobject_at(doc, xmap, o) else {
+                let Some((_, stream)) = xobject_at(access, xmap, o) else {
                     continue;
                 };
                 // `OwnOnly`: a form's fonts and XObjects live in its OWN /Resources (PDF
@@ -1341,26 +1364,25 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
                 // a form without one is skipped rather than decoded through some other
                 // scope's encoding. That is a deliberate policy difference from the raster
                 // and vector walks, which overlay the parent scope; see `walker::ScopePolicy`.
-                let f = match descend_form(doc, stream, xmap, ScopePolicy::OwnOnly, depth, budget, fonts.len()) {
-                    Descend::Into(f) => f,
-                    Descend::Skip => continue,
-                    Descend::Halt => return,
-                };
-                let ff = match &f.scope.resources {
-                    Some(fr) => build_fonts_from_resources(doc, fr, raw),
-                    None => continue, // unreachable under OwnOnly, which refuses a form without /Resources
-                };
-                let sub = f.matrix.mul(ctm);
-                // §8.10.2: the form's `/BBox` clips its content, glyphs included. The raster
-                // and vector walks already read the key (`walker::form_bbox_clip`); this walk
-                // did not, so a producer that reuses ONE oversized form body and selects a
-                // band of it per placement got every glyph of the whole body, once per
-                // placement. See `clip_spans_to`.
-                let clip = crate::walker::form_bbox_clip(doc, stream, sub);
-                let mark = spans.len();
-                decode_spans(doc, &f.ops, &ff, &f.scope.xobjects, sub, raw, depth + 1, spans, budget, None);
-                if let Some(bb) = clip {
-                    clip_spans_to(spans, mark, bb);
+                let halt = stream.read(|stream| {
+                    let f = match descend_form(access, stream, xmap, ScopePolicy::OwnOnly, depth, budget, fonts.len()) {
+                        Descend::Into(f) => f,
+                        Descend::Skip => return false,
+                        Descend::Halt => return true,
+                    };
+                    let Some(fr) = &f.scope.resources else { return false };
+                    let ff = build_fonts_from_resources(doc, fr, raw);
+                    let sub = f.matrix.mul(ctm);
+                    let clip = crate::walker::form_bbox_clip(access, stream, sub);
+                    let mark = spans.len();
+                    decode_spans(doc, access, &f.ops, &ff, &f.scope.xobjects, sub, raw, depth + 1, spans, budget, None);
+                    if let Some(bb) = clip {
+                        clip_spans_to(spans, mark, bb);
+                    }
+                    false
+                });
+                if halt == Some(true) {
+                    return;
                 }
                 continue; // the form's spans carry the form's numbering, never the page's
             }
@@ -1856,14 +1878,20 @@ pub fn debug_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> String {
 
 /// Extract text for one page via positioned spans + reading-order reconstruction.
 /// Returns None if the page content cannot be decoded.
-pub fn extract_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Option<String> {
-    let spans = extract_spans(doc, page_id, raw);
+pub fn extract_page(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    page_id: ObjectId,
+    raw: &[u8],
+) -> Option<String> {
+    let spans = extract_spans(doc, access, page_id, raw);
     Some(text_from_spans(spans))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::test_adapter;
 
     /// An adversarial fixture (`tests/gen_fixtures.py::gen_form_bomb`), its bytes and page.
     fn adversarial(name: &str) -> (Vec<u8>, Document, ObjectId) {
@@ -1880,7 +1908,7 @@ mod tests {
         // `MAX_FORM_DEPTH` alone allowed ~2^40 descents. This call never returned.
         let (raw, doc, page_id) = adversarial("form_bomb.pdf");
         let t = std::time::Instant::now();
-        let spans = extract_spans(&doc, page_id, &raw);
+        let spans = extract_spans(&doc, &test_adapter(&doc), page_id, &raw);
         assert!(t.elapsed().as_secs() < 10, "form bomb ran for {:?} — the budget is not bounding it", t.elapsed());
         assert!(spans.is_empty(), "the bomb shows no text, so none may be invented for it");
     }
@@ -1891,7 +1919,7 @@ mod tests {
         // showing one word, invoked at three offsets, is three real runs on the page. An
         // `ObjectId` dedupe would return 1 and silently drop two thirds of the text.
         let (raw, doc, page_id) = adversarial("form_repeat.pdf");
-        let spans = extract_spans(&doc, page_id, &raw);
+        let spans = extract_spans(&doc, &test_adapter(&doc), page_id, &raw);
         let hits: Vec<&Span> = spans.iter().filter(|s| s.text.contains("REPEAT")).collect();
         let seen: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(hits.len(), 3, "a repeated form must show its text once per invocation, got {seen:?}");
@@ -1907,10 +1935,10 @@ mod tests {
         let (raw, doc, page_id) = adversarial("form_repeat.pdf");
         let content = doc.get_and_decode_page_content(page_id).expect("fixture page has content");
         let fonts = build_fonts(&doc, page_id, &raw);
-        let xmap = crate::walker::page_xobjects(&doc, page_id);
+        let xmap = crate::walker::page_xobjects(&test_adapter(&doc), page_id);
         let mut spans = Vec::new();
         let mut budget = crate::WalkBudget::new(700);
-        decode_spans(&doc, &content.operations, &fonts, &xmap, Mat::ID, &raw, 0, &mut spans, &mut budget, None);
+        decode_spans(&doc, &test_adapter(&doc), &content.operations, &fonts, &xmap, Mat::ID, &raw, 0, &mut spans, &mut budget, None);
         assert!(!spans.is_empty(), "a tripped budget must not empty the page");
         assert!(spans.len() < 3, "the budget must really bite, got {} spans", spans.len());
     }
@@ -1925,7 +1953,7 @@ mod tests {
         let raw = std::fs::read(path).unwrap();
         let doc = Document::load_mem(&raw).unwrap();
         let pid = *doc.get_pages().get(&1).unwrap();
-        let out = extract_page(&doc, pid, &raw).unwrap();
+        let out = extract_page(&doc, &test_adapter(&doc), pid, &raw).unwrap();
         // The six the table omits (this is the defect) …
         for sym in ["\u{2B1F}", "\u{2B22}", "\u{2B21}", "\u{27F6}", "\u{27F5}", "\u{27F7}"] {
             assert!(out.contains(sym), "uncovered symbol {sym:?} lost from {out:?}");
@@ -1950,7 +1978,7 @@ mod tests {
         let raw = std::fs::read(path).unwrap();
         let doc = Document::load_mem(&raw).unwrap();
         let pid = *doc.get_pages().get(&1).unwrap();
-        let out = extract_page(&doc, pid, &raw).unwrap();
+        let out = extract_page(&doc, &test_adapter(&doc), pid, &raw).unwrap();
         assert!(out.contains("Hello"), "subset font text lost: {out:?}");
         assert!(!out.contains("HelloA"), "unmapped CID 0x41 invented an 'A': {out:?}");
         assert!(!out.contains('A'), "no 'A' is drawn anywhere on this page: {out:?}");
@@ -1962,7 +1990,7 @@ mod tests {
         let raw = std::fs::read(path).unwrap();
         let doc = Document::load_mem(&raw).unwrap();
         let pid = *doc.get_pages().get(&n).unwrap();
-        extract_page(&doc, pid, &raw).unwrap()
+        extract_page(&doc, &test_adapter(&doc), pid, &raw).unwrap()
     }
 
     /// An *incomplete* ToUnicode (the common case — one `bfchar` per subsetted glyph) left
@@ -2013,7 +2041,7 @@ mod tests {
         let raw = std::fs::read(path).expect("form_inherit.pdf fixture must exist");
         let doc = Document::load_mem(&raw).expect("form_inherit.pdf fixture must load");
         let pid = *doc.get_pages().get(&1).expect("fixture has page 1");
-        let spans = extract_spans(&doc, pid, &raw);
+        let spans = extract_spans(&doc, &test_adapter(&doc), pid, &raw);
         let s = spans.iter().find(|s| s.text.contains("INHERIT")).expect("the form's label");
         assert!((s.x - 172.0).abs() < 1.0, "x {} (72 means the indirect /Matrix was lost)", s.x);
     }
@@ -2031,7 +2059,7 @@ mod tests {
         let raw = std::fs::read(path).expect("form_bbox_text.pdf fixture must exist");
         let doc = Document::load_mem(&raw).expect("form_bbox_text.pdf fixture must load");
         let pid = *doc.get_pages().get(&1).expect("fixture has page 1");
-        let spans = extract_spans(&doc, pid, &raw);
+        let spans = extract_spans(&doc, &test_adapter(&doc), pid, &raw);
         let hits = |w: &str| spans.iter().filter(|s| s.text.contains(w)).count();
         assert_eq!(hits("TOPBAND"), 1, "the top band paints once, not once per placement");
         assert_eq!(hits("BOTBAND"), 1, "the bottom band paints once, not once per placement");
@@ -2042,7 +2070,7 @@ mod tests {
         let bot = spans.iter().find(|s| s.text.contains("BOTBAND")).unwrap();
         assert!((bot.x - 95.0).abs() < 1.0 && (bot.y - 371.6).abs() < 1.0, "BOTBAND at ({}, {})", bot.x, bot.y);
         // The guard: the clip must not eat the page's own text, which no `/BBox` governs.
-        let out = extract_page(&doc, pid, &raw).expect("page text");
+        let out = extract_page(&doc, &test_adapter(&doc), pid, &raw).expect("page text");
         assert!(out.contains("One body, two bands"), "page-level text lost to a form clip: {out:?}");
     }
 
@@ -2059,7 +2087,7 @@ mod tests {
         let doc = Document::load_mem(&raw).expect("unfiltered_form.pdf fixture must load");
         let pid = *doc.get_pages().get(&1).expect("fixture has page 1");
         // The premise, asserted rather than assumed: the form really is unfiltered.
-        let form_id = crate::walker::page_xobjects(&doc, pid).get(b"UF".as_slice()).copied().expect("/UF form");
+        let form_id = crate::walker::page_xobjects(&test_adapter(&doc), pid).get(b"UF".as_slice()).copied().expect("/UF form");
         let form = doc.get_object(form_id).unwrap().as_stream().unwrap();
         assert!(form.dict.get(b"Filter").is_err(), "the fixture's form must carry no /Filter");
         assert_eq!(
@@ -2068,7 +2096,7 @@ mod tests {
             "the premise, lopdf 0.44: an unfiltered stream decodes to its raw content",
         );
 
-        let out = extract_page(&doc, pid, &raw).expect("page text");
+        let out = extract_page(&doc, &test_adapter(&doc), pid, &raw).expect("page text");
         assert!(out.contains("Unfiltered form ink"), "the form's own label is lost: {out:?}");
         // The page-level text was never at risk — its presence proves the page decoded and
         // only the form descent was dropping content.
@@ -2151,7 +2179,7 @@ mod tests {
         let doc = Document::load(path).expect("textstate_q.pdf fixture must load");
         let raw = std::fs::read(path).expect("fixture readable");
         let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
-        let spans = extract_spans(&doc, page_id, &raw);
+        let spans = extract_spans(&doc, &test_adapter(&doc), page_id, &raw);
         let mut by_line: std::collections::BTreeMap<i32, Vec<&Span>> = std::collections::BTreeMap::new();
         for s in &spans {
             by_line.entry(-(s.y.round() as i32)).or_default().push(s);

@@ -36,7 +36,14 @@ use crate::{frontmatter, html, links, nav, ocr};
 ///
 /// Returns the model plus the embedded-asset bytes map (keyed by asset id) the container
 /// writer needs; it is empty under `assets="none"` or when no figure raster was recoverable.
-pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: String, profile: AssetProfile) -> (DocModel, AssetBytes) {
+pub(crate) fn build_model(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    raw: &[u8],
+    file: &str,
+    generated_at: String,
+    profile: AssetProfile,
+) -> (DocModel, AssetBytes) {
     let page_map = doc.get_pages(); // BTreeMap<u32, ObjectId> — 1-indexed, sorted
     let page_count = page_map.len() as u32;
 
@@ -47,7 +54,7 @@ pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: 
         .iter()
         .map(|(&n, &pid)| {
             let (w, h) = ocr::page_size_pts(doc, pid);
-            let decision: OcrDecision = ocr::detect::decide(doc, pid, raw).into();
+            let decision: OcrDecision = ocr::detect::decide(doc, access, pid, raw).into();
             let mut lmap: BTreeMap<String, String> = BTreeMap::new();
             if let Some(lbl) = labels.get(&n) {
                 lmap.insert("pdf".to_string(), lbl.clone());
@@ -70,7 +77,7 @@ pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: 
     // — no HTML round-trip, no stored fidelity body. The blocks ARE the render source of truth
     // (`render::render_html` rebuilds the IR from them byte-identically), so the page's content
     // is held once, in `blocks`.
-    let (pages_ir, _outline) = html::render_doc_elements(doc, raw, html::Mode::Page, false);
+    let (pages_ir, _outline) = html::render_doc_elements(doc, access, raw, html::Mode::Page, false);
     // The post-dedup id map (`fig-3` → `fig-3-2` when ids collide) and the `sec-…` minting both
     // key off the deduped body's id namespace, exactly as the renderer's `build_toc` does —
     // computed directly from the IR's element fragments in document order (no full-body emit).
@@ -80,7 +87,7 @@ pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: 
 
     // Front-matter / metadata: reuse the dedicated extractor (the same one the public
     // `metadata()` method exposes) rather than re-deriving from the HTML <header>.
-    let fm = frontmatter::extract_front_matter(doc, raw);
+    let fm = frontmatter::extract_front_matter(doc, access, raw);
     let metadata = Metadata {
         title: (!fm.title.trim().is_empty()).then(|| fm.title.clone()),
         authors: fm.authors.iter().map(|a| a.name.clone()).collect(),
@@ -114,7 +121,7 @@ pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: 
     // height, and embed them; under `"none"` (or when a figure's graphic is vector-only / not
     // recoverable as a raster) the bytes are dropped and only the regen STUB remains — a named,
     // reversible hole. The asset table is always complete (every figure image id has an entry).
-    let (assets, asset_bytes) = build_assets(doc, raw, &mut blocks, profile);
+    let (assets, asset_bytes) = build_assets(doc, access, raw, &mut blocks, profile);
 
     let source = Source {
         file: file.to_string(),
@@ -310,12 +317,22 @@ fn build_toc(doc: &Document, sections: &[Section]) -> Vec<TocEntry> {
 /// vector/SVG figure, or one whose graphic the inline render didn't materialise) keeps a
 /// DROPPED stub with a `regen` recipe — a named, reversible hole, never silent. Under
 /// `assets="none"` every figure is a dropped stub.
-fn build_assets(doc: &Document, raw: &[u8], blocks: &mut [Block], profile: AssetProfile) -> (Vec<Asset>, AssetBytes) {
+fn build_assets(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    raw: &[u8],
+    blocks: &mut [Block],
+    profile: AssetProfile,
+) -> (Vec<Asset>, AssetBytes) {
     let mut assets = Vec::new();
     let mut bytes_map = AssetBytes::new();
     // The figure-id → raster bytes map, built only when the profile keeps figures (re-rendering
     // inline is the cost we pay exactly once, and only when bytes are wanted).
-    let rasters = if profile.keeps_figures() { figure_rasters(doc, raw) } else { BTreeMap::new() };
+    let rasters = if profile.keeps_figures() {
+        figure_rasters(doc, access, raw)
+    } else {
+        BTreeMap::new()
+    };
 
     for b in blocks.iter_mut() {
         let Some(id) = b.image.clone() else { continue };
@@ -360,9 +377,13 @@ type FigureRaster = (Vec<u8>, String, Option<u32>, Option<u32>);
 /// Re-render the document with images INLINE (once) and decode each figure's raster into
 /// `figure_number → `[`FigureRaster`]. Vector-only figures yield no entry (their graphic is
 /// `<svg>`, not a raster). Width/height come from decoding the image header.
-fn figure_rasters(doc: &Document, raw: &[u8]) -> BTreeMap<String, FigureRaster> {
+fn figure_rasters(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    raw: &[u8],
+) -> BTreeMap<String, FigureRaster> {
     let mut out = BTreeMap::new();
-    let html = html::to_html(doc, raw, html::Mode::Page, true, false);
+    let html = html::to_html(doc, access, raw, html::Mode::Page, true, false);
     // Walk `<figure id="fig-N"> … <img src="data:…"> … </figure>` occurrences. We only need the
     // FIRST raster `<img>` inside each figure (a composite figure's base raster).
     let mut rest = html.as_str();
