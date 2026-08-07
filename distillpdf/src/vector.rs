@@ -73,7 +73,7 @@ const MAX_COLORANTS: usize = 32;
 fn parse_cs(
     doc: &Document,
     access: &dyn crate::access::DocumentAccess,
-    res: &Dictionary,
+    res: &crate::walker::ResourceScope,
     o: &Object,
     depth: u32,
 ) -> Option<PaintCs> {
@@ -129,12 +129,13 @@ fn parse_cs(
 fn colorspaces_of(
     doc: &Document,
     access: &dyn crate::access::DocumentAccess,
+    scope: &crate::walker::ResourceScope,
     resources: &Dictionary,
 ) -> HashMap<Vec<u8>, Rc<PaintCs>> {
     let mut map = HashMap::new();
     if let Some(csd) = sub_dict(doc, resources, b"ColorSpace") {
         for (name, val) in csd.iter() {
-            if let Some(cs) = parse_cs(doc, access, resources, val, 0) {
+            if let Some(cs) = parse_cs(doc, access, scope, val, 0) {
                 map.insert(name.clone(), Rc::new(cs));
             }
         }
@@ -1224,11 +1225,12 @@ fn painted_page(
     let mut xmap = XMap::new();
     let mut egmap: HashMap<Vec<u8>, (Option<f32>, Option<f32>)> = HashMap::new();
     let mut csmap: HashMap<Vec<u8>, Rc<PaintCs>> = HashMap::new();
+    let resource_scope = crate::walker::ResourceScope::page(access, page_id);
     for res in &chain {
         let _ = res.read(|dictionary| {
             overlay_xobjects(access, dictionary, &mut xmap);
             egmap.extend(extgstates_of(doc, dictionary));
-            csmap.extend(colorspaces_of(doc, access, dictionary));
+            csmap.extend(colorspaces_of(doc, access, &resource_scope, dictionary));
         });
     }
     let mut painted = Vec::new();
@@ -1257,7 +1259,12 @@ fn painted_page(
         if let Some(fr) = &f.scope.resources {
             let _ = fr.read(|resources| {
                 aeg.extend(extgstates_of(doc, resources));
-                acs.extend(colorspaces_of(doc, access, resources));
+                acs.extend(colorspaces_of(
+                    doc,
+                    access,
+                    &crate::walker::ResourceScope::own(fr.clone()),
+                    resources,
+                ));
             });
         }
         let mut g = GState::new(f.matrix.mul(actm), [0; 3], [0; 3], 1.0, 1.0, 1.0);
@@ -1583,7 +1590,12 @@ fn walk(
                         for (k, v) in extgstates_of(doc, resources) {
                             child_eg.insert(k, v);
                         }
-                        for (k, v) in colorspaces_of(doc, access, resources) {
+                        for (k, v) in colorspaces_of(
+                            doc,
+                            access,
+                            &crate::walker::ResourceScope::own(fr.clone()),
+                            resources,
+                        ) {
                             child_cs.insert(k, v);
                         }
                     });
@@ -2008,11 +2020,17 @@ mod tests {
         let mut xmap = XMap::new();
         let mut egmap: HashMap<Vec<u8>, (Option<f32>, Option<f32>)> = HashMap::new();
         let mut csmap: HashMap<Vec<u8>, Rc<PaintCs>> = HashMap::new();
+        let resource_scope = crate::walker::ResourceScope::page(&access, page_id);
         for res in &page_resource_chain(&access, page_id) {
             let _ = res.read(|dictionary| {
                 overlay_xobjects(&access, dictionary, &mut xmap);
                 egmap.extend(extgstates_of(doc, dictionary));
-                csmap.extend(colorspaces_of(doc, &access, dictionary));
+                csmap.extend(colorspaces_of(
+                    doc,
+                    &access,
+                    &resource_scope,
+                    dictionary,
+                ));
             });
         }
         let mut painted = Vec::new();

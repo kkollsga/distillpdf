@@ -19,8 +19,8 @@ use crate::raster::{
 };
 use crate::vector::ClipRect;
 use crate::walker::{
-    descend_form, has_subtype, overlay_resources, page_resources, page_xobjects, soft_mask_of,
-    xobject_at, Descend, PaintSeq,
+    descend_form, has_subtype, page_resources, page_xobjects, soft_mask_of,
+    xobject_at, Descend, PaintSeq, ResourceScope,
     ScopePolicy, SoftMask, XMap,
 };
 use lopdf::{Dictionary, Document, Object, ObjectId};
@@ -126,7 +126,7 @@ fn decode_ccitt(doc: &Document, dict: &Dictionary, content: &[u8]) -> Option<ima
 fn decode_rgb(
     doc: &Document,
     access: &dyn crate::access::DocumentAccess,
-    res: &Dictionary,
+    res: &ResourceScope,
     id: ObjectId,
 ) -> Option<image::RgbImage> {
     let stream = doc.get_object(id).ok()?.as_stream().ok()?;
@@ -155,7 +155,7 @@ fn decode_rgb(
 fn decode_smask(
     doc: &Document,
     access: &dyn crate::access::DocumentAccess,
-    res: &Dictionary,
+    res: &ResourceScope,
     dict: &Dictionary,
 ) -> Option<image::GrayImage> {
     let sid = dict.get(b"SMask").ok().and_then(|o| o.as_reference().ok())?;
@@ -194,7 +194,7 @@ fn decode_smask(
 fn decodable(
     doc: &Document,
     access: &dyn crate::access::DocumentAccess,
-    res: &Dictionary,
+    res: &ResourceScope,
     id: ObjectId,
 ) -> bool {
     let stream = match doc.get_object(id).ok().and_then(|o| o.as_stream().ok()) {
@@ -220,16 +220,16 @@ fn decodable(
 fn data_uri(
     doc: &Document,
     access: &dyn crate::access::DocumentAccess,
-    res: &Dictionary,
+    res: &ResourceScope,
     id: ObjectId,
     window: Option<(f32, f32, f32, f32)>,
     turn: i32,
 ) -> Option<String> {
     let stream = doc.get_object(id).ok()?.as_stream().ok()?;
-    let dict = stream.dict.clone();
+    let dict = &stream.dict;
     let b64 = base64::engine::general_purpose::STANDARD;
     let has_smask = dict.get(b"SMask").and_then(|o| o.as_reference()).is_ok();
-    let filters = filters_of(&dict);
+    let filters = filters_of(dict);
 
     // No soft mask: keep JPEG passthrough (cheap, lossless), assemble PNG for
     // Flate raster, bail on formats we can't decode.
@@ -248,7 +248,7 @@ fn data_uri(
             //     inverted in `to_html`.
             // A clip is the third reason the bytes cannot pass straight through: the
             // passthrough hands over the WHOLE authored image, and the page shows a window of it.
-            let inv = decode_inverts(doc, &dict);
+            let inv = decode_inverts(doc, dict);
             if inv || window.is_some() || turn != 0 || jpeg_is_cmyk(&jpeg) {
                 let rgb = decode_dct_rgb(&jpeg, inv)?;
                 return jpeg_uri(turn_pixels(crop_window(rgb, window), turn));
@@ -267,7 +267,7 @@ fn data_uri(
     // Soft mask present: decode base + mask, composite to RGBA, emit PNG.
     let base = decode_rgb(doc, access, res, id)?;
     let (w, h) = (base.width(), base.height());
-    let mask = decode_smask(doc, access, res, &dict);
+    let mask = decode_smask(doc, access, res, dict);
     let mut rgba = image::RgbaImage::new(w, h);
     let resized;
     let mask_ref = match &mask {
@@ -521,7 +521,7 @@ struct RawTile {
     /// dictionary, or a form's own `/Resources` overlaid on it. Decoding needs it because
     /// an image may name its colour space (`/ColorSpace /CS0`) rather than declare one
     /// (§8.6.3), and the name resolves only here. Shared, not cloned, per tile.
-    res: Rc<Dictionary>,
+    res: Rc<ResourceScope>,
     /// Paint position of this tile's `Do` in the page's content tree (see [`Placed::seq`]).
     seq: PaintSeq,
     /// The page-space clip in force at the `Do`, when it actually cropped this tile. The bbox
@@ -604,8 +604,8 @@ pub fn positioned_images(
             let ares = Rc::new(
                 f.scope
                     .resources
-                    .as_ref()
-                    .and_then(|resources| resources.read(Clone::clone).ok())
+                    .clone()
+                    .map(ResourceScope::own)
                     .unwrap_or_default(),
             );
             let here = PaintSeq::at(&[], content.operations.len() + k);
@@ -811,7 +811,7 @@ fn walk(
     access: &dyn crate::access::DocumentAccess,
     ops: &[lopdf::content::Operation],
     xmap: &XMap,
-    res: &Rc<Dictionary>,
+    res: &Rc<ResourceScope>,
     base: Mat,
     // The clipping rectangle in force where this stream is invoked (page space, y up).
     base_clip: Option<ClipRect>,
@@ -870,22 +870,27 @@ fn walk(
             // image". A `gs` that names no `/SMask` leaves the one in force alone; `/None`
             // clears it; a group we can bound becomes a window (see [`mask_window`]).
             "gs" if !o.is_empty() => {
-                let Some(gsd) = o[0].as_name().ok().and_then(|name| {
-                    res.get(b"ExtGState")
+                let Some(mask) = o[0].as_name().ok().and_then(|name| {
+                    res.read_named(access, b"ExtGState", name, |value| {
+                        crate::access::read_resolved(access, value, |value| {
+                            value
+                                .as_dict()
+                                .ok()
+                                .and_then(|dictionary| soft_mask_of(access, dictionary))
+                        })
                         .ok()
-                        .and_then(|value| crate::access::read_resolved(access, value, |o| o.as_dict().ok().cloned()).ok().flatten())
-                        .and_then(|states| states.get(name).ok().cloned())
-                        .and_then(|value| crate::access::read_resolved(access, &value, |o| o.as_dict().ok().cloned()).ok().flatten())
+                        .flatten()
+                    })
+                    .flatten()
                 })
                 else {
                     continue;
                 };
-                match soft_mask_of(access, &gsd) {
-                    Some(SoftMask::Cleared) => smask = None,
-                    Some(SoftMask::Group(group)) => {
+                match mask {
+                    SoftMask::Cleared => smask = None,
+                    SoftMask::Group(group) => {
                         smask = mask_window(doc, access, &group, xmap, ctm, depth, budget)
                     }
-                    None => {}
                 }
             }
             // The path operators, tracked for their EXTENT alone — a clip path is just a path
@@ -991,13 +996,7 @@ fn walk(
                             // inherited ones name by name. A form that declares none draws
                             // in the scope it was invoked from, and shares it — no clone.
                             let child = match &f.scope.resources {
-                                Some(fr) => {
-                                    let mut merged = (**res).clone();
-                                    let _ = fr.read(|resources| {
-                                        overlay_resources(access, &mut merged, resources)
-                                    });
-                                    Rc::new(merged)
-                                }
+                                Some(fr) => Rc::new(res.overlay(fr)),
                                 None => Rc::clone(res),
                             };
                             let sub_ctm = f.matrix.mul(ctm);
@@ -1244,13 +1243,13 @@ fn is_grid(tiles: &[&RawTile]) -> bool {
 fn decode_rgba(
     doc: &Document,
     access: &dyn crate::access::DocumentAccess,
-    res: &Dictionary,
+    res: &ResourceScope,
     id: ObjectId,
 ) -> Option<image::RgbaImage> {
     let base = decode_rgb(doc, access, res, id)?;
     let (w, h) = (base.width(), base.height());
-    let dict = doc.get_object(id).ok()?.as_stream().ok()?.dict.clone();
-    match decode_smask(doc, access, res, &dict) {
+    let dict = &doc.get_object(id).ok()?.as_stream().ok()?.dict;
+    match decode_smask(doc, access, res, dict) {
         Some(mask) => {
             let resized;
             let m = if mask.width() == w && mask.height() == h {

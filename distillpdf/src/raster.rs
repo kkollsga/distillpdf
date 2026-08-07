@@ -29,8 +29,8 @@
 
 use crate::access::{read_resolved, DocumentAccess};
 use crate::pdfobj::{content_bytes, deref, filters_of, is_generic_filter};
+use crate::walker::ResourceScope;
 use lopdf::{Dictionary, Document, Object};
-use std::borrow::Cow;
 
 pub(crate) fn filter_to_format(filters: &Option<Vec<String>>) -> &'static str {
     match filters {
@@ -89,7 +89,7 @@ pub(crate) const MAX_CS_DEPTH: u32 = 8;
 ///     device space, so the name has to be looked up in `res` before it means anything.
 pub(crate) fn read_color_space<R>(
     access: &dyn DocumentAccess,
-    resources: &Dictionary,
+    resources: &ResourceScope,
     object: &Object,
     depth: u32,
     mut inspect: impl FnMut(&Object) -> R,
@@ -99,7 +99,7 @@ pub(crate) fn read_color_space<R>(
 
 fn read_color_space_inner<R>(
     access: &dyn DocumentAccess,
-    resources: &Dictionary,
+    resources: &ResourceScope,
     object: &Object,
     depth: u32,
     inspect: &mut impl FnMut(&Object) -> R,
@@ -114,30 +114,17 @@ fn read_color_space_inner<R>(
         .ok()
         .flatten(),
         Object::Name(n) if !is_builtin_cs_name(n) => {
-            let Ok(color_spaces) = resources.get(b"ColorSpace") else {
-                return Some(inspect(object));
-            };
-            enum Lookup<R> {
-                Missing,
-                Found(Option<R>),
-            }
-            match read_resolved(access, color_spaces, |resolved| {
-                let Ok(dictionary) = resolved.as_dict() else {
-                    return Lookup::Missing;
-                };
-                let Ok(value) = dictionary.get(n.as_slice()) else {
-                    return Lookup::Missing;
-                };
-                Lookup::Found(read_color_space_inner(
-                    access,
-                    resources,
-                    value,
-                    depth + 1,
-                    inspect,
-                ))
-            }) {
-                Ok(Lookup::Found(value)) => value,
-                _ => Some(inspect(object)), // no such resource: report the name verbatim, honestly
+            match resources.read_named(access, b"ColorSpace", n, |value| {
+                    read_color_space_inner(
+                        access,
+                        resources,
+                        value,
+                        depth + 1,
+                        inspect,
+                    )
+                }) {
+                Some(result) => result,
+                None => Some(inspect(object)),
             }
         }
         other => Some(inspect(other)),
@@ -169,7 +156,7 @@ fn canonical_cs_name(n: &[u8]) -> String {
 pub(crate) fn image_color_space(
     doc: &Document,
     access: &dyn DocumentAccess,
-    res: &Dictionary,
+    res: &ResourceScope,
     dict: &Dictionary,
 ) -> Option<String> {
     read_color_space(access, res, dict.get(b"ColorSpace").ok()?, 0, |resolved| match resolved {
@@ -276,7 +263,7 @@ fn tint_lut(k: usize, f: &crate::function::Function, alt: &Cs) -> Vec<[u8; 3]> {
 pub(crate) fn cs_model(
     doc: &Document,
     access: &dyn crate::access::DocumentAccess,
-    res: &Dictionary,
+    res: &ResourceScope,
     o: &Object,
     depth: u32,
 ) -> Option<Cs> {
@@ -387,7 +374,7 @@ struct SamplePlan {
 fn sample_plan(
     doc: &Document,
     access: &dyn crate::access::DocumentAccess,
-    res: &Dictionary,
+    res: &ResourceScope,
     dict: &Dictionary,
 ) -> Option<SamplePlan> {
     let w = deref(doc, dict.get(b"Width").ok()?)?.as_i64().ok()?;
@@ -423,7 +410,7 @@ fn sample_plan(
 pub(crate) fn samples_decodable(
     doc: &Document,
     access: &dyn crate::access::DocumentAccess,
-    res: &Dictionary,
+    res: &ResourceScope,
     dict: &Dictionary,
 ) -> bool {
     sample_plan(doc, access, res, dict).is_some()
@@ -475,7 +462,7 @@ impl Samples {
 pub(crate) fn decode_samples(
     doc: &Document,
     access: &dyn crate::access::DocumentAccess,
-    res: &Dictionary,
+    res: &ResourceScope,
     stream: &lopdf::Stream,
 ) -> Option<Samples> {
     let dict = &stream.dict;
@@ -578,7 +565,7 @@ pub(crate) fn decode_samples(
 pub(crate) fn assemble_png(
     doc: &Document,
     access: &dyn crate::access::DocumentAccess,
-    res: &Dictionary,
+    res: &ResourceScope,
     stream: &lopdf::Stream,
 ) -> Option<Vec<u8>> {
     png_bytes(decode_samples(doc, access, res, stream)?.into_dynamic())
@@ -610,8 +597,8 @@ pub(crate) fn png_bytes(img: image::DynamicImage) -> Option<Vec<u8>> {
 /// back as a JPEG file and not as a blob nothing can open.
 ///
 /// The filter chain is read from the stream's own dict, so no caller can peel against a
-/// list that disagrees with the bytes. Borrows when there is nothing to peel (the common
-/// single-codec case), so the passthrough path copies no pixels.
+/// list that disagrees with the bytes. The returned leaf payload is owned so it cannot
+/// outlive a short resolver read through a stream-derived borrow.
 ///
 /// **Not a decode of the generic layers lopdf cannot apply.** `ASCIIHexDecode`/`AHx` are
 /// in the set above, but lopdf 0.40 answers `Unimplemented` for them, so a chain that
@@ -620,25 +607,25 @@ pub(crate) fn png_bytes(img: image::DynamicImage) -> Option<Vec<u8>> {
 /// degradation is *reported*, not silent: `pdfobj::stream_issues` flags exactly this stream
 /// as `filter-unapplied`, and a truncated Flate wrapper — which lopdf reports as `Ok` —
 /// as `flate-truncated`.
-pub(crate) fn codec_payload(stream: &lopdf::Stream) -> Cow<'_, [u8]> {
+pub(crate) fn codec_payload(stream: &lopdf::Stream) -> Vec<u8> {
     let lead: Vec<Object> = filters_of(&stream.dict)
         .iter()
         .take_while(|f| is_generic_filter(f))
         .map(|f| Object::Name(f.clone()))
         .collect();
     if lead.is_empty() {
-        return Cow::Borrowed(&stream.content);
+        return stream.content.clone();
     }
     let mut s = stream.clone();
     s.dict.set("Filter", Object::Array(lead));
     s.dict.remove(b"DecodeParms"); // codec parms don't apply to the generic layers
     s.dict.remove(b"DP");
     if crate::pdfobj::has_legacy_unsupported_filter(&s.dict) {
-        return Cow::Borrowed(&stream.content);
+        return stream.content.clone();
     }
     match s.decompressed_content() {
-        Ok(b) => Cow::Owned(b),
-        Err(_) => Cow::Borrowed(&stream.content),
+        Ok(bytes) => bytes,
+        Err(_) => stream.content.clone(),
     }
 }
 
@@ -786,27 +773,33 @@ mod tests {
     use lopdf::{dictionary, Stream, StringFormat};
 
     fn cs_model(doc: &Document, resources: &Dictionary, object: &Object, depth: u32) -> Option<Cs> {
-        super::cs_model(doc, &test_adapter(doc), resources, object, depth)
+        super::cs_model(doc, &test_adapter(doc), &ResourceScope::test_owned(resources), object, depth)
     }
 
     fn samples_decodable(doc: &Document, resources: &Dictionary, dict: &Dictionary) -> bool {
-        super::samples_decodable(doc, &test_adapter(doc), resources, dict)
+        super::samples_decodable(doc, &test_adapter(doc), &ResourceScope::test_owned(resources), dict)
     }
 
     fn decode_samples(doc: &Document, resources: &Dictionary, stream: &Stream) -> Option<Samples> {
-        super::decode_samples(doc, &test_adapter(doc), resources, stream)
+        super::decode_samples(doc, &test_adapter(doc), &ResourceScope::test_owned(resources), stream)
     }
 
     fn assemble_png(doc: &Document, resources: &Dictionary, stream: &Stream) -> Option<Vec<u8>> {
-        super::assemble_png(doc, &test_adapter(doc), resources, stream)
+        super::assemble_png(doc, &test_adapter(doc), &ResourceScope::test_owned(resources), stream)
     }
 
     fn image_color_space(doc: &Document, resources: &Dictionary, dict: &Dictionary) -> Option<String> {
-        super::image_color_space(doc, &test_adapter(doc), resources, dict)
+        super::image_color_space(doc, &test_adapter(doc), &ResourceScope::test_owned(resources), dict)
     }
 
     fn resolve_cs(doc: &Document, resources: &Dictionary, object: &Object, depth: u32) -> Option<Object> {
-        super::read_color_space(&test_adapter(doc), resources, object, depth, Clone::clone)
+        super::read_color_space(
+            &test_adapter(doc),
+            &ResourceScope::test_owned(resources),
+            object,
+            depth,
+            Clone::clone,
+        )
     }
 
     fn stream(filters: &[&str], content: Vec<u8>) -> Stream {
@@ -854,7 +847,7 @@ mod tests {
         // as the ASCII blob nothing can open — the shape reportlab writes.
         let jpeg = b"\xff\xd8\xff\xe0hello";
         let s = stream(&["ASCII85Decode", "DCTDecode"], b"s4IA0BOu!rDZ~>".to_vec());
-        assert_eq!(codec_payload(&s).as_ref(), jpeg);
+        assert_eq!(codec_payload(&s).as_slice(), jpeg);
     }
 
     #[test]
@@ -866,14 +859,14 @@ mod tests {
         let hex = b"ffd8ffe068656c6c6f>".to_vec();
         let s = stream(&["ASCIIHexDecode", "DCTDecode"], hex.clone());
         assert!(crate::pdfobj::has_legacy_unsupported_filter(&s.dict));
-        assert_eq!(codec_payload(&s).as_ref(), hex);
+        assert_eq!(codec_payload(&s).as_slice(), hex);
     }
 
     #[test]
     fn codec_payload_hands_back_the_stream_verbatim_when_there_is_nothing_to_peel() {
         // A bare codec stream: no generic layer, so the bytes ARE the payload.
         let s = stream(&["DCTDecode"], b"\xff\xd8raw jpeg".to_vec());
-        assert_eq!(codec_payload(&s).as_ref(), b"\xff\xd8raw jpeg");
+        assert_eq!(codec_payload(&s).as_slice(), b"\xff\xd8raw jpeg");
         // A stream whose declared Flate wrapper is not actually deflate comes back EMPTY,
         // not raw: lopdf's zlib reader swallows its error and returns the partial output it
         // managed (the same lopdf quirk `pdfobj::content_bytes` documents), so the
@@ -888,7 +881,7 @@ mod tests {
         // leaving it on the peeling copy makes lopdf misapply it.
         let mut s = stream(&["ASCII85Decode", "CCITTFaxDecode"], b"88/~>".to_vec()); // "Hi"
         s.dict.set("DecodeParms", dictionary! { "K" => -1i64, "Columns" => 1728i64 });
-        assert_eq!(codec_payload(&s).as_ref(), b"Hi");
+        assert_eq!(codec_payload(&s).as_slice(), b"Hi");
     }
 
     #[test]

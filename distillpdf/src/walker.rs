@@ -124,6 +124,69 @@ pub(crate) struct FormDescent {
     pub matrix: Mat,
 }
 
+/// A nearest-wins resource overlay that retains only owner-pinned dictionary handles.
+#[derive(Clone, Default)]
+pub(crate) struct ResourceScope {
+    layers: Vec<DictionaryHandle>,
+}
+
+impl ResourceScope {
+    pub(crate) fn page(access: &dyn DocumentAccess, page: ObjectId) -> Self {
+        Self {
+            layers: page_resource_chain(access, page),
+        }
+    }
+
+    pub(crate) fn own(resources: DictionaryHandle) -> Self {
+        Self {
+            layers: vec![resources],
+        }
+    }
+
+    pub(crate) fn overlay(&self, resources: &DictionaryHandle) -> Self {
+        let mut layers = self.layers.clone();
+        layers.push(resources.clone());
+        Self { layers }
+    }
+
+    /// Read one named entry from a resource kind, searching nearest scope first.
+    pub(crate) fn read_named<R>(
+        &self,
+        access: &dyn DocumentAccess,
+        kind: &[u8],
+        name: &[u8],
+        mut inspect: impl FnMut(&Object) -> R,
+    ) -> Option<R> {
+        for layer in self.layers.iter().rev() {
+            let found = layer
+                .read(|resources| {
+                    let kind = resources.get(kind).ok()?;
+                    read_resolved(access, kind, |kind| {
+                        let kind = kind.as_dict().ok()?;
+                        let value = kind.get(name).ok()?;
+                        Some(inspect(value))
+                    })
+                    .ok()
+                    .flatten()
+                })
+                .ok()
+                .flatten();
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_owned(resources: &Dictionary) -> Self {
+        let mut document = lopdf::Document::with_version("1.7");
+        let id = document.add_object(Object::Dictionary(resources.clone()));
+        let adapter = crate::access::test_adapter(&document);
+        Self::own(adapter.page(id).unwrap())
+    }
+}
+
 /// The outcome of a `Do` on a Form XObject.
 pub(crate) enum Descend {
     /// Run this form's content.
@@ -180,45 +243,12 @@ pub(crate) fn page_xobjects(access: &dyn DocumentAccess, page_id: ObjectId) -> X
     map
 }
 
-/// Overlay one resource dictionary onto another, merging the per-kind sub-dictionaries
-/// **one level deep**: `/ColorSpace`, `/Font`, `/XObject` and friends are name → resource
-/// maps, so an inner dictionary that defines `/CS1` must not delete the `/CS0` an outer one
-/// defined. Within a kind, the inner name wins — the same nearest-wins precedence
-/// [`overlay_xobjects`] applies.
-///
-/// The sub-dictionaries are dereferenced on the way in (they are usually written as
-/// indirect objects) so the merged result is self-contained: a consumer can read it with a
-/// plain `get`, and it stays valid after the scope that produced it is gone.
-pub(crate) fn overlay_resources(access: &dyn DocumentAccess, base: &mut Dictionary, inner: &Dictionary) {
-    for (key, val) in inner.iter() {
-        let Some(kind) = read_resolved(access, val, |o| o.as_dict().ok().cloned()).ok().flatten() else {
-            base.set(key.clone(), val.clone()); // /ProcSet and friends: not a name map
-            continue;
-        };
-        match base.get(key).ok().and_then(|o| o.as_dict().ok()).cloned() {
-            Some(mut merged) => {
-                for (name, res) in kind.iter() {
-                    merged.set(name.clone(), res.clone());
-                }
-                base.set(key.clone(), Object::Dictionary(merged));
-            }
-            None => base.set(key.clone(), Object::Dictionary(kind.clone())),
-        }
-    }
-}
-
-/// A page's effective resource dictionary: its whole [`page_resource_chain`] folded
-/// outermost-first through [`overlay_resources`], so every name the page can name resolves
-/// in one dictionary.
+/// A page's effective resource scope, kept as its owner-pinned nearest-wins layers.
 ///
 /// This is what a `/ColorSpace /CS0` on one of the page's images has to be looked up in
 /// (§8.6.3) — the name alone describes nothing.
-pub(crate) fn page_resources(access: &dyn DocumentAccess, page_id: ObjectId) -> Dictionary {
-    let mut out = Dictionary::new();
-    for res in page_resource_chain(access, page_id) {
-        let _ = res.read(|dictionary| overlay_resources(access, &mut out, dictionary));
-    }
-    out
+pub(crate) fn page_resources(access: &dyn DocumentAccess, page_id: ObjectId) -> ResourceScope {
+    ResourceScope::page(access, page_id)
 }
 
 /// Resolve a `Do` operand to the XObject stream it names, in the scope in force.
@@ -253,16 +283,22 @@ pub(crate) fn has_subtype(stream: &lopdf::Stream, expected: &[u8]) -> bool {
 /// (§11.4.7.2) — so inheriting the alpha into the group instead lets the group's first
 /// `gs` overwrite it, silently discarding the caller's transparency.
 pub(crate) fn is_transparency_group(access: &dyn DocumentAccess, stream: &lopdf::Stream) -> bool {
-    let Some(group) = stream.dict.get(b"Group").ok().and_then(|value| {
-        read_resolved(access, value, |o| o.as_dict().ok().cloned()).ok().flatten()
-    }) else {
+    let Ok(group) = stream.dict.get(b"Group") else {
         return false;
     };
-    group
-        .get(b"S")
-        .ok()
-        .and_then(|value| read_resolved(access, value, |o| o.as_name().ok().map(<[u8]>::to_vec)).ok().flatten())
-        .is_some_and(|name| name == b"Transparency")
+    read_resolved(access, group, |group| {
+        let Ok(group) = group.as_dict() else {
+            return false;
+        };
+        let Ok(subtype) = group.get(b"S") else {
+            return false;
+        };
+        read_resolved(access, subtype, |subtype| {
+            subtype.as_name().is_ok_and(|name| name == b"Transparency")
+        })
+        .unwrap_or(false)
+    })
+    .unwrap_or(false)
 }
 
 /// A form XObject's `/BBox` as a page-space clipping rectangle under `ctm`, or `None` when

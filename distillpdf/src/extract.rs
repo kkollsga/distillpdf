@@ -3,9 +3,10 @@
 //! Pure Rust: these return plain owned structs. The PyO3 layer (`src/lib.rs`) assembles the
 //! Python dicts/lists from them — no pyo3 types appear in this module.
 
-use crate::pdfobj::{deref, filters_of, sub_dict};
+use crate::pdfobj::{deref, filters_of};
 use crate::raster::{assemble_png, codec_payload, filter_to_format, image_bpc, image_color_space, normalized_jpeg_png};
 use crate::text::{self, Span};
+use crate::{access::DictionaryHandle, walker::ResourceScope};
 use lopdf::{Dictionary, Document, ObjectId};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -69,15 +70,13 @@ pub struct TableInfo {
 fn page_resource_dicts(
     access: &dyn crate::access::DocumentAccess,
     page_id: ObjectId,
-) -> Vec<Dictionary> {
-    let mut queue: VecDeque<(Dictionary, u32)> = VecDeque::new();
+) -> Vec<DictionaryHandle> {
+    let mut queue: VecDeque<(DictionaryHandle, u32)> = VecDeque::new();
     let mut seen: HashSet<ObjectId> = HashSet::new();
     // The adapter returns outermost → page for overlay consumers. Reporting has always
     // enumerated page → outermost, so reverse it to preserve every existing row index.
     for resources in access.page_resource_chain(page_id).unwrap_or_default().into_iter().rev() {
-        if let Ok(resources) = resources.read(Clone::clone) {
-            queue.push_back((resources, 0));
-        }
+        queue.push_back((resources, 0));
     }
     resource_bfs(access, queue, &mut seen)
 }
@@ -95,8 +94,8 @@ fn page_resource_dicts(
 fn appearance_resource_dicts(
     access: &dyn crate::access::DocumentAccess,
     page_id: ObjectId,
-) -> Vec<Dictionary> {
-    let mut queue: VecDeque<(Dictionary, u32)> = VecDeque::new();
+) -> Vec<DictionaryHandle> {
+    let mut queue: VecDeque<(DictionaryHandle, u32)> = VecDeque::new();
     let mut seen: HashSet<ObjectId> = HashSet::new();
     for (id, stream) in crate::walker::appearance_streams(access, page_id) {
         if !seen.insert(id) {
@@ -104,15 +103,9 @@ fn appearance_resource_dicts(
         }
         // §12.5.5: an appearance stream's resources are its OWN — it inherits nothing from
         // the page, the same rule the nested-form step below applies.
-        stream.read(|stream| {
-            if let Some(resources) = stream.dict.get(b"Resources").ok().and_then(|value| {
-                crate::access::read_resolved(access, value, |o| o.as_dict().ok().cloned())
-                    .ok()
-                    .flatten()
-            }) {
-                queue.push_back((resources, 0));
-            }
-        });
+        if let Ok(resources) = stream.dictionary_entry(access, b"Resources") {
+            queue.push_back((resources, 0));
+        }
     }
     resource_bfs(access, queue, &mut seen)
 }
@@ -123,43 +116,44 @@ fn appearance_resource_dicts(
 /// has already visited); [`crate::MAX_FORM_DEPTH`] caps nesting.
 fn resource_bfs(
     access: &dyn crate::access::DocumentAccess,
-    mut queue: VecDeque<(Dictionary, u32)>,
+    mut queue: VecDeque<(DictionaryHandle, u32)>,
     seen: &mut HashSet<ObjectId>,
-) -> Vec<Dictionary> {
+) -> Vec<DictionaryHandle> {
     let mut out = Vec::new();
     while let Some((res, depth)) = queue.pop_front() {
         if depth >= crate::MAX_FORM_DEPTH {
             out.push(res);
             continue; // nesting cap (a self-referential form is already cut by `seen`)
         }
-        let Some(xobjects) = res.get(b"XObject").ok().and_then(|value| {
-            crate::access::read_resolved(access, value, |o| o.as_dict().ok().cloned())
-                .ok()
-                .flatten()
-        }) else {
-            out.push(res);
-            continue;
-        };
-        for (_, v) in xobjects.iter() {
-            let Ok(id) = v.as_reference() else { continue };
-            if !seen.insert(id) {
-                continue; // already walked: a shared or self-referential form
-            }
-            let Ok(stream) = access.stream(id) else {
-                continue;
+        let _ = res.read(|resources| {
+            let Ok(xobjects) = resources.get(b"XObject") else {
+                return;
             };
-            stream.read(|stream| {
-                if crate::walker::has_subtype(stream, b"Form") {
-                    if let Some(resources) = stream.dict.get(b"Resources").ok().and_then(|value| {
-                        crate::access::read_resolved(access, value, |o| o.as_dict().ok().cloned())
-                            .ok()
-                            .flatten()
-                    }) {
-                        queue.push_back((resources, depth + 1));
+            let _ = crate::access::read_resolved(access, xobjects, |xobjects| {
+                let Ok(xobjects) = xobjects.as_dict() else {
+                    return;
+                };
+                for (_, value) in xobjects.iter() {
+                    let Ok(id) = value.as_reference() else {
+                        continue;
+                    };
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    let Ok(stream) = access.stream(id) else {
+                        continue;
+                    };
+                    if stream
+                        .read(|stream| crate::walker::has_subtype(stream, b"Form"))
+                        .unwrap_or(false)
+                    {
+                        if let Ok(resources) = stream.dictionary_entry(access, b"Resources") {
+                            queue.push_back((resources, depth + 1));
+                        }
                     }
                 }
             });
-        }
+        });
         out.push(res);
     }
     out
@@ -291,24 +285,33 @@ fn drawn_images(
 /// says". That is what makes the short-circuit semantics-preserving rather than a heuristic.
 fn reaches_image_xobject(
     access: &dyn crate::access::DocumentAccess,
-    dicts: &[Dictionary],
+    dicts: &[DictionaryHandle],
 ) -> bool {
-    dicts.iter().any(|res| {
-        res.get(b"XObject").ok().and_then(|value| {
-            crate::access::read_resolved(access, value, |o| o.as_dict().ok().cloned())
+    dicts.iter().any(|resources| {
+        resources
+            .read(|resources| {
+                let value = resources.get(b"XObject").ok()?;
+                crate::access::read_resolved(access, value, |xobjects| {
+                    let xobjects = xobjects.as_dict().ok()?;
+                    Some(xobjects.iter().any(|(_, value)| {
+                        value
+                            .as_reference()
+                            .ok()
+                            .and_then(|id| access.stream(id).ok())
+                            .and_then(|stream| {
+                                stream.read(|stream| {
+                                    crate::walker::has_subtype(stream, b"Image")
+                                })
+                            })
+                            .unwrap_or(false)
+                    }))
+                })
                 .ok()
                 .flatten()
-        }).is_some_and(|xobjects| {
-            xobjects.iter().any(|(_, v)| {
-                v.as_reference()
-                    .ok()
-                    .and_then(|id| access.stream(id).ok())
-                    .and_then(|stream| {
-                        stream.read(|s| crate::walker::has_subtype(s, b"Image"))
-                    })
-                    .unwrap_or(false)
             })
-        })
+            .ok()
+            .flatten()
+            .unwrap_or(false)
     })
 }
 
@@ -385,68 +388,81 @@ fn extract_images_inner(
         let mut from_this_dict: Vec<ObjectId> = Vec::new();
         for res in dicts {
             seen.extend(from_this_dict.drain(..));
-            let Some(xobjects) = res.get(b"XObject").ok().and_then(|value| {
-                crate::access::read_resolved(access, value, |o| o.as_dict().ok().cloned())
-                    .ok()
-                    .flatten()
-            }) else {
-                continue;
-            };
-            for (_, v) in xobjects.iter() {
-                let Ok(id) = v.as_reference() else { continue };
-                if drawn.as_ref().is_some_and(|d| !d.contains(&id)) {
-                    continue; // reachable from the resource tree, but this page never paints it
-                }
-                if seen.contains(&id) {
-                    continue; // already reported from an outer resource dictionary
-                }
-                let Ok(stream) = access.stream(id) else {
-                    continue;
+            let scope = ResourceScope::own(res.clone());
+            let _ = res.read(|resources| {
+                let Ok(xobjects) = resources.get(b"XObject") else {
+                    return;
                 };
-                let row = stream.read(|stream| {
-                    let dict = &stream.dict;
-                    if !crate::walker::has_subtype(stream, b"Image") {
-                        return None;
-                    }
-                    let (Ok(width), Ok(height)) = (
-                        dict.get(b"Width").and_then(|o| o.as_i64()),
-                        dict.get(b"Height").and_then(|o| o.as_i64()),
-                    ) else { return None };
-                    let filters = image_filters(dict);
-                    let mut format = filter_to_format(&Some(filters));
-                    let mut data = if format == "raw" {
-                        match assemble_png(doc, access, &res, stream) {
-                            Some(png) => {
-                                format = "png";
-                                png
-                            }
-                            None => stream.content.clone(),
-                        }
-                    } else {
-                        codec_payload(stream).into_owned()
+                let _ = crate::access::read_resolved(access, xobjects, |xobjects| {
+                    let Ok(xobjects) = xobjects.as_dict() else {
+                        return;
                     };
-                    if format == "jpeg" {
-                        if let Some(png) = normalized_jpeg_png(doc, dict, &data) {
-                            format = "png";
-                            data = png;
+                    for (_, value) in xobjects.iter() {
+                        let Ok(id) = value.as_reference() else {
+                            continue;
+                        };
+                        if drawn.as_ref().is_some_and(|drawn| !drawn.contains(&id))
+                            || seen.contains(&id)
+                        {
+                            continue;
                         }
+                        let Ok(stream) = access.stream(id) else {
+                            continue;
+                        };
+                        let row = stream
+                            .read(|stream| {
+                                let dict = &stream.dict;
+                                if !crate::walker::has_subtype(stream, b"Image") {
+                                    return None;
+                                }
+                                let (Ok(width), Ok(height)) = (
+                                    dict.get(b"Width").and_then(|object| object.as_i64()),
+                                    dict.get(b"Height").and_then(|object| object.as_i64()),
+                                ) else {
+                                    return None;
+                                };
+                                let filters = image_filters(dict);
+                                let mut format = filter_to_format(&Some(filters));
+                                let mut data = if format == "raw" {
+                                    match assemble_png(doc, access, &scope, stream) {
+                                        Some(png) => {
+                                            format = "png";
+                                            png
+                                        }
+                                        None => stream.content.clone(),
+                                    }
+                                } else {
+                                    codec_payload(stream)
+                                };
+                                if format == "jpeg" {
+                                    if let Some(png) = normalized_jpeg_png(doc, dict, &data) {
+                                        format = "png";
+                                        data = png;
+                                    }
+                                }
+                                Some(ImageInfo {
+                                    page: pno,
+                                    index,
+                                    width,
+                                    height,
+                                    color_space: image_color_space(
+                                        doc, access, &scope, dict,
+                                    ),
+                                    bits_per_component: image_bpc(doc, dict),
+                                    format,
+                                    data,
+                                })
+                            })
+                            .flatten();
+                        let Some(row) = row else {
+                            continue;
+                        };
+                        out.push(row);
+                        index += 1;
+                        from_this_dict.push(id);
                     }
-                    Some(ImageInfo {
-                        page: pno,
-                        index,
-                        width,
-                        height,
-                        color_space: image_color_space(doc, access, &res, dict),
-                        bits_per_component: image_bpc(doc, dict),
-                        format,
-                        data,
-                    })
-                }).flatten();
-                let Some(row) = row else { continue };
-                out.push(row);
-                index += 1;
-                from_this_dict.push(id);
-            }
+                });
+            });
         }
     }
     out
@@ -2550,45 +2566,68 @@ pub fn extract_fonts(
         // several forms is one row, while the same name bound to different objects in the
         // page and in a form is two. `BTreeMap` keeps rows in resource-name order, which
         // is the order the non-recursive accessor produced them in.
-        let mut fonts: BTreeMap<(Vec<u8>, Option<ObjectId>), Dictionary> = BTreeMap::new();
+        let mut fonts: BTreeMap<
+            (Vec<u8>, Option<ObjectId>),
+            (String, String, String, bool, bool),
+        > = BTreeMap::new();
         for res in page_resource_dicts(access, page_id) {
             // A form's fonts live in its OWN /Resources (PDF 32000-1 §8.10.2) — the same
             // rule text.rs:1213 follows when it decodes a form's content.
-            let Some(fdict) = sub_dict(doc, &res, b"Font") else {
-                continue;
-            };
-            for (name, v) in fdict.iter() {
-                let Some(dict) = deref(doc, v).and_then(|o| o.as_dict().ok()) else {
-                    continue;
+            let _ = res.read(|resources| {
+                let Ok(fonts_object) = resources.get(b"Font") else {
+                    return;
                 };
-                fonts.entry((name.clone(), v.as_reference().ok())).or_insert_with(|| dict.clone());
-            }
+                let _ = crate::access::read_resolved(access, fonts_object, |fonts_dict| {
+                    let Ok(fonts_dict) = fonts_dict.as_dict() else {
+                        return;
+                    };
+                    for (name, value) in fonts_dict.iter() {
+                        let parsed = crate::access::read_resolved(access, value, |font| {
+                            let dict = font.as_dict().ok()?;
+                            let subtype = dict
+                                .get(b"Subtype")
+                                .and_then(|object| object.as_name())
+                                .map(|name| String::from_utf8_lossy(name).into_owned())
+                                .unwrap_or_default();
+                            let base_font = dict
+                                .get(b"BaseFont")
+                                .and_then(|object| object.as_name())
+                                .map(|name| String::from_utf8_lossy(name).into_owned())
+                                .unwrap_or_default();
+                            let encoding = dict
+                                .get(b"Encoding")
+                                .ok()
+                                .and_then(|object| object.as_name().ok())
+                                .map(|name| String::from_utf8_lossy(name).into_owned())
+                                .unwrap_or_else(|| "custom".to_string());
+                            Some((
+                                subtype,
+                                base_font,
+                                encoding,
+                                font_embedded(doc, dict),
+                                dict.has(b"ToUnicode"),
+                            ))
+                        })
+                        .ok()
+                        .flatten();
+                        if let Some(parsed) = parsed {
+                            fonts
+                                .entry((name.clone(), value.as_reference().ok()))
+                                .or_insert(parsed);
+                        }
+                    }
+                });
+            });
         }
-        for ((name, _), dict) in fonts {
-            let subtype = dict
-                .get(b"Subtype")
-                .and_then(|o| o.as_name())
-                .map(|n| String::from_utf8_lossy(n).into_owned())
-                .unwrap_or_default();
-            let base_font = dict
-                .get(b"BaseFont")
-                .and_then(|o| o.as_name())
-                .map(|n| String::from_utf8_lossy(n).into_owned())
-                .unwrap_or_default();
-            let encoding = dict
-                .get(b"Encoding")
-                .ok()
-                .and_then(|o| o.as_name().ok())
-                .map(|n| String::from_utf8_lossy(n).into_owned())
-                .unwrap_or_else(|| "custom".to_string());
+        for ((name, _), (subtype, base_font, encoding, embedded, has_tounicode)) in fonts {
             out.push(FontInfo {
                 page: pno,
                 name: String::from_utf8_lossy(&name).into_owned(),
                 subtype,
                 base_font,
                 encoding,
-                embedded: font_embedded(doc, &dict),
-                has_tounicode: dict.has(b"ToUnicode"),
+                embedded,
+                has_tounicode,
             });
         }
     }
@@ -3259,8 +3298,20 @@ mod tests {
         let page1 = *doc.get_pages().get(&1).expect("page 1");
         let reachable: usize = page_resource_dicts(&test_adapter(&doc), page1)
             .iter()
-            .filter_map(|r| sub_dict(&doc, r, b"XObject"))
-            .map(|x| x.iter().count())
+            .map(|resources| {
+                resources
+                    .read(|resources| {
+                        let value = resources.get(b"XObject").ok()?;
+                        crate::access::read_resolved(&test_adapter(&doc), value, |value| {
+                            value.as_dict().ok().map(|xobjects| xobjects.iter().count())
+                        })
+                        .ok()
+                        .flatten()
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0)
+            })
             .sum();
         assert_eq!(reachable, 5, "page + form resources list 3 + 2 XObject entries");
     }
