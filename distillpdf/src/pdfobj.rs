@@ -10,7 +10,7 @@
 //!
 //! **The rule this module encodes:** mechanics and policy live here; interpretation stays
 //! with the consumer. Where two consumers legitimately want different behaviour that
-//! difference is a *named function* with a documented invariant ([`num`] vs [`num_deref`]),
+//! difference is a *named function* with a documented invariant ([`num`] vs [`num_resolved`]),
 //! never two copies of one name.
 //!
 //! Every function here is total: malformed input degrades (a default, `None`, or the raw
@@ -49,7 +49,7 @@ pub(crate) fn deref<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Object> 
 ///
 /// It is the **wrong** reader for a value pulled out of a dictionary or array, where an
 /// indirect number is perfectly legal (`/MediaBox [0 0 12 0 R 13 0 R]`): use
-/// [`num_deref`] there, or the number silently becomes `0.0`.
+/// [`num_resolved`] there, or the number silently becomes `0.0`.
 pub(crate) fn num(o: &Object) -> f32 {
     match o {
         Object::Integer(i) => *i as f32,
@@ -58,16 +58,8 @@ pub(crate) fn num(o: &Object) -> f32 {
     }
 }
 
-/// A numeric object as `f32`, **following an indirect reference** first; `0.0` for a
-/// non-numeric or dangling value.
-///
-/// The reader for dictionary and array values (page boxes, `/Decode`, `/Matrix` stored
-/// indirectly). Terminates for the same reason [`deref`] does.
-pub(crate) fn num_deref(doc: &Document, o: &Object) -> f32 {
-    deref(doc, o).map(num).unwrap_or(0.0)
-}
-
-/// Backend-neutral form of [`num_deref`].
+/// A numeric object as `f32`, resolving an indirect reference through the selected backend
+/// first; `0.0` for a non-numeric or dangling value.
 pub(crate) fn num_resolved(access: &dyn DocumentAccess, object: &Object) -> f32 {
     read_resolved(access, object, num).unwrap_or(0.0)
 }
@@ -127,7 +119,7 @@ pub(crate) fn has_legacy_unsupported_filter(dict: &Dictionary) -> bool {
 /// - `/MediaBox` and `/CropBox` are **inheritable** page attributes (PDF 32000-1 §7.7.3.4):
 ///   a writer may state one once on a `/Pages` node and omit it from every page. The walk
 ///   climbs `/Parent` until it finds a box, and takes the *nearest* ancestor's.
-/// - Extents are read with [`num_deref`], because an array element may legally be an
+/// - Extents are read with [`num_resolved`], because an array element may legally be an
 ///   indirect reference (`/MediaBox [0 0 12 0 R 13 0 R]`). Reading them with [`num`] makes
 ///   such a box measure zero — which is how a real page becomes a guessed US-Letter one.
 /// - Termination is bounded twice over: a visited set (a `/Parent` cycle returns `None`)
@@ -530,28 +522,30 @@ mod tests {
     }
 
     #[test]
-    fn num_is_direct_only_and_num_deref_follows_the_reference() {
+    fn num_is_direct_only_and_num_resolved_follows_the_reference() {
         // The pin for the split: an indirect number is 0.0 to `num` (content-stream
-        // operands may not be indirect) and its real value to `num_deref` (dict/array
+        // operands may not be indirect) and its real value to `num_resolved` (dict/array
         // values may). Reading a dict value with `num` is how an indirect /MediaBox
         // element silently becomes 0.0.
         let (doc, ids) = doc_with(vec![Object::Real(612.0)]);
+        let access = test_adapter(&doc);
         let r = Object::Reference(ids[0]);
         assert_eq!(num(&r), 0.0);
-        assert_eq!(num_deref(&doc, &r), 612.0);
+        assert_eq!(num_resolved(&access, &r), 612.0);
         for direct in [Object::Integer(-7), Object::Real(2.5)] {
-            assert_eq!(num(&direct), num_deref(&doc, &direct));
+            assert_eq!(num(&direct), num_resolved(&access, &direct));
         }
     }
 
     #[test]
     fn num_degrades_non_numeric_and_dangling_input_to_zero() {
         let (doc, _) = doc_with(vec![Object::Null]);
+        let access = test_adapter(&doc);
         for o in [Object::Null, Object::Boolean(true), Object::Name(b"Foo".to_vec()), Object::Array(vec![])] {
             assert_eq!(num(&o), 0.0);
-            assert_eq!(num_deref(&doc, &o), 0.0);
+            assert_eq!(num_resolved(&access, &o), 0.0);
         }
-        assert_eq!(num_deref(&doc, &Object::Reference((9999, 0))), 0.0);
+        assert_eq!(num_resolved(&access, &Object::Reference((9999, 0))), 0.0);
     }
 
     #[test]
@@ -765,7 +759,7 @@ mod tests {
 
     #[test]
     fn page_box_resolves_indirect_extents() {
-        // THE reason this is `num_deref` and not `num`: an array element may legally be an
+        // THE reason this is `num_resolved` and not `num`: an array element may legally be an
         // indirect reference, and reading it directly makes the whole page measure zero.
         let mut doc = Document::with_version("1.5");
         let w = doc.add_object(Object::Integer(1008));

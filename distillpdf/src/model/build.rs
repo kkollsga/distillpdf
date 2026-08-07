@@ -26,6 +26,7 @@ use super::{
     SCHEMA_VERSION,
 };
 use crate::html::{Bbox, ElKind, PageIR};
+use crate::access::DocumentAccess;
 use crate::{frontmatter, html, links, nav, ocr};
 
 /// Build the document model from a parsed PDF plus its raw bytes (the raw bytes back the
@@ -97,7 +98,7 @@ pub(crate) fn build_model(
     };
 
     // Links, named destinations, TOC — straight from the existing extractors.
-    let links: Vec<Link> = links::extract_links(doc)
+    let links: Vec<Link> = links::extract_links(access)
         .into_iter()
         .map(|l| Link {
             page: l.page,
@@ -107,14 +108,14 @@ pub(crate) fn build_model(
             remote_file: l.remote_file,
         })
         .collect();
-    let named_dests: Vec<NamedDest> = links::named_destinations(doc)
+    let named_dests: Vec<NamedDest> = links::named_destinations(access)
         .into_iter()
         .map(|d| NamedDest { name: d.name, page: d.page })
         .collect();
     // Prefer the PDF's own outline; fall back to the section tree (same precedence as the
     // rendered <nav>). The fallback is derived from `sections` — the heading tree we already
     // reconstructed — so anchors are exactly the section ids.
-    let toc = build_toc(doc, &sections);
+    let toc = build_toc(access, &sections);
 
     // Assets: one per figure block that carried an image. Under `assets="figures"`/`"full"`
     // we capture the figure's actual bytes (re-rendering inline once), fill sha256 + width +
@@ -325,8 +326,8 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 /// Build the model TOC: the PDF's own outline when present (the author's clean TOC, with
 /// `page-N` anchors), else the heading tree derived from `sections` (with `sec-…` anchors
 /// that resolve into both the HTML and the model's section ids).
-fn build_toc(doc: &Document, sections: &[Section]) -> Vec<TocEntry> {
-    let outline = links::outline(doc);
+fn build_toc(access: &dyn DocumentAccess, sections: &[Section]) -> Vec<TocEntry> {
+    let outline = links::outline(access);
     if !outline.is_empty() {
         return outline
             .into_iter()

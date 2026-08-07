@@ -483,7 +483,7 @@ pub(crate) fn form_ops(stream: &lopdf::Stream) -> Option<Vec<Operation>> {
 
 /// A form's `/Matrix`, identity when absent or malformed.
 ///
-/// The array and its elements are read through `deref`/`num_deref`: `/Matrix` is a
+/// The array and its elements are read through `read_resolved`/`num_resolved`: `/Matrix` is a
 /// dictionary value, not a content-stream operand, so any part of it may legally be an
 /// indirect reference. A direct-only read turned `[1 0 0 1 0 5 0 R]` into a matrix with a
 /// zero component — which collapses the whole form onto a point or a line, silently.

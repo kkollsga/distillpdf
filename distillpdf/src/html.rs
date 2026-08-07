@@ -1177,7 +1177,7 @@ pub(crate) fn render_doc_elements(
     // (#cite.x / #figure.n / #equation.n / #section.x) — resolving to the exact
     // target — and only falls back to "#page-N" when there is no name.
     let mut links_by_page: std::collections::HashMap<u32, Vec<LinkBox>> = std::collections::HashMap::new();
-    for lk in links::extract_links(doc) {
+    for lk in links::extract_links(access) {
         let href = match (&lk.uri, &lk.dest_name, lk.dest_page) {
             (Some(u), _, _) => u.clone(),
             (None, Some(name), _) => format!("#{}", slug(name)),
@@ -1191,14 +1191,14 @@ pub(crate) fn render_doc_elements(
     // Named-destination targets, grouped by page: each becomes an anchor id at (or
     // near) its position so the semantic links above actually resolve.
     let mut dests_by_page: std::collections::HashMap<u32, Vec<(String, Option<f32>)>> = std::collections::HashMap::new();
-    for d in links::named_destinations(doc) {
+    for d in links::named_destinations(access) {
         dests_by_page.entry(d.page).or_default().push((slug(&d.name), d.y));
     }
 
     // The PDF's own outline (bookmarks): used both to drive the nav and — per target
     // page — to promote matching lines to headings (so body-size section titles the
     // visual cues miss are still recognised, and the outline TOC links resolve).
-    let outline = links::outline(doc);
+    let outline = links::outline(access);
     // Each entry carries the author's own nesting depth (`OutlineEntry::level`, 0-based)
     // alongside the match key, so a promoted line lands at the level the author declared
     // instead of being flattened to a top-level section.

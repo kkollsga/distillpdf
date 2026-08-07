@@ -12,8 +12,11 @@
 //! Named destinations are resolved via the catalog `/Dests` dict and the
 //! `/Names /Dests` name tree.
 
-use crate::pdfobj::{decode_text_string, deref, num_deref};
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use crate::access::{read_resolved, DocumentAccess, ObjectHandle};
+use crate::pdfobj::{decode_text_string, num};
+use lopdf::{Dictionary, Object, ObjectId};
+#[cfg(test)]
+use lopdf::Document;
 use std::collections::HashMap;
 
 /// A link annotation: a clickable rectangle and where it points.
@@ -58,58 +61,86 @@ fn pdf_string(o: &Object) -> Option<String> {
 /// Read a PDF file specification (`/GoToR`'s `/F`): either a bare string, or a filespec
 /// dictionary whose path lives under `/UF` (Unicode, preferred), `/F`, or one of the
 /// legacy platform keys. Decoded as PDF text so UTF-16BE `/UF` values come out readable.
-fn file_spec(doc: &Document, o: &Object) -> Option<String> {
-    match deref(doc, o)? {
-        Object::String(b, _) => Some(decode_text_string(b)),
-        Object::Dictionary(d) => [&b"UF"[..], b"F", b"DOS", b"Mac", b"Unix"].iter().find_map(|k| {
-            d.get(k).ok().and_then(|v| deref(doc, v)).and_then(|v| match v {
-                Object::String(b, _) => Some(decode_text_string(b)),
-                _ => None,
-            })
-        }),
+fn file_spec(access: &dyn DocumentAccess, object: &Object) -> Option<String> {
+    read_resolved(access, object, |object| match object {
+        Object::String(bytes, _) => Some(decode_text_string(bytes)),
+        Object::Dictionary(dictionary) => {
+            [&b"UF"[..], b"F", b"DOS", b"Mac", b"Unix"]
+                .iter()
+                .find_map(|key| {
+                    let value = dictionary.get(key).ok()?;
+                    read_resolved(access, value, |value| match value {
+                        Object::String(bytes, _) => Some(decode_text_string(bytes)),
+                        _ => None,
+                    })
+                    .ok()
+                    .flatten()
+                })
+        }
         _ => None,
-    }
-    .filter(|s| !s.trim().is_empty())
+    })
+    .ok()
+    .flatten()
+    .filter(|value| !value.trim().is_empty())
 }
 
 /// Resolve a destination value (explicit `[pageRef /XYZ …]` array, or a dict with
 /// a `/D` array) to a 1-indexed page number plus the target y (top) when present.
 /// `/XYZ left top zoom` → top is element 3; `/FitH top` / `/FitBH top` → element 2.
-fn dest_to_pos(doc: &Document, v: &Object, page_no: &HashMap<ObjectId, u32>) -> Option<(u32, Option<f32>)> {
-    match deref(doc, v)? {
-        Object::Array(a) => {
-            let p = match a.first() {
+fn dest_to_pos(
+    access: &dyn DocumentAccess,
+    value: &Object,
+    page_no: &HashMap<ObjectId, u32>,
+) -> Option<(u32, Option<f32>)> {
+    read_resolved(access, value, |value| match value {
+        Object::Array(array) => {
+            let page = match array.first() {
                 Some(Object::Reference(r)) => page_no.get(r).copied()?,
                 _ => return None,
             };
-            let y = match a.get(1).and_then(|o| o.as_name().ok()) {
+            let y = match array.get(1).and_then(|object| object.as_name().ok()) {
                 // Array VALUES, so `num_deref`: `/XYZ 72 15 0 R 0` is legal, and reading it
                 // with the direct-only `num` puts the anchor at y=0 (the page bottom).
-                Some(b"XYZ") if a.len() >= 4 => Some(num_deref(doc, &a[3])),
-                Some(b"FitH") | Some(b"FitBH") if a.len() >= 3 => Some(num_deref(doc, &a[2])),
+                Some(b"XYZ") if array.len() >= 4 => Some(
+                    read_resolved(access, &array[3], num)
+                        .unwrap_or(0.0),
+                ),
+                Some(b"FitH") | Some(b"FitBH") if array.len() >= 3 => Some(
+                    read_resolved(access, &array[2], num)
+                        .unwrap_or(0.0),
+                ),
                 _ => None,
             };
-            Some((p, y))
+            Some((page, y))
         }
-        Object::Dictionary(d) => d.get(b"D").ok().and_then(|o| dest_to_pos(doc, o, page_no)),
+        Object::Dictionary(dictionary) => dictionary
+            .get(b"D")
+            .ok()
+            .and_then(|value| dest_to_pos(access, value, page_no)),
         _ => None,
-    }
+    })
+    .ok()
+    .flatten()
 }
 
-fn dest_to_page(doc: &Document, v: &Object, page_no: &HashMap<ObjectId, u32>) -> Option<u32> {
-    dest_to_pos(doc, v, page_no).map(|(p, _)| p)
+fn dest_to_page(
+    access: &dyn DocumentAccess,
+    value: &Object,
+    page_no: &HashMap<ObjectId, u32>,
+) -> Option<u32> {
+    dest_to_pos(access, value, page_no).map(|(page, _)| page)
 }
 
 /// Resolve a link destination to `(dest_page, dest_name)`. A named destination
 /// keeps its name even when the page is resolved (useful as an anchor id).
 fn resolve_dest(
-    doc: &Document,
+    access: &dyn DocumentAccess,
     dest: &Object,
     page_no: &HashMap<ObjectId, u32>,
     named: &HashMap<Vec<u8>, u32>,
 ) -> (Option<u32>, Option<String>) {
     match dest {
-        Object::Array(_) => (dest_to_page(doc, dest, page_no), None),
+        Object::Array(_) => (dest_to_page(access, dest, page_no), None),
         // A destination NAME is a byte string used as a name-tree KEY, not a PDF text
         // string: it must be read verbatim (never through `pdfobj::decode_text_string`)
         // or it stops matching the `/Dests` entry it names. Lossy is correct here.
@@ -117,57 +148,98 @@ fn resolve_dest(
             named.get(n).copied(),
             Some(String::from_utf8_lossy(n).into_owned()),
         ),
-        Object::Reference(_) => deref(doc, dest)
-            .map(|d| resolve_dest(doc, d, page_no, named))
-            .unwrap_or((None, None)),
+        Object::Reference(_) => read_resolved(access, dest, |resolved| {
+            resolve_dest(access, resolved, page_no, named)
+        })
+        .unwrap_or((None, None)),
         _ => (None, None),
     }
 }
 
 /// Recurse a name-tree node, collecting `name -> target page`.
 fn walk_name_tree(
-    doc: &Document,
-    tree: &Dictionary,
+    access: &dyn DocumentAccess,
+    tree: &ObjectHandle,
     page_no: &HashMap<ObjectId, u32>,
     out: &mut HashMap<Vec<u8>, u32>,
 ) {
-    if let Some(kids) = tree.get(b"Kids").ok().and_then(|o| o.as_array().ok()) {
-        for k in kids {
-            if let Some(d) = k.as_reference().ok().and_then(|r| doc.get_dictionary(r).ok()) {
-                walk_name_tree(doc, d, page_no, out);
-            }
-        }
-    }
-    if let Some(names) = tree.get(b"Names").ok().and_then(|o| o.as_array().ok()) {
-        let mut i = 0;
-        while i + 1 < names.len() {
-            if let Object::String(key, _) = &names[i] {
-                if let Some(p) = dest_to_page(doc, &names[i + 1], page_no) {
-                    out.insert(key.clone(), p);
+    let (kids, names) = tree
+        .read(|tree| {
+            let tree = tree.as_dict().ok()?;
+            let kids = tree
+                .get(b"Kids")
+                .ok()
+                .and_then(|value| value.as_array().ok())
+                .map(|kids| {
+                    kids.iter()
+                        .filter_map(|kid| kid.as_reference().ok())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let mut entries = Vec::new();
+            if let Some(names) = tree
+                .get(b"Names")
+                .ok()
+                .and_then(|value| value.as_array().ok())
+            {
+                let mut index = 0;
+                while index + 1 < names.len() {
+                    if let Object::String(key, _) = &names[index] {
+                        if let Some(page) = dest_to_page(access, &names[index + 1], page_no) {
+                            entries.push((key.clone(), page));
+                        }
+                    }
+                    index += 2;
                 }
             }
-            i += 2;
+            Some((kids, entries))
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    for kid in kids {
+        if let Ok(kid) = access.object(kid) {
+            if kid.read(|value| value.as_dict().is_ok()).unwrap_or(false) {
+                walk_name_tree(access, &kid, page_no, out);
+            }
         }
     }
+    out.extend(names);
 }
 
 /// Collect all named destinations (catalog `/Dests` dict + `/Names /Dests` tree).
-fn collect_named(doc: &Document, page_no: &HashMap<ObjectId, u32>) -> HashMap<Vec<u8>, u32> {
+fn collect_named(
+    access: &dyn DocumentAccess,
+    page_no: &HashMap<ObjectId, u32>,
+) -> HashMap<Vec<u8>, u32> {
     let mut out = HashMap::new();
-    let cat = match doc.catalog() {
-        Ok(c) => c,
+    let catalog = match access.catalog() {
+        Ok(catalog) => catalog,
         Err(_) => return out,
     };
-    if let Some(dests) = cat.get(b"Dests").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
-        for (k, v) in dests.iter() {
-            if let Some(p) = dest_to_page(doc, v, page_no) {
-                out.insert(k.clone(), p);
-            }
-        }
+    if let Ok(dests) = catalog.entry(access, b"Dests") {
+        let entries = dests
+            .read(|dests| {
+                let dests = dests.as_dict().ok()?;
+                Some(
+                    dests
+                        .iter()
+                        .filter_map(|(name, value)| {
+                            Some((name.clone(), dest_to_page(access, value, page_no)?))
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        out.extend(entries);
     }
-    if let Some(names) = cat.get(b"Names").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
-        if let Some(tree) = names.get(b"Dests").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
-            walk_name_tree(doc, tree, page_no, &mut out);
+    if let Ok(names) = catalog.entry(access, b"Names") {
+        if let Ok(tree) = names.dictionary_entry(access, b"Dests") {
+            if tree.read(|value| value.as_dict().is_ok()).unwrap_or(false) {
+                walk_name_tree(access, &tree, page_no, &mut out);
+            }
         }
     }
     out
@@ -182,49 +254,108 @@ pub struct NamedDest {
     pub y: Option<f32>,
 }
 
-fn walk_name_tree_pos(doc: &Document, tree: &Dictionary, page_no: &HashMap<ObjectId, u32>, out: &mut Vec<NamedDest>) {
-    if let Some(kids) = tree.get(b"Kids").ok().and_then(|o| o.as_array().ok()) {
-        for k in kids {
-            if let Some(d) = k.as_reference().ok().and_then(|r| doc.get_dictionary(r).ok()) {
-                walk_name_tree_pos(doc, d, page_no, out);
-            }
-        }
-    }
-    if let Some(names) = tree.get(b"Names").ok().and_then(|o| o.as_array().ok()) {
-        let mut i = 0;
-        while i + 1 < names.len() {
-            if let Object::String(key, _) = &names[i] {
-                if let Some((p, y)) = dest_to_pos(doc, &names[i + 1], page_no) {
-                    // Name-tree key: a byte string, not a text string — see `resolve_dest`.
-                    out.push(NamedDest { name: String::from_utf8_lossy(key).into_owned(), page: p, y });
+fn walk_name_tree_pos(
+    access: &dyn DocumentAccess,
+    tree: &ObjectHandle,
+    page_no: &HashMap<ObjectId, u32>,
+    out: &mut Vec<NamedDest>,
+) {
+    let (kids, names) = tree
+        .read(|tree| {
+            let tree = tree.as_dict().ok()?;
+            let kids = tree
+                .get(b"Kids")
+                .ok()
+                .and_then(|value| value.as_array().ok())
+                .map(|kids| {
+                    kids.iter()
+                        .filter_map(|kid| kid.as_reference().ok())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let mut entries = Vec::new();
+            if let Some(names) = tree
+                .get(b"Names")
+                .ok()
+                .and_then(|value| value.as_array().ok())
+            {
+                let mut index = 0;
+                while index + 1 < names.len() {
+                    if let Object::String(key, _) = &names[index] {
+                        if let Some((page, y)) =
+                            dest_to_pos(access, &names[index + 1], page_no)
+                        {
+                            entries.push(NamedDest {
+                                // Name-tree key: a byte string, not a text string — see
+                                // `resolve_dest`.
+                                name: String::from_utf8_lossy(key).into_owned(),
+                                page,
+                                y,
+                            });
+                        }
+                    }
+                    index += 2;
                 }
             }
-            i += 2;
+            Some((kids, entries))
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    for kid in kids {
+        if let Ok(kid) = access.object(kid) {
+            if kid.read(|value| value.as_dict().is_ok()).unwrap_or(false) {
+                walk_name_tree_pos(access, &kid, page_no, out);
+            }
         }
     }
+    out.extend(names);
 }
 
 /// All named destinations (catalog `/Dests` dict + `/Names /Dests` tree) with the
 /// page and y where each lands.
-pub fn named_destinations(doc: &Document) -> Vec<NamedDest> {
-    let pages = doc.get_pages();
-    let page_no: HashMap<ObjectId, u32> = pages.iter().map(|(&n, &id)| (id, n)).collect();
+pub fn named_destinations(access: &dyn DocumentAccess) -> Vec<NamedDest> {
+    let page_no: HashMap<ObjectId, u32> = access
+        .pages()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|page| (page.id, page.number))
+        .collect();
     let mut out = Vec::new();
-    let cat = match doc.catalog() {
-        Ok(c) => c,
+    let catalog = match access.catalog() {
+        Ok(catalog) => catalog,
         Err(_) => return out,
     };
-    if let Some(dests) = cat.get(b"Dests").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
-        for (k, v) in dests.iter() {
-            if let Some((p, y)) = dest_to_pos(doc, v, &page_no) {
-                // `/Dests` key: a byte string, not a text string — see `resolve_dest`.
-                out.push(NamedDest { name: String::from_utf8_lossy(k).into_owned(), page: p, y });
-            }
-        }
+    if let Ok(dests) = catalog.entry(access, b"Dests") {
+        let entries = dests
+            .read(|dests| {
+                let dests = dests.as_dict().ok()?;
+                Some(
+                    dests
+                        .iter()
+                        .filter_map(|(name, value)| {
+                            let (page, y) = dest_to_pos(access, value, &page_no)?;
+                            Some(NamedDest {
+                                // `/Dests` key: a byte string, not a text string — see
+                                // `resolve_dest`.
+                                name: String::from_utf8_lossy(name).into_owned(),
+                                page,
+                                y,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        out.extend(entries);
     }
-    if let Some(names) = cat.get(b"Names").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
-        if let Some(tree) = names.get(b"Dests").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
-            walk_name_tree_pos(doc, tree, &page_no, &mut out);
+    if let Ok(names) = catalog.entry(access, b"Names") {
+        if let Ok(tree) = names.dictionary_entry(access, b"Dests") {
+            if tree.read(|value| value.as_dict().is_ok()).unwrap_or(false) {
+                walk_name_tree_pos(access, &tree, &page_no, &mut out);
+            }
         }
     }
     out
@@ -241,50 +372,78 @@ pub struct OutlineEntry {
 /// tree (titles + GoTo destinations), in reading order with nesting depth. Empty when
 /// the document has no outline. This is the document's OWN TOC — distinct from the one
 /// distillPDF synthesises from detected headings.
-pub fn outline(doc: &Document) -> Vec<OutlineEntry> {
-    let pages = doc.get_pages();
-    let page_no: HashMap<ObjectId, u32> = pages.iter().map(|(&n, &id)| (id, n)).collect();
-    let named = collect_named(doc, &page_no);
-    let cat = match doc.catalog() {
-        Ok(c) => c,
+pub fn outline(access: &dyn DocumentAccess) -> Vec<OutlineEntry> {
+    let page_no: HashMap<ObjectId, u32> = access
+        .pages()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|page| (page.id, page.number))
+        .collect();
+    let named = collect_named(access, &page_no);
+    let catalog = match access.catalog() {
+        Ok(catalog) => catalog,
         Err(_) => return Vec::new(),
     };
-    let root = match cat.get(b"Outlines").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
-        Some(d) => d,
-        None => return Vec::new(),
-    };
-    let first = match root.get(b"First").ok().and_then(|o| o.as_reference().ok()) {
+    let first = match catalog
+        .entry(access, b"Outlines")
+        .ok()
+        .and_then(|root| {
+            root.read(|root| {
+                root.as_dict()
+                    .ok()?
+                    .get(b"First")
+                    .ok()?
+                    .as_reference()
+                    .ok()
+            })
+            .ok()
+            .flatten()
+        }) {
         Some(r) => r,
         None => return Vec::new(), // present but empty
     };
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    walk_outline(doc, first, &page_no, &named, 0, &mut seen, &mut out);
+    walk_outline(access, first, &page_no, &named, 0, &mut seen, &mut out);
     out
 }
 
 /// Resolve an outline item's destination (`/Dest` array/name, or `/A` GoTo `/D`) to a
 /// page + optional y. Named destinations fall back to the names map (page only).
-fn outline_dest(doc: &Document, item: &Dictionary, page_no: &HashMap<ObjectId, u32>, named: &HashMap<Vec<u8>, u32>) -> (u32, Option<f32>) {
+fn outline_dest(
+    access: &dyn DocumentAccess,
+    item: &Dictionary,
+    page_no: &HashMap<ObjectId, u32>,
+    named: &HashMap<Vec<u8>, u32>,
+) -> (u32, Option<f32>) {
     let resolve = |d: &Object| -> Option<(u32, Option<f32>)> {
-        match deref(doc, d)? {
-            Object::Array(_) => dest_to_pos(doc, d, page_no),
+        read_resolved(access, d, |d| match d {
+            Object::Array(_) => dest_to_pos(access, d, page_no),
             Object::Name(n) | Object::String(n, _) => named.get(n).map(|&p| (p, None)),
             _ => None,
-        }
+        })
+        .ok()
+        .flatten()
     };
     if let Ok(dest) = item.get(b"Dest") {
         if let Some(r) = resolve(dest) {
             return r;
         }
     }
-    if let Some(a) = item.get(b"A").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
-        if a.get(b"S").and_then(|o| o.as_name()).ok() == Some(&b"GoTo"[..]) {
-            if let Ok(d) = a.get(b"D") {
-                if let Some(r) = resolve(d) {
-                    return r;
+    if let Ok(action) = item.get(b"A") {
+        if let Some(result) = read_resolved(access, action, |action| {
+            let action = action.as_dict().ok()?;
+            if action.get(b"S").and_then(|o| o.as_name()).ok() == Some(&b"GoTo"[..]) {
+                if let Ok(destination) = action.get(b"D") {
+                    return resolve(destination);
                 }
             }
+            None
+        })
+        .ok()
+        .flatten()
+        {
+            return result;
         }
     }
     (0, None)
@@ -293,7 +452,7 @@ fn outline_dest(doc: &Document, item: &Dictionary, page_no: &HashMap<ObjectId, u
 /// Walk a sibling chain (`/Next`), recursing into children (`/First`). A visited set
 /// guards against cyclic `/Next` links in malformed outlines; depth is capped.
 fn walk_outline(
-    doc: &Document,
+    access: &dyn DocumentAccess,
     node: ObjectId,
     page_no: &HashMap<ObjectId, u32>,
     named: &HashMap<Vec<u8>, u32>,
@@ -309,115 +468,208 @@ fn walk_outline(
         if !seen.insert(cur) {
             break; // cycle
         }
-        let item = match doc.get_dictionary(cur) {
-            Ok(d) => d.clone(),
+        let item = match access.object(cur) {
+            Ok(item) => item,
             Err(_) => break,
         };
-        // `/Title` is frequently an indirect reference (hyperref/pdfTeX writes
-        // `/Title 5 0 R` pointing at a UTF-16BE string), so deref before matching —
-        // without this the title decodes empty and the entry is dropped below.
-        let title = match item.get(b"Title").ok().and_then(|o| deref(doc, o)) {
-            Some(Object::String(b, _)) => decode_text_string(b),
-            _ => String::new(),
+        let Some((title, page, first, next)) = item
+            .read(|item| {
+                let item = item.as_dict().ok()?;
+                // `/Title` is frequently an indirect reference (hyperref/pdfTeX writes
+                // `/Title 5 0 R` pointing at a UTF-16BE string), so resolve it before
+                // matching — without this the title decodes empty and the entry is dropped.
+                let title = item
+                    .get(b"Title")
+                    .ok()
+                    .and_then(|title| {
+                        read_resolved(access, title, |title| match title {
+                            Object::String(bytes, _) => Some(decode_text_string(bytes)),
+                            _ => None,
+                        })
+                        .ok()
+                        .flatten()
+                    })
+                    .unwrap_or_default();
+                let (page, _y) = outline_dest(access, item, page_no, named);
+                let first = item
+                    .get(b"First")
+                    .ok()
+                    .and_then(|value| value.as_reference().ok());
+                let next = item
+                    .get(b"Next")
+                    .ok()
+                    .and_then(|value| value.as_reference().ok());
+                Some((title, page, first, next))
+            })
+            .ok()
+            .flatten()
+        else {
+            break;
         };
-        let (page, _y) = outline_dest(doc, &item, page_no, named);
         if !title.trim().is_empty() {
             out.push(OutlineEntry { level: depth, title: title.trim().to_string(), page });
         }
-        if let Some(first) = item.get(b"First").ok().and_then(|o| o.as_reference().ok()) {
-            walk_outline(doc, first, page_no, named, depth + 1, seen, out);
+        if let Some(first) = first {
+            walk_outline(access, first, page_no, named, depth + 1, seen, out);
         }
-        match item.get(b"Next").ok().and_then(|o| o.as_reference().ok()) {
+        match next {
             Some(next) => cur = next,
             None => break,
         }
     }
 }
 
-/// Extract every Link annotation across the document.
-pub fn extract_links(doc: &Document) -> Vec<Link> {
-    let pages = doc.get_pages();
-    let page_no: HashMap<ObjectId, u32> = pages.iter().map(|(&n, &id)| (id, n)).collect();
-    let named = collect_named(doc, &page_no);
-    let mut out = Vec::new();
-
-    for (&pno, &pid) in &pages {
-        let dict = match doc.get_dictionary(pid) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let annots = dict
-            .get(b"Annots")
-            .ok()
-            .and_then(|o| deref(doc, o))
-            .and_then(|o| o.as_array().ok());
-        let annots = match annots {
-            Some(a) => a,
-            None => continue,
-        };
-        for a in annots {
-            let ad = match deref(doc, a).and_then(|o| o.as_dict().ok()) {
-                Some(d) => d,
-                None => continue,
-            };
-            let is_link = ad.get(b"Subtype").and_then(|o| o.as_name()).map(|n| n == b"Link").unwrap_or(false);
-            if !is_link {
-                continue;
+fn link_from_annotation(
+    access: &dyn DocumentAccess,
+    page: u32,
+    annotation: &Dictionary,
+    page_no: &HashMap<ObjectId, u32>,
+    named: &HashMap<Vec<u8>, u32>,
+) -> Option<Link> {
+    if annotation
+        .get(b"Subtype")
+        .and_then(|value| value.as_name())
+        .map(|name| name == b"Link")
+        .unwrap_or(false)
+        == false
+    {
+        return None;
+    }
+    let rect = annotation.get(b"Rect").ok().and_then(|rect| {
+        read_resolved(access, rect, |rect| {
+            let rect = rect.as_array().ok()?;
+            if rect.len() < 4 {
+                return None;
             }
-            let rect = ad.get(b"Rect").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_array().ok());
-            let rect = match rect {
-                // Ditto: an annotation `/Rect` entry may be an indirect number, and reading
-                // one as 0.0 collapses the clickable box to the page corner.
-                Some(r) if r.len() >= 4 => {
-                    [num_deref(doc, &r[0]), num_deref(doc, &r[1]), num_deref(doc, &r[2]), num_deref(doc, &r[3])]
-                }
-                _ => continue,
-            };
+            // An annotation `/Rect` entry may be an indirect number, and reading one as
+            // 0.0 collapses the clickable box to the page corner.
+            Some([
+                read_resolved(access, &rect[0], num).unwrap_or(0.0),
+                read_resolved(access, &rect[1], num).unwrap_or(0.0),
+                read_resolved(access, &rect[2], num).unwrap_or(0.0),
+                read_resolved(access, &rect[3], num).unwrap_or(0.0),
+            ])
+        })
+        .ok()
+        .flatten()
+    })?;
 
-            let (mut uri, mut dest_page, mut dest_name, mut remote_file) = (None, None, None, None);
-            if let Some(act) = ad.get(b"A").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
-                let s = act.get(b"S").and_then(|o| o.as_name()).unwrap_or(b"");
-                if s == b"URI" {
-                    uri = act.get(b"URI").ok().and_then(|o| deref(doc, o)).and_then(pdf_string);
-                } else if s == b"GoTo" {
-                    if let Ok(d) = act.get(b"D") {
-                        let (p, n) = resolve_dest(doc, d, &page_no, &named);
-                        dest_page = p;
-                        dest_name = n;
-                    }
-                } else if s == b"GoToR" || s == b"Launch" {
-                    // Both carry a `/F` file specification. `/Launch` additionally allows
-                    // per-platform launch dictionaries whose own `/F` holds the path.
-                    remote_file = act
-                        .get(b"F")
-                        .ok()
-                        .and_then(|o| file_spec(doc, o))
-                        .or_else(|| {
-                            [&b"Win"[..], b"Mac", b"Unix"].iter().find_map(|k| {
-                                act.get(k).ok().and_then(|o| deref(doc, o)).and_then(|o| file_spec(doc, o))
+    let action = annotation.get(b"A").ok().and_then(|action| {
+        read_resolved(access, action, |action| {
+            let action = action.as_dict().ok()?;
+            let (mut uri, mut dest_page, mut dest_name, mut remote_file) =
+                (None, None, None, None);
+            let subtype = action
+                .get(b"S")
+                .and_then(|value| value.as_name())
+                .unwrap_or(b"");
+            if subtype == b"URI" {
+                uri = action.get(b"URI").ok().and_then(|value| {
+                    read_resolved(access, value, pdf_string).ok().flatten()
+                });
+            } else if subtype == b"GoTo" {
+                if let Ok(destination) = action.get(b"D") {
+                    (dest_page, dest_name) = resolve_dest(access, destination, page_no, named);
+                }
+            } else if subtype == b"GoToR" || subtype == b"Launch" {
+                // Both carry a `/F` file specification. `/Launch` additionally allows
+                // per-platform launch dictionaries whose own `/F` holds the path.
+                remote_file = action
+                    .get(b"F")
+                    .ok()
+                    .and_then(|value| file_spec(access, value))
+                    .or_else(|| {
+                        [&b"Win"[..], b"Mac", b"Unix"].iter().find_map(|key| {
+                            let platform = action.get(key).ok()?;
+                            read_resolved(access, platform, |platform| {
+                                file_spec(access, platform)
                             })
-                        });
-                    // A `/GoToR` destination addresses the REMOTE file: never resolve it
-                    // against this document's pages or named-destination map.
-                    dest_name = match act.get(b"D").ok().and_then(|o| deref(doc, o)) {
+                            .ok()
+                            .flatten()
+                        })
+                    });
+                // A `/GoToR` destination addresses the REMOTE file: never resolve it
+                // against this document's pages or named-destination map.
+                dest_name = action.get(b"D").ok().and_then(|destination| {
+                    read_resolved(access, destination, |destination| match destination {
                         // Byte string / name-tree key in the REMOTE file, not a text
                         // string — see `resolve_dest`.
-                        Some(Object::Name(n)) | Some(Object::String(n, _)) => {
-                            Some(String::from_utf8_lossy(n).into_owned())
+                        Object::Name(name) | Object::String(name, _) => {
+                            Some(String::from_utf8_lossy(name).into_owned())
                         }
                         _ => None,
-                    };
-                }
-            } else if let Ok(d) = ad.get(b"Dest") {
-                let (p, n) = resolve_dest(doc, d, &page_no, &named);
-                dest_page = p;
-                dest_name = n;
+                    })
+                    .ok()
+                    .flatten()
+                });
             }
+            Some((uri, dest_page, dest_name, remote_file))
+        })
+        .ok()
+        .flatten()
+    });
+    let (uri, dest_page, dest_name, remote_file) = action.unwrap_or_else(|| {
+        let (dest_page, dest_name) = annotation
+            .get(b"Dest")
+            .ok()
+            .map(|destination| resolve_dest(access, destination, page_no, named))
+            .unwrap_or((None, None));
+        (None, dest_page, dest_name, None)
+    });
+    if uri.is_none() && dest_page.is_none() && dest_name.is_none() && remote_file.is_none() {
+        return None;
+    }
+    // Normalise rect to x0<=x1, y0<=y1.
+    let rect = [
+        rect[0].min(rect[2]),
+        rect[1].min(rect[3]),
+        rect[0].max(rect[2]),
+        rect[1].max(rect[3]),
+    ];
+    Some(Link {
+        page,
+        rect,
+        uri,
+        dest_page,
+        dest_name,
+        remote_file,
+    })
+}
 
-            if uri.is_some() || dest_page.is_some() || dest_name.is_some() || remote_file.is_some() {
-                // Normalise rect to x0<=x1, y0<=y1.
-                let r = [rect[0].min(rect[2]), rect[1].min(rect[3]), rect[0].max(rect[2]), rect[1].max(rect[3])];
-                out.push(Link { page: pno, rect: r, uri, dest_page, dest_name, remote_file });
+/// Extract every Link annotation across the document.
+pub fn extract_links(access: &dyn DocumentAccess) -> Vec<Link> {
+    let pages = access.pages().unwrap_or_default();
+    let page_no: HashMap<ObjectId, u32> = pages
+        .iter()
+        .map(|page| (page.id, page.number))
+        .collect();
+    let named = collect_named(access, &page_no);
+    let mut out = Vec::new();
+
+    for page in pages {
+        let Ok(page_handle) = access.page(page.id) else {
+            continue;
+        };
+        let Ok(annotations) = page_handle.entry(access, b"Annots") else {
+            continue;
+        };
+        let count = annotations
+            .read(|annotations| annotations.as_array().ok().map(Vec::len))
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        for index in 0..count {
+            let Ok(annotation) = annotations.array_entry(access, index) else {
+                continue;
+            };
+            let link = annotation
+                .read(|annotation| {
+                    link_from_annotation(access, page.number, annotation.as_dict().ok()?, &page_no, &named)
+                })
+                .ok()
+                .flatten();
+            if let Some(link) = link {
+                out.push(link);
             }
         }
     }
@@ -466,7 +718,7 @@ mod tests {
     #[test]
     fn every_extracted_link_reports_one_of_the_three_kinds() {
         let doc = links_doc();
-        let links = extract_links(&doc);
+        let links = extract_links(&crate::access::test_adapter(&doc));
         assert!(!links.is_empty());
         assert!(links.iter().all(|l| ["uri", "internal", "remote"].contains(&l.kind())));
     }
@@ -480,11 +732,11 @@ mod tests {
         // The premise: the fixture's rect really is written with indirect entries.
         let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
         let annots = doc.get_dictionary(page_id).unwrap().get(b"Annots").unwrap().as_array().unwrap();
-        let annot = deref(&doc, &annots[0]).unwrap().as_dict().unwrap();
+        let annot = crate::pdfobj::deref(&doc, &annots[0]).unwrap().as_dict().unwrap();
         let r = annot.get(b"Rect").unwrap().as_array().unwrap();
         assert!(matches!(r[2], Object::Reference(_)) && matches!(r[3], Object::Reference(_)));
 
-        let links = extract_links(&doc);
+        let links = extract_links(&crate::access::test_adapter(&doc));
         assert_eq!(links.len(), 1, "the fixture carries exactly one link");
         assert_eq!(links[0].uri.as_deref(), Some("https://example.com/indirect"));
         assert_eq!(links[0].rect, [72.0, 696.0, 420.0, 714.0], "indirect /Rect entries must resolve, not read 0");
@@ -495,7 +747,7 @@ mod tests {
         // `/XYZ 72 15 0 R 0` and `/FitH 16 0 R`: the anchor y is what places the target id on
         // the rendered page. Read as 0.0 it lands at the page BOTTOM, not at the section.
         let doc = indirect_doc();
-        let mut dests = named_destinations(&doc);
+        let mut dests = named_destinations(&crate::access::test_adapter(&doc));
         dests.sort_by(|a, b| a.name.cmp(&b.name));
         let names: Vec<&str> = dests.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["fig.indirect", "sec.indirect"]);
@@ -510,7 +762,7 @@ mod tests {
         // decoded such titles to "" and dropped the whole entry (20 of 54 corpus docs
         // returned an empty outline).
         let doc = links_doc();
-        let entries = outline(&doc);
+        let entries = outline(&crate::access::test_adapter(&doc));
         let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
         assert_eq!(titles, vec!["Métodos y Análisis §2", "Appendix A Notation"]);
         assert_eq!(entries[0].page, 2, "indirect-title entry must still resolve its /Dest");
@@ -523,7 +775,7 @@ mod tests {
         // Both actions address another document, so nothing resolved in this one and the
         // rows were dropped by the keep-condition — the links vanished entirely.
         let doc = links_doc();
-        let links = extract_links(&doc);
+        let links = extract_links(&crate::access::test_adapter(&doc));
         let remote: Vec<&Link> = links.iter().filter(|l| l.remote_file.is_some()).collect();
         assert_eq!(remote.len(), 2, "expected the /GoToR + /Launch rows among {} links", links.len());
 
@@ -551,18 +803,18 @@ mod tests {
     fn file_spec_reads_both_bare_strings_and_filespec_dictionaries() {
         let doc = Document::new();
         let bare = Object::String(b"other.pdf".to_vec(), lopdf::StringFormat::Literal);
-        assert_eq!(file_spec(&doc, &bare).as_deref(), Some("other.pdf"));
+        assert_eq!(file_spec(&crate::access::test_adapter(&doc), &bare).as_deref(), Some("other.pdf"));
         // A filespec dict prefers /UF (Unicode) over /F.
         let mut d = Dictionary::new();
         d.set("F", Object::String(b"legacy.pdf".to_vec(), lopdf::StringFormat::Literal));
         let uf = [&b"\xfe\xff"[..], &"rapport-år.pdf".encode_utf16().flat_map(u16::to_be_bytes).collect::<Vec<u8>>()].concat();
         d.set("UF", Object::String(uf, lopdf::StringFormat::Literal));
-        assert_eq!(file_spec(&doc, &Object::Dictionary(d.clone())).as_deref(), Some("rapport-år.pdf"));
+        assert_eq!(file_spec(&crate::access::test_adapter(&doc), &Object::Dictionary(d.clone())).as_deref(), Some("rapport-år.pdf"));
         d.remove(b"UF");
-        assert_eq!(file_spec(&doc, &Object::Dictionary(d)).as_deref(), Some("legacy.pdf"));
+        assert_eq!(file_spec(&crate::access::test_adapter(&doc), &Object::Dictionary(d)).as_deref(), Some("legacy.pdf"));
         // Empty / non-string specs yield nothing rather than a blank target.
         let empty = Object::String(Vec::new(), lopdf::StringFormat::Literal);
-        assert_eq!(file_spec(&doc, &empty), None);
-        assert_eq!(file_spec(&doc, &Object::Null), None);
+        assert_eq!(file_spec(&crate::access::test_adapter(&doc), &empty), None);
+        assert_eq!(file_spec(&crate::access::test_adapter(&doc), &Object::Null), None);
     }
 }

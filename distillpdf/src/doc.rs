@@ -533,7 +533,7 @@ impl PdfDocument {
 
     /// Extract hyperlinks from all pages.
     pub fn extract_links(&self) -> Vec<links::Link> {
-        links::extract_links(&self.doc)
+        links::extract_links(self.access.as_ref())
     }
 
     /// Render the document to HTML.
@@ -548,7 +548,7 @@ impl PdfDocument {
 
     /// The PDF's OWN `/Outlines` bookmarks as `(level, title, page, anchor)`.
     pub fn outline(&self) -> Vec<(u8, String, u32, String)> {
-        links::outline(&self.doc)
+        links::outline(self.access.as_ref())
             .into_iter()
             .map(|e| ((e.level + 1), e.title, e.page, format!("page-{}", e.page)))
             .collect()

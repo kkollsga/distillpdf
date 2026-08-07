@@ -286,7 +286,7 @@ mod structure {
         // `deref` had five byte-identical copies, `num` four plus a divergent fifth that was
         // the only one following an indirect reference, `xobjects_of` three. Each now lives
         // in one module; a redefinition anywhere else is the drift starting over.
-        for (name, owner) in [("fn deref", "pdfobj.rs"), ("fn num(", "pdfobj.rs"), ("fn num_deref", "pdfobj.rs"), ("fn xobjects_of", "walker.rs")] {
+        for (name, owner) in [("fn deref", "pdfobj.rs"), ("fn num(", "pdfobj.rs"), ("fn xobjects_of", "walker.rs")] {
             for (file, src) in rust_files(&core_src()) {
                 // The owner's own definition and any module's `use`/test may name it.
                 if file == owner {
