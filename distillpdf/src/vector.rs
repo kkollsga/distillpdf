@@ -1214,9 +1214,11 @@ fn painted_page(
     let mut egmap: HashMap<Vec<u8>, (Option<f32>, Option<f32>)> = HashMap::new();
     let mut csmap: HashMap<Vec<u8>, Rc<PaintCs>> = HashMap::new();
     for res in &chain {
-        overlay_xobjects(access, res, &mut xmap);
-        egmap.extend(extgstates_of(doc, res));
-        csmap.extend(colorspaces_of(doc, res));
+        let _ = res.read(|dictionary| {
+            overlay_xobjects(access, dictionary, &mut xmap);
+            egmap.extend(extgstates_of(doc, dictionary));
+            csmap.extend(colorspaces_of(doc, dictionary));
+        });
     }
     let mut painted = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
@@ -1973,7 +1975,11 @@ mod tests {
 
     /// The page's own (nearest) resource dictionary — the last entry of the overlay chain.
     fn page_res(doc: &Document, page_id: ObjectId) -> Dictionary {
-        page_resource_chain(&test_adapter(doc), page_id).pop().expect("fixture page has resources")
+        page_resource_chain(&test_adapter(doc), page_id)
+            .pop()
+            .expect("fixture page has resources")
+            .read(Clone::clone)
+            .unwrap()
     }
 
     fn walk_page(doc: &Document, page_id: ObjectId, budget: usize) -> Vec<Painted> {
@@ -1983,9 +1989,11 @@ mod tests {
         let mut egmap: HashMap<Vec<u8>, (Option<f32>, Option<f32>)> = HashMap::new();
         let mut csmap: HashMap<Vec<u8>, Rc<PaintCs>> = HashMap::new();
         for res in &page_resource_chain(&access, page_id) {
-            overlay_xobjects(&access, res, &mut xmap);
-            egmap.extend(extgstates_of(doc, res));
-            csmap.extend(colorspaces_of(doc, res));
+            let _ = res.read(|dictionary| {
+                overlay_xobjects(&access, dictionary, &mut xmap);
+                egmap.extend(extgstates_of(doc, dictionary));
+                csmap.extend(colorspaces_of(doc, dictionary));
+            });
         }
         let mut painted = Vec::new();
         let mut budget = crate::WalkBudget::new(budget);

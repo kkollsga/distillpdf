@@ -37,7 +37,7 @@
 //!   `/Resources` under [`ScopePolicy::OwnOnly`]) yields [`Descend::Skip`]: the walk
 //!   continues with the operators around it. Nothing here panics.
 
-use crate::access::{read_resolved, DocumentAccess, StreamHandle};
+use crate::access::{read_resolved, DictionaryHandle, DocumentAccess, StreamHandle};
 use crate::geom::Mat;
 use crate::pdfobj::{content_bytes, num};
 use lopdf::content::Operation;
@@ -166,20 +166,15 @@ pub(crate) fn overlay_xobjects(access: &dyn DocumentAccess, resources: &Dictiona
 /// the whole chain can only ever ADD names — the nearest dictionary is applied last and
 /// still wins every name it defines. `extract::drawn_images` has read the chain this way
 /// since it was written; this is the three interpreters catching up.
-pub(crate) fn page_resource_chain(access: &dyn DocumentAccess, page_id: ObjectId) -> Vec<Dictionary> {
-    access
-        .page_resource_chain(page_id)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|resources| resources.read(Clone::clone).ok())
-        .collect()
+pub(crate) fn page_resource_chain(access: &dyn DocumentAccess, page_id: ObjectId) -> Vec<DictionaryHandle> {
+    access.page_resource_chain(page_id).unwrap_or_default()
 }
 
 /// The XObjects a page can `Do`, resolved over its whole resource chain.
 pub(crate) fn page_xobjects(access: &dyn DocumentAccess, page_id: ObjectId) -> XMap {
     let mut map = XMap::new();
     for res in page_resource_chain(access, page_id) {
-        overlay_xobjects(access, &res, &mut map);
+        let _ = res.read(|dictionary| overlay_xobjects(access, dictionary, &mut map));
     }
     map
 }
@@ -220,7 +215,7 @@ pub(crate) fn overlay_resources(access: &dyn DocumentAccess, base: &mut Dictiona
 pub(crate) fn page_resources(access: &dyn DocumentAccess, page_id: ObjectId) -> Dictionary {
     let mut out = Dictionary::new();
     for res in page_resource_chain(access, page_id) {
-        overlay_resources(access, &mut out, &res);
+        let _ = res.read(|dictionary| overlay_resources(access, &mut out, dictionary));
     }
     out
 }
