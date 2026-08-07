@@ -414,7 +414,7 @@ fn extract_images_inner(
                     let filters = image_filters(dict);
                     let mut format = filter_to_format(&Some(filters));
                     let mut data = if format == "raw" {
-                        match assemble_png(doc, &res, stream) {
+                        match assemble_png(doc, access, &res, stream) {
                             Some(png) => {
                                 format = "png";
                                 png

@@ -122,7 +122,12 @@ fn decode_ccitt(doc: &Document, dict: &Dictionary, content: &[u8]) -> Option<ima
 ///
 /// `res` is the resource scope the image was drawn in; a `/ColorSpace /CS0` names an entry
 /// there and describes nothing without it (§8.6.3).
-fn decode_rgb(doc: &Document, res: &Dictionary, id: ObjectId) -> Option<image::RgbImage> {
+fn decode_rgb(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    res: &Dictionary,
+    id: ObjectId,
+) -> Option<image::RgbImage> {
     let stream = doc.get_object(id).ok()?.as_stream().ok()?;
     let dict = &stream.dict;
     let filters = filters_of(dict);
@@ -142,11 +147,16 @@ fn decode_rgb(doc: &Document, res: &Dictionary, id: ObjectId) -> Option<image::R
     // channel count GUESSED from `raw.len() / (w*h)`, which renders an Indexed image's
     // palette indices as gray levels. It also read the bytes with `decompressed_content()`,
     // which errors on an unfiltered stream, so every uncompressed raster vanished.
-    Some(decode_samples(doc, res, stream)?.into_rgb8())
+    Some(decode_samples(doc, access, res, stream)?.into_rgb8())
 }
 
 /// Decode the soft mask (`/SMask`) of an image to a grayscale alpha channel.
-fn decode_smask(doc: &Document, res: &Dictionary, dict: &Dictionary) -> Option<image::GrayImage> {
+fn decode_smask(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    res: &Dictionary,
+    dict: &Dictionary,
+) -> Option<image::GrayImage> {
     let sid = dict.get(b"SMask").ok().and_then(|o| o.as_reference().ok())?;
     let stream = doc.get_object(sid).ok()?.as_stream().ok()?;
     let sd = &stream.dict;
@@ -169,7 +179,7 @@ fn decode_smask(doc: &Document, res: &Dictionary, dict: &Dictionary) -> Option<i
     }
     // The shared decoder applies the mask's own `/Decode` on this path too, and handles the
     // sub-byte depths a soft mask is often written at (a 1-bpc knockout mask).
-    Some(decode_samples(doc, res, stream)?.into_luma8())
+    Some(decode_samples(doc, access, res, stream)?.into_luma8())
 }
 
 /// Cheap (no-decode) test that an image XObject is a format we can render — used in
@@ -180,7 +190,12 @@ fn decode_smask(doc: &Document, res: &Dictionary, dict: &Dictionary) -> Option<i
 /// one thing that needs the bytes (whether the stream is long enough). It used to be an
 /// independently-written `bpc == 8` guess that disagreed with the decoder in both
 /// directions.
-fn decodable(doc: &Document, res: &Dictionary, id: ObjectId) -> bool {
+fn decodable(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    res: &Dictionary,
+    id: ObjectId,
+) -> bool {
     let stream = match doc.get_object(id).ok().and_then(|o| o.as_stream().ok()) {
         Some(s) => s,
         None => return false,
@@ -193,7 +208,7 @@ fn decodable(doc: &Document, res: &Dictionary, id: ObjectId) -> bool {
     if filters.iter().any(|f| f == b"DCTDecode" || f == b"CCITTFaxDecode") {
         return true; // JPEG / CCITT fax: renderable (fax via decode_ccitt)
     }
-    samples_decodable(doc, res, dict)
+    samples_decodable(doc, access, res, dict)
 }
 
 /// Build a base64 data URI for an image stream, or None if unsupported.
@@ -201,7 +216,14 @@ fn decodable(doc: &Document, res: &Dictionary, id: ObjectId) -> bool {
 /// Images with a soft mask (`/SMask`) are alpha-composited so transparency is
 /// preserved — without this, masked figures (whose visible content lives in the
 /// mask, over a flat-colour/black base) render as solid black boxes.
-fn data_uri(doc: &Document, res: &Dictionary, id: ObjectId, window: Option<(f32, f32, f32, f32)>, turn: i32) -> Option<String> {
+fn data_uri(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    res: &Dictionary,
+    id: ObjectId,
+    window: Option<(f32, f32, f32, f32)>,
+    turn: i32,
+) -> Option<String> {
     let stream = doc.get_object(id).ok()?.as_stream().ok()?;
     let dict = stream.dict.clone();
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -236,15 +258,15 @@ fn data_uri(doc: &Document, res: &Dictionary, id: ObjectId, window: Option<(f32,
             return None;
         }
         // CCITTFax falls through to decode_rgb (which decodes it via decode_ccitt) → PNG.
-        let rgb = turn_pixels(crop_window(decode_rgb(doc, res, id)?, window), turn);
+        let rgb = turn_pixels(crop_window(decode_rgb(doc, access, res, id)?, window), turn);
         let png = png_bytes(image::DynamicImage::ImageRgb8(rgb))?;
         return Some(format!("data:image/png;base64,{}", b64.encode(&png)));
     }
 
     // Soft mask present: decode base + mask, composite to RGBA, emit PNG.
-    let base = decode_rgb(doc, res, id)?;
+    let base = decode_rgb(doc, access, res, id)?;
     let (w, h) = (base.width(), base.height());
-    let mask = decode_smask(doc, res, &dict);
+    let mask = decode_smask(doc, access, res, &dict);
     let mut rgba = image::RgbaImage::new(w, h);
     let resized;
     let mask_ref = match &mask {
@@ -591,7 +613,7 @@ pub fn positioned_images(
     // (see `turn_pixels`): every bbox this module hands out stays in page space, because every
     // cross-subsystem comparison in `html.rs` — captions, containment, reading order — is
     // page-space, exactly as `vector::positioned_vectors_capped` reasons.
-    finalize(doc, raws, want_uris, crate::pdfobj::page_rotation(access, page_id))
+    finalize(doc, access, raws, want_uris, crate::pdfobj::page_rotation(access, page_id))
 }
 
 /// Grow `out` by the part of `bb` its clip leaves visible. A rectangle entirely outside the
@@ -1051,7 +1073,13 @@ fn round2(v: f32) -> String {
 /// authoring software exports as a tile mosaic) and stitch each into ONE image; every
 /// other image is emitted on its own. In placeholder mode (`!want_uris`) the same
 /// grouping applies with no pixel decode — a grid becomes one empty-uri slot.
-fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool, rot: i32) -> Vec<Placed> {
+fn finalize(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    raws: Vec<RawTile>,
+    want_uris: bool,
+    rot: i32,
+) -> Vec<Placed> {
     let mut out = Vec::new();
     for g in cluster(&raws) {
         let tiles: Vec<&RawTile> = g.iter().map(|&i| &raws[i]).collect();
@@ -1061,14 +1089,14 @@ fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool, rot: i32) -> Ve
         if tiles.len() >= MIN_GRID_TILES && is_grid(&tiles) {
             // A stitched grid is composed axis-aligned, so it carries no rotation.
             if want_uris {
-                if let Some(uri) = stitch_grid(doc, &tiles, (x0, x1, y0, y1), rot) {
+                if let Some(uri) = stitch_grid(doc, access, &tiles, (x0, x1, y0, y1), rot) {
                     let ctm = turned_placement(None, (x0, y0, x1, y1), rot);
                     out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri, ctm, seq: grid_seq(), clip: None });
                     continue;
                 }
                 // stitch failed → fall through to per-tile emission
             } else {
-                if tiles.iter().any(|t| decodable(doc, &t.res, t.id)) {
+                if tiles.iter().any(|t| decodable(doc, access, &t.res, t.id)) {
                     out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri: String::new(), ctm: turned_placement(None, (x0, y0, x1, y1), rot), seq: grid_seq(), clip: None });
                 }
                 continue;
@@ -1091,7 +1119,7 @@ fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool, rot: i32) -> Ve
                 // can never fire for an image we can decode: a decodable stream never reaches
                 // it, and `raster::declined_codec` is the same list the four decline points
                 // on this path read.
-                let uri = match data_uri(doc, &t.res, t.id, window, rot) {
+                let uri = match data_uri(doc, access, &t.res, t.id, window, rot) {
                     Some(uri) => Some(uri),
                     None => doc
                         .get_object(t.id)
@@ -1103,7 +1131,7 @@ fn finalize(doc: &Document, raws: Vec<RawTile>, want_uris: bool, rot: i32) -> Ve
                 if let Some(uri) = uri {
                     out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri, ctm, seq: t.seq.clone(), clip: mask });
                 }
-            } else if decodable(doc, &t.res, t.id) {
+            } else if decodable(doc, access, &t.res, t.id) {
                 out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri: String::new(), ctm, seq: t.seq.clone(), clip: mask });
             }
         }
@@ -1203,11 +1231,16 @@ fn is_grid(tiles: &[&RawTile]) -> bool {
 
 /// Decode an image XObject to RGBA, compositing its soft mask (`/SMask`) into the alpha
 /// channel when present. Used by the grid stitcher.
-fn decode_rgba(doc: &Document, res: &Dictionary, id: ObjectId) -> Option<image::RgbaImage> {
-    let base = decode_rgb(doc, res, id)?;
+fn decode_rgba(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    res: &Dictionary,
+    id: ObjectId,
+) -> Option<image::RgbaImage> {
+    let base = decode_rgb(doc, access, res, id)?;
     let (w, h) = (base.width(), base.height());
     let dict = doc.get_object(id).ok()?.as_stream().ok()?.dict.clone();
-    match decode_smask(doc, res, &dict) {
+    match decode_smask(doc, access, res, &dict) {
         Some(mask) => {
             let resized;
             let m = if mask.width() == w && mask.height() == h {
@@ -1237,7 +1270,13 @@ fn decode_rgba(doc: &Document, res: &Dictionary, id: ObjectId) -> Option<image::
 /// size, and pasted at its grid position (PDF y-up → image y-down). The canvas starts
 /// opaque white so any uncovered seams stay opaque (and JPEG-encodable). None if nothing
 /// decodes.
-fn stitch_grid(doc: &Document, tiles: &[&RawTile], bbox: (f32, f32, f32, f32), turn: i32) -> Option<String> {
+fn stitch_grid(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    tiles: &[&RawTile],
+    bbox: (f32, f32, f32, f32),
+    turn: i32,
+) -> Option<String> {
     let (x0, x1, y0, y1) = bbox;
     let (pw, ph) = (x1 - x0, y1 - y0);
     if pw <= 0.0 || ph <= 0.0 {
@@ -1257,7 +1296,7 @@ fn stitch_grid(doc: &Document, tiles: &[&RawTile], bbox: (f32, f32, f32, f32), t
     let mut canvas = image::RgbaImage::from_pixel(cw, ch, image::Rgba([255, 255, 255, 255]));
     let mut placed_any = false;
     for t in tiles {
-        let tile = match decode_rgba(doc, &t.res, t.id).map(|im| crop_window(im, t.window())) {
+        let tile = match decode_rgba(doc, access, &t.res, t.id).map(|im| crop_window(im, t.window())) {
             Some(im) => im,
             None => continue,
         };

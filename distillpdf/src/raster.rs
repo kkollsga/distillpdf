@@ -227,7 +227,13 @@ fn tint_lut(k: usize, f: &crate::function::Function, alt: &Cs) -> Vec<[u8; 3]> {
     lut
 }
 
-pub(crate) fn cs_model(doc: &Document, res: &Dictionary, o: &Object, depth: u32) -> Option<Cs> {
+pub(crate) fn cs_model(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    res: &Dictionary,
+    o: &Object,
+    depth: u32,
+) -> Option<Cs> {
     if depth > MAX_CS_DEPTH {
         return None;
     }
@@ -249,7 +255,7 @@ pub(crate) fn cs_model(doc: &Document, res: &Dictionary, o: &Object, depth: u32)
             b"CalGray" => Some(Cs::Gray),
             b"CalRGB" => Some(Cs::Rgb),
             b"Indexed" | b"I" => {
-                let base = cs_model(doc, res, a.get(1)?, depth + 1)?;
+                let base = cs_model(doc, access, res, a.get(1)?, depth + 1)?;
                 if matches!(base, Cs::Indexed { .. }) {
                     return None; // an Indexed base is illegal (§8.6.6.3); don't guess
                 }
@@ -269,11 +275,11 @@ pub(crate) fn cs_model(doc: &Document, res: &Dictionary, o: &Object, depth: u32)
                 if k == 0 || k > MAX_TINT_COLORANTS {
                     return None;
                 }
-                let alt = cs_model(doc, res, a.get(2)?, depth + 1)?;
+                let alt = cs_model(doc, access, res, a.get(2)?, depth + 1)?;
                 if matches!(alt, Cs::Indexed { .. } | Cs::Tint { .. }) {
                     return None; // an Indexed or spot alternate is illegal (§8.6.6.4)
                 }
-                let tint = crate::function::Function::parse(doc, a.get(3)?)?;
+                let tint = crate::function::Function::parse(access, a.get(3)?)?;
                 // A transform whose output arity disagrees with the space it feeds is not
                 // one to trust — the same refusal `vector.rs::parse_cs` makes.
                 if tint.n_outputs().is_some_and(|n| n != alt.components()) {
@@ -332,7 +338,12 @@ struct SamplePlan {
 
 /// The dictionary-only half of the decode gate — see [`SamplePlan`]. Touches no stream
 /// bytes, so a caller may ask it about every image on a page for free.
-fn sample_plan(doc: &Document, res: &Dictionary, dict: &Dictionary) -> Option<SamplePlan> {
+fn sample_plan(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    res: &Dictionary,
+    dict: &Dictionary,
+) -> Option<SamplePlan> {
     let w = deref(doc, dict.get(b"Width").ok()?)?.as_i64().ok()?;
     let h = deref(doc, dict.get(b"Height").ok()?)?.as_i64().ok()?;
     if w <= 0 || h <= 0 || w > MAX_IMAGE_DIM || h > MAX_IMAGE_DIM {
@@ -347,7 +358,7 @@ fn sample_plan(doc: &Document, res: &Dictionary, dict: &Dictionary) -> Option<Sa
     let (cs, bpc) = if is_mask {
         (Cs::Gray, 1i64)
     } else {
-        let cs = cs_model(doc, res, dict.get(b"ColorSpace").ok()?, 0)?;
+        let cs = cs_model(doc, access, res, dict.get(b"ColorSpace").ok()?, 0)?;
         let bpc = image_bpc(doc, dict)?;
         (cs, bpc)
     };
@@ -363,8 +374,13 @@ fn sample_plan(doc: &Document, res: &Dictionary, dict: &Dictionary) -> Option<Sa
 ///
 /// Only ever over-reports (a truncated stream still says `true`), never under-reports —
 /// which is the direction a placeholder count can afford to be wrong in.
-pub(crate) fn samples_decodable(doc: &Document, res: &Dictionary, dict: &Dictionary) -> bool {
-    sample_plan(doc, res, dict).is_some()
+pub(crate) fn samples_decodable(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    res: &Dictionary,
+    dict: &Dictionary,
+) -> bool {
+    sample_plan(doc, access, res, dict).is_some()
 }
 
 /// A decoded sample block, in the narrowest form that holds it without loss: an achromatic
@@ -410,9 +426,14 @@ impl Samples {
 /// Reads the stream through [`crate::pdfobj::content_bytes`], so an **unfiltered** raster
 /// keeps its bytes — `decompressed_content()` alone errors when a stream has no `/Filter`,
 /// which is how the render path's own copy silently lost every uncompressed image.
-pub(crate) fn decode_samples(doc: &Document, res: &Dictionary, stream: &lopdf::Stream) -> Option<Samples> {
+pub(crate) fn decode_samples(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    res: &Dictionary,
+    stream: &lopdf::Stream,
+) -> Option<Samples> {
     let dict = &stream.dict;
-    let SamplePlan { cs, bpc, w: wu, h: hu } = sample_plan(doc, res, dict)?;
+    let SamplePlan { cs, bpc, w: wu, h: hu } = sample_plan(doc, access, res, dict)?;
     let nc = cs.components();
 
     let samples = content_bytes(stream);
@@ -508,8 +529,13 @@ pub(crate) fn decode_samples(doc: &Document, res: &Dictionary, stream: &lopdf::S
 /// The extract path's container for `format:"png"` — 1167 of 2604 corpus rows, none of
 /// which opened as an image file before (the caller got back compressed samples with no
 /// container at all).
-pub(crate) fn assemble_png(doc: &Document, res: &Dictionary, stream: &lopdf::Stream) -> Option<Vec<u8>> {
-    png_bytes(decode_samples(doc, res, stream)?.into_dynamic())
+pub(crate) fn assemble_png(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    res: &Dictionary,
+    stream: &lopdf::Stream,
+) -> Option<Vec<u8>> {
+    png_bytes(decode_samples(doc, access, res, stream)?.into_dynamic())
 }
 
 /// The `i`-th `bpc`-bit sample of a packed row.
@@ -710,7 +736,24 @@ pub(crate) fn image_bpc(doc: &Document, dict: &Dictionary) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::test_adapter;
     use lopdf::{dictionary, Stream, StringFormat};
+
+    fn cs_model(doc: &Document, resources: &Dictionary, object: &Object, depth: u32) -> Option<Cs> {
+        super::cs_model(doc, &test_adapter(doc), resources, object, depth)
+    }
+
+    fn samples_decodable(doc: &Document, resources: &Dictionary, dict: &Dictionary) -> bool {
+        super::samples_decodable(doc, &test_adapter(doc), resources, dict)
+    }
+
+    fn decode_samples(doc: &Document, resources: &Dictionary, stream: &Stream) -> Option<Samples> {
+        super::decode_samples(doc, &test_adapter(doc), resources, stream)
+    }
+
+    fn assemble_png(doc: &Document, resources: &Dictionary, stream: &Stream) -> Option<Vec<u8>> {
+        super::assemble_png(doc, &test_adapter(doc), resources, stream)
+    }
 
     fn stream(filters: &[&str], content: Vec<u8>) -> Stream {
         let mut d = Dictionary::new();

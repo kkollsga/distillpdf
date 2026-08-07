@@ -70,7 +70,13 @@ const MAX_COLORANTS: usize = 32;
 
 /// Parse one colour-space object. `None` means "not a space this path models" — the caller
 /// then leaves the active space unset, which is precisely today's behaviour.
-fn parse_cs(doc: &Document, res: &Dictionary, o: &Object, depth: u32) -> Option<PaintCs> {
+fn parse_cs(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    res: &Dictionary,
+    o: &Object,
+    depth: u32,
+) -> Option<PaintCs> {
     if depth > crate::raster::MAX_CS_DEPTH {
         return None;
     }
@@ -94,7 +100,7 @@ fn parse_cs(doc: &Document, res: &Dictionary, o: &Object, depth: u32) -> Option<
                 }
                 // The alternate space reduces to a component count — and an `/Indexed`
                 // alternate is illegal, so it degrades rather than being read as gray.
-                let alt = crate::raster::cs_model(doc, res, a.get(2)?, depth + 1).and_then(|c| match c {
+                let alt = crate::raster::cs_model(doc, access, res, a.get(2)?, depth + 1).and_then(|c| match c {
                     // An `/Indexed` or spot alternate is illegal (§8.6.6.4), so it degrades
                     // rather than being read as gray or as another space's tint count.
                     crate::raster::Cs::Indexed { .. } | crate::raster::Cs::Tint { .. } => None,
@@ -105,7 +111,7 @@ fn parse_cs(doc: &Document, res: &Dictionary, o: &Object, depth: u32) -> Option<
                 // coverage fallback instead of to a confidently wrong colour.
                 let tint = a
                     .get(3)
-                    .and_then(|f| Function::parse(doc, f))
+                    .and_then(|f| Function::parse(access, f))
                     .filter(|f| !matches!((f.n_outputs(), alt), (Some(n), Some(k)) if n != k));
                 return Some(PaintCs::Tint { k, tint, alt });
             }
@@ -113,17 +119,21 @@ fn parse_cs(doc: &Document, res: &Dictionary, o: &Object, depth: u32) -> Option<
             _ => {}
         }
     }
-    crate::raster::cs_model(doc, res, o, depth).map(|_| PaintCs::Device)
+    crate::raster::cs_model(doc, access, res, o, depth).map(|_| PaintCs::Device)
 }
 
 /// The colour spaces one resource dictionary defines, by name — the `/ColorSpace` half of
 /// what `cs`/`CS` resolve against, folded over the page's resource chain exactly as the
 /// `/ExtGState` map is.
-fn colorspaces_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, Rc<PaintCs>> {
+fn colorspaces_of(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    resources: &Dictionary,
+) -> HashMap<Vec<u8>, Rc<PaintCs>> {
     let mut map = HashMap::new();
     if let Some(csd) = sub_dict(doc, resources, b"ColorSpace") {
         for (name, val) in csd.iter() {
-            if let Some(cs) = parse_cs(doc, resources, val, 0) {
+            if let Some(cs) = parse_cs(doc, access, resources, val, 0) {
                 map.insert(name.clone(), Rc::new(cs));
             }
         }
@@ -1217,7 +1227,7 @@ fn painted_page(
         let _ = res.read(|dictionary| {
             overlay_xobjects(access, dictionary, &mut xmap);
             egmap.extend(extgstates_of(doc, dictionary));
-            csmap.extend(colorspaces_of(doc, dictionary));
+            csmap.extend(colorspaces_of(doc, access, dictionary));
         });
     }
     let mut painted = Vec::new();
@@ -1238,7 +1248,7 @@ fn painted_page(
             let (mut aeg, mut acs) = (HashMap::new(), HashMap::new());
             if let Some(fr) = &f.scope.resources {
                 aeg.extend(extgstates_of(doc, fr));
-                acs.extend(colorspaces_of(doc, fr));
+                acs.extend(colorspaces_of(doc, access, fr));
             }
             let mut g = GState::new(f.matrix.mul(actm), [0; 3], [0; 3], 1.0, 1.0, 1.0);
             if let Some(bb) = crate::walker::form_bbox_clip(access, ap, g.ctm) {
@@ -1565,7 +1575,7 @@ fn walk(
                     for (k, v) in extgstates_of(doc, fr) {
                         child_eg.insert(k, v);
                     }
-                    for (k, v) in colorspaces_of(doc, fr) {
+                    for (k, v) in colorspaces_of(doc, access, fr) {
                         child_cs.insert(k, v);
                     }
                 }
@@ -1992,7 +2002,7 @@ mod tests {
             let _ = res.read(|dictionary| {
                 overlay_xobjects(&access, dictionary, &mut xmap);
                 egmap.extend(extgstates_of(doc, dictionary));
-                csmap.extend(colorspaces_of(doc, dictionary));
+                csmap.extend(colorspaces_of(doc, &access, dictionary));
             });
         }
         let mut painted = Vec::new();
