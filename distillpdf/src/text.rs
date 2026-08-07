@@ -140,7 +140,7 @@ fn build_fonts(
     let mut out = HashMap::new();
     // The access chain is outermost-to-page. Later overlays therefore reproduce
     // `get_page_fonts`' nearest-resource-wins behavior without borrowing its map.
-    for resources in access.page_resource_chain(page_id).unwrap_or_default() {
+    for resources in access.page_resource_chain_or_empty(page_id) {
         out.extend(build_fonts_from_resources(access, &resources, raw));
     }
     out
@@ -2035,7 +2035,7 @@ pub fn debug_page(access: &dyn DocumentAccess, page_id: ObjectId, raw: &[u8]) ->
     }
     // ToUnicode raw diagnostics per font.
     let mut font_handles = std::collections::BTreeMap::new();
-    for resources in access.page_resource_chain(page_id).unwrap_or_default() {
+    for resources in access.page_resource_chain_or_empty(page_id) {
         let Ok(fonts) = resources.entry(access, b"Font") else {
             continue;
         };

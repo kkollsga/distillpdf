@@ -575,7 +575,7 @@ pub(crate) fn extract_front_matter(
     access: &dyn crate::access::DocumentAccess,
     raw: &[u8],
 ) -> FrontMatter {
-    let first = match access.pages().unwrap_or_default().into_iter().min_by_key(|page| page.number) {
+    let first = match access.pages_or_empty().into_iter().min_by_key(|page| page.number) {
         Some(page) => page.id,
         None => return FrontMatter::default(),
     };

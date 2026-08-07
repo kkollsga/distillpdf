@@ -1139,7 +1139,7 @@ pub(crate) fn render_doc_elements(
         }
     };
 
-    let pages = access.pages().unwrap_or_default();
+    let pages = access.pages_or_empty();
 
     // Document-wide body font size = most common rounded span size. Spans are extracted
     // per page in PARALLEL (each page is independent and read-only on the document); the

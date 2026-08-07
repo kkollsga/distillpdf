@@ -46,7 +46,7 @@ pub(crate) fn build_model(
     generated_at: String,
     profile: AssetProfile,
 ) -> (DocModel, AssetBytes) {
-    let page_map = access.pages().unwrap_or_default(); // detached, 1-indexed, sorted by the adapter
+    let page_map = access.pages_or_empty(); // detached, 1-indexed, sorted by the adapter
     let page_count = page_map.len() as u32;
 
     // Per-page geometry + OCR decision + PDF page labels. Built first so blocks can be

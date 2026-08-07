@@ -231,7 +231,7 @@ pub(crate) fn overlay_xobjects(access: &dyn DocumentAccess, resources: &Dictiona
 /// still wins every name it defines. `extract::drawn_images` has read the chain this way
 /// since it was written; this is the three interpreters catching up.
 pub(crate) fn page_resource_chain(access: &dyn DocumentAccess, page_id: ObjectId) -> Vec<DictionaryHandle> {
-    access.page_resource_chain(page_id).unwrap_or_default()
+    access.page_resource_chain_or_empty(page_id)
 }
 
 /// The XObjects a page can `Do`, resolved over its whole resource chain.

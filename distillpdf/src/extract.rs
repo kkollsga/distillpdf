@@ -77,7 +77,7 @@ fn page_resource_dicts(
     let mut seen: HashSet<ObjectId> = HashSet::new();
     // The adapter returns outermost → page for overlay consumers. Reporting has always
     // enumerated page → outermost, so reverse it to preserve every existing row index.
-    for resources in access.page_resource_chain(page_id).unwrap_or_default().into_iter().rev() {
+    for resources in access.page_resource_chain_or_empty(page_id).into_iter().rev() {
         queue.push_back((resources, 0));
     }
     resource_bfs(access, queue, &mut seen)
@@ -361,7 +361,7 @@ fn extract_images_inner(
     short_circuit: bool,
 ) -> Vec<ImageInfo> {
     let mut out = Vec::new();
-    for page in access.pages().unwrap_or_default() {
+    for page in access.pages_or_empty() {
         let (pno, page_id) = (page.number, page.id);
         // The page's own resource tree first, so every `(page, index)` a page already
         // reported keeps it; the annotation appearances are appended after.
@@ -2494,7 +2494,7 @@ pub fn extract_tables(
     access: &dyn crate::access::DocumentAccess,
     raw: &[u8],
 ) -> Vec<TableInfo> {
-    let pages = access.pages().unwrap_or_default();
+    let pages = access.pages_or_empty();
     let mut per_page: Vec<(u32, Vec<Vec<Vec<String>>>)> = pages
         .par_iter()
         .map(|page| {
@@ -2567,7 +2567,7 @@ fn font_embedded(access: &dyn crate::access::DocumentAccess, dict: &Dictionary) 
 /// it. [`appearance_resource_dicts`] exists and is one call away if that verdict changes.
 pub fn extract_fonts(access: &dyn crate::access::DocumentAccess) -> Vec<FontInfo> {
     let mut out = Vec::new();
-    for page in access.pages().unwrap_or_default() {
+    for page in access.pages_or_empty() {
         let (pno, page_id) = (page.number, page.id);
         // De-duplicated per page by (resource name, font object id): one font shared by
         // several forms is one row, while the same name bound to different objects in the

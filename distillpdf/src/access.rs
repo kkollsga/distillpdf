@@ -18,19 +18,62 @@ pub(crate) struct PageRef {
     pub(crate) id: ObjectId,
 }
 
-/// A stable internal access failure. L2d expands this into the complete suppression key.
+/// Stable failure phase used by the suppression contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AccessPhase {
+    Resolve,
+    Object,
+    Trailer,
+    Catalog,
+    Page,
+    PageContent,
+    Pages,
+    FallbackText,
+    Resources,
+}
+
+/// Stable failure class. Backend messages remain in `detail`; policy never branches on them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AccessKind {
+    Type,
+    Bounds,
+    #[cfg_attr(not(test), allow(dead_code))] // constructed by the fault-injection adapter
+    Injected,
+    Backend,
+}
+
+/// A stable internal access failure key `(phase,page,object,kind,detail)`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AccessError {
+    pub(crate) phase: AccessPhase,
+    pub(crate) page: Option<u32>,
     pub(crate) object: ObjectId,
+    pub(crate) kind: AccessKind,
     pub(crate) detail: String,
 }
 
 impl AccessError {
     fn object(object: ObjectId, error: impl fmt::Display) -> Self {
+        let detail = error.to_string();
         Self {
+            phase: AccessPhase::Resolve,
+            page: None,
             object,
-            detail: error.to_string(),
+            kind: AccessKind::Backend,
+            detail,
         }
+    }
+
+    fn typed(object: ObjectId, kind: AccessKind, error: impl fmt::Display) -> Self {
+        let mut failure = Self::object(object, error);
+        failure.kind = kind;
+        failure
+    }
+
+    fn at(mut self, phase: AccessPhase, page: Option<u32>) -> Self {
+        self.phase = phase;
+        self.page = page;
+        self
     }
 }
 
@@ -38,9 +81,53 @@ impl fmt::Display for AccessError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "object {} {}: {}",
-            self.object.0, self.object.1, self.detail
+            "{:?} page {:?} object {} {} {:?}: {}",
+            self.phase, self.page, self.object.0, self.object.1, self.kind, self.detail
         )
+    }
+}
+
+/// Legacy disposition for a failed immutable operation. This table is the checked-in L2d
+/// authority: adapters return typed errors; consumers keep the eager route's historical
+/// suppression/fallback at these exact operation boundaries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Suppression {
+    SkipNode,
+    SkipMetadata,
+    EmptyPage,
+    EmptyDocument,
+    EmptyText,
+    EmptyResources,
+}
+
+pub(crate) const LEGACY_SUPPRESSION: &[(AccessPhase, Suppression)] = &[
+    (AccessPhase::Resolve, Suppression::SkipNode),
+    (AccessPhase::Object, Suppression::SkipNode),
+    (AccessPhase::Trailer, Suppression::SkipMetadata),
+    (AccessPhase::Catalog, Suppression::SkipMetadata),
+    (AccessPhase::Page, Suppression::SkipNode),
+    (AccessPhase::PageContent, Suppression::EmptyPage),
+    (AccessPhase::Pages, Suppression::EmptyDocument),
+    (AccessPhase::FallbackText, Suppression::EmptyText),
+    (AccessPhase::Resources, Suppression::EmptyResources),
+];
+
+pub(crate) fn legacy_suppression(phase: AccessPhase) -> Option<Suppression> {
+    LEGACY_SUPPRESSION.iter().find_map(|(candidate, disposition)| {
+        (*candidate == phase).then_some(*disposition)
+    })
+}
+
+fn suppress_default<T: Default>(
+    result: Result<T, AccessError>,
+    disposition: Suppression,
+) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            debug_assert_eq!(legacy_suppression(error.phase), Some(disposition));
+            T::default()
+        }
     }
 }
 
@@ -92,8 +179,9 @@ impl DictionaryHandle {
     fn new(object: ObjectHandle) -> Result<Self, AccessError> {
         let id = object.root_id();
         if !object.read(|value| value.as_dict().is_ok())? {
-            return Err(AccessError::object(
+            return Err(AccessError::typed(
                 id,
+                AccessKind::Type,
                 "resolved object is not a dictionary",
             ));
         }
@@ -121,7 +209,7 @@ impl StreamHandle {
     fn new(id: ObjectId, object: ObjectHandle) -> Result<Self, AccessError> {
         let is_stream = object.read(|value| value.as_stream().is_ok())?;
         if !is_stream {
-            return Err(AccessError::object(id, "resolved object is not a stream"));
+            return Err(AccessError::typed(id, AccessKind::Type, "resolved object is not a stream"));
         }
         Ok(Self { object })
     }
@@ -195,7 +283,7 @@ impl ObjectHandle {
                     .ok()
                     .and_then(|array| array.get(*index))
                     .ok_or_else(|| {
-                        AccessError::object(id, format!("array index {index} is out of bounds"))
+                        AccessError::typed(id, AccessKind::Bounds, format!("array index {index} is out of bounds"))
                     })?,
             };
         }
@@ -249,7 +337,7 @@ impl ObjectHandle {
         })?;
         self.child(
             access,
-            step.ok_or_else(|| AccessError::object(self.root_id(), "object has no dictionary"))?,
+            step.ok_or_else(|| AccessError::typed(self.root_id(), AccessKind::Type, "object has no dictionary"))?,
         )
     }
 
@@ -294,10 +382,16 @@ pub(crate) trait DocumentAccess: Send + Sync {
     fn object(&self, id: ObjectId) -> Result<ObjectHandle, AccessError>;
     fn trailer_entry(&self, key: &[u8]) -> Result<ObjectHandle, AccessError>;
     fn catalog(&self) -> Result<DictionaryHandle, AccessError> {
-        DictionaryHandle::new(self.trailer_entry(b"Root")?)
+        let root = self.trailer_entry(b"Root")
+            .map_err(|error| error.at(AccessPhase::Catalog, None))?;
+        DictionaryHandle::new(root)
+            .map_err(|error| error.at(AccessPhase::Catalog, None))
     }
     fn page(&self, id: ObjectId) -> Result<DictionaryHandle, AccessError> {
-        DictionaryHandle::new(self.object(id)?)
+        let page = self.object(id)
+            .map_err(|error| error.at(AccessPhase::Page, None))?;
+        DictionaryHandle::new(page)
+            .map_err(|error| error.at(AccessPhase::Page, None))
     }
     /// Materialize a page's decoded content with the selected backend's exact fallback policy.
     fn page_content(&self, page: ObjectId) -> Result<Vec<u8>, AccessError>;
@@ -305,12 +399,21 @@ pub(crate) trait DocumentAccess: Send + Sync {
         StreamHandle::new(id, self.object(id)?)
     }
     fn pages(&self) -> Result<Vec<PageRef>, AccessError>;
+    fn pages_or_empty(&self) -> Vec<PageRef> {
+        suppress_default(self.pages(), Suppression::EmptyDocument)
+    }
     /// Backend-compatible fallback text for one 1-indexed page.
     fn fallback_page_text(&self, page: u32) -> Result<String, AccessError>;
+    fn fallback_page_text_or_empty(&self, page: u32) -> String {
+        suppress_default(self.fallback_page_text(page), Suppression::EmptyText)
+    }
     /// Every indexed indirect object id in deterministic order.
     fn object_ids(&self) -> Vec<ObjectId>;
     /// Page `/Resources` dictionaries in outermost-to-page overlay order.
     fn page_resource_chain(&self, page: ObjectId) -> Result<Vec<DictionaryHandle>, AccessError>;
+    fn page_resource_chain_or_empty(&self, page: ObjectId) -> Vec<DictionaryHandle> {
+        suppress_default(self.page_resource_chain(page), Suppression::EmptyResources)
+    }
     #[allow(dead_code)] // raw-recovery consumers migrate in L2b
     fn source(&self) -> Arc<dyn RandomAccessSource>;
     /// Perform the one explicit whole-source scan permitted to the recovery index.
@@ -352,7 +455,7 @@ impl DocumentAccess for EagerDocumentAdapter {
         // surprise. The immutable eager document makes the same lookup stable at read time.
         self.document
             .get_object(id)
-            .map_err(|error| AccessError::object(id, error))?;
+            .map_err(|error| AccessError::object(id, error).at(AccessPhase::Object, None))?;
         Ok(ObjectHandle::eager(Arc::clone(&self.document), id))
     }
 
@@ -361,7 +464,7 @@ impl DocumentAccess for EagerDocumentAdapter {
             .document
             .trailer
             .get(key)
-            .map_err(|error| AccessError::object((0, 0), error))?;
+            .map_err(|error| AccessError::object((0, 0), error).at(AccessPhase::Trailer, None))?;
         if let Object::Reference(id) = value {
             self.object(*id)
         } else {
@@ -375,7 +478,7 @@ impl DocumentAccess for EagerDocumentAdapter {
     fn page_content(&self, page: ObjectId) -> Result<Vec<u8>, AccessError> {
         self.document
             .get_dictionary(page)
-            .map_err(|error| AccessError::object(page, error))?;
+            .map_err(|error| AccessError::object(page, error).at(AccessPhase::PageContent, None))?;
         Ok(self.document.get_page_content(page))
     }
 
@@ -391,7 +494,7 @@ impl DocumentAccess for EagerDocumentAdapter {
     fn fallback_page_text(&self, page: u32) -> Result<String, AccessError> {
         self.document
             .extract_text(&[page])
-            .map_err(|error| AccessError::object((0, 0), error))
+            .map_err(|error| AccessError::object((0, 0), error).at(AccessPhase::FallbackText, Some(page)))
     }
 
     fn object_ids(&self) -> Vec<ObjectId> {
@@ -402,7 +505,7 @@ impl DocumentAccess for EagerDocumentAdapter {
         let (own, inherited) = self
             .document
             .get_page_resources(page)
-            .map_err(|error| AccessError::object(page, error))?;
+            .map_err(|error| AccessError::object(page, error).at(AccessPhase::Resources, None))?;
         let mut out: Vec<DictionaryHandle> = inherited
             .iter()
             .rev()
@@ -528,6 +631,20 @@ pub(crate) mod tests {
         Source,
     }
 
+    impl FaultPoint {
+        fn phase(self) -> AccessPhase {
+            match self {
+                Self::Object => AccessPhase::Object,
+                Self::Trailer => AccessPhase::Trailer,
+                Self::PageContent => AccessPhase::PageContent,
+                Self::Pages => AccessPhase::Pages,
+                Self::FallbackText => AccessPhase::FallbackText,
+                Self::Resources => AccessPhase::Resources,
+                Self::Source => AccessPhase::Resolve,
+            }
+        }
+    }
+
     /// Test-only counter/fault wrapper. Every future boundary operation must pass through this
     /// shape so L2d can prove suppression without falling back to the eager backend.
     pub(crate) struct FaultAccess {
@@ -551,10 +668,11 @@ pub(crate) mod tests {
 
         fn failure(&self, point: FaultPoint, object: ObjectId) -> Result<(), AccessError> {
             if self.fault == Some(point) {
-                Err(AccessError::object(
+                Err(AccessError::typed(
                     object,
+                    AccessKind::Injected,
                     format!("injected {point:?} failure"),
-                ))
+                ).at(point.phase(), None))
             } else {
                 Ok(())
             }
@@ -588,7 +706,8 @@ pub(crate) mod tests {
 
         fn fallback_page_text(&self, page: u32) -> Result<String, AccessError> {
             self.counts.fallback_text_reads.fetch_add(1, Ordering::Relaxed);
-            self.failure(FaultPoint::FallbackText, (page, 0))?;
+            self.failure(FaultPoint::FallbackText, (page, 0))
+                .map_err(|error| error.at(AccessPhase::FallbackText, Some(page)))?;
             self.inner.fallback_page_text(page)
         }
 
@@ -886,8 +1005,31 @@ pub(crate) mod tests {
                 }
             };
             assert!(error.detail.contains("injected"));
+            assert_eq!(error.phase, point.phase());
+            assert_eq!(error.kind, AccessKind::Injected);
+            assert!(legacy_suppression(error.phase).is_some());
             assert_eq!(fault.counts.opens.load(Ordering::Relaxed), 1);
         }
+
+        let counts = Arc::new(AccessCounts::default());
+        let catalog_fault = FaultAccess::new(
+            Arc::new(adapter.clone()),
+            Some(FaultPoint::Trailer),
+            Arc::clone(&counts),
+        );
+        let catalog_error = catalog_fault.catalog().err().unwrap();
+        assert_eq!(catalog_error.phase, AccessPhase::Catalog);
+        assert_eq!(legacy_suppression(catalog_error.phase), Some(Suppression::SkipMetadata));
+
+        let counts = Arc::new(AccessCounts::default());
+        let page_fault = FaultAccess::new(
+            Arc::new(adapter.clone()),
+            Some(FaultPoint::Object),
+            Arc::clone(&counts),
+        );
+        let page_error = page_fault.page(ids[0]).err().unwrap();
+        assert_eq!(page_error.phase, AccessPhase::Page);
+        assert_eq!(legacy_suppression(page_error.phase), Some(Suppression::SkipNode));
 
         let counts = Arc::new(AccessCounts::default());
         counts.opens.fetch_add(1, Ordering::Relaxed);

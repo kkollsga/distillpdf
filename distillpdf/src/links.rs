@@ -638,7 +638,7 @@ fn link_from_annotation(
 
 /// Extract every Link annotation across the document.
 pub fn extract_links(access: &dyn DocumentAccess) -> Vec<Link> {
-    let pages = access.pages().unwrap_or_default();
+    let pages = access.pages_or_empty();
     let page_no: HashMap<ObjectId, u32> = pages
         .iter()
         .map(|page| (page.id, page.number))

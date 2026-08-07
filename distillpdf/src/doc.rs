@@ -405,7 +405,7 @@ impl PdfDocument {
     /// loop by construction, not by luck: nothing crosses pages, and the pieces are re-sorted
     /// by page number before they are joined, so completion order is never observed.
     pub fn extract_text(&self) -> String {
-        let pages = self.access.pages().unwrap_or_default();
+        let pages = self.access.pages_or_empty();
         let mut per_page: Vec<(u32, String)> = pages
             .par_iter()
             .map(|page| {
@@ -413,7 +413,7 @@ impl PdfDocument {
                 let s = if mine.trim().chars().count() >= 2 {
                     mine
                 } else {
-                    self.access.fallback_page_text(page.number).unwrap_or_default()
+                    self.access.fallback_page_text_or_empty(page.number)
                 };
                 (page.number, s)
             })
@@ -429,21 +429,21 @@ impl PdfDocument {
 
     /// Extract text from a single 1-indexed page (hybrid).
     pub fn extract_page_text(&self, page: u32) -> Result<String, Error> {
-        let page_id = self.access.pages().unwrap_or_default().into_iter()
+        let page_id = self.access.pages_or_empty().into_iter()
             .find(|entry| entry.number == page).map(|entry| entry.id)
             .ok_or(Error::NoPage(Some(page)))?;
         let mine = text::extract_page(self.access.as_ref(), page_id, &self.raw).unwrap_or_default();
         Ok(if mine.trim().chars().count() >= 2 {
             mine
         } else {
-            self.access.fallback_page_text(page).unwrap_or_default()
+            self.access.fallback_page_text_or_empty(page)
         })
     }
 
     /// Diagnostic: force our ToUnicode extractor for all pages.
     pub fn mine_text(&self) -> String {
         let mut out = String::new();
-        for page in self.access.pages().unwrap_or_default() {
+        for page in self.access.pages_or_empty() {
             out.push_str(&text::extract_page(self.access.as_ref(), page.id, &self.raw).unwrap_or_default());
             out.push('\n');
         }
@@ -452,7 +452,7 @@ impl PdfDocument {
 
     /// Diagnostic: raw spans (text, x, width, size) for a 1-indexed page.
     pub fn dbg_spans(&self, page: u32) -> Result<Vec<(String, f32, f32, f32)>, Error> {
-        let page_id = self.access.pages().unwrap_or_default().into_iter()
+        let page_id = self.access.pages_or_empty().into_iter()
             .find(|entry| entry.number == page).map(|entry| entry.id)
             .ok_or(Error::NoPage(None))?;
         Ok(text::extract_spans(self.access.as_ref(), page_id, &self.raw)
@@ -464,7 +464,7 @@ impl PdfDocument {
     /// Diagnostic: spans with y for a 1-indexed page (text, x, y, width, size).
     #[allow(clippy::type_complexity)] // a flat diagnostic tuple mirroring the Python `_dbg_spans_xy`
     pub fn dbg_spans_xy(&self, page: u32) -> Result<Vec<(String, f32, f32, f32, f32)>, Error> {
-        let page_id = self.access.pages().unwrap_or_default().into_iter()
+        let page_id = self.access.pages_or_empty().into_iter()
             .find(|entry| entry.number == page).map(|entry| entry.id)
             .ok_or(Error::NoPage(None))?;
         Ok(text::extract_spans(self.access.as_ref(), page_id, &self.raw)
@@ -486,7 +486,7 @@ impl PdfDocument {
     /// document, so a filter can never quietly start eating real figures.
     pub fn figure_gate_stats(&self) -> (u32, u32, Vec<u32>) {
         let (mut accepted, mut suppressed, mut pages) = (0u32, 0u32, Vec::new());
-        let mut page_map = self.access.pages().unwrap_or_default();
+        let mut page_map = self.access.pages_or_empty();
         page_map.sort_by_key(|page| page.number);
         for page in page_map {
             let (strong, weak) = crate::vector::positioned_vectors(self.access.as_ref(), page.id);
@@ -518,7 +518,7 @@ impl PdfDocument {
 
     /// Diagnostic for one 1-indexed page.
     pub fn debug_page(&self, page: u32) -> Result<String, Error> {
-        let page_id = self.access.pages().unwrap_or_default().into_iter()
+        let page_id = self.access.pages_or_empty().into_iter()
             .find(|entry| entry.number == page).map(|entry| entry.id)
             .ok_or(Error::NoPage(Some(page)))?;
         Ok(text::debug_page(self.access.as_ref(), page_id, &self.raw))
@@ -575,7 +575,7 @@ impl PdfDocument {
     /// OCR plan: per page, whether OCR is needed and (if so) the page raster bytes.
     pub fn ocr_plan(&self) -> Vec<OcrPlanEntry> {
         let mut out = Vec::new();
-        for page in self.access.pages().unwrap_or_default() {
+        for page in self.access.pages_or_empty() {
             let decision = ocr::detect::decide(self.access.as_ref(), page.id, &self.raw);
             let needs = !matches!(decision, ocr::detect::OcrDecision::NotNeeded);
             let (w, h) = ocr::page_size_pts(self.access.as_ref(), page.id);
