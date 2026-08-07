@@ -6,13 +6,17 @@
 //! typed [`DistillOptions`]. NO pyo3 appears here — the binding does all Python-object
 //! assembly and maps [`Error`] → `PyValueError`.
 
-use lopdf::Document;
+use lopdf::{BytesSource, Document, FileSource, RandomAccessSource, SourceError, SourceResult};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::access::{DocumentAccess, EagerDocumentAdapter};
+use crate::access::{
+    AccessError, DocumentAccess, EagerDocumentAdapter, IndexedAdapterCounters,
+    IndexedDocumentAdapter, PageRef,
+};
 use crate::error::Error;
 use crate::extract::{self, FontInfo, ImageInfo, TableInfo};
 use crate::model::container::AssetBytes;
@@ -99,15 +103,207 @@ pub struct OcrPlanEntry {
 
 /// A loaded PDF document — the reusable pure-Rust handle.
 pub struct PdfDocument {
-    #[cfg(test)]
-    pub(crate) doc: Arc<Document>,
     /// Runtime-selectable immutable access route. L2 uses the eager oracle adapter; L3 adds
     /// the bounded indexed implementation without reopening consumer signatures.
     pub(crate) access: Arc<dyn DocumentAccess>,
+    #[allow(dead_code)] // internal route provenance becomes public only after API approval
+    diagnostics: Arc<RouteDiagnostics>,
     /// Source path (`open`); `None` when constructed from bytes.
     pub(crate) source: Option<PathBuf>,
     /// Cached OCR results: `{1-based page: DocTags}`, populated once by `set_ocr`.
     pub(crate) ocr_cache: Mutex<HashMap<u32, String>>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OpenRoute {
+    EagerFile,
+    EagerBytes,
+    IndexedFile,
+    IndexedBytes,
+    IndexedSnapshot,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OpenReason {
+    PublicCompatibility,
+    InternalMeasurement,
+    ExplicitSnapshot,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceMode {
+    FileDescriptor,
+    SharedBytes,
+    EagerMaterializedFile,
+    FullSnapshot,
+}
+
+#[derive(Default)]
+struct RouteSourceCounters {
+    requests: AtomicU64,
+    reads: AtomicU64,
+    max_request: AtomicU64,
+}
+
+struct ObservedSource {
+    inner: Arc<dyn RandomAccessSource>,
+    counters: Arc<RouteSourceCounters>,
+}
+
+impl RandomAccessSource for ObservedSource {
+    fn len(&self) -> SourceResult<u64> {
+        self.counters.requests.fetch_add(1, Ordering::Relaxed);
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> SourceResult<usize> {
+        self.counters.requests.fetch_add(1, Ordering::Relaxed);
+        self.counters.reads.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .max_request
+            .fetch_max(out.len() as u64, Ordering::Relaxed);
+        self.inner.read_at(offset, out)
+    }
+
+    fn validate_unchanged(&self) -> SourceResult<()> {
+        self.counters.requests.fetch_add(1, Ordering::Relaxed);
+        self.inner.validate_unchanged()
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) struct RouteDiagnostics {
+    pub(crate) route: OpenRoute,
+    pub(crate) reason: OpenReason,
+    pub(crate) source_mode: SourceMode,
+    eager_opens: AtomicU64,
+    indexed_opens: AtomicU64,
+    fallback_opens: AtomicU64,
+    source: Arc<RouteSourceCounters>,
+    indexed: OnceLock<Arc<IndexedAdapterCounters>>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RouteDiagnosticsSnapshot {
+    pub(crate) route: OpenRoute,
+    pub(crate) reason: OpenReason,
+    pub(crate) source_mode: SourceMode,
+    pub(crate) eager_opens: u64,
+    pub(crate) indexed_opens: u64,
+    pub(crate) fallback_opens: u64,
+    pub(crate) source_requests: u64,
+    pub(crate) source_reads: u64,
+    pub(crate) source_max_request: u64,
+    pub(crate) page_map_builds: u64,
+    pub(crate) index_estimated_bytes: u64,
+    pub(crate) index_objects: u64,
+    pub(crate) index_pages: u64,
+    pub(crate) document_object_o_admitted_bytes: u64,
+}
+
+#[allow(dead_code)]
+impl RouteDiagnostics {
+    fn new(route: OpenRoute, reason: OpenReason, source_mode: SourceMode) -> Arc<Self> {
+        Arc::new(Self {
+            route,
+            reason,
+            source_mode,
+            eager_opens: AtomicU64::new(0),
+            indexed_opens: AtomicU64::new(0),
+            fallback_opens: AtomicU64::new(0),
+            source: Arc::new(RouteSourceCounters::default()),
+            indexed: OnceLock::new(),
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> RouteDiagnosticsSnapshot {
+        let indexed = self.indexed.get();
+        RouteDiagnosticsSnapshot {
+            route: self.route,
+            reason: self.reason,
+            source_mode: self.source_mode,
+            eager_opens: self.eager_opens.load(Ordering::Relaxed),
+            indexed_opens: self.indexed_opens.load(Ordering::Relaxed),
+            fallback_opens: self.fallback_opens.load(Ordering::Relaxed),
+            source_requests: self.source.requests.load(Ordering::Relaxed),
+            source_reads: self.source.reads.load(Ordering::Relaxed),
+            source_max_request: self.source.max_request.load(Ordering::Relaxed),
+            page_map_builds: indexed.map_or(0, |counters| {
+                counters.page_map_builds.load(Ordering::Relaxed)
+            }),
+            index_estimated_bytes: indexed.map_or(0, |counters| {
+                counters.index_estimated_bytes.load(Ordering::Relaxed)
+            }),
+            index_objects: indexed
+                .map_or(0, |counters| counters.index_objects.load(Ordering::Relaxed)),
+            index_pages: indexed
+                .map_or(0, |counters| counters.index_pages.load(Ordering::Relaxed)),
+            document_object_o_admitted_bytes: indexed.map_or(0, |counters| {
+                counters
+                    .retained_object_admitted_bytes
+                    .load(Ordering::Relaxed)
+            }),
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum RouteFailure {
+    Source(SourceError),
+    Access(AccessError),
+}
+
+#[allow(dead_code)]
+pub(crate) struct RouteOpenError {
+    pub(crate) failure: RouteFailure,
+    pub(crate) diagnostics: Arc<RouteDiagnostics>,
+}
+
+impl std::fmt::Debug for RouteOpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RouteOpenError")
+            .field("failure", &self.failure)
+            .field("route", &self.diagnostics.route)
+            .finish()
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) struct IndexedOpenControl {
+    access: Arc<IndexedDocumentAdapter>,
+    diagnostics: Arc<RouteDiagnostics>,
+    source_owner: Option<Arc<[u8]>>,
+}
+
+#[allow(dead_code)]
+impl IndexedOpenControl {
+    pub(crate) fn diagnostics(&self) -> RouteDiagnosticsSnapshot {
+        self.diagnostics.snapshot()
+    }
+
+    pub(crate) fn pages(&self) -> Result<Vec<PageRef>, AccessError> {
+        self.access.pages()
+    }
+
+    pub(crate) fn source_sha256(&self) -> Result<String, AccessError> {
+        self.access.source_sha256()
+    }
+
+    #[cfg(test)]
+    fn check_page_content(&self, page: lopdf::ObjectId) -> Result<(), AccessError> {
+        self.access.page_content(page).map(|_| ())
+    }
+
+    #[cfg(test)]
+    fn shared_bytes(&self) -> Option<&Arc<[u8]>> {
+        self.source_owner.as_ref()
+    }
 }
 
 /// A private one-thread rayon pool, used for **nothing but** `Document::load_mem`.
@@ -339,44 +535,169 @@ fn ensure_decrypted(raw: &[u8], doc: &mut Document) -> Result<(), Error> {
     Ok(())
 }
 
+fn open_indexed_source(
+    source: Arc<dyn RandomAccessSource>,
+    source_owner: Option<Arc<[u8]>>,
+    diagnostics: Arc<RouteDiagnostics>,
+    password: Option<Vec<u8>>,
+) -> Result<IndexedOpenControl, RouteOpenError> {
+    diagnostics.indexed_opens.store(1, Ordering::Relaxed);
+    let observed: Arc<dyn RandomAccessSource> = Arc::new(ObservedSource {
+        inner: source,
+        counters: Arc::clone(&diagnostics.source),
+    });
+    let access = IndexedDocumentAdapter::open(observed, password).map_err(|failure| {
+        RouteOpenError {
+            failure: RouteFailure::Access(failure),
+            diagnostics: Arc::clone(&diagnostics),
+        }
+    })?;
+    let access = Arc::new(access);
+    assert!(
+        diagnostics.indexed.set(access.counters()).is_ok(),
+        "route diagnostics indexed counters are assigned once"
+    );
+    Ok(IndexedOpenControl {
+        access,
+        diagnostics,
+        source_owner,
+    })
+}
+
+#[allow(dead_code)] // internal L3 route authority; public constructors remain eager
+pub(crate) fn open_indexed_file_internal(
+    path: &Path,
+    password: Option<Vec<u8>>,
+) -> Result<IndexedOpenControl, RouteOpenError> {
+    let diagnostics = RouteDiagnostics::new(
+        OpenRoute::IndexedFile,
+        OpenReason::InternalMeasurement,
+        SourceMode::FileDescriptor,
+    );
+    let source: Arc<dyn RandomAccessSource> = Arc::new(FileSource::open(path).map_err(|failure| {
+        RouteOpenError {
+            failure: RouteFailure::Source(failure),
+            diagnostics: Arc::clone(&diagnostics),
+        }
+    })?);
+    open_indexed_source(
+        source,
+        None,
+        diagnostics,
+        password,
+    )
+}
+
+#[allow(dead_code)] // internal L3 route authority; public constructors remain eager
+pub(crate) fn open_indexed_bytes_internal(
+    bytes: Arc<[u8]>,
+    password: Option<Vec<u8>>,
+) -> Result<IndexedOpenControl, RouteOpenError> {
+    let diagnostics = RouteDiagnostics::new(
+        OpenRoute::IndexedBytes,
+        OpenReason::InternalMeasurement,
+        SourceMode::SharedBytes,
+    );
+    let source: Arc<dyn RandomAccessSource> = Arc::new(BytesSource::new(Arc::clone(&bytes)));
+    open_indexed_source(
+        source,
+        Some(bytes),
+        diagnostics,
+        password,
+    )
+}
+
+#[allow(dead_code)] // the only indexed route authorized to materialize a complete file
+pub(crate) fn open_indexed_snapshot_internal(
+    path: &Path,
+    password: Option<Vec<u8>>,
+) -> Result<IndexedOpenControl, RouteOpenError> {
+    let diagnostics = RouteDiagnostics::new(
+        OpenRoute::IndexedSnapshot,
+        OpenReason::ExplicitSnapshot,
+        SourceMode::FullSnapshot,
+    );
+    let bytes: Arc<[u8]> = std::fs::read(path)
+        .map_err(SourceError::Io)
+        .map_err(|failure| RouteOpenError {
+            failure: RouteFailure::Source(failure),
+            diagnostics: Arc::clone(&diagnostics),
+        })?
+        .into();
+    let source: Arc<dyn RandomAccessSource> = Arc::new(BytesSource::new(Arc::clone(&bytes)));
+    open_indexed_source(
+        source,
+        Some(bytes),
+        diagnostics,
+        password,
+    )
+}
+
 impl PdfDocument {
     fn finish_open(
+        access: Arc<dyn DocumentAccess>,
+        diagnostics: Arc<RouteDiagnostics>,
+        source: Option<PathBuf>,
+    ) -> Self {
+        PdfDocument {
+            access,
+            diagnostics,
+            source,
+            ocr_cache: Default::default(),
+        }
+    }
+
+    fn finish_eager_open(
         doc: Document,
         raw: Arc<[u8]>,
         source: Option<PathBuf>,
+        diagnostics: Arc<RouteDiagnostics>,
         make_access: impl FnOnce(Arc<Document>, Arc<[u8]>) -> Arc<dyn DocumentAccess>,
     ) -> Self {
         let doc = Arc::new(doc);
         let access = make_access(Arc::clone(&doc), raw);
-        PdfDocument {
-            #[cfg(test)]
-            doc,
-            access,
-            source,
-            ocr_cache: Default::default(),
-        }
+        Self::finish_open(access, diagnostics, source)
     }
 
     fn from_bytes_with_access_factory(
         data: &[u8],
         make_access: impl FnOnce(Arc<Document>, Arc<[u8]>) -> Arc<dyn DocumentAccess>,
     ) -> Result<Self, Error> {
+        let diagnostics = RouteDiagnostics::new(
+            OpenRoute::EagerBytes,
+            OpenReason::PublicCompatibility,
+            SourceMode::SharedBytes,
+        );
+        diagnostics.eager_opens.store(1, Ordering::Relaxed);
         let raw: Arc<[u8]> = Arc::from(data);
         let mut doc = load_mem_deterministic(&raw)
             .map_err(|error| Error::Parse(eager_error_message(&error)))?;
         ensure_decrypted(&raw, &mut doc)?;
-        Ok(Self::finish_open(doc, raw, None, make_access))
+        Ok(Self::finish_eager_open(
+            doc,
+            raw,
+            None,
+            diagnostics,
+            make_access,
+        ))
     }
 
     /// Open a PDF from a filesystem path. Only loads/parses the container.
     pub fn open(path: &str) -> Result<Self, Error> {
+        let diagnostics = RouteDiagnostics::new(
+            OpenRoute::EagerFile,
+            OpenReason::PublicCompatibility,
+            SourceMode::EagerMaterializedFile,
+        );
+        diagnostics.eager_opens.store(1, Ordering::Relaxed);
         let raw: Arc<[u8]> = std::fs::read(path).map_err(Error::Read)?.into();
         let mut doc = load_mem_deterministic(&raw).map_err(|e| Error::Open(eager_error_message(&e)))?;
         ensure_decrypted(&raw, &mut doc)?;
-        Ok(Self::finish_open(
+        Ok(Self::finish_eager_open(
             doc,
             raw,
             Some(PathBuf::from(path)),
+            diagnostics,
             |document, source| Arc::new(EagerDocumentAdapter::new(document, source)),
         ))
     }
@@ -386,6 +707,11 @@ impl PdfDocument {
         Self::from_bytes_with_access_factory(data, |document, source| {
             Arc::new(EagerDocumentAdapter::new(document, source))
         })
+    }
+
+    #[cfg(test)]
+    fn route_diagnostics(&self) -> RouteDiagnosticsSnapshot {
+        self.diagnostics.snapshot()
     }
 
     /// Number of pages.
@@ -697,6 +1023,9 @@ fn iso8601_now() -> String {
 pub(crate) mod tests {
     use super::*;
     use crate::access::tests::{AccessCounts, FaultAccess, FaultPoint};
+    use crate::access::AccessKind;
+    use lopdf::dictionary;
+    use std::io::{Seek, Write};
     use std::sync::atomic::Ordering;
 
     /// The owned encrypted fixtures (`tests/gen_fixtures.py::gen_encrypted`). They live in
@@ -706,6 +1035,331 @@ pub(crate) mod tests {
     }
 
     const ENC_SENTENCE: &str = "Encrypted fixture sentinel phrase for distillPDF.";
+
+    fn route_fixture() -> (PathBuf, Vec<u8>) {
+        let path = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures_pdf/sec_structure.pdf"
+        ));
+        let raw = std::fs::read(&path).unwrap();
+        (path, raw)
+    }
+
+    fn route_temp(label: &str, raw: &[u8]) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "distillpdf-l3a-route-{}-{label}-{}.pdf",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, raw).unwrap();
+        path
+    }
+
+    #[test]
+    fn indexed_file_bytes_and_snapshot_are_single_open_explicit_routes() {
+        let (fixture, raw) = route_fixture();
+        let shared: Arc<[u8]> = Arc::from(raw.clone());
+        let bytes = open_indexed_bytes_internal(Arc::clone(&shared), None).unwrap();
+        assert!(Arc::ptr_eq(bytes.shared_bytes().unwrap(), &shared));
+        let expected_sha = bytes.source_sha256().unwrap();
+        let bytes_diag = bytes.diagnostics();
+        assert_eq!(bytes_diag.route, OpenRoute::IndexedBytes);
+        assert_eq!(bytes_diag.source_mode, SourceMode::SharedBytes);
+        assert_eq!(bytes_diag.eager_opens, 0);
+        assert_eq!(bytes_diag.indexed_opens, 1);
+        assert_eq!(bytes_diag.fallback_opens, 0);
+        assert_eq!(bytes_diag.page_map_builds, 1);
+        assert!(bytes_diag.index_objects > 0);
+        assert!(bytes_diag.index_pages > 0);
+        assert!(bytes_diag.index_estimated_bytes > 0);
+        assert_eq!(bytes_diag.document_object_o_admitted_bytes, 0);
+
+        let file = open_indexed_file_internal(&fixture, None).unwrap();
+        assert!(file.shared_bytes().is_none());
+        assert_eq!(file.pages().unwrap().len(), bytes.pages().unwrap().len());
+        assert_eq!(file.source_sha256().unwrap(), expected_sha);
+        let file_diag = file.diagnostics();
+        assert_eq!(file_diag.route, OpenRoute::IndexedFile);
+        assert_eq!(file_diag.source_mode, SourceMode::FileDescriptor);
+        assert_eq!(file_diag.indexed_opens, 1);
+        assert_eq!(file_diag.fallback_opens, 0);
+        assert!(file_diag.source_requests >= file_diag.source_reads);
+        assert!(file_diag.source_reads > 0);
+        assert!(file_diag.source_max_request <= 64 * 1024);
+
+        let snapshot = open_indexed_snapshot_internal(&fixture, None).unwrap();
+        assert!(snapshot.shared_bytes().is_some());
+        assert_eq!(snapshot.source_sha256().unwrap(), expected_sha);
+        let snapshot_diag = snapshot.diagnostics();
+        assert_eq!(snapshot_diag.route, OpenRoute::IndexedSnapshot);
+        assert_eq!(snapshot_diag.reason, OpenReason::ExplicitSnapshot);
+        assert_eq!(snapshot_diag.source_mode, SourceMode::FullSnapshot);
+        assert_eq!(snapshot_diag.indexed_opens, 1);
+        assert_eq!(snapshot_diag.fallback_opens, 0);
+
+        let diagnostics = Arc::clone(&file.diagnostics);
+        drop(file);
+        assert_eq!(
+            diagnostics.snapshot().document_object_o_admitted_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn public_constructors_remain_eager_compatibility_routes() {
+        let (fixture, raw) = route_fixture();
+        let file = PdfDocument::open(fixture.to_str().unwrap()).unwrap();
+        let bytes = PdfDocument::from_bytes(&raw).unwrap();
+        for (actual, route, mode) in [
+            (
+                file.route_diagnostics(),
+                OpenRoute::EagerFile,
+                SourceMode::EagerMaterializedFile,
+            ),
+            (
+                bytes.route_diagnostics(),
+                OpenRoute::EagerBytes,
+                SourceMode::SharedBytes,
+            ),
+        ] {
+            assert_eq!(actual.route, route);
+            assert_eq!(actual.reason, OpenReason::PublicCompatibility);
+            assert_eq!(actual.source_mode, mode);
+            assert_eq!(actual.eager_opens, 1);
+            assert_eq!(actual.indexed_opens, 0);
+            assert_eq!(actual.fallback_opens, 0);
+        }
+    }
+
+    #[test]
+    fn indexed_file_descriptor_survives_path_replacement_and_fails_on_mutation() {
+        let (_, raw) = route_fixture();
+        let expected = open_indexed_bytes_internal(Arc::from(raw.clone()), None)
+            .unwrap()
+            .source_sha256()
+            .unwrap();
+
+        let path = route_temp("replace", &raw);
+        let displaced = path.with_extension("held.pdf");
+        let control = open_indexed_file_internal(&path, None).unwrap();
+        std::fs::rename(&path, &displaced).unwrap();
+        std::fs::write(&path, b"replacement path bytes").unwrap();
+        assert_eq!(control.source_sha256().unwrap(), expected);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&displaced).unwrap();
+
+        let path = route_temp("rewrite", &raw);
+        let control = open_indexed_file_internal(&path, None).unwrap();
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file.write_all(b"%QDF-").unwrap();
+        file.sync_all().unwrap();
+        let error = control.source_sha256().unwrap_err();
+        assert_eq!(error.kind, AccessKind::SourceChanged);
+        std::fs::remove_file(&path).unwrap();
+
+        let path = route_temp("truncate", &raw);
+        let control = open_indexed_file_internal(&path, None).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len((raw.len() / 2) as u64)
+            .unwrap();
+        let error = control.source_sha256().unwrap_err();
+        assert_eq!(error.kind, AccessKind::SourceChanged);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn indexed_route_keeps_post_open_source_io_typed_and_never_falls_back() {
+        struct SwitchedSource {
+            bytes: Arc<[u8]>,
+            mode: Arc<AtomicU64>,
+        }
+        impl RandomAccessSource for SwitchedSource {
+            fn len(&self) -> SourceResult<u64> {
+                Ok(self.bytes.len() as u64)
+            }
+            fn read_at(&self, offset: u64, out: &mut [u8]) -> SourceResult<usize> {
+                match self.mode.load(Ordering::Acquire) {
+                    1 => return Ok(0),
+                    2 => return Ok(out.len() + 1),
+                    3 => return Err(SourceError::Io(std::io::Error::other("injected I/O"))),
+                    _ => {}
+                }
+                let start = offset as usize;
+                let take = out.len().min(self.bytes.len().saturating_sub(start));
+                out[..take].copy_from_slice(&self.bytes[start..start + take]);
+                Ok(take)
+            }
+        }
+
+        let (_, raw) = route_fixture();
+        for failure_mode in 1..=3 {
+            let mode = Arc::new(AtomicU64::new(0));
+            let diagnostics = RouteDiagnostics::new(
+                OpenRoute::IndexedBytes,
+                OpenReason::InternalMeasurement,
+                SourceMode::SharedBytes,
+            );
+            let source: Arc<dyn RandomAccessSource> = Arc::new(SwitchedSource {
+                bytes: Arc::from(raw.clone()),
+                mode: Arc::clone(&mode),
+            });
+            let control = open_indexed_source(source, None, diagnostics, None).unwrap();
+            mode.store(failure_mode, Ordering::Release);
+            let error = control.source_sha256().unwrap_err();
+            assert_eq!(error.kind, AccessKind::SourceIo);
+            assert_eq!(control.diagnostics().indexed_opens, 1);
+            assert_eq!(control.diagnostics().fallback_opens, 0);
+        }
+    }
+
+    #[test]
+    fn indexed_route_preserves_encryption_open_categories() {
+        for name in [
+            "rc4_40.pdf",
+            "rc4_128.pdf",
+            "aes_128.pdf",
+            "aes_256.pdf",
+            "inline_encrypt_aes_128.pdf",
+            "inline_encrypt_rc4_128.pdf",
+        ] {
+            let raw: Arc<[u8]> = std::fs::read(enc_fixture(name)).unwrap().into();
+            let control = open_indexed_bytes_internal(raw, None)
+                .unwrap_or_else(|error| panic!("{name} owner-password route failed: {error:?}"));
+            assert!(!control.pages().unwrap().is_empty(), "{name}");
+            assert_eq!(control.diagnostics().indexed_opens, 1);
+            assert_eq!(control.diagnostics().fallback_opens, 0);
+        }
+
+        for name in ["userpw.pdf", "inline_encrypt_userpw.pdf"] {
+            let raw: Arc<[u8]> = std::fs::read(enc_fixture(name)).unwrap().into();
+            let error = open_indexed_bytes_internal(Arc::clone(&raw), None)
+                .err()
+                .expect("password required");
+            assert!(matches!(
+                error.failure,
+                RouteFailure::Access(AccessError {
+                    kind: AccessKind::PasswordRequired,
+                    ..
+                })
+            ));
+            assert_eq!(error.diagnostics.snapshot().indexed_opens, 1);
+            assert_eq!(error.diagnostics.snapshot().fallback_opens, 0);
+
+            let error = open_indexed_bytes_internal(raw, Some(b"wrong".to_vec()))
+                .err()
+                .expect("wrong password");
+            assert!(matches!(
+                error.failure,
+                RouteFailure::Access(AccessError {
+                    kind: AccessKind::InvalidPassword,
+                    ..
+                })
+            ));
+        }
+
+        let mut document = Document::with_version("1.7");
+        let pages = document.add_object(dictionary! {
+            "Type" => "Pages", "Count" => 0, "Kids" => Vec::<lopdf::Object>::new(),
+        });
+        let catalog = document.add_object(dictionary! {
+            "Type" => "Catalog", "Pages" => pages,
+        });
+        document.trailer.set("Root", catalog);
+        document.trailer.set("Encrypt", 7);
+        let mut raw = Vec::new();
+        document.save_to(&mut raw).unwrap();
+        let error = open_indexed_bytes_internal(Arc::from(raw), None)
+            .err()
+            .expect("invalid Encrypt value");
+        assert!(matches!(
+            error.failure,
+            RouteFailure::Access(AccessError {
+                kind: AccessKind::InvalidEncryptDictionary,
+                ..
+            })
+        ));
+
+        let mut corrupted = std::fs::read(enc_fixture("inline_encrypt_userpw.pdf")).unwrap();
+        let endstream = corrupted
+            .windows(b"endstream".len())
+            .position(|window| window == b"endstream")
+            .expect("generated AES fixture has a page-content stream");
+        let mut last_payload = endstream;
+        while corrupted
+            .get(last_payload.saturating_sub(1))
+            .is_some_and(|byte| matches!(byte, b'\r' | b'\n'))
+        {
+            last_payload -= 1;
+        }
+        corrupted[last_payload - 1] ^= 0xff;
+        let control = open_indexed_bytes_internal(
+            Arc::from(corrupted),
+            Some(b"secret".to_vec()),
+        )
+        .expect("encryption bootstrap remains valid");
+        let page = control.pages().unwrap()[0].id;
+        let error = control
+            .check_page_content(page)
+            .expect_err("corrupted AES padding must fail object decryption");
+        assert_eq!(error.kind, AccessKind::ObjectDecryption);
+    }
+
+    #[test]
+    fn indexed_constructor_region_has_no_eager_retry_or_implicit_snapshot() {
+        let source = include_str!("doc.rs");
+        let indexed_start = source.find("fn open_indexed_source(").unwrap();
+        let snapshot_start = source
+            .find("pub(crate) fn open_indexed_snapshot_internal(")
+            .unwrap();
+        let implementation_end = source[snapshot_start..]
+            .find("\nimpl PdfDocument")
+            .map(|offset| snapshot_start + offset)
+            .unwrap();
+        let bounded_routes = &source[indexed_start..snapshot_start];
+        let all_indexed_routes = &source[indexed_start..implementation_end];
+        for forbidden in [
+            "load_mem_deterministic",
+            "Document::load",
+            "EagerDocumentAdapter",
+            "std::fs::read",
+            "_or_empty",
+        ] {
+            assert!(!bounded_routes.contains(forbidden), "forbidden {forbidden}");
+        }
+        assert_eq!(all_indexed_routes.matches("std::fs::read").count(), 1);
+        assert!(!all_indexed_routes.contains("load_mem_deterministic"));
+        assert!(!all_indexed_routes.contains("EagerDocumentAdapter"));
+        assert!(!all_indexed_routes.contains("fallback_open"));
+        assert!(!all_indexed_routes.contains("_or_empty"));
+    }
+
+    #[test]
+    fn indexed_route_open_failures_keep_route_and_zero_fallback_provenance() {
+        let missing = route_temp("missing", b"");
+        std::fs::remove_file(&missing).unwrap();
+        let error = open_indexed_file_internal(&missing, None)
+            .err()
+            .expect("missing file");
+        assert!(matches!(error.failure, RouteFailure::Source(SourceError::Io(_))));
+        let diagnostics = error.diagnostics.snapshot();
+        assert_eq!(diagnostics.route, OpenRoute::IndexedFile);
+        assert_eq!(diagnostics.indexed_opens, 0);
+        assert_eq!(diagnostics.fallback_opens, 0);
+
+        let error = open_indexed_bytes_internal(Arc::from(&b"not a PDF"[..]), None)
+            .err()
+            .expect("invalid bytes");
+        assert!(matches!(error.failure, RouteFailure::Access(_)));
+        let diagnostics = error.diagnostics.snapshot();
+        assert_eq!(diagnostics.route, OpenRoute::IndexedBytes);
+        assert_eq!(diagnostics.indexed_opens, 1);
+        assert_eq!(diagnostics.fallback_opens, 0);
+    }
 
     #[test]
     fn actual_access_factory_opens_once_and_a_faulted_consumer_never_retries() {
@@ -893,12 +1547,17 @@ pub(crate) mod tests {
                 continue; // encrypted / deliberately damaged
             };
             let mut want = String::new();
-            for (&p, &page_id) in &pdf.doc.get_pages() {
-                let mine = text::extract_page(pdf.access.as_ref(), page_id).unwrap_or_default();
+            let pages = pdf.access.pages().expect("public eager route pages");
+            for page in pages {
+                let mine = text::extract_page(pdf.access.as_ref(), page.id).unwrap_or_default();
                 if mine.trim().chars().count() >= 2 {
                     want.push_str(&mine);
                 } else {
-                    want.push_str(&pdf.doc.extract_text(&[p]).unwrap_or_default());
+                    want.push_str(
+                        &pdf.access
+                            .fallback_page_text(page.number)
+                            .unwrap_or_default(),
+                    );
                 }
                 want.push('\n');
             }

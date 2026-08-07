@@ -33,10 +33,15 @@
     "direct-backend-method|f2fff51a7156922e31f1d021c6f3d238b59ad5606f0e51d7b00d5323fa17cc08|self . document . get_page_resources (page)"
   ],
   "doc.rs": [
+    "clone-call|08acfd2955c2da32ae9559bac1af73bbf38189fe2c2f09488857530ba3fa3b1a|Arc :: clone (& diagnostics)",
+    "clone-call|08acfd2955c2da32ae9559bac1af73bbf38189fe2c2f09488857530ba3fa3b1a|Arc :: clone (& diagnostics)",
+    "clone-call|08acfd2955c2da32ae9559bac1af73bbf38189fe2c2f09488857530ba3fa3b1a|Arc :: clone (& diagnostics)",
     "clone-call|11cc002ed60fe6a4d70b1d670eea56cd4df4e03015426db1d15c5a28ed2af02d|d . clone ()",
+    "clone-call|16c64627e978791e18ba1aba62a18cc00bb2ff3c05017d417ead35147ec81a6e|Arc :: clone (& bytes)",
+    "clone-call|16c64627e978791e18ba1aba62a18cc00bb2ff3c05017d417ead35147ec81a6e|Arc :: clone (& bytes)",
     "clone-call|55003b322b1ccc86fc885dfebbc223c072a41df9522acee0d15a924743177d77|Arc :: clone (& doc)",
     "clone-call|96301b6953741669afa76e087890d99ee565d933f01a437b72ab2b63cebd6c40|self . ocr_cache . lock () . map_err (| _ | Error :: OcrPoisoned) ? . clone ()",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
+    "clone-call|ab62cfa4f4555ad9f07fce275da9ea584156f51b434be5a98936f6680c2697cd|Arc :: clone (& diagnostics . source)",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",

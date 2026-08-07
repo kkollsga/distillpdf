@@ -1456,13 +1456,12 @@ impl DocumentAccess for EagerDocumentAdapter {
 
 /// Bounded random-access adapter over lopdf's immutable indexed reader.
 ///
-/// This route is intentionally internal and unreachable from public constructors until L3a's
-/// explicit route-selection slice. Every indirect object is resolved under a call-local permit;
+/// This route is intentionally internal and selected only by L3a's explicit measurement controls;
+/// public constructors remain eager. Every indirect object is resolved under a call-local permit;
 /// the returned handle pins the bounded owner and its permit charges.
 // Boundary-audit clone authority: Arc clones retain source/recovery/counter owners; the cached
-// PageMap Result must be cloneable; raw Contents/Resources clones are short-read shape snapshots
-// needed to distinguish direct values from references; raw stream cloning is the eager-compatible
-// fallback for a non-limit decode error and remains inside the page payload admission.
+// PageMap Result must be cloneable; raw stream cloning is the eager-compatible fallback for a
+// non-limit decode error and remains inside the page payload admission.
 pub(crate) struct IndexedDocumentAdapter {
     reader: IndexedReader,
     recovery: Arc<SourceRecovery>,
@@ -1598,15 +1597,6 @@ impl IndexedDocumentAdapter {
                 .at(AccessPhase::FallbackText, Some(number))
             })
     }
-}
-
-/// Internal slice-2 construction seam. Public constructors remain eager until L3a slice 3.
-#[allow(dead_code)]
-pub(crate) fn open_indexed_access(
-    source: Arc<dyn RandomAccessSource>,
-    password: Option<Vec<u8>>,
-) -> Result<Arc<dyn DocumentAccess>, AccessError> {
-    Ok(Arc::new(IndexedDocumentAdapter::open(source, password)?))
 }
 
 impl DocumentAccess for IndexedDocumentAdapter {
