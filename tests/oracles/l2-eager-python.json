@@ -1,0 +1,140 @@
+{
+  "format": 1,
+  "layer": "python",
+  "malformed_streams": {
+    "stream-missing-length.pdf": {
+      "html": {
+        "outcome": "ok",
+        "stage": "html_render",
+        "value": {
+          "kind": "bytes",
+          "length": 232,
+          "sha256": "9b8e5f8932426bc52583490287e4441f79a7f08d08cf422ed72658ac066d941b"
+        }
+      },
+      "integrity": {
+        "outcome": "ok",
+        "stage": "stream_integrity",
+        "value": []
+      },
+      "markdown": {
+        "outcome": "ok",
+        "stage": "markdown_render",
+        "value": {
+          "kind": "bytes",
+          "length": 1,
+          "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+        }
+      },
+      "model": {
+        "outcome": "ok",
+        "stage": "model_build",
+        "value": {
+          "kind": "bytes",
+          "length": 600,
+          "sha256": "c0f0a0923c590040beb561dbfddbc9cece5e8f912dc09925d0d3f6397515b1fa"
+        }
+      },
+      "page_count": {
+        "outcome": "ok",
+        "stage": "page_count",
+        "value": 1
+      },
+      "page_text": {
+        "outcome": "ok",
+        "stage": "page_text_extract",
+        "value": {
+          "kind": "bytes",
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "source": {
+        "kind": "bytes",
+        "length": 612,
+        "sha256": "70976f20e679b338e01154288b75bc038ff9e5af4bd26e22de0184e83362ec47"
+      },
+      "text": {
+        "outcome": "ok",
+        "stage": "text_extract",
+        "value": {
+          "kind": "bytes",
+          "length": 1,
+          "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+        }
+      }
+    },
+    "stream-short-length.pdf": {
+      "html": {
+        "outcome": "ok",
+        "stage": "html_render",
+        "value": {
+          "kind": "bytes",
+          "length": 232,
+          "sha256": "9b8e5f8932426bc52583490287e4441f79a7f08d08cf422ed72658ac066d941b"
+        }
+      },
+      "integrity": {
+        "outcome": "ok",
+        "stage": "stream_integrity",
+        "value": []
+      },
+      "markdown": {
+        "outcome": "ok",
+        "stage": "markdown_render",
+        "value": {
+          "kind": "bytes",
+          "length": 1,
+          "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+        }
+      },
+      "model": {
+        "outcome": "ok",
+        "stage": "model_build",
+        "value": {
+          "kind": "bytes",
+          "length": 598,
+          "sha256": "9243a0734333770ef1a27945f1d44937a239d34ebbe9233017f8e6a8f0e287fe"
+        }
+      },
+      "page_count": {
+        "outcome": "ok",
+        "stage": "page_count",
+        "value": 1
+      },
+      "page_text": {
+        "outcome": "ok",
+        "stage": "page_text_extract",
+        "value": {
+          "kind": "bytes",
+          "length": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "source": {
+        "kind": "bytes",
+        "length": 622,
+        "sha256": "21d6acdd6ba833b92598d68669e961434f22a2b983fe7e87fad29addc7ca5f87"
+      },
+      "text": {
+        "outcome": "ok",
+        "stage": "text_extract",
+        "value": {
+          "kind": "bytes",
+          "length": 1,
+          "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+        }
+      }
+    }
+  },
+  "searchable_pdf.remove_raster": {
+    "kind": "bytes",
+    "length": 2948,
+    "sha256": "d1fa33b864b350a8119f9964c671cc5ebb626edaa8136ce4f3bda849b684a5e8"
+  },
+  "searchable_pdf.write_failure": {
+    "error_type": "ValueError",
+    "kind": "error",
+    "message": "write failed: No such file or directory (os error 2)"
+  }
+}

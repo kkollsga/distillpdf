@@ -248,6 +248,13 @@ pub(crate) trait DocumentAccess: Send + Sync {
     fn page_resource_chain(&self, page: ObjectId) -> Result<Vec<DictionaryHandle>, AccessError>;
     #[allow(dead_code)] // raw-recovery consumers migrate in L2b
     fn source(&self) -> Arc<dyn RandomAccessSource>;
+    /// Perform the one explicit whole-source scan permitted to the recovery index.
+    #[allow(dead_code)] // the L2b recovery index is the first production caller
+    fn scan_source(&self, limit: u64) -> SourceResult<Vec<u8>> {
+        let source = self.source();
+        let length = source.len()?;
+        source.read_range(0, length, limit)
+    }
 }
 
 /// The behavior-preserving adapter over lopdf's fully loaded object graph.
@@ -268,6 +275,7 @@ impl EagerDocumentAdapter {
 }
 
 /// Test-only bridge for pre-boundary fixtures that build lopdf documents in memory.
+#[cfg(test)]
 #[allow(dead_code)] // compatibility fixture bridge; production never clones a Document here
 pub(crate) fn test_adapter(document: &Document) -> EagerDocumentAdapter {
     EagerDocumentAdapter::new(Arc::new(document.clone()), Arc::from(&b""[..]))
@@ -364,9 +372,137 @@ impl SourceRange {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use lopdf::dictionary;
+    use lopdf::SourceError;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Default)]
+    pub(crate) struct AccessCounts {
+        pub(crate) opens: AtomicU64,
+        pub(crate) object_reads: AtomicU64,
+        pub(crate) object_lists: AtomicU64,
+        pub(crate) page_reads: AtomicU64,
+        pub(crate) resource_reads: AtomicU64,
+        pub(crate) source_requests: AtomicU64,
+        pub(crate) source_reads: AtomicU64,
+        pub(crate) source_scans: AtomicU64,
+        pub(crate) max_request: AtomicU64,
+    }
+
+    struct CountingSource {
+        inner: Arc<dyn RandomAccessSource>,
+        counts: Arc<AccessCounts>,
+        fail_reads: bool,
+    }
+
+    impl RandomAccessSource for CountingSource {
+        fn len(&self) -> SourceResult<u64> {
+            self.inner.len()
+        }
+
+        fn read_at(&self, offset: u64, out: &mut [u8]) -> SourceResult<usize> {
+            self.counts.source_reads.fetch_add(1, Ordering::Relaxed);
+            self.counts
+                .max_request
+                .fetch_max(out.len() as u64, Ordering::Relaxed);
+            if self.fail_reads {
+                return Err(SourceError::UnexpectedEof {
+                    offset,
+                    expected: out.len() as u64,
+                    actual: 0,
+                });
+            }
+            self.inner.read_at(offset, out)
+        }
+
+        fn validate_unchanged(&self) -> SourceResult<()> {
+            self.inner.validate_unchanged()
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum FaultPoint {
+        Object,
+        Pages,
+        Resources,
+        Source,
+    }
+
+    /// Test-only counter/fault wrapper. Every future boundary operation must pass through this
+    /// shape so L2d can prove suppression without falling back to the eager backend.
+    pub(crate) struct FaultAccess {
+        inner: Arc<dyn DocumentAccess>,
+        fault: Option<FaultPoint>,
+        pub(crate) counts: Arc<AccessCounts>,
+    }
+
+    impl FaultAccess {
+        pub(crate) fn new(
+            inner: Arc<dyn DocumentAccess>,
+            fault: Option<FaultPoint>,
+            counts: Arc<AccessCounts>,
+        ) -> Self {
+            Self {
+                inner,
+                fault,
+                counts,
+            }
+        }
+
+        fn failure(&self, point: FaultPoint, object: ObjectId) -> Result<(), AccessError> {
+            if self.fault == Some(point) {
+                Err(AccessError::object(object, format!("injected {point:?} failure")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl DocumentAccess for FaultAccess {
+        fn object(&self, id: ObjectId) -> Result<ObjectHandle, AccessError> {
+            self.counts.object_reads.fetch_add(1, Ordering::Relaxed);
+            self.failure(FaultPoint::Object, id)?;
+            self.inner.object(id)
+        }
+
+        fn pages(&self) -> Result<Vec<PageRef>, AccessError> {
+            self.counts.page_reads.fetch_add(1, Ordering::Relaxed);
+            self.failure(FaultPoint::Pages, (0, 0))?;
+            self.inner.pages()
+        }
+
+        fn object_ids(&self) -> Vec<ObjectId> {
+            self.counts.object_lists.fetch_add(1, Ordering::Relaxed);
+            self.inner.object_ids()
+        }
+
+        fn page_resource_chain(
+            &self,
+            page: ObjectId,
+        ) -> Result<Vec<DictionaryHandle>, AccessError> {
+            self.counts.resource_reads.fetch_add(1, Ordering::Relaxed);
+            self.failure(FaultPoint::Resources, page)?;
+            self.inner.page_resource_chain(page)
+        }
+
+        fn source(&self) -> Arc<dyn RandomAccessSource> {
+            self.counts.source_requests.fetch_add(1, Ordering::Relaxed);
+            Arc::new(CountingSource {
+                inner: self.inner.source(),
+                counts: Arc::clone(&self.counts),
+                fail_reads: self.fault == Some(FaultPoint::Source),
+            })
+        }
+
+        fn scan_source(&self, limit: u64) -> SourceResult<Vec<u8>> {
+            self.counts.source_scans.fetch_add(1, Ordering::Relaxed);
+            let source = self.source();
+            let length = source.len()?;
+            source.read_range(0, length, limit)
+        }
+    }
 
     fn adapter(objects: Vec<Object>, raw: &[u8]) -> (EagerDocumentAdapter, Vec<ObjectId>) {
         let mut document = Document::with_version("1.7");
@@ -500,5 +636,46 @@ mod tests {
         drop(adapter);
         assert!(resources[0].read(|dict| dict.has(b"Outer")).unwrap());
         assert!(resources[1].read(|dict| dict.has(b"Inner")).unwrap());
+    }
+
+    #[test]
+    fn fault_access_injects_each_operation_and_counts_bounded_source_reads() {
+        let (adapter, ids) = adapter(vec![Object::Integer(7)], b"abcdef");
+        for point in [
+            FaultPoint::Object,
+            FaultPoint::Pages,
+            FaultPoint::Resources,
+            FaultPoint::Source,
+        ] {
+            let counts = Arc::new(AccessCounts::default());
+            counts.opens.fetch_add(1, Ordering::Relaxed);
+            let fault = FaultAccess::new(Arc::new(adapter.clone()), Some(point), counts);
+            let error = match point {
+                FaultPoint::Object => fault.object(ids[0]).err().unwrap(),
+                FaultPoint::Pages => fault.pages().err().unwrap(),
+                FaultPoint::Resources => fault.page_resource_chain(ids[0]).err().unwrap(),
+                FaultPoint::Source => {
+                    let source_error = fault.source().read_range(0, 1, 1).err().unwrap();
+                    assert!(matches!(source_error, SourceError::UnexpectedEof { .. }));
+                    assert_eq!(fault.counts.source_reads.load(Ordering::Relaxed), 1);
+                    continue;
+                }
+            };
+            assert!(error.detail.contains("injected"));
+            assert_eq!(fault.counts.opens.load(Ordering::Relaxed), 1);
+        }
+
+        let counts = Arc::new(AccessCounts::default());
+        counts.opens.fetch_add(1, Ordering::Relaxed);
+        let counted = FaultAccess::new(Arc::new(adapter), None, counts);
+        assert_eq!(counted.object_ids(), ids);
+        assert_eq!(counted.counts.object_lists.load(Ordering::Relaxed), 1);
+        assert_eq!(counted.source().read_range(1, 3, 3).unwrap(), b"bcd");
+        assert_eq!(counted.counts.source_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(counted.counts.source_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(counted.counts.max_request.load(Ordering::Relaxed), 3);
+        assert_eq!(counted.counts.source_scans.load(Ordering::Relaxed), 0);
+        assert_eq!(counted.scan_source(6).unwrap(), b"abcdef");
+        assert_eq!(counted.counts.source_scans.load(Ordering::Relaxed), 1);
     }
 }

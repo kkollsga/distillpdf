@@ -195,6 +195,14 @@ mod structure {
     #[path = "eager_oracle.rs"]
     mod eager_oracle;
 
+    // L2-specific targets are deliberately separate from the admitted L1 manifests. They lock
+    // behavior that the resolver migration needs but must not rewrite L1 evidence to obtain.
+    #[path = "l2_oracle.rs"]
+    mod l2_oracle;
+
+    #[path = "boundary_audit.rs"]
+    mod boundary_audit;
+
     fn core_src() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
     }
@@ -228,7 +236,18 @@ mod structure {
     fn production_code(src: &str) -> String {
         // A top-level test module's attribute is the whole line, at column 0 — which is what
         // distinguishes it from this module's own prose and string literals naming it.
-        let marks: Vec<usize> = src.lines().enumerate().filter(|(_, l)| *l == TEST_ATTR).map(|(i, _)| i).collect();
+        let lines = src.lines().collect::<Vec<_>>();
+        let marks: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(index, line)| {
+                **line == TEST_ATTR
+                    && lines
+                        .get(index + 1)
+                        .is_some_and(|next| next.contains("mod "))
+            })
+            .map(|(index, _)| index)
+            .collect();
         assert!(marks.len() <= 1, "a file with two top-level test modules would truncate wrongly");
         match marks.first() {
             Some(&i) => src.lines().take(i).collect::<Vec<_>>().join("\n"),

@@ -52,3 +52,9 @@ whatlang = { version = "0.16", optional = true }
 [build-dependencies]
 # Only pulled in when the `tesseract` feature is on (the from-source C/C++ build).
 cmake = { version = "0.1", optional = true }
+
+[dev-dependencies]
+# L2's production-boundary gate parses Rust syntax so aliases, whitespace, UFCS calls,
+# block comments and string literals cannot bypass a spelling-based audit.
+quote = "1"
+syn = { version = "2", features = ["full", "visit"] }

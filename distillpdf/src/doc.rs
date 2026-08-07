@@ -342,30 +342,52 @@ fn ensure_decrypted(raw: &[u8], doc: &mut Document) -> Result<(), Error> {
 }
 
 impl PdfDocument {
+    fn finish_open(
+        doc: Document,
+        raw: Arc<[u8]>,
+        source: Option<PathBuf>,
+        make_access: impl FnOnce(Arc<Document>, Arc<[u8]>) -> Arc<dyn DocumentAccess>,
+    ) -> Self {
+        let doc = Arc::new(doc);
+        let access = make_access(Arc::clone(&doc), Arc::clone(&raw));
+        PdfDocument {
+            doc,
+            raw,
+            access,
+            source,
+            ocr_cache: Default::default(),
+        }
+    }
+
+    fn from_bytes_with_access_factory(
+        data: &[u8],
+        make_access: impl FnOnce(Arc<Document>, Arc<[u8]>) -> Arc<dyn DocumentAccess>,
+    ) -> Result<Self, Error> {
+        let raw: Arc<[u8]> = Arc::from(data);
+        let mut doc = load_mem_deterministic(&raw)
+            .map_err(|error| Error::Parse(eager_error_message(&error)))?;
+        ensure_decrypted(&raw, &mut doc)?;
+        Ok(Self::finish_open(doc, raw, None, make_access))
+    }
+
     /// Open a PDF from a filesystem path. Only loads/parses the container.
     pub fn open(path: &str) -> Result<Self, Error> {
         let raw: Arc<[u8]> = std::fs::read(path).map_err(Error::Read)?.into();
         let mut doc = load_mem_deterministic(&raw).map_err(|e| Error::Open(eager_error_message(&e)))?;
         ensure_decrypted(&raw, &mut doc)?;
-        let doc = Arc::new(doc);
-        let access = Arc::new(EagerDocumentAdapter::new(Arc::clone(&doc), Arc::clone(&raw)));
-        Ok(PdfDocument {
+        Ok(Self::finish_open(
             doc,
             raw,
-            access,
-            source: Some(PathBuf::from(path)),
-            ocr_cache: Default::default(),
-        })
+            Some(PathBuf::from(path)),
+            |document, source| Arc::new(EagerDocumentAdapter::new(document, source)),
+        ))
     }
 
     /// Open a PDF from raw bytes. There is no source path.
     pub fn from_bytes(data: &[u8]) -> Result<Self, Error> {
-        let raw: Arc<[u8]> = Arc::from(data);
-        let mut doc = load_mem_deterministic(&raw).map_err(|e| Error::Parse(eager_error_message(&e)))?;
-        ensure_decrypted(&raw, &mut doc)?;
-        let doc = Arc::new(doc);
-        let access = Arc::new(EagerDocumentAdapter::new(Arc::clone(&doc), Arc::clone(&raw)));
-        Ok(PdfDocument { doc, raw, access, source: None, ocr_cache: Default::default() })
+        Self::from_bytes_with_access_factory(data, |document, source| {
+            Arc::new(EagerDocumentAdapter::new(document, source))
+        })
     }
 
     /// Number of pages.
@@ -743,6 +765,8 @@ fn iso8601_now() -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::access::tests::{AccessCounts, FaultAccess, FaultPoint};
+    use std::sync::atomic::Ordering;
 
     /// The owned encrypted fixtures (`tests/gen_fixtures.py::gen_encrypted`). They live in
     /// their own subfolder so the Python whole-fixture-set sweeps skip them.
@@ -751,6 +775,41 @@ pub(crate) mod tests {
     }
 
     const ENC_SENTENCE: &str = "Encrypted fixture sentinel phrase for distillPDF.";
+
+    #[test]
+    fn actual_access_factory_opens_once_and_a_faulted_consumer_never_retries() {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures_pdf/sec_structure.pdf"
+        ))
+        .unwrap();
+        let counts = Arc::new(AccessCounts::default());
+        let factory_counts = Arc::clone(&counts);
+        let document = PdfDocument::from_bytes_with_access_factory(
+            &bytes,
+            move |eager_document, source| {
+                factory_counts.opens.fetch_add(1, Ordering::Relaxed);
+                let eager: Arc<dyn DocumentAccess> = Arc::new(EagerDocumentAdapter::new(
+                    eager_document,
+                    source,
+                ));
+                Arc::new(FaultAccess::new(
+                    eager,
+                    Some(FaultPoint::Pages),
+                    Arc::clone(&factory_counts),
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(counts.opens.load(Ordering::Relaxed), 1);
+        assert_eq!(document.page_count(), 0);
+        assert_eq!(document.page_count(), 0);
+        assert_eq!(counts.opens.load(Ordering::Relaxed), 1, "no eager retry");
+        assert_eq!(counts.page_reads.load(Ordering::Relaxed), 2);
+        let _ = document.stream_integrity();
+        assert_eq!(counts.object_lists.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.opens.load(Ordering::Relaxed), 1, "no fallback opener");
+    }
 
     /// Every committed fixture PDF, in sorted path order — the sweep corpus a unit test uses
     /// when its claim is about *all* documents (parallelism agreeing with the sequential path,
