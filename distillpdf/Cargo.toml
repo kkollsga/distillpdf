@@ -22,7 +22,10 @@ categories = ["text-processing", "parser-implementations"]
 tesseract = ["dep:cmake", "dep:whatlang"]
 
 [dependencies]
-lopdf = "0.44"
+# L0-approved owned resolver/index contract. Keep this exact revision pinned: the
+# eager adapter remains the active route through L2, while L3 consumes the indexed
+# reader behind distillPDF's owned DocumentAccess boundary.
+lopdf = { git = "https://github.com/kkollsga/lopdf.git", rev = "44fb08006a1a069cf87422dc73eb04dbeb433ba5" }
 # Independent Flate validation (`pdfobj::flate_incomplete`). lopdf swallows its own zlib
 # error and returns the partial output, so a TRUNCATED stream reports Ok and renders short
 # with no signal; inflating the bytes ourselves is the only way to tell. Already linked twice
