@@ -12,16 +12,19 @@ use crate::broker::{
     BrokerError, BrokerOperation, BudgetBroker, Lane, OwnershipClass, ReservationCancellation,
     RetainedCharge, SelfPinCharge,
 };
-use lopdf::{BoundedObject, Object, ObjectId, ScalarResolutionPermit};
+use lopdf::{
+    BoundedObject, BoundedObjectStream, Object, ObjectId, ScalarResolutionPermit,
+    BOUNDED_OBJECT_STREAM_STRUCTURAL_ENVELOPE_BYTES,
+};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 
 const ARENA_METADATA_BYTES: u64 = 4 * 1024;
-// The fixed 4 KiB precharge explicitly partitions an emergency flight-error
+// The fixed 5 KiB precharge explicitly partitions an emergency flight-error
 // owner. Broker admission/close failures cannot acquire another reservation,
 // so their bounded owner and detail remain charged by this cell-local slice.
-const CELL_BASE_METADATA_BYTES: u64 = 3_584;
+const CELL_BASE_METADATA_BYTES: u64 = 4_608;
 const CELL_ERROR_ENVELOPE_BYTES: u64 = 512;
 const CELL_METADATA_BYTES: u64 = CELL_BASE_METADATA_BYTES + CELL_ERROR_ENVELOPE_BYTES;
 const ERROR_OWNER_BYTES: u64 = 256;
@@ -34,10 +37,35 @@ const MAX_LOADING_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_INTERESTS_PER_CELL: usize = 64;
 const MAX_GLOBAL_INTERESTS: usize = 65_536;
 const MAX_GLOBAL_CELLS: usize = 16_384;
+const BTREE_NODE_ENVELOPE_BYTES: usize = 2 * 1024;
+const PREPARED_STREAM_STRUCTURAL_BYTES: usize =
+    BOUNDED_OBJECT_STREAM_STRUCTURAL_ENVELOPE_BYTES as usize;
+const ARC_ALLOCATION_HEADERS_BYTES: usize = 4 * std::mem::size_of::<usize>();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum Representation {
     RawNormalObject,
+    DeclaredObjStmContainer,
+    DeclaredObjStmMember,
+}
+
+impl Representation {
+    const COUNT: usize = 3;
+
+    const fn index(self) -> usize {
+        match self {
+            Self::RawNormalObject => 0,
+            Self::DeclaredObjStmContainer => 1,
+            Self::DeclaredObjStmMember => 2,
+        }
+    }
+
+    const fn loader_estimate(self) -> u64 {
+        match self {
+            Self::RawNormalObject | Self::DeclaredObjStmContainer => LOADER_ESTIMATE_BYTES,
+            Self::DeclaredObjStmMember => 4 * 1024 * 1024,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -118,7 +146,23 @@ pub(crate) struct ObjectCellSnapshot {
     pub(crate) evictions: u64,
     pub(crate) cancellations: u64,
     pub(crate) closes: u64,
+    pub(crate) raw: RepresentationSnapshot,
+    pub(crate) containers: RepresentationSnapshot,
+    pub(crate) members: RepresentationSnapshot,
     pub(crate) invariant_failed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RepresentationSnapshot {
+    pub(crate) calls: u64,
+    pub(crate) loads: u64,
+    pub(crate) hits: u64,
+    pub(crate) waits: u64,
+    pub(crate) negative_hits: u64,
+    pub(crate) transient_shares: u64,
+    pub(crate) bypasses: u64,
+    pub(crate) evictions: u64,
+    pub(crate) cancellations: u64,
 }
 
 #[derive(Clone)]
@@ -181,7 +225,33 @@ struct DomainState {
     evictions: u64,
     cancellations: u64,
     closes: u64,
+    representations: [RepresentationSnapshot; Representation::COUNT],
     invariant_failed: bool,
+}
+
+macro_rules! representation_counter {
+    ($method:ident, $field:ident) => {
+        fn $method(&mut self, representation: Representation, amount: u64) -> bool {
+            let Some(total) = self.$field.checked_add(amount) else {
+                return false;
+            };
+            let counter = &mut self.representations[representation.index()].$field;
+            let Some(kind) = counter.checked_add(amount) else {
+                return false;
+            };
+            self.$field = total;
+            *counter = kind;
+            true
+        }
+    };
+}
+
+impl DomainState {
+    representation_counter!(add_loads, loads);
+    representation_counter!(add_bypasses, bypasses);
+    representation_counter!(add_transient_shares, transient_shares);
+    representation_counter!(add_evictions, evictions);
+    representation_counter!(add_cancellations, cancellations);
 }
 
 #[derive(Clone)]
@@ -263,24 +333,56 @@ pub(crate) struct CellCancellation {
 }
 
 pub(crate) struct ResolvedObjectOwner {
-    object: BoundedObject,
+    payload: CellPayload,
     transition_gate: Mutex<()>,
     cache_backed: AtomicBool,
     charge: Mutex<Option<RetainedCharge>>,
     self_pin: Mutex<Option<SelfPinCharge>>,
 }
 
+enum CellPayload {
+    Object(BoundedObject),
+    ObjectStream(BoundedObjectStream),
+}
+
 #[derive(Clone)]
 pub(crate) struct ResolvedObjectPin {
+    inner: ResolvedCellPin,
+}
+
+pub(crate) struct ResolvedObjectStreamPin {
+    inner: ResolvedCellPin,
+}
+
+#[derive(Clone)]
+struct ResolvedCellPin {
     owner: Arc<ResolvedObjectOwner>,
     _pin: Arc<ExternalPin>,
+}
+
+impl std::fmt::Debug for ResolvedCellPin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedCellPin")
+            .field("retained_bytes", &self.owner.retained_bytes())
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Debug for ResolvedObjectPin {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ResolvedObjectPin")
-            .field("retained_bytes", &self.owner.retained_bytes())
+            .field("retained_bytes", &self.inner.owner.retained_bytes())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ResolvedObjectStreamPin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedObjectStreamPin")
+            .field("retained_bytes", &self.inner.owner.retained_bytes())
             .finish_non_exhaustive()
     }
 }
@@ -298,6 +400,18 @@ struct FailureOwner {
     _reservation: Mutex<Option<crate::broker::Reservation>>,
     cell_envelope: bool,
 }
+
+const CELL_FIXED_STRUCTURAL_BYTES: usize = std::mem::size_of::<Cell>()
+    + std::mem::size_of::<ResolvedObjectOwner>()
+    + BTREE_NODE_ENVELOPE_BYTES
+    + PREPARED_STREAM_STRUCTURAL_BYTES
+    + ARC_ALLOCATION_HEADERS_BYTES;
+const _: () = assert!(CELL_FIXED_STRUCTURAL_BYTES <= CELL_BASE_METADATA_BYTES as usize);
+const _: () = assert!(
+    CELL_FIXED_STRUCTURAL_BYTES
+        > CELL_BASE_METADATA_BYTES as usize - CELL_ERROR_ENVELOPE_BYTES as usize
+);
+const _: () = assert!(std::mem::size_of::<FailureOwner>() <= ERROR_OWNER_BYTES as usize);
 
 enum ResolveStep {
     Lead {
@@ -360,6 +474,7 @@ impl ObjectCellDomain {
                         "object cell arena headroom overflow",
                     )
                 })?,
+            LOADER_ESTIMATE_BYTES,
             (0, 0),
         )?;
         let operation = self
@@ -430,6 +545,32 @@ impl ObjectCellArena {
         self.request(id)?.resolve(loader)
     }
 
+    pub(crate) fn resolve_object_stream<F>(
+        &self,
+        id: ObjectId,
+        loader: F,
+    ) -> Result<ResolvedObjectStreamPin, AccessError>
+    where
+        F: FnOnce(&ScalarResolutionPermit) -> Result<BoundedObjectStream, CellLoadError>,
+    {
+        self.inner
+            .request_representation(id, Representation::DeclaredObjStmContainer)?
+            .resolve_object_stream(loader)
+    }
+
+    pub(crate) fn resolve_declared_member<F>(
+        &self,
+        id: ObjectId,
+        loader: F,
+    ) -> Result<ResolvedObjectPin, AccessError>
+    where
+        F: FnOnce(&ScalarResolutionPermit) -> Result<BoundedObject, CellLoadError>,
+    {
+        self.inner
+            .request_representation(id, Representation::DeclaredObjStmMember)?
+            .resolve(loader)
+    }
+
     #[cfg(test)]
     pub(crate) fn close(&self) {
         self.inner.close();
@@ -451,9 +592,34 @@ impl ObjectCellRequest {
         }
     }
 
-    pub(crate) fn resolve<F>(mut self, loader: F) -> Result<ResolvedObjectPin, AccessError>
+    pub(crate) fn resolve<F>(self, loader: F) -> Result<ResolvedObjectPin, AccessError>
     where
         F: FnOnce(&ScalarResolutionPermit) -> Result<BoundedObject, CellLoadError>,
+    {
+        let id = self.cell.key.id;
+        let pin = self.resolve_payload(|permit| loader(permit).map(CellPayload::Object))?;
+        if !matches!(&pin.owner.payload, CellPayload::Object(_)) {
+            return Err(cell_error(
+                id,
+                AccessKind::Backend,
+                "object cell payload representation mismatch",
+            ));
+        }
+        Ok(ResolvedObjectPin { inner: pin })
+    }
+
+    fn resolve_object_stream<F>(self, loader: F) -> Result<ResolvedObjectStreamPin, AccessError>
+    where
+        F: FnOnce(&ScalarResolutionPermit) -> Result<BoundedObjectStream, CellLoadError>,
+    {
+        let pin = self.resolve_payload(|permit| loader(permit).map(CellPayload::ObjectStream))?;
+        debug_assert!(matches!(&pin.owner.payload, CellPayload::ObjectStream(_)));
+        Ok(ResolvedObjectStreamPin { inner: pin })
+    }
+
+    fn resolve_payload<F>(mut self, loader: F) -> Result<ResolvedCellPin, AccessError>
+    where
+        F: FnOnce(&ScalarResolutionPermit) -> Result<CellPayload, CellLoadError>,
     {
         let mut loader = Some(loader);
         loop {
@@ -498,6 +664,15 @@ impl ObjectCellRequest {
                     self.run_leader(generation, &cancellation, load);
                 }
                 ResolveStep::Ready(owner) => {
+                    if !owner
+                        .payload
+                        .matches_representation(self.cell.key.representation)
+                    {
+                        let failure = self.arena.invalidate_payload_mismatch(&self.cell);
+                        self.finish_interest();
+                        self.completed = true;
+                        return Err(failure);
+                    }
                     let pin = self.arena.pin(&self.cell, owner)?;
                     self.finish_interest();
                     self.completed = true;
@@ -556,13 +731,14 @@ impl ObjectCellRequest {
 
     fn run_leader<F>(&self, generation: u64, load_cancel: &Arc<AtomicBool>, loader: F)
     where
-        F: FnOnce(&ScalarResolutionPermit) -> Result<BoundedObject, CellLoadError>,
+        F: FnOnce(&ScalarResolutionPermit) -> Result<CellPayload, CellLoadError>,
     {
+        let loader_estimate = self.cell.key.representation.loader_estimate();
         let pending = match {
             let _headroom = lock(&self.arena.domain.headroom);
             self.arena
                 .domain
-                .reclaim_loader_headroom(0, self.cell.key.id)
+                .reclaim_loader_headroom(0, loader_estimate, self.cell.key.id)
                 .and_then(|()| {
                     self.arena
                         .operation
@@ -570,7 +746,7 @@ impl ObjectCellRequest {
                             Lane::Normal {
                                 completion_reserve: 0,
                             },
-                            LOADER_ESTIMATE_BYTES,
+                            loader_estimate,
                         )
                         .map_err(|error| broker_error(self.cell.key.id, error))
                 })
@@ -611,7 +787,7 @@ impl ObjectCellRequest {
         if load_cancel.load(Ordering::Acquire) {
             reservation.cancel();
         }
-        let permit = ScalarResolutionPermit::new(LOADER_ESTIMATE_BYTES);
+        let permit = ScalarResolutionPermit::new(loader_estimate);
         let replaced_permit = {
             let mut state = lock(&self.cell.state);
             if let CellPhase::Loading(loading) = &mut state.phase {
@@ -630,7 +806,7 @@ impl ObjectCellRequest {
         }
         {
             let mut domain = lock(&self.arena.domain.state);
-            if !checked_add(&mut domain.loads, 1) {
+            if !domain.add_loads(self.cell.key.representation, 1) {
                 domain.invariant_failed = true;
                 drop(domain);
                 drop(reservation);
@@ -667,10 +843,10 @@ impl ObjectCellRequest {
             }
         };
         match outcome {
-            Ok(object) if object.peak_bytes() <= LOADER_ESTIMATE_BYTES => {
-                let retained = object.retained_bytes();
+            Ok(payload) if payload.peak_bytes(&permit) <= loader_estimate => {
+                let retained = payload.retained_bytes();
                 match reservation.reconcile(retained) {
-                    Ok(charge) => self.publish_value(object, charge),
+                    Ok(charge) => self.publish_value(payload, charge),
                     Err(error) => self.publish_broker_error(error),
                 }
             }
@@ -682,9 +858,9 @@ impl ObjectCellRequest {
         }
     }
 
-    fn publish_value(&self, object: BoundedObject, charge: RetainedCharge) {
+    fn publish_value(&self, payload: CellPayload, charge: RetainedCharge) {
         let owner = Arc::new(ResolvedObjectOwner {
-            object,
+            payload,
             transition_gate: Mutex::new(()),
             cache_backed: AtomicBool::new(false),
             charge: Mutex::new(Some(charge)),
@@ -696,7 +872,10 @@ impl ObjectCellRequest {
     fn publish_load_error(&self, reservation: crate::broker::Reservation, failure: CellLoadError) {
         let weight = ERROR_OWNER_BYTES.checked_add(failure.error.detail.capacity() as u64);
         let (charge, reservation) = match weight {
-            Some(weight) if weight <= LOADER_ESTIMATE_BYTES && !reservation.is_cancelled() => {
+            Some(weight)
+                if weight <= self.cell.key.representation.loader_estimate()
+                    && !reservation.is_cancelled() =>
+            {
                 match reservation.reconcile(weight) {
                     Ok(charge) => (Some(charge), None),
                     Err(error) => {
@@ -791,11 +970,16 @@ impl CellCancellation {
 
 impl ResolvedObjectOwner {
     pub(crate) fn as_object(&self) -> &Object {
-        self.object.as_object()
+        match &self.payload {
+            CellPayload::Object(object) => object.as_object(),
+            CellPayload::ObjectStream(_) => {
+                unreachable!("representation-checked object pin owns an object payload")
+            }
+        }
     }
 
     pub(crate) fn retained_bytes(&self) -> u64 {
-        self.object.retained_bytes()
+        self.payload.retained_bytes()
     }
 
     fn transition(&self, ownership: OwnershipClass) -> Result<(), AccessError> {
@@ -835,6 +1019,35 @@ impl ResolvedObjectOwner {
     }
 }
 
+impl CellPayload {
+    fn retained_bytes(&self) -> u64 {
+        match self {
+            Self::Object(object) => object.retained_bytes(),
+            Self::ObjectStream(stream) => stream.retained_bytes(),
+        }
+    }
+
+    fn peak_bytes(&self, permit: &ScalarResolutionPermit) -> u64 {
+        match self {
+            Self::Object(object) => object.peak_bytes(),
+            Self::ObjectStream(_) => permit.stats().peak_bytes,
+        }
+    }
+
+    fn matches_representation(&self, representation: Representation) -> bool {
+        matches!(
+            (self, representation),
+            (
+                Self::Object(_),
+                Representation::RawNormalObject | Representation::DeclaredObjStmMember
+            ) | (
+                Self::ObjectStream(_),
+                Representation::DeclaredObjStmContainer
+            )
+        )
+    }
+}
+
 impl FailureOwner {
     fn transition(&self, ownership: OwnershipClass) -> Result<(), AccessError> {
         let mut charge = lock(&self.charge);
@@ -849,12 +1062,28 @@ impl FailureOwner {
 
 impl ResolvedObjectPin {
     pub(crate) fn owner(&self) -> &Arc<ResolvedObjectOwner> {
-        &self.owner
+        &self.inner.owner
     }
 
     #[cfg(test)]
     pub(crate) fn pointer(&self) -> usize {
-        Arc::as_ptr(&self.owner) as usize
+        Arc::as_ptr(&self.inner.owner) as usize
+    }
+}
+
+impl ResolvedObjectStreamPin {
+    pub(crate) fn as_object_stream(&self) -> &BoundedObjectStream {
+        match &self.inner.owner.payload {
+            CellPayload::ObjectStream(stream) => stream,
+            CellPayload::Object(_) => {
+                unreachable!("representation-checked object-stream pin owns a container payload")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn pointer(&self) -> usize {
+        Arc::as_ptr(&self.inner.owner) as usize
     }
 }
 
@@ -972,6 +1201,14 @@ impl ArenaInner {
     }
 
     fn request(self: &Arc<Self>, id: ObjectId) -> Result<ObjectCellRequest, AccessError> {
+        self.request_representation(id, Representation::RawNormalObject)
+    }
+
+    fn request_representation(
+        self: &Arc<Self>,
+        id: ObjectId,
+        representation: Representation,
+    ) -> Result<ObjectCellRequest, AccessError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(cell_error(
                 id,
@@ -982,7 +1219,7 @@ impl ArenaInner {
         let key = CellKey {
             epoch: self.epoch,
             id,
-            representation: Representation::RawNormalObject,
+            representation,
         };
         if let Some(request) = self.join_key(key)? {
             return Ok(request);
@@ -992,8 +1229,11 @@ impl ArenaInner {
             return Ok(request);
         }
         let _headroom = lock(&self.domain.headroom);
-        self.domain
-            .reclaim_loader_headroom(CELL_METADATA_BYTES, id)?;
+        self.domain.reclaim_loader_headroom(
+            CELL_METADATA_BYTES,
+            representation.loader_estimate(),
+            id,
+        )?;
         let victims = self.domain.make_cell_room(id, CELL_METADATA_BYTES)?;
         drop(victims);
         let reservation = self
@@ -1087,6 +1327,7 @@ impl ArenaInner {
                 &mut domain,
                 &mut state,
                 id,
+                representation,
                 self.domain.config.max_global_interests,
             )?;
             domain.cache_bytes = cache_bytes;
@@ -1113,6 +1354,7 @@ impl ArenaInner {
             &mut domain,
             &mut state,
             cell.key.id,
+            cell.key.representation,
             self.domain.config.max_global_interests,
         );
         drop(state);
@@ -1213,7 +1455,7 @@ impl ArenaInner {
         } else {
             let removed_cell = domain.cells.remove(&cell.key);
             state.cached = false;
-            if !checked_add(&mut domain.bypasses, 1)
+            if !domain.add_bypasses(cell.key.representation, 1)
                 || !checked_sub(&mut domain.cache_bytes, state.completed_weight)
             {
                 domain.invariant_failed = true;
@@ -1367,7 +1609,7 @@ impl ArenaInner {
                 domain.invariant_failed = true;
             }
             let shared = (state.live_interests - 1) as u64;
-            if !checked_add(&mut domain.transient_shares, shared) {
+            if !domain.add_transient_shares(cell.key.representation, shared) {
                 domain.invariant_failed = true;
             }
             if !checked_sub(&mut domain.loading_metadata_bytes, CELL_METADATA_BYTES) {
@@ -1398,11 +1640,48 @@ impl ArenaInner {
             && matches!(&state.phase, CellPhase::Loading(loading) if loading.leader_slot == leader_slot && !loading.cancellation.load(Ordering::Acquire))
     }
 
+    fn invalidate_payload_mismatch(&self, cell: &Arc<Cell>) -> AccessError {
+        let failure = cell_error(
+            cell.key.id,
+            AccessKind::Backend,
+            "object cell payload representation mismatch",
+        );
+        let closed = Arc::new(failure.clone());
+        let (old_phase, removed_cell) = {
+            let mut domain = lock(&self.domain.state);
+            let mut state = lock(&cell.state);
+            domain.invariant_failed = true;
+            let removed_cell = domain
+                .cells
+                .get(&cell.key)
+                .filter(|current| Arc::ptr_eq(current, cell))
+                .is_some()
+                .then(|| domain.cells.remove(&cell.key))
+                .flatten();
+            if state.cached && !checked_sub(&mut domain.cache_bytes, state.completed_weight) {
+                domain.invariant_failed = true;
+            }
+            state.cached = false;
+            let old_phase = std::mem::replace(&mut state.phase, CellPhase::Closed(closed));
+            (old_phase, removed_cell)
+        };
+        if let CellPhase::Ready(owner) = &old_phase {
+            let _ = owner.transition(OwnershipClass::Bypass);
+        }
+        drop(old_phase);
+        drop(removed_cell);
+        if let Some(metadata) = lock(&cell.metadata).as_mut() {
+            let _ = metadata.transition(OwnershipClass::Bypass);
+        }
+        cell.ready.notify_all();
+        failure
+    }
+
     fn pin(
         self: &Arc<Self>,
         cell: &Arc<Cell>,
         owner: Arc<ResolvedObjectOwner>,
-    ) -> Result<ResolvedObjectPin, AccessError> {
+    ) -> Result<ResolvedCellPin, AccessError> {
         let _transition = lock(&owner.transition_gate);
         let cache_backed = owner.cache_backed.load(Ordering::Acquire);
         let admission = {
@@ -1454,7 +1733,7 @@ impl ArenaInner {
             let _domain = lock(&self.domain.state);
             lock(&cell.state).transitioning = false;
         }
-        Ok(ResolvedObjectPin {
+        Ok(ResolvedCellPin {
             owner: Arc::clone(&owner),
             _pin: Arc::new(ExternalPin {
                 arena: Arc::downgrade(self),
@@ -1515,7 +1794,7 @@ impl ArenaInner {
             domain.live_interests -= 1;
             let cancel_loading = release != InterestRelease::Complete
                 && matches!(state.phase, CellPhase::Loading(_));
-            if cancel_loading && !checked_add(&mut domain.cancellations, 1) {
+            if cancel_loading && !domain.add_cancellations(cell.key.representation, 1) {
                 domain.invariant_failed = true;
             }
             match &mut state.phase {
@@ -1668,6 +1947,9 @@ impl DomainInner {
             evictions: domain.evictions,
             cancellations: domain.cancellations,
             closes: domain.closes,
+            raw: domain.representations[Representation::RawNormalObject.index()],
+            containers: domain.representations[Representation::DeclaredObjStmContainer.index()],
+            members: domain.representations[Representation::DeclaredObjStmMember.index()],
             invariant_failed: domain.invariant_failed,
             ..ObjectCellSnapshot::default()
         };
@@ -1713,7 +1995,12 @@ impl DomainInner {
         Ok(victims)
     }
 
-    fn reclaim_loader_headroom(&self, additional: u64, id: ObjectId) -> Result<(), AccessError> {
+    fn reclaim_loader_headroom(
+        &self,
+        additional: u64,
+        loader_estimate: u64,
+        id: ObjectId,
+    ) -> Result<(), AccessError> {
         loop {
             let broker = self.broker.normal_headroom();
             let drained_payload = broker
@@ -1730,7 +2017,7 @@ impl DomainInner {
                 .checked_add(broker.metadata_bytes)
                 .and_then(|bytes| bytes.checked_add(broker.completion_reserve_bytes))
                 .and_then(|bytes| bytes.checked_add(additional))
-                .and_then(|bytes| bytes.checked_add(LOADER_ESTIMATE_BYTES))
+                .and_then(|bytes| bytes.checked_add(loader_estimate))
                 .and_then(|bytes| bytes.checked_add(broker.queue_metadata_weight));
             if projected.is_some_and(|bytes| bytes <= broker.normal_limit_bytes) {
                 return Ok(());
@@ -1808,7 +2095,8 @@ fn remove_victim(domain: &mut DomainState, key: CellKey) -> Option<Arc<Cell>> {
         state.cached = false;
         state.completed_weight
     };
-    if !checked_sub(&mut domain.cache_bytes, weight) || !checked_add(&mut domain.evictions, 1) {
+    if !checked_sub(&mut domain.cache_bytes, weight) || !domain.add_evictions(key.representation, 1)
+    {
         domain.invariant_failed = true;
     }
     Some(cell)
@@ -1818,6 +2106,7 @@ fn attach_interest(
     domain: &mut DomainState,
     state: &mut CellState,
     id: ObjectId,
+    representation: Representation,
     max_global_interests: usize,
 ) -> Result<(usize, u64), AccessError> {
     if domain.live_interests >= max_global_interests {
@@ -1857,6 +2146,11 @@ fn attach_interest(
         .calls
         .checked_add(1)
         .ok_or_else(|| cell_error(id, AccessKind::ResourceLimit, "cell call counter overflow"))?;
+    let mut kind = domain.representations[representation.index()];
+    kind.calls = kind
+        .calls
+        .checked_add(1)
+        .ok_or_else(|| cell_error(id, AccessKind::ResourceLimit, "kind call counter overflow"))?;
     let mut waits = domain.waits;
     let mut hits = domain.hits;
     let mut negative_hits = domain.negative_hits;
@@ -1866,12 +2160,18 @@ fn attach_interest(
             waits = waits.checked_add(1).ok_or_else(|| {
                 cell_error(id, AccessKind::ResourceLimit, "cell wait counter overflow")
             })?;
+            kind.waits = kind.waits.checked_add(1).ok_or_else(|| {
+                cell_error(id, AccessKind::ResourceLimit, "kind wait counter overflow")
+            })?;
             None
         }
         CellPhase::Loading(_) => None,
         CellPhase::Ready(_) => {
             hits = hits.checked_add(1).ok_or_else(|| {
                 cell_error(id, AccessKind::ResourceLimit, "cell hit counter overflow")
+            })?;
+            kind.hits = kind.hits.checked_add(1).ok_or_else(|| {
+                cell_error(id, AccessKind::ResourceLimit, "kind hit counter overflow")
             })?;
             Some(domain.touch.checked_add(1).ok_or_else(|| {
                 cell_error(
@@ -1889,6 +2189,13 @@ fn attach_interest(
                     "negative hit counter overflow",
                 )
             })?;
+            kind.negative_hits = kind.negative_hits.checked_add(1).ok_or_else(|| {
+                cell_error(
+                    id,
+                    AccessKind::ResourceLimit,
+                    "kind negative hit counter overflow",
+                )
+            })?;
             Some(domain.touch.checked_add(1).ok_or_else(|| {
                 cell_error(
                     id,
@@ -1903,6 +2210,13 @@ fn attach_interest(
                     id,
                     AccessKind::ResourceLimit,
                     "transient share counter overflow",
+                )
+            })?;
+            kind.transient_shares = kind.transient_shares.checked_add(1).ok_or_else(|| {
+                cell_error(
+                    id,
+                    AccessKind::ResourceLimit,
+                    "kind transient share counter overflow",
                 )
             })?;
             None
@@ -1932,6 +2246,7 @@ fn attach_interest(
     domain.hits = hits;
     domain.negative_hits = negative_hits;
     domain.transient_shares = transient_shares;
+    domain.representations[representation.index()] = kind;
     if let Some(touch) = touch {
         domain.touch = touch;
         state.touch = touch;
@@ -1984,10 +2299,420 @@ fn wait<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lopdf::{BytesSource, IndexedReader, IndexedReaderOptions, ScalarResolutionPermit};
+    use lopdf::{
+        dictionary, BytesSource, Document, IndexedObjectLocation, IndexedReader,
+        IndexedReaderOptions, Object, SaveOptions, ScalarResolutionPermit,
+    };
     use std::sync::atomic::{AtomicU64, AtomicUsize};
     use std::sync::{mpsc, Barrier};
     use std::thread;
+
+    fn assert_representation_counter_sums(snapshot: &ObjectCellSnapshot) {
+        let kinds = [snapshot.raw, snapshot.containers, snapshot.members];
+        macro_rules! assert_sum {
+            ($field:ident) => {
+                assert_eq!(
+                    snapshot.$field,
+                    kinds.iter().map(|kind| kind.$field).sum::<u64>(),
+                    "aggregate {} counter diverged from representation counters",
+                    stringify!($field)
+                );
+            };
+        }
+        assert_sum!(calls);
+        assert_sum!(loads);
+        assert_sum!(hits);
+        assert_sum!(waits);
+        assert_sum!(negative_hits);
+        assert_sum!(transient_shares);
+        assert_sum!(bypasses);
+        assert_sum!(evictions);
+        assert_sum!(cancellations);
+    }
+
+    #[test]
+    fn production_cell_precharges_cover_typed_owner_and_error_structures() {
+        assert!(CELL_FIXED_STRUCTURAL_BYTES <= CELL_BASE_METADATA_BYTES as usize);
+        assert!(
+            CELL_FIXED_STRUCTURAL_BYTES
+                > CELL_BASE_METADATA_BYTES as usize - CELL_ERROR_ENVELOPE_BYTES as usize
+        );
+        assert!(std::mem::size_of::<FailureOwner>() <= ERROR_OWNER_BYTES as usize);
+        assert_eq!(BTREE_NODE_ENVELOPE_BYTES, 2 * 1024);
+        assert_eq!(
+            PREPARED_STREAM_STRUCTURAL_BYTES as u64,
+            BOUNDED_OBJECT_STREAM_STRUCTURAL_ENVELOPE_BYTES
+        );
+
+        let (reader, _, container, _) = object_stream_reader();
+        let permit = ScalarResolutionPermit::new(64 * 1024 * 1024);
+        let prepared = reader
+            .prepare_object_stream_with_permit(container, &permit)
+            .unwrap();
+        assert!(
+            prepared.excluded_structural_bytes() <= BOUNDED_OBJECT_STREAM_STRUCTURAL_ENVELOPE_BYTES
+        );
+    }
+
+    #[test]
+    fn representation_keys_share_one_domain_but_keep_typed_owners_and_estimates_distinct() {
+        let broker = broker();
+        let domain =
+            ObjectCellDomain::new(broker.clone(), ObjectCellConfig::scaled(32 * 1024 * 1024));
+        let arena = domain.open_arena().unwrap();
+        let (object_reader, member, container, index) = object_stream_reader();
+
+        let first_container = arena
+            .resolve_object_stream(container, |permit| {
+                assert_eq!(permit.limit_bytes(), 64 * 1024 * 1024);
+                object_reader
+                    .prepare_object_stream_with_permit(container, permit)
+                    .map_err(|error| {
+                        CellLoadError::new(
+                            AccessError::typed(container, AccessKind::Backend, error),
+                            NegativeDisposition::Persistent,
+                        )
+                    })
+            })
+            .unwrap();
+        let second_container = arena
+            .resolve_object_stream(container, |_| panic!("container must hit"))
+            .unwrap();
+        assert_eq!(first_container.pointer(), second_container.pointer());
+        assert_eq!(first_container.as_object_stream().container_id(), container);
+
+        let first_member = arena
+            .resolve_declared_member(member, |permit| {
+                assert_eq!(permit.limit_bytes(), 4 * 1024 * 1024);
+                first_container
+                    .as_object_stream()
+                    .resolve_member_with_permit(member, index, permit)
+                    .map(BoundedObject::Scalar)
+                    .map_err(|error| {
+                        CellLoadError::new(
+                            AccessError::typed(member, AccessKind::Backend, error),
+                            NegativeDisposition::Persistent,
+                        )
+                    })
+            })
+            .unwrap();
+        let second_member = arena
+            .resolve_declared_member(member, |_| panic!("member must hit"))
+            .unwrap();
+        assert_eq!(first_member.pointer(), second_member.pointer());
+        assert_eq!(
+            first_member
+                .owner()
+                .as_object()
+                .as_dict()
+                .unwrap()
+                .get(b"Answer")
+                .unwrap()
+                .as_i64()
+                .unwrap(),
+            42
+        );
+
+        let raw_reader = reader(42);
+        let raw = arena
+            .resolve(member, |permit| load(&raw_reader, (1, 0), permit))
+            .unwrap();
+        assert_ne!(raw.pointer(), first_member.pointer());
+
+        let snapshot = domain.snapshot();
+        assert_eq!(snapshot.calls, 5);
+        assert_eq!(snapshot.loads, 3);
+        assert_eq!(snapshot.raw.calls, 1);
+        assert_eq!(snapshot.raw.loads, 1);
+        assert_eq!(snapshot.containers.calls, 2);
+        assert_eq!(snapshot.containers.loads, 1);
+        assert_eq!(snapshot.containers.hits, 1);
+        assert_eq!(snapshot.members.calls, 2);
+        assert_eq!(snapshot.members.loads, 1);
+        assert_eq!(snapshot.members.hits, 1);
+        assert_representation_counter_sums(&snapshot);
+
+        drop(raw);
+        drop(first_member);
+        drop(second_member);
+        drop(first_container);
+        drop(second_container);
+        arena.close();
+        drop(arena);
+        assert_eq!(broker.snapshot().aggregate_bytes, 0);
+    }
+
+    #[test]
+    fn every_counter_is_transactionally_aggregated_across_one_mixed_domain() {
+        let broker = broker();
+        let domain = ObjectCellDomain::new(
+            broker.clone(),
+            ObjectCellConfig::scaled(CELL_METADATA_BYTES + 1024),
+        );
+        let arena = domain.open_arena().unwrap();
+        let scalar_reader = reader(17);
+        let (stream_reader, member_id, container_id, member_index) = object_stream_reader();
+
+        for (offset, representation) in [
+            Representation::RawNormalObject,
+            Representation::DeclaredObjStmContainer,
+            Representation::DeclaredObjStmMember,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = (100 + u32::try_from(offset).unwrap(), 0);
+            let failure = || {
+                CellLoadError::new(
+                    AccessError::typed(id, AccessKind::Backend, "stable mixed negative"),
+                    NegativeDisposition::Persistent,
+                )
+            };
+            match representation {
+                Representation::DeclaredObjStmContainer => {
+                    arena
+                        .resolve_object_stream(id, |_| Err(failure()))
+                        .unwrap_err();
+                    arena
+                        .resolve_object_stream(id, |_| Err(failure()))
+                        .unwrap_err();
+                }
+                Representation::RawNormalObject | Representation::DeclaredObjStmMember => {
+                    let resolve = |arena: &ObjectCellArena| match representation {
+                        Representation::RawNormalObject => arena.resolve(id, |_| Err(failure())),
+                        Representation::DeclaredObjStmMember => {
+                            arena.resolve_declared_member(id, |_| Err(failure()))
+                        }
+                        Representation::DeclaredObjStmContainer => unreachable!(),
+                    };
+                    resolve(&arena).unwrap_err();
+                    resolve(&arena).unwrap_err();
+                }
+            }
+        }
+
+        let raw = arena
+            .resolve((200, 0), |permit| load(&scalar_reader, (1, 0), permit))
+            .unwrap();
+        let raw_pointer = raw.pointer();
+        drop(raw);
+        let raw_hit = arena
+            .resolve((200, 0), |_| panic!("raw value must hit"))
+            .unwrap();
+        assert_eq!(raw_hit.pointer(), raw_pointer);
+        drop(raw_hit);
+
+        let container = arena
+            .resolve_object_stream(container_id, |permit| {
+                stream_reader
+                    .prepare_object_stream_with_permit(container_id, permit)
+                    .map_err(|error| {
+                        CellLoadError::new(
+                            AccessError::typed(container_id, AccessKind::Backend, error),
+                            NegativeDisposition::Persistent,
+                        )
+                    })
+            })
+            .unwrap();
+        let container_pointer = container.pointer();
+        drop(container);
+        let container_hit = arena
+            .resolve_object_stream(container_id, |_| panic!("container must hit"))
+            .unwrap();
+        assert_eq!(container_hit.pointer(), container_pointer);
+        drop(container_hit);
+
+        let member = arena
+            .resolve_declared_member(member_id, |permit| {
+                let container_permit = ScalarResolutionPermit::new(64 * 1024 * 1024);
+                let container = stream_reader
+                    .prepare_object_stream_with_permit(container_id, &container_permit)
+                    .unwrap();
+                container
+                    .resolve_member_with_permit(member_id, member_index, permit)
+                    .map(BoundedObject::Scalar)
+                    .map_err(|error| {
+                        CellLoadError::new(
+                            AccessError::typed(member_id, AccessKind::Backend, error),
+                            NegativeDisposition::Persistent,
+                        )
+                    })
+            })
+            .unwrap();
+        let member_pointer = member.pointer();
+        drop(member);
+        let member_hit = arena
+            .resolve_declared_member(member_id, |_| panic!("member must hit"))
+            .unwrap();
+        assert_eq!(member_hit.pointer(), member_pointer);
+        drop(member_hit);
+
+        let pinned_raw = arena
+            .resolve((300, 0), |permit| load(&scalar_reader, (1, 0), permit))
+            .unwrap();
+        let bypass_raw = arena
+            .resolve((301, 0), |permit| load(&scalar_reader, (1, 0), permit))
+            .unwrap();
+        let bypass_container = arena
+            .resolve_object_stream(container_id, |permit| {
+                stream_reader
+                    .prepare_object_stream_with_permit(container_id, permit)
+                    .map_err(|error| {
+                        CellLoadError::new(
+                            AccessError::typed(container_id, AccessKind::Backend, error),
+                            NegativeDisposition::Persistent,
+                        )
+                    })
+            })
+            .unwrap();
+        let bypass_member = arena
+            .resolve_declared_member((302, 0), |permit| load(&scalar_reader, (1, 0), permit))
+            .unwrap();
+
+        for (offset, representation) in [
+            Representation::RawNormalObject,
+            Representation::DeclaredObjStmContainer,
+            Representation::DeclaredObjStmMember,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = (400 + u32::try_from(offset).unwrap(), 0);
+            let leader = arena
+                .inner
+                .request_representation(id, representation)
+                .unwrap();
+            let follower = arena
+                .inner
+                .request_representation(id, representation)
+                .unwrap();
+            match representation {
+                Representation::DeclaredObjStmContainer => {
+                    leader
+                        .resolve_object_stream(|_| Err(transient(id, "mixed transient")))
+                        .unwrap_err();
+                    follower
+                        .resolve_object_stream(|_| panic!("follower must share"))
+                        .unwrap_err();
+                }
+                Representation::RawNormalObject | Representation::DeclaredObjStmMember => {
+                    leader
+                        .resolve(|_| Err(transient(id, "mixed transient")))
+                        .unwrap_err();
+                    follower
+                        .resolve(|_| panic!("follower must share"))
+                        .unwrap_err();
+                }
+            }
+
+            let cancelled = arena
+                .inner
+                .request_representation((500 + u32::try_from(offset).unwrap(), 0), representation)
+                .unwrap();
+            cancelled.cancellation_handle().cancel();
+            match representation {
+                Representation::DeclaredObjStmContainer => cancelled
+                    .resolve_object_stream(|_| panic!("cancelled loader must not run"))
+                    .unwrap_err(),
+                Representation::RawNormalObject | Representation::DeclaredObjStmMember => cancelled
+                    .resolve(|_| panic!("cancelled loader must not run"))
+                    .unwrap_err(),
+            };
+        }
+
+        let snapshot = domain.snapshot();
+        assert_representation_counter_sums(&snapshot);
+        for kind in [snapshot.raw, snapshot.containers, snapshot.members] {
+            assert!(kind.calls > 0);
+            assert!(kind.loads > 0);
+            assert!(kind.hits > 0);
+            assert!(kind.waits > 0);
+            assert!(kind.negative_hits > 0);
+            assert!(kind.transient_shares > 0);
+            assert!(kind.bypasses > 0);
+            assert!(kind.evictions > 0);
+            assert!(kind.cancellations > 0);
+        }
+
+        drop(bypass_member);
+        drop(bypass_container);
+        drop(bypass_raw);
+        drop(pinned_raw);
+        arena.close();
+        drop(arena);
+        assert_eq!(broker.snapshot().aggregate_bytes, 0);
+    }
+
+    #[test]
+    fn per_kind_counter_overflow_refuses_without_partial_aggregate_mutation() {
+        let domain = ObjectCellDomain::new(broker(), ObjectCellConfig::scaled(32 * 1024 * 1024));
+        let arena = domain.open_arena().unwrap();
+        {
+            let mut state = lock(&domain.inner.state);
+            state.calls = 7;
+            state.representations[Representation::DeclaredObjStmContainer.index()].calls = u64::MAX;
+        }
+        let error = arena
+            .inner
+            .request_representation((77, 0), Representation::DeclaredObjStmContainer)
+            .err()
+            .expect("kind counter overflow must refuse the interest");
+        assert_eq!(error.kind, AccessKind::ResourceLimit);
+        let state = lock(&domain.inner.state);
+        assert_eq!(state.calls, 7);
+        assert_eq!(
+            state.representations[Representation::DeclaredObjStmContainer.index()].calls,
+            u64::MAX
+        );
+        assert_eq!(state.live_interests, 0);
+        assert!(state.cells.is_empty());
+    }
+
+    #[test]
+    fn typed_payload_mismatch_closes_only_its_exact_key() {
+        let broker = broker();
+        let domain =
+            ObjectCellDomain::new(broker.clone(), ObjectCellConfig::scaled(32 * 1024 * 1024));
+        let arena = domain.open_arena().unwrap();
+        let object_reader = reader(7);
+        let raw = arena
+            .resolve((1, 0), |permit| load(&object_reader, (1, 0), permit))
+            .unwrap();
+        let member = arena
+            .resolve_declared_member((1, 0), |permit| load(&object_reader, (1, 0), permit))
+            .unwrap();
+        let raw_pointer = raw.pointer();
+        let member_pointer = member.pointer();
+        drop(raw);
+        drop(member);
+
+        let request = arena
+            .inner
+            .request_representation((1, 0), Representation::DeclaredObjStmContainer)
+            .unwrap();
+        let error = request
+            .resolve(|permit| load(&object_reader, (1, 0), permit))
+            .expect_err("an object payload cannot inhabit a container key");
+        assert_eq!(error.kind, AccessKind::Backend);
+        let snapshot = domain.snapshot();
+        assert_eq!(snapshot.cells, 2);
+        assert!(snapshot.invariant_failed);
+
+        let surviving_raw = arena
+            .resolve((1, 0), |_| panic!("raw sibling must hit"))
+            .unwrap();
+        let surviving_member = arena
+            .resolve_declared_member((1, 0), |_| panic!("member sibling must hit"))
+            .unwrap();
+        assert_eq!(surviving_raw.pointer(), raw_pointer);
+        assert_eq!(surviving_member.pointer(), member_pointer);
+        assert_ne!(surviving_raw.pointer(), surviving_member.pointer());
+        drop(surviving_raw);
+        drop(surviving_member);
+        arena.close();
+        drop(arena);
+        assert_eq!(broker.snapshot().aggregate_bytes, 0);
+    }
 
     fn broker() -> BudgetBroker {
         BudgetBroker::new(crate::broker::BrokerConfig {
@@ -2045,6 +2770,34 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    fn object_stream_reader() -> (Arc<IndexedReader>, ObjectId, ObjectId, u32) {
+        let mut document = Document::with_version("1.7");
+        let pages = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => Vec::<Object>::new(), "Count" => 0,
+        }));
+        let catalog = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Catalog", "Pages" => Object::Reference(pages),
+        }));
+        let member = document.add_object(Object::Dictionary(dictionary! {
+            "Answer" => 42,
+        }));
+        document.trailer.set("Root", Object::Reference(catalog));
+        document.trailer.set("Info", Object::Reference(member));
+        let options = SaveOptions::builder()
+            .use_object_streams(true)
+            .use_xref_streams(true)
+            .build();
+        let mut raw = Vec::new();
+        document.save_with_options(&mut raw, options).unwrap();
+        let reader = Arc::new(IndexedReader::open(BytesSource::from(raw)).unwrap());
+        let IndexedObjectLocation::Compressed { container, index } =
+            reader.object_location(member).unwrap()
+        else {
+            panic!("fixture member must be declared compressed")
+        };
+        (reader, member, container, index)
     }
 
     fn load(
@@ -2375,7 +3128,10 @@ mod tests {
 
     #[test]
     fn global_lru_evicts_across_documents_but_never_evicts_pins() {
-        let domain = ObjectCellDomain::new(broker(), ObjectCellConfig::scaled(4_608));
+        let domain = ObjectCellDomain::new(
+            broker(),
+            ObjectCellConfig::scaled(CELL_METADATA_BYTES + 512),
+        );
         let first_arena = domain.open_arena().unwrap();
         let second_arena = domain.open_arena().unwrap();
         let first_reader = reader(10);
@@ -2409,7 +3165,10 @@ mod tests {
         assert_eq!(second_loads.load(Ordering::Relaxed), 1);
         assert!(domain.snapshot().evictions >= 2);
 
-        let pinned_domain = ObjectCellDomain::new(broker(), ObjectCellConfig::scaled(4_608));
+        let pinned_domain = ObjectCellDomain::new(
+            broker(),
+            ObjectCellConfig::scaled(CELL_METADATA_BYTES + 512),
+        );
         let pinned_arena = pinned_domain.open_arena().unwrap();
         let bypass_arena = pinned_domain.open_arena().unwrap();
         let pinned_reader = reader(30);
@@ -2514,19 +3273,34 @@ mod tests {
         );
         let arena = domain.open_arena().unwrap();
         let mut requests = Vec::new();
-        for number in 1..=4_096u32 {
-            requests.push(arena.request((number, 0)).unwrap());
+        let exact_cells = MAX_LOADING_METADATA_BYTES / CELL_METADATA_BYTES;
+        for number in 1..=u32::try_from(exact_cells).unwrap() {
+            let representation = match number % 3 {
+                0 => Representation::RawNormalObject,
+                1 => Representation::DeclaredObjStmContainer,
+                _ => Representation::DeclaredObjStmMember,
+            };
+            requests.push(
+                arena
+                    .inner
+                    .request_representation((number, 0), representation)
+                    .unwrap(),
+            );
         }
         let error = arena
-            .request((4_097, 0))
+            .inner
+            .request_representation(
+                (u32::try_from(exact_cells).unwrap() + 1, 0),
+                Representation::DeclaredObjStmMember,
+            )
             .err()
-            .expect("the 4,097th 4 KiB Loading cell must be refused");
+            .expect("the first Loading cell above the byte cap must be refused");
         assert_eq!(error.kind, AccessKind::ResourceLimit);
         assert_eq!(
             lock(&domain.inner.state).loading_metadata_bytes,
-            MAX_LOADING_METADATA_BYTES
+            exact_cells * CELL_METADATA_BYTES
         );
-        assert_eq!(domain.snapshot().loading, 4_096);
+        assert_eq!(domain.snapshot().loading, exact_cells as usize);
         drop(requests);
         assert_eq!(lock(&domain.inner.state).loading_metadata_bytes, 0);
         assert_eq!(domain.snapshot().cells, 0);
@@ -2577,7 +3351,7 @@ mod tests {
             .unwrap();
         let called = AtomicBool::new(false);
         let error = second_arena
-            .resolve((9, 7), |_| {
+            .resolve_declared_member((9, 7), |_| {
                 called.store(true, Ordering::Release);
                 Err(transient((9, 7), "must not run"))
             })
@@ -2631,8 +3405,10 @@ mod tests {
         assert!(result_rx.recv().unwrap().is_ok());
         assert!(cap_domain.snapshot().cells <= 1);
 
-        let publication_domain =
-            ObjectCellDomain::new(wide_broker(), ObjectCellConfig::scaled(4_608));
+        let publication_domain = ObjectCellDomain::new(
+            wide_broker(),
+            ObjectCellConfig::scaled(CELL_METADATA_BYTES + 512),
+        );
         let first_arena = publication_domain.open_arena().unwrap();
         let second_arena = publication_domain.open_arena().unwrap();
         let _publication_keeps = [first_arena.clone(), second_arena.clone()];
@@ -2655,7 +3431,7 @@ mod tests {
             .map(|join| join.join().unwrap().unwrap())
             .collect();
         let snapshot = publication_domain.snapshot();
-        assert!(snapshot.cache_bytes <= 4_608);
+        assert!(snapshot.cache_bytes <= CELL_METADATA_BYTES + 512);
         assert_eq!(snapshot.cells, 1);
         assert_eq!(snapshot.bypasses, 1);
         assert_ne!(pins[0].pointer(), pins[1].pointer());

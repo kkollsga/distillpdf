@@ -293,7 +293,8 @@
     "clone-call|bc39bd0a8ff20187244278c4fdc89784ce6fb5fb15fbac6573bbd6beb88a1e4a|Arc :: clone (self)",
     "clone-call|debf76422aac53af28c130721ae0373350faefa8f5224c60ea693e6c3fcf448b|BudgetBroker :: production () . clone ()",
     "clone-call|e007a17925a47c2e6e43e96d87fbe7d6fcae7d82cbe3537a14529806669702f8|Arc :: clone (& owner)",
-    "clone-call|e007a17925a47c2e6e43e96d87fbe7d6fcae7d82cbe3537a14529806669702f8|Arc :: clone (& owner)"
+    "clone-call|e007a17925a47c2e6e43e96d87fbe7d6fcae7d82cbe3537a14529806669702f8|Arc :: clone (& owner)",
+    "clone-call|ebfa0b8c68a29c1b6197aefa209c18b0677d243b99eef1aa4e8f08c113a1cf51|failure . clone ()"
   ],
   "ocr/doctags.rs": [
     "clone-call|1b328262b779300ca6b82ac4de0be39372984529ad9b979980367c9268878af6|name . clone ()",
