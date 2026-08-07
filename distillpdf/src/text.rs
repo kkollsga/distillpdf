@@ -2391,6 +2391,7 @@ mod tests {
 
     #[test]
     fn malformed_tounicode_stream_recovers_through_source_boundary() {
+        let _test_lock = crate::access::indexed_test_lock();
         let cmap = b"1 beginbfchar\n<41> <0041>\nendbfchar\n";
         let mut raw = b"%PDF-1.7\n9 0 obj\n<<>>\nstream\n".to_vec();
         raw.extend_from_slice(cmap);

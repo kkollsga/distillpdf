@@ -160,12 +160,36 @@ impl RandomAccessSource for ObservedSource {
     }
 
     fn read_at(&self, offset: u64, out: &mut [u8]) -> SourceResult<usize> {
-        self.counters.requests.fetch_add(1, Ordering::Relaxed);
-        self.counters.reads.fetch_add(1, Ordering::Relaxed);
-        self.counters
-            .max_request
-            .fetch_max(out.len() as u64, Ordering::Relaxed);
-        self.inner.read_at(offset, out)
+        const PHYSICAL_READ_BYTES: usize = 64 * 1024;
+        let mut read = 0;
+        while read < out.len() {
+            let request = (out.len() - read).min(PHYSICAL_READ_BYTES);
+            let physical_offset = offset.checked_add(read as u64).ok_or(
+                SourceError::RangeOverflow {
+                    offset,
+                    length: out.len() as u64,
+                },
+            )?;
+            self.counters.requests.fetch_add(1, Ordering::Relaxed);
+            self.counters.reads.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .max_request
+                .fetch_max(request as u64, Ordering::Relaxed);
+            let actual = self
+                .inner
+                .read_at(physical_offset, &mut out[read..read + request])?;
+            if actual > request {
+                return Err(SourceError::InvalidReadCount {
+                    returned: actual,
+                    buffer_len: request,
+                });
+            }
+            read += actual;
+            if actual < request {
+                break;
+            }
+        }
+        Ok(read)
     }
 
     fn validate_unchanged(&self) -> SourceResult<()> {
@@ -296,14 +320,142 @@ impl IndexedOpenControl {
     }
 
     #[cfg(test)]
+    fn shared_bytes(&self) -> Option<&Arc<[u8]>> {
+        self.source_owner.as_ref()
+    }
+
+    #[cfg(test)]
     fn check_page_content(&self, page: lopdf::ObjectId) -> Result<(), AccessError> {
         self.access.page_content(page).map(|_| ())
     }
 
     #[cfg(test)]
-    fn shared_bytes(&self) -> Option<&Arc<[u8]>> {
-        self.source_owner.as_ref()
+    fn checked_page_content_matches(
+        &self,
+        page: lopdf::ObjectId,
+        expected: &[u8],
+    ) -> Result<bool, AccessError> {
+        self.access
+            .page_content(page)
+            .map(|content| content.as_ref() == expected)
     }
+
+    #[cfg(test)]
+    fn checked_recovered_stream_matches(
+        &self,
+        object: u32,
+        expected: &[u8],
+    ) -> Result<bool, AccessError> {
+        self.access
+            .recover_source_stream(object)
+            .map(|stream| stream.is_some_and(|stream| stream.as_ref() == expected))
+    }
+
+    #[cfg(test)]
+    fn checked_fingerprint(&self) -> Result<String, AccessError> {
+        checked_access_fingerprint(self.access.as_ref())
+    }
+}
+
+#[cfg(test)]
+fn canonical_object(value: &lopdf::Object, output: &mut Vec<u8>) {
+    use lopdf::Object;
+    match value {
+        Object::Null => output.extend_from_slice(b"null;"),
+        Object::Boolean(value) => output.extend_from_slice(if *value { b"true;" } else { b"false;" }),
+        Object::Integer(value) => output.extend_from_slice(format!("i{value};").as_bytes()),
+        Object::Real(value) => output.extend_from_slice(format!("r{value:?};").as_bytes()),
+        Object::Name(value) => {
+            output.extend_from_slice(b"n");
+            output.extend_from_slice(format!("{}:", value.len()).as_bytes());
+            output.extend_from_slice(value);
+        }
+        Object::String(value, format) => {
+            output.extend_from_slice(format!("s{format:?}:{}:", value.len()).as_bytes());
+            output.extend_from_slice(value);
+        }
+        Object::Array(values) => {
+            output.extend_from_slice(format!("a{}[", values.len()).as_bytes());
+            for value in values {
+                canonical_object(value, output);
+            }
+            output.extend_from_slice(b"]");
+        }
+        Object::Dictionary(dictionary) => canonical_dictionary(dictionary, output),
+        Object::Stream(stream) => {
+            output.extend_from_slice(b"stream{");
+            canonical_dictionary(&stream.dict, output);
+            output.extend_from_slice(format!("bytes{}:", stream.content.len()).as_bytes());
+            output.extend_from_slice(&stream.content);
+            output.extend_from_slice(b"}");
+        }
+        Object::Reference((object, generation)) => {
+            output.extend_from_slice(format!("ref{object}:{generation};").as_bytes());
+        }
+    }
+}
+
+#[cfg(test)]
+fn canonical_dictionary(dictionary: &lopdf::Dictionary, output: &mut Vec<u8>) {
+    let mut entries: Vec<_> = dictionary.iter().collect();
+    entries.sort_by(|left, right| left.0.cmp(right.0));
+    output.extend_from_slice(format!("d{}{{", entries.len()).as_bytes());
+    for (key, value) in entries {
+        output.extend_from_slice(format!("k{}:", key.len()).as_bytes());
+        output.extend_from_slice(key);
+        canonical_object(value, output);
+    }
+    output.extend_from_slice(b"}");
+}
+
+#[cfg(test)]
+fn checked_access_fingerprint(access: &dyn DocumentAccess) -> Result<String, AccessError> {
+    use sha2::{Digest, Sha256};
+
+    let mut canonical = Vec::new();
+    {
+        let root = access.trailer_entry(b"Root")?;
+        canonical.extend_from_slice(b"trailer-root:");
+        root.read(|value| canonical_object(value, &mut canonical))?;
+    }
+
+    let catalog = access.catalog()?;
+    canonical.extend_from_slice(b"catalog:");
+    catalog.read(|dictionary| canonical_dictionary(dictionary, &mut canonical))?;
+    if catalog.read(|dictionary| dictionary.has(b"Probe"))? {
+        canonical.extend_from_slice(b"probe:");
+        catalog
+            .entry(access, b"Probe")?
+            .read(|value| canonical_object(value, &mut canonical))?;
+    }
+
+    let object_ids = access.object_ids();
+    canonical.extend_from_slice(format!("objects{}:", object_ids.len()).as_bytes());
+    for (object, generation) in object_ids {
+        canonical.extend_from_slice(format!("{object}:{generation};").as_bytes());
+    }
+
+    let pages = access.pages()?;
+    canonical.extend_from_slice(format!("pages{}:", pages.len()).as_bytes());
+    for page in pages {
+        canonical.extend_from_slice(
+            format!("page{}@{}:{};", page.number, page.id.0, page.id.1).as_bytes(),
+        );
+        let content = access.page_content(page.id)?;
+        canonical.extend_from_slice(format!("content{}:", content.len()).as_bytes());
+        canonical.extend_from_slice(content.as_ref());
+
+        let resources = access.page_resource_chain(page.id)?;
+        canonical.extend_from_slice(format!("resources{}:", resources.len()).as_bytes());
+        for resource in resources {
+            resource.read(|dictionary| canonical_dictionary(dictionary, &mut canonical))?;
+        }
+
+        let fallback = access.fallback_page_text(page.number)?;
+        canonical.extend_from_slice(format!("text{}:", fallback.len()).as_bytes());
+        canonical.extend_from_slice(fallback.as_bytes());
+    }
+    Ok(format!("{:x}", Sha256::digest(canonical)))
 }
 
 /// A private one-thread rayon pool, used for **nothing but** `Document::load_mem`.
@@ -1024,8 +1176,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::access::tests::{AccessCounts, FaultAccess, FaultPoint};
     use crate::access::AccessKind;
-    use lopdf::dictionary;
+    use lopdf::{dictionary, Object};
     use std::io::{Seek, Write};
+    use std::process::Command;
     use std::sync::atomic::Ordering;
 
     /// The owned encrypted fixtures (`tests/gen_fixtures.py::gen_encrypted`). They live in
@@ -1054,6 +1207,247 @@ pub(crate) mod tests {
         ));
         std::fs::write(&path, raw).unwrap();
         path
+    }
+
+    struct GeneratedDir(PathBuf);
+
+    impl GeneratedDir {
+        fn new(label: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "distillpdf-l3a-terminal-{}-{label}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for GeneratedDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn generate_lazy_fixtures(output: &Path, arguments: &[&str]) {
+        let generator = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/lazy_engine_fixtures.py"
+        );
+        let status = Command::new("python3")
+            .arg(generator)
+            .arg("generate")
+            .arg("--out")
+            .arg(output)
+            .args(arguments)
+            .status()
+            .expect("run deterministic lazy fixture generator");
+        assert!(status.success(), "lazy fixture generation failed");
+    }
+
+    fn indexed_outcome(
+        opened: Result<IndexedOpenControl, RouteOpenError>,
+    ) -> Result<String, AccessKind> {
+        match opened {
+            Ok(control) => control
+                .checked_fingerprint()
+                .map_err(|error| error.kind),
+            Err(error) => match error.failure {
+                RouteFailure::Access(error) => Err(error.kind),
+                RouteFailure::Source(_) => Err(AccessKind::SourceIo),
+            },
+        }
+    }
+
+    fn eager_outcome(raw: &[u8]) -> Result<String, AccessKind> {
+        let document = PdfDocument::from_bytes(raw).map_err(|_| AccessKind::Backend)?;
+        checked_access_fingerprint(document.access.as_ref()).map_err(|error| error.kind)
+    }
+
+    fn inherited_resources_pdf(parent_depth: usize, malformed_parent: bool) -> Vec<u8> {
+        let mut document = Document::with_version("1.7");
+        let content = document.add_object(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            b"BT /F1 12 Tf (resource-depth) Tj ET".to_vec(),
+        ));
+        let font = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        }));
+        let resources = document.add_object(Object::Dictionary(dictionary! {
+            "Font" => dictionary! { "F1" => Object::Reference(font) },
+            "DepthMarker" => parent_depth as i64,
+        }));
+        let page = document.new_object_id();
+        let parent = if malformed_parent {
+            (999_999, 0)
+        } else {
+            let mut next = None;
+            for depth in (1..=parent_depth).rev() {
+                let mut dictionary = dictionary! { "Type" => "Pages" };
+                if let Some(next) = next {
+                    dictionary.set("Parent", Object::Reference(next));
+                }
+                if depth == parent_depth {
+                    dictionary.set("Resources", Object::Reference(resources));
+                }
+                next = Some(document.add_object(Object::Dictionary(dictionary)));
+            }
+            next.expect("resource fixture has at least one parent")
+        };
+        document.objects.insert(
+            page,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page", "Parent" => Object::Reference(parent),
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Contents" => Object::Reference(content),
+            }),
+        );
+        let pages = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Count" => 1,
+            "Kids" => vec![Object::Reference(page)],
+        }));
+        let catalog = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Catalog", "Pages" => Object::Reference(pages),
+        }));
+        document.trailer.set("Root", Object::Reference(catalog));
+        let mut raw = Vec::new();
+        document.save_to(&mut raw).unwrap();
+        raw
+    }
+
+    #[test]
+    fn l3a_terminal_all_small_fixtures_have_checked_file_bytes_parity() {
+        let _test_lock = crate::access::indexed_test_lock();
+        let generated = GeneratedDir::new("small");
+        generate_lazy_fixtures(generated.path(), &["--profile", "small"]);
+        let names = [
+            "classic.pdf",
+            "xref-stream.pdf",
+            "incremental.pdf",
+            "object-stream.pdf",
+            "reference-one-hop.pdf",
+            "reference-at-limit.pdf",
+            "reference-over-limit.pdf",
+            "reference-dangling.pdf",
+            "reference-cycle.pdf",
+            "generation-match.pdf",
+            "generation-mismatch.pdf",
+            "stream-missing-length.pdf",
+            "stream-short-length.pdf",
+        ];
+        for name in names {
+            let path = generated.path().join(name);
+            let raw = std::fs::read(&path).unwrap();
+            let file = open_indexed_file_internal(&path, None);
+            let file_diagnostics = file
+                .as_ref()
+                .map(|control| {
+                    assert!(control.shared_bytes().is_none(), "{name}");
+                    control.diagnostics()
+                })
+                .unwrap_or_else(|error| error.diagnostics.snapshot());
+            let bytes = open_indexed_bytes_internal(Arc::from(raw.clone()), None);
+            let bytes_diagnostics = bytes
+                .as_ref()
+                .map(|control| control.diagnostics())
+                .unwrap_or_else(|error| error.diagnostics.snapshot());
+            if matches!(name, "stream-missing-length.pdf" | "stream-short-length.pdf") {
+                let decoded: &[u8] = b"";
+                let recovered = b"BT /F1 12 Tf 72 720 Td (malformed stream) Tj ET";
+                for control in [file.as_ref().unwrap(), bytes.as_ref().unwrap()] {
+                    let page = control.pages().unwrap()[0].id;
+                    assert!(control.checked_page_content_matches(page, decoded).unwrap(), "{name}");
+                    assert!(control.checked_recovered_stream_matches(4, recovered).unwrap(), "{name}");
+                }
+            }
+            let file_outcome = indexed_outcome(file);
+            let bytes_outcome = indexed_outcome(bytes);
+            assert_eq!(file_outcome, bytes_outcome, "file/bytes {name}");
+            match name {
+                "reference-over-limit.pdf" => {
+                    assert_eq!(file_outcome, Err(AccessKind::ResourceLimit), "{name}");
+                }
+                "reference-dangling.pdf" | "generation-mismatch.pdf" => {
+                    assert_eq!(file_outcome, Err(AccessKind::Backend), "{name}");
+                }
+                "reference-cycle.pdf" => {
+                    assert_eq!(file_outcome, Err(AccessKind::Backend), "{name}");
+                }
+                "stream-missing-length.pdf" | "stream-short-length.pdf" => {
+                    assert!(file_outcome.is_ok(), "{name}");
+                }
+                _ => assert_eq!(file_outcome, eager_outcome(&raw), "eager parity {name}"),
+            }
+            for diagnostics in [file_diagnostics, bytes_diagnostics] {
+                assert_eq!(diagnostics.indexed_opens, 1, "{name}");
+                assert_eq!(diagnostics.fallback_opens, 0, "{name}");
+            }
+            assert!(file_diagnostics.source_max_request <= 64 * 1024, "{name}");
+        }
+    }
+
+    #[test]
+    fn l3a_terminal_inherited_resources_enforce_frozen_parent_boundary() {
+        let _test_lock = crate::access::indexed_test_lock();
+        let at_limit = inherited_resources_pdf(100, false);
+        let eager = eager_outcome(&at_limit);
+        assert!(eager.is_ok());
+        let indexed = indexed_outcome(open_indexed_bytes_internal(Arc::from(at_limit), None));
+        assert_eq!(indexed, eager);
+
+        let over_limit = inherited_resources_pdf(101, false);
+        let indexed = indexed_outcome(open_indexed_bytes_internal(Arc::from(over_limit), None));
+        assert_eq!(indexed, Err(AccessKind::ResourceLimit));
+
+        let malformed = inherited_resources_pdf(1, true);
+        let indexed = indexed_outcome(open_indexed_bytes_internal(Arc::from(malformed), None));
+        assert_eq!(indexed, Err(AccessKind::Backend));
+    }
+
+    #[test]
+    fn l3a_terminal_scale_axes_obey_frozen_metadata_formula() {
+        let _test_lock = crate::access::indexed_test_lock();
+        let generated = GeneratedDir::new("scale");
+        for axis in ["objects", "pages"] {
+            for count in [1_000_u64, 5_000, 10_000] {
+                generate_lazy_fixtures(
+                    generated.path(),
+                    &["--profile", "scale", "--axis", axis, "--count", &count.to_string()],
+                );
+                let path = generated.path().join(format!("{axis}-{count}.pdf"));
+                let raw: Arc<[u8]> = std::fs::read(&path).unwrap().into();
+                let file = open_indexed_file_internal(&path, None).unwrap();
+                let bytes = open_indexed_bytes_internal(raw, None).unwrap();
+                let expected_objects = if axis == "objects" { count + 5 } else { 2 * count + 3 };
+                let expected_pages = if axis == "pages" { count } else { 1 };
+                for diagnostics in [file.diagnostics(), bytes.diagnostics()] {
+                    assert_eq!(diagnostics.index_objects, expected_objects, "{axis}-{count}");
+                    assert_eq!(diagnostics.index_pages, expected_pages, "{axis}-{count}");
+                    assert_eq!(diagnostics.page_map_builds, 1, "{axis}-{count}");
+                    assert_eq!(diagnostics.indexed_opens, 1, "{axis}-{count}");
+                    assert_eq!(diagnostics.fallback_opens, 0, "{axis}-{count}");
+                    let cap = 33_554_432_u64
+                        + 1_536_u64 * expected_objects
+                        + 3_072_u64 * expected_pages;
+                    assert!(
+                        diagnostics.index_estimated_bytes <= cap,
+                        "{axis}-{count}: retained={} cap={cap}",
+                        diagnostics.index_estimated_bytes
+                    );
+                }
+                assert!(file.shared_bytes().is_none(), "{axis}-{count}");
+                assert!(
+                    file.diagnostics().source_max_request <= 64 * 1024,
+                    "{axis}-{count}: max request {}",
+                    file.diagnostics().source_max_request
+                );
+            }
+        }
     }
 
     #[test]
@@ -1312,6 +1706,27 @@ pub(crate) mod tests {
     #[test]
     fn indexed_constructor_region_has_no_eager_retry_or_implicit_snapshot() {
         let source = include_str!("doc.rs");
+        let terminal_start = source.find("fn check_page_content(").unwrap();
+        let terminal_end = source[terminal_start..]
+            .find("/// A private one-thread rayon pool")
+            .map(|offset| terminal_start + offset)
+            .unwrap();
+        let checked_terminal = &source[terminal_start..terminal_end];
+        for forbidden in [
+            "std::fs::read",
+            "read_to_end",
+            "load_mem_deterministic",
+            "EagerDocumentAdapter",
+            "materialize_source_bounded",
+            "Arc<[u8]>",
+            "source_owner",
+            "fallback_open",
+            "Default::default",
+            "unwrap_or_default",
+            "_or_empty",
+        ] {
+            assert!(!checked_terminal.contains(forbidden), "terminal forbidden {forbidden}");
+        }
         let indexed_start = source.find("fn open_indexed_source(").unwrap();
         let snapshot_start = source
             .find("pub(crate) fn open_indexed_snapshot_internal(")

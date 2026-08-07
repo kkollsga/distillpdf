@@ -26,7 +26,8 @@ const RECOVERY_METADATA_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 const PROVISIONAL_O_BYTES: u64 = 64 * 1024 * 1024;
 const INDEXED_OBJECT_BYTES: u64 = 4 * 1024 * 1024;
 const INDEXED_STREAM_BYTES: u64 = 64 * 1024 * 1024;
-const INDEXED_REFERENCE_DEPTH: usize = 64;
+// Frozen by `tests/lazy_engine_fixtures.py`: 128 reference hops are admitted and 129 fail.
+const INDEXED_REFERENCE_DEPTH: usize = 128;
 const INDEXED_PAGE_TREE_DEPTH: usize = 256;
 const INDEXED_MAX_PAGES: usize = 1_000_000;
 const EAGER_RESOURCE_DEPTH: usize = 100;
@@ -550,7 +551,10 @@ impl StreamScanner {
                 self.object = valid.then_some(object);
             }
         }
-        if self.object.is_some() && self.recent_ends_with(b"stream") {
+        if self.object.is_some()
+            && self.recent_ends_with(b"stream")
+            && self.keyword_has_left_boundary(b"stream")
+        {
             self.pending_stream_start = Some((position + 1, false));
         }
     }
@@ -570,6 +574,18 @@ impl StreamScanner {
                 .rev()
                 .zip(self.recent.iter().rev())
                 .all(|(expected, actual)| expected == actual)
+    }
+
+    fn keyword_has_left_boundary(&self, keyword: &[u8]) -> bool {
+        let Some(before) = self.recent.len().checked_sub(keyword.len() + 1) else {
+            return true;
+        };
+        let byte = self.recent[before];
+        byte.is_ascii_whitespace()
+            || matches!(
+                byte,
+                b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+            )
     }
 }
 
@@ -750,6 +766,12 @@ fn indexed_page_content_exclusive() -> &'static Mutex<()> {
 
 fn exclusive(lock: &'static Mutex<()>) -> MutexGuard<'static, ()> {
     lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+pub(crate) fn indexed_test_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    exclusive(LOCK.get_or_init(|| Mutex::new(())))
 }
 
 struct IndexedRetainedCharge {
@@ -1583,6 +1605,38 @@ impl IndexedDocumentAdapter {
         }
     }
 
+    fn resolve_bounded_terminal(&self, id: ObjectId) -> Result<ObjectHandle, AccessError> {
+        let mut current = id;
+        let mut seen = std::collections::HashSet::new();
+        let mut hops = 0;
+        loop {
+            if !seen.insert(current) {
+                return Err(AccessError::typed(
+                    current,
+                    AccessKind::Backend,
+                    "indirect reference cycle",
+                ));
+            }
+            let handle = self.resolve_bounded(current)?;
+            let next = handle.read(|object| object.as_reference().ok())?;
+            let Some(next) = next else {
+                return Ok(handle);
+            };
+            // The caller followed the first reference to `id`; this loop admits the remaining
+            // hops up to the frozen end-to-end boundary.
+            if hops >= INDEXED_REFERENCE_DEPTH.saturating_sub(1) {
+                return Err(AccessError::typed(
+                    current,
+                    AccessKind::ResourceLimit,
+                    format!("reference depth exceeds {INDEXED_REFERENCE_DEPTH}"),
+                ));
+            }
+            drop(handle);
+            current = next;
+            hops += 1;
+        }
+    }
+
     fn page_id(&self, number: u32) -> Result<ObjectId, AccessError> {
         let index = usize::try_from(number.saturating_sub(1)).unwrap_or(usize::MAX);
         self.cached_page_map()?
@@ -1601,7 +1655,7 @@ impl IndexedDocumentAdapter {
 
 impl DocumentAccess for IndexedDocumentAdapter {
     fn object(&self, id: ObjectId) -> Result<ObjectHandle, AccessError> {
-        self.resolve_bounded(id)
+        self.resolve_bounded_terminal(id)
             .map_err(|error| error.at(AccessPhase::Object, None))
     }
 
@@ -1952,11 +2006,6 @@ pub(crate) mod tests {
     use lopdf::dictionary;
     use lopdf::SourceError;
     use std::sync::atomic::{AtomicU64, Ordering};
-
-    fn indexed_test_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        exclusive(LOCK.get_or_init(|| Mutex::new(())))
-    }
 
     #[derive(Default)]
     pub(crate) struct AccessCounts {
@@ -2562,6 +2611,17 @@ pub(crate) mod tests {
         let spill = b"42 0 obj\n<<>>\nendobj\n43 0 obj\n<<>>\nstream\nwrong\nendstream";
         assert!(legacy_recovery_range(spill, 42).is_some());
         assert!(scanned_range(spill, 42).unwrap().is_none());
+
+        // Approved correction 3: a regular-character-prefixed substring is not the `stream`
+        // keyword and cannot steal a later object's actual stream range.
+        let regular_prefix = b"1 0 obj\n<< /Probe (malformed-stream) >>\nendobj\n\
+            4 0 obj\n<<>>\nstream\npayload\nendstream";
+        assert!(legacy_recovery_range(regular_prefix, 1).is_some());
+        assert!(scanned_range(regular_prefix, 1).unwrap().is_none());
+        assert_eq!(
+            scanned_range(regular_prefix, 4).unwrap(),
+            legacy_recovery_range(regular_prefix, 4)
+        );
 
         // The frozen 64 MiB recovery cap refuses the range before allocating its payload.
         let mut oversize = b"42 0 obj\n<<>>\nstream\n".to_vec();
