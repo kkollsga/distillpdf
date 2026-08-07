@@ -27,7 +27,8 @@
 //! - Colour-space indirection is bounded by [`MAX_CS_DEPTH`], so a cyclic `/ColorSpace`
 //!   chain terminates.
 
-use crate::pdfobj::{content_bytes, deref, filters_of, is_generic_filter, sub_dict};
+use crate::access::{read_resolved, DocumentAccess};
+use crate::pdfobj::{content_bytes, deref, filters_of, is_generic_filter};
 use lopdf::{Dictionary, Document, Object};
 use std::borrow::Cow;
 
@@ -86,19 +87,60 @@ pub(crate) const MAX_CS_DEPTH: u32 = 8;
 ///   * per PDF 32000-1 §8.6.3 an image may name a space *defined in the resource
 ///     dictionary's `/ColorSpace` sub-dictionary* (`/ColorSpace /CS0`) rather than a
 ///     device space, so the name has to be looked up in `res` before it means anything.
-pub(crate) fn resolve_cs<'a>(doc: &'a Document, res: &'a Dictionary, o: &'a Object, depth: u32) -> Option<&'a Object> {
+pub(crate) fn read_color_space<R>(
+    access: &dyn DocumentAccess,
+    resources: &Dictionary,
+    object: &Object,
+    depth: u32,
+    mut inspect: impl FnMut(&Object) -> R,
+) -> Option<R> {
+    read_color_space_inner(access, resources, object, depth, &mut inspect)
+}
+
+fn read_color_space_inner<R>(
+    access: &dyn DocumentAccess,
+    resources: &Dictionary,
+    object: &Object,
+    depth: u32,
+    inspect: &mut impl FnMut(&Object) -> R,
+) -> Option<R> {
     if depth > MAX_CS_DEPTH {
         return None;
     }
-    match o {
-        Object::Reference(r) => resolve_cs(doc, res, doc.get_object(*r).ok()?, depth + 1),
+    match object {
+        Object::Reference(_) => read_resolved(access, object, |resolved| {
+            read_color_space_inner(access, resources, resolved, depth + 1, inspect)
+        })
+        .ok()
+        .flatten(),
         Object::Name(n) if !is_builtin_cs_name(n) => {
-            match sub_dict(doc, res, b"ColorSpace").and_then(|d| d.get(n.as_slice()).ok()) {
-                Some(v) => resolve_cs(doc, res, v, depth + 1),
-                None => Some(o), // no such resource: report the name verbatim, honestly
+            let Ok(color_spaces) = resources.get(b"ColorSpace") else {
+                return Some(inspect(object));
+            };
+            enum Lookup<R> {
+                Missing,
+                Found(Option<R>),
+            }
+            match read_resolved(access, color_spaces, |resolved| {
+                let Ok(dictionary) = resolved.as_dict() else {
+                    return Lookup::Missing;
+                };
+                let Ok(value) = dictionary.get(n.as_slice()) else {
+                    return Lookup::Missing;
+                };
+                Lookup::Found(read_color_space_inner(
+                    access,
+                    resources,
+                    value,
+                    depth + 1,
+                    inspect,
+                ))
+            }) {
+                Ok(Lookup::Found(value)) => value,
+                _ => Some(inspect(object)), // no such resource: report the name verbatim, honestly
             }
         }
-        other => Some(other),
+        other => Some(inspect(other)),
     }
 }
 
@@ -124,15 +166,19 @@ fn canonical_cs_name(n: &[u8]) -> String {
 /// The image's colour-space **family** name (`DeviceRGB`, `ICCBased`, `Indexed`, …),
 /// after [`resolve_cs`]. The family is what pymupdf reports too; the component count an
 /// `ICCBased`/`Indexed` space implies is what [`cs_model`] derives for PNG assembly.
-pub(crate) fn image_color_space(doc: &Document, res: &Dictionary, dict: &Dictionary) -> Option<String> {
-    match resolve_cs(doc, res, dict.get(b"ColorSpace").ok()?, 0)? {
+pub(crate) fn image_color_space(
+    doc: &Document,
+    access: &dyn DocumentAccess,
+    res: &Dictionary,
+    dict: &Dictionary,
+) -> Option<String> {
+    read_color_space(access, res, dict.get(b"ColorSpace").ok()?, 0, |resolved| match resolved {
         Object::Name(n) => Some(canonical_cs_name(n)),
-        Object::Array(a) => {
-            let head = deref(doc, a.first()?)?.as_name().ok()?;
-            Some(canonical_cs_name(head))
-        }
+        Object::Array(a) => deref(doc, a.first()?)
+            .and_then(|head| head.as_name().ok())
+            .map(canonical_cs_name),
         _ => None,
-    }
+    })?
 }
 
 /// A colour space reduced to what PNG assembly needs: how many samples make a pixel and
@@ -237,7 +283,7 @@ pub(crate) fn cs_model(
     if depth > MAX_CS_DEPTH {
         return None;
     }
-    match resolve_cs(doc, res, o, 0)? {
+    read_color_space(access, res, o, 0, |resolved| match resolved {
         Object::Name(n) => match n.as_slice() {
             b"DeviceGray" | b"G" | b"CalGray" => Some(Cs::Gray),
             b"DeviceRGB" | b"RGB" | b"CalRGB" => Some(Cs::Rgb),
@@ -290,7 +336,7 @@ pub(crate) fn cs_model(
             _ => None, // Lab / Pattern: not reducible to RGB here
         },
         _ => None,
-    }
+    })?
 }
 
 /// Per-dimension and total-pixel ceilings: a malformed or hostile stream can declare an
@@ -755,6 +801,14 @@ mod tests {
         super::assemble_png(doc, &test_adapter(doc), resources, stream)
     }
 
+    fn image_color_space(doc: &Document, resources: &Dictionary, dict: &Dictionary) -> Option<String> {
+        super::image_color_space(doc, &test_adapter(doc), resources, dict)
+    }
+
+    fn resolve_cs(doc: &Document, resources: &Dictionary, object: &Object, depth: u32) -> Option<Object> {
+        super::read_color_space(&test_adapter(doc), resources, object, depth, Clone::clone)
+    }
+
     fn stream(filters: &[&str], content: Vec<u8>) -> Stream {
         let mut d = Dictionary::new();
         if filters.len() == 1 {
@@ -925,7 +979,7 @@ mod tests {
         let a = Object::Name(b"A".to_vec());
         assert_eq!(resolve_cs(&doc, &loopy, &a, 0), None);
         // A name nothing defines is reported honestly rather than guessed at.
-        assert_eq!(resolve_cs(&doc, &Dictionary::new(), &a, 0), Some(&a));
+        assert_eq!(resolve_cs(&doc, &Dictionary::new(), &a, 0), Some(a));
     }
 
     #[test]

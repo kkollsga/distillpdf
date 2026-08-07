@@ -435,7 +435,7 @@ fn extract_images_inner(
                         index,
                         width,
                         height,
-                        color_space: image_color_space(doc, &res, dict),
+                        color_space: image_color_space(doc, access, &res, dict),
                         bits_per_component: image_bpc(doc, dict),
                         format,
                         data,

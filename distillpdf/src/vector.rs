@@ -82,15 +82,15 @@ fn parse_cs(
     }
     // `resolve_cs` follows the reference AND the `/Resources`-`/ColorSpace` name lookup that
     // makes `/CS0` mean anything (`raster.rs` owns that reader; there is one copy of it).
-    let resolved = crate::raster::resolve_cs(doc, res, o, 0)?;
-    if let Object::Name(n) = resolved {
-        if n.as_slice() == b"Pattern" {
-            return Some(PaintCs::Pattern);
+    crate::raster::read_color_space(access, res, o, 0, |resolved| {
+        if let Object::Name(n) = resolved {
+            if n.as_slice() == b"Pattern" {
+                return Some(PaintCs::Pattern);
+            }
         }
-    }
-    if let Object::Array(a) = resolved {
-        let head = deref(doc, a.first()?)?.as_name().ok()?;
-        match head {
+        if let Object::Array(a) = resolved {
+            let head = deref(doc, a.first()?).and_then(|value| value.as_name().ok())?;
+            match head {
             b"Separation" | b"DeviceN" => {
                 // `/Separation` is one colorant by definition; `/DeviceN`'s count is the
                 // length of its names array (§8.6.6.4/§8.6.6.5).
@@ -117,9 +117,10 @@ fn parse_cs(
             }
             b"Pattern" => return Some(PaintCs::Pattern),
             _ => {}
+            }
         }
-    }
-    crate::raster::cs_model(doc, access, res, o, depth).map(|_| PaintCs::Device)
+        crate::raster::cs_model(doc, access, res, o, depth).map(|_| PaintCs::Device)
+    })?
 }
 
 /// The colour spaces one resource dictionary defines, by name — the `/ColorSpace` half of
