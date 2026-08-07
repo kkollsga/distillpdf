@@ -518,7 +518,7 @@ impl PdfDocument {
 
     /// Extract images from all pages.
     pub fn extract_images(&self) -> Vec<ImageInfo> {
-        extract::extract_images(&self.doc, self.access.as_ref())
+        extract::extract_images(self.access.as_ref())
     }
 
     /// Extract per-page font info.
@@ -528,7 +528,7 @@ impl PdfDocument {
 
     /// Extract tables from all pages.
     pub fn extract_tables(&self) -> Vec<TableInfo> {
-        extract::extract_tables(&self.doc, self.access.as_ref(), &self.raw)
+        extract::extract_tables(self.access.as_ref(), &self.raw)
     }
 
     /// Extract hyperlinks from all pages.
@@ -538,12 +538,12 @@ impl PdfDocument {
 
     /// Render the document to HTML.
     pub fn render(&self, mode: html::Mode, images: bool, toc: bool) -> String {
-        html::to_html(&self.doc, self.access.as_ref(), &self.raw, mode, images, toc)
+        html::to_html(self.access.as_ref(), &self.raw, mode, images, toc)
     }
 
     /// The detected-heading outline: `(level, title, page, anchor_id)` in reading order.
     pub fn toc(&self, mode: html::Mode) -> Vec<(u8, String, u32, String)> {
-        nav::toc(&html::to_html(&self.doc, self.access.as_ref(), &self.raw, mode, false, true))
+        nav::toc(&html::to_html(self.access.as_ref(), &self.raw, mode, false, true))
     }
 
     /// The PDF's OWN `/Outlines` bookmarks as `(level, title, page, anchor)`.
@@ -556,19 +556,19 @@ impl PdfDocument {
 
     /// HTML of a single section resolved by `name`.
     pub fn section(&self, mode: html::Mode, name: &str, images: bool) -> Option<String> {
-        nav::section(&html::to_html(&self.doc, self.access.as_ref(), &self.raw, mode, images, true), name)
+        nav::section(&html::to_html(self.access.as_ref(), &self.raw, mode, images, true), name)
     }
 
     /// Structured front-matter of an academic paper (page 1).
     pub fn front_matter(&self) -> frontmatter::FrontMatter {
-        frontmatter::extract_front_matter(&self.doc, self.access.as_ref(), &self.raw)
+        frontmatter::extract_front_matter(self.access.as_ref(), &self.raw)
     }
 
     /// OCR plan: per page, whether OCR is needed and (if so) the page raster bytes.
     pub fn ocr_plan(&self) -> Vec<OcrPlanEntry> {
         let mut out = Vec::new();
         for (&pno, &page_id) in &self.doc.get_pages() {
-            let decision = ocr::detect::decide(&self.doc, self.access.as_ref(), page_id, &self.raw);
+            let decision = ocr::detect::decide(self.access.as_ref(), page_id, &self.raw);
             let needs = !matches!(decision, ocr::detect::OcrDecision::NotNeeded);
             let (w, h) = ocr::page_size_pts(self.access.as_ref(), page_id);
             let image = if needs {
@@ -689,7 +689,6 @@ impl PdfDocument {
             .unwrap_or_else(|| "document.pdf".to_string());
         let generated_at = iso8601_now();
         let (model, asset_bytes) = model::build::build_model(
-            &self.doc,
             self.access.as_ref(),
             &self.raw,
             &file,

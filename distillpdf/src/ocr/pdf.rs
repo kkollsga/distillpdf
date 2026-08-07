@@ -670,7 +670,6 @@ mod tests {
         let bytes = write_pdf(&[page_from(dt)]).unwrap();
         let doc = Document::load_mem(&bytes).unwrap();
         let h_b = crate::html::to_html(
-            &doc,
             &crate::access::test_adapter(&doc),
             &bytes,
             crate::html::Mode::Page,

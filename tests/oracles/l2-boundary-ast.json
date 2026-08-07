@@ -92,14 +92,7 @@
     "clone-call|9c0ffb2c04c1984cd04a01bdc398d94c182ad044689c6a11d95faf1582835d5f|headers . clone ()",
     "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
     "clone-call|c08285b199d650a1b5018845452a9b162a62889824e2a0a292186c8457695a4c|s . text . clone ()",
-    "clone-call|fb3e906394d5adec2ad8604b89eb513794ddf848b726325a304c321ac8d6dad9|cell . 0 . clone ()",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "direct-backend-method|dd6ce4098685d3fac6d61782032203c250ba8af906122ddeac0fa32f2f4e904f|doc . get_pages ()",
-    "direct-backend-method|dd6ce4098685d3fac6d61782032203c250ba8af906122ddeac0fa32f2f4e904f|doc . get_pages ()"
+    "clone-call|fb3e906394d5adec2ad8604b89eb513794ddf848b726325a304c321ac8d6dad9|cell . 0 . clone ()"
   ],
   "frontmatter.rs": [
     "clone-call|107137afd2527f3ac8a73238de835166a62f34992148072fc4cbb3d6f358bd5e|order . iter () . cloned ()",
@@ -112,9 +105,7 @@
     "clone-call|9e610813dd4553e3ef3bea793936748f206189c3dcabf0825785654a925ce45c|markers . clone ()",
     "clone-call|bbaa97656cf009044486447f1d10980576261656b9e9d9f453f2cedbe874bd34|o . clone ()",
     "clone-call|bbaa97656cf009044486447f1d10980576261656b9e9d9f453f2cedbe874bd34|o . clone ()",
-    "clone-call|be30c647a53501cfb36958e68cba6500facd5dd62262277f84f93d427659fd5b|tt . clone ()",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "direct-backend-method|dd6ce4098685d3fac6d61782032203c250ba8af906122ddeac0fa32f2f4e904f|doc . get_pages ()"
+    "clone-call|be30c647a53501cfb36958e68cba6500facd5dd62262277f84f93d427659fd5b|tt . clone ()"
   ],
   "function.rs": [
     "clone-call|e1ba3773e06a39fa620380239022a60f66627ebfae09a7feb60d4ef966cee3ca|funcs [0] . domain . clone ()"
@@ -158,11 +149,7 @@
     "clone-call|e076b6496dd6f68fc52868dc0d263d5d1f24ad52501dd657296451bfae13b109|l . href . clone ()",
     "clone-call|e105933b33981f5352b23e6a69800e3cd097d89f9ce61a458f5301cfa2ca38ef|uris . iter () . cloned ()",
     "clone-call|e96849971de7e0afcacfe9eec3e6f0d181ab6c2e87a35b6183f4769357e0ddbd|meta . 1 . clone ()",
-    "clone-call|fb618d790b688eb2ef9cd31bf3b641989c417ec844fb1a7149d8a219d0f52d61|n . clone ()",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "direct-backend-method|dd6ce4098685d3fac6d61782032203c250ba8af906122ddeac0fa32f2f4e904f|doc . get_pages ()"
+    "clone-call|fb618d790b688eb2ef9cd31bf3b641989c417ec844fb1a7149d8a219d0f52d61|n . clone ()"
   ],
   "img.rs": [
     "clone-call|46f4d22f2b043729c34028059be55db2b583e23e42b84987edb5eac7db1d134d|Rc :: clone (res)",
@@ -235,11 +222,7 @@
     "clone-call|f2d4dc0f1239e47600638a7382bba13c5c999491832e575bf4904a8bd2a936f8|label . clone ()",
     "clone-call|fb33199d3996bfa8b0206ff706ffcc8b2239697c21642a81eb049f7dd5b97d5f|it . clone ()",
     "clone-call|fb618d790b688eb2ef9cd31bf3b641989c417ec844fb1a7149d8a219d0f52d61|n . clone ()",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "direct-backend-method|04e7f46dfaa5cbfe77b5455425f6ba51c78c0b0549b5451ed52a03aeda09ca9b|access . catalog ()",
-    "direct-backend-method|dd6ce4098685d3fac6d61782032203c250ba8af906122ddeac0fa32f2f4e904f|doc . get_pages ()"
+    "direct-backend-method|04e7f46dfaa5cbfe77b5455425f6ba51c78c0b0549b5451ed52a03aeda09ca9b|access . catalog ()"
   ],
   "model/mod.rs": [
     "clone-call|2c8a89e629d146cfa56130d49a2598d1a30a1f64b0ad95b749d5ebabd2ce8000|s . clone ()",
@@ -277,12 +260,6 @@
     "clone-call|e2da444bb3b692a507b5d057005e2aa14c6138b04ea098ecd5a743d313b82de6|e . title . clone ()",
     "clone-call|ece0c0c3db32bf573e1eb38c03df58d07698e03a9fa28672a3b38b481cb882ef|base . clone ()",
     "clone-call|ece0c0c3db32bf573e1eb38c03df58d07698e03a9fa28672a3b38b481cb882ef|base . clone ()"
-  ],
-  "ocr/detect.rs": [
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "direct-backend-field|0734cfb74bd1f1186928639dfa0d9f0aef3065af8d4441e57322ab0a9f3bf4c8|doc . trailer",
-    "direct-backend-method|8a92211c57687fe572f2113de238cf4d9539ab8ffd1fc4b602703b9c08d13cdc|doc . get_object (* id)"
   ],
   "ocr/doctags.rs": [
     "clone-call|1b328262b779300ca6b82ac4de0be39372984529ad9b979980367c9268878af6|name . clone ()",

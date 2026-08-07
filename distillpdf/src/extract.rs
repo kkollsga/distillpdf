@@ -7,7 +7,9 @@ use crate::pdfobj::filters_of;
 use crate::raster::{assemble_png, codec_payload, filter_to_format, image_bpc, image_color_space, normalized_jpeg_png};
 use crate::text::{self, Span};
 use crate::{access::DictionaryHandle, walker::ResourceScope};
-use lopdf::{Dictionary, Document, ObjectId};
+use lopdf::{Dictionary, ObjectId};
+#[cfg(test)]
+use lopdf::Document;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
@@ -175,7 +177,6 @@ fn resource_bfs(
 /// legitimately huge document. It composes `walker`'s descent pieces rather than calling
 /// `walker::descend_form`, which is the budgeted composition.
 fn walk_drawn(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     ops: &[lopdf::content::Operation],
     xmap: &crate::walker::XMap,
@@ -214,7 +215,7 @@ fn walk_drawn(
                 continue;
             };
             if let Some(ops) = stream.read(crate::walker::form_ops).flatten() {
-                walk_drawn(doc, access, &ops, &scope.xobjects, depth + 1, seen, out);
+                walk_drawn(access, &ops, &scope.xobjects, depth + 1, seen, out);
             }
         }
     }
@@ -238,7 +239,6 @@ fn walk_drawn(
 /// `None` when the page's content stream can't be read or parsed at all — the caller then
 /// falls back to plain reachability rather than silently reporting an image-less page.
 fn drawn_images(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     page_id: ObjectId,
 ) -> Option<HashSet<ObjectId>> {
@@ -255,7 +255,7 @@ fn drawn_images(
     let ops = lopdf::content::Content::decode(&content).ok()?;
     let mut out = HashSet::new();
     let mut seen = HashSet::new();
-    walk_drawn(doc, access, &ops.operations, &xmap, 0, &mut seen, &mut out);
+    walk_drawn(access, &ops.operations, &xmap, 0, &mut seen, &mut out);
     for (id, ap) in crate::walker::appearance_streams(access, page_id) {
         if !seen.insert(id) {
             continue; // shared between annotations, or already reached from the content
@@ -269,7 +269,7 @@ fn drawn_images(
             continue;
         };
         if let Some(ops) = ap.read(crate::walker::form_ops).flatten() {
-            walk_drawn(doc, access, &ops, &scope.xobjects, 1, &mut seen, &mut out);
+            walk_drawn(access, &ops, &scope.xobjects, 1, &mut seen, &mut out);
         }
     }
     Some(out)
@@ -348,22 +348,21 @@ fn image_filters(dict: &Dictionary) -> Vec<String> {
 /// `format:"raw"` — and those now carry `color_space` and `bits_per_component`, which is
 /// what a caller needs to reassemble them by hand.
 pub fn extract_images(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
 ) -> Vec<ImageInfo> {
-    extract_images_inner(doc, access, true)
+    extract_images_inner(access, true)
 }
 
 /// The body of [`extract_images`], with the resource-tree short-circuit switchable so a test
 /// can assert the two paths agree ([`tests::the_short_circuit_reports_exactly_what_the_full_walk_reports`]).
 /// Production always passes `true`; `false` is the full-walk oracle.
 fn extract_images_inner(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     short_circuit: bool,
 ) -> Vec<ImageInfo> {
     let mut out = Vec::new();
-    for (&pno, &page_id) in &doc.get_pages() {
+    for page in access.pages().unwrap_or_default() {
+        let (pno, page_id) = (page.number, page.id);
         // The page's own resource tree first, so every `(page, index)` a page already
         // reported keeps it; the annotation appearances are appended after.
         let mut dicts = page_resource_dicts(access, page_id);
@@ -379,7 +378,7 @@ fn extract_images_inner(
             continue;
         }
         let mut index = 0usize;
-        let drawn = drawn_images(doc, access, page_id);
+        let drawn = drawn_images(access, page_id);
         // Dedup is across resource dictionaries only: an image the page's own /XObject
         // already listed is not re-reported when a nested form points at it too. Repeats
         // *within* one dictionary are kept, so the `index` a directly-referenced image had
@@ -2492,14 +2491,14 @@ fn detect_tables(spans: Vec<Span>, rules: &crate::vector::PageRules) -> Vec<Vec<
 /// completion order decides nothing — which makes the output byte-identical to the sequential
 /// loop, including each page's internal table order.
 pub fn extract_tables(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     raw: &[u8],
 ) -> Vec<TableInfo> {
-    let pages = doc.get_pages();
+    let pages = access.pages().unwrap_or_default();
     let mut per_page: Vec<(u32, Vec<Vec<Vec<String>>>)> = pages
         .par_iter()
-        .map(|(&pno, &page_id)| {
+        .map(|page| {
+            let (pno, page_id) = (page.number, page.id);
             let rules = crate::vector::page_rules(access, page_id);
             (pno, detect_tables(text::extract_spans(access, page_id, raw), &rules))
         })
@@ -3148,7 +3147,7 @@ mod tests {
                 with_tables += 1;
             }
             for run in 0..5 {
-                let got: Vec<(u32, Vec<Vec<String>>)> = extract_tables(&doc, &test_adapter(&doc), &raw).into_iter().map(|t| (t.page, t.cells)).collect();
+                let got: Vec<(u32, Vec<Vec<String>>)> = extract_tables(&test_adapter(&doc), &raw).into_iter().map(|t| (t.page, t.cells)).collect();
                 assert_eq!(got, want, "run {run} of {} disagrees with the sequential scan", path.display());
             }
         }
@@ -3168,8 +3167,8 @@ mod tests {
         let mut with_images = 0usize;
         for p in &paths {
             let Ok(doc) = Document::load(p) else { continue }; // encrypted / deliberately damaged
-            let short = extract_images_inner(&doc, &test_adapter(&doc), true);
-            let full = extract_images_inner(&doc, &test_adapter(&doc), false);
+            let short = extract_images_inner(&test_adapter(&doc), true);
+            let full = extract_images_inner(&test_adapter(&doc), false);
             assert_eq!(image_rows(&short), image_rows(&full), "short-circuit changed the rows of {}", p.display());
             if !short.is_empty() {
                 with_images += 1;
@@ -3184,7 +3183,7 @@ mod tests {
         // /Resources. lopdf's get_page_images() stops at the page, so this returned
         // nothing — 13 of 54 corpus documents reported no images at all.
         let doc = form_image_doc();
-        let rows = extract_images(&doc, &test_adapter(&doc));
+        let rows = extract_images(&test_adapter(&doc));
         let page1: Vec<&ImageInfo> = rows.iter().filter(|i| i.page == 1).collect();
         assert_eq!(page1.len(), 1, "exactly one form-nested image on page 1");
         assert_eq!((page1[0].width, page1[0].height), (240, 160));
@@ -3198,7 +3197,7 @@ mod tests {
         // The ordering contract: recursing must not renumber images that were already
         // reported. Page 2 draws one raster directly and a second inside a form.
         let doc = form_image_doc();
-        let rows = extract_images(&doc, &test_adapter(&doc));
+        let rows = extract_images(&test_adapter(&doc));
         let page2: Vec<&ImageInfo> = rows.iter().filter(|i| i.page == 2).collect();
         assert_eq!(page2.len(), 2);
         assert_eq!((page2[0].index, page2[0].width, page2[0].height), (0, 120, 90), "direct image keeps index 0");
@@ -3281,7 +3280,7 @@ mod tests {
         assert_eq!(dicts.len(), 3, "page + the two form resource dicts, each once");
 
         // …and the image inside the cyclic form is still reported, exactly once.
-        let rows = extract_images(&doc, &test_adapter(&doc));
+        let rows = extract_images(&test_adapter(&doc));
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].page, rows[0].index, rows[0].width, rows[0].height), (1, 0, 7, 5));
     }
@@ -3294,7 +3293,7 @@ mod tests {
         // A page's images are the ones its content stream paints.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/undrawn_image.pdf");
         let doc = Document::load(path).expect("undrawn_image.pdf fixture must load");
-        let rows = extract_images(&doc, &test_adapter(&doc));
+        let rows = extract_images(&test_adapter(&doc));
         let dims: Vec<(u32, usize, i64, i64)> = rows.iter().map(|i| (i.page, i.index, i.width, i.height)).collect();
         // page 1 paints /ImDrawn (40x30) only; page 2 paints only the form, whose content
         // paints /ImInForm (42x32). /ImNever (41x31) and /ImFormNever (43x33) are listed
@@ -3331,14 +3330,14 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/annot_appearance.pdf");
         let doc = Document::load(path).expect("annot_appearance.pdf fixture must load");
         let dims: Vec<(u32, usize, i64, i64)> =
-            extract_images(&doc, &test_adapter(&doc)).iter().map(|i| (i.page, i.index, i.width, i.height)).collect();
+            extract_images(&test_adapter(&doc)).iter().map(|i| (i.page, i.index, i.width, i.height)).collect();
         assert_eq!(
             dims,
             vec![(1, 0, 40, 30), (1, 1, 10, 10), (1, 2, 12, 12), (1, 3, 15, 15), (1, 4, 16, 16)],
             "the page's own image keeps index 0; the appearances are appended after it"
         );
         // What must NOT be there, and why each would be a different bug:
-        let sizes: Vec<i64> = extract_images(&doc, &test_adapter(&doc)).iter().map(|i| i.width).collect();
+        let sizes: Vec<i64> = extract_images(&test_adapter(&doc)).iter().map(|i| i.width).collect();
         assert!(!sizes.contains(&11), "11x11 sits in the appearance's /Resources but is never drawn");
         assert!(!sizes.contains(&13), "13x13 is the appearance state /AS did NOT select");
         assert!(!sizes.contains(&14), "14x14 belongs to a HIDDEN (/F bit 2) annotation");
@@ -3385,7 +3384,7 @@ mod tests {
         // an ICC profile whose /N is the only component count, a palette, or a name that
         // only means something in the resource dictionary's /ColorSpace sub-dictionary.
         let doc = colorspace_doc();
-        let rows = extract_images(&doc, &test_adapter(&doc));
+        let rows = extract_images(&test_adapter(&doc));
         let seen: Vec<(usize, Option<&str>, Option<i64>, &str)> = rows
             .iter()
             .map(|i| (i.index, i.color_space.as_deref(), i.bits_per_component, i.format))
@@ -3406,7 +3405,7 @@ mod tests {
         // The bytes used to be the compressed samples with no container — nothing opened
         // them. Each assembled PNG must carry the authored pixels back.
         let doc = colorspace_doc();
-        let rows = extract_images(&doc, &test_adapter(&doc));
+        let rows = extract_images(&test_adapter(&doc));
 
         // 4x2 @ 4bpc through a 4-entry palette: row 0 is red/green/blue/white, row 1 the
         // reverse — sub-byte unpacking AND the palette lookup, in one image.
@@ -3439,7 +3438,7 @@ mod tests {
         // — lopdf errors on `decompressed_content()` there, which must not lose the row.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/undrawn_image.pdf");
         let doc = Document::load(path).expect("undrawn_image.pdf fixture must load");
-        for r in extract_images(&doc, &test_adapter(&doc)) {
+        for r in extract_images(&test_adapter(&doc)) {
             assert_eq!(r.format, "png", "unfiltered DeviceRGB samples must assemble");
             assert_eq!(r.color_space.as_deref(), Some("DeviceRGB"));
             assert_eq!(r.bits_per_component, Some(8));
@@ -3456,7 +3455,7 @@ mod tests {
         // white band came out black. K is 0 in all three bands, so RGB is just 255 - ink.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/cmyk_jpeg.pdf");
         let doc = Document::load(path).expect("cmyk_jpeg.pdf fixture must load");
-        let rows = extract_images(&doc, &test_adapter(&doc));
+        let rows = extract_images(&test_adapter(&doc));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].color_space.as_deref(), Some("DeviceCMYK"));
         assert_eq!(rows[0].format, "png", "a CMYK JPEG is normalized, not passed through");
@@ -3497,7 +3496,7 @@ mod tests {
         let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
         doc.trailer.set("Root", catalog_id);
 
-        let rows = extract_images(&doc, &test_adapter(&doc));
+        let rows = extract_images(&test_adapter(&doc));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].format, "raw");
         assert_eq!(rows[0].color_space.as_deref(), Some("DeviceRGB"));

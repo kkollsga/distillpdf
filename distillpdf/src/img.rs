@@ -1379,10 +1379,10 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/image_order.pdf");
         let doc = Document::load(path).expect("image_order.pdf fixture must load");
         let raw = std::fs::read(path).expect("fixture readable");
-        let first = crate::html::to_html(&doc, &test_adapter(&doc), &raw, crate::html::Mode::Page, true, true);
+        let first = crate::html::to_html(&test_adapter(&doc), &raw, crate::html::Mode::Page, true, true);
         assert_eq!(first.matches("<img").count(), 6, "the fixture must place six separate rasters");
         for i in 1..25 {
-            let again = crate::html::to_html(&doc, &test_adapter(&doc), &raw, crate::html::Mode::Page, true, true);
+            let again = crate::html::to_html(&test_adapter(&doc), &raw, crate::html::Mode::Page, true, true);
             assert!(
                 again == first,
                 "render {i} differs from render 0 ({} vs {} bytes) — to_html is not deterministic",
@@ -1624,7 +1624,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/smask_panel.pdf");
         let doc = Document::load(path).expect("smask_panel.pdf fixture must load");
         let raw = std::fs::read(path).expect("fixture readable");
-        let html = crate::html::to_html(&doc, &test_adapter(&doc), &raw, crate::html::Mode::Page, true, true);
+        let html = crate::html::to_html(&test_adapter(&doc), &raw, crate::html::Mode::Page, true, true);
         let href = html
             .split("<image href=\"")
             .nth(1)
@@ -1767,7 +1767,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/clipped_raster.pdf");
         let doc = Document::load(path).expect("clipped_raster.pdf fixture must load");
         let raw = std::fs::read(path).expect("fixture readable");
-        let html = crate::html::to_html(&doc, &test_adapter(&doc), &raw, crate::html::Mode::Page, true, true);
+        let html = crate::html::to_html(&test_adapter(&doc), &raw, crate::html::Mode::Page, true, true);
         assert_eq!(html.matches("<image ").count(), 3, "all three figures composite their raster");
         // Only the rotated one needs a mask; the axis-aligned crop is in the samples.
         assert_eq!(html.matches("clip-path=").count(), 1, "exactly one mask");

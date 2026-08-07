@@ -27,7 +27,6 @@ pub struct Author {
 use crate::html::{esc, initials_count, looks_like_reference, numbered_level, roman_section, FOOTNOTE_MARKERS};
 use crate::layout::{lines_of, Line};
 use crate::text;
-use lopdf::Document;
 use std::collections::HashSet;
 
 /// Split an affiliation line `"1Institut …"` / `"* University …"` into its marker key
@@ -573,12 +572,11 @@ pub(crate) fn emit_document_title(lines: &mut Vec<Line>, body: f32, out: &mut Ve
 /// Extract the front-matter (title/authors/abstract/keywords) of `doc` from page 1.
 /// Standalone path for `pdf.metadata()` — does not run the full HTML pipeline.
 pub(crate) fn extract_front_matter(
-    doc: &Document,
     access: &dyn crate::access::DocumentAccess,
     raw: &[u8],
 ) -> FrontMatter {
-    let first = match doc.get_pages().into_iter().min_by_key(|(n, _)| *n) {
-        Some((_, id)) => id,
+    let first = match access.pages().unwrap_or_default().into_iter().min_by_key(|page| page.number) {
+        Some(page) => page.id,
         None => return FrontMatter::default(),
     };
     let spans = text::extract_spans(access, first, raw);

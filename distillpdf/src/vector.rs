@@ -2205,7 +2205,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/codec_basemap.pdf");
         let doc = lopdf::Document::load(path).expect("codec_basemap.pdf fixture must load");
         let raw = std::fs::read(path).expect("fixture readable");
-        let html = crate::html::to_html(&doc, &test_adapter(&doc), &raw, crate::html::Mode::Page, true, true);
+        let html = crate::html::to_html(&test_adapter(&doc), &raw, crate::html::Mode::Page, true, true);
         let svgs: Vec<&str> = html.match_indices("<svg").map(|(i, _)| &html[i..html[i..].find("</svg>").map(|e| i + e).unwrap_or(html.len())]).collect();
         assert_eq!(svgs.len(), 2, "one composited figure per page");
         assert_eq!(svgs[0].matches("<path").count(), 8, "page 1 keeps every stroke of its ink");
@@ -2871,7 +2871,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/panel_table.pdf");
         let doc = Document::load(path).expect("panel_table.pdf fixture must load");
         let raw = std::fs::read(path).expect("fixture readable");
-        let html = crate::html::to_html(&doc, &test_adapter(&doc), &raw, crate::html::Mode::Page, true, true);
+        let html = crate::html::to_html(&test_adapter(&doc), &raw, crate::html::Mode::Page, true, true);
         assert_eq!(html.matches("<table").count(), 1, "the ruled grid is still a table");
         assert_eq!(html.matches("<svg").count(), 1, "the panel is still a figure");
         for cell in ["Constituent", "Arsenic", "Federal MCL", "10 ppb", "Boron", "Federal HAL", "Radon-222", "Proposed MCL", "4,000 pCi"] {
