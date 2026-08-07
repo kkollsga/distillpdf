@@ -1103,12 +1103,11 @@ fn build_doc_profile(page_spans: &[(u32, ObjectId, Vec<Span>)], body: f32, title
 /// assigned (so `#sec-…` links and `section()` keep working), only the visible TOC drops.
 pub fn to_html(
     access: &dyn crate::access::DocumentAccess,
-    raw: &[u8],
     mode: Mode,
     inline_images: bool,
     include_toc: bool,
 ) -> String {
-    let (body, img_uris, outline) = render_doc(access, raw, mode, inline_images);
+    let (body, img_uris, outline) = render_doc(access, mode, inline_images);
     assemble(body, mode, include_toc, &outline, &img_uris, inline_images)
 }
 
@@ -1125,7 +1124,6 @@ pub(crate) type PageIR = (u32, Vec<PageElement>, Vec<String>);
 /// from the emit is what lets HTML and the model derive from one materialized structure.
 pub(crate) fn render_doc_elements(
     access: &dyn crate::access::DocumentAccess,
-    raw: &[u8],
     mode: Mode,
     inline_images: bool,
 ) -> (Vec<PageIR>, Vec<links::OutlineEntry>) {
@@ -1147,7 +1145,13 @@ pub(crate) fn render_doc_elements(
     let t = std::time::Instant::now();
     let mut page_spans: Vec<(u32, ObjectId, Vec<Span>)> = pages
         .par_iter()
-        .map(|page| (page.number, page.id, text::extract_spans(access, page.id, raw)))
+        .map(|page| {
+            (
+                page.number,
+                page.id,
+                text::extract_spans(access, page.id).unwrap_or_default(),
+            )
+        })
         .collect();
     page_spans.sort_by_key(|(pno, _, _)| *pno);
     phase("01_spans", t);
@@ -2386,11 +2390,10 @@ pub(crate) fn emit_and_merge(pages_els: &[PageIR], mode: Mode) -> (String, Vec<S
 /// HTML), kept so [`to_html`] and the legacy callers have one entry point.
 pub(crate) fn render_doc(
     access: &dyn crate::access::DocumentAccess,
-    raw: &[u8],
     mode: Mode,
     inline_images: bool,
 ) -> (String, Vec<String>, Vec<links::OutlineEntry>) {
-    let (pages_els, outline) = render_doc_elements(access, raw, mode, inline_images);
+    let (pages_els, outline) = render_doc_elements(access, mode, inline_images);
     let (body, img_uris) = emit_and_merge(&pages_els, mode);
     (body, img_uris, outline)
 }
@@ -2503,7 +2506,6 @@ pub(crate) fn clone_span(s: &Span) -> Span {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access::test_adapter;
 
     fn line(text: &str, y: f32) -> Line {
         Line {
@@ -2602,7 +2604,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/rotated_body.pdf");
         let raw = std::fs::read(path).expect("rotated_body.pdf fixture must exist");
         let doc = Document::load(path).expect("rotated_body.pdf fixture must load");
-        let html = to_html(&test_adapter(&doc), &raw, Mode::Page, false, false);
+        let html = to_html(&crate::access::test_adapter_with_source(&doc, &raw), Mode::Page, false, false);
         let pages: Vec<&str> = html.split("<section data-page=").skip(1).collect();
         assert_eq!(pages.len(), 4, "fixture has one page per rotation");
         let want = [

@@ -670,8 +670,7 @@ mod tests {
         let bytes = write_pdf(&[page_from(dt)]).unwrap();
         let doc = Document::load_mem(&bytes).unwrap();
         let h_b = crate::html::to_html(
-            &crate::access::test_adapter(&doc),
-            &bytes,
+            &crate::access::test_adapter_with_source(&doc, &bytes),
             crate::html::Mode::Page,
             false,
             false,
@@ -693,9 +692,8 @@ mod tests {
         let doc = Document::load_mem(&bytes).unwrap();
         let page_id = *doc.get_pages().values().next().unwrap();
         let got = crate::text::extract_page(
-            &crate::access::test_adapter(&doc),
+            &crate::access::test_adapter_with_source(&doc, &bytes),
             page_id,
-            &bytes,
         )
         .unwrap_or_default();
         let norm = crate::textutil::normalize_ws;

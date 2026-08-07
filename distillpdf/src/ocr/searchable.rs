@@ -10,12 +10,15 @@ use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
 use std::collections::HashMap;
 
 pub(crate) fn build(
-    raw: &[u8],
     access: &dyn DocumentAccess,
     results: &HashMap<u32, String>,
     remove_raster: bool,
 ) -> Result<Vec<u8>, String> {
-    let mut document = crate::doc::load_mem_deterministic(raw).map_err(|error| error.to_string())?;
+    let source_length = access.source_len().map_err(|error| error.to_string())?;
+    let raw = access
+        .materialize_source_bounded(source_length)
+        .map_err(|error| error.to_string())?;
+    let mut document = crate::doc::load_mem_deterministic(&raw).map_err(|error| error.to_string())?;
     let (helv, helv_b) = ocr::pdf::add_fonts(&mut document);
     let pages = document.get_pages();
     for (&page_number, &page_id) in &pages {

@@ -635,17 +635,11 @@ mod tests {
         assert!(whole.starts_with(&short[..]), "what survives a cut is a PREFIX of the page");
         // And the per-page diagnostic names it, so the one page-level entry point in the
         // crate does not report `ops=N` as though N were all there was.
-        let dbg = crate::text::debug_page(
-            &test_adapter(&doc),
-            pages[&1],
-            &std::fs::read(path).expect("fixture readable"),
-        );
+        let raw = std::fs::read(path).expect("fixture readable");
+        let access = crate::access::test_adapter_with_source(&doc, &raw);
+        let dbg = crate::text::debug_page(&access, pages[&1]).unwrap();
         assert!(dbg.contains("flate-truncated"), "debug_page must surface it: {dbg}");
-        let clean = crate::text::debug_page(
-            &test_adapter(&doc),
-            pages[&3],
-            &std::fs::read(path).expect("fixture readable"),
-        );
+        let clean = crate::text::debug_page(&access, pages[&3]).unwrap();
         assert!(!clean.contains("truncated"), "the intact page reports nothing: {clean}");
     }
 

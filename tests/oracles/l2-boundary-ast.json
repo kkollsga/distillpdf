@@ -1,13 +1,15 @@
 {
   "access.rs": [
     "clone-call|49733a8f34f513daeb3fc60d7a3efa1199c52737e6da5beee62d7e9479a80f6f|step . clone ()",
-    "clone-call|59d477c3db76e9afcffa0847c7cff1ef5482f0ddc2a2106e2e24db49aa520d49|Arc :: clone (& self . source)",
     "clone-call|910bcfb4b0c1724ad46e37a537cbed887731cd14f9ad807dd95637c02ab2bd4c|Arc :: clone (& self . document)",
     "clone-call|910bcfb4b0c1724ad46e37a537cbed887731cd14f9ad807dd95637c02ab2bd4c|Arc :: clone (& self . document)",
+    "clone-call|b8c80446b736970392cd721afc3f046b0a29115a47005456989858c12518f0ff|Arc :: clone (& self . recovery)",
     "clone-call|be875f50f8e5ce7dc199ab7afe28e4d6b936da24ef158ad3aa90219477212679|self . owner . clone ()",
     "clone-call|be875f50f8e5ce7dc199ab7afe28e4d6b936da24ef158ad3aa90219477212679|self . owner . clone ()",
     "clone-call|dd2998c047431890f19b567e5eca43e779740be3cfe5a83ba74624e5f3ae9e4c|self . path . clone ()",
     "clone-call|dd2998c047431890f19b567e5eca43e779740be3cfe5a83ba74624e5f3ae9e4c|self . path . clone ()",
+    "clone-call|e65e31126d6670adabd769f8574f9dee4e45809783a80d23524f721bff46d384|Arc :: clone (& self . recovery . source)",
+    "clone-call|f97b182c3d9fe53dccb9dbe347dccfbbbacad2e33832a0f7d8abecb5a37c8234|scan . sha256 . clone ()",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
@@ -27,7 +29,6 @@
   "doc.rs": [
     "clone-call|11cc002ed60fe6a4d70b1d670eea56cd4df4e03015426db1d15c5a28ed2af02d|d . clone ()",
     "clone-call|55003b322b1ccc86fc885dfebbc223c072a41df9522acee0d15a924743177d77|Arc :: clone (& doc)",
-    "clone-call|85fe7b4cb70e4244270d3b0a389206a790ea8d03fde551d73154990fde856b0a|Arc :: clone (& raw)",
     "clone-call|96301b6953741669afa76e087890d99ee565d933f01a437b72ab2b63cebd6c40|self . ocr_cache . lock () . map_err (| _ | Error :: OcrPoisoned) ? . clone ()",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",

@@ -77,13 +77,12 @@ fn decide_from(has_image: bool, coverage: f32, n_text: usize, producer: &str, ga
 pub(crate) fn decide(
     access: &dyn crate::access::DocumentAccess,
     page_id: ObjectId,
-    raw: &[u8],
 ) -> OcrDecision {
     let coverage = image_coverage(access, page_id);
     if coverage <= 0.0 {
         return OcrDecision::NotNeeded; // no renderable image → leave the page alone
     }
-    let txt = text::extract_page(access, page_id, raw).unwrap_or_default();
+    let txt = text::extract_page(access, page_id).unwrap_or_default();
     let n = txt.trim().chars().count();
     let producer = doc_producer(access).unwrap_or_default();
     decide_from(true, coverage, n, &producer, text_is_garbled(&txt))

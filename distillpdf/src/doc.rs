@@ -101,8 +101,6 @@ pub struct OcrPlanEntry {
 pub struct PdfDocument {
     #[cfg(test)]
     pub(crate) doc: Arc<Document>,
-    /// Raw PDF bytes, kept for lenient recovery of malformed streams.
-    pub(crate) raw: Arc<[u8]>,
     /// Runtime-selectable immutable access route. L2 uses the eager oracle adapter; L3 adds
     /// the bounded indexed implementation without reopening consumer signatures.
     pub(crate) access: Arc<dyn DocumentAccess>,
@@ -349,11 +347,10 @@ impl PdfDocument {
         make_access: impl FnOnce(Arc<Document>, Arc<[u8]>) -> Arc<dyn DocumentAccess>,
     ) -> Self {
         let doc = Arc::new(doc);
-        let access = make_access(Arc::clone(&doc), Arc::clone(&raw));
+        let access = make_access(Arc::clone(&doc), raw);
         PdfDocument {
             #[cfg(test)]
             doc,
-            raw,
             access,
             source,
             ocr_cache: Default::default(),
@@ -409,7 +406,7 @@ impl PdfDocument {
         let mut per_page: Vec<(u32, String)> = pages
             .par_iter()
             .map(|page| {
-                let mine = text::extract_page(self.access.as_ref(), page.id, &self.raw).unwrap_or_default();
+                let mine = text::extract_page(self.access.as_ref(), page.id).unwrap_or_default();
                 let s = if mine.trim().chars().count() >= 2 {
                     mine
                 } else {
@@ -432,7 +429,7 @@ impl PdfDocument {
         let page_id = self.access.pages_or_empty().into_iter()
             .find(|entry| entry.number == page).map(|entry| entry.id)
             .ok_or(Error::NoPage(Some(page)))?;
-        let mine = text::extract_page(self.access.as_ref(), page_id, &self.raw).unwrap_or_default();
+        let mine = text::extract_page(self.access.as_ref(), page_id).unwrap_or_default();
         Ok(if mine.trim().chars().count() >= 2 {
             mine
         } else {
@@ -444,7 +441,7 @@ impl PdfDocument {
     pub fn mine_text(&self) -> String {
         let mut out = String::new();
         for page in self.access.pages_or_empty() {
-            out.push_str(&text::extract_page(self.access.as_ref(), page.id, &self.raw).unwrap_or_default());
+            out.push_str(&text::extract_page(self.access.as_ref(), page.id).unwrap_or_default());
             out.push('\n');
         }
         out
@@ -455,7 +452,8 @@ impl PdfDocument {
         let page_id = self.access.pages_or_empty().into_iter()
             .find(|entry| entry.number == page).map(|entry| entry.id)
             .ok_or(Error::NoPage(None))?;
-        Ok(text::extract_spans(self.access.as_ref(), page_id, &self.raw)
+        Ok(text::extract_spans(self.access.as_ref(), page_id)
+            .map_err(|error| Error::Model(error.to_string()))?
             .into_iter()
             .map(|s| (s.text, s.x, s.width, s.size))
             .collect())
@@ -467,7 +465,8 @@ impl PdfDocument {
         let page_id = self.access.pages_or_empty().into_iter()
             .find(|entry| entry.number == page).map(|entry| entry.id)
             .ok_or(Error::NoPage(None))?;
-        Ok(text::extract_spans(self.access.as_ref(), page_id, &self.raw)
+        Ok(text::extract_spans(self.access.as_ref(), page_id)
+            .map_err(|error| Error::Model(error.to_string()))?
             .into_iter()
             .map(|s| (s.text, s.x, s.y, s.width, s.size))
             .collect())
@@ -521,7 +520,8 @@ impl PdfDocument {
         let page_id = self.access.pages_or_empty().into_iter()
             .find(|entry| entry.number == page).map(|entry| entry.id)
             .ok_or(Error::NoPage(Some(page)))?;
-        Ok(text::debug_page(self.access.as_ref(), page_id, &self.raw))
+        text::debug_page(self.access.as_ref(), page_id)
+            .map_err(|error| Error::Model(error.to_string()))
     }
 
     /// Extract images from all pages.
@@ -536,7 +536,7 @@ impl PdfDocument {
 
     /// Extract tables from all pages.
     pub fn extract_tables(&self) -> Vec<TableInfo> {
-        extract::extract_tables(self.access.as_ref(), &self.raw)
+        extract::extract_tables(self.access.as_ref())
     }
 
     /// Extract hyperlinks from all pages.
@@ -546,12 +546,12 @@ impl PdfDocument {
 
     /// Render the document to HTML.
     pub fn render(&self, mode: html::Mode, images: bool, toc: bool) -> String {
-        html::to_html(self.access.as_ref(), &self.raw, mode, images, toc)
+        html::to_html(self.access.as_ref(), mode, images, toc)
     }
 
     /// The detected-heading outline: `(level, title, page, anchor_id)` in reading order.
     pub fn toc(&self, mode: html::Mode) -> Vec<(u8, String, u32, String)> {
-        nav::toc(&html::to_html(self.access.as_ref(), &self.raw, mode, false, true))
+        nav::toc(&html::to_html(self.access.as_ref(), mode, false, true))
     }
 
     /// The PDF's OWN `/Outlines` bookmarks as `(level, title, page, anchor)`.
@@ -564,19 +564,19 @@ impl PdfDocument {
 
     /// HTML of a single section resolved by `name`.
     pub fn section(&self, mode: html::Mode, name: &str, images: bool) -> Option<String> {
-        nav::section(&html::to_html(self.access.as_ref(), &self.raw, mode, images, true), name)
+        nav::section(&html::to_html(self.access.as_ref(), mode, images, true), name)
     }
 
     /// Structured front-matter of an academic paper (page 1).
     pub fn front_matter(&self) -> frontmatter::FrontMatter {
-        frontmatter::extract_front_matter(self.access.as_ref(), &self.raw)
+        frontmatter::extract_front_matter(self.access.as_ref())
     }
 
     /// OCR plan: per page, whether OCR is needed and (if so) the page raster bytes.
     pub fn ocr_plan(&self) -> Vec<OcrPlanEntry> {
         let mut out = Vec::new();
         for page in self.access.pages_or_empty() {
-            let decision = ocr::detect::decide(self.access.as_ref(), page.id, &self.raw);
+            let decision = ocr::detect::decide(self.access.as_ref(), page.id);
             let needs = !matches!(decision, ocr::detect::OcrDecision::NotNeeded);
             let (w, h) = ocr::page_size_pts(self.access.as_ref(), page.id);
             let image = if needs {
@@ -609,7 +609,7 @@ impl PdfDocument {
     /// Build a searchable PDF from OCR results. `remove_raster` selects clean-reflow vs
     /// invisible-overlay. Returns the saved PDF bytes; the caller writes the file.
     pub fn build_searchable_pdf(&self, ocr: &HashMap<u32, String>, remove_raster: bool) -> Result<Vec<u8>, Error> {
-        ocr::searchable::build(&self.raw, self.access.as_ref(), ocr, remove_raster)
+        ocr::searchable::build(self.access.as_ref(), ocr, remove_raster)
             .map_err(Error::Model)
     }
 
@@ -658,11 +658,11 @@ impl PdfDocument {
         let generated_at = iso8601_now();
         let (model, asset_bytes) = model::build::build_model(
             self.access.as_ref(),
-            &self.raw,
             &file,
             generated_at,
             opts.profile,
-        );
+        )
+        .map_err(|error| Error::Model(error.to_string()))?;
         if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(Error::Mkdir)?;
         }
@@ -894,7 +894,7 @@ pub(crate) mod tests {
             };
             let mut want = String::new();
             for (&p, &page_id) in &pdf.doc.get_pages() {
-                let mine = text::extract_page(pdf.access.as_ref(), page_id, &pdf.raw).unwrap_or_default();
+                let mine = text::extract_page(pdf.access.as_ref(), page_id).unwrap_or_default();
                 if mine.trim().chars().count() >= 2 {
                     want.push_str(&mine);
                 } else {

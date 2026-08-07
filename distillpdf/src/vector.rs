@@ -2205,7 +2205,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/codec_basemap.pdf");
         let doc = lopdf::Document::load(path).expect("codec_basemap.pdf fixture must load");
         let raw = std::fs::read(path).expect("fixture readable");
-        let html = crate::html::to_html(&test_adapter(&doc), &raw, crate::html::Mode::Page, true, true);
+        let html = crate::html::to_html(&crate::access::test_adapter_with_source(&doc, &raw), crate::html::Mode::Page, true, true);
         let svgs: Vec<&str> = html.match_indices("<svg").map(|(i, _)| &html[i..html[i..].find("</svg>").map(|e| i + e).unwrap_or(html.len())]).collect();
         assert_eq!(svgs.len(), 2, "one composited figure per page");
         assert_eq!(svgs[0].matches("<path").count(), 8, "page 1 keeps every stroke of its ink");
@@ -2792,7 +2792,7 @@ mod tests {
         let want: [(&str, [f32; 4]); 2] = [("Alpha", [0.0, 90.0, 180.0, 270.0]), ("Beta", [-90.0, 0.0, 90.0, 180.0])];
         for (i, &page_id) in ids.iter().enumerate() {
             let rot = crate::pdfobj::page_rotation(&test_adapter(&doc), page_id);
-            let spans = crate::text::extract_spans(&test_adapter(&doc), page_id, &raw);
+            let spans = crate::text::extract_spans(&crate::access::test_adapter_with_source(&doc, &raw), page_id).unwrap();
             // The premise, asserted not assumed: the two labels really are drawn at 0° and
             // +90° in PAGE space, identically on every page.
             for (t, a) in [("Alpha", 0.0f32), ("Beta", std::f32::consts::FRAC_PI_2)] {
@@ -2871,7 +2871,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/panel_table.pdf");
         let doc = Document::load(path).expect("panel_table.pdf fixture must load");
         let raw = std::fs::read(path).expect("fixture readable");
-        let html = crate::html::to_html(&test_adapter(&doc), &raw, crate::html::Mode::Page, true, true);
+        let html = crate::html::to_html(&crate::access::test_adapter_with_source(&doc, &raw), crate::html::Mode::Page, true, true);
         assert_eq!(html.matches("<table").count(), 1, "the ruled grid is still a table");
         assert_eq!(html.matches("<svg").count(), 1, "the panel is still a figure");
         for cell in ["Constituent", "Arsenic", "Federal MCL", "10 ppb", "Boron", "Federal HAL", "Radon-222", "Proposed MCL", "4,000 pCi"] {

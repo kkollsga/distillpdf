@@ -6,10 +6,415 @@
 //! explicitly owned.  The eager implementation remains the compatibility oracle through L9.
 
 use lopdf::{
-    BytesSource, Dictionary, Document, Object, ObjectId, RandomAccessSource, SourceResult,
+    BytesSource, Dictionary, Document, Object, ObjectId, RandomAccessSource, SourceError,
+    SourceResult,
 };
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
-use std::sync::Arc;
+use std::ops::Deref;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+const SOURCE_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_RECOVERED_STREAM_BYTES: u64 = 64 * 1024 * 1024;
+const RECOVERY_INDEX_ENTRY_BYTES: u64 = 128;
+const MAX_RECOVERY_INDEX_ENTRIES: usize = 65_536;
+const RECOVERY_METADATA_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
+const RECOVERY_PAYLOAD_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceFailureKind {
+    SourceChanged,
+    Bounds,
+    ResourceLimit,
+    Backend,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceFailure {
+    kind: SourceFailureKind,
+    detail: Arc<str>,
+}
+
+impl SourceFailure {
+    fn new(kind: SourceFailureKind, detail: impl Into<Arc<str>>) -> Self {
+        Self { kind, detail: detail.into() }
+    }
+
+    fn resource(detail: impl Into<Arc<str>>) -> Self {
+        Self::new(SourceFailureKind::ResourceLimit, detail)
+    }
+}
+
+impl fmt::Display for SourceFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl From<SourceError> for SourceFailure {
+    fn from(error: SourceError) -> Self {
+        let kind = match error {
+            SourceError::SourceChanged => SourceFailureKind::SourceChanged,
+            SourceError::RangeOverflow { .. } | SourceError::OutOfBounds { .. } => {
+                SourceFailureKind::Bounds
+            }
+            SourceError::ReadLimitExceeded { .. }
+            | SourceError::PlatformLimitExceeded { .. }
+            | SourceError::AllocationFailed { .. } => SourceFailureKind::ResourceLimit,
+            SourceError::UnexpectedEof { .. }
+            | SourceError::InvalidReadCount { .. }
+            | SourceError::Io(_) => SourceFailureKind::Backend,
+            _ => SourceFailureKind::Backend,
+        };
+        Self::new(kind, Arc::<str>::from(error.to_string()))
+    }
+}
+
+#[derive(Debug)]
+struct RecoveryBudget {
+    limit: u64,
+    used: Mutex<u64>,
+    available: Condvar,
+}
+
+impl RecoveryBudget {
+    fn new(limit: u64) -> Self {
+        Self { limit, used: Mutex::new(0), available: Condvar::new() }
+    }
+
+    fn acquire(&'static self, bytes: u64) -> Result<RecoveryCharge, SourceFailure> {
+        if bytes > self.limit {
+            return Err(SourceFailure::resource(format!(
+                "recovery request {bytes} exceeds process-wide limit {}",
+                self.limit
+            )));
+        }
+        let mut used = self
+            .used
+            .lock()
+            .map_err(|_| SourceFailure::new(SourceFailureKind::Backend, "recovery budget lock poisoned"))?;
+        while used.saturating_add(bytes) > self.limit {
+            used = self
+                .available
+                .wait(used)
+                .map_err(|_| SourceFailure::new(SourceFailureKind::Backend, "recovery budget lock poisoned"))?;
+        }
+        *used += bytes;
+        Ok(RecoveryCharge { budget: self, bytes })
+    }
+}
+
+struct RecoveryCharge {
+    budget: &'static RecoveryBudget,
+    bytes: u64,
+}
+
+impl RecoveryCharge {
+    fn shrink_to(&mut self, bytes: u64) {
+        debug_assert!(bytes <= self.bytes);
+        let released = self.bytes.saturating_sub(bytes);
+        if released == 0 {
+            return;
+        }
+        let mut used = self.budget.used.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *used = used.saturating_sub(released);
+        self.bytes = bytes;
+        self.budget.available.notify_all();
+    }
+}
+
+impl Drop for RecoveryCharge {
+    fn drop(&mut self) {
+        let mut used = self.budget.used.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *used = used.saturating_sub(self.bytes);
+        self.budget.available.notify_all();
+    }
+}
+
+fn recovery_metadata_budget() -> &'static RecoveryBudget {
+    static BUDGET: OnceLock<RecoveryBudget> = OnceLock::new();
+    BUDGET.get_or_init(|| RecoveryBudget::new(RECOVERY_METADATA_BUDGET_BYTES))
+}
+
+fn recovery_payload_budget() -> &'static RecoveryBudget {
+    static BUDGET: OnceLock<RecoveryBudget> = OnceLock::new();
+    BUDGET.get_or_init(|| RecoveryBudget::new(RECOVERY_PAYLOAD_BUDGET_BYTES))
+}
+
+pub(crate) struct RecoveredStream {
+    bytes: Vec<u8>,
+    _charge: RecoveryCharge,
+}
+
+impl AsRef<[u8]> for RecoveredStream {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Deref for RecoveredStream {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CheckedSourceRange {
+    offset: u64,
+    length: u64,
+}
+
+struct SourceScan {
+    streams: BTreeMap<u32, CheckedSourceRange>,
+    sha256: String,
+    _metadata_charge: RecoveryCharge,
+}
+
+/// Per-document source services shared by every consumer of one access adapter.
+///
+/// The first recovery/hash caller performs one streaming pass. `OnceLock` is the single-flight
+/// owner: concurrent callers wait for that pass and then share only the compact range map and
+/// digest, never a whole-source buffer.
+pub(crate) struct SourceRecovery {
+    source: Arc<dyn RandomAccessSource>,
+    scan: OnceLock<Result<SourceScan, SourceFailure>>,
+}
+
+impl SourceRecovery {
+    pub(crate) fn new(source: Arc<dyn RandomAccessSource>) -> Self {
+        Self { source, scan: OnceLock::new() }
+    }
+
+    fn scanned(&self) -> Result<&SourceScan, SourceFailure> {
+        self.scan
+            .get_or_init(|| scan_source_streams(self.source.as_ref()))
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    fn recover_stream(&self, object: u32) -> Result<Option<RecoveredStream>, SourceFailure> {
+        let Some(range) = self.scanned()?.streams.get(&object).copied() else {
+            return Ok(None);
+        };
+        let charge = recovery_payload_budget().acquire(range.length)?;
+        let bytes = read_bounded_range(
+            self.source.as_ref(),
+            range.offset,
+            range.length,
+            MAX_RECOVERED_STREAM_BYTES,
+        )
+        .map_err(SourceFailure::from)?;
+        Ok(Some(RecoveredStream { bytes, _charge: charge }))
+    }
+
+    fn sha256(&self) -> Result<String, SourceFailure> {
+        self.scanned().map(|scan| scan.sha256.clone())
+    }
+
+    fn materialize(&self, limit: u64) -> SourceResult<Vec<u8>> {
+        let length = self.source.len()?;
+        read_bounded_range(self.source.as_ref(), 0, length, limit)
+    }
+
+    fn len(&self) -> SourceResult<u64> {
+        self.source.len()
+    }
+}
+
+fn read_bounded_range(
+    source: &dyn RandomAccessSource,
+    offset: u64,
+    length: u64,
+    limit: u64,
+) -> SourceResult<Vec<u8>> {
+    if length > limit {
+        return Err(SourceError::ReadLimitExceeded { requested: length, limit });
+    }
+    let source_len = source.len()?;
+    let end = offset
+        .checked_add(length)
+        .ok_or(SourceError::RangeOverflow { offset, length })?;
+    if end > source_len {
+        return Err(SourceError::OutOfBounds { offset, length, source_len });
+    }
+    let output_len = usize::try_from(length).map_err(|_| SourceError::PlatformLimitExceeded {
+        requested: length,
+        limit: usize::MAX as u64,
+    })?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(output_len)
+        .map_err(|_| SourceError::AllocationFailed { requested: length })?;
+    output.resize(output_len, 0);
+    let mut completed = 0usize;
+    while completed < output.len() {
+        let take = (output.len() - completed).min(SOURCE_CHUNK_BYTES);
+        let at = offset
+            .checked_add(completed as u64)
+            .ok_or(SourceError::RangeOverflow { offset, length })?;
+        source.read_exact_at(at, &mut output[completed..completed + take])?;
+        completed += take;
+    }
+    Ok(output)
+}
+
+fn scan_source_streams(source: &dyn RandomAccessSource) -> Result<SourceScan, SourceFailure> {
+    let maximum_metadata = (MAX_RECOVERY_INDEX_ENTRIES as u64)
+        .checked_mul(RECOVERY_INDEX_ENTRY_BYTES)
+        .expect("fixed recovery metadata cap fits u64");
+    let mut metadata_charge = recovery_metadata_budget().acquire(maximum_metadata)?;
+    let length = source.len().map_err(SourceFailure::from)?;
+    let mut hash = Sha256::new();
+    let mut scanner = StreamScanner::default();
+    let mut chunk = vec![0u8; SOURCE_CHUNK_BYTES];
+    let mut offset = 0u64;
+    while offset < length {
+        let take = usize::try_from((length - offset).min(SOURCE_CHUNK_BYTES as u64))
+            .expect("source chunk is bounded to 64 KiB");
+        source
+            .read_exact_at(offset, &mut chunk[..take])
+            .map_err(SourceFailure::from)?;
+        hash.update(&chunk[..take]);
+        for (within, byte) in chunk[..take].iter().copied().enumerate() {
+            scanner.push(offset + within as u64, byte);
+        }
+        offset += take as u64;
+        if scanner.overflowed {
+            return Err(SourceFailure::resource(format!(
+                "recovery stream index exceeds {MAX_RECOVERY_INDEX_ENTRIES} entries"
+            )));
+        }
+    }
+    source.validate_unchanged().map_err(SourceFailure::from)?;
+    let digest = hash.finalize();
+    let mut sha256 = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(sha256, "{byte:02x}");
+    }
+    metadata_charge.shrink_to(
+        (scanner.streams.len() as u64).saturating_mul(RECOVERY_INDEX_ENTRY_BYTES),
+    );
+    Ok(SourceScan {
+        streams: scanner.streams,
+        sha256,
+        _metadata_charge: metadata_charge,
+    })
+}
+
+#[derive(Default)]
+struct StreamScanner {
+    recent: VecDeque<u8>,
+    object: Option<u32>,
+    pending_stream_start: Option<(u64, bool)>,
+    stream_start: Option<u64>,
+    streams: BTreeMap<u32, CheckedSourceRange>,
+    overflowed: bool,
+}
+
+impl StreamScanner {
+    fn push(&mut self, position: u64, byte: u8) {
+        if let Some((after_keyword, saw_cr)) = self.pending_stream_start {
+            if position == after_keyword && byte == b'\r' {
+                self.pending_stream_start = Some((position + 1, true));
+                self.push_recent(byte);
+                return;
+            }
+            if position == after_keyword && byte == b'\n' {
+                self.pending_stream_start = None;
+                self.stream_start = Some(position + 1);
+                self.push_recent(byte);
+                return;
+            }
+            // Legacy recovery skips at most one CR and then one LF.
+            let start = if saw_cr { after_keyword } else { position };
+            self.pending_stream_start = None;
+            self.stream_start = Some(start);
+        }
+
+        self.push_recent(byte);
+
+        if let Some(start) = self.stream_start {
+            if self.recent_ends_with(b"endstream") {
+                let keyword_start = position + 1 - b"endstream".len() as u64;
+                let mut end = keyword_start;
+                let prefix_len = self.recent.len() - b"endstream".len();
+                let had_lf = prefix_len > 0 && self.recent[prefix_len - 1] == b'\n';
+                if had_lf {
+                    end -= 1;
+                }
+                if end > start {
+                    let before_newline = prefix_len.saturating_sub(usize::from(had_lf));
+                    if before_newline > 0 && self.recent[before_newline - 1] == b'\r' {
+                        end -= 1;
+                    }
+                }
+                if let Some(object) = self.object {
+                    if end > start && !self.streams.contains_key(&object) {
+                        if self.streams.len() == MAX_RECOVERY_INDEX_ENTRIES {
+                            self.overflowed = true;
+                        } else {
+                            self.streams.insert(
+                                object,
+                                CheckedSourceRange {
+                                    offset: start,
+                                    length: end - start,
+                                },
+                            );
+                        }
+                    }
+                }
+                self.stream_start = None;
+                self.object = None;
+            }
+            return;
+        }
+
+        if self.recent_ends_with(b" 0 obj") {
+            let suffix = b" 0 obj".len();
+            let before = self.recent.len() - suffix;
+            let mut begin = before;
+            while begin > 0 && self.recent[begin - 1].is_ascii_digit() {
+                begin -= 1;
+            }
+            if begin < before {
+                let mut object = 0u32;
+                let mut valid = true;
+                for index in begin..before {
+                    valid &= object
+                        .checked_mul(10)
+                        .and_then(|value| value.checked_add(u32::from(self.recent[index] - b'0')))
+                        .map(|value| object = value)
+                        .is_some();
+                }
+                self.object = valid.then_some(object);
+            }
+        }
+        if self.object.is_some() && self.recent_ends_with(b"stream") {
+            self.pending_stream_start = Some((position + 1, false));
+        }
+    }
+
+    fn push_recent(&mut self, byte: u8) {
+        const RECENT_LIMIT: usize = 64;
+        if self.recent.len() == RECENT_LIMIT {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(byte);
+    }
+
+    fn recent_ends_with(&self, needle: &[u8]) -> bool {
+        needle.len() <= self.recent.len()
+            && needle
+                .iter()
+                .rev()
+                .zip(self.recent.iter().rev())
+                .all(|(expected, actual)| expected == actual)
+    }
+}
 
 /// One page entry, detached from the backend's page-map allocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +442,8 @@ pub(crate) enum AccessPhase {
 pub(crate) enum AccessKind {
     Type,
     Bounds,
+    ResourceLimit,
+    SourceChanged,
     #[cfg_attr(not(test), allow(dead_code))] // constructed by the fault-injection adapter
     Injected,
     Backend,
@@ -68,6 +475,16 @@ impl AccessError {
         let mut failure = Self::object(object, error);
         failure.kind = kind;
         failure
+    }
+
+    fn source(error: SourceFailure) -> Self {
+        let kind = match error.kind {
+            SourceFailureKind::SourceChanged => AccessKind::SourceChanged,
+            SourceFailureKind::Bounds => AccessKind::Bounds,
+            SourceFailureKind::ResourceLimit => AccessKind::ResourceLimit,
+            SourceFailureKind::Backend => AccessKind::Backend,
+        };
+        Self::typed((0, 0), kind, error)
     }
 
     fn at(mut self, phase: AccessPhase, page: Option<u32>) -> Self {
@@ -414,14 +831,27 @@ pub(crate) trait DocumentAccess: Send + Sync {
     fn page_resource_chain_or_empty(&self, page: ObjectId) -> Vec<DictionaryHandle> {
         suppress_default(self.page_resource_chain(page), Suppression::EmptyResources)
     }
-    #[allow(dead_code)] // raw-recovery consumers migrate in L2b
+    #[cfg(test)]
     fn source(&self) -> Arc<dyn RandomAccessSource>;
-    /// Perform the one explicit whole-source scan permitted to the recovery index.
-    #[allow(dead_code)] // the L2b recovery index is the first production caller
-    fn scan_source(&self, limit: u64) -> SourceResult<Vec<u8>> {
-        let source = self.source();
-        let length = source.len()?;
-        source.read_range(0, length, limit)
+    fn source_recovery(&self) -> Arc<SourceRecovery>;
+    fn source_len(&self) -> SourceResult<u64> {
+        self.source_recovery().len()
+    }
+    /// Recover the encoded bytes of a malformed indirect stream without materializing the PDF.
+    fn recover_source_stream(&self, object: u32) -> Result<Option<RecoveredStream>, AccessError> {
+        self.source_recovery()
+            .recover_stream(object)
+            .map_err(AccessError::source)
+    }
+    /// Incremental SHA-256 from the same single-flight source pass as malformed recovery.
+    fn source_sha256(&self) -> Result<String, AccessError> {
+        self.source_recovery()
+            .sha256()
+            .map_err(AccessError::source)
+    }
+    /// Named whole-source exception for detached writers which must reparse mutable bytes.
+    fn materialize_source_bounded(&self, limit: u64) -> SourceResult<Vec<u8>> {
+        self.source_recovery().materialize(limit)
     }
 }
 
@@ -429,15 +859,15 @@ pub(crate) trait DocumentAccess: Send + Sync {
 #[derive(Clone)]
 pub(crate) struct EagerDocumentAdapter {
     document: Arc<Document>,
-    #[allow(dead_code)] // retained now so L2b recovery never reintroduces raw Vec borrowing
-    source: Arc<dyn RandomAccessSource>,
+    recovery: Arc<SourceRecovery>,
 }
 
 impl EagerDocumentAdapter {
     pub(crate) fn new(document: Arc<Document>, raw: Arc<[u8]>) -> Self {
+        let source: Arc<dyn RandomAccessSource> = Arc::new(BytesSource::new(raw));
         Self {
             document,
-            source: Arc::new(BytesSource::new(raw)),
+            recovery: Arc::new(SourceRecovery::new(source)),
         }
     }
 }
@@ -447,6 +877,25 @@ impl EagerDocumentAdapter {
 #[allow(dead_code)] // compatibility fixture bridge; production never clones a Document here
 pub(crate) fn test_adapter(document: &Document) -> EagerDocumentAdapter {
     EagerDocumentAdapter::new(Arc::new(document.clone()), Arc::from(&b""[..]))
+}
+
+#[cfg(test)]
+pub(crate) fn test_adapter_with_source(
+    document: &Document,
+    raw: &[u8],
+) -> EagerDocumentAdapter {
+    EagerDocumentAdapter::new(Arc::new(document.clone()), Arc::from(raw))
+}
+
+#[cfg(test)]
+pub(crate) fn test_adapter_with_random_source(
+    document: &Document,
+    source: Arc<dyn RandomAccessSource>,
+) -> EagerDocumentAdapter {
+    EagerDocumentAdapter {
+        document: Arc::new(document.clone()),
+        recovery: Arc::new(SourceRecovery::new(source)),
+    }
 }
 
 impl DocumentAccess for EagerDocumentAdapter {
@@ -522,8 +971,13 @@ impl DocumentAccess for EagerDocumentAdapter {
         Ok(out)
     }
 
+    #[cfg(test)]
     fn source(&self) -> Arc<dyn RandomAccessSource> {
-        Arc::clone(&self.source)
+        Arc::clone(&self.recovery.source)
+    }
+
+    fn source_recovery(&self) -> Arc<SourceRecovery> {
+        Arc::clone(&self.recovery)
     }
 }
 
@@ -585,7 +1039,6 @@ pub(crate) mod tests {
         pub(crate) resource_reads: AtomicU64,
         pub(crate) source_requests: AtomicU64,
         pub(crate) source_reads: AtomicU64,
-        pub(crate) source_scans: AtomicU64,
         pub(crate) max_request: AtomicU64,
     }
 
@@ -651,6 +1104,7 @@ pub(crate) mod tests {
         inner: Arc<dyn DocumentAccess>,
         fault: Option<FaultPoint>,
         pub(crate) counts: Arc<AccessCounts>,
+        recovery: Arc<SourceRecovery>,
     }
 
     impl FaultAccess {
@@ -659,10 +1113,16 @@ pub(crate) mod tests {
             fault: Option<FaultPoint>,
             counts: Arc<AccessCounts>,
         ) -> Self {
+            let counted_source: Arc<dyn RandomAccessSource> = Arc::new(CountingSource {
+                inner: inner.source(),
+                counts: Arc::clone(&counts),
+                fail_reads: fault == Some(FaultPoint::Source),
+            });
             Self {
                 inner,
                 fault,
                 counts,
+                recovery: Arc::new(SourceRecovery::new(counted_source)),
             }
         }
 
@@ -727,19 +1187,13 @@ pub(crate) mod tests {
 
         fn source(&self) -> Arc<dyn RandomAccessSource> {
             self.counts.source_requests.fetch_add(1, Ordering::Relaxed);
-            Arc::new(CountingSource {
-                inner: self.inner.source(),
-                counts: Arc::clone(&self.counts),
-                fail_reads: self.fault == Some(FaultPoint::Source),
-            })
+            Arc::clone(&self.recovery.source)
         }
 
-        fn scan_source(&self, limit: u64) -> SourceResult<Vec<u8>> {
-            self.counts.source_scans.fetch_add(1, Ordering::Relaxed);
-            let source = self.source();
-            let length = source.len()?;
-            source.read_range(0, length, limit)
+        fn source_recovery(&self) -> Arc<SourceRecovery> {
+            Arc::clone(&self.recovery)
         }
+
     }
 
     fn adapter(objects: Vec<Object>, raw: &[u8]) -> (EagerDocumentAdapter, Vec<ObjectId>) {
@@ -918,6 +1372,10 @@ pub(crate) mod tests {
         fn source(&self) -> Arc<dyn RandomAccessSource> {
             Arc::new(BytesSource::new(Arc::from(&b""[..])))
         }
+
+        fn source_recovery(&self) -> Arc<SourceRecovery> {
+            Arc::new(SourceRecovery::new(self.source()))
+        }
     }
 
     #[test]
@@ -1040,8 +1498,186 @@ pub(crate) mod tests {
         assert_eq!(counted.counts.source_requests.load(Ordering::Relaxed), 1);
         assert_eq!(counted.counts.source_reads.load(Ordering::Relaxed), 1);
         assert_eq!(counted.counts.max_request.load(Ordering::Relaxed), 3);
-        assert_eq!(counted.counts.source_scans.load(Ordering::Relaxed), 0);
-        assert_eq!(counted.scan_source(6).unwrap(), b"abcdef");
-        assert_eq!(counted.counts.source_scans.load(Ordering::Relaxed), 1);
+        assert_eq!(counted.materialize_source_bounded(6).unwrap(), b"abcdef");
+        assert_eq!(counted.counts.source_reads.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn recovery_index_is_single_flight_chunk_bounded_and_shares_incremental_hash() {
+        let mut raw = vec![b'x'; SOURCE_CHUNK_BYTES - 4];
+        raw.extend_from_slice(b"42 0 obj\n<<>>\nstream\r\ncmap-data\r\nendstream\n");
+        raw.extend(std::iter::repeat_n(b'z', SOURCE_CHUNK_BYTES + 17));
+        let expected_hash = {
+            let digest = Sha256::digest(&raw);
+            digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+        };
+        let counts = Arc::new(AccessCounts::default());
+        let bytes: Arc<[u8]> = Arc::from(raw.clone());
+        let inner: Arc<dyn RandomAccessSource> = Arc::new(BytesSource::new(bytes));
+        let counted: Arc<dyn RandomAccessSource> = Arc::new(CountingSource {
+            inner,
+            counts: Arc::clone(&counts),
+            fail_reads: false,
+        });
+        let recovery = Arc::new(SourceRecovery::new(counted));
+        let barrier = Arc::new(std::sync::Barrier::new(12));
+        let mut children = Vec::new();
+        for index in 0..12 {
+            let recovery = Arc::clone(&recovery);
+            let barrier = Arc::clone(&barrier);
+            let expected_hash = expected_hash.clone();
+            children.push(std::thread::spawn(move || {
+                barrier.wait();
+                if index % 2 == 0 {
+                    assert_eq!(recovery.sha256().unwrap(), expected_hash);
+                } else {
+                    let bytes = recovery.recover_stream(42).unwrap().unwrap();
+                    assert_eq!(bytes.as_ref(), b"cmap-data");
+                }
+            }));
+        }
+        for child in children {
+            child.join().unwrap();
+        }
+        let scan_reads = raw.len().div_ceil(SOURCE_CHUNK_BYTES) as u64;
+        assert_eq!(
+            counts.source_reads.load(Ordering::Relaxed),
+            scan_reads + 6,
+            "one source scan plus one bounded target read per recovery caller"
+        );
+        assert!(counts.max_request.load(Ordering::Relaxed) <= SOURCE_CHUNK_BYTES as u64);
+        assert!(recovery.recover_stream(99).unwrap().is_none());
+        assert_eq!(counts.source_reads.load(Ordering::Relaxed), scan_reads + 6);
+    }
+
+    fn legacy_recovery_range(raw: &[u8], object: u32) -> Option<CheckedSourceRange> {
+        fn find(raw: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+            raw.get(from..)?
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .map(|position| position + from)
+        }
+
+        let marker = format!("{object} 0 obj");
+        let object = find(raw, marker.as_bytes(), 0)?;
+        let mut start = find(raw, b"stream", object)? + b"stream".len();
+        if raw.get(start) == Some(&b'\r') {
+            start += 1;
+        }
+        if raw.get(start) == Some(&b'\n') {
+            start += 1;
+        }
+        let mut end = find(raw, b"endstream", start)?;
+        if end > start && raw[end - 1] == b'\n' {
+            end -= 1;
+        }
+        if end > start && raw[end - 1] == b'\r' {
+            end -= 1;
+        }
+        (end > start).then_some(CheckedSourceRange {
+            offset: start as u64,
+            length: (end - start) as u64,
+        })
+    }
+
+    fn scanned_range(raw: &[u8], object: u32) -> Result<Option<CheckedSourceRange>, SourceFailure> {
+        let source = BytesSource::new(Arc::from(raw));
+        Ok(scan_source_streams(&source)?.streams.get(&object).copied())
+    }
+
+    #[test]
+    fn recovery_scanner_has_differential_legacy_authority_and_named_security_corrections() {
+        let ordinary = [
+            b"42 0 obj\n<<>>\nstream\nlf\nendstream".as_slice(),
+            b"42 0 obj\n<<>>\nstream\r\ncrlf\r\nendstream".as_slice(),
+            b"42 0 obj\n<<>>\nstream\rcr-only\rendstream".as_slice(),
+            b"42 0 obj\n<<>>\nstreamno-eolendstream".as_slice(),
+            b"42 0 obj\n<< /Note (stream) >>\nstream\nactual\nendstream".as_slice(),
+            b"42 0 obj\n<<>>\nstream\nfirst\nendstream\n42 0 obj\n<<>>\nstream\nsecond\nendstream".as_slice(),
+            b"42 0 obj\n<<>>\nstream\nendstream".as_slice(),
+        ];
+        for raw in ordinary {
+            assert_eq!(scanned_range(raw, 42).unwrap(), legacy_recovery_range(raw, 42));
+        }
+
+        let mut split = vec![b'x'; SOURCE_CHUNK_BYTES - 3];
+        split.extend_from_slice(b"42 0 obj\n<<>>\nstream\r\nsplit\r\nendstream");
+        assert_eq!(scanned_range(&split, 42).unwrap(), legacy_recovery_range(&split, 42));
+
+        // Approved correction 1: a requested object number is not a suffix of a larger number.
+        let suffix = b"142 0 obj\n<<>>\nstream\nwrong\nendstream";
+        assert!(legacy_recovery_range(suffix, 42).is_some());
+        assert!(scanned_range(suffix, 42).unwrap().is_none());
+
+        // Approved correction 2: a streamless object cannot steal a later object's stream.
+        let spill = b"42 0 obj\n<<>>\nendobj\n43 0 obj\n<<>>\nstream\nwrong\nendstream";
+        assert!(legacy_recovery_range(spill, 42).is_some());
+        assert!(scanned_range(spill, 42).unwrap().is_none());
+
+        // The frozen 64 MiB recovery cap refuses the range before allocating its payload.
+        let mut oversize = b"42 0 obj\n<<>>\nstream\n".to_vec();
+        oversize.resize(oversize.len() + MAX_RECOVERED_STREAM_BYTES as usize + 1, b'x');
+        oversize.extend_from_slice(b"\nendstream");
+        let recovery = SourceRecovery::new(Arc::new(BytesSource::new(oversize.into())));
+        let error = recovery.recover_stream(42).err().expect("oversize recovery must fail");
+        assert_eq!(error.kind, SourceFailureKind::ResourceLimit);
+    }
+
+    #[test]
+    fn recovery_metadata_and_process_payload_admission_are_hard_bounded() {
+        let mut hostile = Vec::new();
+        for object in 0..=MAX_RECOVERY_INDEX_ENTRIES {
+            hostile.extend_from_slice(format!("{object} 0 obj stream\nx\nendstream\n").as_bytes());
+        }
+        let error = scan_source_streams(&BytesSource::new(hostile.into()))
+            .err()
+            .expect("hostile recovery index must hit its entry cap");
+        assert_eq!(error.kind, SourceFailureKind::ResourceLimit);
+
+        let budget: &'static RecoveryBudget = Box::leak(Box::new(RecoveryBudget::new(10)));
+        let first = budget.acquire(7).unwrap();
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let child = {
+            let child_budget = budget;
+            let started = Arc::clone(&started);
+            let finished = Arc::clone(&finished);
+            std::thread::spawn(move || {
+                started.wait();
+                let _second = child_budget.acquire(6).unwrap();
+                finished.store(true, Ordering::Release);
+            })
+        };
+        started.wait();
+        std::thread::yield_now();
+        assert!(!finished.load(Ordering::Acquire));
+        drop(first);
+        child.join().unwrap();
+        assert!(finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn source_changed_remains_typed_and_never_becomes_model_data() {
+        struct ChangedSource;
+        impl RandomAccessSource for ChangedSource {
+            fn len(&self) -> SourceResult<u64> {
+                Ok(1)
+            }
+
+            fn read_at(&self, _offset: u64, _out: &mut [u8]) -> SourceResult<usize> {
+                Err(SourceError::SourceChanged)
+            }
+
+            fn validate_unchanged(&self) -> SourceResult<()> {
+                Err(SourceError::SourceChanged)
+            }
+        }
+
+        let recovery = SourceRecovery::new(Arc::new(ChangedSource));
+        let first = recovery.sha256().unwrap_err();
+        let second = recovery.sha256().unwrap_err();
+        assert_eq!(first.kind, SourceFailureKind::SourceChanged);
+        assert_eq!(second, first, "single-flight failure publication is stable");
+        assert_eq!(AccessError::source(first).kind, AccessKind::SourceChanged);
     }
 }

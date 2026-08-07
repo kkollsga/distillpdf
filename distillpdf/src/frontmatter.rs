@@ -573,13 +573,12 @@ pub(crate) fn emit_document_title(lines: &mut Vec<Line>, body: f32, out: &mut Ve
 /// Standalone path for `pdf.metadata()` — does not run the full HTML pipeline.
 pub(crate) fn extract_front_matter(
     access: &dyn crate::access::DocumentAccess,
-    raw: &[u8],
 ) -> FrontMatter {
     let first = match access.pages_or_empty().into_iter().min_by_key(|page| page.number) {
         Some(page) => page.id,
         None => return FrontMatter::default(),
     };
-    let spans = text::extract_spans(access, first, raw);
+    let spans = text::extract_spans(access, first).unwrap_or_default();
     // BTreeMap, for the same reason as `html::render`'s body histogram: `max_by_key`
     // returns the LAST maximum in iteration order, and a `HashMap`'s order varies per map
     // instance — so a tie between two equally-common sizes resolved differently run to run.

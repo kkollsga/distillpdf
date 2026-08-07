@@ -7,8 +7,8 @@ use quote::ToTokens;
 use sha2::{Digest, Sha256};
 use syn::visit::{self, Visit};
 use syn::{
-    ExprCall, ExprField, ExprMethodCall, ExprUnsafe, ImplItem, Item, ItemFn, ItemImpl, Member,
-    TypePath,
+    ExprCall, ExprField, ExprMethodCall, ExprUnsafe, FnArg, ImplItem, Item, ItemFn, ItemImpl,
+    Member, Pat, Type, TypePath,
 };
 
 fn workspace() -> PathBuf {
@@ -281,6 +281,64 @@ fn production_boundary_matches_exact_syntax_allowlist() {
         serde_json::from_slice(&std::fs::read(&snapshot).expect("L2 AST allowlist"))
             .expect("valid L2 AST allowlist");
     assert_eq!(actual, expected, "production boundary syntax changed");
+}
+
+#[derive(Default)]
+struct RawSliceParameterAudit(Vec<String>);
+
+impl<'ast> Visit<'ast> for RawSliceParameterAudit {
+    fn visit_item_fn(&mut self, node: &'ast ItemFn) {
+        for input in &node.sig.inputs {
+            let FnArg::Typed(argument) = input else { continue };
+            let Pat::Ident(name) = argument.pat.as_ref() else { continue };
+            let Type::Reference(reference) = argument.ty.as_ref() else { continue };
+            let Type::Slice(slice) = reference.elem.as_ref() else { continue };
+            let Type::Path(element) = slice.elem.as_ref() else { continue };
+            if name.ident == "raw" && element.path.is_ident("u8") {
+                self.0.push(node.sig.ident.to_string());
+            }
+        }
+        visit::visit_item_fn(self, node);
+    }
+}
+
+#[test]
+fn l3_consumers_have_no_raw_pdf_slice_parameters_or_pdfdocument_raw_field() {
+    for relative in [
+        "text.rs",
+        "html.rs",
+        "extract.rs",
+        "frontmatter.rs",
+        "ocr/detect.rs",
+        "model/build.rs",
+    ] {
+        let source = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(relative),
+        )
+        .unwrap();
+        let file = syn::parse_file(&source).unwrap();
+        let mut audit = RawSliceParameterAudit::default();
+        for item in &file.items {
+            if !has_test_cfg(item) {
+                audit.visit_item(item);
+            }
+        }
+        assert!(audit.0.is_empty(), "{relative} raw PDF pass-throughs: {:?}", audit.0);
+    }
+
+    let source = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/doc.rs"),
+    )
+    .unwrap();
+    let file = syn::parse_file(&source).unwrap();
+    let fields = file.items.iter().find_map(|item| {
+        let Item::Struct(item) = item else { return None };
+        (item.ident == "PdfDocument").then_some(&item.fields)
+    }).expect("PdfDocument struct");
+    assert!(
+        fields.iter().all(|field| field.ident.as_ref().is_none_or(|name| name != "raw")),
+        "PdfDocument must not retain ordinary raw PDF bytes"
+    );
 }
 
 #[test]

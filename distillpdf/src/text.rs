@@ -5,7 +5,7 @@
 //! ourselves, decode show-text operators through each font's ToUnicode CMap, and
 //! recover real Unicode — including 2-byte CID codes and diacritics.
 
-use crate::access::{read_resolved, DictionaryHandle, DocumentAccess, ObjectHandle};
+use crate::access::{AccessError, DictionaryHandle, DocumentAccess, ObjectHandle, read_resolved};
 use crate::geom::Mat;
 use crate::pdfobj::num;
 use crate::walker::{descend_form, xobject_at, Descend, ScopePolicy, XMap};
@@ -91,59 +91,18 @@ fn obj_i64(o: &Object) -> Option<i64> {
     }
 }
 
-/// Find the first occurrence of `needle` in `hay` starting at `from`.
-fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.is_empty() || from > hay.len() {
-        return None;
-    }
-    hay[from..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|p| p + from)
-}
-
-/// Lenient recovery of a stream's bytes straight from the raw PDF, for malformed
-/// streams that omit `/Length` (e.g. oxidize-pdf's ToUnicode CMaps), which lopdf
-/// reads as empty. Mirrors what PyMuPDF does: scan `N 0 obj ... stream..endstream`.
-fn recover_stream(raw: &[u8], obj_num: u32) -> Option<Vec<u8>> {
-    let marker = format!("{obj_num} 0 obj");
-    let obj_pos = find_from(raw, marker.as_bytes(), 0)?;
-    let s = find_from(raw, b"stream", obj_pos)? + b"stream".len();
-    let mut start = s;
-    if raw.get(start) == Some(&b'\r') {
-        start += 1;
-    }
-    if raw.get(start) == Some(&b'\n') {
-        start += 1;
-    }
-    let end = find_from(raw, b"endstream", start)?;
-    let mut e = end;
-    if e > start && raw[e - 1] == b'\n' {
-        e -= 1;
-    }
-    if e > start && raw[e - 1] == b'\r' {
-        e -= 1;
-    }
-    if e > start {
-        Some(raw[start..e].to_vec())
-    } else {
-        None
-    }
-}
-
 /// Build per-page font table: resource name -> FontInfo.
 fn build_fonts(
     access: &dyn DocumentAccess,
     page_id: ObjectId,
-    raw: &[u8],
-) -> HashMap<Vec<u8>, FontInfo> {
+) -> Result<HashMap<Vec<u8>, FontInfo>, AccessError> {
     let mut out = HashMap::new();
     // The access chain is outermost-to-page. Later overlays therefore reproduce
     // `get_page_fonts`' nearest-resource-wins behavior without borrowing its map.
     for resources in access.page_resource_chain_or_empty(page_id) {
-        out.extend(build_fonts_from_resources(access, &resources, raw));
+        out.extend(build_fonts_from_resources(access, &resources)?);
     }
-    out
+    Ok(out)
 }
 
 /// Build a font table from a resources dictionary's `/Font` subdict (used for
@@ -151,11 +110,10 @@ fn build_fonts(
 fn build_fonts_from_resources(
     access: &dyn DocumentAccess,
     resources: &DictionaryHandle,
-    raw: &[u8],
-) -> HashMap<Vec<u8>, FontInfo> {
+) -> Result<HashMap<Vec<u8>, FontInfo>, AccessError> {
     let mut out = HashMap::new();
     let Ok(fonts) = resources.entry(access, b"Font") else {
-        return out;
+        return Ok(out);
     };
     let names = fonts
         .read(|value| {
@@ -173,11 +131,11 @@ fn build_fonts_from_resources(
         let Ok(font) = fonts.dictionary_entry(access, &name) else {
             continue;
         };
-        if let Some(info) = font_info(access, &font, raw) {
+        if let Some(info) = font_info(access, &font)? {
             out.insert(name, info);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Parse a Type1 FontFile's built-in `/Encoding` (cleartext `dup N /glyph put`
@@ -336,29 +294,42 @@ fn descendant_metrics(
 }
 
 /// Construct a [`FontInfo`] from an owner-pinned font dictionary.
-fn font_info(access: &dyn DocumentAccess, font: &ObjectHandle, raw: &[u8]) -> Option<FontInfo> {
-    font.read(|value| {
-        let dict = value.as_dict().ok()?;
+fn font_info(
+    access: &dyn DocumentAccess,
+    font: &ObjectHandle,
+) -> Result<Option<FontInfo>, AccessError> {
+    font.read(|value| -> Result<Option<FontInfo>, AccessError> {
+        let Ok(dict) = value.as_dict() else {
+            return Ok(None);
+        };
         let subtype = dict
             .get(b"Subtype")
             .and_then(|o| o.as_name())
             .unwrap_or(b"");
         let two_byte = subtype == b"Type0";
-        let to_unicode = dict
+        let to_unicode_ref = dict
             .get(b"ToUnicode")
             .ok()
-            .and_then(|o| o.as_reference().ok())
-            .and_then(|r| {
-                // Prefer lopdf's loaded content; fall back to raw recovery when the
-                // stream is missing /Length (lopdf yields empty bytes).
-                let from_lopdf = access
-                    .stream(r)
-                    .ok()
-                    .and_then(|stream| stream.read(crate::pdfobj::content_bytes))
-                    .filter(|b| !b.is_empty());
-                let bytes = from_lopdf.or_else(|| recover_stream(raw, r.0))?;
+            .and_then(|object| object.as_reference().ok());
+        let to_unicode = if let Some(reference) = to_unicode_ref {
+            // Prefer lopdf's loaded content; fall back to bounded source recovery when the
+            // stream is missing /Length (lopdf yields empty bytes). Recovery failures are
+            // not missing mappings: they remain typed errors through this checked path.
+            let from_lopdf = access
+                .stream(reference)
+                .ok()
+                .and_then(|stream| stream.read(crate::pdfobj::content_bytes))
+                .filter(|bytes| !bytes.is_empty());
+            if let Some(bytes) = from_lopdf {
                 Some(parse_tounicode(&bytes))
-            });
+            } else {
+                access
+                    .recover_source_stream(reference.0)?
+                    .map(|bytes| parse_tounicode(&bytes))
+            }
+        } else {
+            None
+        };
 
         let identity_unicode = two_byte && to_unicode.as_ref().is_some_and(is_identity_cmap);
 
@@ -508,7 +479,7 @@ fn font_info(access: &dyn DocumentAccess, font: &ObjectHandle, raw: &[u8]) -> Op
             .flatten();
 
         let font_id = font_id_of(&basefont);
-        Some(FontInfo {
+        Ok(Some(FontInfo {
             two_byte,
             to_unicode,
             identity_unicode,
@@ -522,10 +493,8 @@ fn font_info(access: &dyn DocumentAccess, font: &ObjectHandle, raw: &[u8]) -> Op
             italic,
             mono,
             font_id,
-        })
-    })
-    .ok()
-    .flatten()
+        }))
+    })?
 }
 
 /// Parse a Type0 /W array: `[ c [w...] ]` and `[ c1 c2 w ]` forms.
@@ -1180,17 +1149,16 @@ pub struct Span {
 pub fn extract_spans(
     access: &dyn crate::access::DocumentAccess,
     page_id: ObjectId,
-    raw: &[u8],
-) -> Vec<Span> {
+) -> Result<Vec<Span>, AccessError> {
     let content = match access
         .page_content(page_id)
         .ok()
         .and_then(|bytes| lopdf::content::Content::decode(&bytes).ok())
     {
         Some(content) => content,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
-    let fonts = build_fonts(access, page_id, raw);
+    let fonts = build_fonts(access, page_id)?;
     let xmap = crate::walker::page_xobjects(access, page_id);
     let mut spans = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
@@ -1201,12 +1169,11 @@ pub fn extract_spans(
         &fonts,
         &xmap,
         Mat::ID,
-        raw,
         0,
         &mut spans,
         &mut budget,
         Some(&props),
-    );
+    )?;
     // §12.5.5: an annotation's appearance stream is page content — a filled form field's
     // value, a stamp's caption — reachable from neither the content stream nor the page's
     // `/Resources`. `walker::placed_appearances` carries the `/BBox`→`/Rect` mapping that
@@ -1228,22 +1195,21 @@ pub fn extract_spans(
         let Some(fr) = &f.scope.resources else {
             continue;
         };
-        let ff = build_fonts_from_resources(access, fr, raw);
+        let ff = build_fonts_from_resources(access, fr)?;
         decode_spans(
             access,
             &f.ops,
             &ff,
             &f.scope.xobjects,
             f.matrix.mul(actm),
-            raw,
             1,
             &mut spans,
             &mut budget,
             None,
-        );
+        )?;
     }
     dedup_coincident(&mut spans);
-    spans
+    Ok(spans)
 }
 
 /// Emit one positioned text span from a decoded word, resolving its device position
@@ -1334,12 +1300,11 @@ fn decode_spans(
     fonts: &HashMap<Vec<u8>, FontInfo>,
     xmap: &XMap,
     base: Mat,
-    raw: &[u8],
     depth: u32,
     spans: &mut Vec<Span>,
     budget: &mut crate::WalkBudget,
     props: Option<&HashMap<Vec<u8>, u32>>,
-) {
+) -> Result<(), AccessError> {
     let mut tm = Mat::ID;
     let mut tlm = Mat::ID;
     let mut leading = 0.0f32;
@@ -1381,7 +1346,7 @@ fn decode_spans(
         // self-referential form branch 2x per level. Out of budget → return the spans
         // decoded so far; a page degrades, it never comes back looking blank.
         if !budget.spend(1) {
-            return;
+            return Ok(());
         }
         let o = &op.operands;
         // Spans this operator paints directly. A `Do` recursion's spans are excluded
@@ -1535,12 +1500,12 @@ fn decode_spans(
                 ) {
                     Descend::Into(f) => f,
                     Descend::Skip => continue,
-                    Descend::Halt => return,
+                    Descend::Halt => return Ok(()),
                 };
                 let Some(fr) = &f.scope.resources else {
                     continue;
                 };
-                let ff = build_fonts_from_resources(access, fr, raw);
+                let ff = build_fonts_from_resources(access, fr)?;
                 let sub = f.matrix.mul(ctm);
                 let clip = stream
                     .read(|stream| crate::walker::form_bbox_clip(access, stream, sub))
@@ -1552,12 +1517,11 @@ fn decode_spans(
                     &ff,
                     &f.scope.xobjects,
                     sub,
-                    raw,
                     depth + 1,
                     spans,
                     budget,
                     None,
-                );
+                )?;
                 if let Some(bb) = clip {
                     clip_spans_to(spans, mark, bb);
                 }
@@ -1569,6 +1533,7 @@ fn decode_spans(
             spans[mark..].iter_mut().for_each(|s| s.mcid = Some(m));
         }
     }
+    Ok(())
 }
 
 /// The `/MCID` a `BDC`'s property operand names — written inline as a dictionary, or as a
@@ -2022,8 +1987,8 @@ fn text_from_spans(mut spans: Vec<Span>) -> String {
 }
 
 /// Diagnostic: report font table + content status for one page.
-pub fn debug_page(access: &dyn DocumentAccess, page_id: ObjectId, raw: &[u8]) -> String {
-    let fonts = build_fonts(access, page_id, raw);
+pub fn debug_page(access: &dyn DocumentAccess, page_id: ObjectId) -> Result<String, AccessError> {
+    let fonts = build_fonts(access, page_id)?;
     let mut s = format!("fonts={}\n", fonts.len());
     for (k, fi) in &fonts {
         s += &format!(
@@ -2131,7 +2096,7 @@ pub fn debug_page(access: &dyn DocumentAccess, page_id: ObjectId, raw: &[u8]) ->
         }
         Err(e) => s += &format!("content ERR: {e}\n"),
     }
-    s
+    Ok(s)
 }
 
 /// Extract text for one page via positioned spans + reading-order reconstruction.
@@ -2139,16 +2104,68 @@ pub fn debug_page(access: &dyn DocumentAccess, page_id: ObjectId, raw: &[u8]) ->
 pub fn extract_page(
     access: &dyn crate::access::DocumentAccess,
     page_id: ObjectId,
-    raw: &[u8],
-) -> Option<String> {
-    let spans = extract_spans(access, page_id, raw);
-    Some(text_from_spans(spans))
+) -> Result<String, AccessError> {
+    let spans = extract_spans(access, page_id)?;
+    Ok(text_from_spans(spans))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::access::test_adapter;
+
+    #[test]
+    fn malformed_tounicode_stream_recovers_through_source_boundary() {
+        let cmap = b"1 beginbfchar\n<41> <0041>\nendbfchar\n";
+        let mut raw = b"%PDF-1.7\n9 0 obj\n<<>>\nstream\n".to_vec();
+        raw.extend_from_slice(cmap);
+        raw.extend_from_slice(b"endstream\nendobj\n");
+
+        let mut document = Document::with_version("1.7");
+        document.objects.insert(
+            (9, 0),
+            Object::Stream(lopdf::Stream::new(lopdf::Dictionary::new(), Vec::new())),
+        );
+        let mut font = lopdf::Dictionary::new();
+        font.set("Subtype", Object::Name(b"Type0".to_vec()));
+        font.set("ToUnicode", Object::Reference((9, 0)));
+        document.objects.insert((10, 0), Object::Dictionary(font));
+        let access = crate::access::test_adapter_with_source(&document, &raw);
+        let font = access.object((10, 0)).unwrap();
+        let info = font_info(&access, &font).unwrap().expect("font info");
+        assert_eq!(info.to_unicode.unwrap().get(&0x41).map(String::as_str), Some("A"));
+    }
+
+    #[test]
+    fn malformed_tounicode_recovery_propagates_typed_source_failure() {
+        struct ChangedSource;
+        impl lopdf::RandomAccessSource for ChangedSource {
+            fn len(&self) -> lopdf::SourceResult<u64> {
+                Ok(1)
+            }
+
+            fn read_at(&self, _offset: u64, _out: &mut [u8]) -> lopdf::SourceResult<usize> {
+                Err(lopdf::SourceError::SourceChanged)
+            }
+        }
+
+        let mut document = Document::with_version("1.7");
+        document.objects.insert(
+            (9, 0),
+            Object::Stream(lopdf::Stream::new(lopdf::Dictionary::new(), Vec::new())),
+        );
+        let mut font = lopdf::Dictionary::new();
+        font.set("Subtype", Object::Name(b"Type0".to_vec()));
+        font.set("ToUnicode", Object::Reference((9, 0)));
+        document.objects.insert((10, 0), Object::Dictionary(font));
+        let access = crate::access::test_adapter_with_random_source(
+            &document,
+            std::sync::Arc::new(ChangedSource),
+        );
+        let font = access.object((10, 0)).unwrap();
+        let error = font_info(&access, &font).err().expect("source change must propagate");
+        assert_eq!(error.kind, crate::access::AccessKind::SourceChanged);
+    }
 
     /// An adversarial fixture (`tests/gen_fixtures.py::gen_form_bomb`), its bytes and page.
     fn adversarial(name: &str) -> (Vec<u8>, Document, ObjectId) {
@@ -2165,7 +2182,7 @@ mod tests {
         // `MAX_FORM_DEPTH` alone allowed ~2^40 descents. This call never returned.
         let (raw, doc, page_id) = adversarial("form_bomb.pdf");
         let t = std::time::Instant::now();
-        let spans = extract_spans(&test_adapter(&doc), page_id, &raw);
+        let spans = extract_spans(&crate::access::test_adapter_with_source(&doc, &raw), page_id).unwrap();
         assert!(t.elapsed().as_secs() < 10, "form bomb ran for {:?} — the budget is not bounding it", t.elapsed());
         assert!(spans.is_empty(), "the bomb shows no text, so none may be invented for it");
     }
@@ -2176,7 +2193,7 @@ mod tests {
         // showing one word, invoked at three offsets, is three real runs on the page. An
         // `ObjectId` dedupe would return 1 and silently drop two thirds of the text.
         let (raw, doc, page_id) = adversarial("form_repeat.pdf");
-        let spans = extract_spans(&test_adapter(&doc), page_id, &raw);
+        let spans = extract_spans(&crate::access::test_adapter_with_source(&doc, &raw), page_id).unwrap();
         let hits: Vec<&Span> = spans.iter().filter(|s| s.text.contains("REPEAT")).collect();
         let seen: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(hits.len(), 3, "a repeated form must show its text once per invocation, got {seen:?}");
@@ -2191,12 +2208,12 @@ mod tests {
         // Degrade, don't vanish: a walk that runs out mid-page keeps the spans it decoded.
         let (raw, doc, page_id) = adversarial("form_repeat.pdf");
         let content = doc.get_and_decode_page_content(page_id).expect("fixture page has content");
-        let access = test_adapter(&doc);
-        let fonts = build_fonts(&access, page_id, &raw);
+        let access = crate::access::test_adapter_with_source(&doc, &raw);
+        let fonts = build_fonts(&access, page_id).unwrap();
         let xmap = crate::walker::page_xobjects(&access, page_id);
         let mut spans = Vec::new();
         let mut budget = crate::WalkBudget::new(700);
-        decode_spans(&test_adapter(&doc), &content.operations, &fonts, &xmap, Mat::ID, &raw, 0, &mut spans, &mut budget, None);
+        decode_spans(&access, &content.operations, &fonts, &xmap, Mat::ID, 0, &mut spans, &mut budget, None).unwrap();
         assert!(!spans.is_empty(), "a tripped budget must not empty the page");
         assert!(spans.len() < 3, "the budget must really bite, got {} spans", spans.len());
     }
@@ -2211,7 +2228,7 @@ mod tests {
         let raw = std::fs::read(path).unwrap();
         let doc = Document::load_mem(&raw).unwrap();
         let pid = *doc.get_pages().get(&1).unwrap();
-        let out = extract_page(&test_adapter(&doc), pid, &raw).unwrap();
+        let out = extract_page(&crate::access::test_adapter_with_source(&doc, &raw), pid).unwrap();
         // The six the table omits (this is the defect) …
         for sym in ["\u{2B1F}", "\u{2B22}", "\u{2B21}", "\u{27F6}", "\u{27F5}", "\u{27F7}"] {
             assert!(out.contains(sym), "uncovered symbol {sym:?} lost from {out:?}");
@@ -2236,7 +2253,7 @@ mod tests {
         let raw = std::fs::read(path).unwrap();
         let doc = Document::load_mem(&raw).unwrap();
         let pid = *doc.get_pages().get(&1).unwrap();
-        let out = extract_page(&test_adapter(&doc), pid, &raw).unwrap();
+        let out = extract_page(&crate::access::test_adapter_with_source(&doc, &raw), pid).unwrap();
         assert!(out.contains("Hello"), "subset font text lost: {out:?}");
         assert!(!out.contains("HelloA"), "unmapped CID 0x41 invented an 'A': {out:?}");
         assert!(!out.contains('A'), "no 'A' is drawn anywhere on this page: {out:?}");
@@ -2248,7 +2265,7 @@ mod tests {
         let raw = std::fs::read(path).unwrap();
         let doc = Document::load_mem(&raw).unwrap();
         let pid = *doc.get_pages().get(&n).unwrap();
-        extract_page(&test_adapter(&doc), pid, &raw).unwrap()
+        extract_page(&crate::access::test_adapter_with_source(&doc, &raw), pid).unwrap()
     }
 
     /// An *incomplete* ToUnicode (the common case — one `bfchar` per subsetted glyph) left
@@ -2299,7 +2316,7 @@ mod tests {
         let raw = std::fs::read(path).expect("form_inherit.pdf fixture must exist");
         let doc = Document::load_mem(&raw).expect("form_inherit.pdf fixture must load");
         let pid = *doc.get_pages().get(&1).expect("fixture has page 1");
-        let spans = extract_spans(&test_adapter(&doc), pid, &raw);
+        let spans = extract_spans(&crate::access::test_adapter_with_source(&doc, &raw), pid).unwrap();
         let s = spans.iter().find(|s| s.text.contains("INHERIT")).expect("the form's label");
         assert!((s.x - 172.0).abs() < 1.0, "x {} (72 means the indirect /Matrix was lost)", s.x);
     }
@@ -2317,7 +2334,7 @@ mod tests {
         let raw = std::fs::read(path).expect("form_bbox_text.pdf fixture must exist");
         let doc = Document::load_mem(&raw).expect("form_bbox_text.pdf fixture must load");
         let pid = *doc.get_pages().get(&1).expect("fixture has page 1");
-        let spans = extract_spans(&test_adapter(&doc), pid, &raw);
+        let spans = extract_spans(&crate::access::test_adapter_with_source(&doc, &raw), pid).unwrap();
         let hits = |w: &str| spans.iter().filter(|s| s.text.contains(w)).count();
         assert_eq!(hits("TOPBAND"), 1, "the top band paints once, not once per placement");
         assert_eq!(hits("BOTBAND"), 1, "the bottom band paints once, not once per placement");
@@ -2328,7 +2345,7 @@ mod tests {
         let bot = spans.iter().find(|s| s.text.contains("BOTBAND")).unwrap();
         assert!((bot.x - 95.0).abs() < 1.0 && (bot.y - 371.6).abs() < 1.0, "BOTBAND at ({}, {})", bot.x, bot.y);
         // The guard: the clip must not eat the page's own text, which no `/BBox` governs.
-        let out = extract_page(&test_adapter(&doc), pid, &raw).expect("page text");
+        let out = extract_page(&crate::access::test_adapter_with_source(&doc, &raw), pid).expect("page text");
         assert!(out.contains("One body, two bands"), "page-level text lost to a form clip: {out:?}");
     }
 
@@ -2354,7 +2371,7 @@ mod tests {
             "the premise, lopdf 0.44: an unfiltered stream decodes to its raw content",
         );
 
-        let out = extract_page(&test_adapter(&doc), pid, &raw).expect("page text");
+        let out = extract_page(&crate::access::test_adapter_with_source(&doc, &raw), pid).expect("page text");
         assert!(out.contains("Unfiltered form ink"), "the form's own label is lost: {out:?}");
         // The page-level text was never at risk — its presence proves the page decoded and
         // only the form descent was dropping content.
@@ -2437,7 +2454,7 @@ mod tests {
         let doc = Document::load(path).expect("textstate_q.pdf fixture must load");
         let raw = std::fs::read(path).expect("fixture readable");
         let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
-        let spans = extract_spans(&test_adapter(&doc), page_id, &raw);
+        let spans = extract_spans(&crate::access::test_adapter_with_source(&doc, &raw), page_id).unwrap();
         let mut by_line: std::collections::BTreeMap<i32, Vec<&Span>> = std::collections::BTreeMap::new();
         for s in &spans {
             by_line.entry(-(s.y.round() as i32)).or_default().push(s);
