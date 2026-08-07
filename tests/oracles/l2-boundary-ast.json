@@ -98,13 +98,6 @@
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "direct-backend-function|1dc737dfb5535500dd94f7a61db40d716a44a3ab7672cbb8ed4fdc24749751ec|deref (doc , o)",
-    "direct-backend-function|1dc737dfb5535500dd94f7a61db40d716a44a3ab7672cbb8ed4fdc24749751ec|deref (doc , o)",
-    "direct-backend-function|1dc737dfb5535500dd94f7a61db40d716a44a3ab7672cbb8ed4fdc24749751ec|deref (doc , o)",
-    "direct-backend-function|1dc737dfb5535500dd94f7a61db40d716a44a3ab7672cbb8ed4fdc24749751ec|deref (doc , o)",
-    "direct-backend-method|dd6ce4098685d3fac6d61782032203c250ba8af906122ddeac0fa32f2f4e904f|doc . get_pages ()",
     "direct-backend-method|dd6ce4098685d3fac6d61782032203c250ba8af906122ddeac0fa32f2f4e904f|doc . get_pages ()",
     "direct-backend-method|dd6ce4098685d3fac6d61782032203c250ba8af906122ddeac0fa32f2f4e904f|doc . get_pages ()"
   ],

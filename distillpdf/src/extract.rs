@@ -3,7 +3,7 @@
 //! Pure Rust: these return plain owned structs. The PyO3 layer (`src/lib.rs`) assembles the
 //! Python dicts/lists from them — no pyo3 types appear in this module.
 
-use crate::pdfobj::{deref, filters_of};
+use crate::pdfobj::filters_of;
 use crate::raster::{assemble_png, codec_payload, filter_to_format, image_bpc, image_color_space, normalized_jpeg_png};
 use crate::text::{self, Span};
 use crate::{access::DictionaryHandle, walker::ResourceScope};
@@ -2514,29 +2514,41 @@ pub fn extract_tables(
 }
 
 /// Does this font dict (or its descendant) carry an embedded font program?
-fn font_embedded(doc: &Document, dict: &Dictionary) -> bool {
+fn font_embedded(access: &dyn crate::access::DocumentAccess, dict: &Dictionary) -> bool {
+    let embedded = |object: &lopdf::Object| {
+        object.as_dict().ok().is_some_and(|descriptor| {
+            descriptor.has(b"FontFile")
+                || descriptor.has(b"FontFile2")
+                || descriptor.has(b"FontFile3")
+        })
+    };
     // Type0: descriptor lives on the descendant font.
-    let descriptor = dict
-        .get(b"FontDescriptor")
-        .ok()
-        .and_then(|o| deref(doc, o))
-        .or_else(|| {
-            dict.get(b"DescendantFonts")
-                .ok()
-                .and_then(|o| deref(doc, o))
-                .and_then(|o| o.as_array().ok())
-                .and_then(|a| a.first())
-                .and_then(|o| deref(doc, o))
-                .and_then(|o| o.as_dict().ok())
-                .and_then(|dd| dd.get(b"FontDescriptor").ok())
-                .and_then(|o| deref(doc, o))
-        });
-    match descriptor.and_then(|o| o.as_dict().ok()) {
-        Some(d) => {
-            d.has(b"FontFile") || d.has(b"FontFile2") || d.has(b"FontFile3")
+    if let Ok(descriptor) = dict.get(b"FontDescriptor") {
+        if let Ok(result) = crate::access::read_resolved(access, descriptor, embedded) {
+            // A resolved non-dictionary suppresses the descendant fallback, matching eager.
+            return result;
         }
-        None => false,
     }
+    dict.get(b"DescendantFonts")
+        .ok()
+        .and_then(|descendants| {
+            crate::access::read_resolved(access, descendants, |descendants| {
+                let first = descendants.as_array().ok()?.first()?;
+                crate::access::read_resolved(access, first, |descendant| {
+                    let descriptor = descendant
+                        .as_dict()
+                        .ok()?
+                        .get(b"FontDescriptor")
+                        .ok()?;
+                    crate::access::read_resolved(access, descriptor, embedded).ok()
+                })
+                .ok()
+                .flatten()
+            })
+            .ok()
+            .flatten()
+        })
+        .unwrap_or(false)
 }
 
 /// Extract per-page font info as owned [`FontInfo`] rows: `{page, name, subtype, base_font,
@@ -2556,12 +2568,10 @@ fn font_embedded(doc: &Document, dict: &Dictionary) -> bool {
 /// widget uses to draw its own tick is a property of the form field, not of the page's
 /// text, and adding it would put this pillar *ahead* of the parity target rather than at
 /// it. [`appearance_resource_dicts`] exists and is one call away if that verdict changes.
-pub fn extract_fonts(
-    doc: &Document,
-    access: &dyn crate::access::DocumentAccess,
-) -> Vec<FontInfo> {
+pub fn extract_fonts(access: &dyn crate::access::DocumentAccess) -> Vec<FontInfo> {
     let mut out = Vec::new();
-    for (&pno, &page_id) in &doc.get_pages() {
+    for page in access.pages().unwrap_or_default() {
+        let (pno, page_id) = (page.number, page.id);
         // De-duplicated per page by (resource name, font object id): one font shared by
         // several forms is one row, while the same name bound to different objects in the
         // page and in a form is two. `BTreeMap` keeps rows in resource-name order, which
@@ -2604,7 +2614,7 @@ pub fn extract_fonts(
                                 subtype,
                                 base_font,
                                 encoding,
-                                font_embedded(doc, dict),
+                                font_embedded(access, dict),
                                 dict.has(b"ToUnicode"),
                             ))
                         })
@@ -3505,7 +3515,7 @@ mod tests {
         // is invoked under two names, so the row must appear exactly once.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/form_font.pdf");
         let doc = Document::load(path).expect("form_font.pdf fixture must load");
-        let fonts = extract_fonts(&doc, &test_adapter(&doc));
+        let fonts = extract_fonts(&test_adapter(&doc));
         assert_eq!(fonts.len(), 1, "expected one de-duplicated form-nested font, got {fonts:?}",
                    fonts = fonts.iter().map(|f| (f.page, f.name.clone())).collect::<Vec<_>>());
         let f = &fonts[0];
@@ -3525,7 +3535,7 @@ mod tests {
         // what the non-recursive accessor produced, in the same name order.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/mathfonts.pdf");
         let doc = Document::load(path).expect("mathfonts.pdf fixture must load");
-        let names: Vec<String> = extract_fonts(&doc, &test_adapter(&doc)).into_iter().map(|f| f.name).collect();
+        let names: Vec<String> = extract_fonts(&test_adapter(&doc)).into_iter().map(|f| f.name).collect();
         assert_eq!(names, vec!["F1", "F2", "F3", "F4"]);
     }
 

@@ -523,7 +523,7 @@ impl PdfDocument {
 
     /// Extract per-page font info.
     pub fn extract_fonts(&self) -> Vec<FontInfo> {
-        extract::extract_fonts(&self.doc, self.access.as_ref())
+        extract::extract_fonts(self.access.as_ref())
     }
 
     /// Extract tables from all pages.
