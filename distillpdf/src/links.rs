@@ -99,7 +99,7 @@ fn dest_to_pos(
                 _ => return None,
             };
             let y = match array.get(1).and_then(|object| object.as_name().ok()) {
-                // Array VALUES, so `num_deref`: `/XYZ 72 15 0 R 0` is legal, and reading it
+                // Array VALUES, so resolve first: `/XYZ 72 15 0 R 0` is legal, and reading it
                 // with the direct-only `num` puts the anchor at y=0 (the page bottom).
                 Some(b"XYZ") if array.len() >= 4 => Some(
                     read_resolved(access, &array[3], num)
@@ -732,7 +732,11 @@ mod tests {
         // The premise: the fixture's rect really is written with indirect entries.
         let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
         let annots = doc.get_dictionary(page_id).unwrap().get(b"Annots").unwrap().as_array().unwrap();
-        let annot = crate::pdfobj::deref(&doc, &annots[0]).unwrap().as_dict().unwrap();
+        let annot = doc
+            .get_object(annots[0].as_reference().unwrap())
+            .unwrap()
+            .as_dict()
+            .unwrap();
         let r = annot.get(b"Rect").unwrap().as_array().unwrap();
         assert!(matches!(r[2], Object::Reference(_)) && matches!(r[3], Object::Reference(_)));
 

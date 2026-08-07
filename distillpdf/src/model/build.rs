@@ -269,12 +269,6 @@ fn page_labels(
     out
 }
 
-/// An OWNED resolve: [`pdfobj::deref`] plus the clone this walk needs (it re-borrows the
-/// document while holding the result, so a borrowed view will not do).
-fn resolve(doc: &Document, o: &Object) -> Option<Object> {
-    crate::pdfobj::deref(doc, o).cloned()
-}
-
 /// Lowercase/uppercase roman numeral for a PDF page label (1 → i/I, 4 → iv/IV, …).
 fn roman(mut n: u32, upper: bool) -> String {
     if n == 0 {

@@ -218,7 +218,6 @@
   ],
   "model/build.rs": [
     "clone-call|025243e0b15f2b6c6f6ced7a8323c753d5a3c31d6296bc1384933f61f7430002|s . parent . clone ()",
-    "clone-call|1140b1d343bcb34d54123743ecf18dd69ddb90f496b2d46a96369669115f0f0e|crate :: pdfobj :: deref (doc , o) . cloned ()",
     "clone-call|13b30fcc00b2def2a66502ea62db1698f8b5bf57862c334b1bcea524347a9a1d|header . clone ()",
     "clone-call|26e925a53852d7c42582343131a2a0dbb547b1b229c0a2fb0957bd05ccbf966e|id . clone ()",
     "clone-call|26e925a53852d7c42582343131a2a0dbb547b1b229c0a2fb0957bd05ccbf966e|id . clone ()",
@@ -259,8 +258,6 @@
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
     "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "direct-backend-function|d0ca8f536869576c833ce6410da011d68402d40d8e672de9a54dccfad418f246|crate :: pdfobj :: deref (doc , o)",
     "direct-backend-method|04e7f46dfaa5cbfe77b5455425f6ba51c78c0b0549b5451ed52a03aeda09ca9b|access . catalog ()",
     "direct-backend-method|dd6ce4098685d3fac6d61782032203c250ba8af906122ddeac0fa32f2f4e904f|doc . get_pages ()"
   ],
@@ -343,9 +340,7 @@
     "clone-call|2c8a89e629d146cfa56130d49a2598d1a30a1f64b0ad95b749d5ebabd2ce8000|s . clone ()",
     "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
     "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
-    "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
-    "concrete-document-type|d6bd8c0aeee80fedb2dbf05c973100c3db04be90c072a88572533f2684131a36|Document",
-    "direct-backend-method|b2ad60c6bd0915794280bb56c0c85fc17118e798bf99e5f220f9640a55b13701|doc . get_object (* r)"
+    "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()"
   ],
   "raster.rs": [
     "clone-call|0196e7bdf620d14b5211a06aa677e198b05b8ca295a794bea1cb3e18a1b2cebc|f . clone ()",

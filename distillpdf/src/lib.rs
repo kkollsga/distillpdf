@@ -230,7 +230,7 @@ mod structure {
 
     /// `src` up to its `#[cfg(test)]` module. These rules govern production code: a test may
     /// name a banned spelling in order to *exercise* it (`pdfobj`'s tests call the real
-    /// `deref`; this module's own rules are written out as string literals). Every file in
+    /// indirect resolution; this module's own rules are written out as string literals). Every file in
     /// this crate puts its test module last and has at most one, which is asserted rather
     /// than assumed — a second one would mean this truncation silently dropped real code.
     fn production_code(src: &str) -> String {
@@ -283,10 +283,9 @@ mod structure {
 
     #[test]
     fn the_primitives_have_exactly_one_definition_each() {
-        // `deref` had five byte-identical copies, `num` four plus a divergent fifth that was
-        // the only one following an indirect reference, `xobjects_of` three. Each now lives
-        // in one module; a redefinition anywhere else is the drift starting over.
-        for (name, owner) in [("fn deref", "pdfobj.rs"), ("fn num(", "pdfobj.rs"), ("fn xobjects_of", "walker.rs")] {
+        // `num` had four copies plus a divergent fifth, and `xobjects_of` had three. Each
+        // remaining primitive now lives in one module; a redefinition elsewhere is drift.
+        for (name, owner) in [("fn num(", "pdfobj.rs"), ("fn xobjects_of", "walker.rs")] {
             for (file, src) in rust_files(&core_src()) {
                 // The owner's own definition and any module's `use`/test may name it.
                 if file == owner {

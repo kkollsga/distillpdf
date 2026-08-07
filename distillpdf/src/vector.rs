@@ -2442,7 +2442,11 @@ mod tests {
         // The premise: the alphas really are indirect.
         let res = page_res(&doc, page_id);
         let eg = res.get(b"ExtGState").unwrap().as_dict().unwrap().get(b"GA").unwrap();
-        let eg = crate::pdfobj::deref(&doc, eg).unwrap().as_dict().unwrap();
+        let eg = doc
+            .get_object(eg.as_reference().unwrap())
+            .unwrap()
+            .as_dict()
+            .unwrap();
         assert!(matches!(eg.get(b"ca").unwrap(), Object::Reference(_)));
         assert!(matches!(eg.get(b"CA").unwrap(), Object::Reference(_)));
 

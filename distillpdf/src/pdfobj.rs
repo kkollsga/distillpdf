@@ -3,7 +3,7 @@
 //! Reading a PDF means doing the same five things over and over: follow an indirect
 //! reference, read a number, get a stream's bytes, decode a text string, list a stream's
 //! filters. Before this module each of those lived as a private copy in whichever file
-//! needed it — `deref` in five files, `num` in four, the stream reader in two strong and
+//! needed it — indirect resolution in five files, `num` in four, the stream reader in two strong and
 //! two weak spellings, the text-string decoder in three — and the copies drifted. That
 //! drift has shipped bugs (the CMYK polarity split between extract and render) and is the
 //! reason a fourth walker could be written that silently loses uncompressed form streams.
@@ -17,7 +17,9 @@
 //! bytes) and never panics, never fabricates data, and never loops unboundedly.
 
 use crate::access::{read_resolved, DocumentAccess};
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use lopdf::{Dictionary, Object, ObjectId};
+#[cfg(test)]
+use lopdf::Document;
 
 /// The page size assumed when a document states no page box at all: US Letter, in points.
 ///
@@ -26,20 +28,6 @@ use lopdf::{Dictionary, Document, Object, ObjectId};
 /// A caller reaching for this is saying "the file told me nothing", never "the file is
 /// letter-sized" — [`page_box`] returning `None` is the only thing that should lead here.
 pub const DEFAULT_PAGE_PTS: (f32, f32) = (612.0, 792.0);
-
-/// Follow one indirect reference; pass a direct object straight through.
-///
-/// **Invariants callers may rely on and must not re-check:**
-/// - The result is **never** an [`Object::Reference`]. lopdf's `Document::get_object`
-///   walks a whole reference chain itself, bounded by its own `DEREF_LIMIT`, so a cyclic
-///   or absurdly long chain terminates inside lopdf. Callers must **not** loop on this.
-/// - A dangling reference (target not in the document) yields `None`, not a panic.
-pub(crate) fn deref<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Object> {
-    match o {
-        Object::Reference(r) => doc.get_object(*r).ok(),
-        other => Some(other),
-    }
-}
 
 /// A **direct** numeric object as `f32`; `0.0` for anything else.
 ///
@@ -488,37 +476,6 @@ mod tests {
         let mut doc = Document::with_version("1.5");
         let ids = objs.into_iter().map(|o| doc.add_object(o)).collect();
         (doc, ids)
-    }
-
-    #[test]
-    fn deref_passes_direct_objects_through_and_follows_one_reference() {
-        let (doc, ids) = doc_with(vec![Object::Integer(42)]);
-        let direct = Object::Real(1.5);
-        assert_eq!(deref(&doc, &direct), Some(&Object::Real(1.5)));
-        assert_eq!(deref(&doc, &Object::Reference(ids[0])), Some(&Object::Integer(42)));
-    }
-
-    #[test]
-    fn deref_of_a_dangling_reference_is_none_not_a_panic() {
-        // A truncated / hand-edited file routinely points at an object that isn't there.
-        let (doc, _) = doc_with(vec![Object::Null]);
-        assert_eq!(deref(&doc, &Object::Reference((9999, 0))), None);
-    }
-
-    #[test]
-    fn deref_terminates_on_a_reference_cycle_and_never_returns_a_reference() {
-        // 1 0 obj -> 2 0 R, 2 0 obj -> 1 0 R. lopdf's own DEREF_LIMIT breaks the loop, so
-        // callers may treat `deref` as one-shot; if this ever hangs, that assumption died.
-        let mut doc = Document::with_version("1.5");
-        let a = doc.add_object(Object::Null);
-        let b = doc.add_object(Object::Reference(a));
-        doc.set_object(a, Object::Reference(b));
-        let start = Object::Reference(a);
-        let got = deref(&doc, &start);
-        assert!(
-            !matches!(got, Some(Object::Reference(_))),
-            "deref must never hand back a reference — callers do not loop"
-        );
     }
 
     #[test]
