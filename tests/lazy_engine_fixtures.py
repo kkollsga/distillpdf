@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -284,6 +285,7 @@ def _small_fixtures() -> Iterable[tuple[str, RenderedPdf, dict]]:
 
 
 SCALE_AXES = ("pages", "objects", "links", "headings", "tags", "assets")
+IMAGE_VARIANTS = ("shared", "unique", "mosaic", "encrypted-objstm")
 
 
 def _sha256_file(path: Path) -> str:
@@ -292,6 +294,20 @@ def _sha256_file(path: Path) -> str:
         while chunk := source.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _flate_repeated(value: int, length: int) -> bytes:
+    """Deflate a logical large payload without allocating it as one Python bytes."""
+    compressor = zlib.compressobj(level=6)
+    chunk = bytes([value]) * min(length, 1024 * 1024)
+    parts = []
+    remaining = length
+    while remaining:
+        take = min(remaining, len(chunk))
+        parts.append(compressor.compress(chunk[:take]))
+        remaining -= take
+    parts.append(compressor.flush())
+    return b"".join(parts)
 
 
 def _scale_objects(axis: str, count: int) -> Iterator[tuple[int, int, bytes]]:
@@ -415,6 +431,103 @@ def _scale_objects(axis: str, count: int) -> Iterator[tuple[int, int, bytes]]:
     raise ValueError(f"unknown scale axis: {axis}")
 
 
+def _image_stream(dimension: int, ordinal: int, smask: int) -> bytes:
+    samples = _flate_repeated((ordinal * 37) & 0xFF, dimension * dimension * 3)
+    return _stream(
+        samples,
+        b"/Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceRGB "
+        b"/BitsPerComponent 8 /Filter /FlateDecode /SMask %d 0 R" % (dimension, dimension, smask),
+    )
+
+
+def _smask_stream(dimension: int, ordinal: int) -> bytes:
+    samples = _flate_repeated((ordinal * 53) & 0xFF, dimension * dimension)
+    return _stream(
+        samples,
+        b"/Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceGray "
+        b"/BitsPerComponent 8 /Filter /FlateDecode" % (dimension, dimension),
+    )
+
+
+def _image_objects(variant: str, count: int, dimension: int) -> Iterator[tuple[int, int, bytes]]:
+    pages = count if variant in ("shared", "unique") else 1
+    first_page = 3
+    first_content = first_page + pages
+    first_asset = first_content + pages
+    kids = b" ".join(f"{first_page + i} 0 R".encode("ascii") for i in range(pages))
+    yield 1, 0, b"<< /Type /Catalog /Pages 2 0 R >>"
+    yield 2, 0, b"<< /Type /Pages /Kids [" + kids + b"] /Count %d >>" % pages
+
+    for page_index in range(pages):
+        if variant == "shared":
+            image_pairs = [(first_asset, first_asset + 1)]
+        elif variant == "unique":
+            image_pairs = [(first_asset + page_index * 2, first_asset + page_index * 2 + 1)]
+        else:
+            image_pairs = [(first_asset + index * 2, first_asset + index * 2 + 1) for index in range(count)]
+        resources = b" ".join(
+            b"/Im%d %d 0 R" % (index, image) for index, (image, _mask) in enumerate(image_pairs)
+        )
+        yield first_page + page_index, 0, (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /XObject << " + resources + b" >> >> "
+            b"/Contents %d 0 R >>" % (first_content + page_index)
+        )
+    for page_index in range(pages):
+        draws = []
+        image_count = 1 if variant in ("shared", "unique") else count
+        for index in range(image_count):
+            x = (index % 4) * 144
+            y = (index // 4) * 144
+            draws.append(b"q 128 0 0 128 %d %d cm /Im%d Do Q" % (x, y, index))
+        yield first_content + page_index, 0, _stream(b"\n".join(draws))
+
+    asset_count = 1 if variant == "shared" else count
+    for index in range(asset_count):
+        image = first_asset + index * 2
+        mask = image + 1
+        yield image, 0, _image_stream(dimension, index + 1, mask)
+        yield mask, 0, _smask_stream(dimension, index + 1)
+
+
+def _objstm_shared_image_pdf(count: int, dimension: int) -> RenderedPdf:
+    writer = PdfWriter()
+    page_ids = [100 + index for index in range(count)]
+    writer.add(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+    writer.add(
+        2,
+        b"<< /Type /Pages /Kids ["
+        + b" ".join(f"{page} 0 R".encode("ascii") for page in page_ids)
+        + b"] /Count %d >>" % count,
+    )
+    first_content = 3
+    image = first_content + count
+    mask = image + 1
+    container = mask + 1
+    for index in range(count):
+        writer.add(first_content + index, _stream(b"q 256 0 0 256 36 400 cm /Im0 Do Q"))
+    writer.add(image, _image_stream(dimension, 1, mask))
+    writer.add(mask, _smask_stream(dimension, 1))
+
+    member_bodies = []
+    offsets = []
+    cursor = 0
+    for index, page in enumerate(page_ids):
+        body = (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /XObject << /Im0 %d 0 R >> >> /Contents %d 0 R >>"
+            % (image, first_content + index)
+        )
+        offsets.append((page, cursor))
+        member_bodies.append(body)
+        cursor += len(body) + 1
+    header = b" ".join(b"%d %d" % pair for pair in offsets) + b" "
+    payload = header + b" ".join(member_bodies)
+    writer.add(container, _stream(payload, b"/Type /ObjStm /N %d /First %d" % (count, len(header))))
+    compressed = {page: (container, index) for index, page in enumerate(page_ids)}
+    return writer.render_xref_stream(compressed, xref_number=max(page_ids) + 1)
+
+
 def generate_small(output: Path) -> dict:
     output.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -465,6 +578,67 @@ def generate_scale(output: Path, axis: str, count: int) -> dict:
     return manifest
 
 
+def generate_image(output: Path, variant: str, count: int, dimension: int) -> dict:
+    if variant not in IMAGE_VARIANTS:
+        raise ValueError(f"unknown image variant: {variant}")
+    if not 1 <= count <= 64:
+        raise ValueError("image count must be between 1 and 64")
+    if not 1 <= dimension <= 4096:
+        raise ValueError("image dimension must be between 1 and 4096")
+    output.mkdir(parents=True, exist_ok=True)
+    name = f"image-{variant}-{count}x{dimension}.pdf"
+    path = output / name
+    if variant == "encrypted-objstm":
+        try:
+            import pikepdf
+        except ImportError as error:
+            raise RuntimeError("encrypted image fixtures require pikepdf") from error
+        plain = output / ".plain-objstm.pdf"
+        rendered = _objstm_shared_image_pdf(count, dimension)
+        plain.write_bytes(rendered.data)
+        with pikepdf.open(plain) as pdf:
+            pdf.save(
+                path,
+                static_id=True,
+                object_stream_mode=pikepdf.ObjectStreamMode.preserve,
+                encryption=pikepdf.Encryption(
+                    owner="owner", user="", R=4, aes=False, metadata=False
+                ),
+            )
+        plain.unlink()
+        raw = path.read_bytes()
+        marker = raw.rfind(b"startxref\n")
+        if marker < 0:
+            raise ValueError("encrypted output has no startxref")
+        startxref = int(raw[marker + len(b"startxref\n"):].splitlines()[0])
+    else:
+        startxref = _write_classic_streaming(path, _image_objects(variant, count, dimension))
+    unique_pairs = 1 if variant in ("shared", "encrypted-objstm") else count
+    facts = {
+        "variant": variant,
+        "pages": count if variant in ("shared", "unique", "encrypted-objstm") else 1,
+        "dimension": dimension,
+        "unique_image_pairs": unique_pairs,
+        "decoded_bytes_per_pair": dimension * dimension * 4,
+        "decoded_bytes_total": unique_pairs * dimension * dimension * 4,
+        "encrypted": variant == "encrypted-objstm",
+        "object_stream_pages": count if variant == "encrypted-objstm" else 0,
+        "generated_on_demand": True,
+    }
+    row = {
+        "name": name,
+        "bytes": path.stat().st_size,
+        "sha256": _sha256_file(path),
+        "startxref": startxref,
+        "facts": facts,
+    }
+    manifest = {"schema": 1, "profile": "image", "fixtures": [row]}
+    (output / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return manifest
+
+
 def verify(output: Path) -> dict:
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("schema") != 1:
@@ -489,18 +663,24 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("generate", "verify"))
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--profile", choices=("small", "scale"), default="small")
+    parser.add_argument("--profile", choices=("small", "scale", "image"), default="small")
     parser.add_argument("--axis", choices=SCALE_AXES)
     parser.add_argument("--count", type=int)
+    parser.add_argument("--variant", choices=IMAGE_VARIANTS)
+    parser.add_argument("--dimension", type=int, default=4096)
     args = parser.parse_args()
     if args.command == "verify":
         manifest = verify(args.out)
     elif args.profile == "small":
         manifest = generate_small(args.out)
-    else:
+    elif args.profile == "scale":
         if args.axis is None or args.count is None:
             parser.error("scale generation requires --axis and --count")
         manifest = generate_scale(args.out, args.axis, args.count)
+    else:
+        if args.variant is None or args.count is None:
+            parser.error("image generation requires --variant and --count")
+        manifest = generate_image(args.out, args.variant, args.count, args.dimension)
     print(json.dumps({"profile": manifest["profile"], "fixtures": len(manifest["fixtures"])}, sort_keys=True))
 
 

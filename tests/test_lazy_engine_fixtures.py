@@ -6,7 +6,14 @@ from pathlib import Path
 import pytest
 
 import distillpdf
-from lazy_engine_fixtures import SCALE_AXES, generate_scale, generate_small, verify
+from lazy_engine_fixtures import (
+    IMAGE_VARIANTS,
+    SCALE_AXES,
+    generate_image,
+    generate_scale,
+    generate_small,
+    verify,
+)
 
 
 EXPECTED_SMALL = {
@@ -141,3 +148,47 @@ def test_cli_scale_profile(tmp_path):
     assert json.loads(result.stdout) == {"fixtures": 1, "profile": "scale"}
     manifest = verify(tmp_path)
     assert manifest["fixtures"][0]["facts"]["unique_count"] == 23
+
+
+@pytest.mark.parametrize("variant", IMAGE_VARIANTS)
+def test_image_profiles_pin_shared_unique_mosaic_and_encrypted_objstm(tmp_path, variant):
+    if variant == "encrypted-objstm":
+        pytest.importorskip("pikepdf")
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    first = generate_image(left, variant, 3, 32)
+    second = generate_image(right, variant, 3, 32)
+
+    assert first == second
+    assert verify(left) == first
+    row = first["fixtures"][0]
+    assert row["facts"]["decoded_bytes_per_pair"] == 32 * 32 * 4
+    assert row["facts"]["unique_image_pairs"] == (1 if variant in ("shared", "encrypted-objstm") else 3)
+    pdf = distillpdf.Pdf.open(str(left / row["name"]))
+    assert pdf.page_count() == row["facts"]["pages"]
+
+
+def test_cli_image_profile(tmp_path):
+    script = Path(__file__).with_name("lazy_engine_fixtures.py")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "generate",
+            "--profile",
+            "image",
+            "--variant",
+            "mosaic",
+            "--count",
+            "4",
+            "--dimension",
+            "64",
+            "--out",
+            str(tmp_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {"fixtures": 1, "profile": "image"}
+    assert verify(tmp_path)["fixtures"][0]["facts"]["decoded_bytes_total"] == 4 * 64 * 64 * 4
