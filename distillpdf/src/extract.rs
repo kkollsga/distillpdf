@@ -75,7 +75,9 @@ fn page_resource_dicts(
     // The adapter returns outermost → page for overlay consumers. Reporting has always
     // enumerated page → outermost, so reverse it to preserve every existing row index.
     for resources in access.page_resource_chain(page_id).unwrap_or_default().into_iter().rev() {
-        queue.push_back((resources, 0));
+        if let Ok(resources) = resources.read(Clone::clone) {
+            queue.push_back((resources, 0));
+        }
     }
     resource_bfs(access, queue, &mut seen)
 }

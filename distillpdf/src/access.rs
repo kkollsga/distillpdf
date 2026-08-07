@@ -76,6 +76,36 @@ pub(crate) struct StreamHandle {
     object: ObjectHandle,
 }
 
+/// A dictionary view whose root object owner remains pinned for every short read.
+#[derive(Clone)]
+pub(crate) struct DictionaryHandle {
+    object: ObjectHandle,
+}
+
+impl DictionaryHandle {
+    fn new(object: ObjectHandle) -> Result<Self, AccessError> {
+        let id = object.root_id();
+        if !object.read(|value| value.as_dict().is_ok())? {
+            return Err(AccessError::object(id, "resolved object is not a dictionary"));
+        }
+        Ok(Self { object })
+    }
+
+    pub(crate) fn read<R>(&self, inspect: impl FnOnce(&Dictionary) -> R) -> Result<R, AccessError> {
+        let id = self.object.root_id();
+        self.object.read(|value| value.as_dict().map(inspect))?.map_err(|error| AccessError::object(id, error))
+    }
+
+    #[allow(dead_code)] // resource consumers migrate incrementally through L2b
+    pub(crate) fn entry(
+        &self,
+        access: &dyn DocumentAccess,
+        key: &[u8],
+    ) -> Result<ObjectHandle, AccessError> {
+        self.object.dictionary_entry(access, key)
+    }
+}
+
 impl StreamHandle {
     fn new(id: ObjectId, object: ObjectHandle) -> Result<Self, AccessError> {
         let is_stream = object.read(|value| value.as_stream().is_ok())?;
@@ -215,7 +245,7 @@ pub(crate) trait DocumentAccess: Send + Sync {
     /// Every indexed indirect object id in deterministic order.
     fn object_ids(&self) -> Vec<ObjectId>;
     /// Page `/Resources` dictionaries in outermost-to-page overlay order.
-    fn page_resource_chain(&self, page: ObjectId) -> Result<Vec<Dictionary>, AccessError>;
+    fn page_resource_chain(&self, page: ObjectId) -> Result<Vec<DictionaryHandle>, AccessError>;
     #[allow(dead_code)] // raw-recovery consumers migrate in L2b
     fn source(&self) -> Arc<dyn RandomAccessSource>;
 }
@@ -266,18 +296,23 @@ impl DocumentAccess for EagerDocumentAdapter {
         self.document.objects.keys().copied().collect()
     }
 
-    fn page_resource_chain(&self, page: ObjectId) -> Result<Vec<Dictionary>, AccessError> {
+    fn page_resource_chain(&self, page: ObjectId) -> Result<Vec<DictionaryHandle>, AccessError> {
         let (own, inherited) = self
             .document
             .get_page_resources(page)
             .map_err(|error| AccessError::object(page, error))?;
-        let mut out: Vec<Dictionary> = inherited
+        let mut out: Vec<DictionaryHandle> = inherited
             .iter()
             .rev()
-            .filter_map(|id| self.document.get_dictionary(*id).ok().cloned())
+            .filter_map(|id| DictionaryHandle::new(self.object(*id).ok()?).ok())
             .collect();
-        if let Some(resources) = own {
-            out.push(resources.clone());
+        if own.is_some() {
+            let page_handle = self.object(page)?;
+            if let Ok(resources) = page_handle.dictionary_entry(self, b"Resources") {
+                if let Ok(resources) = DictionaryHandle::new(resources) {
+                    out.push(resources);
+                }
+            }
         }
         Ok(out)
     }
@@ -432,5 +467,38 @@ mod tests {
             b"inline"
         );
         assert_eq!(indirect.read(|object| object.as_i64().unwrap()).unwrap(), 42);
+    }
+
+    #[test]
+    fn resource_chain_handles_pin_inline_page_and_indirect_parent_dictionaries() {
+        let mut document = Document::with_version("1.7");
+        let outer_resources = document.add_object(Object::Dictionary(dictionary! {
+            "Outer" => Object::Integer(1),
+        }));
+        let pages = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => Object::Array(Vec::new()),
+            "Count" => 1,
+            "Resources" => Object::Reference(outer_resources),
+        }));
+        let page = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages),
+            "Resources" => Object::Dictionary(dictionary! {
+                "Inner" => Object::Integer(2),
+            }),
+        }));
+        document
+            .get_object_mut(pages)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Kids", Object::Array(vec![Object::Reference(page)]));
+        let adapter = EagerDocumentAdapter::new(Arc::new(document), Arc::from(&b""[..]));
+        let resources = adapter.page_resource_chain(page).unwrap();
+        assert_eq!(resources.len(), 2);
+        drop(adapter);
+        assert!(resources[0].read(|dict| dict.has(b"Outer")).unwrap());
+        assert!(resources[1].read(|dict| dict.has(b"Inner")).unwrap());
     }
 }
