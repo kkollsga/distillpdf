@@ -13,6 +13,7 @@ materialising a third-party PDF.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import zlib
@@ -286,6 +287,13 @@ def _small_fixtures() -> Iterable[tuple[str, RenderedPdf, dict]]:
 
 SCALE_AXES = ("pages", "objects", "links", "headings", "tags", "assets")
 IMAGE_VARIANTS = ("shared", "unique", "mosaic", "encrypted-objstm")
+SEMANTIC_VARIANTS = ("ocr", "tagged-table")
+
+# Self-generated once from a 64x64 grayscale canvas with five black text-like bars.
+# Embedding the bytes keeps OCR-candidate generation independent of Pillow versions.
+_OCR_JPEG = base64.b64decode(
+    "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0dHx8fExciJCIeJBweHx7/wAALCABAAEABAREA/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/9oACAEBAAA/APsuiiiiiiiuM+NvgX/hZXww1fwV/an9lf2j5P8Apf2fzvL8ueOX7m5c52Y6jGc+1fM3/DDH/VUf/KB/90Uf8MMf9VR/8oH/AN0Uf8MMf9VR/wDKB/8AdFH/AAwx/wBVR/8AKB/90Uf8MMf9VR/8oH/3RW14E/Y1/wCEX8caD4m/4WP9r/sjUre++z/2Js83ypVfZu887c7cZwcZ6GvrKuM+Nv8Awnf/AArDV/8AhWn/ACNn7n7B/qP+e8fmf6/93/q/M+9+HOK+Zv8AjOz/AD/YtH/Gdn+f7Fo/4zs/z/YtH/Gdn+f7Fra8Cf8ADZ3/AAnGg/8ACU/8gD+0rf8AtT/kEf8AHr5q+b/q/n+5u+783pzX1lRXGfG3x1/wrX4Yav41/sv+1f7O8n/RPtHk+Z5k8cX39rYxvz0OcY96+Zv+G5/+qXf+V/8A+56P+G5/+qXf+V//AO56P+G5/wDql3/lf/8Auej/AIbn/wCqXf8Alf8A/uej/huf/ql3/lf/APuej/huf/ql3/lf/wDuevoD9nH4r/8AC4fA954m/sH+xPs2pPY/Z/tn2jdtiiffu2JjPm4xjt1547Pxt4p0LwX4Yu/E3ia++waTZ7PtFx5TybN7qi/KgLHLMo4B6+leZf8ADUfwJ/6Hn/yk3v8A8Zo/4aj+BP8A0PP/AJSb3/4zR/w1H8Cf+h5/8pN7/wDGaP8AhqP4E/8AQ8/+Um9/+M0f8NR/An/oef8Ayk3v/wAZr0D4cePfCfxE0ObW/B2rf2nYQXLWskv2eWHbKqqxXEiqfuupzjHP1rpqxvG3hbQvGnhi78M+JrH7fpN5s+0W/mvHv2Orr8yEMMMqngjp6V5l/wAMufAn/oRv/Kte/wDx6j/hlz4E/wDQjf8AlWvf/j1H/DLnwJ/6Eb/yrXv/AMeo/wCGXPgT/wBCN/5Vr3/49R/wy58Cf+hG/wDKte//AB6vQPhx4C8J/DvQ5tE8HaT/AGZYT3LXUkX2iWbdKyqpbMjMfuooxnHH1rpq4z42+Bf+FlfDDV/BX9qf2V/aPk/6X9n87y/Lnjl+5uXOdmOoxnPtXzN/wwx/1VH/AMoH/wB0Uf8ADDH/AFVH/wAoH/3RR/wwx/1VH/ygf/dFH/DDH/VUf/KB/wDdFH/DDH/VUf8Aygf/AHRR/wAMMf8AVUf/ACgf/dFfWfgTQv8AhF/A+g+GftX2v+yNNt7H7R5ezzfKiVN+3J2525xk4z1NbNFFFFFFFf/Z"
+)
 
 
 def _sha256_file(path: Path) -> str:
@@ -528,6 +536,72 @@ def _objstm_shared_image_pdf(count: int, dimension: int) -> RenderedPdf:
     return writer.render_xref_stream(compressed, xref_number=max(page_ids) + 1)
 
 
+def _jpeg_with_ordinal(ordinal: int) -> bytes:
+    comment = b"L1OCR%06d" % ordinal
+    return _OCR_JPEG[:2] + b"\xff\xfe" + (len(comment) + 2).to_bytes(2, "big") + comment + _OCR_JPEG[2:]
+
+
+def _ocr_objects(count: int) -> Iterator[tuple[int, int, bytes]]:
+    first_page = 3
+    first_content = first_page + count
+    first_image = first_content + count
+    kids = b" ".join(f"{first_page + i} 0 R".encode("ascii") for i in range(count))
+    yield 1, 0, b"<< /Type /Catalog /Pages 2 0 R >>"
+    yield 2, 0, b"<< /Type /Pages /Kids [" + kids + b"] /Count %d >>" % count
+    for index in range(count):
+        yield first_page + index, 0, (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /XObject << /Scan %d 0 R >> >> /Contents %d 0 R >>"
+            % (first_image + index, first_content + index)
+        )
+    for index in range(count):
+        yield first_content + index, 0, _stream(b"q 612 0 0 792 0 0 cm /Scan Do Q")
+    for index in range(count):
+        jpeg = _jpeg_with_ordinal(index + 1)
+        yield first_image + index, 0, _stream(
+            jpeg,
+            b"/Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceGray "
+            b"/BitsPerComponent 8 /Filter /DCTDecode",
+        )
+
+
+def _tagged_table_objects(pages: int) -> Iterator[tuple[int, int, bytes]]:
+    first_page = 10
+    first_content = first_page + pages
+    kids = b" ".join(f"{first_page + i} 0 R".encode("ascii") for i in range(pages))
+    rows = []
+    for index in range(pages):
+        page = first_page + index
+        role = b"TH" if index == 0 else b"TD"
+        rows.append(
+            b"<< /Type /StructElem /S /TR /Pg %d 0 R /K ["
+            b"<< /Type /StructElem /S /%s /Pg %d 0 R /K [0] >> "
+            b"<< /Type /StructElem /S /TD /Pg %d 0 R /K [1] >>] >>"
+            % (page, role, page, page)
+        )
+    yield 1, 0, (
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 4 0 R /MarkInfo << /Marked true >> >>"
+    )
+    yield 2, 0, b"<< /Type /Pages /Kids [" + kids + b"] /Count %d >>" % pages
+    yield 3, 0, FONT
+    yield 4, 0, b"<< /Type /StructTreeRoot /K [5 0 R] >>"
+    yield 5, 0, b"<< /Type /StructElem /S /Document /K [6 0 R] >>"
+    yield 6, 0, b"<< /Type /StructElem /S /Table /K [" + b" ".join(rows) + b"] >>"
+    for index in range(pages):
+        yield first_page + index, 0, (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /StructParents %d "
+            b"/Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>"
+            % (index, first_content + index)
+        )
+    for index in range(pages):
+        content = (
+            b"/P <</MCID 0>> BDC BT /F1 11 Tf 72 720 Td (Row %04d key) Tj ET EMC\n"
+            b"/P <</MCID 1>> BDC BT /F1 11 Tf 260 720 Td (value %04d) Tj ET EMC"
+            % (index + 1, index + 1)
+        )
+        yield first_content + index, 0, _stream(content)
+
+
 def generate_small(output: Path) -> dict:
     output.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -639,6 +713,45 @@ def generate_image(output: Path, variant: str, count: int, dimension: int) -> di
     return manifest
 
 
+def generate_semantic(output: Path, variant: str, count: int) -> dict:
+    if variant not in SEMANTIC_VARIANTS:
+        raise ValueError(f"unknown semantic variant: {variant}")
+    if not 1 <= count <= 10_000:
+        raise ValueError("semantic count must be between 1 and 10000")
+    output.mkdir(parents=True, exist_ok=True)
+    name = f"{variant}-{count}.pdf"
+    path = output / name
+    objects = _ocr_objects(count) if variant == "ocr" else _tagged_table_objects(count)
+    startxref = _write_classic_streaming(path, objects)
+    if variant == "ocr":
+        facts = {
+            "pages": count,
+            "ocr_candidates": count,
+            "jpeg_ordinals": [1, count],
+            "completion_order_probe": list(range(count, 0, -1)),
+            "failure_page": (count + 1) // 2,
+        }
+    else:
+        facts = {
+            "pages": count,
+            "tagged_table_rows": count,
+            "spans_multiple_windows_when_w_lt": count,
+            "cross_page_section": True,
+        }
+    row = {
+        "name": name,
+        "bytes": path.stat().st_size,
+        "sha256": _sha256_file(path),
+        "startxref": startxref,
+        "facts": facts,
+    }
+    manifest = {"schema": 1, "profile": "semantic", "fixtures": [row]}
+    (output / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return manifest
+
+
 def verify(output: Path) -> dict:
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("schema") != 1:
@@ -663,10 +776,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("generate", "verify"))
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--profile", choices=("small", "scale", "image"), default="small")
+    parser.add_argument(
+        "--profile", choices=("small", "scale", "image", "semantic"), default="small"
+    )
     parser.add_argument("--axis", choices=SCALE_AXES)
     parser.add_argument("--count", type=int)
     parser.add_argument("--variant", choices=IMAGE_VARIANTS)
+    parser.add_argument("--semantic", choices=SEMANTIC_VARIANTS)
     parser.add_argument("--dimension", type=int, default=4096)
     args = parser.parse_args()
     if args.command == "verify":
@@ -677,10 +793,14 @@ def main() -> None:
         if args.axis is None or args.count is None:
             parser.error("scale generation requires --axis and --count")
         manifest = generate_scale(args.out, args.axis, args.count)
-    else:
+    elif args.profile == "image":
         if args.variant is None or args.count is None:
             parser.error("image generation requires --variant and --count")
         manifest = generate_image(args.out, args.variant, args.count, args.dimension)
+    else:
+        if args.semantic is None or args.count is None:
+            parser.error("semantic generation requires --semantic and --count")
+        manifest = generate_semantic(args.out, args.semantic, args.count)
     print(json.dumps({"profile": manifest["profile"], "fixtures": len(manifest["fixtures"])}, sort_keys=True))
 
 

@@ -11,6 +11,7 @@ from lazy_engine_fixtures import (
     SCALE_AXES,
     generate_image,
     generate_scale,
+    generate_semantic,
     generate_small,
     verify,
 )
@@ -192,3 +193,116 @@ def test_cli_image_profile(tmp_path):
     )
     assert json.loads(result.stdout) == {"fixtures": 1, "profile": "image"}
     assert verify(tmp_path)["fixtures"][0]["facts"]["decoded_bytes_total"] == 4 * 64 * 64 * 4
+
+
+def _jpeg_ordinal(image):
+    marker = b"L1OCR"
+    start = image.index(marker) + len(marker)
+    return int(image[start:start + 6])
+
+
+def test_ocr_candidate_fixture_freezes_order_failure_and_cache_semantics(tmp_path):
+    from distillpdf import ocr
+
+    manifest = generate_semantic(tmp_path, "ocr", 7)
+    row = manifest["fixtures"][0]
+    pdf = distillpdf.Pdf.open(str(tmp_path / row["name"]))
+    plan = pdf.ocr_plan()
+    assert [item["page"] for item in plan if item["needs_ocr"]] == list(range(1, 8))
+    assert [_jpeg_ordinal(item["image"]) for item in plan] == list(range(1, 8))
+
+    class ReverseOracle(ocr.OcrBackend):
+        tier = "fast"
+
+        def __init__(self, fail=None):
+            super().__init__()
+            self.fail = fail
+            self.calls = []
+
+        def ocr_page(self, image):
+            page = _jpeg_ordinal(image)
+            self.calls.append(page)
+            if page == self.fail:
+                raise RuntimeError(f"barrier failure page {page}")
+            return f"<text>Recovered OCR page {page:06d}</text>"
+
+    backend = ReverseOracle()
+    result = ocr.run(pdf, backend, progress=False)
+    assert backend.calls == list(range(1, 8))
+    assert list(result) == list(range(1, 8))
+    assert pdf.get_ocr() == result
+
+    failing_pdf = distillpdf.Pdf.open(str(tmp_path / row["name"]))
+    failing = ReverseOracle(fail=row["facts"]["failure_page"])
+    with pytest.raises(RuntimeError, match="barrier failure page 4"):
+        ocr.run(failing_pdf, failing, progress=False)
+    assert failing.calls == [1, 2, 3, 4]
+    assert failing_pdf.get_ocr() == {}
+
+
+def test_tagged_table_spans_pages_and_preserves_authored_rows(tmp_path):
+    manifest = generate_semantic(tmp_path, "tagged-table", 5)
+    row = manifest["fixtures"][0]
+    pdf = distillpdf.Pdf.open(str(tmp_path / row["name"]))
+    assert pdf.page_count() == 5
+    html = pdf.to_html(mode="page", return_string=True, image_mode="drop")
+    for page in range(1, 6):
+        assert f"Row {page:04d} key" in html
+        assert f"value {page:04d}" in html
+    # This phase freezes authored structure, not today's table-admission policy. The
+    # structure tree names one table with one row tied to each distinct page.
+    raw = (tmp_path / row["name"]).read_bytes()
+    assert raw.count(b"/S /Table") == 1
+    assert raw.count(b"/S /TR") == 5
+    for page_object in range(10, 15):
+        assert b"/Pg %d 0 R" % page_object in raw
+
+
+def test_cli_semantic_profile(tmp_path):
+    script = Path(__file__).with_name("lazy_engine_fixtures.py")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "generate",
+            "--profile",
+            "semantic",
+            "--semantic",
+            "ocr",
+            "--count",
+            "9",
+            "--out",
+            str(tmp_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {"fixtures": 1, "profile": "semantic"}
+    assert verify(tmp_path)["fixtures"][0]["facts"]["ocr_candidates"] == 9
+
+
+def test_native_ocr_child_accepts_generated_candidate(tmp_path):
+    from distillpdf import _distillpdf as core
+
+    if "tesseract" not in core.native_engines():
+        pytest.skip("tesseract feature not in this build")
+    manifest = generate_semantic(tmp_path, "ocr", 1)
+    name = manifest["fixtures"][0]["name"]
+    code = (
+        "import json,distillpdf; "
+        "p=distillpdf.Pdf.open(__import__('sys').argv[1]); "
+        "b=p.ocr_plan()[0]['image']; "
+        "r=distillpdf._distillpdf.ocr_page_native('tesseract',b,{'languages':['eng']}); "
+        "print(json.dumps({'type':type(r).__name__,'engines':distillpdf._distillpdf.native_engines()}))"
+    )
+    child = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path / name)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    result = json.loads(child.stdout)
+    assert result["type"] == "str"
+    assert "tesseract" in result["engines"]
