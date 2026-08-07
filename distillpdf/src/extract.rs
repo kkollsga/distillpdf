@@ -3609,7 +3609,7 @@ mod tests {
         // elements are refused (both shapes occur in the measurement corpus — one World Bank
         // table is declared as 1x9 + 1x8 + 4x13 for a single 2x12 grid).
         let (doc, spans, page) = tagged();
-        let declared = crate::structtree::declared_tables(&doc);
+        let declared = crate::structtree::declared_tables(&test_adapter(&doc));
         let annots = crate::walker::annot_rects(&test_adapter(&doc), page);
         let out = declared_pos_tables(&declared[&page], &spans, &annots);
         assert_eq!(out.refused, vec![Refusal::TooFewRows, Refusal::TooFewCols]);
@@ -3629,7 +3629,7 @@ mod tests {
         // as TD. This isolates the state the old `header.is_empty() => row 0 is TH` fallback
         // could not represent; exact declarations must not acquire an inferred header.
         let (doc, spans, page) = tagged();
-        let mut declared = crate::structtree::declared_tables(&doc);
+        let mut declared = crate::structtree::declared_tables(&test_adapter(&doc));
         for row in &mut declared.get_mut(&page).expect("page is declared")[0].rows {
             for cell in row {
                 cell.header = false;
@@ -3647,7 +3647,7 @@ mod tests {
         // The stale tag: the tree survives an edit that removed the content it named. An
         // empty grid is worse than no grid, so the page falls back to inference.
         let (doc, _spans, page) = tagged();
-        let declared = crate::structtree::declared_tables(&doc);
+        let declared = crate::structtree::declared_tables(&test_adapter(&doc));
         let out = declared_pos_tables(&declared[&page], &[], &[]);
         assert!(out.tables.is_empty());
         assert!(out.refused.iter().all(|r| *r == Refusal::TooFewRows), "got {:?}", out.refused);

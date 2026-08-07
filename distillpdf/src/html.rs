@@ -1215,7 +1215,7 @@ pub(crate) fn render_doc_elements(
     // L0 evidence: the tables the document DECLARES (`/StructTreeRoot`), keyed by page. Read
     // once for the whole document — the tree is document-wide and a table may straddle a page
     // break — and empty for the untagged majority.
-    let declared_tables = crate::structtree::declared_tables(doc);
+    let declared_tables = crate::structtree::declared_tables(access);
     // Global heading pre-detection: distrust over-used emphasis/label styles so a filing's
     // line-item flood doesn't read as hundreds of headings (see plan_headings).
     let head_plan = plan_headings(&page_spans, body, &profile);

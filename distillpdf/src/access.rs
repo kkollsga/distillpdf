@@ -269,6 +269,20 @@ impl ObjectHandle {
             ObjectOwner::EagerTrailerEntry { .. } => (0, 0),
         }
     }
+
+    /// The indirect object represented by this handle itself, excluding inline descendants.
+    ///
+    /// Structure-tree cycle detection must track referenced elements but not direct child
+    /// dictionaries, which share their owner's root id and cannot form reference cycles.
+    pub(crate) fn indirect_id(&self) -> Option<ObjectId> {
+        if !self.path.is_empty() {
+            return None;
+        }
+        match &self.owner {
+            ObjectOwner::Eager { id, .. } | ObjectOwner::Owned { id, .. } => Some(*id),
+            ObjectOwner::EagerTrailerEntry { .. } => None,
+        }
+    }
 }
 
 /// Backend-neutral access to immutable PDF objects, pages and source bytes.

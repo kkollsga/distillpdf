@@ -24,8 +24,10 @@
 //! trust rule — and hence the caps below, because a structure tree is attacker-controlled
 //! data like every other part of the file.
 
-use crate::pdfobj::deref;
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use crate::access::{read_resolved, DocumentAccess, ObjectHandle};
+use lopdf::{Dictionary, Object, ObjectId};
+#[cfg(test)]
+use lopdf::Document;
 use std::collections::{HashMap, HashSet};
 
 /// One declared table cell.
@@ -63,15 +65,28 @@ impl DeclaredTable {
 ///
 /// Empty for an untagged document, reached without touching an object beyond the catalogue
 /// lookup — the fast path that makes L0 inert where there is no declaration.
-pub(crate) fn declared_tables(doc: &Document) -> HashMap<ObjectId, Vec<DeclaredTable>> {
+pub(crate) fn declared_tables(
+    access: &dyn DocumentAccess,
+) -> HashMap<ObjectId, Vec<DeclaredTable>> {
     let mut out: HashMap<ObjectId, Vec<DeclaredTable>> = HashMap::new();
-    let Some(root) = doc.catalog().ok().and_then(|c| sub_dict_of(doc, c, b"StructTreeRoot")).cloned() else {
+    let Some(root) = access
+        .catalog()
+        .ok()
+        .and_then(|catalog| catalog.entry(access, b"StructTreeRoot").ok())
+        .filter(|root| root.read(|value| value.as_dict().is_ok()).unwrap_or(false))
+    else {
         return out;
     };
-    let mut w = Walk { doc, roles: role_map(doc, &root), classes: class_map(doc, &root), nodes: 0, visited: HashSet::new() };
+    let mut w = Walk {
+        access,
+        roles: role_map(access, &root),
+        classes: class_map(access, &root),
+        nodes: 0,
+        visited: HashSet::new(),
+    };
     let mut tables: Vec<RawTable> = Vec::new();
     let pg = page_of(&root);
-    for k in kids(doc, &root) {
+    for k in kids(access, &root) {
         w.find_tables(&k, 0, pg, &mut tables);
     }
     for t in tables {
@@ -143,7 +158,7 @@ impl RawTable {
 }
 
 struct Walk<'a> {
-    doc: &'a Document,
+    access: &'a dyn DocumentAccess,
     roles: HashMap<Vec<u8>, Vec<u8>>,
     classes: HashMap<Vec<u8>, (usize, usize)>,
     /// Structure elements entered — the work bound (see [`crate::MAX_STRUCT_NODES`]).
@@ -158,42 +173,57 @@ impl Walk<'_> {
     /// types anything (`/TableCellHeading`, as USGS does) as long as the role map says what
     /// they mean. One hop only: a map that sends A→B→A is malformed, and chasing it would
     /// put a cycle in the hot path for nothing — the spec's own example is a single hop.
-    fn role(&self, d: &Dictionary) -> Vec<u8> {
-        let Some(raw) = d.get(b"S").ok().and_then(|o| deref(self.doc, o)).and_then(|o| o.as_name().ok()) else {
-            return Vec::new();
-        };
-        self.roles.get(raw).cloned().unwrap_or_else(|| raw.to_vec())
+    fn role(&self, element: &ObjectHandle) -> Vec<u8> {
+        let raw = element
+            .read(|element| {
+                let value = element.as_dict().ok()?.get(b"S").ok()?;
+                read_resolved(self.access, value, |value| {
+                    value.as_name().ok().map(Vec::from)
+                })
+                .ok()
+                .flatten()
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        self.roles.get(&raw).cloned().unwrap_or(raw)
     }
 
     /// Resolve an object to a structure-element dictionary, honouring the cycle guard and the
     /// node budget. `None` means "stop here" — exhausted, cyclic, or not an element.
-    fn elem(&mut self, o: &Object) -> Option<Dictionary> {
+    fn elem(&mut self, element: &ObjectHandle) -> Option<ObjectHandle> {
         if self.nodes >= crate::MAX_STRUCT_NODES {
             return None;
         }
         self.nodes += 1;
-        match o {
-            Object::Dictionary(d) => Some(d.clone()),
-            Object::Reference(id) => {
-                if !self.visited.insert(*id) {
-                    return None;
-                }
-                self.doc.get_dictionary(*id).ok().cloned()
+        if let Some(id) = element.indirect_id() {
+            if !self.visited.insert(id) {
+                return None;
             }
-            _ => None,
         }
+        element
+            .read(|value| value.as_dict().is_ok())
+            .ok()
+            .filter(|is_dictionary| *is_dictionary)
+            .map(|_| element.clone())
     }
 
     /// Depth-first hunt for `/Table` elements, carrying the inherited `/Pg`.
-    fn find_tables(&mut self, o: &Object, depth: u32, pg: Option<ObjectId>, out: &mut Vec<RawTable>) {
+    fn find_tables(
+        &mut self,
+        element: &ObjectHandle,
+        depth: u32,
+        pg: Option<ObjectId>,
+        out: &mut Vec<RawTable>,
+    ) {
         if depth > crate::MAX_STRUCT_DEPTH || out.len() >= crate::MAX_STRUCT_TABLES {
             return;
         }
-        let Some(d) = self.elem(o) else { return };
-        let pg = page_of(&d).or(pg);
-        if self.role(&d) == b"Table" {
+        let Some(element) = self.elem(element) else { return };
+        let pg = page_of(&element).or(pg);
+        if self.role(&element) == b"Table" {
             let mut rows = Vec::new();
-            self.read_rows(&d, pg, 0, &mut rows);
+            self.read_rows(&element, pg, 0, &mut rows);
             if !rows.is_empty() {
                 out.push(RawTable { rows });
             }
@@ -201,51 +231,59 @@ impl Walk<'_> {
             // declaration already covers the region, so descending would double-count it.
             return;
         }
-        for k in kids(self.doc, &d) {
+        for k in kids(self.access, &element) {
             self.find_tables(&k, depth + 1, pg, out);
         }
     }
 
     /// Rows of one `/Table`: its own `/TR` kids, plus those inside `/THead`/`/TBody`/`/TFoot`.
-    fn read_rows(&mut self, d: &Dictionary, pg: Option<ObjectId>, depth: u32, rows: &mut Vec<Vec<RawCell>>) {
+    fn read_rows(
+        &mut self,
+        element: &ObjectHandle,
+        pg: Option<ObjectId>,
+        depth: u32,
+        rows: &mut Vec<Vec<RawCell>>,
+    ) {
         if depth > crate::MAX_STRUCT_DEPTH {
             return;
         }
-        for k in kids(self.doc, d) {
+        for k in kids(self.access, element) {
             if rows.len() >= crate::MAX_STRUCT_ROWS {
                 return;
             }
-            let Some(kd) = self.elem(&k) else { continue };
-            let kpg = page_of(&kd).or(pg);
-            match self.role(&kd).as_slice() {
+            let Some(kid) = self.elem(&k) else { continue };
+            let kpg = page_of(&kid).or(pg);
+            match self.role(&kid).as_slice() {
                 b"TR" => {
-                    let cells = self.read_cells(&kd, kpg);
+                    let cells = self.read_cells(&kid, kpg);
                     if !cells.is_empty() {
                         rows.push(cells);
                     }
                 }
-                b"THead" | b"TBody" | b"TFoot" => self.read_rows(&kd, kpg, depth + 1, rows),
+                b"THead" | b"TBody" | b"TFoot" => {
+                    self.read_rows(&kid, kpg, depth + 1, rows)
+                }
                 _ => {}
             }
         }
     }
 
-    fn read_cells(&mut self, row: &Dictionary, pg: Option<ObjectId>) -> Vec<RawCell> {
+    fn read_cells(&mut self, row: &ObjectHandle, pg: Option<ObjectId>) -> Vec<RawCell> {
         let mut cells = Vec::new();
-        for k in kids(self.doc, row) {
+        for k in kids(self.access, row) {
             if cells.len() >= crate::MAX_STRUCT_COLS {
                 break;
             }
-            let Some(cd) = self.elem(&k) else { continue };
-            let role = self.role(&cd);
+            let Some(cell) = self.elem(&k) else { continue };
+            let role = self.role(&cell);
             let header = role == b"TH";
             if !header && role != b"TD" {
                 continue;
             }
-            let cpg = page_of(&cd).or(pg);
-            let (rowspan, colspan) = self.spans_of(&cd);
+            let cpg = page_of(&cell).or(pg);
+            let (rowspan, colspan) = self.spans_of(&cell);
             let mut c = RawCell { header, rowspan, colspan, mcids: Vec::new(), objs: Vec::new() };
-            self.harvest(&cd, cpg, 0, &mut c);
+            self.harvest(&cell, cpg, 0, &mut c);
             cells.push(c);
         }
         cells
@@ -254,43 +292,66 @@ impl Walk<'_> {
     /// `/RowSpan` and `/ColSpan`, from the element's `/A` attribute dictionaries (one, or an
     /// array of them) and from its `/C` class, clamped so a hostile `/ColSpan 2000000000`
     /// cannot become an allocation.
-    fn spans_of(&self, d: &Dictionary) -> (usize, usize) {
+    fn spans_of(&self, element: &ObjectHandle) -> (usize, usize) {
         let clamp = |v: usize| v.clamp(1, crate::MAX_STRUCT_COLS);
-        let (mut rs, mut cs) = (1usize, 1usize);
-        if let Some(cls) = d.get(b"C").ok().and_then(|o| deref(self.doc, o)).and_then(|o| o.as_name().ok()) {
-            if let Some(&(r, c)) = self.classes.get(cls) {
-                rs = r;
-                cs = c;
-            }
-        }
-        let doc = self.doc;
-        let mut apply = |o: &Object| {
-            if let Some(a) = deref(doc, o).and_then(|o| o.as_dict().ok()) {
-                if let Some(v) = int_key(doc, a, b"RowSpan") {
-                    rs = clamp(v);
+        element
+            .read(|element| {
+                let element = element.as_dict().ok()?;
+                let (mut rs, mut cs) = (1usize, 1usize);
+                if let Some(class) = element.get(b"C").ok().and_then(|value| {
+                    read_resolved(self.access, value, |value| {
+                        value.as_name().ok().map(Vec::from)
+                    })
+                    .ok()
+                    .flatten()
+                }) {
+                    if let Some(&(rowspan, colspan)) = self.classes.get(&class) {
+                        rs = rowspan;
+                        cs = colspan;
+                    }
                 }
-                if let Some(v) = int_key(doc, a, b"ColSpan") {
-                    cs = clamp(v);
+                let mut apply = |object: &Object| {
+                    let _ = read_resolved(self.access, object, |object| {
+                        if let Ok(attributes) = object.as_dict() {
+                            if let Some(value) = int_key(self.access, attributes, b"RowSpan") {
+                                rs = clamp(value);
+                            }
+                            if let Some(value) = int_key(self.access, attributes, b"ColSpan") {
+                                cs = clamp(value);
+                            }
+                        }
+                    });
+                };
+                if let Ok(attributes) = element.get(b"A") {
+                    let _ = read_resolved(self.access, attributes, |attributes| match attributes {
+                        Object::Array(items) => items
+                            .iter()
+                            .take(crate::MAX_STRUCT_COLS)
+                            .for_each(&mut apply),
+                        other => apply(other),
+                    });
                 }
-            }
-        };
-        if let Some(a) = d.get(b"A").ok().and_then(|o| deref(doc, o)) {
-            match a {
-                Object::Array(items) => items.iter().take(crate::MAX_STRUCT_COLS).for_each(&mut apply),
-                other => apply(other),
-            }
-        }
-        (clamp(rs), clamp(cs))
+                Some((clamp(rs), clamp(cs)))
+            })
+            .ok()
+            .flatten()
+            .unwrap_or((1, 1))
     }
 
     /// A cell's content references: `/MCID` integers (bare kids, or `/MCR` dictionaries) and
     /// `/OBJR` referents. Descends through whatever wrappers the producer put between the
     /// cell and its content (`/P`, `/Span`, `/Link`, a vendor role, …).
-    fn harvest(&mut self, d: &Dictionary, pg: Option<ObjectId>, depth: u32, out: &mut RawCell) {
+    fn harvest(
+        &mut self,
+        element: &ObjectHandle,
+        pg: Option<ObjectId>,
+        depth: u32,
+        out: &mut RawCell,
+    ) {
         if depth > crate::MAX_STRUCT_DEPTH {
             return;
         }
-        for k in kids(self.doc, d) {
+        for k in kids(self.access, element) {
             if out.mcids.len() + out.objs.len() >= crate::MAX_STRUCT_CELL_REFS {
                 return;
             }
@@ -299,21 +360,39 @@ impl Walk<'_> {
             // content as `/K [521 0 R]` where object 521 is the integer `2`; reading only
             // direct integers found 34 declared tables in that file and not one cell's
             // content, which the trust rule then correctly (and uselessly) refused.
-            match deref(self.doc, &k) {
-                Some(Object::Integer(n)) => {
-                    if let (Some(p), Ok(m)) = (pg, u32::try_from(*n)) {
+            match k.read(|value| value.as_i64().ok()).ok().flatten() {
+                Some(number) => {
+                    if let (Some(p), Ok(m)) = (pg, u32::try_from(number)) {
                         out.mcids.push((p, m));
                     }
                 }
                 _ => {
-                    let Some(kd) = self.elem(&k) else { continue };
-                    let kpg = page_of(&kd).or(pg);
-                    if let (Some(p), Some(m)) = (kpg, int_key(self.doc, &kd, b"MCID").and_then(|m| u32::try_from(m).ok())) {
+                    let Some(kid) = self.elem(&k) else { continue };
+                    let kpg = page_of(&kid).or(pg);
+                    let mcid = kid
+                        .read(|kid| {
+                            int_key(self.access, kid.as_dict().ok()?, b"MCID")
+                                .and_then(|value| u32::try_from(value).ok())
+                        })
+                        .ok()
+                        .flatten();
+                    let object = kid
+                        .read(|kid| {
+                            kid.as_dict()
+                                .ok()?
+                                .get(b"Obj")
+                                .ok()?
+                                .as_reference()
+                                .ok()
+                        })
+                        .ok()
+                        .flatten();
+                    if let (Some(p), Some(m)) = (kpg, mcid) {
                         out.mcids.push((p, m));
-                    } else if let (Some(p), Ok(Object::Reference(id))) = (kpg, kd.get(b"Obj")) {
-                        out.objs.push((p, *id));
+                    } else if let (Some(p), Some(id)) = (kpg, object) {
+                        out.objs.push((p, id));
                     } else {
-                        self.harvest(&kd, kpg, depth + 1, out);
+                        self.harvest(&kid, kpg, depth + 1, out);
                     }
                 }
             }
@@ -322,63 +401,142 @@ impl Walk<'_> {
 }
 
 /// `/K`, normalised to a list: the spec allows a single kid, an array, or nothing.
-fn kids(doc: &Document, d: &Dictionary) -> Vec<Object> {
-    match d.get(b"K").ok().and_then(|o| deref(doc, o)) {
-        Some(Object::Array(a)) => a.iter().take(crate::MAX_STRUCT_KIDS).cloned().collect(),
-        Some(other) => vec![other.clone()],
-        None => Vec::new(),
+fn kids(access: &dyn DocumentAccess, element: &ObjectHandle) -> Vec<ObjectHandle> {
+    let Ok(kids) = element.dictionary_entry(access, b"K") else {
+        return Vec::new();
+    };
+    let count = kids
+        .read(|kids| match kids {
+            Object::Array(items) => Some(items.len().min(crate::MAX_STRUCT_KIDS)),
+            _ => None,
+        })
+        .ok()
+        .flatten();
+    match count {
+        Some(count) => (0..count)
+            .filter_map(|index| kids.array_entry(access, index).ok())
+            .collect(),
+        None => vec![kids],
     }
 }
 
 /// The `/Pg` an element names, if any — inherited by its kids (§14.7.4.2). Read raw: a
-/// `deref` would resolve the reference and lose the identity we need.
-fn page_of(d: &Dictionary) -> Option<ObjectId> {
-    match d.get(b"Pg") {
-        Ok(Object::Reference(id)) => Some(*id),
-        _ => None,
-    }
+/// Resolving the reference would lose the identity we need.
+fn page_of(element: &ObjectHandle) -> Option<ObjectId> {
+    element
+        .read(|element| {
+            element
+                .as_dict()
+                .ok()?
+                .get(b"Pg")
+                .ok()?
+                .as_reference()
+                .ok()
+        })
+        .ok()
+        .flatten()
 }
 
-fn int_key(doc: &Document, d: &Dictionary, key: &[u8]) -> Option<usize> {
-    usize::try_from(d.get(key).ok().and_then(|o| deref(doc, o))?.as_i64().ok()?).ok()
+fn int_key(access: &dyn DocumentAccess, dictionary: &Dictionary, key: &[u8]) -> Option<usize> {
+    let value = dictionary.get(key).ok()?;
+    read_resolved(access, value, |value| {
+        value
+            .as_i64()
+            .ok()
+            .and_then(|value| usize::try_from(value).ok())
+    })
+    .ok()
+    .flatten()
 }
 
-fn sub_dict_of<'a>(doc: &'a Document, d: &'a Dictionary, key: &[u8]) -> Option<&'a Dictionary> {
-    d.get(key).ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok())
-}
-
-fn role_map(doc: &Document, root: &Dictionary) -> HashMap<Vec<u8>, Vec<u8>> {
+fn role_map(
+    access: &dyn DocumentAccess,
+    root: &ObjectHandle,
+) -> HashMap<Vec<u8>, Vec<u8>> {
     let mut m = HashMap::new();
-    if let Some(rm) = sub_dict_of(doc, root, b"RoleMap") {
-        for (k, v) in rm.iter().take(crate::MAX_STRUCT_KIDS) {
-            if let Some(n) = deref(doc, v).and_then(|o| o.as_name().ok()) {
-                m.insert(k.to_vec(), n.to_vec());
-            }
-        }
+    let Ok(role_map) = root.dictionary_entry(access, b"RoleMap") else {
+        return m;
+    };
+    let entries = role_map
+        .read(|role_map| {
+            let role_map = role_map.as_dict().ok()?;
+            Some(
+                role_map
+                    .iter()
+                    .take(crate::MAX_STRUCT_KIDS)
+                    .filter_map(|(key, value)| {
+                        read_resolved(access, value, |value| {
+                            value
+                                .as_name()
+                                .ok()
+                                .map(|name| (key.to_vec(), name.to_vec()))
+                        })
+                        .ok()
+                        .flatten()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    for (key, value) in entries {
+        m.insert(key, value);
     }
     m
 }
 
 /// `/ClassMap`: named attribute sets a `/C` may point at instead of spelling `/A` out.
-fn class_map(doc: &Document, root: &Dictionary) -> HashMap<Vec<u8>, (usize, usize)> {
+fn class_map(
+    access: &dyn DocumentAccess,
+    root: &ObjectHandle,
+) -> HashMap<Vec<u8>, (usize, usize)> {
     let mut m = HashMap::new();
-    let Some(cm) = sub_dict_of(doc, root, b"ClassMap") else { return m };
-    for (k, v) in cm.iter().take(crate::MAX_STRUCT_KIDS) {
-        let (mut rs, mut cs) = (None, None);
-        let mut read = |o: &Object| {
-            if let Some(a) = deref(doc, o).and_then(|o| o.as_dict().ok()) {
-                rs = int_key(doc, a, b"RowSpan").or(rs);
-                cs = int_key(doc, a, b"ColSpan").or(cs);
-            }
-        };
-        match deref(doc, v) {
-            Some(Object::Array(items)) => items.iter().take(crate::MAX_STRUCT_COLS).for_each(&mut read),
-            Some(other) => read(other),
-            None => {}
-        }
-        if rs.is_some() || cs.is_some() {
-            m.insert(k.to_vec(), (rs.unwrap_or(1).clamp(1, crate::MAX_STRUCT_COLS), cs.unwrap_or(1).clamp(1, crate::MAX_STRUCT_COLS)));
-        }
+    let Ok(class_map) = root.dictionary_entry(access, b"ClassMap") else {
+        return m;
+    };
+    let entries = class_map
+        .read(|class_map| {
+            let class_map = class_map.as_dict().ok()?;
+            Some(
+                class_map
+                    .iter()
+                    .take(crate::MAX_STRUCT_KIDS)
+                    .filter_map(|(key, value)| {
+                        let (mut rs, mut cs) = (None, None);
+                        let mut read = |object: &Object| {
+                            let _ = read_resolved(access, object, |object| {
+                                if let Ok(attributes) = object.as_dict() {
+                                    rs = int_key(access, attributes, b"RowSpan").or(rs);
+                                    cs = int_key(access, attributes, b"ColSpan").or(cs);
+                                }
+                            });
+                        };
+                        let _ = read_resolved(access, value, |value| match value {
+                            Object::Array(items) => items
+                                .iter()
+                                .take(crate::MAX_STRUCT_COLS)
+                                .for_each(&mut read),
+                            other => read(other),
+                        });
+                        (rs.is_some() || cs.is_some()).then(|| {
+                            (
+                                key.to_vec(),
+                                (
+                                    rs.unwrap_or(1).clamp(1, crate::MAX_STRUCT_COLS),
+                                    cs.unwrap_or(1).clamp(1, crate::MAX_STRUCT_COLS),
+                                ),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    for (key, value) in entries {
+        m.insert(key, value);
     }
     m
 }
@@ -429,7 +587,7 @@ mod tests {
             ]);
             doc.add_object(dictionary! { "K" => t })
         });
-        let found = declared_tables(&doc);
+        let found = declared_tables(&crate::access::test_adapter(&doc));
         let page = *doc.get_pages().get(&1).expect("one page");
         let t = &found.get(&page).expect("the page carries the declaration")[0];
         assert_eq!(t.rows.len(), 2);
@@ -451,7 +609,7 @@ mod tests {
             })
         });
         let page = *doc.get_pages().get(&1).expect("one page");
-        let found = declared_tables(&doc);
+        let found = declared_tables(&crate::access::test_adapter(&doc));
         let t = &found.get(&page).expect("role-mapped table found")[0];
         assert_eq!(t.rows.len(), 2);
         assert!(t.rows[0][0].header, "a role-mapped /TH is still a header cell");
@@ -469,7 +627,7 @@ mod tests {
             doc.add_object(dictionary! { "K" => table(vec![body]) })
         });
         let page = *doc.get_pages().get(&1).expect("one page");
-        assert_eq!(declared_tables(&doc)[&page][0].rows.len(), 2);
+        assert_eq!(declared_tables(&crate::access::test_adapter(&doc))[&page][0].rows.len(), 2);
     }
 
     #[test]
@@ -486,7 +644,8 @@ mod tests {
             doc.add_object(dictionary! { "K" => table(vec![tr(vec![wide]), tr(vec![hostile])]) })
         });
         let page = *doc.get_pages().get(&1).expect("one page");
-        let t = &declared_tables(&doc)[&page][0];
+        let declared = declared_tables(&crate::access::test_adapter(&doc));
+        let t = &declared[&page][0];
         assert_eq!((t.rows[0][0].rowspan, t.rows[0][0].colspan), (2, 4));
         assert_eq!(t.rows[1][0].colspan, crate::MAX_STRUCT_COLS, "a hostile span is clamped, never allocated");
         assert_eq!(t.cols(), crate::MAX_STRUCT_COLS);
@@ -509,7 +668,7 @@ mod tests {
             "Type" => "Catalog", "Pages" => pages, "StructTreeRoot" => root
         });
         doc.trailer.set("Root", Object::Reference(cat));
-        assert!(declared_tables(&doc).is_empty(), "a cycle must terminate with no tables, not hang");
+        assert!(declared_tables(&crate::access::test_adapter(&doc)).is_empty(), "a cycle must terminate with no tables, not hang");
     }
 
     #[test]
@@ -519,7 +678,7 @@ mod tests {
         let pages = doc.add_object(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 });
         let cat = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
         doc.trailer.set("Root", Object::Reference(cat));
-        assert!(declared_tables(&doc).is_empty());
+        assert!(declared_tables(&crate::access::test_adapter(&doc)).is_empty());
     }
 
     #[test]
@@ -540,7 +699,7 @@ mod tests {
             "Type" => "Catalog", "Pages" => pages, "StructTreeRoot" => root
         });
         doc.trailer.set("Root", Object::Reference(cat));
-        let found = declared_tables(&doc);
+        let found = declared_tables(&crate::access::test_adapter(&doc));
         assert_eq!(found[&p1][0].rows.len(), 2);
         assert_eq!(found[&p2][0].rows.len(), 1);
     }
