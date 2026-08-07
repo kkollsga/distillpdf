@@ -48,13 +48,26 @@ impl fmt::Display for AccessError {
 /// graph. `Owned` is the lazy-reader shape: one independently owned resolved object. Neither
 /// variant exposes an object-derived borrow beyond the closure passed to [`Self::read`].
 #[derive(Clone)]
-pub(crate) enum ObjectHandle {
+enum ObjectOwner {
     Eager {
         document: Arc<Document>,
         id: ObjectId,
     },
     #[allow(dead_code)] // constructed by the L3 indexed adapter
-    Owned(Arc<Object>),
+    Owned { object: Arc<Object>, id: ObjectId },
+}
+
+#[derive(Clone)]
+enum PathStep {
+    DictionaryKey(Vec<u8>),
+    StreamDictionaryKey(Vec<u8>),
+    ArrayIndex(usize),
+}
+
+#[derive(Clone)]
+pub(crate) struct ObjectHandle {
+    owner: ObjectOwner,
+    path: Vec<PathStep>,
 }
 
 /// A typed object handle that can only be inspected as a stream.
@@ -82,22 +95,109 @@ impl StreamHandle {
 }
 
 impl ObjectHandle {
-    /// Inspect the resolved value without allowing its borrow to escape the handle.
-    pub(crate) fn read<R>(&self, inspect: impl FnOnce(&Object) -> R) -> Result<R, AccessError> {
-        match self {
-            Self::Eager { document, id } => {
-                let object = document
-                    .get_object(*id)
-                    .map_err(|error| AccessError::object(*id, error))?;
-                Ok(inspect(object))
-            }
-            Self::Owned(object) => Ok(inspect(object)),
+    fn eager(document: Arc<Document>, id: ObjectId) -> Self {
+        Self {
+            owner: ObjectOwner::Eager { document, id },
+            path: Vec::new(),
         }
     }
 
+    /// Inspect the resolved value without allowing its borrow to escape the handle.
+    pub(crate) fn read<R>(&self, inspect: impl FnOnce(&Object) -> R) -> Result<R, AccessError> {
+        let (mut object, id) = match &self.owner {
+            ObjectOwner::Eager { document, id } => {
+                let object = document
+                    .get_object(*id)
+                    .map_err(|error| AccessError::object(*id, error))?;
+                (object, *id)
+            }
+            ObjectOwner::Owned { object, id } => (object.as_ref(), *id),
+        };
+        for step in &self.path {
+            object = match step {
+                PathStep::DictionaryKey(key) => object
+                    .as_dict()
+                    .and_then(|dictionary| dictionary.get(key))
+                    .map_err(|error| AccessError::object(id, error))?,
+                PathStep::StreamDictionaryKey(key) => object
+                    .as_stream()
+                    .and_then(|stream| stream.dict.get(key))
+                    .map_err(|error| AccessError::object(id, error))?,
+                PathStep::ArrayIndex(index) => object
+                    .as_array()
+                    .ok()
+                    .and_then(|array| array.get(*index))
+                    .ok_or_else(|| AccessError::object(id, format!("array index {index} is out of bounds")))?,
+            };
+        }
+        Ok(inspect(object))
+    }
+
     #[allow(dead_code)] // constructed by the L3 indexed adapter; unit-tested in L2
-    fn owned(object: Object) -> Self {
-        Self::Owned(Arc::new(object))
+    fn owned(id: ObjectId, object: Object) -> Self {
+        Self {
+            owner: ObjectOwner::Owned {
+                object: Arc::new(object),
+                id,
+            },
+            path: Vec::new(),
+        }
+    }
+
+    fn child(&self, access: &dyn DocumentAccess, step: PathStep) -> Result<Self, AccessError> {
+        let reference = {
+            let mut path = self.path.clone();
+            path.push(step.clone());
+            let candidate = Self {
+                owner: self.owner.clone(),
+                path,
+            };
+            candidate.read(|object| object.as_reference().ok())?
+        };
+        if let Some(id) = reference {
+            access.object(id)
+        } else {
+            let mut path = self.path.clone();
+            path.push(step);
+            Ok(Self {
+                owner: self.owner.clone(),
+                path,
+            })
+        }
+    }
+
+    /// A dictionary entry that stays attached to the root object which owns an inline value.
+    #[allow(dead_code)] // consumer migrations begin in L2b
+    pub(crate) fn dictionary_entry(
+        &self,
+        access: &dyn DocumentAccess,
+        key: &[u8],
+    ) -> Result<Self, AccessError> {
+        let step = self.read(|object| match object {
+            Object::Dictionary(_) => Some(PathStep::DictionaryKey(key.to_vec())),
+            Object::Stream(_) => Some(PathStep::StreamDictionaryKey(key.to_vec())),
+            _ => None,
+        })?;
+        self.child(
+            access,
+            step.ok_or_else(|| AccessError::object(self.root_id(), "object has no dictionary"))?,
+        )
+    }
+
+    /// An array entry that stays attached to the root object which owns it.
+    #[allow(dead_code)] // consumer migrations begin in L2b
+    pub(crate) fn array_entry(
+        &self,
+        access: &dyn DocumentAccess,
+        index: usize,
+    ) -> Result<Self, AccessError> {
+        self.child(access, PathStep::ArrayIndex(index))
+    }
+
+    fn root_id(&self) -> ObjectId {
+        match &self.owner {
+            ObjectOwner::Eager { id, .. } | ObjectOwner::Owned { id, .. } => *id,
+        }
     }
 }
 
@@ -150,10 +250,7 @@ impl DocumentAccess for EagerDocumentAdapter {
         self.document
             .get_object(id)
             .map_err(|error| AccessError::object(id, error))?;
-        Ok(ObjectHandle::Eager {
-            document: Arc::clone(&self.document),
-            id,
-        })
+        Ok(ObjectHandle::eager(Arc::clone(&self.document), id))
     }
 
     fn pages(&self) -> Result<Vec<PageRef>, AccessError> {
@@ -234,6 +331,7 @@ impl SourceRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::dictionary;
 
     fn adapter(objects: Vec<Object>, raw: &[u8]) -> (EagerDocumentAdapter, Vec<ObjectId>) {
         let mut document = Document::with_version("1.7");
@@ -289,7 +387,7 @@ mod tests {
 
     #[test]
     fn owned_handle_and_source_range_keep_their_owners_alive() {
-        let handle = ObjectHandle::owned(Object::String(
+        let handle = ObjectHandle::owned((7, 0), Object::String(
             b"owned".to_vec(),
             lopdf::StringFormat::Literal,
         ));
@@ -309,5 +407,30 @@ mod tests {
     fn typed_stream_handles_reject_non_streams() {
         let (adapter, ids) = adapter(vec![Object::Integer(1)], b"");
         assert!(adapter.stream(ids[0]).is_err());
+    }
+
+    #[test]
+    fn nested_handles_pin_inline_values_and_resolve_nested_references() {
+        let nested = Object::Dictionary(lopdf::dictionary! {
+            "Direct" => Object::Array(vec![Object::String(
+                b"inline".to_vec(),
+                lopdf::StringFormat::Literal,
+            )]),
+            "Indirect" => Object::Reference((1, 0)),
+        });
+        let (adapter, ids) = adapter(vec![Object::Integer(42), nested], b"");
+        let root = adapter.object(ids[1]).unwrap();
+        let direct = root
+            .dictionary_entry(&adapter, b"Direct")
+            .unwrap()
+            .array_entry(&adapter, 0)
+            .unwrap();
+        let indirect = root.dictionary_entry(&adapter, b"Indirect").unwrap();
+        drop(root);
+        assert_eq!(
+            direct.read(|object| object.as_str().unwrap().to_vec()).unwrap(),
+            b"inline"
+        );
+        assert_eq!(indirect.read(|object| object.as_i64().unwrap()).unwrap(), 42);
     }
 }
