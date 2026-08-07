@@ -101,7 +101,7 @@ fn image_coverage(
     if placed.is_empty() {
         return 0.0;
     }
-    let (w, h) = super::page_size_pts(doc, page_id);
+    let (w, h) = super::page_size_pts(access, page_id);
     let page_area = (w * h).max(1.0);
     placed
         .iter()

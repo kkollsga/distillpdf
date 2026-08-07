@@ -53,8 +53,8 @@ fn data_uri_bytes(uri: &str) -> Option<Vec<u8>> {
 /// Page size in PDF points, from the one page-box walker ([`crate::pdfobj::page_box`]):
 /// `/MediaBox` then `/CropBox`, inherited up `/Parent`, indirect extents resolved. Defaults
 /// to [`crate::pdfobj::DEFAULT_PAGE_PTS`] only when the document states no box at all.
-pub(crate) fn page_size_pts(doc: &Document, page_id: ObjectId) -> (f32, f32) {
-    match crate::pdfobj::page_box(doc, page_id) {
+pub(crate) fn page_size_pts(access: &dyn crate::access::DocumentAccess, page_id: ObjectId) -> (f32, f32) {
+    match crate::pdfobj::page_box(access, page_id) {
         Some([x0, y0, x1, y1]) => ((x1 - x0).abs().max(1.0), (y1 - y0).abs().max(1.0)),
         None => crate::pdfobj::DEFAULT_PAGE_PTS,
     }
@@ -83,6 +83,11 @@ pub fn detect_language(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::test_adapter;
+
+    fn page_size_pts(doc: &Document, page_id: ObjectId) -> (f32, f32) {
+        super::page_size_pts(&test_adapter(doc), page_id)
+    }
 
     /// The owned page-box fixture (`tests/gen_fixtures.py::gen_indirect_mediabox`).
     fn box_fixture() -> Document {

@@ -1814,7 +1814,12 @@ fn text_from_spans(mut spans: Vec<Span>) -> String {
 }
 
 /// Diagnostic: report font table + content status for one page.
-pub fn debug_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> String {
+pub fn debug_page(
+    doc: &Document,
+    access: &dyn crate::access::DocumentAccess,
+    page_id: ObjectId,
+    raw: &[u8],
+) -> String {
     let fonts = build_fonts(doc, page_id, raw);
     let mut s = format!("fonts={}\n", fonts.len());
     for (k, fi) in &fonts {
@@ -1853,7 +1858,7 @@ pub fn debug_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> String {
     // Stream integrity for this page's OWN content streams. A truncated Flate stream is
     // reported `Ok` by lopdf and renders short with no error at all, so the one page-level
     // diagnostic in the crate is where "the ops below are all there were" has to be said.
-    for issue in crate::pdfobj::page_stream_issues(doc, page_id) {
+    for issue in crate::pdfobj::page_stream_issues(access, page_id) {
         s += &format!("stream {:?}: {} ({}), {} bytes recovered\n", issue.object, issue.kind, issue.filter, issue.recovered);
     }
     match doc.get_and_decode_page_content(page_id) {

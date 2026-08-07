@@ -53,7 +53,7 @@ pub(crate) fn build_model(
     let pages: Vec<Page> = page_map
         .iter()
         .map(|(&n, &pid)| {
-            let (w, h) = ocr::page_size_pts(doc, pid);
+            let (w, h) = ocr::page_size_pts(access, pid);
             let decision: OcrDecision = ocr::detect::decide(doc, access, pid, raw).into();
             let mut lmap: BTreeMap<String, String> = BTreeMap::new();
             if let Some(lbl) = labels.get(&n) {

@@ -16,6 +16,7 @@
 //! Every function here is total: malformed input degrades (a default, `None`, or the raw
 //! bytes) and never panics, never fabricates data, and never loops unboundedly.
 
+use crate::access::{read_resolved, DocumentAccess};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::borrow::Cow;
 
@@ -65,6 +66,11 @@ pub(crate) fn num(o: &Object) -> f32 {
 /// indirectly). Terminates for the same reason [`deref`] does.
 pub(crate) fn num_deref(doc: &Document, o: &Object) -> f32 {
     deref(doc, o).map(num).unwrap_or(0.0)
+}
+
+/// Backend-neutral form of [`num_deref`].
+pub(crate) fn num_resolved(access: &dyn DocumentAccess, object: &Object) -> f32 {
+    read_resolved(access, object, num).unwrap_or(0.0)
 }
 
 /// A stream's decoded bytes, decompressed when it carries a `/Filter`.
@@ -130,7 +136,7 @@ pub(crate) fn has_legacy_unsupported_filter(dict: &Dictionary) -> bool {
 ///   mean US Letter — that decision belongs to the caller, which should reach for
 ///   [`DEFAULT_PAGE_PTS`]. The box is returned as authored: it may be inverted or
 ///   degenerate, so callers take `.abs()` of the extents they care about.
-pub(crate) fn page_box(doc: &Document, page_id: ObjectId) -> Option<[f32; 4]> {
+pub(crate) fn page_box(access: &dyn DocumentAccess, page_id: ObjectId) -> Option<[f32; 4]> {
     let mut node = page_id;
     let mut seen: Vec<ObjectId> = Vec::new();
     for _ in 0..crate::MAX_FORM_DEPTH {
@@ -138,21 +144,36 @@ pub(crate) fn page_box(doc: &Document, page_id: ObjectId) -> Option<[f32; 4]> {
             return None; // cyclic /Parent chain
         }
         seen.push(node);
-        let dict = doc.get_object(node).ok()?.as_dict().ok()?;
-        let found = dict
-            .get(b"MediaBox")
+        let handle = access.object(node).ok()?;
+        let (found, parent) = handle
+            .read(|object| {
+                let dict = object.as_dict().ok()?;
+                let found = dict
+                    .get(b"MediaBox")
+                    .ok()
+                    .or_else(|| dict.get(b"CropBox").ok())
+                    .and_then(|value| {
+                        read_resolved(access, value, |resolved| {
+                            let values = resolved.as_array().ok()?.get(..4)?;
+                            Some([
+                                num_resolved(access, &values[0]),
+                                num_resolved(access, &values[1]),
+                                num_resolved(access, &values[2]),
+                                num_resolved(access, &values[3]),
+                            ])
+                        })
+                        .ok()
+                        .flatten()
+                    });
+                let parent = dict.get(b"Parent").ok().and_then(|value| value.as_reference().ok());
+                Some((found, parent))
+            })
             .ok()
-            .or_else(|| dict.get(b"CropBox").ok())
-            .and_then(|o| deref(doc, o))
-            .and_then(|o| o.as_array().ok())
-            .filter(|a| a.len() >= 4);
-        if let Some(a) = found {
-            return Some([num_deref(doc, &a[0]), num_deref(doc, &a[1]), num_deref(doc, &a[2]), num_deref(doc, &a[3])]);
+            .flatten()?;
+        if found.is_some() {
+            return found;
         }
-        node = match dict.get(b"Parent") {
-            Ok(Object::Reference(r)) => *r,
-            _ => return None,
-        };
+        node = parent?;
     }
     None
 }
@@ -172,7 +193,7 @@ pub(crate) fn page_box(doc: &Document, page_id: ObjectId) -> Option<[f32; 4]> {
 ///   non-number, a dangling reference — is **`0`**: a page we cannot turn squarely is left
 ///   alone rather than skewed.
 /// - Never panics, never loops (visited set + [`crate::MAX_FORM_DEPTH`]).
-pub(crate) fn page_rotation(doc: &Document, page_id: ObjectId) -> i32 {
+pub(crate) fn page_rotation(access: &dyn DocumentAccess, page_id: ObjectId) -> i32 {
     let mut node = page_id;
     let mut seen: Vec<ObjectId> = Vec::new();
     for _ in 0..crate::MAX_FORM_DEPTH {
@@ -180,18 +201,27 @@ pub(crate) fn page_rotation(doc: &Document, page_id: ObjectId) -> i32 {
             return 0; // cyclic /Parent chain
         }
         seen.push(node);
-        let dict = match doc.get_object(node).ok().and_then(|o| o.as_dict().ok()) {
-            Some(d) => d,
-            None => return 0,
+        let Some((rotation, parent)) = access.object(node).ok().and_then(|handle| {
+            handle
+                .read(|object| {
+                    let dict = object.as_dict().ok()?;
+                    let rotation = dict.get(b"Rotate").ok().map(|value| num_resolved(access, value));
+                    let parent = dict.get(b"Parent").ok().and_then(|value| value.as_reference().ok());
+                    Some((rotation, parent))
+                })
+                .ok()
+                .flatten()
+        }) else {
+            return 0;
         };
-        if let Ok(o) = dict.get(b"Rotate") {
-            // A dictionary value may legally be indirect, so `num_deref`, not `num`.
-            let deg = num_deref(doc, o).round() as i32;
+        if let Some(rotation) = rotation {
+            // A dictionary value may legally be indirect, so `num_resolved`, not `num`.
+            let deg = rotation.round() as i32;
             return if deg % 90 == 0 { deg.rem_euclid(360) } else { 0 };
         }
-        node = match dict.get(b"Parent") {
-            Ok(Object::Reference(r)) => *r,
-            _ => return 0,
+        node = match parent {
+            Some(id) => id,
+            None => return 0,
         };
     }
     0
@@ -360,8 +390,12 @@ pub(crate) fn flate_incomplete(stream: &lopdf::Stream) -> Option<usize> {
 /// Deterministic (lopdf stores objects in a `BTreeMap`) and total: a document with no
 /// damaged stream returns an empty list. See [`StreamIssue::kind`] for what is reported and
 /// [`flate_incomplete`] for why the truncation case needs an independent decode.
-pub(crate) fn stream_issues(doc: &Document) -> Vec<StreamIssue> {
-    doc.objects.iter().filter_map(|(id, obj)| stream_issue(*id, obj.as_stream().ok()?)).collect()
+pub(crate) fn stream_issues(access: &dyn DocumentAccess) -> Vec<StreamIssue> {
+    access
+        .object_ids()
+        .into_iter()
+        .filter_map(|id| access.stream(id).ok()?.read(|stream| stream_issue(id, stream)).flatten())
+        .collect()
 }
 
 /// [`stream_issues`] for a single stream: `None` when its bytes decode cleanly (or it carries
@@ -412,18 +446,30 @@ fn stream_issue(id: ObjectId, s: &lopdf::Stream) -> Option<StreamIssue> {
 /// `/Contents` is either one stream or an array of them (a writer may split a page's content
 /// at any byte boundary), and either form may be indirect — so both are followed here rather
 /// than at the two call sites.
-pub(crate) fn page_stream_issues(doc: &Document, page_id: ObjectId) -> Vec<StreamIssue> {
-    let Ok(dict) = doc.get_object(page_id).and_then(|o| o.as_dict()) else {
-        return Vec::new();
-    };
-    let mut ids: Vec<ObjectId> = Vec::new();
-    match dict.get(b"Contents") {
-        Ok(Object::Reference(r)) => ids.push(*r),
-        Ok(Object::Array(a)) => ids.extend(a.iter().filter_map(|o| o.as_reference().ok())),
-        _ => {}
-    }
+pub(crate) fn page_stream_issues(access: &dyn DocumentAccess, page_id: ObjectId) -> Vec<StreamIssue> {
+    let ids = access
+        .object(page_id)
+        .ok()
+        .and_then(|handle| {
+            handle
+                .read(|object| {
+                    let dict = object.as_dict().ok()?;
+                    let mut ids: Vec<ObjectId> = Vec::new();
+                    match dict.get(b"Contents") {
+                        Ok(Object::Reference(id)) => ids.push(*id),
+                        Ok(Object::Array(values)) => {
+                            ids.extend(values.iter().filter_map(|value| value.as_reference().ok()));
+                        }
+                        _ => {}
+                    }
+                    Some(ids)
+                })
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_default();
     ids.into_iter()
-        .filter_map(|id| stream_issue(id, doc.get_object(id).ok()?.as_stream().ok()?))
+        .filter_map(|id| access.stream(id).ok()?.read(|stream| stream_issue(id, stream)).flatten())
         .collect()
 }
 
@@ -438,7 +484,20 @@ pub(crate) fn sub_dict<'a>(doc: &'a Document, d: &'a Dictionary, key: &[u8]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::test_adapter;
     use lopdf::{dictionary, Stream};
+
+    fn page_box(doc: &Document, page_id: ObjectId) -> Option<[f32; 4]> {
+        super::page_box(&test_adapter(doc), page_id)
+    }
+
+    fn page_rotation(doc: &Document, page_id: ObjectId) -> i32 {
+        super::page_rotation(&test_adapter(doc), page_id)
+    }
+
+    fn stream_issues(doc: &Document) -> Vec<StreamIssue> {
+        super::stream_issues(&test_adapter(doc))
+    }
 
     /// A document holding the given objects at ids `(1,0), (2,0), …` in order.
     fn doc_with(objs: Vec<Object>) -> (Document, Vec<lopdf::ObjectId>) {
@@ -633,9 +692,19 @@ mod tests {
         assert!(whole.starts_with(&short[..]), "what survives a cut is a PREFIX of the page");
         // And the per-page diagnostic names it, so the one page-level entry point in the
         // crate does not report `ops=N` as though N were all there was.
-        let dbg = crate::text::debug_page(&doc, pages[&1], &std::fs::read(path).expect("fixture readable"));
+        let dbg = crate::text::debug_page(
+            &doc,
+            &test_adapter(&doc),
+            pages[&1],
+            &std::fs::read(path).expect("fixture readable"),
+        );
         assert!(dbg.contains("flate-truncated"), "debug_page must surface it: {dbg}");
-        let clean = crate::text::debug_page(&doc, pages[&3], &std::fs::read(path).expect("fixture readable"));
+        let clean = crate::text::debug_page(
+            &doc,
+            &test_adapter(&doc),
+            pages[&3],
+            &std::fs::read(path).expect("fixture readable"),
+        );
         assert!(!clean.contains("truncated"), "the intact page reports nothing: {clean}");
     }
 

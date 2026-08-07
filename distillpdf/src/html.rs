@@ -1268,8 +1268,8 @@ pub(crate) fn render_doc_elements(
         // touches, and the page-space originals kept only for the SVG emitters (which do
         // their own turn from page space — see `PlacedSvg::rot`).
         let turn = geom::PageTurn::new(
-            crate::pdfobj::page_rotation(doc, *_pid),
-            crate::pdfobj::page_box(doc, *_pid).unwrap_or([0.0, 0.0, crate::pdfobj::DEFAULT_PAGE_PTS.0, crate::pdfobj::DEFAULT_PAGE_PTS.1]),
+            crate::pdfobj::page_rotation(access, *_pid),
+            crate::pdfobj::page_box(access, *_pid).unwrap_or([0.0, 0.0, crate::pdfobj::DEFAULT_PAGE_PTS.0, crate::pdfobj::DEFAULT_PAGE_PTS.1]),
         );
         // Display-space spans. `turned` owns them only on a turned page; upright, `dspans` IS
         // `spans`, so no page in any upright document allocates or copies anything here.

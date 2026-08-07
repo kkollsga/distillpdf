@@ -1166,8 +1166,8 @@ fn positioned_vectors_capped(
     // defect. Turning at the page→SVG-local boundary fixes the orientation and leaves every
     // selection rule — and every page-space comparison `html.rs` makes against these boxes —
     // exactly as it was.
-    let rot = crate::pdfobj::page_rotation(doc, page_id);
-    let page_w = page_width(doc, page_id, rot);
+    let rot = crate::pdfobj::page_rotation(access, page_id);
+    let page_w = page_width(access, page_id, rot);
     let (strong, weak) = cluster_figures(painted, rot);
     let strong: Vec<PlacedSvg> = strong.iter().map(|c| build_svg(c, page_w, rot)).collect();
     let weak: Vec<PlacedSvg> = weak
@@ -1265,8 +1265,8 @@ fn painted_page(
 /// extent is likewise measured in display orientation, so both sides of the share must be —
 /// otherwise a landscape table is sized against a portrait denominator and renders at half
 /// the width it occupies.
-fn page_width(doc: &Document, page_id: ObjectId, rot: i32) -> f32 {
-    crate::pdfobj::page_box(doc, page_id)
+fn page_width(access: &dyn crate::access::DocumentAccess, page_id: ObjectId, rot: i32) -> f32 {
+    crate::pdfobj::page_box(access, page_id)
         .map(|b| if rot % 180 == 0 { (b[2] - b[0]).abs() } else { (b[3] - b[1]).abs() })
         .filter(|w| *w > 1.0)
         .unwrap_or(crate::pdfobj::DEFAULT_PAGE_PTS.0)
@@ -1941,6 +1941,10 @@ pub(crate) fn intersect_clip(cur: Option<ClipRect>, add: ClipRect) -> ClipRect {
 mod tests {
     use super::*;
     use crate::access::test_adapter;
+
+    fn page_width(doc: &Document, page_id: ObjectId, rot: i32) -> f32 {
+        super::page_width(&test_adapter(doc), page_id, rot)
+    }
 
     /// Load an adversarial fixture (`tests/gen_fixtures.py::gen_form_bomb`) and set up the
     /// exact state `positioned_vectors_capped` hands to [`walk`], so a test can drive the
@@ -2680,7 +2684,7 @@ mod tests {
         ];
         for (i, &page_id) in ids.iter().enumerate() {
             let (rot, marker_d, (lw, lh)) = want[i];
-            assert_eq!(crate::pdfobj::page_rotation(&doc, page_id), rot);
+            assert_eq!(crate::pdfobj::page_rotation(&test_adapter(&doc), page_id), rot);
             let strong = size_bar_figures(&doc, page_id);
             assert_eq!(strong.len(), 1, "/Rotate {rot}: the 9 paths must cluster as one figure");
             let f = &strong[0];
@@ -2710,7 +2714,7 @@ mod tests {
         // negates the PDF angle, so an upright label emits no transform at all).
         let want: [(&str, [f32; 4]); 2] = [("Alpha", [0.0, 90.0, 180.0, 270.0]), ("Beta", [-90.0, 0.0, 90.0, 180.0])];
         for (i, &page_id) in ids.iter().enumerate() {
-            let rot = crate::pdfobj::page_rotation(&doc, page_id);
+            let rot = crate::pdfobj::page_rotation(&test_adapter(&doc), page_id);
             let spans = crate::text::extract_spans(&doc, &test_adapter(&doc), page_id, &raw);
             // The premise, asserted not assumed: the two labels really are drawn at 0° and
             // +90° in PAGE space, identically on every page.

@@ -112,6 +112,8 @@ pub(crate) trait DocumentAccess: Send + Sync {
         StreamHandle::new(id, self.object(id)?)
     }
     fn pages(&self) -> Result<Vec<PageRef>, AccessError>;
+    /// Every indexed indirect object id in deterministic order.
+    fn object_ids(&self) -> Vec<ObjectId>;
     /// Page `/Resources` dictionaries in outermost-to-page overlay order.
     fn page_resource_chain(&self, page: ObjectId) -> Result<Vec<Dictionary>, AccessError>;
     #[allow(dead_code)] // raw-recovery consumers migrate in L2b
@@ -161,6 +163,10 @@ impl DocumentAccess for EagerDocumentAdapter {
             .into_iter()
             .map(|(number, id)| PageRef { number, id })
             .collect())
+    }
+
+    fn object_ids(&self) -> Vec<ObjectId> {
+        self.document.objects.keys().copied().collect()
     }
 
     fn page_resource_chain(&self, page: ObjectId) -> Result<Vec<Dictionary>, AccessError> {

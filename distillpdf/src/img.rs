@@ -591,7 +591,7 @@ pub fn positioned_images(
     // (see `turn_pixels`): every bbox this module hands out stays in page space, because every
     // cross-subsystem comparison in `html.rs` — captions, containment, reading order — is
     // page-space, exactly as `vector::positioned_vectors_capped` reasons.
-    finalize(doc, raws, want_uris, crate::pdfobj::page_rotation(doc, page_id))
+    finalize(doc, raws, want_uris, crate::pdfobj::page_rotation(access, page_id))
 }
 
 /// Grow `out` by the part of `bb` its clip leaves visible. A rectangle entirely outside the
@@ -1670,7 +1670,7 @@ mod tests {
         // "this stream is not what it looks like".
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/undecodable_codec.pdf");
         let doc = Document::load(path).expect("fixture must load");
-        let issues = crate::pdfobj::stream_issues(&doc);
+        let issues = crate::pdfobj::stream_issues(&crate::access::test_adapter(&doc));
         let hit = issues.iter().find(|i| i.object.0 == 5).expect("the declined stream is reported");
         assert_eq!((hit.kind, hit.filter.as_str(), hit.recovered), ("codec-unsupported", "JPXDecode", 0));
         assert!(issues.iter().all(|i| i.object.0 != 6), "the decodable raster is NOT reported: {issues:?}");

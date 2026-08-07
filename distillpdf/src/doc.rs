@@ -485,13 +485,13 @@ impl PdfDocument {
     /// full inflate per stream, a price no page should pay to answer a question almost every
     /// document answers with "nothing wrong".
     pub fn stream_integrity(&self) -> Vec<crate::pdfobj::StreamIssue> {
-        crate::pdfobj::stream_issues(&self.doc)
+        crate::pdfobj::stream_issues(self.access.as_ref())
     }
 
     /// Diagnostic for one 1-indexed page.
     pub fn debug_page(&self, page: u32) -> Result<String, Error> {
         let page_id = *self.doc.get_pages().get(&page).ok_or(Error::NoPage(Some(page)))?;
-        Ok(text::debug_page(&self.doc, page_id, &self.raw))
+        Ok(text::debug_page(&self.doc, self.access.as_ref(), page_id, &self.raw))
     }
 
     /// Extract images from all pages.
@@ -548,7 +548,7 @@ impl PdfDocument {
         for (&pno, &page_id) in &self.doc.get_pages() {
             let decision = ocr::detect::decide(&self.doc, self.access.as_ref(), page_id, &self.raw);
             let needs = !matches!(decision, ocr::detect::OcrDecision::NotNeeded);
-            let (w, h) = ocr::page_size_pts(&self.doc, page_id);
+            let (w, h) = ocr::page_size_pts(self.access.as_ref(), page_id);
             let image = if needs {
                 ocr::page_main_image(&self.doc, self.access.as_ref(), page_id).map(|(b, _)| b)
             } else {
@@ -585,7 +585,7 @@ impl PdfDocument {
             let pages = doc.get_pages();
             for (&pno, &page_id) in &pages {
                 let Some(dt) = ocr.get(&pno) else { continue };
-                let (w, h) = ocr::page_size_pts(&doc, page_id);
+                let (w, h) = ocr::page_size_pts(self.access.as_ref(), page_id);
                 if remove_raster {
                     // Clean reflow: replace the page's content with our text + cropped figures.
                     let image = ocr::page_main_image(&self.doc, self.access.as_ref(), page_id).map(|(_, img)| img);
