@@ -5,14 +5,14 @@
 //! ourselves, decode show-text operators through each font's ToUnicode CMap, and
 //! recover real Unicode — including 2-byte CID codes and diacritics.
 
-use crate::access::{AccessError, DictionaryHandle, DocumentAccess, ObjectHandle, read_resolved};
+use crate::access::{AccessError, AccessKind, DictionaryHandle, DocumentAccess, ObjectHandle, PayloadCharge, read_resolved};
 use crate::geom::Mat;
 use crate::pdfobj::num;
 use crate::walker::{descend_form, xobject_at, Descend, ScopePolicy, XMap};
 #[cfg(test)]
 use lopdf::Document;
-use lopdf::{Dictionary, Object, ObjectId};
-use std::collections::HashMap;
+use lopdf::{Dictionary, Object, ObjectId, OwnedEncoding};
+use std::collections::{BTreeMap, HashMap};
 
 struct FontInfo {
     two_byte: bool,
@@ -2101,6 +2101,281 @@ pub fn debug_page(access: &dyn DocumentAccess, page_id: ObjectId) -> Result<Stri
 
 /// Extract text for one page via positioned spans + reading-order reconstruction.
 /// Returns None if the page content cannot be decoded.
+struct FallbackEncoding {
+    owned: OwnedEncoding,
+    _payload_charge: Option<PayloadCharge>,
+    object: ObjectId,
+}
+
+fn fallback_fatal(error: &AccessError) -> bool {
+    matches!(
+        error.kind,
+        AccessKind::ResourceLimit
+            | AccessKind::SourceChanged
+            | AccessKind::SourceIo
+            | AccessKind::Bounds
+            | AccessKind::PasswordRequired
+            | AccessKind::InvalidPassword
+            | AccessKind::Encryption
+            | AccessKind::InvalidEncryptDictionary
+            | AccessKind::ObjectDecryption
+    )
+}
+
+fn record_fallback_error(slot: &mut Option<AccessError>, error: AccessError) {
+    if slot.is_none()
+        || (fallback_fatal(&error) && !slot.as_ref().is_some_and(fallback_fatal))
+    {
+        *slot = Some(error);
+    }
+}
+
+fn fallback_error(object: ObjectId, error: impl std::fmt::Display) -> AccessError {
+    AccessError::object(object, error)
+}
+
+fn fallback_to_unicode(
+    access: &dyn DocumentAccess,
+    font: &ObjectHandle,
+) -> Result<FallbackEncoding, AccessError> {
+    let stream = font.dictionary_entry(access, b"ToUnicode")?;
+    let object = stream.root_id();
+    let (bytes, charge) = stream.decoded_stream_bytes(64 * 1024 * 1024)?.into_parts();
+    let owned = OwnedEncoding::from_to_unicode_for_extraction(bytes)
+        .map_err(|error| fallback_error(object, error))?;
+    Ok(FallbackEncoding { owned, _payload_charge: Some(charge), object: font.root_id() })
+}
+
+fn fallback_named_encoding(
+    access: &dyn DocumentAccess,
+    font: &ObjectHandle,
+    name: &[u8],
+) -> Result<FallbackEncoding, AccessError> {
+    if matches!(name, b"Identity-H" | b"Identity-V") {
+        return fallback_to_unicode(access, font);
+    }
+    let owned = OwnedEncoding::from_named(name, None)
+        .map_err(|error| fallback_error(font.root_id(), error))?;
+    Ok(FallbackEncoding { owned, _payload_charge: None, object: font.root_id() })
+}
+
+fn fallback_encoding_value(
+    access: &dyn DocumentAccess,
+    font: &ObjectHandle,
+    encoding: &ObjectHandle,
+) -> Result<FallbackEncoding, AccessError> {
+    enum Shape {
+        Name(Vec<u8>),
+        Dictionary { valid_type: bool, base: Option<Vec<u8>> },
+        Invalid,
+    }
+    let shape = encoding.read(|object| match object {
+        Object::Name(name) => Shape::Name(name.to_vec()),
+        Object::Dictionary(dictionary) => Shape::Dictionary {
+            valid_type: dictionary.get_type().ok() == Some(b"Encoding"),
+            base: dictionary.get(b"BaseEncoding").ok().and_then(|value| value.as_name().ok()).map(Vec::from),
+        },
+        _ => Shape::Invalid,
+    })?;
+    match shape {
+        Shape::Name(name) => fallback_named_encoding(access, font, &name),
+        Shape::Dictionary { valid_type: false, .. } | Shape::Invalid => {
+            Err(fallback_error(encoding.root_id(), "invalid fallback Encoding value"))
+        }
+        Shape::Dictionary { base, .. } => {
+            let base = match base {
+                Some(name) => fallback_named_encoding(access, font, &name)?,
+                None => FallbackEncoding {
+                    owned: OwnedEncoding::standard(),
+                    _payload_charge: None,
+                    object: font.root_id(),
+                },
+            };
+            let FallbackEncoding {
+                owned: base_owned,
+                _payload_charge,
+                ..
+            } = base;
+            let encoding_id = encoding.root_id();
+            let owned = encoding.read(|object| {
+                let differences = object
+                    .as_dict()
+                    .ok()
+                    .and_then(|dictionary| dictionary.get(b"Differences").ok())
+                    .and_then(|value| value.as_array().ok())
+                    .ok_or_else(|| {
+                        fallback_error(encoding_id, "missing required dictionary key Differences")
+                    })?;
+                base_owned
+                    .with_differences(differences)
+                    .map_err(|error| fallback_error(encoding_id, error))
+            })??;
+            Ok(FallbackEncoding {
+                owned,
+                _payload_charge,
+                object: font.root_id(),
+            })
+        }
+    }
+}
+
+fn fallback_font_encoding(
+    access: &dyn DocumentAccess,
+    font: &ObjectHandle,
+) -> Result<FallbackEncoding, AccessError> {
+    let is_font = font.read(|object| {
+        object.as_dict().map(|dictionary| dictionary.has_type(b"Font")).unwrap_or(false)
+    })?;
+    if !is_font {
+        return Err(fallback_error(font.root_id(), "fallback font dictionary has wrong Type"));
+    }
+    let result = (|| {
+        let (has_encoding, has_to_unicode) = font.read(|object| {
+            let dictionary = object.as_dict().ok();
+            (
+                dictionary.is_some_and(|dictionary| dictionary.has(b"Encoding")),
+                dictionary.is_some_and(|dictionary| dictionary.has(b"ToUnicode")),
+            )
+        })?;
+        if has_encoding {
+            let encoding = font.dictionary_entry(access, b"Encoding")?;
+            return fallback_encoding_value(access, font, &encoding);
+        }
+        if has_to_unicode {
+            return fallback_to_unicode(access, font);
+        }
+        Ok(FallbackEncoding {
+            owned: OwnedEncoding::standard(),
+            _payload_charge: None,
+            object: font.root_id(),
+        })
+    })();
+    match result {
+        Err(error) if fallback_fatal(&error) => Err(error),
+        Err(_) => Ok(FallbackEncoding {
+            owned: OwnedEncoding::standard(),
+            _payload_charge: None,
+            object: font.root_id(),
+        }),
+        result => result,
+    }
+}
+
+fn fallback_font_handles(
+    access: &dyn DocumentAccess,
+    page: ObjectId,
+) -> Result<BTreeMap<Vec<u8>, ObjectHandle>, AccessError> {
+    let mut output: BTreeMap<Vec<u8>, ObjectHandle> = BTreeMap::new();
+    for resources in access.page_resource_chain(page)? {
+        let fonts = match resources.entry(access, b"Font") {
+            Ok(fonts) => fonts,
+            Err(error) if fallback_fatal(&error) => return Err(error),
+            Err(_) => continue,
+        };
+        let names: Vec<Vec<u8>> = fonts.read(|object| {
+            object.as_dict().map(|dictionary| {
+                dictionary.iter().map(|(name, _)| name.to_vec()).collect()
+            })
+        })?.unwrap_or_default();
+        for name in names {
+            match fonts.dictionary_entry(access, &name) {
+                Ok(font) => { output.insert(name, font); }
+                Err(error) if fallback_fatal(&error) => return Err(error),
+                Err(_) => {}
+            }
+        }
+    }
+    Ok(output)
+}
+
+pub(crate) fn fallback_page_text(
+    access: &dyn DocumentAccess,
+    page: ObjectId,
+) -> Result<String, AccessError> {
+    fn collect_text(
+        output: &mut String,
+        encoding: &FallbackEncoding,
+        operands: &[Object],
+    ) -> Result<(), AccessError> {
+        for operand in operands {
+            match operand {
+                Object::String(bytes, _) => encoding.owned.write_to_string(bytes, output)
+                    .map_err(|error| fallback_error(encoding.object, error))?,
+                Object::Array(array) => {
+                    collect_text(output, encoding, array)?;
+                    output.push(' ');
+                }
+                Object::Integer(value) if *value < -100 => output.push(' '),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    let fonts = fallback_font_handles(access, page)?;
+    let mut first_error = None;
+    let mut encodings = BTreeMap::new();
+    for (name, font) in fonts {
+        match fallback_font_encoding(access, &font) {
+            Ok(encoding) => { encodings.insert(name, encoding); }
+            Err(error) => record_fallback_error(&mut first_error, error),
+        }
+    }
+    let bytes = access.page_content(page)?;
+    let content = lopdf::content::Content::decode(&bytes).map_err(|error| fallback_error(page, error))?;
+    let mut chunks = Vec::new();
+    let mut current_encoding = None;
+    let mut current_text = String::new();
+    for operation in content.operations {
+        match operation.operator.as_str() {
+            "Tf" => {
+                let operand = operation.operands.first()
+                    .ok_or_else(|| fallback_error(page, "missing font operand"))?;
+                current_encoding = match operand.as_name() {
+                    Ok(name) => encodings.get(name),
+                    Err(error) => {
+                        record_fallback_error(&mut first_error, fallback_error(page, error));
+                        None
+                    }
+                };
+                if !current_text.is_empty() {
+                    chunks.push(std::mem::take(&mut current_text));
+                }
+            }
+            "Tj" | "TJ" => {
+                if let Some(encoding) = current_encoding {
+                    if let Err(error) = collect_text(&mut current_text, encoding, &operation.operands) {
+                        record_fallback_error(&mut first_error, error);
+                    }
+                }
+            }
+            "'" => {
+                if let Some(encoding) = current_encoding {
+                    if !current_text.ends_with('\n') { current_text.push('\n'); }
+                    if let Err(error) = collect_text(&mut current_text, encoding, &operation.operands) {
+                        record_fallback_error(&mut first_error, error);
+                    }
+                }
+            }
+            "\"" => {
+                if let Some(encoding) = current_encoding {
+                    if !current_text.ends_with('\n') { current_text.push('\n'); }
+                    if let Some(value) = operation.operands.get(2) {
+                        if let Err(error) = collect_text(&mut current_text, encoding, std::slice::from_ref(value)) {
+                            record_fallback_error(&mut first_error, error);
+                        }
+                    }
+                }
+            }
+            "T*" | "ET" if !current_text.ends_with('\n') => current_text.push('\n'),
+            _ => {}
+        }
+    }
+    if !current_text.is_empty() { chunks.push(current_text); }
+    if let Some(error) = first_error { return Err(error); }
+    Ok(chunks.concat())
+}
+
 pub fn extract_page(
     access: &dyn crate::access::DocumentAccess,
     page_id: ObjectId,
@@ -2465,5 +2740,18 @@ mod tests {
             let word: String = line.iter().map(|s| s.text.as_str()).collect();
             assert_eq!(word, "Cloverdale", "leaked char spacing transposed the last two glyphs");
         }
+    }
+
+
+    #[test]
+    fn fallback_error_selection_promotes_later_fatal_errors() {
+        let mut selected = None;
+        record_fallback_error(&mut selected, AccessError::object((1, 0), "ordinary"));
+        let fatal = AccessError::typed((2, 0), AccessKind::Bounds, "fatal bounds");
+        record_fallback_error(&mut selected, fatal.clone());
+        assert_eq!(selected, Some(fatal.clone()));
+
+        record_fallback_error(&mut selected, AccessError::object((3, 0), "later ordinary"));
+        assert_eq!(selected, Some(fatal));
     }
 }

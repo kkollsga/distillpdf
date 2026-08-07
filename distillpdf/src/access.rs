@@ -6,27 +6,40 @@
 //! explicitly owned.  The eager implementation remains the compatibility oracle through L9.
 
 use lopdf::{
-    BytesSource, Dictionary, Document, Object, ObjectId, RandomAccessSource, SourceError,
-    SourceResult,
+    BoundedObject, BytesSource, DecompressError, Dictionary, Document, IndexedReader,
+    IndexedReaderError, IndexedReaderOptions, Object, ObjectId, PageMap, RandomAccessSource,
+    ScalarResolutionPermit, SourceError, SourceResult,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::ops::Deref;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 const SOURCE_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_RECOVERED_STREAM_BYTES: u64 = 64 * 1024 * 1024;
 const RECOVERY_INDEX_ENTRY_BYTES: u64 = 128;
 const MAX_RECOVERY_INDEX_ENTRIES: usize = 65_536;
 const RECOVERY_METADATA_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
-const RECOVERY_PAYLOAD_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+/// Provisional process-wide O budget shared by every retained object or payload.
+const PROVISIONAL_O_BYTES: u64 = 64 * 1024 * 1024;
+const INDEXED_OBJECT_BYTES: u64 = 4 * 1024 * 1024;
+const INDEXED_STREAM_BYTES: u64 = 64 * 1024 * 1024;
+const INDEXED_REFERENCE_DEPTH: usize = 64;
+const INDEXED_PAGE_TREE_DEPTH: usize = 256;
+const INDEXED_MAX_PAGES: usize = 1_000_000;
+const EAGER_RESOURCE_DEPTH: usize = 100;
+const INDEX_FIXED_BYTES: u64 = 33_554_432;
+const INDEX_OBJECT_BYTES: u64 = 1_536;
+const INDEX_PAGE_BYTES: u64 = 3_072;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceFailureKind {
     SourceChanged,
     Bounds,
     ResourceLimit,
+    SourceIo,
     Backend,
 }
 
@@ -38,7 +51,10 @@ struct SourceFailure {
 
 impl SourceFailure {
     fn new(kind: SourceFailureKind, detail: impl Into<Arc<str>>) -> Self {
-        Self { kind, detail: detail.into() }
+        Self {
+            kind,
+            detail: detail.into(),
+        }
     }
 
     fn resource(detail: impl Into<Arc<str>>) -> Self {
@@ -64,7 +80,7 @@ impl From<SourceError> for SourceFailure {
             | SourceError::AllocationFailed { .. } => SourceFailureKind::ResourceLimit,
             SourceError::UnexpectedEof { .. }
             | SourceError::InvalidReadCount { .. }
-            | SourceError::Io(_) => SourceFailureKind::Backend,
+            | SourceError::Io(_) => SourceFailureKind::SourceIo,
             _ => SourceFailureKind::Backend,
         };
         Self::new(kind, Arc::<str>::from(error.to_string()))
@@ -80,7 +96,11 @@ struct RecoveryBudget {
 
 impl RecoveryBudget {
     fn new(limit: u64) -> Self {
-        Self { limit, used: Mutex::new(0), available: Condvar::new() }
+        Self {
+            limit,
+            used: Mutex::new(0),
+            available: Condvar::new(),
+        }
     }
 
     fn acquire(&'static self, bytes: u64) -> Result<RecoveryCharge, SourceFailure> {
@@ -90,18 +110,62 @@ impl RecoveryBudget {
                 self.limit
             )));
         }
+        let mut used = self.used.lock().map_err(|_| {
+            SourceFailure::new(SourceFailureKind::Backend, "recovery budget lock poisoned")
+        })?;
+        while used.saturating_add(bytes) > self.limit {
+            used = self.available.wait(used).map_err(|_| {
+                SourceFailure::new(SourceFailureKind::Backend, "recovery budget lock poisoned")
+            })?;
+        }
+        *used += bytes;
+        Ok(RecoveryCharge {
+            budget: self,
+            bytes,
+        })
+    }
+
+    fn acquire_available(&'static self, maximum: u64) -> Result<RecoveryCharge, SourceFailure> {
         let mut used = self
             .used
             .lock()
-            .map_err(|_| SourceFailure::new(SourceFailureKind::Backend, "recovery budget lock poisoned"))?;
-        while used.saturating_add(bytes) > self.limit {
-            used = self
-                .available
-                .wait(used)
-                .map_err(|_| SourceFailure::new(SourceFailureKind::Backend, "recovery budget lock poisoned"))?;
+            .map_err(|_| SourceFailure::new(SourceFailureKind::Backend, "budget lock poisoned"))?;
+        let bytes = self.limit.saturating_sub(*used).min(maximum);
+        if bytes == 0 {
+            return Err(SourceFailure::resource(format!(
+                "process-wide {}-byte budget has no available capacity",
+                self.limit
+            )));
         }
         *used += bytes;
-        Ok(RecoveryCharge { budget: self, bytes })
+        Ok(RecoveryCharge {
+            budget: self,
+            bytes,
+        })
+    }
+
+    fn try_acquire(&'static self, bytes: u64) -> Result<RecoveryCharge, SourceFailure> {
+        if bytes > self.limit {
+            return Err(SourceFailure::resource(format!(
+                "request {bytes} exceeds process-wide limit {}",
+                self.limit
+            )));
+        }
+        let mut used = self
+            .used
+            .lock()
+            .map_err(|_| SourceFailure::new(SourceFailureKind::Backend, "budget lock poisoned"))?;
+        if used.saturating_add(bytes) > self.limit {
+            return Err(SourceFailure::resource(format!(
+                "request {bytes} exceeds {} available process-wide bytes",
+                self.limit.saturating_sub(*used)
+            )));
+        }
+        *used += bytes;
+        Ok(RecoveryCharge {
+            budget: self,
+            bytes,
+        })
     }
 }
 
@@ -117,7 +181,11 @@ impl RecoveryCharge {
         if released == 0 {
             return;
         }
-        let mut used = self.budget.used.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut used = self
+            .budget
+            .used
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *used = used.saturating_sub(released);
         self.bytes = bytes;
         self.budget.available.notify_all();
@@ -126,7 +194,11 @@ impl RecoveryCharge {
 
 impl Drop for RecoveryCharge {
     fn drop(&mut self) {
-        let mut used = self.budget.used.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut used = self
+            .budget
+            .used
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *used = used.saturating_sub(self.bytes);
         self.budget.available.notify_all();
     }
@@ -137,14 +209,31 @@ fn recovery_metadata_budget() -> &'static RecoveryBudget {
     BUDGET.get_or_init(|| RecoveryBudget::new(RECOVERY_METADATA_BUDGET_BYTES))
 }
 
-fn recovery_payload_budget() -> &'static RecoveryBudget {
+fn provisional_o_budget() -> &'static RecoveryBudget {
     static BUDGET: OnceLock<RecoveryBudget> = OnceLock::new();
-    BUDGET.get_or_init(|| RecoveryBudget::new(RECOVERY_PAYLOAD_BUDGET_BYTES))
+    BUDGET.get_or_init(|| RecoveryBudget::new(PROVISIONAL_O_BYTES))
 }
 
 pub(crate) struct RecoveredStream {
     bytes: Vec<u8>,
     _charge: RecoveryCharge,
+}
+
+/// Process-wide payload admission retained by a consumer-owned parsed value.
+pub(crate) struct PayloadCharge {
+    _charge: RecoveryCharge,
+}
+
+/// Decoded stream bytes plus the admission that covered their allocation.
+pub(crate) struct ChargedStreamBytes {
+    bytes: Vec<u8>,
+    charge: PayloadCharge,
+}
+
+impl ChargedStreamBytes {
+    pub(crate) fn into_parts(self) -> (Vec<u8>, PayloadCharge) {
+        (self.bytes, self.charge)
+    }
 }
 
 impl AsRef<[u8]> for RecoveredStream {
@@ -158,6 +247,60 @@ impl Deref for RecoveredStream {
 
     fn deref(&self) -> &Self::Target {
         self.as_ref()
+    }
+}
+
+pub(crate) struct PageContent {
+    bytes: Vec<u8>,
+    _charge: Option<RecoveryCharge>,
+}
+
+impl PageContent {
+    fn eager(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            _charge: None,
+        }
+    }
+
+    fn indexed(bytes: Vec<u8>, charge: Option<RecoveryCharge>) -> Self {
+        debug_assert_eq!(
+            bytes.capacity() as u64,
+            charge.as_ref().map_or(0, |charge| charge.bytes)
+        );
+        Self {
+            bytes,
+            _charge: charge,
+        }
+    }
+}
+
+impl AsRef<[u8]> for PageContent {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Deref for PageContent {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl fmt::Debug for PageContent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("PageContent")
+            .field(&self.bytes.len())
+            .finish()
+    }
+}
+
+impl PartialEq<&[u8]> for PageContent {
+    fn eq(&self, other: &&[u8]) -> bool {
+        self.as_ref() == *other
     }
 }
 
@@ -185,7 +328,10 @@ pub(crate) struct SourceRecovery {
 
 impl SourceRecovery {
     pub(crate) fn new(source: Arc<dyn RandomAccessSource>) -> Self {
-        Self { source, scan: OnceLock::new() }
+        Self {
+            source,
+            scan: OnceLock::new(),
+        }
     }
 
     fn scanned(&self) -> Result<&SourceScan, SourceFailure> {
@@ -199,7 +345,9 @@ impl SourceRecovery {
         let Some(range) = self.scanned()?.streams.get(&object).copied() else {
             return Ok(None);
         };
-        let charge = recovery_payload_budget().acquire(range.length)?;
+        // Recovery can be invoked while another O-owned handle is live. Fail deterministically
+        // instead of waiting for capacity that this call stack itself may retain.
+        let charge = provisional_o_budget().try_acquire(range.length)?;
         let bytes = read_bounded_range(
             self.source.as_ref(),
             range.offset,
@@ -207,7 +355,10 @@ impl SourceRecovery {
             MAX_RECOVERED_STREAM_BYTES,
         )
         .map_err(SourceFailure::from)?;
-        Ok(Some(RecoveredStream { bytes, _charge: charge }))
+        Ok(Some(RecoveredStream {
+            bytes,
+            _charge: charge,
+        }))
     }
 
     fn sha256(&self) -> Result<String, SourceFailure> {
@@ -231,14 +382,21 @@ fn read_bounded_range(
     limit: u64,
 ) -> SourceResult<Vec<u8>> {
     if length > limit {
-        return Err(SourceError::ReadLimitExceeded { requested: length, limit });
+        return Err(SourceError::ReadLimitExceeded {
+            requested: length,
+            limit,
+        });
     }
     let source_len = source.len()?;
     let end = offset
         .checked_add(length)
         .ok_or(SourceError::RangeOverflow { offset, length })?;
     if end > source_len {
-        return Err(SourceError::OutOfBounds { offset, length, source_len });
+        return Err(SourceError::OutOfBounds {
+            offset,
+            length,
+            source_len,
+        });
     }
     let output_len = usize::try_from(length).map_err(|_| SourceError::PlatformLimitExceeded {
         requested: length,
@@ -295,9 +453,8 @@ fn scan_source_streams(source: &dyn RandomAccessSource) -> Result<SourceScan, So
         use std::fmt::Write as _;
         let _ = write!(sha256, "{byte:02x}");
     }
-    metadata_charge.shrink_to(
-        (scanner.streams.len() as u64).saturating_mul(RECOVERY_INDEX_ENTRY_BYTES),
-    );
+    metadata_charge
+        .shrink_to((scanner.streams.len() as u64).saturating_mul(RECOVERY_INDEX_ENTRY_BYTES));
     Ok(SourceScan {
         streams: scanner.streams,
         sha256,
@@ -444,6 +601,12 @@ pub(crate) enum AccessKind {
     Bounds,
     ResourceLimit,
     SourceChanged,
+    SourceIo,
+    PasswordRequired,
+    InvalidPassword,
+    Encryption,
+    InvalidEncryptDictionary,
+    ObjectDecryption,
     #[cfg_attr(not(test), allow(dead_code))] // constructed by the fault-injection adapter
     Injected,
     Backend,
@@ -460,7 +623,7 @@ pub(crate) struct AccessError {
 }
 
 impl AccessError {
-    fn object(object: ObjectId, error: impl fmt::Display) -> Self {
+    pub(crate) fn object(object: ObjectId, error: impl fmt::Display) -> Self {
         let detail = error.to_string();
         Self {
             phase: AccessPhase::Resolve,
@@ -471,7 +634,7 @@ impl AccessError {
         }
     }
 
-    fn typed(object: ObjectId, kind: AccessKind, error: impl fmt::Display) -> Self {
+    pub(crate) fn typed(object: ObjectId, kind: AccessKind, error: impl fmt::Display) -> Self {
         let mut failure = Self::object(object, error);
         failure.kind = kind;
         failure
@@ -482,12 +645,13 @@ impl AccessError {
             SourceFailureKind::SourceChanged => AccessKind::SourceChanged,
             SourceFailureKind::Bounds => AccessKind::Bounds,
             SourceFailureKind::ResourceLimit => AccessKind::ResourceLimit,
+            SourceFailureKind::SourceIo => AccessKind::SourceIo,
             SourceFailureKind::Backend => AccessKind::Backend,
         };
         Self::typed((0, 0), kind, error)
     }
 
-    fn at(mut self, phase: AccessPhase, page: Option<u32>) -> Self {
+    pub(crate) fn at(mut self, phase: AccessPhase, page: Option<u32>) -> Self {
         self.phase = phase;
         self.page = page;
         self
@@ -502,6 +666,230 @@ impl fmt::Display for AccessError {
             self.phase, self.page, self.object.0, self.object.1, self.kind, self.detail
         )
     }
+}
+
+fn indexed_error(object: ObjectId, error: IndexedReaderError) -> AccessError {
+    let error = match error {
+        IndexedReaderError::Source(source) => {
+            let mut failure = AccessError::source(SourceFailure::from(source));
+            failure.object = object;
+            return failure;
+        }
+        other => other,
+    };
+    let kind = match error {
+        IndexedReaderError::StructureLimitExceeded { .. }
+        | IndexedReaderError::EntryLimitExceeded { .. }
+        | IndexedReaderError::RevisionLimitExceeded { .. }
+        | IndexedReaderError::IndirectHeaderLimitExceeded { .. }
+        | IndexedReaderError::ObjectLimitExceeded { .. }
+        | IndexedReaderError::ScalarResourceLimit { .. }
+        | IndexedReaderError::ScalarResolutionCancelled { .. }
+        | IndexedReaderError::ScalarResolutionClosed { .. }
+        | IndexedReaderError::StreamLimitExceeded { .. }
+        | IndexedReaderError::ResolutionDepthExceeded { .. }
+        | IndexedReaderError::ObjectStreamCacheBypass { .. }
+        | IndexedReaderError::PageCountLimitExceeded { .. } => AccessKind::ResourceLimit,
+        IndexedReaderError::StartXrefOutOfBounds { .. }
+        | IndexedReaderError::NegativeStreamLength { .. } => AccessKind::Bounds,
+        IndexedReaderError::NotScalarObject { .. }
+        | IndexedReaderError::NotStreamObject { .. }
+        | IndexedReaderError::UnsupportedBoundedScalar { .. } => AccessKind::Type,
+        IndexedReaderError::PasswordRequired => AccessKind::PasswordRequired,
+        IndexedReaderError::InvalidPassword => AccessKind::InvalidPassword,
+        IndexedReaderError::Encryption(_) => AccessKind::Encryption,
+        IndexedReaderError::InvalidEncryptDictionary => AccessKind::InvalidEncryptDictionary,
+        IndexedReaderError::ObjectDecryption { .. } => AccessKind::ObjectDecryption,
+        _ => AccessKind::Backend,
+    };
+    AccessError::typed(object, kind, error)
+}
+
+fn fatal_lazy_access(error: &AccessError) -> bool {
+    matches!(
+        error.kind,
+        AccessKind::ResourceLimit
+            | AccessKind::SourceChanged
+            | AccessKind::SourceIo
+            | AccessKind::Bounds
+            | AccessKind::PasswordRequired
+            | AccessKind::InvalidPassword
+            | AccessKind::Encryption
+            | AccessKind::InvalidEncryptDictionary
+            | AccessKind::ObjectDecryption
+    )
+}
+
+#[derive(Default)]
+pub(crate) struct IndexedAdapterCounters {
+    pub(crate) object_resolutions: AtomicU64,
+    pub(crate) object_failures: AtomicU64,
+    pub(crate) active_resolutions: AtomicU64,
+    pub(crate) peak_active_resolutions: AtomicU64,
+    pub(crate) retained_object_estimated_bytes: AtomicU64,
+    pub(crate) peak_retained_object_estimated_bytes: AtomicU64,
+    pub(crate) retained_object_admitted_bytes: AtomicU64,
+    pub(crate) peak_retained_object_admitted_bytes: AtomicU64,
+    pub(crate) peak_resolution_bytes: AtomicU64,
+    pub(crate) page_map_builds: AtomicU64,
+    pub(crate) page_content_ops: AtomicU64,
+    pub(crate) index_estimated_bytes: AtomicU64,
+    pub(crate) index_objects: AtomicU64,
+    pub(crate) index_pages: AtomicU64,
+}
+
+fn indexed_object_exclusive() -> &'static Mutex<()> {
+    static EXCLUSIVE: OnceLock<Mutex<()>> = OnceLock::new();
+    EXCLUSIVE.get_or_init(|| Mutex::new(()))
+}
+
+fn indexed_page_content_exclusive() -> &'static Mutex<()> {
+    static EXCLUSIVE: OnceLock<Mutex<()>> = OnceLock::new();
+    EXCLUSIVE.get_or_init(|| Mutex::new(()))
+}
+
+fn exclusive(lock: &'static Mutex<()>) -> MutexGuard<'static, ()> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct IndexedRetainedCharge {
+    estimated_bytes: u64,
+    admitted_bytes: u64,
+    counters: Arc<IndexedAdapterCounters>,
+    _budget: RecoveryCharge,
+}
+
+impl IndexedRetainedCharge {
+    fn new(
+        estimated_bytes: u64,
+        admitted_bytes: u64,
+        counters: Arc<IndexedAdapterCounters>,
+        mut budget: RecoveryCharge,
+    ) -> Self {
+        budget.shrink_to(admitted_bytes);
+        let estimated = counters
+            .retained_object_estimated_bytes
+            .fetch_add(estimated_bytes, Ordering::Relaxed)
+            + estimated_bytes;
+        counters
+            .peak_retained_object_estimated_bytes
+            .fetch_max(estimated, Ordering::Relaxed);
+        let admitted = counters
+            .retained_object_admitted_bytes
+            .fetch_add(admitted_bytes, Ordering::Relaxed)
+            + admitted_bytes;
+        counters
+            .peak_retained_object_admitted_bytes
+            .fetch_max(admitted, Ordering::Relaxed);
+        Self {
+            estimated_bytes,
+            admitted_bytes,
+            counters,
+            _budget: budget,
+        }
+    }
+}
+
+impl Drop for IndexedRetainedCharge {
+    fn drop(&mut self) {
+        self.counters
+            .retained_object_estimated_bytes
+            .fetch_sub(self.estimated_bytes, Ordering::Relaxed);
+        self.counters
+            .retained_object_admitted_bytes
+            .fetch_sub(self.admitted_bytes, Ordering::Relaxed);
+    }
+}
+
+fn retained_object_bytes(object: &Object) -> u64 {
+    fn visit(object: &Object, depth: usize) -> u64 {
+        if depth >= EAGER_RESOURCE_DEPTH {
+            return std::mem::size_of::<Object>() as u64;
+        }
+        let base = std::mem::size_of::<Object>() as u64;
+        match object {
+            Object::Name(bytes) | Object::String(bytes, _) => {
+                base.saturating_add(bytes.len() as u64)
+            }
+            Object::Array(values) => values.iter().fold(
+                base.saturating_add((values.len() * std::mem::size_of::<Object>()) as u64),
+                |sum, value| sum.saturating_add(visit(value, depth + 1)),
+            ),
+            Object::Dictionary(dictionary) => dictionary.iter().fold(base, |sum, (key, value)| {
+                sum.saturating_add(key.len() as u64)
+                    .saturating_add(visit(value, depth + 1))
+            }),
+            Object::Stream(stream) => stream.dict.iter().fold(
+                base.saturating_add(stream.content.len() as u64),
+                |sum, (key, value)| {
+                    sum.saturating_add(key.len() as u64)
+                        .saturating_add(visit(value, depth + 1))
+                },
+            ),
+            Object::Null
+            | Object::Boolean(_)
+            | Object::Integer(_)
+            | Object::Real(_)
+            | Object::Reference(_) => base,
+        }
+    }
+    visit(object, 0)
+}
+
+fn append_page_payload(
+    page: ObjectId,
+    output: &mut Vec<u8>,
+    output_charge: &mut Option<RecoveryCharge>,
+    payload: Vec<u8>,
+    payload_charge: RecoveryCharge,
+) -> Result<(), AccessError> {
+    let additional = payload.len().checked_add(1).ok_or_else(|| {
+        AccessError::typed(
+            page,
+            AccessKind::ResourceLimit,
+            "page content length overflow",
+        )
+    })?;
+    if output.capacity().saturating_sub(output.len()) >= additional {
+        output.extend_from_slice(&payload);
+        output.push(b'\n');
+        drop(payload_charge);
+        return Ok(());
+    }
+
+    let combined = output.len().checked_add(additional).ok_or_else(|| {
+        AccessError::typed(
+            page,
+            AccessKind::ResourceLimit,
+            "page content length overflow",
+        )
+    })?;
+    let new_charge = provisional_o_budget()
+        .try_acquire(combined as u64)
+        .map_err(AccessError::source)?;
+    let mut combined_output = Vec::new();
+    combined_output.try_reserve_exact(combined).map_err(|_| {
+        AccessError::typed(
+            page,
+            AccessKind::ResourceLimit,
+            "page content allocation failed",
+        )
+    })?;
+    if combined_output.capacity() as u64 > new_charge.bytes {
+        return Err(AccessError::typed(
+            page,
+            AccessKind::ResourceLimit,
+            "page content allocator exceeded admitted capacity",
+        ));
+    }
+    combined_output.extend_from_slice(output);
+    combined_output.extend_from_slice(&payload);
+    combined_output.push(b'\n');
+    drop(output_charge.take());
+    drop(payload_charge);
+    *output = combined_output;
+    *output_charge = Some(new_charge);
+    Ok(())
 }
 
 /// Legacy disposition for a failed immutable operation. This table is the checked-in L2d
@@ -530,15 +918,12 @@ pub(crate) const LEGACY_SUPPRESSION: &[(AccessPhase, Suppression)] = &[
 ];
 
 pub(crate) fn legacy_suppression(phase: AccessPhase) -> Option<Suppression> {
-    LEGACY_SUPPRESSION.iter().find_map(|(candidate, disposition)| {
-        (*candidate == phase).then_some(*disposition)
-    })
+    LEGACY_SUPPRESSION
+        .iter()
+        .find_map(|(candidate, disposition)| (*candidate == phase).then_some(*disposition))
 }
 
-fn suppress_default<T: Default>(
-    result: Result<T, AccessError>,
-    disposition: Suppression,
-) -> T {
+fn suppress_default<T: Default>(result: Result<T, AccessError>, disposition: Suppression) -> T {
     match result {
         Ok(value) => value,
         Err(error) => {
@@ -563,8 +948,16 @@ enum ObjectOwner {
         document: Arc<Document>,
         key: Vec<u8>,
     },
-    #[allow(dead_code)] // constructed by the L3 indexed adapter
-    Owned { object: Arc<Object>, id: ObjectId },
+    Owned {
+        object: Arc<Object>,
+        id: ObjectId,
+        _retained: Option<Arc<IndexedRetainedCharge>>,
+    },
+    Bounded {
+        object: Arc<BoundedObject>,
+        id: ObjectId,
+        _retained: Arc<IndexedRetainedCharge>,
+    },
 }
 
 #[derive(Clone)]
@@ -626,7 +1019,11 @@ impl StreamHandle {
     fn new(id: ObjectId, object: ObjectHandle) -> Result<Self, AccessError> {
         let is_stream = object.read(|value| value.as_stream().is_ok())?;
         if !is_stream {
-            return Err(AccessError::typed(id, AccessKind::Type, "resolved object is not a stream"));
+            return Err(AccessError::typed(
+                id,
+                AccessKind::Type,
+                "resolved object is not a stream",
+            ));
         }
         Ok(Self { object })
     }
@@ -683,7 +1080,8 @@ impl ObjectHandle {
                     .map_err(|error| AccessError::object((0, 0), error))?;
                 (object, (0, 0))
             }
-            ObjectOwner::Owned { object, id } => (object.as_ref(), *id),
+            ObjectOwner::Owned { object, id, .. } => (object.as_ref(), *id),
+            ObjectOwner::Bounded { object, id, .. } => (object.as_object(), *id),
         };
         for step in &self.path {
             object = match step {
@@ -700,11 +1098,53 @@ impl ObjectHandle {
                     .ok()
                     .and_then(|array| array.get(*index))
                     .ok_or_else(|| {
-                        AccessError::typed(id, AccessKind::Bounds, format!("array index {index} is out of bounds"))
+                        AccessError::typed(
+                            id,
+                            AccessKind::Bounds,
+                            format!("array index {index} is out of bounds"),
+                        )
                     })?,
             };
         }
         Ok(inspect(object))
+    }
+
+    /// Decode a stream under the process payload broker, retaining its charge for the caller.
+    pub(crate) fn decoded_stream_bytes(
+        &self,
+        maximum: usize,
+    ) -> Result<ChargedStreamBytes, AccessError> {
+        let id = self.root_id();
+        let mut charge = provisional_o_budget()
+            .acquire_available(maximum as u64)
+            .map_err(AccessError::source)?;
+        let limit = usize::try_from(charge.bytes).unwrap_or(usize::MAX);
+        let bytes = self
+            .read(|object| object.as_stream()?.get_plain_content_with_limit(limit))?
+            .map_err(|error| match error {
+                lopdf::Error::Decompress(DecompressError::MemoryLimitExceeded { .. }) => {
+                    AccessError::typed(
+                        id,
+                        AccessKind::ResourceLimit,
+                        format!("decoded stream exceeds available {limit}-byte allowance"),
+                    )
+                }
+                other => AccessError::object(id, other),
+            })?
+            .into_boxed_slice()
+            .into_vec();
+        if bytes.capacity() as u64 > charge.bytes {
+            return Err(AccessError::typed(
+                id,
+                AccessKind::ResourceLimit,
+                "decoded stream allocator exceeded admitted capacity",
+            ));
+        }
+        charge.shrink_to(bytes.capacity() as u64);
+        Ok(ChargedStreamBytes {
+            bytes,
+            charge: PayloadCharge { _charge: charge },
+        })
     }
 
     #[allow(dead_code)] // constructed by the L3 indexed adapter; unit-tested in L2
@@ -713,6 +1153,46 @@ impl ObjectHandle {
             owner: ObjectOwner::Owned {
                 object: Arc::new(object),
                 id,
+                _retained: None,
+            },
+            path: Vec::new(),
+        }
+    }
+
+    fn owned_charged(
+        id: ObjectId,
+        object: Object,
+        counters: Arc<IndexedAdapterCounters>,
+        budget: RecoveryCharge,
+    ) -> Self {
+        let bytes = retained_object_bytes(&object);
+        let admitted = budget.bytes;
+        Self {
+            owner: ObjectOwner::Owned {
+                object: Arc::new(object),
+                id,
+                _retained: Some(Arc::new(IndexedRetainedCharge::new(
+                    bytes, admitted, counters, budget,
+                ))),
+            },
+            path: Vec::new(),
+        }
+    }
+
+    fn bounded(
+        id: ObjectId,
+        object: BoundedObject,
+        counters: Arc<IndexedAdapterCounters>,
+        budget: RecoveryCharge,
+    ) -> Self {
+        let retained = object.retained_bytes();
+        Self {
+            owner: ObjectOwner::Bounded {
+                object: Arc::new(object),
+                id,
+                _retained: Arc::new(IndexedRetainedCharge::new(
+                    retained, retained, counters, budget,
+                )),
             },
             path: Vec::new(),
         }
@@ -754,7 +1234,9 @@ impl ObjectHandle {
         })?;
         self.child(
             access,
-            step.ok_or_else(|| AccessError::typed(self.root_id(), AccessKind::Type, "object has no dictionary"))?,
+            step.ok_or_else(|| {
+                AccessError::typed(self.root_id(), AccessKind::Type, "object has no dictionary")
+            })?,
         )
     }
 
@@ -768,9 +1250,11 @@ impl ObjectHandle {
         self.child(access, PathStep::ArrayIndex(index))
     }
 
-    fn root_id(&self) -> ObjectId {
+    pub(crate) fn root_id(&self) -> ObjectId {
         match &self.owner {
-            ObjectOwner::Eager { id, .. } | ObjectOwner::Owned { id, .. } => *id,
+            ObjectOwner::Eager { id, .. }
+            | ObjectOwner::Owned { id, .. }
+            | ObjectOwner::Bounded { id, .. } => *id,
             ObjectOwner::EagerTrailerEntry { .. } => (0, 0),
         }
     }
@@ -784,7 +1268,9 @@ impl ObjectHandle {
             return None;
         }
         match &self.owner {
-            ObjectOwner::Eager { id, .. } | ObjectOwner::Owned { id, .. } => Some(*id),
+            ObjectOwner::Eager { id, .. }
+            | ObjectOwner::Owned { id, .. }
+            | ObjectOwner::Bounded { id, .. } => Some(*id),
             ObjectOwner::EagerTrailerEntry { .. } => None,
         }
     }
@@ -799,19 +1285,19 @@ pub(crate) trait DocumentAccess: Send + Sync {
     fn object(&self, id: ObjectId) -> Result<ObjectHandle, AccessError>;
     fn trailer_entry(&self, key: &[u8]) -> Result<ObjectHandle, AccessError>;
     fn catalog(&self) -> Result<DictionaryHandle, AccessError> {
-        let root = self.trailer_entry(b"Root")
+        let root = self
+            .trailer_entry(b"Root")
             .map_err(|error| error.at(AccessPhase::Catalog, None))?;
-        DictionaryHandle::new(root)
-            .map_err(|error| error.at(AccessPhase::Catalog, None))
+        DictionaryHandle::new(root).map_err(|error| error.at(AccessPhase::Catalog, None))
     }
     fn page(&self, id: ObjectId) -> Result<DictionaryHandle, AccessError> {
-        let page = self.object(id)
+        let page = self
+            .object(id)
             .map_err(|error| error.at(AccessPhase::Page, None))?;
-        DictionaryHandle::new(page)
-            .map_err(|error| error.at(AccessPhase::Page, None))
+        DictionaryHandle::new(page).map_err(|error| error.at(AccessPhase::Page, None))
     }
     /// Materialize a page's decoded content with the selected backend's exact fallback policy.
-    fn page_content(&self, page: ObjectId) -> Result<Vec<u8>, AccessError>;
+    fn page_content(&self, page: ObjectId) -> Result<PageContent, AccessError>;
     fn stream(&self, id: ObjectId) -> Result<StreamHandle, AccessError> {
         StreamHandle::new(id, self.object(id)?)
     }
@@ -831,8 +1317,6 @@ pub(crate) trait DocumentAccess: Send + Sync {
     fn page_resource_chain_or_empty(&self, page: ObjectId) -> Vec<DictionaryHandle> {
         suppress_default(self.page_resource_chain(page), Suppression::EmptyResources)
     }
-    #[cfg(test)]
-    fn source(&self) -> Arc<dyn RandomAccessSource>;
     fn source_recovery(&self) -> Arc<SourceRecovery>;
     fn source_len(&self) -> SourceResult<u64> {
         self.source_recovery().len()
@@ -845,9 +1329,7 @@ pub(crate) trait DocumentAccess: Send + Sync {
     }
     /// Incremental SHA-256 from the same single-flight source pass as malformed recovery.
     fn source_sha256(&self) -> Result<String, AccessError> {
-        self.source_recovery()
-            .sha256()
-            .map_err(AccessError::source)
+        self.source_recovery().sha256().map_err(AccessError::source)
     }
     /// Named whole-source exception for detached writers which must reparse mutable bytes.
     fn materialize_source_bounded(&self, limit: u64) -> SourceResult<Vec<u8>> {
@@ -880,10 +1362,7 @@ pub(crate) fn test_adapter(document: &Document) -> EagerDocumentAdapter {
 }
 
 #[cfg(test)]
-pub(crate) fn test_adapter_with_source(
-    document: &Document,
-    raw: &[u8],
-) -> EagerDocumentAdapter {
+pub(crate) fn test_adapter_with_source(document: &Document, raw: &[u8]) -> EagerDocumentAdapter {
     EagerDocumentAdapter::new(Arc::new(document.clone()), Arc::from(raw))
 }
 
@@ -909,11 +1388,10 @@ impl DocumentAccess for EagerDocumentAdapter {
     }
 
     fn trailer_entry(&self, key: &[u8]) -> Result<ObjectHandle, AccessError> {
-        let value = self
-            .document
-            .trailer
-            .get(key)
-            .map_err(|error| AccessError::object((0, 0), error).at(AccessPhase::Trailer, None))?;
+        let value =
+            self.document.trailer.get(key).map_err(|error| {
+                AccessError::object((0, 0), error).at(AccessPhase::Trailer, None)
+            })?;
         if let Object::Reference(id) = value {
             self.object(*id)
         } else {
@@ -924,11 +1402,11 @@ impl DocumentAccess for EagerDocumentAdapter {
         }
     }
 
-    fn page_content(&self, page: ObjectId) -> Result<Vec<u8>, AccessError> {
+    fn page_content(&self, page: ObjectId) -> Result<PageContent, AccessError> {
         self.document
             .get_dictionary(page)
             .map_err(|error| AccessError::object(page, error).at(AccessPhase::PageContent, None))?;
-        Ok(self.document.get_page_content(page))
+        Ok(PageContent::eager(self.document.get_page_content(page)))
     }
 
     fn pages(&self) -> Result<Vec<PageRef>, AccessError> {
@@ -941,9 +1419,9 @@ impl DocumentAccess for EagerDocumentAdapter {
     }
 
     fn fallback_page_text(&self, page: u32) -> Result<String, AccessError> {
-        self.document
-            .extract_text(&[page])
-            .map_err(|error| AccessError::object((0, 0), error).at(AccessPhase::FallbackText, Some(page)))
+        self.document.extract_text(&[page]).map_err(|error| {
+            AccessError::object((0, 0), error).at(AccessPhase::FallbackText, Some(page))
+        })
     }
 
     fn object_ids(&self) -> Vec<ObjectId> {
@@ -971,9 +1449,465 @@ impl DocumentAccess for EagerDocumentAdapter {
         Ok(out)
     }
 
-    #[cfg(test)]
-    fn source(&self) -> Arc<dyn RandomAccessSource> {
-        Arc::clone(&self.recovery.source)
+    fn source_recovery(&self) -> Arc<SourceRecovery> {
+        Arc::clone(&self.recovery)
+    }
+}
+
+/// Bounded random-access adapter over lopdf's immutable indexed reader.
+///
+/// This route is intentionally internal and unreachable from public constructors until L3a's
+/// explicit route-selection slice. Every indirect object is resolved under a call-local permit;
+/// the returned handle pins the bounded owner and its permit charges.
+// Boundary-audit clone authority: Arc clones retain source/recovery/counter owners; the cached
+// PageMap Result must be cloneable; raw Contents/Resources clones are short-read shape snapshots
+// needed to distinguish direct values from references; raw stream cloning is the eager-compatible
+// fallback for a non-limit decode error and remains inside the page payload admission.
+pub(crate) struct IndexedDocumentAdapter {
+    reader: IndexedReader,
+    recovery: Arc<SourceRecovery>,
+    page_map: OnceLock<Result<Arc<PageMap>, AccessError>>,
+    counters: Arc<IndexedAdapterCounters>,
+}
+
+impl IndexedDocumentAdapter {
+    pub(crate) fn open(
+        source: Arc<dyn RandomAccessSource>,
+        password: Option<Vec<u8>>,
+    ) -> Result<Self, AccessError> {
+        let options = IndexedReaderOptions {
+            object_bytes: INDEXED_OBJECT_BYTES,
+            stream_bytes: INDEXED_STREAM_BYTES,
+            encoded_stream_bytes: None,
+            endstream_tail_bytes: 64,
+            reference_depth: INDEXED_REFERENCE_DEPTH,
+            page_tree_depth: INDEXED_PAGE_TREE_DEPTH,
+            max_pages: INDEXED_MAX_PAGES,
+            password,
+        };
+        let reader = IndexedReader::open_shared(Arc::clone(&source), options)
+            .map_err(|error| indexed_error((0, 0), error))?;
+        let (map, stats) = reader
+            .page_map_with_stats()
+            .map_err(|error| indexed_error((0, 0), error).at(AccessPhase::Pages, None))?;
+        let cap = INDEX_FIXED_BYTES
+            .saturating_add(INDEX_OBJECT_BYTES.saturating_mul(stats.object_count() as u64))
+            .saturating_add(INDEX_PAGE_BYTES.saturating_mul(stats.page_count() as u64));
+        if stats.estimated_retained_bytes() > cap {
+            return Err(AccessError::typed(
+                (0, 0),
+                AccessKind::ResourceLimit,
+                format!(
+                    "indexed metadata retains {} bytes, exceeding frozen cap {cap}",
+                    stats.estimated_retained_bytes()
+                ),
+            ));
+        }
+        let map = Arc::new(map);
+        let counters = Arc::new(IndexedAdapterCounters::default());
+        counters.page_map_builds.store(1, Ordering::Relaxed);
+        counters
+            .index_estimated_bytes
+            .store(stats.estimated_retained_bytes(), Ordering::Relaxed);
+        counters
+            .index_objects
+            .store(stats.object_count() as u64, Ordering::Relaxed);
+        counters
+            .index_pages
+            .store(stats.page_count() as u64, Ordering::Relaxed);
+        Ok(Self {
+            reader,
+            recovery: Arc::new(SourceRecovery::new(source)),
+            page_map: OnceLock::from(Ok(map)),
+            counters,
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // slice-2 diagnostics; slice 3 exposes route counters
+    pub(crate) fn counters(&self) -> Arc<IndexedAdapterCounters> {
+        Arc::clone(&self.counters)
+    }
+
+    fn cached_page_map(&self) -> Result<Arc<PageMap>, AccessError> {
+        self.page_map
+            .get_or_init(|| {
+                self.counters
+                    .page_map_builds
+                    .fetch_add(1, Ordering::Relaxed);
+                self.reader
+                    .page_map()
+                    .map(Arc::new)
+                    .map_err(|error| indexed_error((0, 0), error).at(AccessPhase::Pages, None))
+            })
+            .clone()
+    }
+
+    fn resolve_bounded(&self, id: ObjectId) -> Result<ObjectHandle, AccessError> {
+        let _exclusive = exclusive(indexed_object_exclusive());
+        let budget = provisional_o_budget()
+            .acquire_available(PROVISIONAL_O_BYTES)
+            .map_err(|error| AccessError::source(error).at(AccessPhase::Object, None))?;
+        let active = self
+            .counters
+            .active_resolutions
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        self.counters
+            .peak_active_resolutions
+            .fetch_max(active, Ordering::Relaxed);
+        self.counters
+            .object_resolutions
+            .fetch_add(1, Ordering::Relaxed);
+        let permit = ScalarResolutionPermit::new(budget.bytes);
+        let result = self.reader.resolve_object_with_permit(id, &permit);
+        self.counters
+            .active_resolutions
+            .fetch_sub(1, Ordering::Relaxed);
+        match result {
+            Ok(object) => {
+                self.counters
+                    .peak_resolution_bytes
+                    .fetch_max(object.peak_bytes(), Ordering::Relaxed);
+                Ok(ObjectHandle::bounded(
+                    id,
+                    object,
+                    Arc::clone(&self.counters),
+                    budget,
+                ))
+            }
+            Err(error) => {
+                self.counters
+                    .object_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(indexed_error(id, error))
+            }
+        }
+    }
+
+    fn page_id(&self, number: u32) -> Result<ObjectId, AccessError> {
+        let index = usize::try_from(number.saturating_sub(1)).unwrap_or(usize::MAX);
+        self.cached_page_map()?
+            .get(index)
+            .map(|entry| entry.id())
+            .ok_or_else(|| {
+                AccessError::typed(
+                    (0, 0),
+                    AccessKind::Bounds,
+                    format!("page {number} not found"),
+                )
+                .at(AccessPhase::FallbackText, Some(number))
+            })
+    }
+}
+
+/// Internal slice-2 construction seam. Public constructors remain eager until L3a slice 3.
+#[allow(dead_code)]
+pub(crate) fn open_indexed_access(
+    source: Arc<dyn RandomAccessSource>,
+    password: Option<Vec<u8>>,
+) -> Result<Arc<dyn DocumentAccess>, AccessError> {
+    Ok(Arc::new(IndexedDocumentAdapter::open(source, password)?))
+}
+
+impl DocumentAccess for IndexedDocumentAdapter {
+    fn object(&self, id: ObjectId) -> Result<ObjectHandle, AccessError> {
+        self.resolve_bounded(id)
+            .map_err(|error| error.at(AccessPhase::Object, None))
+    }
+
+    fn trailer_entry(&self, key: &[u8]) -> Result<ObjectHandle, AccessError> {
+        let _exclusive = exclusive(indexed_object_exclusive());
+        let budget = provisional_o_budget()
+            // The raw trailer seam returns an owned clone rather than a permit-backed owner, so
+            // its size is unknowable until after cloning. Hold all of O across that clone and
+            // reconcile to the retained estimate afterward.
+            .try_acquire(PROVISIONAL_O_BYTES)
+            .map_err(|error| AccessError::source(error).at(AccessPhase::Trailer, None))?;
+        // `trailer_entry_raw_owned` is the independently reviewed L3.0a/a477ba4 seam: it clones only
+        // the immutable raw trailer value and never dereferences an indirect entry.
+        let value = self.reader.trailer_entry_raw_owned(key).ok_or_else(|| {
+            AccessError::typed((0, 0), AccessKind::Type, "missing trailer entry")
+                .at(AccessPhase::Trailer, None)
+        })?;
+        if let Object::Reference(id) = value {
+            drop(budget);
+            drop(_exclusive);
+            return self
+                .object(id)
+                .map_err(|error| error.at(AccessPhase::Trailer, None));
+        }
+        let retained = retained_object_bytes(&value);
+        // Other live bounded owners consume the same O allowance. A direct trailer clone may
+        // retain only the capacity actually admitted for this operation, not merely the nominal
+        // 64 MiB ceiling.
+        if retained > budget.bytes {
+            return Err(AccessError::typed(
+                (0, 0),
+                AccessKind::ResourceLimit,
+                format!(
+                    "direct trailer value retains {retained} bytes, exceeding the admitted {} bytes",
+                    budget.bytes
+                ),
+            )
+            .at(AccessPhase::Trailer, None));
+        }
+        Ok(ObjectHandle::owned_charged(
+            (0, 0),
+            value,
+            Arc::clone(&self.counters),
+            budget,
+        ))
+    }
+
+    fn page_content(&self, page: ObjectId) -> Result<PageContent, AccessError> {
+        let _exclusive = exclusive(indexed_page_content_exclusive());
+        self.counters
+            .page_content_ops
+            .fetch_add(1, Ordering::Relaxed);
+        let page_handle = self
+            .page(page)
+            .map_err(|error| error.at(AccessPhase::PageContent, None))?;
+        enum ContentsShape {
+            Missing,
+            InlineStream,
+            Reference(ObjectId),
+            Array,
+            Other,
+        }
+        let contents_shape = page_handle
+            .read(|dictionary| match dictionary.get(b"Contents").ok() {
+                None => ContentsShape::Missing,
+                Some(Object::Stream(_)) => ContentsShape::InlineStream,
+                Some(Object::Reference(id)) => ContentsShape::Reference(*id),
+                Some(Object::Array(_)) => ContentsShape::Array,
+                Some(_) => ContentsShape::Other,
+            })
+            .map_err(|error| error.at(AccessPhase::PageContent, None))?;
+        // Eager `get_page_contents` ignores an inline stream. It follows an indirect stream or
+        // accepts a direct/indirect array whose members themselves must be references.
+        let contents = match contents_shape {
+            ContentsShape::Reference(id) => match self.object(id) {
+                Ok(contents) => contents,
+                Err(error) if fatal_lazy_access(&error) => {
+                    return Err(error.at(AccessPhase::PageContent, None));
+                }
+                Err(_) => return Ok(PageContent::indexed(Vec::new(), None)),
+            },
+            ContentsShape::Array => page_handle
+                .entry(self, b"Contents")
+                .map_err(|error| error.at(AccessPhase::PageContent, None))?,
+            _ => return Ok(PageContent::indexed(Vec::new(), None)),
+        };
+        let mut streams = Vec::new();
+        let shape = contents
+            .read(|object| match object {
+                Object::Stream(_) => Some(Vec::new()),
+                Object::Array(array) => Some(
+                    array
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, value)| value.as_reference().ok().map(|_| index))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .map_err(|error| error.at(AccessPhase::PageContent, None))?;
+        match shape {
+            Some(indices) if indices.is_empty() => {
+                if contents
+                    .read(|object| object.as_stream().is_ok())
+                    .unwrap_or(false)
+                {
+                    streams.push(contents);
+                }
+            }
+            Some(indices) => {
+                for index in indices {
+                    match contents.array_entry(self, index) {
+                        Ok(stream) => streams.push(stream),
+                        Err(error) if fatal_lazy_access(&error) => {
+                            return Err(error.at(AccessPhase::PageContent, None));
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            None => return Ok(PageContent::indexed(Vec::new(), None)),
+        }
+
+        let mut output = Vec::new();
+        let mut output_charge = None;
+        for stream in streams {
+            if !stream
+                .read(|object| object.as_stream().is_ok())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let logical_remaining = usize::try_from(PROVISIONAL_O_BYTES)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(output.len())
+                .saturating_sub(1);
+            if logical_remaining == 0 {
+                return Err(AccessError::typed(
+                    page,
+                    AccessKind::ResourceLimit,
+                    format!("page content exceeds {PROVISIONAL_O_BYTES} bytes"),
+                )
+                .at(AccessPhase::PageContent, None));
+            }
+            let mut payload_charge = provisional_o_budget()
+                .acquire_available(logical_remaining as u64)
+                .map_err(|error| AccessError::source(error).at(AccessPhase::PageContent, None))?;
+            let payload_limit = usize::try_from(payload_charge.bytes).unwrap_or(usize::MAX);
+            let result = stream.read(|object| {
+                let Ok(stream) = object.as_stream() else {
+                    return Ok(None);
+                };
+                let payload = match stream.decompressed_content_with_limit(payload_limit) {
+                    Ok(bytes) => bytes,
+                    Err(lopdf::Error::Decompress(DecompressError::MemoryLimitExceeded {
+                        ..
+                    })) => {
+                        return Err(AccessError::typed(
+                            page,
+                            AccessKind::ResourceLimit,
+                            format!(
+                                "page content exceeds available {payload_limit}-byte allowance"
+                            ),
+                        ));
+                    }
+                    Err(_) if stream.content.len() <= payload_limit => stream.content.clone(),
+                    Err(_) => {
+                        return Err(AccessError::typed(
+                            page,
+                            AccessKind::ResourceLimit,
+                            format!(
+                                "page content exceeds available {payload_limit}-byte allowance"
+                            ),
+                        ));
+                    }
+                };
+                Ok(Some(payload))
+            });
+            match result {
+                Ok(Ok(Some(payload))) => {
+                    if payload.capacity() as u64 > payload_charge.bytes {
+                        return Err(AccessError::typed(
+                            page,
+                            AccessKind::ResourceLimit,
+                            "decoded payload allocator exceeded admitted capacity",
+                        )
+                        .at(AccessPhase::PageContent, None));
+                    }
+                    payload_charge.shrink_to(payload.capacity() as u64);
+                    append_page_payload(
+                        page,
+                        &mut output,
+                        &mut output_charge,
+                        payload,
+                        payload_charge,
+                    )
+                    .map_err(|error| error.at(AccessPhase::PageContent, None))?;
+                }
+                Ok(Ok(None)) | Err(_) => {}
+                Ok(Err(error)) => {
+                    return Err(error.at(AccessPhase::PageContent, None));
+                }
+            }
+        }
+        Ok(PageContent::indexed(output, output_charge))
+    }
+
+    fn pages(&self) -> Result<Vec<PageRef>, AccessError> {
+        self.cached_page_map().map(|map| {
+            map.iter()
+                .enumerate()
+                .map(|(index, page)| PageRef {
+                    number: u32::try_from(index + 1).unwrap_or(u32::MAX),
+                    id: page.id(),
+                })
+                .collect()
+        })
+    }
+
+    fn fallback_page_text(&self, page: u32) -> Result<String, AccessError> {
+        let page_id = self.page_id(page)?;
+        crate::text::fallback_page_text(self, page_id)
+            .map_err(|error| error.at(AccessPhase::FallbackText, Some(page)))
+    }
+
+    fn object_ids(&self) -> Vec<ObjectId> {
+        self.reader.object_ids()
+    }
+
+    fn page_resource_chain(&self, page: ObjectId) -> Result<Vec<DictionaryHandle>, AccessError> {
+        let mut current = match self.page(page) {
+            Ok(page) => page,
+            Err(error) if fatal_lazy_access(&error) => {
+                return Err(error.at(AccessPhase::Resources, None));
+            }
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut resources = Vec::new();
+        for depth in 0..=EAGER_RESOURCE_DEPTH {
+            let resource_shape = current
+                .read(|dictionary| match dictionary.get(b"Resources").ok() {
+                    Some(Object::Reference(_)) => 1u8,
+                    Some(Object::Dictionary(_)) => 2u8,
+                    _ => 0u8,
+                })
+                .map_err(|error| error.at(AccessPhase::Resources, None))?;
+            let include = resource_shape == 1 || (depth == 0 && resource_shape == 2);
+            if include {
+                match current.entry(self, b"Resources") {
+                    Ok(value) => match DictionaryHandle::new(value) {
+                        Ok(dictionary) => resources.push(dictionary),
+                        Err(error) if fatal_lazy_access(&error) => {
+                            return Err(error.at(AccessPhase::Resources, None));
+                        }
+                        Err(_) => {}
+                    },
+                    Err(error) if fatal_lazy_access(&error) => {
+                        return Err(error.at(AccessPhase::Resources, None));
+                    }
+                    Err(_) => {}
+                }
+            }
+            let parent = current
+                .read(|dictionary| {
+                    dictionary
+                        .get(b"Parent")
+                        .ok()
+                        .and_then(|value| value.as_reference().ok())
+                })
+                .map_err(|error| error.at(AccessPhase::Resources, None))?;
+            let Some(parent) = parent else {
+                break;
+            };
+            if !seen.insert(parent) {
+                return Err(
+                    AccessError::typed(parent, AccessKind::Backend, "page parent cycle")
+                        .at(AccessPhase::Resources, None),
+                );
+            }
+            if depth == EAGER_RESOURCE_DEPTH {
+                return Err(AccessError::typed(
+                    parent,
+                    AccessKind::ResourceLimit,
+                    "page parent depth exceeded",
+                )
+                .at(AccessPhase::Resources, None));
+            }
+            let parent_object = self
+                .object(parent)
+                .map_err(|error| error.at(AccessPhase::Resources, None))?;
+            current = DictionaryHandle::new(parent_object)
+                .map_err(|error| error.at(AccessPhase::Resources, None))?;
+        }
+        resources.reverse();
+        Ok(resources)
     }
 
     fn source_recovery(&self) -> Arc<SourceRecovery> {
@@ -1028,6 +1962,11 @@ pub(crate) mod tests {
     use lopdf::dictionary;
     use lopdf::SourceError;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn indexed_test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        exclusive(LOCK.get_or_init(|| Mutex::new(())))
+    }
 
     #[derive(Default)]
     pub(crate) struct AccessCounts {
@@ -1113,8 +2052,9 @@ pub(crate) mod tests {
             fault: Option<FaultPoint>,
             counts: Arc<AccessCounts>,
         ) -> Self {
+            let inner_recovery = inner.source_recovery();
             let counted_source: Arc<dyn RandomAccessSource> = Arc::new(CountingSource {
-                inner: inner.source(),
+                inner: Arc::clone(&inner_recovery.source),
                 counts: Arc::clone(&counts),
                 fail_reads: fault == Some(FaultPoint::Source),
             });
@@ -1126,13 +2066,19 @@ pub(crate) mod tests {
             }
         }
 
+        fn test_source(&self) -> Arc<dyn RandomAccessSource> {
+            self.counts.source_requests.fetch_add(1, Ordering::Relaxed);
+            Arc::clone(&self.recovery.source)
+        }
+
         fn failure(&self, point: FaultPoint, object: ObjectId) -> Result<(), AccessError> {
             if self.fault == Some(point) {
                 Err(AccessError::typed(
                     object,
                     AccessKind::Injected,
                     format!("injected {point:?} failure"),
-                ).at(point.phase(), None))
+                )
+                .at(point.phase(), None))
             } else {
                 Ok(())
             }
@@ -1152,7 +2098,7 @@ pub(crate) mod tests {
             self.inner.trailer_entry(key)
         }
 
-        fn page_content(&self, page: ObjectId) -> Result<Vec<u8>, AccessError> {
+        fn page_content(&self, page: ObjectId) -> Result<PageContent, AccessError> {
             self.counts.object_reads.fetch_add(1, Ordering::Relaxed);
             self.failure(FaultPoint::PageContent, page)?;
             self.inner.page_content(page)
@@ -1165,7 +2111,9 @@ pub(crate) mod tests {
         }
 
         fn fallback_page_text(&self, page: u32) -> Result<String, AccessError> {
-            self.counts.fallback_text_reads.fetch_add(1, Ordering::Relaxed);
+            self.counts
+                .fallback_text_reads
+                .fetch_add(1, Ordering::Relaxed);
             self.failure(FaultPoint::FallbackText, (page, 0))
                 .map_err(|error| error.at(AccessPhase::FallbackText, Some(page)))?;
             self.inner.fallback_page_text(page)
@@ -1185,15 +2133,9 @@ pub(crate) mod tests {
             self.inner.page_resource_chain(page)
         }
 
-        fn source(&self) -> Arc<dyn RandomAccessSource> {
-            self.counts.source_requests.fetch_add(1, Ordering::Relaxed);
-            Arc::clone(&self.recovery.source)
-        }
-
         fn source_recovery(&self) -> Arc<SourceRecovery> {
             Arc::clone(&self.recovery)
         }
-
     }
 
     fn adapter(objects: Vec<Object>, raw: &[u8]) -> (EagerDocumentAdapter, Vec<ObjectId>) {
@@ -1260,7 +2202,7 @@ pub(crate) mod tests {
         );
 
         let (adapter, _) = adapter(Vec::new(), b"abcdef");
-        let range = SourceRange::new(adapter.source(), 2, 3);
+        let range = SourceRange::new(Arc::clone(&adapter.source_recovery().source), 2, 3);
         drop(adapter);
         assert_eq!(range.read(3).unwrap(), b"cde");
         assert!(range.read(2).is_err());
@@ -1346,7 +2288,7 @@ pub(crate) mod tests {
             Err(AccessError::object((0, 0), "unexpected trailer read"))
         }
 
-        fn page_content(&self, page: ObjectId) -> Result<Vec<u8>, AccessError> {
+        fn page_content(&self, page: ObjectId) -> Result<PageContent, AccessError> {
             Err(AccessError::object(page, "unexpected page content read"))
         }
 
@@ -1355,7 +2297,10 @@ pub(crate) mod tests {
         }
 
         fn fallback_page_text(&self, page: u32) -> Result<String, AccessError> {
-            Err(AccessError::object((page, 0), "unexpected fallback text read"))
+            Err(AccessError::object(
+                (page, 0),
+                "unexpected fallback text read",
+            ))
         }
 
         fn object_ids(&self) -> Vec<ObjectId> {
@@ -1369,12 +2314,10 @@ pub(crate) mod tests {
             Ok(Vec::new())
         }
 
-        fn source(&self) -> Arc<dyn RandomAccessSource> {
-            Arc::new(BytesSource::new(Arc::from(&b""[..])))
-        }
-
         fn source_recovery(&self) -> Arc<SourceRecovery> {
-            Arc::new(SourceRecovery::new(self.source()))
+            Arc::new(SourceRecovery::new(Arc::new(BytesSource::new(Arc::from(
+                &b""[..],
+            )))))
         }
     }
 
@@ -1456,7 +2399,7 @@ pub(crate) mod tests {
                 FaultPoint::FallbackText => fault.fallback_page_text(1).err().unwrap(),
                 FaultPoint::Resources => fault.page_resource_chain(ids[0]).err().unwrap(),
                 FaultPoint::Source => {
-                    let source_error = fault.source().read_range(0, 1, 1).err().unwrap();
+                    let source_error = fault.test_source().read_range(0, 1, 1).err().unwrap();
                     assert!(matches!(source_error, SourceError::UnexpectedEof { .. }));
                     assert_eq!(fault.counts.source_reads.load(Ordering::Relaxed), 1);
                     continue;
@@ -1477,7 +2420,10 @@ pub(crate) mod tests {
         );
         let catalog_error = catalog_fault.catalog().err().unwrap();
         assert_eq!(catalog_error.phase, AccessPhase::Catalog);
-        assert_eq!(legacy_suppression(catalog_error.phase), Some(Suppression::SkipMetadata));
+        assert_eq!(
+            legacy_suppression(catalog_error.phase),
+            Some(Suppression::SkipMetadata)
+        );
 
         let counts = Arc::new(AccessCounts::default());
         let page_fault = FaultAccess::new(
@@ -1487,14 +2433,17 @@ pub(crate) mod tests {
         );
         let page_error = page_fault.page(ids[0]).err().unwrap();
         assert_eq!(page_error.phase, AccessPhase::Page);
-        assert_eq!(legacy_suppression(page_error.phase), Some(Suppression::SkipNode));
+        assert_eq!(
+            legacy_suppression(page_error.phase),
+            Some(Suppression::SkipNode)
+        );
 
         let counts = Arc::new(AccessCounts::default());
         counts.opens.fetch_add(1, Ordering::Relaxed);
         let counted = FaultAccess::new(Arc::new(adapter), None, counts);
         assert_eq!(counted.object_ids(), ids);
         assert_eq!(counted.counts.object_lists.load(Ordering::Relaxed), 1);
-        assert_eq!(counted.source().read_range(1, 3, 3).unwrap(), b"bcd");
+        assert_eq!(counted.test_source().read_range(1, 3, 3).unwrap(), b"bcd");
         assert_eq!(counted.counts.source_requests.load(Ordering::Relaxed), 1);
         assert_eq!(counted.counts.source_reads.load(Ordering::Relaxed), 1);
         assert_eq!(counted.counts.max_request.load(Ordering::Relaxed), 3);
@@ -1509,7 +2458,10 @@ pub(crate) mod tests {
         raw.extend(std::iter::repeat_n(b'z', SOURCE_CHUNK_BYTES + 17));
         let expected_hash = {
             let digest = Sha256::digest(&raw);
-            digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
         };
         let counts = Arc::new(AccessCounts::default());
         let bytes: Arc<[u8]> = Arc::from(raw.clone());
@@ -1593,16 +2545,23 @@ pub(crate) mod tests {
             b"42 0 obj\n<<>>\nstream\rcr-only\rendstream".as_slice(),
             b"42 0 obj\n<<>>\nstreamno-eolendstream".as_slice(),
             b"42 0 obj\n<< /Note (stream) >>\nstream\nactual\nendstream".as_slice(),
-            b"42 0 obj\n<<>>\nstream\nfirst\nendstream\n42 0 obj\n<<>>\nstream\nsecond\nendstream".as_slice(),
+            b"42 0 obj\n<<>>\nstream\nfirst\nendstream\n42 0 obj\n<<>>\nstream\nsecond\nendstream"
+                .as_slice(),
             b"42 0 obj\n<<>>\nstream\nendstream".as_slice(),
         ];
         for raw in ordinary {
-            assert_eq!(scanned_range(raw, 42).unwrap(), legacy_recovery_range(raw, 42));
+            assert_eq!(
+                scanned_range(raw, 42).unwrap(),
+                legacy_recovery_range(raw, 42)
+            );
         }
 
         let mut split = vec![b'x'; SOURCE_CHUNK_BYTES - 3];
         split.extend_from_slice(b"42 0 obj\n<<>>\nstream\r\nsplit\r\nendstream");
-        assert_eq!(scanned_range(&split, 42).unwrap(), legacy_recovery_range(&split, 42));
+        assert_eq!(
+            scanned_range(&split, 42).unwrap(),
+            legacy_recovery_range(&split, 42)
+        );
 
         // Approved correction 1: a requested object number is not a suffix of a larger number.
         let suffix = b"142 0 obj\n<<>>\nstream\nwrong\nendstream";
@@ -1616,10 +2575,16 @@ pub(crate) mod tests {
 
         // The frozen 64 MiB recovery cap refuses the range before allocating its payload.
         let mut oversize = b"42 0 obj\n<<>>\nstream\n".to_vec();
-        oversize.resize(oversize.len() + MAX_RECOVERED_STREAM_BYTES as usize + 1, b'x');
+        oversize.resize(
+            oversize.len() + MAX_RECOVERED_STREAM_BYTES as usize + 1,
+            b'x',
+        );
         oversize.extend_from_slice(b"\nendstream");
         let recovery = SourceRecovery::new(Arc::new(BytesSource::new(oversize.into())));
-        let error = recovery.recover_stream(42).err().expect("oversize recovery must fail");
+        let error = recovery
+            .recover_stream(42)
+            .err()
+            .expect("oversize recovery must fail");
         assert_eq!(error.kind, SourceFailureKind::ResourceLimit);
     }
 
@@ -1679,5 +2644,1105 @@ pub(crate) mod tests {
         assert_eq!(first.kind, SourceFailureKind::SourceChanged);
         assert_eq!(second, first, "single-flight failure publication is stable");
         assert_eq!(AccessError::source(first).kind, AccessKind::SourceChanged);
+    }
+
+    fn indexed_metadata_fixture() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = [0usize; 7];
+        for (number, generation, body) in [
+            (
+                1usize,
+                4u16,
+                b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
+            ),
+            (
+                2,
+                0,
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
+            ),
+            (3, 0, b"<< /Type /Page /Parent 2 0 R >>".as_slice()),
+            (5, 2, b"<< /Producer (indexed-adapter) >>".as_slice()),
+            (6, 0, b"<< /Length 4 >>\nstream\nDATA\nendstream".as_slice()),
+        ] {
+            offsets[number] = pdf.len();
+            pdf.extend_from_slice(format!("{number} {generation} obj\n").as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{:010} 00004 n \n", offsets[1]).as_bytes());
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", offsets[2]).as_bytes());
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", offsets[3]).as_bytes());
+        pdf.extend_from_slice(b"0000000000 00007 f \n");
+        pdf.extend_from_slice(format!("{:010} 00002 n \n", offsets[5]).as_bytes());
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", offsets[6]).as_bytes());
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 7 /Root 1 4 R /Info 5 2 R /Flag [true (owned)] >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    fn indexed(raw: &[u8], password: Option<&[u8]>) -> IndexedDocumentAdapter {
+        let bytes: Arc<[u8]> = Arc::from(raw);
+        let source: Arc<dyn RandomAccessSource> = Arc::new(BytesSource::new(bytes));
+        IndexedDocumentAdapter::open(source, password.map(Vec::from)).unwrap()
+    }
+
+    fn differential_document() -> (Document, Vec<u8>, ObjectId) {
+        let mut document = Document::with_version("1.7");
+        let cmap_conflict = document.add_object(lopdf::Stream::new(
+            Dictionary::new(),
+            b"1 begincodespacerange\n<00> <ff>\nendcodespacerange\n1 beginbfchar\n<41> <0058>\nendbfchar\n".to_vec(),
+        ));
+        let cmap_unicode = document.add_object(lopdf::Stream::new(
+            Dictionary::new(),
+            b"1 begincodespacerange\n<0000> <ffff>\nendcodespacerange\n1 beginbfchar\n<0001> <03a9>\nendbfchar\n".to_vec(),
+        ));
+        let encoding = Object::Dictionary(dictionary! {
+            "Type" => "Encoding",
+            "BaseEncoding" => "StandardEncoding",
+            "Differences" => vec![Object::Integer(65), Object::Name(b"B".to_vec())],
+        });
+        let f1 = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "Encoding" => encoding,
+            "ToUnicode" => Object::Reference(cmap_conflict),
+        }));
+        let f2 = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "Unicode",
+            "ToUnicode" => Object::Reference(cmap_unicode),
+        }));
+        let resources = |level: i64| {
+            Object::Dictionary(dictionary! {
+                "Level" => level,
+                "Font" => Object::Dictionary(dictionary! {
+                    "F1" => Object::Reference(f1),
+                    "F2" => Object::Reference(f2),
+                }),
+            })
+        };
+        let outer_resources = document.add_object(resources(1));
+        let middle_resources = document.add_object(resources(2));
+        let page_resources = document.add_object(resources(3));
+        let first = document.add_object(lopdf::Stream::new(
+            Dictionary::new(),
+            b"BT /F1 12 Tf (A) Tj T* (A) Tj ET\n".to_vec(),
+        ));
+        let second = document.add_object(lopdf::Stream::new(
+            Dictionary::new(),
+            b"BT /F1 12 Tf (A) ' 0 0 (A) \" [(A) -200 (A)] TJ ET\nBT /F2 12 Tf <0001> Tj ET\n"
+                .to_vec(),
+        ));
+        let root_pages = document.new_object_id();
+        let middle_pages = document.new_object_id();
+        let page = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(middle_pages),
+            "Resources" => Object::Reference(page_resources),
+            "Contents" => vec![Object::Reference(first), Object::Reference(second)],
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        }));
+        document.objects.insert(
+            middle_pages,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Parent" => Object::Reference(root_pages),
+                "Resources" => Object::Reference(middle_resources),
+                "Kids" => vec![Object::Reference(page)],
+                "Count" => 1,
+            }),
+        );
+        document.objects.insert(
+            root_pages,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Resources" => Object::Reference(outer_resources),
+                "Kids" => vec![Object::Reference(middle_pages)],
+                "Count" => 1,
+            }),
+        );
+        let catalog = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(root_pages),
+        }));
+        document.trailer.set("Root", Object::Reference(catalog));
+        let mut raw = Vec::new();
+        document.save_to(&mut raw).unwrap();
+        (document, raw, page)
+    }
+
+    fn document_with_page_values(
+        page_resources: Object,
+        ancestor_resources: Object,
+        contents: Object,
+    ) -> (Document, Vec<u8>, ObjectId) {
+        let mut document = Document::with_version("1.7");
+        let pages = document.new_object_id();
+        let page = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages),
+            "Resources" => page_resources,
+            "Contents" => contents,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        }));
+        document.objects.insert(
+            pages,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Resources" => ancestor_resources,
+                "Kids" => vec![Object::Reference(page)],
+                "Count" => 1,
+            }),
+        );
+        let catalog = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Catalog", "Pages" => Object::Reference(pages),
+        }));
+        document.trailer.set("Root", Object::Reference(catalog));
+        let mut raw = Vec::new();
+        document.save_to(&mut raw).unwrap();
+        (document, raw, page)
+    }
+
+    fn cmap(body: &str) -> Vec<u8> {
+        format!(
+            "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapName /Exact def\n/CMapType 2 def\n4 begincodespacerange\n<00> <FF>\n<0000> <FFFF>\n<000000> <FFFFFF>\n<00000000> <FFFFFFFF>\nendcodespacerange\n{body}\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n"
+        )
+        .into_bytes()
+    }
+
+    fn flate_zeros(target: usize) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        let block = [0u8; 64 * 1024];
+        let mut remaining = target;
+        while remaining > 0 {
+            let take = remaining.min(block.len());
+            encoder.write_all(&block[..take]).unwrap();
+            remaining -= take;
+        }
+        encoder.finish().unwrap()
+    }
+
+    fn finish_text_document(
+        mut document: Document,
+        fonts: Vec<(&str, ObjectId)>,
+        content: Vec<u8>,
+    ) -> (Document, Vec<u8>, ObjectId) {
+        let font_dict = Object::Dictionary(Dictionary::from_iter(
+            fonts
+                .into_iter()
+                .map(|(name, id)| (name.as_bytes().to_vec(), Object::Reference(id))),
+        ));
+        let content = document.add_object(lopdf::Stream::new(Dictionary::new(), content));
+        let pages = document.new_object_id();
+        let page = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages),
+            "Resources" => Object::Dictionary(dictionary! { "Font" => font_dict }),
+            "Contents" => Object::Reference(content),
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        }));
+        document.objects.insert(
+            pages,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![Object::Reference(page)], "Count" => 1,
+            }),
+        );
+        let catalog = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Catalog", "Pages" => Object::Reference(pages),
+        }));
+        document.trailer.set("Root", Object::Reference(catalog));
+        let mut raw = Vec::new();
+        document.save_to(&mut raw).unwrap();
+        (document, raw, page)
+    }
+
+    fn fallback_pair(
+        document: Document,
+        raw: &[u8],
+    ) -> (Result<String, AccessError>, Result<String, AccessError>) {
+        let eager = EagerDocumentAdapter::new(Arc::new(document), Arc::from(raw));
+        let lazy = indexed(raw, None);
+        (eager.fallback_page_text(1), lazy.fallback_page_text(1))
+    }
+
+    #[test]
+    fn indexed_adapter_bounds_objects_trailer_pages_and_index_formula() {
+        let _test_lock = indexed_test_lock();
+        let raw = indexed_metadata_fixture();
+        let adapter = indexed(&raw, None);
+        assert_eq!(
+            adapter.object_ids(),
+            vec![(1, 4), (2, 0), (3, 0), (5, 2), (6, 0)]
+        );
+        assert_eq!(
+            adapter.pages().unwrap(),
+            vec![PageRef {
+                number: 1,
+                id: (3, 0)
+            }]
+        );
+        assert_eq!(adapter.pages().unwrap().len(), 1);
+        assert_eq!(
+            adapter.counters().page_map_builds.load(Ordering::Relaxed),
+            1
+        );
+        let held = adapter.object((6, 0)).unwrap();
+        let started = std::time::Instant::now();
+        let error = adapter
+            .trailer_entry(b"Flag")
+            .err()
+            .expect("a direct trailer clone requires all of O");
+        assert_eq!(error.kind, AccessKind::ResourceLimit);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        drop(held);
+        assert_eq!(
+            adapter
+                .trailer_entry(b"Info")
+                .unwrap()
+                .read(|object| object
+                    .as_dict()
+                    .unwrap()
+                    .get(b"Producer")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_vec())
+                .unwrap(),
+            b"indexed-adapter"
+        );
+        let flag = adapter.trailer_entry(b"Flag").unwrap();
+        assert!(
+            flag.read(|object| object.as_array().unwrap().len())
+                .unwrap()
+                == 2
+        );
+        let counters = adapter.counters();
+        assert_eq!(
+            counters
+                .retained_object_admitted_bytes
+                .load(Ordering::Relaxed),
+            PROVISIONAL_O_BYTES
+        );
+        assert!(
+            counters
+                .retained_object_estimated_bytes
+                .load(Ordering::Relaxed)
+                < PROVISIONAL_O_BYTES
+        );
+        let started = std::time::Instant::now();
+        let error = adapter
+            .object((6, 0))
+            .err()
+            .expect("full trailer admission blocks O");
+        assert_eq!(error.kind, AccessKind::ResourceLimit);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let started = std::time::Instant::now();
+        let error = adapter
+            .recover_source_stream(6)
+            .err()
+            .expect("recovery must fail instead of blocking behind a live O owner");
+        assert_eq!(error.kind, AccessKind::ResourceLimit);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        drop(flag);
+        assert_eq!(
+            adapter
+                .counters()
+                .retained_object_admitted_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            adapter.recover_source_stream(6).unwrap().unwrap().as_ref(),
+            b"DATA"
+        );
+        let stream = adapter.object((6, 0)).unwrap();
+        assert_eq!(
+            stream
+                .read(|object| object.as_stream().unwrap().content.clone())
+                .unwrap(),
+            b"DATA"
+        );
+        drop(stream);
+        assert!(adapter.object((5, 1)).is_err());
+        let counters = adapter.counters();
+        let cap = INDEX_FIXED_BYTES
+            + INDEX_OBJECT_BYTES * counters.index_objects.load(Ordering::Relaxed)
+            + INDEX_PAGE_BYTES * counters.index_pages.load(Ordering::Relaxed);
+        assert!(counters.index_estimated_bytes.load(Ordering::Relaxed) <= cap);
+        assert!(counters.peak_active_resolutions.load(Ordering::Relaxed) <= 1);
+        assert!(counters.peak_resolution_bytes.load(Ordering::Relaxed) <= PROVISIONAL_O_BYTES);
+    }
+
+    #[test]
+    fn indexed_content_resources_and_fallback_are_eager_differential() {
+        let _test_lock = indexed_test_lock();
+        let (document, raw, page) = differential_document();
+        let eager = EagerDocumentAdapter::new(Arc::new(document), Arc::from(raw.as_slice()));
+        let lazy = indexed(&raw, None);
+
+        let eager_content = eager.page_content(page).unwrap();
+        let lazy_content = lazy.page_content(page).unwrap();
+        assert_eq!(lazy_content.as_ref(), eager_content.as_ref());
+        drop(lazy_content);
+        let levels = |access: &dyn DocumentAccess| {
+            access
+                .page_resource_chain(page)
+                .unwrap()
+                .into_iter()
+                .map(|resource| {
+                    resource
+                        .read(|dictionary| dictionary.get(b"Level").unwrap().as_i64().unwrap())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(levels(&eager), vec![1, 2, 3]);
+        assert_eq!(levels(&lazy), levels(&eager));
+        let eager_fallback = eager.fallback_page_text(1).unwrap();
+        let lazy_fallback = lazy.fallback_page_text(1).unwrap();
+        assert_eq!(lazy_fallback, eager_fallback);
+        assert!(
+            lazy_fallback.contains('B'),
+            "Encoding differences must beat conflicting ToUnicode"
+        );
+    }
+
+    #[test]
+    fn indexed_fallback_uses_exact_mixed_width_cmap_authority() {
+        let _test_lock = indexed_test_lock();
+        let mut document = Document::with_version("1.7");
+        let to_unicode = document.add_object(lopdf::Stream::new(
+            Dictionary::new(),
+            cmap(
+                "5 beginbfchar\n<01> <0041>\n<0203> <0042>\n<040506> <0043>\n<0708090A> <D83DDE00>\n<0B> <0044>\nendbfchar",
+            ),
+        ));
+        let font = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+            "ToUnicode" => Object::Reference(to_unicode),
+        }));
+        let (document, raw, _) = finish_text_document(
+            document,
+            vec![("F1", font)],
+            b"BT /F1 12 Tf <0102030405060708090AFFFFFFFF0C> Tj ET".to_vec(),
+        );
+        let (eager, lazy) = fallback_pair(document, &raw);
+        assert_eq!(lazy.as_ref().unwrap(), eager.as_ref().unwrap());
+        assert_eq!(lazy.unwrap(), "ABC😀��\n");
+    }
+
+    #[test]
+    fn indexed_fallback_discriminator_does_not_reuse_primary_fontinfo() {
+        let _test_lock = indexed_test_lock();
+        let mut document = Document::with_version("1.7");
+        let to_unicode = document.add_object(lopdf::Stream::new(
+            Dictionary::new(),
+            cmap("2 beginbfchar\n<0102> <00410042>\n<03> <0043>\nendbfchar"),
+        ));
+        let font = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+            "ToUnicode" => Object::Reference(to_unicode),
+        }));
+        let (document, raw, page) = finish_text_document(
+            document,
+            vec![("F1", font)],
+            b"BT /F1 12 Tf 1 0 0 1 10 10 Tm <010203> Tj ET".to_vec(),
+        );
+        let eager_access =
+            EagerDocumentAdapter::new(Arc::new(document.clone()), Arc::from(raw.as_slice()));
+        assert_eq!(
+            crate::text::extract_page(&eager_access, page)
+                .unwrap()
+                .trim(),
+            "C"
+        );
+        let (eager, lazy) = fallback_pair(document, &raw);
+        assert_eq!(lazy.as_ref().unwrap(), eager.as_ref().unwrap());
+        assert_eq!(lazy.unwrap(), "ABC\n");
+    }
+
+    #[test]
+    fn indexed_fallback_named_tables_and_utf16_match_eager() {
+        let _test_lock = indexed_test_lock();
+        for (name, bytes) in [
+            ("MacExpertEncoding", vec![0x21, 0x22, 0x23]),
+            ("PDFDocEncoding", vec![0x80, 0x81, 0x82]),
+            ("UniGB-UTF16-H", vec![0x00, 0x41, 0xD8, 0x00, 0x00]),
+        ] {
+            let mut document = Document::with_version("1.7");
+            let font = document.add_object(Object::Dictionary(dictionary! {
+                "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+                "Encoding" => name,
+            }));
+            let mut content = b"BT /F1 12 Tf <".to_vec();
+            for byte in bytes {
+                content.extend_from_slice(format!("{byte:02X}").as_bytes());
+            }
+            content.extend_from_slice(b"> Tj ET");
+            let (document, raw, _) = finish_text_document(document, vec![("F1", font)], content);
+            let (eager, lazy) = fallback_pair(document, &raw);
+            assert_eq!(lazy.as_ref().unwrap(), eager.as_ref().unwrap(), "{name}");
+        }
+
+        let mut document = Document::with_version("1.7");
+        let font = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+            "Encoding" => "UnknownEncoding",
+        }));
+        let (document, raw, _) = finish_text_document(
+            document,
+            vec![("F1", font)],
+            b"BT /F1 12 Tf (A) Tj ET".to_vec(),
+        );
+        let (eager, lazy) = fallback_pair(document, &raw);
+        assert!(eager.is_err());
+        assert!(lazy.is_err());
+    }
+
+    #[test]
+    fn indexed_fallback_differences_strictness_matches_eager() {
+        let _test_lock = indexed_test_lock();
+        let cases = vec![
+            (
+                Object::Dictionary(dictionary! {
+                    "Type" => "Encoding", "BaseEncoding" => "StandardEncoding",
+                    "Differences" => vec![Object::Integer(65), Object::Name(b"B".to_vec())],
+                }),
+                vec![b'A'],
+                "B\n",
+            ),
+            (
+                Object::Dictionary(dictionary! {
+                    "Type" => "Encoding", "BaseEncoding" => "StandardEncoding",
+                    "Differences" => vec![Object::Integer(65), Object::Name(b"NotAGlyph".to_vec())],
+                }),
+                vec![b'A'],
+                "A\n",
+            ),
+            (
+                Object::Dictionary(dictionary! {
+                    "Type" => "Encoding", "Differences" => vec![Object::Integer(-1)],
+                }),
+                vec![b'A'],
+                "A\n",
+            ),
+            (
+                Object::Dictionary(dictionary! {
+                    "Type" => "Encoding", "Differences" => vec![Object::Integer(256)],
+                }),
+                vec![b'A'],
+                "A\n",
+            ),
+            (
+                Object::Dictionary(dictionary! {
+                    "Type" => "Encoding", "Differences" => vec![Object::Boolean(true)],
+                }),
+                vec![b'A'],
+                "A\n",
+            ),
+            (
+                Object::Dictionary(dictionary! {
+                    "Type" => "Encoding", "BaseEncoding" => "WinAnsiEncoding",
+                }),
+                vec![0x80],
+                "\n",
+            ),
+        ];
+        for (encoding, bytes, expected) in cases {
+            let mut document = Document::with_version("1.7");
+            let font = document.add_object(Object::Dictionary(dictionary! {
+                "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+                "Encoding" => encoding,
+            }));
+            let mut content = b"BT /F1 12 Tf <".to_vec();
+            for byte in bytes {
+                content.extend_from_slice(format!("{byte:02X}").as_bytes());
+            }
+            content.extend_from_slice(b"> Tj ET");
+            let (document, raw, _) = finish_text_document(document, vec![("F1", font)], content);
+            let (eager, lazy) = fallback_pair(document, &raw);
+            assert_eq!(lazy.as_ref().unwrap(), eager.as_ref().unwrap());
+            assert_eq!(lazy.unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn indexed_fallback_encoding_cycle_is_lenient_standard() {
+        let _test_lock = indexed_test_lock();
+        let mut document = Document::with_version("1.7");
+        let first = document.new_object_id();
+        let second = document.new_object_id();
+        document.objects.insert(first, Object::Reference(second));
+        document.objects.insert(second, Object::Reference(first));
+        let font = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+            "Encoding" => Object::Reference(first),
+        }));
+        let (document, raw, _) = finish_text_document(
+            document,
+            vec![("F1", font)],
+            b"BT /F1 12 Tf (A) Tj ET".to_vec(),
+        );
+        let (eager, lazy) = fallback_pair(document, &raw);
+        assert_eq!(lazy.as_ref().unwrap(), eager.as_ref().unwrap());
+        assert_eq!(lazy.unwrap(), "A\n");
+    }
+
+    #[test]
+    fn indexed_fallback_operator_state_matches_eager() {
+        let _test_lock = indexed_test_lock();
+        let mut document = Document::with_version("1.7");
+        let font = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+            "Encoding" => "StandardEncoding",
+        }));
+        let content = b"BT /F1 12 Tf [(A) [(B) -101 (C)] -100 -200.0 (D)] TJ /F1 9 Tf (E) ' 0 0 (F) \" T* /Missing 8 Tf (X) Tj ET".to_vec();
+        let (document, raw, _) = finish_text_document(document, vec![("F1", font)], content);
+        let (eager, lazy) = fallback_pair(document, &raw);
+        assert_eq!(lazy.as_ref().unwrap(), eager.as_ref().unwrap());
+    }
+
+    #[test]
+    fn indexed_fallback_tounicode_precedence_and_leniency_match_eager() {
+        let _test_lock = indexed_test_lock();
+        enum ToUnicodeCase {
+            Stream(Vec<u8>),
+            NonStream,
+            Missing,
+        }
+        let cases = [
+            (
+                None,
+                ToUnicodeCase::Stream(cmap("1 beginbfchar\n<41> <0058>\nendbfchar")),
+                "X\n",
+            ),
+            (None, ToUnicodeCase::Stream(b"not a cmap".to_vec()), "A\n"),
+            (None, ToUnicodeCase::NonStream, "A\n"),
+            (Some("Identity-H"), ToUnicodeCase::Missing, "A\n"),
+            (
+                Some("Identity-H"),
+                ToUnicodeCase::Stream(cmap("1 beginbfchar\n<41> <0059>\nendbfchar")),
+                "Y\n",
+            ),
+            (
+                Some("WinAnsiEncoding"),
+                ToUnicodeCase::Stream(cmap("1 beginbfchar\n<41> <005A>\nendbfchar")),
+                "A\n",
+            ),
+        ];
+        for (encoding, to_unicode, expected) in cases {
+            let mut document = Document::with_version("1.7");
+            let to_unicode = match to_unicode {
+                ToUnicodeCase::Stream(bytes) => {
+                    Some(document.add_object(lopdf::Stream::new(Dictionary::new(), bytes)))
+                }
+                ToUnicodeCase::NonStream => Some(document.add_object(Object::Integer(7))),
+                ToUnicodeCase::Missing => None,
+            };
+            let mut font = dictionary! {
+                "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+            };
+            if let Some(encoding) = encoding {
+                font.set("Encoding", encoding);
+            }
+            if let Some(to_unicode) = to_unicode {
+                font.set("ToUnicode", Object::Reference(to_unicode));
+            }
+            let font = document.add_object(Object::Dictionary(font));
+            let (document, raw, _) = finish_text_document(
+                document,
+                vec![("F1", font)],
+                b"BT /F1 12 Tf (A) Tj ET".to_vec(),
+            );
+            let (eager, lazy) = fallback_pair(document, &raw);
+            assert_eq!(lazy.as_ref().unwrap(), eager.as_ref().unwrap());
+            assert_eq!(lazy.unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn fallback_resource_cycle_and_fault_are_checked_not_suppressed() {
+        let _test_lock = indexed_test_lock();
+        let mut document = Document::with_version("1.7");
+        let font = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        }));
+        let (mut document, _raw, page) = finish_text_document(
+            document,
+            vec![("F1", font)],
+            b"BT /F1 12 Tf (A) Tj ET".to_vec(),
+        );
+        document
+            .get_object_mut(page)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Parent", Object::Reference(page));
+        let mut raw = Vec::new();
+        document.save_to(&mut raw).unwrap();
+        let eager = EagerDocumentAdapter::new(Arc::new(document), Arc::from(raw.as_slice()));
+        let eager_error = crate::text::fallback_page_text(&eager, page).unwrap_err();
+        let indexed_adapter = indexed(&raw, None);
+        let indexed_error = crate::text::fallback_page_text(&indexed_adapter, page).unwrap_err();
+        assert_eq!(indexed_error.kind, eager_error.kind);
+
+        let (_, stable_raw, stable_page) = differential_document();
+        let stable: Arc<dyn DocumentAccess> = Arc::new(indexed(&stable_raw, None));
+        let fault = FaultAccess::new(
+            stable,
+            Some(FaultPoint::Resources),
+            Arc::new(AccessCounts::default()),
+        );
+        let error = crate::text::fallback_page_text(&fault, stable_page).unwrap_err();
+        assert_eq!(error.phase, AccessPhase::Resources);
+    }
+
+    #[test]
+    fn indexed_tounicode_payload_exact_over_release_and_concurrent_admission() {
+        let _test_lock = indexed_test_lock();
+        const MIB: usize = 1024 * 1024;
+        let make = |target: usize, compressed: bool| {
+            let mut document = Document::with_version("1.7");
+            let mut stream_dict = Dictionary::new();
+            let content = if compressed {
+                stream_dict.set("Filter", "FlateDecode");
+                flate_zeros(target)
+            } else {
+                vec![0; target]
+            };
+            let stream = document.add_object(lopdf::Stream::new(stream_dict, content));
+            let font = document.add_object(Object::Dictionary(dictionary! {
+                "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+                "ToUnicode" => Object::Reference(stream),
+            }));
+            let (document, raw, _) = finish_text_document(
+                document,
+                vec![("F1", font)],
+                b"BT /F1 12 Tf (A) Tj ET".to_vec(),
+            );
+            (document, raw, stream)
+        };
+
+        let (_, exact_raw, exact_stream) = make(60 * MIB, true);
+        let exact = indexed(&exact_raw, None);
+        let stream = exact.object(exact_stream).unwrap();
+        let bytes = stream.decoded_stream_bytes(64 * MIB).unwrap();
+        let (payload, charge) = bytes.into_parts();
+        assert_eq!(payload.len(), 60 * MIB);
+        let aggregate = *provisional_o_budget().used.lock().unwrap();
+        assert!(aggregate >= payload.capacity() as u64);
+        assert!(aggregate <= PROVISIONAL_O_BYTES);
+        drop(payload);
+        drop(charge);
+        drop(stream);
+        assert_eq!(*provisional_o_budget().used.lock().unwrap(), 0);
+
+        let (_, over_raw, over_stream) = make(64 * MIB + 1, true);
+        let over = indexed(&over_raw, None);
+        let fallback_error = over.fallback_page_text(1).unwrap_err();
+        assert_eq!(fallback_error.kind, AccessKind::ResourceLimit);
+        let error = over
+            .object(over_stream)
+            .unwrap()
+            .decoded_stream_bytes(64 * MIB)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, AccessKind::ResourceLimit);
+        assert_eq!(*provisional_o_budget().used.lock().unwrap(), 0);
+
+        let (_, concurrent_raw, concurrent_stream) = make(40 * MIB, true);
+        let concurrent = indexed(&concurrent_raw, None);
+        let stream = concurrent.object(concurrent_stream).unwrap();
+        let first = stream.decoded_stream_bytes(64 * MIB).unwrap();
+        let second = stream.decoded_stream_bytes(64 * MIB).err().unwrap();
+        assert_eq!(second.kind, AccessKind::ResourceLimit);
+        drop(first);
+        assert!(stream.decoded_stream_bytes(64 * MIB).is_ok());
+        drop(stream);
+        assert_eq!(*provisional_o_budget().used.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn indexed_fallback_propagates_source_changed() {
+        struct SwitchSource {
+            bytes: Arc<[u8]>,
+            changed: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl RandomAccessSource for SwitchSource {
+            fn len(&self) -> SourceResult<u64> {
+                Ok(self.bytes.len() as u64)
+            }
+            fn read_at(&self, offset: u64, out: &mut [u8]) -> SourceResult<usize> {
+                if self.changed.load(Ordering::Acquire) {
+                    return Err(SourceError::SourceChanged);
+                }
+                let start =
+                    usize::try_from(offset).map_err(|_| SourceError::PlatformLimitExceeded {
+                        requested: offset,
+                        limit: usize::MAX as u64,
+                    })?;
+                if start >= self.bytes.len() {
+                    return Ok(0);
+                }
+                let take = out.len().min(self.bytes.len() - start);
+                out[..take].copy_from_slice(&self.bytes[start..start + take]);
+                Ok(take)
+            }
+            fn validate_unchanged(&self) -> SourceResult<()> {
+                if self.changed.load(Ordering::Acquire) {
+                    Err(SourceError::SourceChanged)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let _test_lock = indexed_test_lock();
+        let (document, raw, _) = differential_document();
+        drop(document);
+        let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let source: Arc<dyn RandomAccessSource> = Arc::new(SwitchSource {
+            bytes: Arc::from(raw),
+            changed: Arc::clone(&changed),
+        });
+        let adapter = IndexedDocumentAdapter::open(source, None).unwrap();
+        changed.store(true, Ordering::Release);
+        let error = adapter.fallback_page_text(1).unwrap_err();
+        assert_eq!(error.kind, AccessKind::SourceChanged);
+    }
+
+    #[test]
+    fn indexed_post_open_short_custom_and_io_reads_are_fatal_source_io() {
+        struct FailingSource {
+            bytes: Arc<[u8]>,
+            mode: Arc<std::sync::atomic::AtomicU8>,
+        }
+        impl RandomAccessSource for FailingSource {
+            fn len(&self) -> SourceResult<u64> {
+                Ok(self.bytes.len() as u64)
+            }
+            fn read_at(&self, offset: u64, out: &mut [u8]) -> SourceResult<usize> {
+                match self.mode.load(Ordering::Acquire) {
+                    1 => return Ok(0),
+                    2 => return Ok(out.len().saturating_add(1)),
+                    3 => {
+                        return Err(SourceError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "injected positioned read failure",
+                        )))
+                    }
+                    _ => {}
+                }
+                let start =
+                    usize::try_from(offset).map_err(|_| SourceError::PlatformLimitExceeded {
+                        requested: offset,
+                        limit: usize::MAX as u64,
+                    })?;
+                if start >= self.bytes.len() {
+                    return Ok(0);
+                }
+                let take = out.len().min(self.bytes.len() - start);
+                out[..take].copy_from_slice(&self.bytes[start..start + take]);
+                Ok(take)
+            }
+        }
+
+        let _test_lock = indexed_test_lock();
+        let (_, raw, _) = differential_document();
+        for mode_value in 1..=3 {
+            let mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
+            let source: Arc<dyn RandomAccessSource> = Arc::new(FailingSource {
+                bytes: Arc::from(raw.clone()),
+                mode: Arc::clone(&mode),
+            });
+            let adapter = IndexedDocumentAdapter::open(source, None).unwrap();
+            mode.store(mode_value, Ordering::Release);
+            let error = adapter.source_sha256().unwrap_err();
+            assert_eq!(error.kind, AccessKind::SourceIo, "mode {mode_value}");
+            assert!(fatal_lazy_access(&error));
+        }
+    }
+
+    #[test]
+    fn indexed_parent_resolution_errors_are_resources_phased() {
+        let _test_lock = indexed_test_lock();
+        let mut document = Document::with_version("1.7");
+        let page = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference((999, 0)),
+        }));
+        let pages = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Count" => 1, "Kids" => vec![Object::Reference(page)],
+        }));
+        let catalog = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Catalog", "Pages" => Object::Reference(pages),
+        }));
+        document.trailer.set("Root", Object::Reference(catalog));
+        let mut raw = Vec::new();
+        document.save_to(&mut raw).unwrap();
+        let adapter = indexed(&raw, None);
+        let error = adapter
+            .page_resource_chain(page)
+            .err()
+            .expect("dangling parent must fail");
+        assert_eq!(error.phase, AccessPhase::Resources);
+        assert_eq!(error.object, (999, 0));
+    }
+
+    #[test]
+    fn indexed_page_content_invalid_filter_malformed_and_bomb_are_bounded() {
+        fn page_pdf(filter: &[u8], content: Vec<u8>) -> (Vec<u8>, ObjectId) {
+            let mut document = Document::with_version("1.7");
+            let mut stream_dictionary = Dictionary::new();
+            stream_dictionary.set("Filter", Object::Name(filter.to_vec()));
+            let content = document.add_object(lopdf::Stream::new(stream_dictionary, content));
+            let pages = document.new_object_id();
+            let page = document.add_object(Object::Dictionary(dictionary! {
+                "Type" => "Page", "Parent" => Object::Reference(pages),
+                "Contents" => Object::Reference(content),
+            }));
+            document.objects.insert(
+                pages,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages", "Count" => 1, "Kids" => vec![Object::Reference(page)],
+                }),
+            );
+            let catalog = document.add_object(Object::Dictionary(dictionary! {
+                "Type" => "Catalog", "Pages" => Object::Reference(pages),
+            }));
+            document.trailer.set("Root", Object::Reference(catalog));
+            let mut raw = Vec::new();
+            document.save_to(&mut raw).unwrap();
+            (raw, page)
+        }
+
+        let _test_lock = indexed_test_lock();
+        for (filter, content, expected) in [
+            (&b"NoSuchFilter"[..], &b"RAW"[..], &b"RAW\n"[..]),
+            // Lopdf's legacy Flate decoder accepts the malformed prefix as empty partial output.
+            (&b"FlateDecode"[..], &b"not-zlib"[..], &b"\n"[..]),
+        ] {
+            let (raw, page) = page_pdf(filter, content.to_vec());
+            assert_eq!(
+                indexed(&raw, None).page_content(page).unwrap().as_ref(),
+                expected
+            );
+        }
+
+        let (raw, page) = page_pdf(b"FlateDecode", flate_zeros(64 * 1024 * 1024));
+        let error = indexed(&raw, None)
+            .page_content(page)
+            .err()
+            .expect("decoded content bomb must exceed aggregate O");
+        assert_eq!(error.phase, AccessPhase::PageContent);
+        assert_eq!(error.kind, AccessKind::ResourceLimit);
+        assert_eq!(*provisional_o_budget().used.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn indexed_fallback_page_content_error_overrides_sorted_font_errors() {
+        let _test_lock = indexed_test_lock();
+        let mut document = Document::with_version("1.7");
+        let zed = document.add_object(Object::Dictionary(dictionary! { "Type" => "WrongZ" }));
+        let alpha = document.add_object(Object::Dictionary(dictionary! { "Type" => "WrongA" }));
+        let (_document, raw, page) = finish_text_document(
+            document,
+            vec![("ZZ", zed), ("AA", alpha)],
+            b"BT ET".to_vec(),
+        );
+        let lazy: Arc<dyn DocumentAccess> = Arc::new(indexed(&raw, None));
+        let sorted_error = lazy.fallback_page_text(1).unwrap_err();
+        assert_eq!(
+            sorted_error.object, alpha,
+            "AA must win BTree encoding order"
+        );
+        let fault = FaultAccess::new(
+            lazy,
+            Some(FaultPoint::PageContent),
+            Arc::new(AccessCounts::default()),
+        );
+        let content_error = crate::text::fallback_page_text(&fault, page).unwrap_err();
+        assert_eq!(content_error.object, page);
+        assert_eq!(content_error.phase, AccessPhase::PageContent);
+    }
+
+    #[test]
+    fn indexed_resources_ignore_direct_ancestor_like_eager() {
+        let _test_lock = indexed_test_lock();
+        let (document, raw, page) = document_with_page_values(
+            Object::Dictionary(dictionary! { "Level" => 3 }),
+            Object::Dictionary(dictionary! { "Level" => 1 }),
+            Object::Null,
+        );
+        let eager = EagerDocumentAdapter::new(Arc::new(document), Arc::from(raw.as_slice()));
+        let lazy = indexed(&raw, None);
+        let levels = |access: &dyn DocumentAccess| {
+            access
+                .page_resource_chain(page)
+                .unwrap()
+                .into_iter()
+                .map(|resource| {
+                    resource
+                        .read(|dict| dict.get(b"Level").unwrap().as_i64().unwrap())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(levels(&eager), vec![3]);
+        assert_eq!(levels(&lazy), levels(&eager));
+    }
+
+    #[test]
+    fn direct_inline_page_stream_is_eager_empty_and_not_indexable_pdf_syntax() {
+        let _test_lock = indexed_test_lock();
+        let (document, raw, page) = document_with_page_values(
+            Object::Dictionary(Dictionary::new()),
+            Object::Dictionary(Dictionary::new()),
+            Object::Stream(lopdf::Stream::new(
+                Dictionary::new(),
+                b"BT (hidden) Tj ET".to_vec(),
+            )),
+        );
+        let eager = EagerDocumentAdapter::new(Arc::new(document), Arc::from(raw.as_slice()));
+        assert!(eager.page_content(page).unwrap().is_empty());
+        let source: Arc<dyn RandomAccessSource> = Arc::new(BytesSource::new(Arc::from(raw)));
+        assert!(IndexedDocumentAdapter::open(source, None).is_err());
+    }
+
+    #[test]
+    fn indexed_adapter_resolves_compressed_trailer_reference_with_bounded_owner() {
+        let _test_lock = indexed_test_lock();
+        let mut document = Document::with_version("1.7");
+        let pages = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => Vec::<Object>::new(), "Count" => 0,
+        }));
+        let catalog = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Catalog", "Pages" => Object::Reference(pages),
+        }));
+        let info = document.add_object(Object::Dictionary(
+            dictionary! { "Producer" => "compressed" },
+        ));
+        document.trailer.set("Root", Object::Reference(catalog));
+        document.trailer.set("Info", Object::Reference(info));
+        let options = lopdf::SaveOptions::builder()
+            .use_object_streams(true)
+            .use_xref_streams(true)
+            .build();
+        let mut raw = Vec::new();
+        document.save_with_options(&mut raw, options).unwrap();
+        let adapter = indexed(&raw, None);
+        assert_eq!(
+            adapter
+                .trailer_entry(b"Info")
+                .unwrap()
+                .read(|object| object
+                    .as_dict()
+                    .unwrap()
+                    .get(b"Producer")
+                    .unwrap()
+                    .as_name()
+                    .unwrap()
+                    .to_vec())
+                .unwrap(),
+            b"compressed"
+        );
+        assert!(
+            adapter
+                .counters()
+                .peak_resolution_bytes
+                .load(Ordering::Relaxed)
+                <= PROVISIONAL_O_BYTES
+        );
+    }
+
+    #[test]
+    fn indexed_encryption_preserves_empty_and_explicit_password_contracts() {
+        let _test_lock = indexed_test_lock();
+        let fixture = |name: &str| {
+            std::fs::read(format!(
+                "{}/../tests/fixtures_pdf/encrypted/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap()
+        };
+        for name in ["rc4_40.pdf", "inline_encrypt_rc4_128.pdf"] {
+            let raw = fixture(name);
+            assert!(
+                IndexedDocumentAdapter::open(Arc::new(BytesSource::new(Arc::from(raw))), None,)
+                    .is_ok(),
+                "{name}"
+            );
+        }
+        for name in ["userpw.pdf", "inline_encrypt_userpw.pdf"] {
+            let raw = fixture(name);
+            let source: Arc<dyn RandomAccessSource> =
+                Arc::new(BytesSource::new(Arc::from(raw.clone())));
+            let error = IndexedDocumentAdapter::open(source, None)
+                .err()
+                .expect("password required");
+            assert_eq!(error.kind, AccessKind::PasswordRequired);
+            let source: Arc<dyn RandomAccessSource> =
+                Arc::new(BytesSource::new(Arc::from(raw.clone())));
+            let error = IndexedDocumentAdapter::open(source, Some(b"wrong".to_vec()))
+                .err()
+                .expect("wrong password rejected");
+            assert_eq!(error.kind, AccessKind::InvalidPassword);
+            let source: Arc<dyn RandomAccessSource> = Arc::new(BytesSource::new(Arc::from(raw)));
+            assert!(IndexedDocumentAdapter::open(source, Some(b"secret".to_vec())).is_ok());
+        }
+    }
+
+    #[test]
+    fn page_content_budget_refuses_multi_stream_combine_overlap() {
+        let _test_lock = indexed_test_lock();
+        let page = (999, 0);
+        let mut output = Vec::new();
+        let mut output_charge = None;
+        let payload = vec![b'a'; 20 * 1024 * 1024];
+        let mut charge = provisional_o_budget()
+            .try_acquire(payload.capacity() as u64)
+            .unwrap();
+        charge.shrink_to(payload.capacity() as u64);
+        append_page_payload(page, &mut output, &mut output_charge, payload, charge).unwrap();
+
+        let payload = vec![b'b'; 20 * 1024 * 1024];
+        let mut charge = provisional_o_budget()
+            .try_acquire(payload.capacity() as u64)
+            .unwrap();
+        charge.shrink_to(payload.capacity() as u64);
+        let error = append_page_payload(page, &mut output, &mut output_charge, payload, charge)
+            .expect_err("old output + payload + combined output must not exceed O");
+        assert_eq!(error.kind, AccessKind::ResourceLimit);
+        drop(output_charge);
+    }
+
+    #[test]
+    fn indexed_route_has_no_eager_document_or_unbounded_resolver_calls() {
+        let source = include_str!("access.rs");
+        let start = source
+            .find("pub(crate) struct IndexedDocumentAdapter")
+            .unwrap();
+        let end = source[start..]
+            .find("#[cfg(test)]\npub(crate) mod tests")
+            .map(|offset| start + offset)
+            .unwrap();
+        let indexed = &source[start..end];
+        assert!(!indexed.contains("resolve_object_shared"));
+        assert!(!indexed.contains("resolve_object("));
+        assert!(!indexed.contains("Document::"));
+        assert!(!indexed.contains("load_mem"));
+        assert!(indexed.contains("resolve_object_with_permit"));
+        assert!(indexed.contains("trailer_entry_raw_owned"));
+        assert!(indexed.contains(".try_acquire(PROVISIONAL_O_BYTES)"));
+        assert!(indexed.contains("retained > budget.bytes"));
     }
 }
