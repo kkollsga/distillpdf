@@ -35,6 +35,7 @@ mod lattice;
 mod layout;
 mod links;
 mod nav;
+mod object_cells;
 mod pdfobj;
 mod postprocess;
 mod profile;

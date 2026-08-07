@@ -5,10 +5,13 @@
 //! reads therefore happen through [`ObjectHandle::read`], while values that escape a read are
 //! explicitly owned.  The eager implementation remains the compatibility oracle through L9.
 
+use crate::object_cells::{
+    CellLoadError, NegativeDisposition, ObjectCellArena, ObjectCellDomain, ResolvedObjectPin,
+};
 use lopdf::{
-    BoundedObject, BytesSource, DecompressError, Dictionary, Document, IndexedReader,
-    IndexedReaderError, IndexedReaderOptions, Object, ObjectId, PageMap, RandomAccessSource,
-    ScalarResolutionPermit, SourceError, SourceResult,
+    BoundedObject, BytesSource, DecompressError, Dictionary, Document, IndexedObjectLocation,
+    IndexedReader, IndexedReaderError, IndexedReaderOptions, Object, ObjectId, PageMap,
+    RandomAccessSource, ScalarResolutionPermit, SourceError, SourceResult,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
@@ -616,6 +619,7 @@ pub(crate) enum AccessKind {
     Type,
     Bounds,
     ResourceLimit,
+    CellFull,
     SourceChanged,
     SourceIo,
     PasswordRequired,
@@ -721,10 +725,64 @@ fn indexed_error(object: ObjectId, error: IndexedReaderError) -> AccessError {
     AccessError::typed(object, kind, error)
 }
 
+fn indexed_cell_error(object: ObjectId, error: IndexedReaderError) -> CellLoadError {
+    let disposition = indexed_negative_disposition(&error);
+    CellLoadError::new(indexed_error(object, error), disposition)
+}
+
+fn indexed_negative_disposition(error: &IndexedReaderError) -> NegativeDisposition {
+    match error {
+        IndexedReaderError::MissingNormalObject { .. }
+        | IndexedReaderError::MissingNormalObjectAtXref { .. }
+        | IndexedReaderError::GenerationMismatch { .. }
+        | IndexedReaderError::IndirectObjectMismatch { .. }
+        | IndexedReaderError::InvalidIndirectObject { .. }
+        | IndexedReaderError::IncompleteObject { .. }
+        | IndexedReaderError::ObjectLimitExceeded { .. }
+        | IndexedReaderError::NotScalarObject { .. }
+        | IndexedReaderError::NotStreamObject { .. }
+        | IndexedReaderError::UnsupportedBoundedScalar { .. }
+        | IndexedReaderError::StreamLimitExceeded { .. }
+        | IndexedReaderError::NegativeStreamLength { .. }
+        | IndexedReaderError::MissingEndstream { .. }
+        | IndexedReaderError::ResolutionCycle { .. }
+        | IndexedReaderError::ResolutionDepthExceeded { .. }
+        | IndexedReaderError::ObjectDecryption { .. } => NegativeDisposition::Persistent,
+        IndexedReaderError::Source(_)
+        | IndexedReaderError::InvalidHeader { .. }
+        | IndexedReaderError::InvalidStartXref { .. }
+        | IndexedReaderError::StartXrefOutOfBounds { .. }
+        | IndexedReaderError::InvalidXref { .. }
+        | IndexedReaderError::IncompleteXref { .. }
+        | IndexedReaderError::InvalidTrailer { .. }
+        | IndexedReaderError::StructureLimitExceeded { .. }
+        | IndexedReaderError::EntryLimitExceeded { .. }
+        | IndexedReaderError::RevisionLimitExceeded { .. }
+        | IndexedReaderError::InvalidTrailerOffset { .. }
+        | IndexedReaderError::XrefDecompression(_)
+        | IndexedReaderError::IndirectHeaderLimitExceeded { .. }
+        | IndexedReaderError::ScalarResourceLimit { .. }
+        | IndexedReaderError::ScalarResolutionCancelled { .. }
+        | IndexedReaderError::ScalarResolutionClosed { .. }
+        | IndexedReaderError::ObjectStreamContainerNotStream { .. }
+        | IndexedReaderError::ObjectStreamMember { .. }
+        | IndexedReaderError::ObjectStreamBatchSetup { .. }
+        | IndexedReaderError::ObjectStreamCacheBypass { .. }
+        | IndexedReaderError::PasswordRequired
+        | IndexedReaderError::InvalidPassword
+        | IndexedReaderError::Encryption(_)
+        | IndexedReaderError::InvalidEncryptDictionary
+        | IndexedReaderError::PageCountLimitExceeded { .. } => NegativeDisposition::FlightOnly,
+        #[allow(unreachable_patterns)]
+        _ => NegativeDisposition::FlightOnly,
+    }
+}
+
 fn fatal_lazy_access(error: &AccessError) -> bool {
     matches!(
         error.kind,
         AccessKind::ResourceLimit
+            | AccessKind::CellFull
             | AccessKind::SourceChanged
             | AccessKind::SourceIo
             | AccessKind::Bounds
@@ -976,6 +1034,10 @@ enum ObjectOwner {
         _retained: Option<Arc<IndexedRetainedCharge>>,
     },
     Bounded {
+        pin: ResolvedObjectPin,
+        id: ObjectId,
+    },
+    LegacyBounded {
         object: Arc<BoundedObject>,
         id: ObjectId,
         _retained: Arc<IndexedRetainedCharge>,
@@ -1103,7 +1165,8 @@ impl ObjectHandle {
                 (object, (0, 0))
             }
             ObjectOwner::Owned { object, id, .. } => (object.as_ref(), *id),
-            ObjectOwner::Bounded { object, id, .. } => (object.as_object(), *id),
+            ObjectOwner::Bounded { pin, id } => (pin.owner().as_object(), *id),
+            ObjectOwner::LegacyBounded { object, id, .. } => (object.as_object(), *id),
         };
         for step in &self.path {
             object = match step {
@@ -1201,7 +1264,14 @@ impl ObjectHandle {
         }
     }
 
-    fn bounded(
+    fn bounded(id: ObjectId, pin: ResolvedObjectPin) -> Self {
+        Self {
+            owner: ObjectOwner::Bounded { pin, id },
+            path: Vec::new(),
+        }
+    }
+
+    fn legacy_bounded(
         id: ObjectId,
         object: BoundedObject,
         counters: Arc<IndexedAdapterCounters>,
@@ -1209,7 +1279,7 @@ impl ObjectHandle {
     ) -> Self {
         let retained = object.retained_bytes();
         Self {
-            owner: ObjectOwner::Bounded {
+            owner: ObjectOwner::LegacyBounded {
                 object: Arc::new(object),
                 id,
                 _retained: Arc::new(IndexedRetainedCharge::new(
@@ -1276,7 +1346,8 @@ impl ObjectHandle {
         match &self.owner {
             ObjectOwner::Eager { id, .. }
             | ObjectOwner::Owned { id, .. }
-            | ObjectOwner::Bounded { id, .. } => *id,
+            | ObjectOwner::Bounded { id, .. }
+            | ObjectOwner::LegacyBounded { id, .. } => *id,
             ObjectOwner::EagerTrailerEntry { .. } => (0, 0),
         }
     }
@@ -1292,7 +1363,8 @@ impl ObjectHandle {
         match &self.owner {
             ObjectOwner::Eager { id, .. }
             | ObjectOwner::Owned { id, .. }
-            | ObjectOwner::Bounded { id, .. } => Some(*id),
+            | ObjectOwner::Bounded { id, .. }
+            | ObjectOwner::LegacyBounded { id, .. } => Some(*id),
             ObjectOwner::EagerTrailerEntry { .. } => None,
         }
     }
@@ -1489,6 +1561,7 @@ pub(crate) struct IndexedDocumentAdapter {
     recovery: Arc<SourceRecovery>,
     page_map: OnceLock<Result<Arc<PageMap>, AccessError>>,
     counters: Arc<IndexedAdapterCounters>,
+    object_cells: ObjectCellArena,
 }
 
 impl IndexedDocumentAdapter {
@@ -1536,11 +1609,13 @@ impl IndexedDocumentAdapter {
         counters
             .index_pages
             .store(stats.page_count() as u64, Ordering::Relaxed);
+        let object_cells = ObjectCellDomain::production().open_arena()?;
         Ok(Self {
             reader,
             recovery: Arc::new(SourceRecovery::new(source)),
             page_map: OnceLock::from(Ok(map)),
             counters,
+            object_cells,
         })
     }
 
@@ -1563,7 +1638,7 @@ impl IndexedDocumentAdapter {
             .clone()
     }
 
-    fn resolve_bounded(&self, id: ObjectId) -> Result<ObjectHandle, AccessError> {
+    fn resolve_bounded_legacy(&self, id: ObjectId) -> Result<ObjectHandle, AccessError> {
         let _exclusive = exclusive(indexed_object_exclusive());
         let budget = provisional_o_budget()
             .acquire_available(PROVISIONAL_O_BYTES)
@@ -1589,7 +1664,7 @@ impl IndexedDocumentAdapter {
                 self.counters
                     .peak_resolution_bytes
                     .fetch_max(object.peak_bytes(), Ordering::Relaxed);
-                Ok(ObjectHandle::bounded(
+                Ok(ObjectHandle::legacy_bounded(
                     id,
                     object,
                     Arc::clone(&self.counters),
@@ -1603,6 +1678,47 @@ impl IndexedDocumentAdapter {
                 Err(indexed_error(id, error))
             }
         }
+    }
+
+    fn resolve_bounded(&self, id: ObjectId) -> Result<ObjectHandle, AccessError> {
+        if matches!(
+            self.reader.object_location(id),
+            Some(IndexedObjectLocation::Compressed { .. })
+        ) {
+            return self.resolve_bounded_legacy(id);
+        }
+        let pin = self.object_cells.resolve(id, |permit| {
+            let active = self
+                .counters
+                .active_resolutions
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            self.counters
+                .peak_active_resolutions
+                .fetch_max(active, Ordering::Relaxed);
+            self.counters
+                .object_resolutions
+                .fetch_add(1, Ordering::Relaxed);
+            let result = self.reader.resolve_object_with_permit(id, permit);
+            self.counters
+                .active_resolutions
+                .fetch_sub(1, Ordering::Relaxed);
+            match result {
+                Ok(object) => {
+                    self.counters
+                        .peak_resolution_bytes
+                        .fetch_max(object.peak_bytes(), Ordering::Relaxed);
+                    Ok(object)
+                }
+                Err(error) => {
+                    self.counters
+                        .object_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    Err(indexed_cell_error(id, error))
+                }
+            }
+        })?;
+        Ok(ObjectHandle::bounded(id, pin))
     }
 
     fn resolve_bounded_terminal(&self, id: ObjectId) -> Result<ObjectHandle, AccessError> {
@@ -2946,14 +3062,6 @@ pub(crate) mod tests {
             1
         );
         let held = adapter.object((6, 0)).unwrap();
-        let started = std::time::Instant::now();
-        let error = adapter
-            .trailer_entry(b"Flag")
-            .err()
-            .expect("a direct trailer clone requires all of O");
-        assert_eq!(error.kind, AccessKind::ResourceLimit);
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
-        drop(held);
         assert_eq!(
             adapter
                 .trailer_entry(b"Info")
@@ -2970,10 +3078,10 @@ pub(crate) mod tests {
             b"indexed-adapter"
         );
         let flag = adapter.trailer_entry(b"Flag").unwrap();
-        assert!(
+        assert_eq!(
             flag.read(|object| object.as_array().unwrap().len())
-                .unwrap()
-                == 2
+                .unwrap(),
+            2
         );
         let counters = adapter.counters();
         assert_eq!(
@@ -2988,13 +3096,14 @@ pub(crate) mod tests {
                 .load(Ordering::Relaxed)
                 < PROVISIONAL_O_BYTES
         );
-        let started = std::time::Instant::now();
-        let error = adapter
-            .object((6, 0))
-            .err()
-            .expect("full trailer admission blocks O");
-        assert_eq!(error.kind, AccessKind::ResourceLimit);
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let concurrent = adapter.object((6, 0)).unwrap();
+        assert_eq!(
+            concurrent
+                .read(|object| object.as_stream().unwrap().content.clone())
+                .unwrap(),
+            b"DATA"
+        );
+        drop(concurrent);
         let started = std::time::Instant::now();
         let error = adapter
             .recover_source_stream(6)
@@ -3002,6 +3111,7 @@ pub(crate) mod tests {
             .expect("recovery must fail instead of blocking behind a live O owner");
         assert_eq!(error.kind, AccessKind::ResourceLimit);
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        drop(held);
         drop(flag);
         assert_eq!(
             adapter
@@ -3030,6 +3140,195 @@ pub(crate) mod tests {
         assert!(counters.index_estimated_bytes.load(Ordering::Relaxed) <= cap);
         assert!(counters.peak_active_resolutions.load(Ordering::Relaxed) <= 1);
         assert!(counters.peak_resolution_bytes.load(Ordering::Relaxed) <= PROVISIONAL_O_BYTES);
+    }
+
+    #[test]
+    fn indexed_normal_objects_single_flight_and_negative_cache_by_full_id() {
+        let _test_lock = indexed_test_lock();
+        let raw = indexed_metadata_fixture();
+        let adapter = Arc::new(indexed(&raw, None));
+        let baseline = adapter.object_cells.snapshot();
+        let barrier = Arc::new(std::sync::Barrier::new(17));
+        let mut joins = Vec::new();
+        for _ in 0..16 {
+            let adapter = Arc::clone(&adapter);
+            let barrier = Arc::clone(&barrier);
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                adapter
+                    .object((6, 0))
+                    .unwrap()
+                    .read(|object| object.as_stream().unwrap().content.clone())
+                    .unwrap()
+            }));
+        }
+        barrier.wait();
+        for join in joins {
+            assert_eq!(join.join().unwrap(), b"DATA");
+        }
+        assert_eq!(
+            adapter
+                .counters()
+                .object_resolutions
+                .load(Ordering::Relaxed),
+            1
+        );
+        let first = adapter.object((5, 1)).err().expect("wrong generation");
+        let second = adapter
+            .object((5, 1))
+            .err()
+            .expect("cached wrong generation");
+        assert_eq!(first, second);
+        assert_eq!(first.object, (5, 1));
+        assert_eq!(
+            adapter.counters().object_failures.load(Ordering::Relaxed),
+            1
+        );
+        let cells = adapter.object_cells.snapshot();
+        assert_eq!(cells.loads - baseline.loads, 2);
+        assert_eq!(cells.negative_hits - baseline.negative_hits, 1);
+        assert_eq!(cells.live_interests, 0);
+    }
+
+    #[test]
+    fn indexed_normal_cells_do_not_alias_across_document_epochs() {
+        let _test_lock = indexed_test_lock();
+        let raw = indexed_metadata_fixture();
+        let first = indexed(&raw, None);
+        let second = indexed(&raw, None);
+        assert_ne!(first.object_cells.epoch(), second.object_cells.epoch());
+        assert_eq!(
+            first
+                .object((6, 0))
+                .unwrap()
+                .read(|object| object.as_stream().unwrap().content.clone())
+                .unwrap(),
+            b"DATA"
+        );
+        assert_eq!(
+            second
+                .object((6, 0))
+                .unwrap()
+                .read(|object| object.as_stream().unwrap().content.clone())
+                .unwrap(),
+            b"DATA"
+        );
+        assert_eq!(
+            first.counters().object_resolutions.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            second.counters().object_resolutions.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn indexed_negative_classifier_covers_every_current_fork_variant() {
+        use lopdf::MissingNormalObjectReason;
+
+        let id = (7, 3);
+        let persistent = vec![
+            IndexedReaderError::MissingNormalObject { id },
+            IndexedReaderError::MissingNormalObjectAtXref {
+                id,
+                reason: MissingNormalObjectReason::HeaderProbeLimit {
+                    offset: 1,
+                    limit: 2,
+                },
+            },
+            IndexedReaderError::GenerationMismatch { id, indexed: 2 },
+            IndexedReaderError::IndirectObjectMismatch {
+                expected: id,
+                actual: (8, 0),
+            },
+            IndexedReaderError::InvalidIndirectObject { id, offset: 4 },
+            IndexedReaderError::IncompleteObject { id, offset: 4 },
+            IndexedReaderError::ObjectLimitExceeded { id, limit: 8 },
+            IndexedReaderError::NotScalarObject { id },
+            IndexedReaderError::NotStreamObject { id },
+            IndexedReaderError::UnsupportedBoundedScalar { id, reason: "test" },
+            IndexedReaderError::StreamLimitExceeded {
+                id,
+                length: 9,
+                limit: 8,
+            },
+            IndexedReaderError::NegativeStreamLength { id, length: -1 },
+            IndexedReaderError::MissingEndstream { id },
+            IndexedReaderError::ResolutionCycle { id },
+            IndexedReaderError::ResolutionDepthExceeded { limit: 128 },
+            IndexedReaderError::ObjectDecryption {
+                id,
+                source: lopdf::encryption::DecryptionError::NotDecryptable,
+            },
+        ];
+        for error in persistent {
+            assert_eq!(
+                indexed_negative_disposition(&error),
+                NegativeDisposition::Persistent,
+                "{error:?}"
+            );
+        }
+
+        let transient = vec![
+            IndexedReaderError::Source(SourceError::SourceChanged),
+            IndexedReaderError::InvalidHeader { limit: 8 },
+            IndexedReaderError::InvalidStartXref { limit: 8 },
+            IndexedReaderError::StartXrefOutOfBounds {
+                offset: 9,
+                logical_len: 8,
+            },
+            IndexedReaderError::InvalidXref { offset: 1 },
+            IndexedReaderError::IncompleteXref { offset: 1 },
+            IndexedReaderError::InvalidTrailer { offset: 1 },
+            IndexedReaderError::StructureLimitExceeded {
+                structure: "test",
+                limit: 8,
+            },
+            IndexedReaderError::EntryLimitExceeded { count: 9, limit: 8 },
+            IndexedReaderError::RevisionLimitExceeded { limit: 8 },
+            IndexedReaderError::InvalidTrailerOffset { key: "Root" },
+            IndexedReaderError::XrefDecompression(lopdf::Error::InvalidStream("test".to_string())),
+            IndexedReaderError::IndirectHeaderLimitExceeded {
+                offset: 1,
+                limit: 8,
+            },
+            IndexedReaderError::ScalarResourceLimit {
+                id,
+                requested: 9,
+                limit: 8,
+                phase: "test",
+            },
+            IndexedReaderError::ScalarResolutionCancelled { id, phase: "test" },
+            IndexedReaderError::ScalarResolutionClosed { id, phase: "test" },
+            IndexedReaderError::ObjectStreamContainerNotStream {
+                id,
+                container: (10, 0),
+            },
+            IndexedReaderError::ObjectStreamMember {
+                id,
+                container: (10, 0),
+                index: 1,
+                source: lopdf::Error::InvalidObjectStream("test".to_string()),
+            },
+            IndexedReaderError::ObjectStreamBatchSetup {
+                container: (10, 0),
+                source: lopdf::Error::InvalidObjectStream("test".to_string()),
+            },
+            IndexedReaderError::ObjectStreamCacheBypass { container: (10, 0) },
+            IndexedReaderError::PasswordRequired,
+            IndexedReaderError::InvalidPassword,
+            IndexedReaderError::Encryption(lopdf::Error::InvalidStream("test".to_string())),
+            IndexedReaderError::InvalidEncryptDictionary,
+            IndexedReaderError::PageCountLimitExceeded { limit: 8 },
+        ];
+        for error in transient {
+            assert_eq!(
+                indexed_negative_disposition(&error),
+                NegativeDisposition::FlightOnly,
+                "{error:?}"
+            );
+        }
     }
 
     #[test]
@@ -3712,6 +4011,7 @@ pub(crate) mod tests {
                 .load(Ordering::Relaxed)
                 <= PROVISIONAL_O_BYTES
         );
+        assert_eq!(adapter.object_cells.snapshot().cells, 0);
     }
 
     #[test]

@@ -106,7 +106,9 @@ impl std::error::Error for BrokerError {}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BrokerSnapshot {
+    pub(crate) normal_limit_bytes: u64,
     pub(crate) normal_payload_bytes: u64,
+    pub(crate) normal_in_flight_estimate_bytes: u64,
     pub(crate) metadata_bytes: u64,
     pub(crate) completion_reserve_bytes: u64,
     pub(crate) oversize_bytes: u64,
@@ -136,6 +138,17 @@ pub(crate) struct BrokerSnapshot {
     pub(crate) operations: BTreeMap<u64, OperationSnapshot>,
     pub(crate) invariant_failed: bool,
     pub(crate) closed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NormalHeadroomSnapshot {
+    pub(crate) normal_limit_bytes: u64,
+    pub(crate) normal_payload_bytes: u64,
+    pub(crate) normal_in_flight_estimate_bytes: u64,
+    pub(crate) metadata_bytes: u64,
+    pub(crate) completion_reserve_bytes: u64,
+    pub(crate) queue_metadata_weight: u64,
+    pub(crate) operation_metadata_weight: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -290,6 +303,14 @@ pub(crate) struct PendingReservation {
     completed: bool,
 }
 
+#[derive(Clone)]
+pub(crate) struct ReservationCancellation {
+    broker: Weak<BrokerInner>,
+    operation_id: u64,
+    request_id: u64,
+    cancellation: Weak<AtomicBool>,
+}
+
 pub(crate) struct SelfPinCharge {
     operation: Arc<OperationInner>,
     owner: Arc<RetainedInner>,
@@ -426,6 +447,19 @@ impl BudgetBroker {
         self.inner.snapshot()
     }
 
+    pub(crate) fn normal_headroom(&self) -> NormalHeadroomSnapshot {
+        let state = self.inner.lock();
+        NormalHeadroomSnapshot {
+            normal_limit_bytes: self.inner.config.normal_limit,
+            normal_payload_bytes: state.normal_payload,
+            normal_in_flight_estimate_bytes: state.normal_in_flight_estimates,
+            metadata_bytes: state.metadata,
+            completion_reserve_bytes: state.completion_reserve,
+            queue_metadata_weight: self.inner.config.queue_metadata_weight,
+            operation_metadata_weight: self.inner.config.operation_metadata_weight,
+        }
+    }
+
     pub(crate) fn close(&self) {
         self.inner.close_all();
     }
@@ -542,6 +576,15 @@ impl Drop for OperationInner {
 }
 
 impl PendingReservation {
+    pub(crate) fn cancellation_handle(&self) -> ReservationCancellation {
+        ReservationCancellation {
+            broker: Arc::downgrade(&self.broker),
+            operation_id: self.operation_id,
+            request_id: self.request_id,
+            cancellation: Arc::downgrade(&self.cancellation),
+        }
+    }
+
     pub(crate) fn cancel(&self) {
         self.broker
             .cancel_request(self.operation_id, self.request_id, &self.cancellation);
@@ -600,6 +643,19 @@ impl PendingReservation {
                 self.completed = true;
                 Err(request_error.error.clone())
             }
+        }
+    }
+}
+
+impl ReservationCancellation {
+    pub(crate) fn cancel(&self) {
+        let Some(cancellation) = self.cancellation.upgrade() else {
+            return;
+        };
+        if let Some(broker) = self.broker.upgrade() {
+            broker.cancel_request(self.operation_id, self.request_id, &cancellation);
+        } else {
+            cancellation.store(true, Ordering::Release);
         }
     }
 }
@@ -2064,7 +2120,9 @@ impl State {
             }
         }
         BrokerSnapshot {
+            normal_limit_bytes: config.normal_limit,
             normal_payload_bytes: self.normal_payload,
+            normal_in_flight_estimate_bytes: self.normal_in_flight_estimates,
             metadata_bytes: self.metadata,
             completion_reserve_bytes: self.completion_reserve,
             oversize_bytes: oversize,
@@ -2321,6 +2379,142 @@ mod tests {
         drop(blocker);
         blocker_operation.close();
         waiting_operation.close();
+        assert_drained(&broker);
+    }
+
+    #[test]
+    fn cancellation_handle_cancels_a_queued_request_through_the_broker() {
+        let broker = broker();
+        let blocker_operation = broker.register_operation().unwrap();
+        let blocker = blocker_operation
+            .reserve(
+                Lane::Normal {
+                    completion_reserve: 0,
+                },
+                6_000,
+            )
+            .unwrap();
+        let waiting_operation = broker.register_operation().unwrap();
+        let pending = waiting_operation
+            .request(
+                Lane::Normal {
+                    completion_reserve: 0,
+                },
+                2_048,
+            )
+            .unwrap();
+        let cancellation = pending.cancellation_handle();
+        let cloned = cancellation.clone();
+
+        cloned.cancel();
+        let retained_error = broker.snapshot();
+        assert_eq!(retained_error.queued, 0);
+        assert_eq!(retained_error.cancellations, 1);
+        assert_eq!(retained_error.error_metadata_bytes, 256);
+        assert!(matches!(pending.wait(), Err(BrokerError::Cancelled)));
+        assert_eq!(broker.snapshot().error_metadata_bytes, 0);
+
+        drop(cancellation);
+        drop(blocker);
+        blocker_operation.close();
+        waiting_operation.close();
+        assert_drained(&broker);
+    }
+
+    #[test]
+    fn cancellation_handle_after_grant_rejects_reconciliation() {
+        let broker = broker();
+        let operation = broker.register_operation().unwrap();
+        let pending = operation
+            .request(
+                Lane::Normal {
+                    completion_reserve: 128,
+                },
+                512,
+            )
+            .unwrap();
+        let cancellation = pending.cancellation_handle();
+        let reservation = pending.wait().unwrap();
+
+        cancellation.cancel();
+        assert!(reservation.is_cancelled());
+        assert!(matches!(
+            reservation.reconcile(512),
+            Err(BrokerError::Cancelled)
+        ));
+
+        operation.close();
+        assert_drained(&broker);
+    }
+
+    #[test]
+    fn dropping_cancellation_handle_does_not_cancel_queued_request() {
+        let broker = broker();
+        let blocker_operation = broker.register_operation().unwrap();
+        let blocker = blocker_operation
+            .reserve(
+                Lane::Normal {
+                    completion_reserve: 0,
+                },
+                6_000,
+            )
+            .unwrap();
+        let waiting_operation = broker.register_operation().unwrap();
+        let pending = waiting_operation
+            .request(
+                Lane::Normal {
+                    completion_reserve: 0,
+                },
+                2_048,
+            )
+            .unwrap();
+        let cancellation = pending.cancellation_handle();
+
+        drop(cancellation);
+        assert_eq!(broker.snapshot().queued, 1);
+        drop(blocker);
+        let reservation = pending.wait().unwrap();
+        assert!(!reservation.is_cancelled());
+        drop(reservation);
+
+        blocker_operation.close();
+        waiting_operation.close();
+        assert_drained(&broker);
+    }
+
+    #[test]
+    fn broker_close_keeps_queued_error_typed_when_handle_cancels_later() {
+        let broker = broker();
+        let blocker_operation = broker.register_operation().unwrap();
+        let blocker = blocker_operation
+            .reserve(
+                Lane::Normal {
+                    completion_reserve: 0,
+                },
+                6_000,
+            )
+            .unwrap();
+        let waiting_operation = broker.register_operation().unwrap();
+        let pending = waiting_operation
+            .request(
+                Lane::Normal {
+                    completion_reserve: 0,
+                },
+                2_048,
+            )
+            .unwrap();
+        let cancellation = pending.cancellation_handle();
+
+        broker.close();
+        cancellation.cancel();
+        assert_eq!(broker.snapshot().error_metadata_bytes, 256);
+        assert!(matches!(pending.wait(), Err(BrokerError::Closed)));
+        assert_eq!(broker.snapshot().error_metadata_bytes, 0);
+
+        drop(blocker);
+        drop(cancellation);
+        drop(blocker_operation);
+        drop(waiting_operation);
         assert_drained(&broker);
     }
 
