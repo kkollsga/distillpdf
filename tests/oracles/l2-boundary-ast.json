@@ -32,6 +32,23 @@
     "direct-backend-method|ec407b8c82f3d7d61e37ee1ab3a83f3ed3127db63af4d0110dab072a73c82f5b|self . document . get_pages ()",
     "direct-backend-method|f2fff51a7156922e31f1d021c6f3d238b59ad5606f0e51d7b00d5323fa17cc08|self . document . get_page_resources (page)"
   ],
+  "broker.rs": [
+    "clone-call|0afc43439fabe5066c531e7ffeaa5d204052fb4c4515b1f9cb4e2822731da585|Arc :: clone (& self . inner)",
+    "clone-call|1433f1cf8f00b7709295139d93a4fce4fd067ed92f5d2241f317708c2ec2096a|Arc :: clone (broker)",
+    "clone-call|1433f1cf8f00b7709295139d93a4fce4fd067ed92f5d2241f317708c2ec2096a|Arc :: clone (broker)",
+    "clone-call|398b12cd9eae74f9c60c00c84b4ae201146468436bb7e9e17b9e049a0953a655|rejection_error . clone ()",
+    "clone-call|4b3a4123587f3e4d9f2959a2da212c5bfc2333fc0ead8756410a1d42b722d375|request_error . error . clone ()",
+    "clone-call|4b3a4123587f3e4d9f2959a2da212c5bfc2333fc0ead8756410a1d42b722d375|request_error . error . clone ()",
+    "clone-call|4b3a4123587f3e4d9f2959a2da212c5bfc2333fc0ead8756410a1d42b722d375|request_error . error . clone ()",
+    "clone-call|5212232d9eddd8c10c00096a876ff41ce4d1d8f22e0ef2933e0fa9d7eb53c046|error . clone ()",
+    "clone-call|87467f516a3c232b241e97fa58459e1df2d1ccd833879337f9272c00ad00b1e6|Arc :: clone (& operation . 0)",
+    "clone-call|9c0d6f3ead79a883bba53ca849f6b0d531f69d439d8105633be2ac59679238d6|Arc :: clone (& operation . 0 . self_pinned)",
+    "clone-call|9fa9e4aa5ad2570056e6aec5dda36bf1e905a4388bf748882729232ced668e57|Arc :: clone (& cancellation)",
+    "clone-call|bc39bd0a8ff20187244278c4fdc89784ce6fb5fb15fbac6573bbd6beb88a1e4a|Arc :: clone (self)",
+    "clone-call|bc39bd0a8ff20187244278c4fdc89784ce6fb5fb15fbac6573bbd6beb88a1e4a|Arc :: clone (self)",
+    "clone-call|bc39bd0a8ff20187244278c4fdc89784ce6fb5fb15fbac6573bbd6beb88a1e4a|Arc :: clone (self)",
+    "clone-call|edb73408f5a0e6e6fefb372f90b6d9e46c5232765f3f1e5c3fe033f5fafca45e|Arc :: clone (& wait)"
+  ],
   "doc.rs": [
     "clone-call|08acfd2955c2da32ae9559bac1af73bbf38189fe2c2f09488857530ba3fa3b1a|Arc :: clone (& diagnostics)",
     "clone-call|08acfd2955c2da32ae9559bac1af73bbf38189fe2c2f09488857530ba3fa3b1a|Arc :: clone (& diagnostics)",
