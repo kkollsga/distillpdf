@@ -48,6 +48,13 @@ use std::collections::HashMap;
 /// point in the walk.
 pub(crate) type XMap = HashMap<Vec<u8>, ObjectId>;
 
+#[cfg(test)]
+pub(crate) fn xobjects_of(access: &dyn DocumentAccess, resources: &Dictionary) -> XMap {
+    let mut map = XMap::new();
+    overlay_xobjects(access, resources, &mut map);
+    map
+}
+
 /// **Where** a paint happened in the page's content *tree*: the index of the operation in
 /// the page's content stream, then — for ink inside a Form XObject — the index of the
 /// operation inside that form, and so on down. Comparing two addresses lexicographically
@@ -103,7 +110,7 @@ pub(crate) struct FormScope {
     pub xobjects: XMap,
     /// The form's own `/Resources`, when it has one — the dictionary a caller needs to
     /// build the resource kinds this module does not model (fonts, ExtGState).
-    pub resources: Option<Dictionary>,
+    pub resources: Option<DictionaryHandle>,
 }
 
 /// Everything a walker needs to run a form's content, in one piece.
@@ -129,29 +136,23 @@ pub(crate) enum Descend {
     Halt,
 }
 
-/// All XObject entries (images AND forms) of a resources dict: name → object id.
-pub(crate) fn xobjects_of(access: &dyn DocumentAccess, resources: &Dictionary) -> XMap {
-    let mut map = XMap::new();
-    overlay_xobjects(access, resources, &mut map);
-    map
-}
-
 /// Overlay one resource dictionary's `/XObject` entries onto a name → id map. Later
 /// overlays win, so a nearer scope (a form's own resources, the page's own dictionary)
 /// shadows an outer one — the precedence a renderer applies.
 pub(crate) fn overlay_xobjects(access: &dyn DocumentAccess, resources: &Dictionary, map: &mut XMap) {
-    let Some(xd) = resources
-        .get(b"XObject")
-        .ok()
-        .and_then(|value| read_resolved(access, value, |o| o.as_dict().ok().cloned()).ok().flatten())
-    else {
+    let Ok(value) = resources.get(b"XObject") else {
         return;
     };
-    for (name, val) in xd.iter() {
-        if let Ok(id) = val.as_reference() {
-            map.insert(name.clone(), id);
+    let _ = read_resolved(access, value, |resolved| {
+        let Ok(xobjects) = resolved.as_dict() else {
+            return;
+        };
+        for (name, value) in xobjects.iter() {
+            if let Ok(id) = value.as_reference() {
+                map.insert(name.clone(), id);
+            }
         }
-    }
+    });
 }
 
 /// Every resource dictionary that governs a page, in **overlay order**: the outermost
@@ -410,29 +411,25 @@ pub(crate) fn too_deep(depth: u32) -> bool {
 /// nothing its names could resolve against, so it is not descended.
 pub(crate) fn form_scope(
     access: &dyn DocumentAccess,
-    stream: &lopdf::Stream,
+    stream: &StreamHandle,
     parent: &XMap,
     policy: ScopePolicy,
 ) -> Option<FormScope> {
-    let resources = stream
-        .dict
-        .get(b"Resources")
-        .ok()
-        .and_then(|value| {
-            read_resolved(access, value, |o| o.as_dict().ok().cloned()).ok().flatten()
-        });
+    let resources = stream.dictionary_entry(access, b"Resources").ok();
     match policy {
         ScopePolicy::OverlayParent => {
             let mut xobjects = parent.clone();
             if let Some(fr) = &resources {
-                overlay_xobjects(access, fr, &mut xobjects);
+                let _ = fr.read(|dictionary| overlay_xobjects(access, dictionary, &mut xobjects));
             }
             Some(FormScope { xobjects, resources })
         }
         ScopePolicy::OwnOnly => {
             let fr = resources?;
+            let mut xobjects = XMap::new();
+            let _ = fr.read(|dictionary| overlay_xobjects(access, dictionary, &mut xobjects));
             Some(FormScope {
-                xobjects: xobjects_of(access, &fr),
+                xobjects,
                 resources: Some(fr),
             })
         }
@@ -749,14 +746,14 @@ fn appearance_ctm(
 /// it attempts even when the branch turns out to be a dead end.
 pub(crate) fn descend_form(
     access: &dyn DocumentAccess,
-    stream: &lopdf::Stream,
+    stream: &StreamHandle,
     parent: &XMap,
     policy: ScopePolicy,
     depth: u32,
     budget: &mut crate::WalkBudget,
     sibling_cost: usize,
 ) -> Descend {
-    if !has_subtype(stream, b"Form") || too_deep(depth) {
+    if !stream.read(|stream| has_subtype(stream, b"Form")).unwrap_or(false) || too_deep(depth) {
         return Descend::Skip;
     }
     // Bill the descent before doing it: cloning the inherited resource maps and decoding
@@ -768,8 +765,8 @@ pub(crate) fn descend_form(
     let Some(scope) = form_scope(access, stream, parent, policy) else {
         return Descend::Skip;
     };
-    let matrix = form_matrix(access, stream);
-    match form_ops(stream) {
+    let matrix = stream.read(|stream| form_matrix(access, stream)).unwrap_or(Mat::ID);
+    match stream.read(form_ops).flatten() {
         Some(ops) => Descend::Into(Box::new(FormDescent { ops, scope, matrix })),
         None => Descend::Skip,
     }
@@ -801,6 +798,10 @@ mod tests {
 
     fn stream_of(doc: &Document, id: ObjectId) -> &Stream {
         doc.get_object(id).unwrap().as_stream().unwrap()
+    }
+
+    fn handle_of(doc: &Document, id: ObjectId) -> StreamHandle {
+        test_adapter(doc).stream(id).unwrap()
     }
 
     #[test]
@@ -862,7 +863,7 @@ mod tests {
         let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
         let at_cap = descend_form(
             &test_adapter(&doc),
-            stream_of(&doc, id),
+            &handle_of(&doc, id),
             &XMap::new(),
             ScopePolicy::OverlayParent,
             crate::MAX_FORM_DEPTH,
@@ -872,7 +873,7 @@ mod tests {
         assert!(matches!(at_cap, Descend::Skip));
         let under = descend_form(
             &test_adapter(&doc),
-            stream_of(&doc, id),
+            &handle_of(&doc, id),
             &XMap::new(),
             ScopePolicy::OverlayParent,
             crate::MAX_FORM_DEPTH - 1,
@@ -957,11 +958,11 @@ mod tests {
         let mut parent = XMap::new();
         parent.insert(b"Outer".to_vec(), (9, 0));
 
-        let overlay = form_scope(&test_adapter(&doc), stream_of(&doc, id), &parent, ScopePolicy::OverlayParent).expect("overlay scope");
+        let overlay = form_scope(&test_adapter(&doc), &handle_of(&doc, id), &parent, ScopePolicy::OverlayParent).expect("overlay scope");
         assert!(overlay.xobjects.contains_key(b"Outer".as_slice()), "OverlayParent keeps the inherited name");
         assert!(overlay.xobjects.contains_key(b"Own".as_slice()));
 
-        let own = form_scope(&test_adapter(&doc), stream_of(&doc, id), &parent, ScopePolicy::OwnOnly).expect("own scope");
+        let own = form_scope(&test_adapter(&doc), &handle_of(&doc, id), &parent, ScopePolicy::OwnOnly).expect("own scope");
         assert!(!own.xobjects.contains_key(b"Outer".as_slice()), "OwnOnly must NOT see the invoking scope");
         assert!(own.xobjects.contains_key(b"Own".as_slice()));
     }
@@ -977,7 +978,7 @@ mod tests {
         let id = doc.add_object(Object::Stream(Stream::new(d, b"".to_vec())));
         let mut parent = XMap::new();
         parent.insert(b"Im0".to_vec(), (99, 0));
-        let scope = form_scope(&test_adapter(&doc), stream_of(&doc, id), &parent, ScopePolicy::OverlayParent).expect("scope");
+        let scope = form_scope(&test_adapter(&doc), &handle_of(&doc, id), &parent, ScopePolicy::OverlayParent).expect("scope");
         assert_eq!(scope.xobjects[b"Im0".as_slice()], inner, "the form's own /Im0 wins");
     }
 
@@ -985,9 +986,9 @@ mod tests {
     fn own_only_refuses_a_form_that_carries_no_resources() {
         let (doc, id) = doc_with_form(form_dict(Dictionary::new()), b"");
         let parent = XMap::new();
-        assert!(form_scope(&test_adapter(&doc), stream_of(&doc, id), &parent, ScopePolicy::OwnOnly).is_none());
+        assert!(form_scope(&test_adapter(&doc), &handle_of(&doc, id), &parent, ScopePolicy::OwnOnly).is_none());
         assert!(
-            form_scope(&test_adapter(&doc), stream_of(&doc, id), &parent, ScopePolicy::OverlayParent).is_some(),
+            form_scope(&test_adapter(&doc), &handle_of(&doc, id), &parent, ScopePolicy::OverlayParent).is_some(),
             "OverlayParent still descends: the inherited scope is what its names resolve against"
         );
     }
@@ -1003,7 +1004,7 @@ mod tests {
         }));
         let d = form_dict(dictionary! { "Resources" => Object::Reference(res) });
         let id = doc.add_object(Object::Stream(Stream::new(d, b"".to_vec())));
-        let scope = form_scope(&test_adapter(&doc), stream_of(&doc, id), &XMap::new(), ScopePolicy::OwnOnly).expect("scope");
+        let scope = form_scope(&test_adapter(&doc), &handle_of(&doc, id), &XMap::new(), ScopePolicy::OwnOnly).expect("scope");
         assert_eq!(scope.xobjects[b"Im0".as_slice()], im);
     }
 
@@ -1013,7 +1014,7 @@ mod tests {
         let (doc, id) = doc_with_form(d, b"junk");
         let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
         assert!(matches!(
-            descend_form(&test_adapter(&doc), stream_of(&doc, id), &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0),
+            descend_form(&test_adapter(&doc), &handle_of(&doc, id), &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0),
             Descend::Skip
         ));
     }
@@ -1025,7 +1026,7 @@ mod tests {
         let (doc, id) = doc_with_form(form_dict(Dictionary::new()), b"0 0 10 10 re f");
         let mut budget = crate::WalkBudget::new(10); // less than FORM_DESCENT_COST
         assert!(matches!(
-            descend_form(&test_adapter(&doc), stream_of(&doc, id), &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0),
+            descend_form(&test_adapter(&doc), &handle_of(&doc, id), &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0),
             Descend::Halt
         ));
     }
@@ -1040,7 +1041,7 @@ mod tests {
         // Exactly enough for one descent charged FORM_DESCENT_COST + 7 (scope) + 3 (sibling).
         let mut budget = crate::WalkBudget::new(crate::FORM_DESCENT_COST + 10);
         assert!(matches!(
-            descend_form(&test_adapter(&doc), stream_of(&doc, id), &parent, ScopePolicy::OverlayParent, 0, &mut budget, 3),
+            descend_form(&test_adapter(&doc), &handle_of(&doc, id), &parent, ScopePolicy::OverlayParent, 0, &mut budget, 3),
             Descend::Into(_)
         ));
         assert!(!budget.spend(1), "the descent must have charged the sibling map too");
@@ -1054,7 +1055,7 @@ mod tests {
         let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
         for _ in 0..3 {
             assert!(matches!(
-                descend_form(&test_adapter(&doc), stream_of(&doc, id), &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0),
+                descend_form(&test_adapter(&doc), &handle_of(&doc, id), &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0),
                 Descend::Into(_)
             ));
         }

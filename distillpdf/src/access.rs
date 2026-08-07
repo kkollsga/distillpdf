@@ -133,6 +133,15 @@ impl StreamHandle {
             .ok()
             .flatten()
     }
+
+    /// A dictionary-valued stream entry that remains pinned to this stream's object owner.
+    pub(crate) fn dictionary_entry(
+        &self,
+        access: &dyn DocumentAccess,
+        key: &[u8],
+    ) -> Result<DictionaryHandle, AccessError> {
+        DictionaryHandle::new(self.object.dictionary_entry(access, key)?)
+    }
 }
 
 impl ObjectHandle {

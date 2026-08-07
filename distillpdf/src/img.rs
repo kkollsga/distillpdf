@@ -592,16 +592,22 @@ pub fn positioned_images(
         // The appearance's resources are its OWN (§12.5.5), so the scope it descends from is
         // empty — this walk's `OverlayParent` against nothing, which is `OwnOnly` except it
         // still runs an appearance that declares no `/Resources` (path ink needs none).
-        let outcome = ap.read(|ap| {
-            let f = match descend_form(access, ap, &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0) {
+        let outcome = ap.read(|ap_stream| {
+            let f = match descend_form(access, &ap, &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0) {
                 Descend::Into(f) => f,
                 Descend::Skip => return false,
                 Descend::Halt => return true,
             };
             let sub_ctm = f.matrix.mul(ctm);
-            let clip = crate::walker::form_bbox_clip(access, ap, sub_ctm)
+            let clip = crate::walker::form_bbox_clip(access, ap_stream, sub_ctm)
                 .map(|bb| (bb.x0, bb.y0, bb.x1, bb.y1));
-            let ares = Rc::new(f.scope.resources.clone().unwrap_or_default());
+            let ares = Rc::new(
+                f.scope
+                    .resources
+                    .as_ref()
+                    .and_then(|resources| resources.read(Clone::clone).ok())
+                    .unwrap_or_default(),
+            );
             let here = PaintSeq::at(&[], content.operations.len() + k);
             walk(doc, access, &f.ops, &f.scope.xobjects, &ares, sub_ctm, clip, None, &mut raws, 1, &mut budget, here.as_slice());
             false
@@ -719,8 +725,8 @@ fn mask_extent(
                 let Some((_, stream)) = xobject_at(access, xmap, o) else {
                     continue;
                 };
-                let completed = stream.read(|stream| {
-                if has_subtype(stream, b"Image") {
+                let completed = stream.read(|value| {
+                if has_subtype(value, b"Image") {
                     let mut bb = Rect::EMPTY;
                     for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
                         let (px, py) = ctm.apply(u, v);
@@ -728,10 +734,10 @@ fn mask_extent(
                     }
                     add_ink(bb, clip, out);
                 } else {
-                    match descend_form(access, stream, xmap, ScopePolicy::OverlayParent, depth, budget, 0) {
+                    match descend_form(access, &stream, xmap, ScopePolicy::OverlayParent, depth, budget, 0) {
                         Descend::Into(f) => {
                             let sub_ctm = f.matrix.mul(ctm);
-                            let sub_clip = match crate::walker::form_bbox_clip(access, stream, sub_ctm) {
+                            let sub_clip = match crate::walker::form_bbox_clip(access, value, sub_ctm) {
                                 Some(bb) => Some(crate::vector::intersect_clip(clip, (bb.x0, bb.y0, bb.x1, bb.y1))),
                                 None => clip,
                             };
@@ -773,7 +779,7 @@ fn mask_extent(
 fn mask_window(
     doc: &Document,
     access: &dyn crate::access::DocumentAccess,
-    form: &lopdf::Stream,
+    form: &crate::access::StreamHandle,
     xmap: &XMap,
     ctm: Mat,
     depth: u32,
@@ -784,7 +790,10 @@ fn mask_window(
     };
     let sub_ctm = f.matrix.mul(ctm);
     // §8.10.2 applies to a mask group like any other form: its `/BBox` bounds its ink.
-    let sub_clip = crate::walker::form_bbox_clip(access, form, sub_ctm).map(|bb| (bb.x0, bb.y0, bb.x1, bb.y1));
+    let sub_clip = form
+        .read(|form| crate::walker::form_bbox_clip(access, form, sub_ctm))
+        .flatten()
+        .map(|bb| (bb.x0, bb.y0, bb.x1, bb.y1));
     let mut ink = Rect::EMPTY;
     if !mask_extent(doc, access, &f.ops, &f.scope.xobjects, sub_ctm, sub_clip, depth + 1, budget, &mut ink) {
         return None;
@@ -874,9 +883,7 @@ fn walk(
                 match soft_mask_of(access, &gsd) {
                     Some(SoftMask::Cleared) => smask = None,
                     Some(SoftMask::Group(group)) => {
-                        smask = group
-                            .read(|g| mask_window(doc, access, g, xmap, ctm, depth, budget))
-                            .flatten()
+                        smask = mask_window(doc, access, &group, xmap, ctm, depth, budget)
                     }
                     None => {}
                 }
@@ -921,8 +928,8 @@ fn walk(
                 let Some((id, stream)) = xobject_at(access, xmap, o) else {
                     continue;
                 };
-                let action = stream.read(|stream| {
-                if has_subtype(stream, b"Image") {
+                let action = stream.read(|value| {
+                if has_subtype(value, b"Image") {
                     // Placed bbox = image unit square [0,1]^2 through the CTM.
                     let corners = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
                     let mut bb = Rect::EMPTY;
@@ -970,14 +977,14 @@ fn walk(
                     };
                     // Record geometry + pixel dims; uri building / grid stitching happens
                     // in finalize() once the whole page's tiles are known.
-                    let pw = stream.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0) as u32;
+                    let pw = value.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0) as u32;
                     out.push(RawTile { id, x0, x1, y0, y1, pw, ctm: rot_ctm, res: Rc::clone(res), seq: PaintSeq::at(here, opi), clip: crop, full: (bb.x0, bb.y0, bb.x1, bb.y1) });
                     false
                 } else {
                     // A form is descended with the page's XObject scope still in force
                     // (`OverlayParent`): a raster the page defines and the form invokes by
                     // an unqualified name must still be found.
-                    match descend_form(access, stream, xmap, ScopePolicy::OverlayParent, depth, budget, 0) {
+                    match descend_form(access, &stream, xmap, ScopePolicy::OverlayParent, depth, budget, 0) {
                         Descend::Into(f) => {
                             // The colour-space scope follows the same `OverlayParent` rule
                             // as the XObject scope: the form's own resources shadow the
@@ -986,7 +993,9 @@ fn walk(
                             let child = match &f.scope.resources {
                                 Some(fr) => {
                                     let mut merged = (**res).clone();
-                                    overlay_resources(access, &mut merged, fr);
+                                    let _ = fr.read(|resources| {
+                                        overlay_resources(access, &mut merged, resources)
+                                    });
                                     Rc::new(merged)
                                 }
                                 None => Rc::clone(res),
@@ -995,7 +1004,7 @@ fn walk(
                             // §8.10.2: a form's `/BBox` clips its content — a raster the form
                             // places outside its own box does not paint. Same reader, same
                             // intersect as `vector::walk`'s `Do` arm.
-                            let sub_clip = match crate::walker::form_bbox_clip(access, stream, sub_ctm) {
+                            let sub_clip = match crate::walker::form_bbox_clip(access, value, sub_ctm) {
                                 Some(bb) => Some(crate::vector::intersect_clip(clip, (bb.x0, bb.y0, bb.x1, bb.y1))),
                                 None => clip,
                             };

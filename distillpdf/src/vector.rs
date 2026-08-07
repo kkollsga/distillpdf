@@ -1240,28 +1240,35 @@ fn painted_page(
     // `/BBox`→`/Rect` mapping that makes it land where a viewer puts it.
     for (k, (_, ap, actm)) in crate::walker::placed_appearances(access, page_id).into_iter().enumerate() {
         // The appearance's resources are its OWN, so the scope it descends from is empty.
-        let halt = ap.read(|ap| {
-            let f = match descend_form(access, ap, &XMap::new(), ScopePolicy::OverlayParent, 0, &mut budget, 0) {
-                Descend::Into(f) => f,
-                Descend::Skip => return false,
-                Descend::Halt => return true,
-            };
-            let (mut aeg, mut acs) = (HashMap::new(), HashMap::new());
-            if let Some(fr) = &f.scope.resources {
-                aeg.extend(extgstates_of(doc, fr));
-                acs.extend(colorspaces_of(doc, access, fr));
-            }
-            let mut g = GState::new(f.matrix.mul(actm), [0; 3], [0; 3], 1.0, 1.0, 1.0);
-            if let Some(bb) = crate::walker::form_bbox_clip(access, ap, g.ctm) {
-                g.clip = Some(intersect_clip(g.clip, (bb.x0, bb.y0, bb.x1, bb.y1)));
-            }
-            let here = PaintSeq::at(&[], content.operations.len() + k);
-            walk(doc, access, &f.ops, &f.scope.xobjects, &aeg, &acs, g, &mut painted, 1, &mut budget, here.as_slice());
-            false
-        });
-        if halt == Some(true) {
-            break;
+        let f = match descend_form(
+            access,
+            &ap,
+            &XMap::new(),
+            ScopePolicy::OverlayParent,
+            0,
+            &mut budget,
+            0,
+        ) {
+            Descend::Into(f) => f,
+            Descend::Skip => continue,
+            Descend::Halt => break,
+        };
+        let (mut aeg, mut acs) = (HashMap::new(), HashMap::new());
+        if let Some(fr) = &f.scope.resources {
+            let _ = fr.read(|resources| {
+                aeg.extend(extgstates_of(doc, resources));
+                acs.extend(colorspaces_of(doc, access, resources));
+            });
         }
+        let mut g = GState::new(f.matrix.mul(actm), [0; 3], [0; 3], 1.0, 1.0, 1.0);
+        if let Some(bb) = ap
+            .read(|ap| crate::walker::form_bbox_clip(access, ap, g.ctm))
+            .flatten()
+        {
+            g.clip = Some(intersect_clip(g.clip, (bb.x0, bb.y0, bb.x1, bb.y1)));
+        }
+        let here = PaintSeq::at(&[], content.operations.len() + k);
+        walk(doc, access, &f.ops, &f.scope.xobjects, &aeg, &acs, g, &mut painted, 1, &mut budget, here.as_slice());
     }
     painted
 }
@@ -1561,11 +1568,10 @@ fn walk(
                 let Some((_, stream)) = crate::walker::xobject_at(access, xmap, o) else {
                     continue;
                 };
-                let halt = stream.read(|stream| {
-                let f = match descend_form(access, stream, xmap, ScopePolicy::OverlayParent, depth, budget, egmap.len()) {
+                let f = match descend_form(access, &stream, xmap, ScopePolicy::OverlayParent, depth, budget, egmap.len()) {
                     Descend::Into(f) => f,
-                    Descend::Skip => return false,
-                    Descend::Halt => return true,
+                    Descend::Skip => continue,
+                    Descend::Halt => return,
                 };
                 // The ExtGState and ColorSpace halves of the scope are this walker's own
                 // interpretation, so they are overlaid here rather than in the shared
@@ -1573,19 +1579,24 @@ fn walk(
                 let mut child_eg = egmap.clone();
                 let mut child_cs = csmap.clone();
                 if let Some(fr) = &f.scope.resources {
-                    for (k, v) in extgstates_of(doc, fr) {
-                        child_eg.insert(k, v);
-                    }
-                    for (k, v) in colorspaces_of(doc, access, fr) {
-                        child_cs.insert(k, v);
-                    }
+                    let _ = fr.read(|resources| {
+                        for (k, v) in extgstates_of(doc, resources) {
+                            child_eg.insert(k, v);
+                        }
+                        for (k, v) in colorspaces_of(doc, access, resources) {
+                            child_cs.insert(k, v);
+                        }
+                    });
                 }
                 let mut sub = g.clone();
                 // A TRANSPARENCY GROUP's alpha applies to its composited result, and the
                 // group's own state starts opaque (§11.4.7.2/§11.6.6). Carrying the caller's
                 // alpha into `fill_a` instead is what let a group's first `gs` — routinely
                 // `ca 1 CA 1`, since inside the group that IS the initial value — erase it.
-                if crate::walker::is_transparency_group(access, stream) {
+                let transparency_group = stream
+                    .read(|stream| crate::walker::is_transparency_group(access, stream))
+                    .unwrap_or(false);
+                if transparency_group {
                     sub.group_a = (g.fill_alpha(), g.stroke_alpha());
                     sub.fill_a = 1.0;
                     sub.stroke_a = 1.0;
@@ -1594,15 +1605,13 @@ fn walk(
                 // §8.10.2: the form's `/BBox`, in form space, CLIPS its content. Intersect it
                 // into the clip the child inherits; `finish` already keeps a clip only when it
                 // actually crops, so the ubiquitous full-page BBox costs nothing.
-                if let Some(bb) = crate::walker::form_bbox_clip(access, stream, sub.ctm) {
+                if let Some(bb) = stream
+                    .read(|stream| crate::walker::form_bbox_clip(access, stream, sub.ctm))
+                    .flatten()
+                {
                     sub.clip = Some(intersect_clip(sub.clip, (bb.x0, bb.y0, bb.x1, bb.y1)));
                 }
                 walk(doc, access, &f.ops, &f.scope.xobjects, &child_eg, &child_cs, sub, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice());
-                false
-                });
-                if halt == Some(true) {
-                    return;
-                }
             }
             _ => {}
         }

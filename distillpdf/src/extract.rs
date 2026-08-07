@@ -196,25 +196,33 @@ fn walk_drawn(
         let Some((id, stream)) = crate::walker::xobject_at(access, xmap, &op.operands) else {
             continue; // not a name, a dangling name, or not a stream: nothing to draw
         };
-        stream.read(|stream| {
-            if crate::walker::has_subtype(stream, b"Image") {
-                out.insert(id);
-            } else if crate::walker::has_subtype(stream, b"Form") {
-                if crate::walker::too_deep(depth) {
-                    return; // the one nesting cap
-                }
-                if !seen.insert(id) {
-                    return; // a form already walked on this page: cycle / repeat guard
-                }
-                let Some(scope) = crate::walker::form_scope(access, stream, xmap, crate::walker::ScopePolicy::OverlayParent)
-                else {
-                    return;
-                };
-                if let Some(ops) = crate::walker::form_ops(stream) {
-                    walk_drawn(doc, access, &ops, &scope.xobjects, depth + 1, seen, out);
-                }
+        if stream
+            .read(|stream| crate::walker::has_subtype(stream, b"Image"))
+            .unwrap_or(false)
+        {
+            out.insert(id);
+        } else {
+            if !stream
+                .read(|stream| crate::walker::has_subtype(stream, b"Form"))
+                .unwrap_or(false)
+            {
+                continue;
             }
-        });
+            if crate::walker::too_deep(depth) || !seen.insert(id) {
+                continue;
+            }
+            let Some(scope) = crate::walker::form_scope(
+                access,
+                &stream,
+                xmap,
+                crate::walker::ScopePolicy::OverlayParent,
+            ) else {
+                continue;
+            };
+            if let Some(ops) = stream.read(crate::walker::form_ops).flatten() {
+                walk_drawn(doc, access, &ops, &scope.xobjects, depth + 1, seen, out);
+            }
+        }
     }
 }
 
@@ -258,17 +266,17 @@ fn drawn_images(
         if !seen.insert(id) {
             continue; // shared between annotations, or already reached from the content
         }
-        ap.read(|ap| {
-            let Some(scope) = crate::walker::form_scope(
-                access,
-                ap,
-                &crate::walker::XMap::new(),
-                crate::walker::ScopePolicy::OwnOnly,
-            ) else { return };
-            if let Some(ops) = crate::walker::form_ops(ap) {
-                walk_drawn(doc, access, &ops, &scope.xobjects, 1, &mut seen, &mut out);
-            }
-        });
+        let Some(scope) = crate::walker::form_scope(
+            access,
+            &ap,
+            &crate::walker::XMap::new(),
+            crate::walker::ScopePolicy::OwnOnly,
+        ) else {
+            continue;
+        };
+        if let Some(ops) = ap.read(crate::walker::form_ops).flatten() {
+            walk_drawn(doc, access, &ops, &scope.xobjects, 1, &mut seen, &mut out);
+        }
     }
     Some(out)
 }

@@ -1064,20 +1064,38 @@ pub fn extract_spans(
     // `/Resources`. `walker::placed_appearances` carries the `/BBox`→`/Rect` mapping that
     // puts it where a viewer puts it; its fonts are its own, exactly as a form's are.
     for (_, ap, actm) in crate::walker::placed_appearances(access, page_id) {
-        let halt = ap.read(|ap| {
-            let f = match descend_form(access, ap, &XMap::new(), ScopePolicy::OwnOnly, 0, &mut budget, fonts.len()) {
-                Descend::Into(f) => f,
-                Descend::Skip => return false,
-                Descend::Halt => return true,
-            };
-            let Some(fr) = &f.scope.resources else { return false };
-            let ff = build_fonts_from_resources(doc, fr, raw);
-            decode_spans(doc, access, &f.ops, &ff, &f.scope.xobjects, f.matrix.mul(actm), raw, 1, &mut spans, &mut budget, None);
-            false
-        });
-        if halt == Some(true) {
-            break;
-        }
+        let f = match descend_form(
+            access,
+            &ap,
+            &XMap::new(),
+            ScopePolicy::OwnOnly,
+            0,
+            &mut budget,
+            fonts.len(),
+        ) {
+            Descend::Into(f) => f,
+            Descend::Skip => continue,
+            Descend::Halt => break,
+        };
+        let Some(fr) = &f.scope.resources else {
+            continue;
+        };
+        let ff = fr
+            .read(|resources| build_fonts_from_resources(doc, resources, raw))
+            .unwrap_or_default();
+        decode_spans(
+            doc,
+            access,
+            &f.ops,
+            &ff,
+            &f.scope.xobjects,
+            f.matrix.mul(actm),
+            raw,
+            1,
+            &mut spans,
+            &mut budget,
+            None,
+        );
     }
     dedup_coincident(&mut spans);
     spans
@@ -1364,25 +1382,45 @@ fn decode_spans(
                 // a form without one is skipped rather than decoded through some other
                 // scope's encoding. That is a deliberate policy difference from the raster
                 // and vector walks, which overlay the parent scope; see `walker::ScopePolicy`.
-                let halt = stream.read(|stream| {
-                    let f = match descend_form(access, stream, xmap, ScopePolicy::OwnOnly, depth, budget, fonts.len()) {
-                        Descend::Into(f) => f,
-                        Descend::Skip => return false,
-                        Descend::Halt => return true,
-                    };
-                    let Some(fr) = &f.scope.resources else { return false };
-                    let ff = build_fonts_from_resources(doc, fr, raw);
-                    let sub = f.matrix.mul(ctm);
-                    let clip = crate::walker::form_bbox_clip(access, stream, sub);
-                    let mark = spans.len();
-                    decode_spans(doc, access, &f.ops, &ff, &f.scope.xobjects, sub, raw, depth + 1, spans, budget, None);
-                    if let Some(bb) = clip {
-                        clip_spans_to(spans, mark, bb);
-                    }
-                    false
-                });
-                if halt == Some(true) {
-                    return;
+                let f = match descend_form(
+                    access,
+                    &stream,
+                    xmap,
+                    ScopePolicy::OwnOnly,
+                    depth,
+                    budget,
+                    fonts.len(),
+                ) {
+                    Descend::Into(f) => f,
+                    Descend::Skip => continue,
+                    Descend::Halt => return,
+                };
+                let Some(fr) = &f.scope.resources else {
+                    continue;
+                };
+                let ff = fr
+                    .read(|resources| build_fonts_from_resources(doc, resources, raw))
+                    .unwrap_or_default();
+                let sub = f.matrix.mul(ctm);
+                let clip = stream
+                    .read(|stream| crate::walker::form_bbox_clip(access, stream, sub))
+                    .flatten();
+                let mark = spans.len();
+                decode_spans(
+                    doc,
+                    access,
+                    &f.ops,
+                    &ff,
+                    &f.scope.xobjects,
+                    sub,
+                    raw,
+                    depth + 1,
+                    spans,
+                    budget,
+                    None,
+                );
+                if let Some(bb) = clip {
+                    clip_spans_to(spans, mark, bb);
                 }
                 continue; // the form's spans carry the form's numbering, never the page's
             }
