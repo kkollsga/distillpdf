@@ -12,7 +12,7 @@
 
 use base64::Engine;
 use crate::geom::{Mat, Rect};
-use crate::pdfobj::{deref, filters_of, num};
+use crate::pdfobj::{filters_of, num};
 use crate::raster::{
     codec_payload, decode_dct_rgb, decode_inverts, decode_samples, dims_sane, jpeg_components, png_bytes,
     samples_decodable, MAX_IMAGE_PIXELS,
@@ -46,32 +46,67 @@ struct CcittParms {
 
 /// Read the CCITTFax `/DecodeParms` (or the abbreviated `/DP`), which may be a single dict
 /// or — when the stream has a filter chain — an array of per-filter dicts.
-fn ccitt_parms(doc: &Document, dict: &Dictionary) -> CcittParms {
-    let raw = dict.get(b"DecodeParms").or_else(|_| dict.get(b"DP")).ok().and_then(|o| deref(doc, o));
-    let pd: Option<&Dictionary> = match raw {
-        Some(Object::Dictionary(d)) => Some(d),
-        Some(Object::Array(a)) => a.iter().filter_map(|o| deref(doc, o)).find_map(|o| o.as_dict().ok()),
-        _ => None,
+fn ccitt_parms(
+    access: &dyn crate::access::DocumentAccess,
+    dict: &Dictionary,
+) -> CcittParms {
+    let defaults = || CcittParms {
+        k: 0,
+        columns: 1728,
+        rows: 0,
+        black_is1: false,
     };
-    let geti = |k: &[u8], def: i64| pd.and_then(|d| d.get(k).ok()).and_then(|o| o.as_i64().ok()).unwrap_or(def);
-    let getb = |k: &[u8]| pd.and_then(|d| d.get(k).ok()).and_then(|o| o.as_bool().ok()).unwrap_or(false);
-    CcittParms {
-        k: geti(b"K", 0),
-        columns: geti(b"Columns", 1728).max(0) as u32,
-        rows: geti(b"Rows", 0).max(0) as u32,
-        black_is1: getb(b"BlackIs1"),
-    }
+    let from_dict = |params: &Dictionary| {
+        let geti = |key: &[u8], default: i64| {
+            params
+                .get(key)
+                .ok()
+                .and_then(|value| value.as_i64().ok())
+                .unwrap_or(default)
+        };
+        CcittParms {
+            k: geti(b"K", 0),
+            columns: geti(b"Columns", 1728).max(0) as u32,
+            rows: geti(b"Rows", 0).max(0) as u32,
+            black_is1: params
+                .get(b"BlackIs1")
+                .ok()
+                .and_then(|value| value.as_bool().ok())
+                .unwrap_or(false),
+        }
+    };
+    let Ok(raw) = dict.get(b"DecodeParms").or_else(|_| dict.get(b"DP")) else {
+        return defaults();
+    };
+    crate::access::read_resolved(access, raw, |resolved| match resolved {
+        Object::Dictionary(params) => Some(from_dict(params)),
+        Object::Array(params) => params.iter().find_map(|value| {
+            crate::access::read_resolved(access, value, |value| {
+                value.as_dict().ok().map(from_dict)
+            })
+            .ok()
+            .flatten()
+        }),
+        _ => None,
+    })
+    .ok()
+    .flatten()
+    .unwrap_or_else(defaults)
 }
 
 /// Decode a CCITT Group 3/4 fax image (the encoding of most black-and-white PDF scans) to
 /// grayscale. lopdf cannot apply this filter, so the raw (encoded) stream bytes are decoded
 /// here via the pure-Rust `fax` crate. Honors `/DecodeParms` (`K`, `Columns`, `Rows`,
 /// `BlackIs1`) and an inverting `/Decode` array. `content` must be the raw CCITT bitstream.
-fn decode_ccitt(doc: &Document, dict: &Dictionary, content: &[u8]) -> Option<image::GrayImage> {
+fn decode_ccitt(
+    access: &dyn crate::access::DocumentAccess,
+    dict: &Dictionary,
+    content: &[u8],
+) -> Option<image::GrayImage> {
     use fax::decoder::{decode_g3, decode_g4, pels};
     use fax::Color;
 
-    let parms = ccitt_parms(doc, dict);
+    let parms = ccitt_parms(access, dict);
     let cols = parms.columns;
     let img_h = dict.get(b"Height").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0).max(0) as u32;
     let rows = if parms.rows > 0 { parms.rows } else { img_h };
@@ -82,7 +117,7 @@ fn decode_ccitt(doc: &Document, dict: &Dictionary, content: &[u8]) -> Option<ima
 
     // Default (BlackIs1=false): a fax-"black" pel is a black pixel (0). A `/Decode [1 0]`
     // array flips the mapping; the two inversions compose.
-    let invert = parms.black_is1 ^ decode_inverts(doc, dict);
+    let invert = parms.black_is1 ^ decode_inverts(access, dict);
     let (black, white) = if invert { (255u8, 0u8) } else { (0u8, 255u8) };
 
     let mut buf: Vec<u8> = Vec::new();
@@ -133,12 +168,13 @@ fn decode_rgb(
     let dict = &stream.dict;
     let filters = filters_of(dict);
     if filters.iter().any(|f| f == b"DCTDecode") {
-        return decode_dct_rgb(&codec_payload(stream), decode_inverts(doc, dict));
+        return decode_dct_rgb(&codec_payload(stream), decode_inverts(access, dict));
     }
     if filters.iter().any(|f| f == b"CCITTFaxDecode") {
         // Fax bitstreams are 1-bpc gray; lopdf can't apply the filter, so decode the codec
         // payload here (peeling any Flate wrapper first), then widen gray → RGB.
-        return decode_ccitt(doc, dict, &codec_payload(stream)).map(|g| image::DynamicImage::ImageLuma8(g).to_rgb8());
+        return decode_ccitt(access, dict, &codec_payload(stream))
+            .map(|g| image::DynamicImage::ImageLuma8(g).to_rgb8());
     }
     if filters.iter().any(|f| f == b"JPXDecode" || f == b"JBIG2Decode") {
         return None;
@@ -168,7 +204,7 @@ fn decode_smask(
             .to_luma8();
         // A soft mask carries its own `/Decode`, and `[1 0]` flips the alpha ramp
         // (§8.9.5.2) — a polarity the JPEG file cannot express, so it is applied here.
-        if decode_inverts(doc, sd) {
+        if decode_inverts(access, sd) {
             for v in g.iter_mut() {
                 *v = 255 - *v;
             }
@@ -248,7 +284,7 @@ fn data_uri(
             //     inverted in `to_html`.
             // A clip is the third reason the bytes cannot pass straight through: the
             // passthrough hands over the WHOLE authored image, and the page shows a window of it.
-            let inv = decode_inverts(doc, dict);
+            let inv = decode_inverts(access, dict);
             if inv || window.is_some() || turn != 0 || jpeg_is_cmyk(&jpeg) {
                 let rgb = decode_dct_rgb(&jpeg, inv)?;
                 return jpeg_uri(turn_pixels(crop_window(rgb, window), turn));

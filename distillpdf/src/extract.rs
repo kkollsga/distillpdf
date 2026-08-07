@@ -435,7 +435,7 @@ fn extract_images_inner(
                                     codec_payload(stream)
                                 };
                                 if format == "jpeg" {
-                                    if let Some(png) = normalized_jpeg_png(doc, dict, &data) {
+                                    if let Some(png) = normalized_jpeg_png(access, dict, &data) {
                                         format = "png";
                                         data = png;
                                     }
@@ -448,7 +448,7 @@ fn extract_images_inner(
                                     color_space: image_color_space(
                                         doc, access, &scope, dict,
                                     ),
-                                    bits_per_component: image_bpc(doc, dict),
+                                    bits_per_component: image_bpc(access, dict),
                                     format,
                                     data,
                                 })
