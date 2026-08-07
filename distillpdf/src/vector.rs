@@ -12,7 +12,8 @@
 
 use crate::function::Function;
 use crate::geom::{Mat, Rect};
-use crate::pdfobj::{deref, num, num_deref, sub_dict};
+use crate::access::read_resolved;
+use crate::pdfobj::{num, num_resolved};
 use crate::walker::{descend_form, overlay_xobjects, page_resource_chain, Descend, PaintSeq, ScopePolicy, XMap};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::HashMap;
@@ -89,12 +90,24 @@ fn parse_cs(
             }
         }
         if let Object::Array(a) = resolved {
-            let head = deref(doc, a.first()?).and_then(|value| value.as_name().ok())?;
-            match head {
+            let head = read_resolved(access, a.first()?, |value| {
+                value.as_name().ok().map(<[u8]>::to_vec)
+            })
+            .ok()
+            .flatten()?;
+            match head.as_slice() {
             b"Separation" | b"DeviceN" => {
                 // `/Separation` is one colorant by definition; `/DeviceN`'s count is the
                 // length of its names array (§8.6.6.4/§8.6.6.5).
-                let k = if head == b"Separation" { 1 } else { deref(doc, a.get(1)?)?.as_array().ok()?.len() };
+                let k = if head == b"Separation" {
+                    1
+                } else {
+                    read_resolved(access, a.get(1)?, |names| {
+                        names.as_array().ok().map(Vec::len)
+                    })
+                    .ok()
+                    .flatten()?
+                };
                 if k == 0 || k > MAX_COLORANTS {
                     return None;
                 }
@@ -133,12 +146,17 @@ fn colorspaces_of(
     resources: &Dictionary,
 ) -> HashMap<Vec<u8>, Rc<PaintCs>> {
     let mut map = HashMap::new();
-    if let Some(csd) = sub_dict(doc, resources, b"ColorSpace") {
-        for (name, val) in csd.iter() {
-            if let Some(cs) = parse_cs(doc, access, scope, val, 0) {
-                map.insert(name.clone(), Rc::new(cs));
+    if let Ok(color_spaces) = resources.get(b"ColorSpace") {
+        let _ = read_resolved(access, color_spaces, |color_spaces| {
+            let Ok(color_spaces) = color_spaces.as_dict() else {
+                return;
+            };
+            for (name, value) in color_spaces.iter() {
+                if let Some(color_space) = parse_cs(doc, access, scope, value, 0) {
+                    map.insert(name.clone(), Rc::new(color_space));
+                }
             }
-        }
+        });
     }
     map
 }
@@ -938,19 +956,33 @@ const BAND_GAP: f32 = 24.0; // vertical gap that separates two figures
 const MAX_OPS: usize = 600_000;
 
 /// ExtGState name -> (fill alpha `ca`, stroke alpha `CA`) where defined.
-fn extgstates_of(doc: &Document, resources: &Dictionary) -> HashMap<Vec<u8>, (Option<f32>, Option<f32>)> {
+fn extgstates_of(
+    access: &dyn crate::access::DocumentAccess,
+    resources: &Dictionary,
+) -> HashMap<Vec<u8>, (Option<f32>, Option<f32>)> {
     let mut map = HashMap::new();
-    if let Some(eg) = resources.get(b"ExtGState").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
-        for (name, val) in eg.iter() {
-            if let Some(d) = deref(doc, val).and_then(|o| o.as_dict().ok()) {
-                // Dictionary VALUES, so `num_deref` — a writer that hoists a shared alpha into
-                // an indirect object is legal, and the direct-only `num` read it as 0.0, i.e.
-                // fully transparent, which silently deletes every paint made under this state.
-                let ca = d.get(b"ca").ok().map(|o| num_deref(doc, o));
-                let big = d.get(b"CA").ok().map(|o| num_deref(doc, o));
-                map.insert(name.clone(), (ca, big));
+    if let Ok(states) = resources.get(b"ExtGState") {
+        let _ = read_resolved(access, states, |states| {
+            let Ok(states) = states.as_dict() else {
+                return;
+            };
+            for (name, value) in states.iter() {
+                let _ = read_resolved(access, value, |state| {
+                    let Ok(state) = state.as_dict() else {
+                        return;
+                    };
+                    let ca = state
+                        .get(b"ca")
+                        .ok()
+                        .map(|value| num_resolved(access, value));
+                    let big = state
+                        .get(b"CA")
+                        .ok()
+                        .map(|value| num_resolved(access, value));
+                    map.insert(name.clone(), (ca, big));
+                });
             }
-        }
+        });
     }
     map
 }
@@ -1229,7 +1261,7 @@ fn painted_page(
     for res in &chain {
         let _ = res.read(|dictionary| {
             overlay_xobjects(access, dictionary, &mut xmap);
-            egmap.extend(extgstates_of(doc, dictionary));
+            egmap.extend(extgstates_of(access, dictionary));
             csmap.extend(colorspaces_of(doc, access, &resource_scope, dictionary));
         });
     }
@@ -1258,7 +1290,7 @@ fn painted_page(
         let (mut aeg, mut acs) = (HashMap::new(), HashMap::new());
         if let Some(fr) = &f.scope.resources {
             let _ = fr.read(|resources| {
-                aeg.extend(extgstates_of(doc, resources));
+                aeg.extend(extgstates_of(access, resources));
                 acs.extend(colorspaces_of(
                     doc,
                     access,
@@ -1587,7 +1619,7 @@ fn walk(
                 let mut child_cs = csmap.clone();
                 if let Some(fr) = &f.scope.resources {
                     let _ = fr.read(|resources| {
-                        for (k, v) in extgstates_of(doc, resources) {
+                        for (k, v) in extgstates_of(access, resources) {
                             child_eg.insert(k, v);
                         }
                         for (k, v) in colorspaces_of(
@@ -2024,7 +2056,7 @@ mod tests {
         for res in &page_resource_chain(&access, page_id) {
             let _ = res.read(|dictionary| {
                 overlay_xobjects(&access, dictionary, &mut xmap);
-                egmap.extend(extgstates_of(doc, dictionary));
+                egmap.extend(extgstates_of(&access, dictionary));
                 csmap.extend(colorspaces_of(
                     doc,
                     &access,
@@ -2410,12 +2442,12 @@ mod tests {
         // The premise: the alphas really are indirect.
         let res = page_res(&doc, page_id);
         let eg = res.get(b"ExtGState").unwrap().as_dict().unwrap().get(b"GA").unwrap();
-        let eg = deref(&doc, eg).unwrap().as_dict().unwrap();
+        let eg = crate::pdfobj::deref(&doc, eg).unwrap().as_dict().unwrap();
         assert!(matches!(eg.get(b"ca").unwrap(), Object::Reference(_)));
         assert!(matches!(eg.get(b"CA").unwrap(), Object::Reference(_)));
 
         // The alphas resolve to the authored values, not 0.0 …
-        let egmap = extgstates_of(&doc, &res);
+        let egmap = extgstates_of(&test_adapter(&doc), &res);
         assert_eq!(egmap.get(b"GA".as_slice()).copied(), Some((Some(0.85), Some(0.6))));
         // … and the ink they gate survives the walk: 8 filled bars + 2 stroked axis rules.
         let painted = walk_page(&doc, page_id, crate::MAX_FORM_WORK);
