@@ -303,6 +303,14 @@ pub(crate) struct PendingReservation {
     completed: bool,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingReservationDiagnostic {
+    Queued,
+    Granted,
+    Error,
+}
+
 #[derive(Clone)]
 pub(crate) struct ReservationCancellation {
     broker: Weak<BrokerInner>,
@@ -576,6 +584,15 @@ impl Drop for OperationInner {
 }
 
 impl PendingReservation {
+    #[cfg(test)]
+    pub(crate) fn diagnostic_state(&self) -> PendingReservationDiagnostic {
+        match &*lock_recover(&self.wait.outcome) {
+            WaitOutcome::Pending => PendingReservationDiagnostic::Queued,
+            WaitOutcome::Granted(_) => PendingReservationDiagnostic::Granted,
+            WaitOutcome::Error(_) => PendingReservationDiagnostic::Error,
+        }
+    }
+
     pub(crate) fn cancellation_handle(&self) -> ReservationCancellation {
         ReservationCancellation {
             broker: Arc::downgrade(&self.broker),

@@ -8,6 +8,8 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::access::{AccessError, AccessKind};
+#[cfg(test)]
+use crate::broker::PendingReservationDiagnostic;
 use crate::broker::{
     BrokerError, BrokerOperation, BudgetBroker, Lane, OwnershipClass, ReservationCancellation,
     RetainedCharge, SelfPinCharge,
@@ -21,7 +23,15 @@ use lopdf::{
     BoundedObject, BoundedObjectStream, Object, ObjectId, ScalarResolutionPermit,
     BOUNDED_OBJECT_STREAM_STRUCTURAL_ENVELOPE_BYTES,
 };
+use std::any::Any;
+#[cfg(test)]
+use std::cell::Cell as ThreadCell;
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
+#[cfg(test)]
+use std::ops::{Deref, DerefMut};
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 
@@ -168,6 +178,23 @@ pub(crate) struct ObjectCellSnapshot {
     pub(crate) evictions: u64,
     pub(crate) cancellations: u64,
     pub(crate) closes: u64,
+    pub(crate) dependency_cancellations: usize,
+    pub(crate) dependency_pins: usize,
+    pub(crate) dependency_edges: usize,
+    pub(crate) dependency_leaders: usize,
+    pub(crate) dependency_edge_adds: u64,
+    pub(crate) dependency_edge_removes: u64,
+    pub(crate) dependency_cleanup_acks: u64,
+    #[cfg(test)]
+    pub(crate) active_generations: usize,
+    #[cfg(test)]
+    pub(crate) parse_active: usize,
+    #[cfg(test)]
+    pub(crate) permit_current: usize,
+    #[cfg(test)]
+    pub(crate) broker_cancellation_current: usize,
+    #[cfg(test)]
+    pub(crate) close_acknowledgements: u64,
     pub(crate) raw: RepresentationSnapshot,
     pub(crate) containers: RepresentationSnapshot,
     pub(crate) members: RepresentationSnapshot,
@@ -198,10 +225,23 @@ struct DomainInner {
     admission: Mutex<()>,
     headroom: Mutex<()>,
     wait_hooks: Mutex<Option<Arc<dyn WaitEdgeHooks>>>,
+    dependency_hooks: Mutex<Option<Arc<dyn DependencyHooks>>>,
+    #[cfg(test)]
+    dependency_wait_hooks: Mutex<Option<Arc<dyn DependencyWaitHooks>>>,
+    #[cfg(test)]
+    dependency_cleanup_failure_hooks: Mutex<Option<Arc<dyn DependencyCleanupFailureHooks>>>,
+    #[cfg(test)]
+    dependency_terminal_cleanup_hooks: Mutex<Option<Arc<dyn DependencyTerminalCleanupHooks>>>,
+    #[cfg(test)]
+    dependency_pre_wait_hooks: Mutex<Option<Arc<dyn DependencyPreWaitHooks>>>,
     #[cfg(test)]
     close_hooks: Mutex<Option<Arc<dyn CloseEdgeHooks>>>,
     #[cfg(test)]
     leader_phase_hooks: Mutex<Option<Arc<dyn LeaderPhaseHooks>>>,
+    #[cfg(test)]
+    failure_delivery_hooks: Mutex<Option<Arc<dyn FailureDeliveryHooks>>>,
+    #[cfg(test)]
+    scheduled_resource_hooks: Mutex<Option<Arc<dyn ScheduledResourceHooks>>>,
     state: Mutex<DomainState>,
 }
 
@@ -215,6 +255,178 @@ pub(crate) trait WaitEdgeHooks: Send + Sync {
 trait WaitEdgeHooks: Send + Sync {
     fn add(&self, epoch: u64, id: ObjectId, generation: u64, ordinal: u64);
     fn remove(&self, epoch: u64, id: ObjectId, generation: u64, ordinal: u64);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct DependencyLeaderToken {
+    key: CellKey,
+    generation: u64,
+    leader_slot: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DependencyEdge {
+    from: CellKey,
+    to: CellKey,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DependencyEventKind {
+    BeforeChildInstall,
+    EdgeAdded,
+    InsideChildResolve,
+    ChildResolved,
+    #[cfg(test)]
+    ChildHandleTaken,
+    PinInstalled,
+    BeforeMemberAdmission,
+    #[cfg(test)]
+    MemberRequestCreated,
+    #[cfg(test)]
+    MemberQueued,
+    #[cfg(test)]
+    MemberGranted,
+    #[cfg(test)]
+    MemberParseEnter,
+    #[cfg(test)]
+    MemberParseExit,
+    #[cfg(test)]
+    MemberReconciledBeforePublication,
+    #[cfg(test)]
+    MemberPublished,
+    CleanupDetached,
+    EdgeRemoved,
+    CleanupAcknowledged,
+    SuccessorElected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DependencyEvent {
+    token: DependencyLeaderToken,
+    edge: DependencyEdge,
+    kind: DependencyEventKind,
+    ordinal: u64,
+    successor: Option<DependencySuccessor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DependencySuccessor {
+    generation: u64,
+    leader_slot: usize,
+    interest_ordinal: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DependencyTransition {
+    Idle,
+    Announcing {
+        token: DependencyLeaderToken,
+        kind: DependencyEventKind,
+    },
+    Cleaning(DependencyLeaderToken),
+    Acknowledging(DependencyLeaderToken),
+    CleanupFailed(DependencyLeaderToken),
+    ReleasingSuccessor {
+        old: DependencyLeaderToken,
+        successor: DependencySuccessor,
+    },
+}
+
+impl DependencyTransition {
+    const fn is_idle(self) -> bool {
+        matches!(self, Self::Idle)
+    }
+}
+
+type DependencyHookPanic = Box<dyn Any + Send + 'static>;
+
+struct DependencyCleanupFailure {
+    token: DependencyLeaderToken,
+    control: CellControlFailure,
+    hook_panic: Option<DependencyHookPanic>,
+}
+
+struct DependencyCleanupCompletion {
+    token: DependencyLeaderToken,
+    hook_panic: Option<DependencyHookPanic>,
+}
+
+enum PublishedCleanupOwner {
+    Ready(Arc<ResolvedObjectOwner>),
+    Failure(Arc<FailureOwner>),
+}
+
+#[cfg(test)]
+trait DependencyHooks: Send + Sync {
+    fn event(&self, event: DependencyEvent);
+}
+
+#[cfg(test)]
+trait DependencyWaitHooks: Send + Sync {
+    fn waiting(&self, key: CellKey, transition: DependencyTransition);
+}
+
+#[cfg(test)]
+trait DependencyCleanupFailureHooks: Send + Sync {
+    fn failed(&self, key: CellKey, token: DependencyLeaderToken);
+}
+
+#[cfg(test)]
+trait DependencyTerminalCleanupHooks: Send + Sync {
+    fn before_metadata(&self, key: CellKey, owner: DependencyTerminalCleanupOwner);
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DependencyTerminalCleanupOwner {
+    ArenaClose,
+    LeaderTerminal,
+    ExactTeardown,
+}
+
+#[cfg(test)]
+trait DependencyPreWaitHooks: Send + Sync {
+    fn before_wait(&self, key: CellKey, transition: DependencyTransition);
+}
+
+#[cfg(test)]
+trait FailureDeliveryHooks: Send + Sync {
+    fn delivered(&self, key: CellKey, owner: usize);
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScheduledResourceShape {
+    Requested,
+    Granted,
+    Returned,
+    Reconciled,
+}
+
+#[cfg(test)]
+trait ScheduledResourceHooks: Send + Sync {
+    fn enter(&self, key: CellKey, token: DependencyLeaderToken, shape: ScheduledResourceShape);
+    fn dropped(&self, key: CellKey, token: DependencyLeaderToken, shape: ScheduledResourceShape);
+}
+
+#[cfg(test)]
+struct ScheduledParseActiveGuard<'a>(&'a DomainInner);
+
+#[cfg(test)]
+impl Drop for ScheduledParseActiveGuard<'_> {
+    fn drop(&mut self) {
+        let mut domain = lock(&self.0.state);
+        if domain.parse_active == 0 {
+            domain.invariant_failed = true;
+        } else {
+            domain.parse_active -= 1;
+        }
+    }
+}
+
+#[cfg(not(test))]
+trait DependencyHooks: Send + Sync {
+    fn event(&self, event: DependencyEvent);
 }
 
 #[cfg(test)]
@@ -271,6 +483,20 @@ struct DomainState {
     evictions: u64,
     cancellations: u64,
     closes: u64,
+    dependency_cancellations: usize,
+    dependency_pins: usize,
+    dependency_edges: usize,
+    dependency_edge_adds: u64,
+    dependency_edge_removes: u64,
+    dependency_cleanup_acks: u64,
+    #[cfg(test)]
+    active_generations: BTreeSet<DependencyLeaderToken>,
+    #[cfg(test)]
+    parse_active: usize,
+    #[cfg(test)]
+    close_acknowledgements: u64,
+    dependency_leaders: usize,
+    dependency_event_ordinal: u64,
     representations: [RepresentationSnapshot; Representation::COUNT],
     invariant_failed: bool,
 }
@@ -322,16 +548,25 @@ struct Cell {
 
 #[derive(Clone, Copy)]
 struct InterestSlot {
-    active: bool,
     ordinal: u64,
     generation: u64,
 }
 
 const EMPTY_INTEREST: InterestSlot = InterestSlot {
-    active: false,
     ordinal: 0,
     generation: 0,
 };
+
+impl InterestSlot {
+    const fn is_active(self) -> bool {
+        self.ordinal != 0
+    }
+
+    fn deactivate(&mut self) {
+        self.ordinal = 0;
+        self.generation = 0;
+    }
+}
 
 struct LoadingState {
     generation: u64,
@@ -340,6 +575,21 @@ struct LoadingState {
     cancellation: Arc<AtomicBool>,
     broker_cancellation: Option<ReservationCancellation>,
     permit: Option<ScalarResolutionPermit>,
+    dependency: Option<MemberDependencyState>,
+    dependency_container: Option<ObjectId>,
+}
+
+struct MemberDependencyState {
+    token: DependencyLeaderToken,
+    edge: DependencyEdge,
+    cancellation: Option<CellCancellation>,
+    pin: Option<ResolvedObjectStreamPin>,
+}
+
+struct DetachedDependency {
+    dependency: MemberDependencyState,
+    event: Option<DependencyEvent>,
+    ordinal_invariant: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -380,6 +630,8 @@ enum CellControlTag {
     StreamSpanInvariant,
     ObjectStreamBatchSetupInvariant,
     ObjectStreamCacheBypassInvariant,
+    DependencyRejectedStale,
+    DependencyStateInvariant,
     ErrorAccountingInvariant,
     LoadCounterOverflow,
 }
@@ -427,6 +679,8 @@ impl CellControlTag {
             Self::StreamSpanInvariant => "object-stream stream-span invariant",
             Self::ObjectStreamBatchSetupInvariant => "object-stream batch-setup route invariant",
             Self::ObjectStreamCacheBypassInvariant => "object-stream cache-bypass route invariant",
+            Self::DependencyRejectedStale => "stale member dependency operation rejected",
+            Self::DependencyStateInvariant => "member dependency state invariant",
             Self::ErrorAccountingInvariant => "cell error accounting overflow",
             Self::LoadCounterOverflow => "object cell load counter overflow",
         }
@@ -444,6 +698,7 @@ impl CellControlTag {
                 | Self::StreamSpanInvariant
                 | Self::ObjectStreamBatchSetupInvariant
                 | Self::ObjectStreamCacheBypassInvariant
+                | Self::DependencyStateInvariant
                 | Self::ErrorAccountingInvariant
                 | Self::LoadCounterOverflow
         )
@@ -525,6 +780,7 @@ enum CellPhase {
 
 struct CellState {
     phase: CellPhase,
+    dependency_transition: DependencyTransition,
     interests: [InterestSlot; MAX_INTERESTS_PER_CELL],
     live_interests: usize,
     next_interest_ordinal: u64,
@@ -693,7 +949,7 @@ impl ExactPhaseExpectation<'_> {
                             && state
                                 .interests
                                 .get(loading.leader_slot)
-                                .is_some_and(|interest| interest.active)))
+                                .is_some_and(|interest| interest.is_active())))
             }
             (Self::Ready { owner }, CellPhase::Ready(current)) => {
                 owner.is_none_or(|expected| Arc::ptr_eq(expected, current))
@@ -766,10 +1022,23 @@ impl ObjectCellDomain {
                 admission: Mutex::new(()),
                 headroom: Mutex::new(()),
                 wait_hooks: Mutex::new(None),
+                dependency_hooks: Mutex::new(None),
+                #[cfg(test)]
+                dependency_wait_hooks: Mutex::new(None),
+                #[cfg(test)]
+                dependency_cleanup_failure_hooks: Mutex::new(None),
+                #[cfg(test)]
+                dependency_terminal_cleanup_hooks: Mutex::new(None),
+                #[cfg(test)]
+                dependency_pre_wait_hooks: Mutex::new(None),
                 #[cfg(test)]
                 close_hooks: Mutex::new(None),
                 #[cfg(test)]
                 leader_phase_hooks: Mutex::new(None),
+                #[cfg(test)]
+                failure_delivery_hooks: Mutex::new(None),
+                #[cfg(test)]
+                scheduled_resource_hooks: Mutex::new(None),
                 state: Mutex::new(DomainState::default()),
             }),
         }
@@ -841,6 +1110,44 @@ impl ObjectCellDomain {
     #[cfg(test)]
     pub(crate) fn set_wait_hooks(&self, hooks: Arc<dyn WaitEdgeHooks>) {
         *lock(&self.inner.wait_hooks) = Some(hooks);
+    }
+
+    #[cfg(test)]
+    fn set_dependency_hooks(&self, hooks: Arc<dyn DependencyHooks>) {
+        *lock(&self.inner.dependency_hooks) = Some(hooks);
+    }
+
+    #[cfg(test)]
+    fn set_dependency_wait_hooks(&self, hooks: Arc<dyn DependencyWaitHooks>) {
+        *lock(&self.inner.dependency_wait_hooks) = Some(hooks);
+    }
+
+    #[cfg(test)]
+    fn set_failure_delivery_hooks(&self, hooks: Arc<dyn FailureDeliveryHooks>) {
+        *lock(&self.inner.failure_delivery_hooks) = Some(hooks);
+    }
+
+    #[cfg(test)]
+    fn set_scheduled_resource_hooks(&self, hooks: Arc<dyn ScheduledResourceHooks>) {
+        *lock(&self.inner.scheduled_resource_hooks) = Some(hooks);
+    }
+
+    #[cfg(test)]
+    fn set_dependency_cleanup_failure_hooks(&self, hooks: Arc<dyn DependencyCleanupFailureHooks>) {
+        *lock(&self.inner.dependency_cleanup_failure_hooks) = Some(hooks);
+    }
+
+    #[cfg(test)]
+    fn set_dependency_terminal_cleanup_hooks(
+        &self,
+        hooks: Arc<dyn DependencyTerminalCleanupHooks>,
+    ) {
+        *lock(&self.inner.dependency_terminal_cleanup_hooks) = Some(hooks);
+    }
+
+    #[cfg(test)]
+    fn set_dependency_pre_wait_hooks(&self, hooks: Arc<dyn DependencyPreWaitHooks>) {
+        *lock(&self.inner.dependency_pre_wait_hooks) = Some(hooks);
     }
 
     #[cfg(test)]
@@ -951,7 +1258,11 @@ impl ObjectCellArena {
             return None;
         };
         let charge = lock(&owner.charge).as_ref()?.bytes();
-        Some((owner.retained_bytes(), owner.permit.clone(), charge))
+        Some((
+            owner.retained_bytes(),
+            test_clone_permit(&owner.permit),
+            charge,
+        ))
     }
 
     pub(crate) fn has_container_cell(&self, id: ObjectId) -> bool {
@@ -974,6 +1285,866 @@ impl ObjectCellRequest {
         }
     }
 
+    #[cfg(test)]
+    fn resolve_dependency_synthetic(mut self, container: ObjectId) -> Result<(), AccessError> {
+        loop {
+            let step = {
+                let mut state = lock(&self.cell.state);
+                if state.interests.get(self.slot).is_none_or(|interest| {
+                    !interest.is_active() || interest.ordinal != self.ordinal
+                }) {
+                    self.completed = true;
+                    ResolveStep::Control(CellControlFailure::new(
+                        self.cell.key.id,
+                        AccessKind::Backend,
+                        CellControlTag::InterestCancelled,
+                    ))
+                } else {
+                    let dependency_idle = state.dependency_transition.is_idle();
+                    match &mut state.phase {
+                        CellPhase::Loading(loading)
+                            if dependency_idle
+                                && loading.leader_slot == self.slot
+                                && !loading.leader_running
+                                && !self.arena.closed.load(Ordering::Acquire) =>
+                        {
+                            loading.leader_running = true;
+                            ResolveStep::Lead {
+                                generation: loading.generation,
+                                cancellation: test_arc_clone(&loading.cancellation),
+                            }
+                        }
+                        CellPhase::Loading(_) => ResolveStep::Wait,
+                        CellPhase::Ready(_)
+                        | CellPhase::Negative(_)
+                        | CellPhase::FlightError(_)
+                        | CellPhase::Closed(_)
+                            if !dependency_idle =>
+                        {
+                            ResolveStep::Wait
+                        }
+                        CellPhase::Ready(_)
+                        | CellPhase::Negative(_)
+                        | CellPhase::FlightError(_) => {
+                            ResolveStep::Control(CellControlFailure::new(
+                                self.cell.key.id,
+                                AccessKind::Backend,
+                                CellControlTag::DependencyStateInvariant,
+                            ))
+                        }
+                        CellPhase::Closed(error) => ResolveStep::Closed(error.clone()),
+                    }
+                }
+            };
+            match step {
+                ResolveStep::Lead {
+                    generation,
+                    cancellation,
+                } => {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.run_dependency_synthetic(generation, &cancellation, container)
+                    }));
+                    match outcome {
+                        Ok(result) => {
+                            self.finish_interest();
+                            self.completed = true;
+                            self.arena
+                                .leader_terminal(&self.cell, self.slot, generation);
+                            return result.map_err(|control| control.render());
+                        }
+                        Err(payload) => {
+                            self.arena.release_interest(
+                                &self.cell,
+                                self.slot,
+                                self.ordinal,
+                                InterestRelease::Abandon,
+                            );
+                            self.completed = true;
+                            self.arena
+                                .leader_terminal(&self.cell, self.slot, generation);
+                            std::panic::resume_unwind(payload);
+                        }
+                    }
+                }
+                ResolveStep::Closed(error) | ResolveStep::Control(error) => {
+                    self.finish_interest();
+                    self.completed = true;
+                    return Err(error.render());
+                }
+                ResolveStep::Wait => {
+                    let transition_state = lock(&self.cell.state);
+                    if !transition_state.dependency_transition.is_idle() {
+                        drop(transition_state);
+                        self.arena.wait_for_dependency_transition(&self.cell);
+                        continue;
+                    }
+                    drop(transition_state);
+                    let generation = {
+                        let state = lock(&self.cell.state);
+                        match &state.phase {
+                            CellPhase::Loading(loading)
+                                if !(loading.leader_slot == self.slot
+                                    && !loading.leader_running)
+                                    && state.interests.get(self.slot).is_some_and(|interest| {
+                                        interest.is_active() && interest.ordinal == self.ordinal
+                                    }) =>
+                            {
+                                Some(loading.generation)
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(generation) = generation {
+                        let edge =
+                            self.arena
+                                .domain
+                                .wait_edge(self.cell.key, generation, self.ordinal);
+                        let mut state = lock(&self.cell.state);
+                        if matches!(
+                            &state.phase,
+                            CellPhase::Loading(loading)
+                                if !(loading.leader_slot == self.slot && !loading.leader_running)
+                        ) && state.interests.get(self.slot).is_some_and(|interest| {
+                            interest.is_active() && interest.ordinal == self.ordinal
+                        }) {
+                            state = wait(&self.cell.ready, state);
+                        }
+                        drop(state);
+                        drop(edge);
+                    }
+                }
+                ResolveStep::Ready(_) | ResolveStep::Error(_) => {
+                    unreachable!("synthetic dependency flight has no published payload")
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn run_dependency_synthetic(
+        &self,
+        generation: u64,
+        cancellation: &Arc<AtomicBool>,
+        container: ObjectId,
+    ) -> Result<(), CellControlFailure> {
+        self.prepare_dependency_synthetic(
+            generation,
+            cancellation,
+            container,
+            |_| panic!("C1 synthetic dependency requires an already prepared container"),
+            false,
+        )
+    }
+
+    #[cfg(test)]
+    fn prepare_dependency_synthetic<F>(
+        &self,
+        generation: u64,
+        cancellation: &Arc<AtomicBool>,
+        container: ObjectId,
+        child_loader: F,
+        c2_ordered_evidence: bool,
+    ) -> Result<(), CellControlFailure>
+    where
+        F: FnOnce(&ScalarResolutionPermit) -> Result<BoundedObjectStream, CellLoadError>,
+    {
+        let token = DependencyLeaderToken {
+            key: self.cell.key,
+            generation,
+            leader_slot: self.slot,
+        };
+        let edge = DependencyEdge {
+            from: token.key,
+            to: CellKey {
+                epoch: token.key.epoch,
+                id: container,
+                representation: Representation::DeclaredObjStmContainer,
+            },
+        };
+        if let Some(panic) = self.arena.announce_dependency_event(
+            &self.cell,
+            token,
+            edge,
+            DependencyEventKind::BeforeChildInstall,
+        )? {
+            resume_unwind(panic);
+        }
+        if cancellation.load(Ordering::Acquire) {
+            return Err(CellControlFailure::new(
+                self.cell.key.id,
+                AccessKind::Backend,
+                CellControlTag::InterestCancelled,
+            ));
+        }
+        let child = self
+            .arena
+            .request_representation(container, Representation::DeclaredObjStmContainer)?;
+        let child_cancellation = child.cancellation_handle();
+        match self.arena.install_dependency_cancellation(
+            &self.cell,
+            token,
+            container,
+            child_cancellation,
+        ) {
+            Ok(Some(panic)) => resume_unwind(panic),
+            Ok(None) => {}
+            Err((child_cancellation, control)) => {
+                child_cancellation.cancel();
+                return Err(control);
+            }
+        }
+        if let Some(panic) = self.arena.announce_dependency_event(
+            &self.cell,
+            token,
+            edge,
+            DependencyEventKind::InsideChildResolve,
+        )? {
+            resume_unwind(panic);
+        }
+        let child_result = child.resolve_object_stream(child_loader);
+        if c2_ordered_evidence {
+            if let Some(panic) = self.arena.announce_dependency_event(
+                &self.cell,
+                token,
+                edge,
+                DependencyEventKind::ChildResolved,
+            )? {
+                resume_unwind(panic);
+            }
+        }
+        let Some(child_handle) = self.arena.take_dependency_cancellation(&self.cell, token)? else {
+            return Err(CellControlFailure::new(
+                self.cell.key.id,
+                AccessKind::Backend,
+                CellControlTag::DependencyRejectedStale,
+            ));
+        };
+        drop(child_handle);
+        let taken_kind = if c2_ordered_evidence {
+            DependencyEventKind::ChildHandleTaken
+        } else {
+            DependencyEventKind::ChildResolved
+        };
+        if let Some(panic) = self
+            .arena
+            .announce_dependency_event(&self.cell, token, edge, taken_kind)?
+        {
+            resume_unwind(panic);
+        }
+        let pin = child_result.map_err(|error| match error {
+            ContainerCellError::Control(control) => control,
+            ContainerCellError::Shared(_) => CellControlFailure::new(
+                self.cell.key.id,
+                AccessKind::Backend,
+                CellControlTag::DependencyStateInvariant,
+            ),
+        })?;
+        match self.arena.install_dependency_pin(&self.cell, token, pin) {
+            Ok(Some(panic)) => resume_unwind(panic),
+            Ok(None) => {}
+            Err((pin, control)) => {
+                drop(pin);
+                return Err(control);
+            }
+        }
+        if let Some(panic) = self.arena.announce_dependency_event(
+            &self.cell,
+            token,
+            edge,
+            DependencyEventKind::BeforeMemberAdmission,
+        )? {
+            resume_unwind(panic);
+        }
+        if cancellation.load(Ordering::Acquire) {
+            return Err(CellControlFailure::new(
+                self.cell.key.id,
+                AccessKind::Backend,
+                CellControlTag::InterestCancelled,
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn resolve_scheduled_member_synthetic<CF, MF>(
+        mut self,
+        container: ObjectId,
+        child_loader: CF,
+        member_loader: MF,
+    ) -> Result<ResolvedObjectPin, AccessError>
+    where
+        CF: FnOnce(&ScalarResolutionPermit) -> Result<BoundedObjectStream, CellLoadError>,
+        MF: FnOnce(&ScalarResolutionPermit) -> Result<BoundedObject, CellLoadError>,
+    {
+        let mut child_loader = Some(child_loader);
+        let mut member_loader = Some(member_loader);
+        loop {
+            let step = {
+                let mut state = lock(&self.cell.state);
+                if state.interests.get(self.slot).is_none_or(|interest| {
+                    !interest.is_active() || interest.ordinal != self.ordinal
+                }) {
+                    self.completed = true;
+                    ResolveStep::Control(CellControlFailure::new(
+                        self.cell.key.id,
+                        AccessKind::Backend,
+                        CellControlTag::InterestCancelled,
+                    ))
+                } else {
+                    let dependency_idle = state.dependency_transition.is_idle();
+                    match &mut state.phase {
+                        CellPhase::Loading(loading)
+                            if dependency_idle
+                                && loading.leader_slot == self.slot
+                                && !loading.leader_running
+                                && !self.arena.closed.load(Ordering::Acquire) =>
+                        {
+                            loading.leader_running = true;
+                            ResolveStep::Lead {
+                                generation: loading.generation,
+                                cancellation: test_arc_clone(&loading.cancellation),
+                            }
+                        }
+                        CellPhase::Loading(_) => ResolveStep::Wait,
+                        CellPhase::Ready(_)
+                        | CellPhase::Negative(_)
+                        | CellPhase::FlightError(_)
+                        | CellPhase::Closed(_)
+                            if !dependency_idle =>
+                        {
+                            ResolveStep::Wait
+                        }
+                        CellPhase::Ready(owner) => ResolveStep::Ready(test_arc_clone(owner)),
+                        CellPhase::Negative(error) | CellPhase::FlightError(error) => {
+                            ResolveStep::Error(test_arc_clone(error))
+                        }
+                        CellPhase::Closed(error) => ResolveStep::Closed(test_clone_value(error)),
+                    }
+                }
+            };
+            match step {
+                ResolveStep::Lead {
+                    generation,
+                    cancellation,
+                } => {
+                    let child_loader = child_loader
+                        .take()
+                        .expect("one child loader invocation per member interest");
+                    let member_loader = member_loader
+                        .take()
+                        .expect("one member loader invocation per member interest");
+                    self.run_scheduled_member_synthetic(
+                        generation,
+                        &cancellation,
+                        container,
+                        child_loader,
+                        member_loader,
+                    );
+                }
+                ResolveStep::Ready(owner) => {
+                    if !matches!(&owner.payload, CellPayload::Object(_)) {
+                        let failure = self.arena.invalidate_payload_mismatch(&self.cell, &owner);
+                        self.finish_interest();
+                        self.completed = true;
+                        return Err(failure.render());
+                    }
+                    let pin = self
+                        .arena
+                        .pin(&self.cell, owner)
+                        .map_err(|control| control.render())?;
+                    self.finish_interest();
+                    self.completed = true;
+                    return Ok(ResolvedObjectPin { inner: pin });
+                }
+                ResolveStep::Error(error) => {
+                    let hooks = test_locked_clone(&self.arena.domain.failure_delivery_hooks);
+                    if let Some(hooks) = hooks {
+                        hooks.delivered(self.cell.key, Arc::as_ptr(&error) as usize);
+                    }
+                    self.finish_interest();
+                    self.completed = true;
+                    return match &error.payload {
+                        FailurePayload::Access(error) => Err(test_clone_value(error)),
+                        FailurePayload::ObjStm(_) => Err(self
+                            .arena
+                            .invalidate_failure_payload_mismatch(&self.cell, &error)
+                            .render()),
+                    };
+                }
+                ResolveStep::Closed(error) | ResolveStep::Control(error) => {
+                    self.finish_interest();
+                    self.completed = true;
+                    return Err(error.render());
+                }
+                ResolveStep::Wait => {
+                    let transition_state = lock(&self.cell.state);
+                    if !transition_state.dependency_transition.is_idle() {
+                        drop(transition_state);
+                        self.arena.wait_for_dependency_transition(&self.cell);
+                        continue;
+                    }
+                    drop(transition_state);
+                    let generation = {
+                        let state = lock(&self.cell.state);
+                        match &state.phase {
+                            CellPhase::Loading(loading)
+                                if !(loading.leader_slot == self.slot
+                                    && !loading.leader_running)
+                                    && state.interests.get(self.slot).is_some_and(|interest| {
+                                        interest.is_active() && interest.ordinal == self.ordinal
+                                    }) =>
+                            {
+                                Some(loading.generation)
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(generation) = generation {
+                        let edge =
+                            self.arena
+                                .domain
+                                .wait_edge(self.cell.key, generation, self.ordinal);
+                        let mut state = lock(&self.cell.state);
+                        if matches!(
+                            &state.phase,
+                            CellPhase::Loading(loading)
+                                if !(loading.leader_slot == self.slot && !loading.leader_running)
+                        ) && state.interests.get(self.slot).is_some_and(|interest| {
+                            interest.is_active() && interest.ordinal == self.ordinal
+                        }) {
+                            state = wait(&self.cell.ready, state);
+                        }
+                        drop(state);
+                        drop(edge);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn run_scheduled_member_synthetic<CF, MF>(
+        &self,
+        generation: u64,
+        cancellation: &Arc<AtomicBool>,
+        container: ObjectId,
+        child_loader: CF,
+        member_loader: MF,
+    ) where
+        CF: FnOnce(&ScalarResolutionPermit) -> Result<BoundedObjectStream, CellLoadError>,
+        MF: FnOnce(&ScalarResolutionPermit) -> Result<BoundedObject, CellLoadError>,
+    {
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            self.run_scheduled_member_attempt(
+                generation,
+                cancellation,
+                container,
+                child_loader,
+                member_loader,
+            )
+        }));
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(control)) => {
+                if self.arena.closed.load(Ordering::Acquire) {
+                    if !self.arena.close_exact_control(
+                        &self.cell,
+                        self.slot,
+                        generation,
+                        CellControlFailure::new(
+                            self.cell.key.id,
+                            AccessKind::Backend,
+                            CellControlTag::ArenaClosed,
+                        ),
+                        false,
+                    ) {
+                        self.arena
+                            .leader_terminal(&self.cell, self.slot, generation);
+                    }
+                } else if control.is_invariant() {
+                    if !self
+                        .arena
+                        .close_exact_control(&self.cell, self.slot, generation, control, true)
+                    {
+                        self.arena
+                            .leader_terminal(&self.cell, self.slot, generation);
+                    }
+                } else {
+                    self.arena
+                        .leader_terminal(&self.cell, self.slot, generation);
+                }
+            }
+            Err(payload) => {
+                self.arena.release_interest(
+                    &self.cell,
+                    self.slot,
+                    self.ordinal,
+                    InterestRelease::Abandon,
+                );
+                self.arena
+                    .leader_terminal(&self.cell, self.slot, generation);
+                resume_unwind(payload);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn announce_scheduled_resource_shape(
+        &self,
+        token: DependencyLeaderToken,
+        shape: ScheduledResourceShape,
+    ) {
+        let hooks = test_locked_clone(&self.arena.domain.scheduled_resource_hooks);
+        if let Some(hooks) = hooks {
+            hooks.enter(self.cell.key, token, shape);
+        }
+    }
+
+    #[cfg(test)]
+    fn announce_scheduled_resource_drop(
+        &self,
+        token: DependencyLeaderToken,
+        shape: ScheduledResourceShape,
+    ) {
+        let hooks = test_locked_clone(&self.arena.domain.scheduled_resource_hooks);
+        if let Some(hooks) = hooks {
+            hooks.dropped(self.cell.key, token, shape);
+        }
+    }
+
+    #[cfg(test)]
+    fn run_scheduled_member_attempt<CF, MF>(
+        &self,
+        generation: u64,
+        cancellation: &Arc<AtomicBool>,
+        container: ObjectId,
+        child_loader: CF,
+        member_loader: MF,
+    ) -> Result<(), CellControlFailure>
+    where
+        CF: FnOnce(&ScalarResolutionPermit) -> Result<BoundedObjectStream, CellLoadError>,
+        MF: FnOnce(&ScalarResolutionPermit) -> Result<BoundedObject, CellLoadError>,
+    {
+        let token = DependencyLeaderToken {
+            key: self.cell.key,
+            generation,
+            leader_slot: self.slot,
+        };
+        let edge = DependencyEdge {
+            from: token.key,
+            to: CellKey {
+                epoch: token.key.epoch,
+                id: container,
+                representation: Representation::DeclaredObjStmContainer,
+            },
+        };
+        self.prepare_dependency_synthetic(generation, cancellation, container, child_loader, true)?;
+        if cancellation.load(Ordering::Acquire) || self.arena.closed.load(Ordering::Acquire) {
+            return Err(CellControlFailure::new(
+                self.cell.key.id,
+                AccessKind::Backend,
+                CellControlTag::InterestCancelled,
+            ));
+        }
+        let estimate = Representation::DeclaredObjStmMember.loader_estimate();
+        let pending = {
+            let headroom = lock(&self.arena.domain.headroom);
+            if let Err(control) =
+                self.arena
+                    .domain
+                    .reclaim_loader_headroom(0, estimate, self.cell.key.id)
+            {
+                drop(headroom);
+                if cancellation.load(Ordering::Acquire) {
+                    self.arena
+                        .leader_terminal(&self.cell, self.slot, generation);
+                } else if self.arena.closed.load(Ordering::Acquire) {
+                    self.arena.close_exact_control(
+                        &self.cell,
+                        self.slot,
+                        generation,
+                        CellControlFailure::new(
+                            self.cell.key.id,
+                            AccessKind::Backend,
+                            CellControlTag::ArenaClosed,
+                        ),
+                        false,
+                    );
+                } else if control.is_invariant() {
+                    self.arena
+                        .close_exact_control(&self.cell, self.slot, generation, control, true);
+                } else {
+                    self.arena.publish_cell_envelope_control_error(
+                        &self.cell, self.slot, generation, control,
+                    );
+                    if let Some(panic) = self
+                        .arena
+                        .announce_member_published(&self.cell, token, edge)?
+                    {
+                        resume_unwind(panic);
+                    }
+                }
+                return Ok(());
+            }
+            let pending = match self.arena.operation.request(
+                Lane::Normal {
+                    completion_reserve: 0,
+                },
+                estimate,
+            ) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    drop(headroom);
+                    self.publish_broker_error(generation, error);
+                    if let Some(panic) = self
+                        .arena
+                        .announce_member_published(&self.cell, token, edge)?
+                    {
+                        resume_unwind(panic);
+                    }
+                    return Ok(());
+                }
+            };
+            drop(headroom);
+            pending
+        };
+        if let Some(panic) = self.arena.announce_dependency_event(
+            &self.cell,
+            token,
+            edge,
+            DependencyEventKind::MemberRequestCreated,
+        )? {
+            resume_unwind(panic);
+        }
+        if cancellation.load(Ordering::Acquire) || self.arena.closed.load(Ordering::Acquire) {
+            pending.cancel();
+            return Err(CellControlFailure::new(
+                self.cell.key.id,
+                AccessKind::Backend,
+                CellControlTag::InterestCancelled,
+            ));
+        }
+        let queued = pending.diagnostic_state() == PendingReservationDiagnostic::Queued;
+        let broker_cancellation = pending.cancellation_handle();
+        self.arena
+            .install_member_broker_cancellation(
+                &self.cell,
+                token,
+                test_clone_value(&broker_cancellation),
+            )
+            .map_err(|(returned, control)| {
+                returned.cancel();
+                control
+            })?;
+        self.announce_scheduled_resource_shape(token, ScheduledResourceShape::Requested);
+        if queued {
+            if let Some(panic) = self.arena.announce_dependency_event(
+                &self.cell,
+                token,
+                edge,
+                DependencyEventKind::MemberQueued,
+            )? {
+                resume_unwind(panic);
+            }
+        }
+        if cancellation.load(Ordering::Acquire) || self.arena.closed.load(Ordering::Acquire) {
+            broker_cancellation.cancel();
+        }
+        let reservation = match pending.wait() {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                self.publish_broker_error(generation, error);
+                if !cancellation.load(Ordering::Acquire)
+                    && !self.arena.closed.load(Ordering::Acquire)
+                {
+                    if let Some(panic) = self
+                        .arena
+                        .announce_member_published(&self.cell, token, edge)?
+                    {
+                        resume_unwind(panic);
+                    }
+                }
+                return Ok(());
+            }
+        };
+        if cancellation.load(Ordering::Acquire) || self.arena.closed.load(Ordering::Acquire) {
+            reservation.cancel();
+            return Err(CellControlFailure::new(
+                self.cell.key.id,
+                AccessKind::Backend,
+                CellControlTag::InterestCancelled,
+            ));
+        }
+        let permit = ScalarResolutionPermit::new(estimate);
+        self.arena
+            .install_member_permit(&self.cell, token, test_clone_permit(&permit))
+            .map_err(|(returned, control)| {
+                returned.cancel();
+                control
+            })?;
+        if let Some(panic) = self.arena.announce_dependency_event(
+            &self.cell,
+            token,
+            edge,
+            DependencyEventKind::MemberGranted,
+        )? {
+            resume_unwind(panic);
+        }
+        self.announce_scheduled_resource_shape(token, ScheduledResourceShape::Granted);
+        if cancellation.load(Ordering::Acquire) || self.arena.closed.load(Ordering::Acquire) {
+            reservation.cancel();
+            permit.cancel();
+            let finished_permit = self
+                .arena
+                .take_member_permit_after_attempt(&self.cell, token)?;
+            drop(finished_permit);
+            return Err(CellControlFailure::new(
+                self.cell.key.id,
+                AccessKind::Backend,
+                CellControlTag::InterestCancelled,
+            ));
+        }
+        {
+            let mut domain = lock(&self.arena.domain.state);
+            if !domain.add_loads(self.cell.key.representation, 1) {
+                drop(domain);
+                return Err(CellControlFailure::new(
+                    self.cell.key.id,
+                    AccessKind::Backend,
+                    CellControlTag::LoadCounterOverflow,
+                ));
+            }
+        }
+        if let Some(panic) = self.arena.announce_dependency_event(
+            &self.cell,
+            token,
+            edge,
+            DependencyEventKind::MemberParseEnter,
+        )? {
+            resume_unwind(panic);
+        }
+        if cancellation.load(Ordering::Acquire) || self.arena.closed.load(Ordering::Acquire) {
+            reservation.cancel();
+            permit.cancel();
+            let finished_permit = self
+                .arena
+                .take_member_permit_after_attempt(&self.cell, token)?;
+            drop(finished_permit);
+            return Err(CellControlFailure::new(
+                self.cell.key.id,
+                AccessKind::Backend,
+                CellControlTag::InterestCancelled,
+            ));
+        }
+        {
+            let mut domain = lock(&self.arena.domain.state);
+            let Some(next) = domain.parse_active.checked_add(1) else {
+                domain.invariant_failed = true;
+                return Err(CellControlFailure::new(
+                    self.cell.key.id,
+                    AccessKind::ResourceLimit,
+                    CellControlTag::LoadCounterOverflow,
+                ));
+            };
+            domain.parse_active = next;
+        }
+        let parse_active = ScheduledParseActiveGuard(&self.arena.domain);
+        let outcome = member_loader(&permit);
+        drop(parse_active);
+        if let Some(panic) = self.arena.announce_dependency_event(
+            &self.cell,
+            token,
+            edge,
+            DependencyEventKind::MemberParseExit,
+        )? {
+            resume_unwind(panic);
+        }
+        let finished_permit = self
+            .arena
+            .take_member_permit_after_attempt(&self.cell, token)?
+            .ok_or_else(|| {
+                CellControlFailure::new(
+                    self.cell.key.id,
+                    AccessKind::Backend,
+                    CellControlTag::DependencyRejectedStale,
+                )
+            })?;
+        drop(finished_permit);
+        self.announce_scheduled_resource_shape(token, ScheduledResourceShape::Returned);
+        if cancellation.load(Ordering::Acquire) || self.arena.closed.load(Ordering::Acquire) {
+            reservation.cancel();
+            permit.cancel();
+            drop(outcome);
+            drop(permit);
+            drop(reservation);
+            self.announce_scheduled_resource_drop(token, ScheduledResourceShape::Returned);
+            return Err(CellControlFailure::new(
+                self.cell.key.id,
+                AccessKind::Backend,
+                CellControlTag::InterestCancelled,
+            ));
+        }
+        match outcome {
+            Ok(object) if object.peak_bytes() <= estimate => {
+                let retained = object.retained_bytes();
+                match reservation.reconcile(retained) {
+                    Ok(charge) => {
+                        if let Some(panic) = self.arena.announce_dependency_event(
+                            &self.cell,
+                            token,
+                            edge,
+                            DependencyEventKind::MemberReconciledBeforePublication,
+                        )? {
+                            resume_unwind(panic);
+                        }
+                        self.announce_scheduled_resource_shape(
+                            token,
+                            ScheduledResourceShape::Reconciled,
+                        );
+                        if cancellation.load(Ordering::Acquire)
+                            || self.arena.closed.load(Ordering::Acquire)
+                        {
+                            permit.cancel();
+                            drop(charge);
+                            drop(object);
+                            drop(permit);
+                            self.announce_scheduled_resource_drop(
+                                token,
+                                ScheduledResourceShape::Reconciled,
+                            );
+                            return Err(CellControlFailure::new(
+                                self.cell.key.id,
+                                AccessKind::Backend,
+                                CellControlTag::InterestCancelled,
+                            ));
+                        }
+                        self.publish_scheduled_value(
+                            generation,
+                            CellPayload::Object(object),
+                            charge,
+                            test_clone_permit(&permit),
+                        );
+                    }
+                    Err(error) => self.publish_broker_error(generation, error),
+                }
+            }
+            Ok(_) => {
+                drop(reservation);
+                self.publish_broker_error(generation, BrokerError::ReconciliationLimit);
+            }
+            Err(error) => {
+                self.publish_load_error(generation, reservation, error);
+            }
+        }
+        if let Some(panic) = self
+            .arena
+            .announce_member_published(&self.cell, token, edge)?
+        {
+            resume_unwind(panic);
+        }
+        Ok(())
+    }
+
     pub(crate) fn resolve<F>(mut self, loader: F) -> Result<ResolvedObjectPin, AccessError>
     where
         F: FnOnce(&ScalarResolutionPermit) -> Result<BoundedObject, CellLoadError>,
@@ -982,7 +2153,7 @@ impl ObjectCellRequest {
         let pin = match self.resolve_payload(|permit| loader(permit).map(CellPayload::Object)) {
             Ok(CellResolveResult::Ready(pin)) => pin,
             Ok(CellResolveResult::SharedFailure(owner)) => match &owner.payload {
-                FailurePayload::Access(error) => return Err(error.clone()),
+                FailurePayload::Access(error) => return Err(error.to_owned()),
                 FailurePayload::ObjStm(_) => {
                     return Err(self
                         .arena
@@ -1029,11 +2200,9 @@ impl ObjectCellRequest {
         loop {
             let step = {
                 let mut state = lock(&self.cell.state);
-                if state
-                    .interests
-                    .get(self.slot)
-                    .is_none_or(|interest| !interest.active || interest.ordinal != self.ordinal)
-                {
+                if state.interests.get(self.slot).is_none_or(|interest| {
+                    !interest.is_active() || interest.ordinal != self.ordinal
+                }) {
                     self.completed = true;
                     ResolveStep::Control(CellControlFailure::new(
                         self.cell.key.id,
@@ -1041,9 +2210,13 @@ impl ObjectCellRequest {
                         CellControlTag::InterestCancelled,
                     ))
                 } else {
+                    let dependency_idle = state.dependency_transition.is_idle();
                     match &mut state.phase {
                         CellPhase::Loading(loading)
-                            if loading.leader_slot == self.slot && !loading.leader_running =>
+                            if dependency_idle
+                                && loading.leader_slot == self.slot
+                                && !loading.leader_running
+                                && !self.arena.closed.load(Ordering::Acquire) =>
                         {
                             loading.leader_running = true;
                             ResolveStep::Lead {
@@ -1052,6 +2225,14 @@ impl ObjectCellRequest {
                             }
                         }
                         CellPhase::Loading(_) => ResolveStep::Wait,
+                        CellPhase::Ready(_)
+                        | CellPhase::Negative(_)
+                        | CellPhase::FlightError(_)
+                        | CellPhase::Closed(_)
+                            if !dependency_idle =>
+                        {
+                            ResolveStep::Wait
+                        }
                         CellPhase::Ready(owner) => ResolveStep::Ready(Arc::clone(owner)),
                         CellPhase::Negative(error) | CellPhase::FlightError(error) => {
                             ResolveStep::Error(Arc::clone(error))
@@ -1095,6 +2276,13 @@ impl ObjectCellRequest {
                 }
                 ResolveStep::Control(control) => return Err(control),
                 ResolveStep::Wait => {
+                    let transition_state = lock(&self.cell.state);
+                    if !transition_state.dependency_transition.is_idle() {
+                        drop(transition_state);
+                        self.arena.wait_for_dependency_transition(&self.cell);
+                        continue;
+                    }
+                    drop(transition_state);
                     let generation = {
                         let state = lock(&self.cell.state);
                         match &state.phase {
@@ -1102,7 +2290,7 @@ impl ObjectCellRequest {
                                 if !(loading.leader_slot == self.slot
                                     && !loading.leader_running)
                                     && state.interests.get(self.slot).is_some_and(|interest| {
-                                        interest.active && interest.ordinal == self.ordinal
+                                        interest.is_active() && interest.ordinal == self.ordinal
                                     }) =>
                             {
                                 Some(loading.generation)
@@ -1121,7 +2309,7 @@ impl ObjectCellRequest {
                             CellPhase::Loading(loading)
                                 if !(loading.leader_slot == self.slot && !loading.leader_running)
                         ) && state.interests.get(self.slot).is_some_and(|interest| {
-                            interest.active && interest.ordinal == self.ordinal
+                            interest.is_active() && interest.ordinal == self.ordinal
                         }) {
                             state = wait(&self.cell.ready, state);
                         }
@@ -1328,8 +2516,32 @@ impl ObjectCellRequest {
             charge: Mutex::new(Some(charge)),
             self_pin: Mutex::new(None),
         });
+        #[cfg(test)]
+        self.arena
+            .publish_ready(&self.cell, self.slot, generation, owner, false);
+        #[cfg(not(test))]
         self.arena
             .publish_ready(&self.cell, self.slot, generation, owner);
+    }
+
+    #[cfg(test)]
+    fn publish_scheduled_value(
+        &self,
+        generation: u64,
+        payload: CellPayload,
+        charge: RetainedCharge,
+        permit: ScalarResolutionPermit,
+    ) {
+        let owner = Arc::new(ResolvedObjectOwner {
+            payload,
+            permit,
+            transition_gate: Mutex::new(()),
+            cache_backed: AtomicBool::new(false),
+            charge: Mutex::new(Some(charge)),
+            self_pin: Mutex::new(None),
+        });
+        self.arena
+            .publish_ready(&self.cell, self.slot, generation, owner, true);
     }
 
     fn publish_load_error(
@@ -1645,6 +2857,915 @@ impl Drop for ExternalPin {
 }
 
 impl ArenaInner {
+    fn install_dependency_cancellation(
+        &self,
+        cell: &Arc<Cell>,
+        token: DependencyLeaderToken,
+        container: ObjectId,
+        cancellation: CellCancellation,
+    ) -> Result<Option<DependencyHookPanic>, (CellCancellation, CellControlFailure)> {
+        let edge = DependencyEdge {
+            from: token.key,
+            to: CellKey {
+                epoch: token.key.epoch,
+                id: container,
+                representation: Representation::DeclaredObjStmContainer,
+            },
+        };
+        let event = {
+            let mut domain = lock(&self.domain.state);
+            let exact_entry = domain
+                .cells
+                .get(&cell.key)
+                .is_some_and(|current| Arc::ptr_eq(current, cell));
+            let mut state = lock(&cell.state);
+            let active = state
+                .interests
+                .get(token.leader_slot)
+                .is_some_and(|interest| interest.is_active());
+            let current = exact_entry
+                && token.key == cell.key
+                && token.key.representation == Representation::DeclaredObjStmMember
+                && state.dependency_transition.is_idle()
+                && matches!(
+                    &state.phase,
+                    CellPhase::Loading(loading)
+                        if loading.generation == token.generation
+                            && loading.leader_slot == token.leader_slot
+                            && loading.leader_running
+                            && !loading.cancellation.load(Ordering::Acquire)
+                )
+                && active;
+            if !current {
+                return Err((
+                    cancellation,
+                    CellControlFailure::new(
+                        cell.key.id,
+                        AccessKind::Backend,
+                        CellControlTag::DependencyRejectedStale,
+                    ),
+                ));
+            }
+            let duplicate = matches!(
+                &state.phase,
+                CellPhase::Loading(loading) if loading.dependency.is_some()
+            );
+            let next_cancellations = domain.dependency_cancellations.checked_add(1);
+            let next_edges = domain.dependency_edges.checked_add(1);
+            let next_adds = domain.dependency_edge_adds.checked_add(1);
+            let next_leaders = domain.dependency_leaders.checked_add(1);
+            let next_ordinal = domain.dependency_event_ordinal.checked_add(1);
+            if duplicate
+                || next_cancellations.is_none()
+                || next_edges.is_none()
+                || next_adds.is_none()
+                || next_leaders.is_none()
+                || next_ordinal.is_none()
+            {
+                domain.invariant_failed = true;
+                return Err((
+                    cancellation,
+                    CellControlFailure::new(
+                        cell.key.id,
+                        AccessKind::Backend,
+                        CellControlTag::DependencyStateInvariant,
+                    ),
+                ));
+            }
+            #[cfg(test)]
+            if !domain.active_generations.insert(token) {
+                domain.invariant_failed = true;
+                return Err((
+                    cancellation,
+                    CellControlFailure::new(
+                        cell.key.id,
+                        AccessKind::Backend,
+                        CellControlTag::DependencyStateInvariant,
+                    ),
+                ));
+            }
+            let CellPhase::Loading(loading) = &mut state.phase else {
+                unreachable!("validated member dependency loading state")
+            };
+            loading.dependency = Some(MemberDependencyState {
+                token,
+                edge,
+                cancellation: Some(cancellation),
+                pin: None,
+            });
+            loading.dependency_container = Some(container);
+            state.dependency_transition = DependencyTransition::Announcing {
+                token,
+                kind: DependencyEventKind::EdgeAdded,
+            };
+            domain.dependency_cancellations = next_cancellations.unwrap();
+            domain.dependency_edges = next_edges.unwrap();
+            domain.dependency_edge_adds = next_adds.unwrap();
+            domain.dependency_leaders = next_leaders.unwrap();
+            domain.dependency_event_ordinal = next_ordinal.unwrap();
+            DependencyEvent {
+                token,
+                edge,
+                kind: DependencyEventKind::EdgeAdded,
+                ordinal: next_ordinal.unwrap(),
+                successor: None,
+            }
+        };
+        let panic = self.domain.dispatch_dependency_event(event);
+        self.finish_dependency_announcement(cell, token, DependencyEventKind::EdgeAdded);
+        Ok(panic)
+    }
+
+    fn take_dependency_cancellation(
+        &self,
+        cell: &Arc<Cell>,
+        token: DependencyLeaderToken,
+    ) -> Result<Option<CellCancellation>, CellControlFailure> {
+        let mut domain = lock(&self.domain.state);
+        let exact_entry = domain
+            .cells
+            .get(&cell.key)
+            .is_some_and(|current| Arc::ptr_eq(current, cell));
+        let mut state = lock(&cell.state);
+        if !exact_entry {
+            return Ok(None);
+        }
+        let dependency_idle = state.dependency_transition.is_idle();
+        let CellPhase::Loading(loading) = &mut state.phase else {
+            return Ok(None);
+        };
+        if loading.generation != token.generation
+            || loading.leader_slot != token.leader_slot
+            || !dependency_idle
+            || loading
+                .dependency
+                .as_ref()
+                .is_none_or(|dependency| dependency.token != token)
+        {
+            return Ok(None);
+        }
+        let Some(cancellation) = loading
+            .dependency
+            .as_mut()
+            .and_then(|dependency| dependency.cancellation.take())
+        else {
+            return Ok(None);
+        };
+        let Some(next) = domain.dependency_cancellations.checked_sub(1) else {
+            loading
+                .dependency
+                .as_mut()
+                .expect("validated dependency")
+                .cancellation = Some(cancellation);
+            domain.invariant_failed = true;
+            return Err(CellControlFailure::new(
+                cell.key.id,
+                AccessKind::Backend,
+                CellControlTag::DependencyStateInvariant,
+            ));
+        };
+        domain.dependency_cancellations = next;
+        Ok(Some(cancellation))
+    }
+
+    fn install_dependency_pin(
+        &self,
+        cell: &Arc<Cell>,
+        token: DependencyLeaderToken,
+        pin: ResolvedObjectStreamPin,
+    ) -> Result<Option<DependencyHookPanic>, (ResolvedObjectStreamPin, CellControlFailure)> {
+        let event = {
+            let mut domain = lock(&self.domain.state);
+            let exact_entry = domain
+                .cells
+                .get(&cell.key)
+                .is_some_and(|current| Arc::ptr_eq(current, cell));
+            let mut state = lock(&cell.state);
+            if !exact_entry {
+                return Err((
+                    pin,
+                    CellControlFailure::new(
+                        cell.key.id,
+                        AccessKind::Backend,
+                        CellControlTag::DependencyRejectedStale,
+                    ),
+                ));
+            }
+            let active = state
+                .interests
+                .get(token.leader_slot)
+                .is_some_and(|interest| interest.is_active());
+            let dependency_idle = state.dependency_transition.is_idle();
+            let CellPhase::Loading(loading) = &mut state.phase else {
+                return Err((
+                    pin,
+                    CellControlFailure::new(
+                        cell.key.id,
+                        AccessKind::Backend,
+                        CellControlTag::DependencyRejectedStale,
+                    ),
+                ));
+            };
+            if !active
+                || loading.generation != token.generation
+                || loading.leader_slot != token.leader_slot
+                || !dependency_idle
+                || loading.cancellation.load(Ordering::Acquire)
+            {
+                return Err((
+                    pin,
+                    CellControlFailure::new(
+                        cell.key.id,
+                        AccessKind::Backend,
+                        CellControlTag::DependencyRejectedStale,
+                    ),
+                ));
+            }
+            let Some(dependency) = loading.dependency.as_mut() else {
+                return Err((
+                    pin,
+                    CellControlFailure::new(
+                        cell.key.id,
+                        AccessKind::Backend,
+                        CellControlTag::DependencyRejectedStale,
+                    ),
+                ));
+            };
+            if dependency.token != token || dependency.pin.is_some() {
+                domain.invariant_failed = true;
+                return Err((
+                    pin,
+                    CellControlFailure::new(
+                        cell.key.id,
+                        AccessKind::Backend,
+                        CellControlTag::DependencyStateInvariant,
+                    ),
+                ));
+            }
+            let Some(next_pins) = domain.dependency_pins.checked_add(1) else {
+                domain.invariant_failed = true;
+                return Err((
+                    pin,
+                    CellControlFailure::new(
+                        cell.key.id,
+                        AccessKind::Backend,
+                        CellControlTag::DependencyStateInvariant,
+                    ),
+                ));
+            };
+            let edge = dependency.edge;
+            let Some(next_ordinal) = domain.dependency_event_ordinal.checked_add(1) else {
+                domain.invariant_failed = true;
+                return Err((
+                    pin,
+                    CellControlFailure::new(
+                        cell.key.id,
+                        AccessKind::Backend,
+                        CellControlTag::DependencyStateInvariant,
+                    ),
+                ));
+            };
+            dependency.pin = Some(pin);
+            domain.dependency_pins = next_pins;
+            domain.dependency_event_ordinal = next_ordinal;
+            state.dependency_transition = DependencyTransition::Announcing {
+                token,
+                kind: DependencyEventKind::PinInstalled,
+            };
+            DependencyEvent {
+                token,
+                edge,
+                kind: DependencyEventKind::PinInstalled,
+                ordinal: next_ordinal,
+                successor: None,
+            }
+        };
+        let panic = self.domain.dispatch_dependency_event(event);
+        self.finish_dependency_announcement(cell, token, DependencyEventKind::PinInstalled);
+        Ok(panic)
+    }
+
+    #[cfg(test)]
+    fn install_member_broker_cancellation(
+        &self,
+        cell: &Arc<Cell>,
+        token: DependencyLeaderToken,
+        cancellation: ReservationCancellation,
+    ) -> Result<(), (ReservationCancellation, CellControlFailure)> {
+        let mut domain = lock(&self.domain.state);
+        let exact_entry = domain
+            .cells
+            .get(&cell.key)
+            .is_some_and(|current| Arc::ptr_eq(current, cell));
+        let mut state = lock(&cell.state);
+        let active = state
+            .interests
+            .get(token.leader_slot)
+            .is_some_and(|interest| interest.is_active());
+        let dependency_idle = state.dependency_transition.is_idle();
+        let CellPhase::Loading(loading) = &mut state.phase else {
+            return Err((
+                cancellation,
+                CellControlFailure::new(
+                    cell.key.id,
+                    AccessKind::Backend,
+                    CellControlTag::DependencyRejectedStale,
+                ),
+            ));
+        };
+        let exact = exact_entry
+            && token.key == cell.key
+            && token.key.representation == Representation::DeclaredObjStmMember
+            && active
+            && dependency_idle
+            && loading.generation == token.generation
+            && loading.leader_slot == token.leader_slot
+            && loading.leader_running
+            && !loading.cancellation.load(Ordering::Acquire)
+            && loading
+                .dependency
+                .as_ref()
+                .is_some_and(|dependency| dependency.token == token && dependency.pin.is_some());
+        if !exact {
+            return Err((
+                cancellation,
+                CellControlFailure::new(
+                    cell.key.id,
+                    AccessKind::Backend,
+                    CellControlTag::DependencyRejectedStale,
+                ),
+            ));
+        }
+        if loading.broker_cancellation.is_some() || loading.permit.is_some() {
+            domain.invariant_failed = true;
+            return Err((
+                cancellation,
+                CellControlFailure::new(
+                    cell.key.id,
+                    AccessKind::Backend,
+                    CellControlTag::DependencyStateInvariant,
+                ),
+            ));
+        }
+        loading.broker_cancellation = Some(cancellation);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn install_member_permit(
+        &self,
+        cell: &Arc<Cell>,
+        token: DependencyLeaderToken,
+        permit: ScalarResolutionPermit,
+    ) -> Result<(), (ScalarResolutionPermit, CellControlFailure)> {
+        let mut domain = lock(&self.domain.state);
+        let exact_entry = domain
+            .cells
+            .get(&cell.key)
+            .is_some_and(|current| Arc::ptr_eq(current, cell));
+        let mut state = lock(&cell.state);
+        let active = state
+            .interests
+            .get(token.leader_slot)
+            .is_some_and(|interest| interest.is_active());
+        let dependency_idle = state.dependency_transition.is_idle();
+        let CellPhase::Loading(loading) = &mut state.phase else {
+            return Err((
+                permit,
+                CellControlFailure::new(
+                    cell.key.id,
+                    AccessKind::Backend,
+                    CellControlTag::DependencyRejectedStale,
+                ),
+            ));
+        };
+        let exact = exact_entry
+            && token.key == cell.key
+            && active
+            && dependency_idle
+            && loading.generation == token.generation
+            && loading.leader_slot == token.leader_slot
+            && loading.leader_running
+            && !loading.cancellation.load(Ordering::Acquire)
+            && loading.broker_cancellation.is_some()
+            && loading
+                .dependency
+                .as_ref()
+                .is_some_and(|dependency| dependency.token == token && dependency.pin.is_some());
+        if !exact {
+            return Err((
+                permit,
+                CellControlFailure::new(
+                    cell.key.id,
+                    AccessKind::Backend,
+                    CellControlTag::DependencyRejectedStale,
+                ),
+            ));
+        }
+        if loading.permit.is_some() {
+            domain.invariant_failed = true;
+            return Err((
+                permit,
+                CellControlFailure::new(
+                    cell.key.id,
+                    AccessKind::Backend,
+                    CellControlTag::DependencyStateInvariant,
+                ),
+            ));
+        }
+        loading.permit = Some(permit);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn take_member_permit_after_attempt(
+        &self,
+        cell: &Arc<Cell>,
+        token: DependencyLeaderToken,
+    ) -> Result<Option<ScalarResolutionPermit>, CellControlFailure> {
+        let mut domain = lock(&self.domain.state);
+        let exact_entry = domain
+            .cells
+            .get(&cell.key)
+            .is_some_and(|current| Arc::ptr_eq(current, cell));
+        let mut state = lock(&cell.state);
+        if !exact_entry || !state.dependency_transition.is_idle() {
+            return Ok(None);
+        }
+        let CellPhase::Loading(loading) = &mut state.phase else {
+            return Ok(None);
+        };
+        if loading.generation != token.generation
+            || loading.leader_slot != token.leader_slot
+            || loading
+                .dependency
+                .as_ref()
+                .is_none_or(|dependency| dependency.token != token || dependency.pin.is_none())
+        {
+            return Ok(None);
+        }
+        let Some(permit) = loading.permit.take() else {
+            domain.invariant_failed = true;
+            return Err(CellControlFailure::new(
+                cell.key.id,
+                AccessKind::Backend,
+                CellControlTag::DependencyStateInvariant,
+            ));
+        };
+        Ok(Some(permit))
+    }
+
+    fn take_dependency_locked(
+        domain: &mut DomainState,
+        state: &mut CellState,
+    ) -> Option<DetachedDependency> {
+        if !state.dependency_transition.is_idle() {
+            return None;
+        }
+        let dependency = match &mut state.phase {
+            CellPhase::Loading(loading) => loading.dependency.take()?,
+            _ => return None,
+        };
+        let event = DomainInner::dependency_event_locked(
+            domain,
+            dependency.token,
+            dependency.edge,
+            DependencyEventKind::CleanupDetached,
+            None,
+        );
+        let ordinal_invariant = event.is_none();
+        state.dependency_transition = DependencyTransition::Cleaning(dependency.token);
+        Some(DetachedDependency {
+            dependency,
+            event,
+            ordinal_invariant,
+        })
+    }
+
+    fn cleanup_member_dependency(
+        &self,
+        cell: &Arc<Cell>,
+        detached: DetachedDependency,
+    ) -> Result<DependencyCleanupCompletion, DependencyCleanupFailure> {
+        self.domain.cleanup_dependency(cell, detached)
+    }
+
+    fn record_closed_dependency_cleanup_failure(
+        &self,
+        cell: &Arc<Cell>,
+        failure: DependencyCleanupFailure,
+    ) -> DependencyCleanupCompletion {
+        let DependencyCleanupFailure {
+            token,
+            control,
+            hook_panic,
+        } = failure;
+        let mut domain = lock(&self.domain.state);
+        let mut state = lock(&cell.state);
+        if state.dependency_transition != DependencyTransition::CleanupFailed(token) {
+            domain.invariant_failed = true;
+        }
+        match &mut state.phase {
+            CellPhase::Closed(current) => *current = control,
+            _ => {
+                domain.invariant_failed = true;
+                state.phase = CellPhase::Closed(control);
+            }
+        }
+        drop(state);
+        drop(domain);
+        DependencyCleanupCompletion { token, hook_panic }
+    }
+
+    fn finish_dependency_cleanup(
+        &self,
+        cell: &Arc<Cell>,
+        token: DependencyLeaderToken,
+        expected: DependencyTransition,
+    ) {
+        let cleared = {
+            let mut domain = lock(&self.domain.state);
+            let mut state = lock(&cell.state);
+            let expected_token = match expected {
+                DependencyTransition::Acknowledging(expected)
+                | DependencyTransition::CleanupFailed(expected) => Some(expected),
+                _ => None,
+            };
+            if expected_token == Some(token) && state.dependency_transition == expected {
+                state.dependency_transition = DependencyTransition::Idle;
+                #[cfg(test)]
+                if !domain.active_generations.remove(&token) {
+                    domain.invariant_failed = true;
+                }
+                true
+            } else {
+                domain.invariant_failed = true;
+                false
+            }
+        };
+        if cleared {
+            cell.ready.notify_all();
+        }
+    }
+
+    fn finish_successful_dependency_cleanup(&self, cell: &Arc<Cell>, token: DependencyLeaderToken) {
+        self.finish_dependency_cleanup(cell, token, DependencyTransition::Acknowledging(token));
+    }
+
+    fn finish_dependency_cleanup_failure(&self, cell: &Arc<Cell>, token: DependencyLeaderToken) {
+        self.finish_dependency_cleanup(cell, token, DependencyTransition::CleanupFailed(token));
+    }
+
+    fn close_loading_dependency_cleanup_failure(
+        &self,
+        cell: &Arc<Cell>,
+        failure: DependencyCleanupFailure,
+    ) -> Option<DependencyHookPanic> {
+        let DependencyCleanupFailure {
+            token,
+            control,
+            hook_panic,
+        } = failure;
+        let (broker_cancel, permit, old_phase, removed_cell) = {
+            let mut domain = lock(&self.domain.state);
+            let exact_entry = domain
+                .cells
+                .get(&cell.key)
+                .is_some_and(|current| Arc::ptr_eq(current, cell));
+            let mut state = lock(&cell.state);
+            let exact_loading = matches!(
+                &state.phase,
+                CellPhase::Loading(loading)
+                    if loading.generation == token.generation
+                        && loading.leader_slot == token.leader_slot
+            );
+            if !exact_entry
+                || !exact_loading
+                || state.dependency_transition != DependencyTransition::CleanupFailed(token)
+            {
+                domain.invariant_failed = true;
+            }
+            let removed_cell = domain.cells.remove(&cell.key);
+            if state.cached && !checked_sub(&mut domain.cache_bytes, state.completed_weight) {
+                domain.invariant_failed = true;
+            }
+            if !checked_sub(&mut domain.loading_metadata_bytes, CELL_METADATA_BYTES) {
+                domain.invariant_failed = true;
+            }
+            state.cached = false;
+            let (broker_cancel, permit) = match &mut state.phase {
+                CellPhase::Loading(loading) => {
+                    loading.cancellation.store(true, Ordering::Release);
+                    (loading.broker_cancellation.take(), loading.permit.take())
+                }
+                _ => (None, None),
+            };
+            let old_phase = std::mem::replace(&mut state.phase, CellPhase::Closed(control));
+            (broker_cancel, permit, old_phase, removed_cell)
+        };
+        if let Some(cancel) = broker_cancel {
+            cancel.cancel();
+        }
+        if let Some(permit) = permit {
+            permit.cancel();
+        }
+        drop(old_phase);
+        drop(removed_cell);
+        if let Some(metadata) = lock(&cell.metadata).as_mut() {
+            let _ = metadata.transition(OwnershipClass::Bypass);
+        }
+        self.finish_dependency_cleanup_failure(cell, token);
+        hook_panic
+    }
+
+    fn rollback_published_dependency_cleanup_failure(
+        &self,
+        cell: &Arc<Cell>,
+        failure: DependencyCleanupFailure,
+        expected: PublishedCleanupOwner,
+    ) -> DependencyCleanupCompletion {
+        let DependencyCleanupFailure {
+            token,
+            control,
+            hook_panic,
+        } = failure;
+        let (old_phase, removed_cell) = {
+            let mut domain = lock(&self.domain.state);
+            let mut state = lock(&cell.state);
+            let exact_owner = match (&expected, &state.phase) {
+                (PublishedCleanupOwner::Ready(expected), CellPhase::Ready(current)) => {
+                    Arc::ptr_eq(expected, current)
+                }
+                (PublishedCleanupOwner::Failure(expected), CellPhase::Negative(current))
+                | (PublishedCleanupOwner::Failure(expected), CellPhase::FlightError(current)) => {
+                    Arc::ptr_eq(expected, current)
+                }
+                _ => false,
+            };
+            if !exact_owner
+                || state.dependency_transition != DependencyTransition::CleanupFailed(token)
+            {
+                domain.invariant_failed = true;
+            }
+            let exact_entry = domain
+                .cells
+                .get(&cell.key)
+                .is_some_and(|current| Arc::ptr_eq(current, cell));
+            let removed_cell = if exact_entry {
+                domain.cells.remove(&cell.key)
+            } else {
+                None
+            };
+            if state.cached && !checked_sub(&mut domain.cache_bytes, state.completed_weight) {
+                domain.invariant_failed = true;
+            }
+            state.cached = false;
+            state.transitioning = false;
+            let old_phase = std::mem::replace(&mut state.phase, CellPhase::Closed(control));
+            (old_phase, removed_cell)
+        };
+        match &old_phase {
+            CellPhase::Ready(owner) => {
+                let _ = owner.transition_broker(OwnershipClass::Bypass);
+            }
+            CellPhase::Negative(owner) | CellPhase::FlightError(owner) => {
+                let _ = owner.transition_broker(OwnershipClass::Bypass);
+            }
+            _ => {}
+        }
+        drop(old_phase);
+        drop(removed_cell);
+        if let Some(metadata) = lock(&cell.metadata).as_mut() {
+            let _ = metadata.transition(OwnershipClass::Bypass);
+        }
+        DependencyCleanupCompletion { token, hook_panic }
+    }
+
+    fn finish_dependency_announcement(
+        &self,
+        cell: &Arc<Cell>,
+        token: DependencyLeaderToken,
+        kind: DependencyEventKind,
+    ) {
+        let mut domain = lock(&self.domain.state);
+        let mut state = lock(&cell.state);
+        if state.dependency_transition == (DependencyTransition::Announcing { token, kind }) {
+            state.dependency_transition = DependencyTransition::Idle;
+        } else {
+            domain.invariant_failed = true;
+        }
+        drop(state);
+        drop(domain);
+        cell.ready.notify_all();
+    }
+
+    fn announce_dependency_event(
+        &self,
+        cell: &Arc<Cell>,
+        token: DependencyLeaderToken,
+        edge: DependencyEdge,
+        kind: DependencyEventKind,
+    ) -> Result<Option<DependencyHookPanic>, CellControlFailure> {
+        let event = {
+            let mut domain = lock(&self.domain.state);
+            let exact_entry = domain
+                .cells
+                .get(&cell.key)
+                .is_some_and(|current| Arc::ptr_eq(current, cell));
+            let mut state = lock(&cell.state);
+            let valid = exact_entry
+                && state.dependency_transition.is_idle()
+                && state
+                    .interests
+                    .get(token.leader_slot)
+                    .is_some_and(|interest| interest.is_active())
+                && matches!(
+                    &state.phase,
+                    CellPhase::Loading(loading)
+                        if loading.generation == token.generation
+                            && loading.leader_slot == token.leader_slot
+                            && loading.leader_running
+                            && match kind {
+                                DependencyEventKind::BeforeChildInstall => {
+                                    loading.dependency.is_none()
+                                }
+                                DependencyEventKind::InsideChildResolve => loading
+                                    .dependency
+                                    .as_ref()
+                                    .is_some_and(|dependency| dependency.token == token),
+                                DependencyEventKind::ChildResolved => loading
+                                    .dependency
+                                    .as_ref()
+                                    .is_some_and(|dependency| dependency.token == token),
+                                #[cfg(test)]
+                                DependencyEventKind::ChildHandleTaken => loading
+                                    .dependency
+                                    .as_ref()
+                                    .is_some_and(|dependency| {
+                                        dependency.token == token
+                                            && dependency.cancellation.is_none()
+                                    }),
+                                DependencyEventKind::BeforeMemberAdmission => loading
+                                    .dependency
+                                    .as_ref()
+                                    .is_some_and(|dependency| {
+                                        dependency.token == token && dependency.pin.is_some()
+                                    }),
+                                #[cfg(test)]
+                                DependencyEventKind::MemberRequestCreated => loading
+                                    .dependency
+                                    .as_ref()
+                                    .is_some_and(|dependency| {
+                                        dependency.token == token
+                                            && dependency.pin.is_some()
+                                            && loading.broker_cancellation.is_none()
+                                            && loading.permit.is_none()
+                                    }),
+                                #[cfg(test)]
+                                DependencyEventKind::MemberQueued => loading
+                                    .dependency
+                                    .as_ref()
+                                    .is_some_and(|dependency| {
+                                        dependency.token == token
+                                            && dependency.pin.is_some()
+                                            && loading.broker_cancellation.is_some()
+                                            && loading.permit.is_none()
+                                    }),
+                                #[cfg(test)]
+                                DependencyEventKind::MemberGranted
+                                | DependencyEventKind::MemberParseEnter
+                                | DependencyEventKind::MemberParseExit => loading
+                                    .dependency
+                                    .as_ref()
+                                    .is_some_and(|dependency| {
+                                        dependency.token == token
+                                            && dependency.pin.is_some()
+                                            && loading.broker_cancellation.is_some()
+                                            && loading.permit.is_some()
+                                    }),
+                                #[cfg(test)]
+                                DependencyEventKind::MemberReconciledBeforePublication => loading
+                                    .dependency
+                                    .as_ref()
+                                    .is_some_and(|dependency| {
+                                        dependency.token == token
+                                            && dependency.pin.is_some()
+                                            && loading.broker_cancellation.is_some()
+                                            && loading.permit.is_none()
+                                    }),
+                                _ => false,
+                            }
+                );
+            if !valid {
+                return Err(CellControlFailure::new(
+                    cell.key.id,
+                    AccessKind::Backend,
+                    CellControlTag::DependencyRejectedStale,
+                ));
+            }
+            let Some(event) =
+                DomainInner::dependency_event_locked(&mut domain, token, edge, kind, None)
+            else {
+                return Err(CellControlFailure::new(
+                    cell.key.id,
+                    AccessKind::Backend,
+                    CellControlTag::DependencyStateInvariant,
+                ));
+            };
+            state.dependency_transition = DependencyTransition::Announcing { token, kind };
+            event
+        };
+        let panic = self.domain.dispatch_dependency_event(event);
+        self.finish_dependency_announcement(cell, token, kind);
+        Ok(panic)
+    }
+
+    #[cfg(test)]
+    fn announce_member_published(
+        &self,
+        cell: &Arc<Cell>,
+        token: DependencyLeaderToken,
+        edge: DependencyEdge,
+    ) -> Result<Option<DependencyHookPanic>, CellControlFailure> {
+        let event = {
+            let mut domain = lock(&self.domain.state);
+            let exact_entry = domain
+                .cells
+                .get(&cell.key)
+                .is_some_and(|current| Arc::ptr_eq(current, cell));
+            let state = lock(&cell.state);
+            let detached_flight = !exact_entry && matches!(state.phase, CellPhase::FlightError(_));
+            let valid = (exact_entry || detached_flight)
+                && token.key == cell.key
+                && state.dependency_transition.is_idle()
+                && state
+                    .interests
+                    .get(token.leader_slot)
+                    .is_some_and(|interest| interest.is_active())
+                && matches!(
+                    state.phase,
+                    CellPhase::Ready(_) | CellPhase::Negative(_) | CellPhase::FlightError(_)
+                );
+            if !valid {
+                return Err(CellControlFailure::new(
+                    cell.key.id,
+                    AccessKind::Backend,
+                    CellControlTag::DependencyRejectedStale,
+                ));
+            }
+            DomainInner::dependency_event_locked(
+                &mut domain,
+                token,
+                edge,
+                DependencyEventKind::MemberPublished,
+                None,
+            )
+            .ok_or_else(|| {
+                CellControlFailure::new(
+                    cell.key.id,
+                    AccessKind::Backend,
+                    CellControlTag::DependencyStateInvariant,
+                )
+            })?
+        };
+        Ok(self.domain.dispatch_dependency_event(event))
+    }
+
+    fn wait_for_dependency_transition(&self, cell: &Arc<Cell>) {
+        loop {
+            let transition = lock(&cell.state).dependency_transition;
+            if transition.is_idle() {
+                return;
+            }
+            #[cfg(test)]
+            let hooks = test_locked_clone(&self.domain.dependency_wait_hooks);
+            #[cfg(test)]
+            if let Some(hooks) = hooks {
+                hooks.waiting(cell.key, transition);
+            }
+            let mut state = lock(&cell.state);
+            while state.dependency_transition == transition {
+                #[cfg(test)]
+                {
+                    let hooks = test_locked_clone(&self.domain.dependency_pre_wait_hooks);
+                    if let Some(hooks) = hooks {
+                        hooks.before_wait(cell.key, transition);
+                    }
+                }
+                state = wait(&cell.ready, state);
+                #[cfg(test)]
+                if state.dependency_transition == transition {
+                    drop(state);
+                    let hooks = test_locked_clone(&self.domain.dependency_wait_hooks);
+                    if let Some(hooks) = hooks {
+                        hooks.waiting(cell.key, transition);
+                    }
+                    state = lock(&cell.state);
+                }
+            }
+        }
+    }
+
     fn admit_failure_weight(
         &self,
         cell: &Arc<Cell>,
@@ -1695,7 +3816,8 @@ impl ArenaInner {
         control: CellControlFailure,
         invariant: bool,
     ) -> bool {
-        let (broker_cancel, permit, old_phase, removed_cell, external_pins) = {
+        let (broker_cancel, permit, dependency, old_phase, removed_cell, external_pins) = loop {
+            self.wait_for_dependency_transition(cell);
             let mut domain = lock(&self.domain.state);
             let exact_entry = domain
                 .cells
@@ -1705,6 +3827,11 @@ impl ArenaInner {
                 return false;
             }
             let mut state = lock(&cell.state);
+            if !state.dependency_transition.is_idle() {
+                drop(state);
+                drop(domain);
+                continue;
+            }
             if !expected.matches(&state) {
                 return false;
             }
@@ -1717,25 +3844,33 @@ impl ArenaInner {
             }
             state.cached = false;
             state.transitioning = false;
-            let (broker_cancel, permit) = match &mut state.phase {
+            let (broker_cancel, permit, loading) = match &mut state.phase {
                 CellPhase::Loading(loading) => {
                     if !checked_sub(&mut domain.loading_metadata_bytes, CELL_METADATA_BYTES) {
                         domain.invariant_failed = true;
                     }
                     loading.cancellation.store(true, Ordering::Release);
-                    (loading.broker_cancellation.take(), loading.permit.take())
+                    (
+                        loading.broker_cancellation.take(),
+                        loading.permit.take(),
+                        true,
+                    )
                 }
-                _ => (None, None),
+                _ => (None, None, false),
             };
+            let dependency = loading
+                .then(|| Self::take_dependency_locked(&mut domain, &mut state))
+                .flatten();
             let external_pins = state.external_pins;
             let old_phase = std::mem::replace(&mut state.phase, CellPhase::Closed(control));
-            (
+            break (
                 broker_cancel,
                 permit,
+                dependency,
                 old_phase,
                 removed_cell,
                 external_pins,
-            )
+            );
         };
         if let Some(cancel) = broker_cancel {
             cancel.cancel();
@@ -1743,6 +3878,28 @@ impl ArenaInner {
         if let Some(permit) = permit {
             permit.cancel();
         }
+        let (hook_panic, dependency_completion) = match dependency {
+            Some(dependency) => match self.cleanup_member_dependency(cell, dependency) {
+                Ok(completion) => (
+                    completion.hook_panic,
+                    Some((
+                        completion.token,
+                        DependencyTransition::Acknowledging(completion.token),
+                    )),
+                ),
+                Err(failure) => {
+                    let completion = self.record_closed_dependency_cleanup_failure(cell, failure);
+                    (
+                        completion.hook_panic,
+                        Some((
+                            completion.token,
+                            DependencyTransition::CleanupFailed(completion.token),
+                        )),
+                    )
+                }
+            },
+            None => (None, None),
+        };
         match &old_phase {
             CellPhase::Ready(owner) if external_pins == 0 => {
                 let _ = owner.transition_broker(OwnershipClass::Bypass);
@@ -1754,10 +3911,24 @@ impl ArenaInner {
         }
         drop(old_phase);
         drop(removed_cell);
+        #[cfg(test)]
+        if dependency_completion.is_some() {
+            self.domain.announce_dependency_terminal_cleanup(
+                cell.key,
+                DependencyTerminalCleanupOwner::ExactTeardown,
+            );
+        }
         if let Some(metadata) = lock(&cell.metadata).as_mut() {
             let _ = metadata.transition(OwnershipClass::Bypass);
         }
-        cell.ready.notify_all();
+        if let Some((token, expected)) = dependency_completion {
+            self.finish_dependency_cleanup(cell, token, expected);
+        } else {
+            cell.ready.notify_all();
+        }
+        if let Some(panic) = hook_panic {
+            resume_unwind(panic);
+        }
         true
     }
 
@@ -1817,30 +3988,79 @@ impl ArenaInner {
     }
 
     fn leader_terminal(&self, cell: &Arc<Cell>, leader_slot: usize, generation: u64) {
-        let mut remove = false;
-        let mut old_phase = None;
-        let mut old_cancellation = None;
-        let mut old_broker_cancellation = None;
-        let mut old_permit = None;
-        let mut removed_cell = None;
-        {
+        self.wait_for_dependency_transition(cell);
+        let dependency = {
             let mut domain = lock(&self.domain.state);
             let mut state = lock(&cell.state);
+            if !state.dependency_transition.is_idle() {
+                drop(state);
+                drop(domain);
+                self.wait_for_dependency_transition(cell);
+                return self.leader_terminal(cell, leader_slot, generation);
+            }
             let CellPhase::Loading(loading) = &state.phase else {
                 return;
             };
             if loading.leader_slot != leader_slot || loading.generation != generation {
                 return;
             }
+            Self::take_dependency_locked(&mut domain, &mut state)
+        };
+        let mut dependency_edge = dependency
+            .as_ref()
+            .map(|dependency| (dependency.dependency.token, dependency.dependency.edge));
+        let mut hook_panic = None;
+        if let Some(dependency) = dependency {
+            match self.cleanup_member_dependency(cell, dependency) {
+                Ok(completion) => {
+                    hook_panic = completion.hook_panic;
+                    self.finish_successful_dependency_cleanup(cell, completion.token);
+                    #[cfg(test)]
+                    self.domain.announce_dependency_terminal_cleanup(
+                        cell.key,
+                        DependencyTerminalCleanupOwner::LeaderTerminal,
+                    );
+                }
+                Err(failure) => {
+                    let panic = self.close_loading_dependency_cleanup_failure(cell, failure);
+                    if let Some(panic) = panic {
+                        resume_unwind(panic);
+                    }
+                    return;
+                }
+            }
+        }
+
+        let mut remove = false;
+        let mut old_phase = None;
+        let mut old_cancellation = None;
+        let mut old_broker_cancellation = None;
+        let mut old_permit = None;
+        let mut removed_cell = None;
+        let mut successor_event = None;
+        let mut successor_identity = None;
+        {
+            let mut domain = lock(&self.domain.state);
+            let mut state = lock(&cell.state);
+            let (current_generation, current_leader) = match &state.phase {
+                CellPhase::Loading(loading) => (loading.generation, loading.leader_slot),
+                _ => return,
+            };
+            if current_leader != leader_slot
+                || current_generation != generation
+                || !state.dependency_transition.is_idle()
+            {
+                return;
+            }
             let next = state
                 .interests
                 .iter()
                 .enumerate()
-                .filter(|(_, interest)| interest.active)
+                .filter(|(_, interest)| interest.is_active())
                 .min_by_key(|(_, interest)| interest.ordinal)
-                .map(|(slot, _)| slot);
-            if let Some(slot) = next {
-                let Some(generation) = loading.generation.checked_add(1) else {
+                .map(|(slot, interest)| (slot, interest.ordinal));
+            if let Some((slot, interest_ordinal)) = next {
+                let Some(next_generation) = current_generation.checked_add(1) else {
                     domain.invariant_failed = true;
                     if !checked_sub(&mut domain.cache_bytes, state.completed_weight) {
                         domain.invariant_failed = true;
@@ -1868,15 +4088,71 @@ impl ArenaInner {
                     cell.ready.notify_all();
                     return;
                 };
+                let successor = DependencySuccessor {
+                    generation: next_generation,
+                    leader_slot: slot,
+                    interest_ordinal,
+                };
+                if dependency_edge.is_none() {
+                    let container = match &mut state.phase {
+                        CellPhase::Loading(loading) => loading.dependency_container.take(),
+                        _ => None,
+                    };
+                    dependency_edge = container.map(|container| {
+                        (
+                            DependencyLeaderToken {
+                                key: cell.key,
+                                generation,
+                                leader_slot,
+                            },
+                            DependencyEdge {
+                                from: cell.key,
+                                to: CellKey {
+                                    epoch: cell.key.epoch,
+                                    id: container,
+                                    representation: Representation::DeclaredObjStmContainer,
+                                },
+                            },
+                        )
+                    });
+                } else {
+                    if let CellPhase::Loading(loading) = &mut state.phase {
+                        loading.dependency_container = None;
+                    }
+                }
+                if let Some((token, edge)) = dependency_edge {
+                    let Some(event) = DomainInner::dependency_event_locked(
+                        &mut domain,
+                        token,
+                        edge,
+                        DependencyEventKind::SuccessorElected,
+                        Some(successor),
+                    ) else {
+                        drop(state);
+                        drop(domain);
+                        self.close_exact_invariant(
+                            cell,
+                            leader_slot,
+                            generation,
+                            CellControlTag::DependencyStateInvariant,
+                        );
+                        return;
+                    };
+                    successor_event = Some(event);
+                    state.dependency_transition = DependencyTransition::ReleasingSuccessor {
+                        old: token,
+                        successor,
+                    };
+                }
                 for interest in state
                     .interests
                     .iter_mut()
-                    .filter(|interest| interest.active)
+                    .filter(|interest| interest.is_active())
                 {
-                    interest.generation = generation;
+                    interest.generation = next_generation;
                 }
                 if let CellPhase::Loading(loading) = &mut state.phase {
-                    loading.generation = generation;
+                    loading.generation = next_generation;
                     loading.leader_slot = slot;
                     loading.leader_running = false;
                     old_cancellation = Some(std::mem::replace(
@@ -1885,6 +4161,8 @@ impl ArenaInner {
                     ));
                     old_broker_cancellation = loading.broker_cancellation.take();
                     old_permit = loading.permit.take();
+                    debug_assert!(loading.dependency.is_none());
+                    successor_identity = Some(successor);
                 }
             } else {
                 removed_cell = domain.cells.remove(&cell.key);
@@ -1908,15 +4186,56 @@ impl ArenaInner {
         }
         drop(old_phase);
         drop(old_cancellation);
-        drop(old_broker_cancellation);
-        drop(old_permit);
+        if let Some(cancel) = old_broker_cancellation {
+            cancel.cancel();
+        }
+        if let Some(permit) = old_permit {
+            permit.cancel();
+        }
         drop(removed_cell);
         if remove {
             if let Some(metadata) = lock(&cell.metadata).as_mut() {
                 let _ = metadata.transition(OwnershipClass::Bypass);
             }
         }
+        if let Some(event) = successor_event {
+            if let Some(panic) = self.domain.dispatch_dependency_event(event) {
+                if hook_panic.is_none() {
+                    hook_panic = Some(panic);
+                }
+            }
+            let mut domain = lock(&self.domain.state);
+            let mut state = lock(&cell.state);
+            let expected = event.successor.expect("successor event carries identity");
+            if state.dependency_transition
+                == (DependencyTransition::ReleasingSuccessor {
+                    old: event.token,
+                    successor: expected,
+                })
+            {
+                state.dependency_transition = DependencyTransition::Idle;
+            } else {
+                domain.invariant_failed = true;
+            }
+        }
         cell.ready.notify_all();
+        if let Some(successor) = successor_identity {
+            let canceled = {
+                let state = lock(&cell.state);
+                state
+                    .interests
+                    .get(successor.leader_slot)
+                    .is_none_or(|interest| {
+                        !interest.is_active() || interest.ordinal != successor.interest_ordinal
+                    })
+            };
+            if canceled {
+                self.leader_terminal(cell, successor.leader_slot, successor.generation);
+            }
+        }
+        if let Some(panic) = hook_panic {
+            resume_unwind(panic);
+        }
     }
 
     fn request(self: &Arc<Self>, id: ObjectId) -> Result<ObjectCellRequest, CellControlFailure> {
@@ -1981,7 +4300,10 @@ impl ArenaInner {
                     cancellation,
                     broker_cancellation: None,
                     permit: None,
+                    dependency: None,
+                    dependency_container: None,
                 }),
+                dependency_transition: DependencyTransition::Idle,
                 interests: [EMPTY_INTEREST; MAX_INTERESTS_PER_CELL],
                 live_interests: 0,
                 next_interest_ordinal: 0,
@@ -2097,6 +4419,7 @@ impl ArenaInner {
         leader_slot: usize,
         generation: u64,
         owner: Arc<ResolvedObjectOwner>,
+        #[cfg(test)] require_cache: bool,
     ) {
         let incoming = owner.retained_bytes();
         let mut domain = lock(&self.domain.state);
@@ -2114,6 +4437,20 @@ impl ArenaInner {
         let (cache, victims) =
             self.domain
                 .prepare_publication_locked(&mut domain, cell.key, incoming);
+        #[cfg(test)]
+        if require_cache && !cache {
+            drop(state);
+            drop(domain);
+            drop(victims);
+            drop(owner);
+            self.close_exact_invariant(
+                cell,
+                leader_slot,
+                generation,
+                CellControlTag::ObjectStreamCacheBypassInvariant,
+            );
+            return;
+        }
         if cache {
             if let Err(error) = owner.transition_broker(OwnershipClass::Cache) {
                 if !checked_sub(&mut domain.cache_bytes, incoming) {
@@ -2140,6 +4477,7 @@ impl ArenaInner {
             if !checked_sub(&mut domain.loading_metadata_bytes, CELL_METADATA_BYTES) {
                 domain.invariant_failed = true;
             }
+            let dependency = Self::take_dependency_locked(&mut domain, &mut state);
             let old_phase = std::mem::replace(
                 &mut state.phase,
                 CellPhase::Closed(CellControlFailure::new(
@@ -2151,15 +4489,52 @@ impl ArenaInner {
             drop(state);
             drop(domain);
             drop(victims);
+            let (hook_panic, dependency_completion) = match dependency {
+                Some(dependency) => match self.cleanup_member_dependency(cell, dependency) {
+                    Ok(completion) => (
+                        completion.hook_panic,
+                        Some((
+                            completion.token,
+                            DependencyTransition::Acknowledging(completion.token),
+                        )),
+                    ),
+                    Err(failure) => {
+                        let completion =
+                            self.record_closed_dependency_cleanup_failure(cell, failure);
+                        (
+                            completion.hook_panic,
+                            Some((
+                                completion.token,
+                                DependencyTransition::CleanupFailed(completion.token),
+                            )),
+                        )
+                    }
+                },
+                None => (None, None),
+            };
             drop(old_phase);
             drop(removed_cell);
             if cache {
                 let _ = owner.transition_broker(OwnershipClass::Bypass);
             }
+            #[cfg(test)]
+            if dependency_completion.is_some() {
+                self.domain.announce_dependency_terminal_cleanup(
+                    cell.key,
+                    DependencyTerminalCleanupOwner::ExactTeardown,
+                );
+            }
             if let Some(metadata) = lock(&cell.metadata).as_mut() {
                 let _ = metadata.transition(OwnershipClass::Bypass);
             }
-            cell.ready.notify_all();
+            if let Some((token, expected)) = dependency_completion {
+                self.finish_dependency_cleanup(cell, token, expected);
+            } else {
+                cell.ready.notify_all();
+            }
+            if let Some(panic) = hook_panic {
+                resume_unwind(panic);
+            }
             return;
         };
         let removed_cell = if cache {
@@ -2189,6 +4564,8 @@ impl ArenaInner {
         if !checked_sub(&mut domain.loading_metadata_bytes, CELL_METADATA_BYTES) {
             domain.invariant_failed = true;
         }
+        let dependency = Self::take_dependency_locked(&mut domain, &mut state);
+        let published_owner = owner.to_owned();
         let old_phase = std::mem::replace(&mut state.phase, CellPhase::Ready(owner));
         state.transitioning = false;
         domain.touch = next_touch;
@@ -2196,14 +4573,49 @@ impl ArenaInner {
         drop(state);
         drop(domain);
         drop(victims);
+        let (hook_panic, dependency_completion, cleanup_failed) = match dependency {
+            Some(dependency) => match self.cleanup_member_dependency(cell, dependency) {
+                Ok(completion) => (
+                    completion.hook_panic,
+                    Some((
+                        completion.token,
+                        DependencyTransition::Acknowledging(completion.token),
+                    )),
+                    false,
+                ),
+                Err(failure) => {
+                    let completion = self.rollback_published_dependency_cleanup_failure(
+                        cell,
+                        failure,
+                        PublishedCleanupOwner::Ready(published_owner),
+                    );
+                    (
+                        completion.hook_panic,
+                        Some((
+                            completion.token,
+                            DependencyTransition::CleanupFailed(completion.token),
+                        )),
+                        true,
+                    )
+                }
+            },
+            None => (None, None, false),
+        };
         drop(old_phase);
         drop(removed_cell);
-        if !cache {
+        if !cache && !cleanup_failed {
             if let Some(metadata) = lock(&cell.metadata).as_mut() {
                 let _ = metadata.transition(OwnershipClass::Bypass);
             }
         }
-        cell.ready.notify_all();
+        if let Some((token, expected)) = dependency_completion {
+            self.finish_dependency_cleanup(cell, token, expected);
+        } else {
+            cell.ready.notify_all();
+        }
+        if let Some(panic) = hook_panic {
+            resume_unwind(panic);
+        }
     }
 
     fn publish_error(
@@ -2282,6 +4694,7 @@ impl ArenaInner {
             if !checked_sub(&mut domain.loading_metadata_bytes, CELL_METADATA_BYTES) {
                 domain.invariant_failed = true;
             }
+            let dependency = Self::take_dependency_locked(&mut domain, &mut state);
             let old_phase = std::mem::replace(
                 &mut state.phase,
                 CellPhase::Closed(CellControlFailure::new(
@@ -2293,12 +4706,52 @@ impl ArenaInner {
             drop(state);
             drop(domain);
             drop(victims);
+            let (hook_panic, dependency_completion) = match dependency {
+                Some(dependency) => match self.cleanup_member_dependency(cell, dependency) {
+                    Ok(completion) => (
+                        completion.hook_panic,
+                        Some((
+                            completion.token,
+                            DependencyTransition::Acknowledging(completion.token),
+                        )),
+                    ),
+                    Err(failure) => {
+                        let completion =
+                            self.record_closed_dependency_cleanup_failure(cell, failure);
+                        (
+                            completion.hook_panic,
+                            Some((
+                                completion.token,
+                                DependencyTransition::CleanupFailed(completion.token),
+                            )),
+                        )
+                    }
+                },
+                None => (None, None),
+            };
             drop(old_phase);
             drop(removed_cell);
+            if cache {
+                let _ = error.transition_broker(OwnershipClass::Bypass);
+            }
+            #[cfg(test)]
+            if dependency_completion.is_some() {
+                self.domain.announce_dependency_terminal_cleanup(
+                    cell.key,
+                    DependencyTerminalCleanupOwner::ExactTeardown,
+                );
+            }
             if let Some(metadata) = lock(&cell.metadata).as_mut() {
                 let _ = metadata.transition(OwnershipClass::Bypass);
             }
-            cell.ready.notify_all();
+            if let Some((token, expected)) = dependency_completion {
+                self.finish_dependency_cleanup(cell, token, expected);
+            } else {
+                cell.ready.notify_all();
+            }
+            if let Some(panic) = hook_panic {
+                resume_unwind(panic);
+            }
             return;
         };
         if cache {
@@ -2322,6 +4775,8 @@ impl ArenaInner {
             if !checked_sub(&mut domain.loading_metadata_bytes, CELL_METADATA_BYTES) {
                 domain.invariant_failed = true;
             }
+            let dependency = Self::take_dependency_locked(&mut domain, &mut state);
+            let published_owner = error.to_owned();
             let old_phase = std::mem::replace(&mut state.phase, CellPhase::Negative(error));
             state.transitioning = false;
             domain.touch = next_touch;
@@ -2329,8 +4784,41 @@ impl ArenaInner {
             drop(state);
             drop(domain);
             drop(victims);
+            let (hook_panic, dependency_completion) = match dependency {
+                Some(dependency) => match self.cleanup_member_dependency(cell, dependency) {
+                    Ok(completion) => (
+                        completion.hook_panic,
+                        Some((
+                            completion.token,
+                            DependencyTransition::Acknowledging(completion.token),
+                        )),
+                    ),
+                    Err(failure) => {
+                        let completion = self.rollback_published_dependency_cleanup_failure(
+                            cell,
+                            failure,
+                            PublishedCleanupOwner::Failure(published_owner),
+                        );
+                        (
+                            completion.hook_panic,
+                            Some((
+                                completion.token,
+                                DependencyTransition::CleanupFailed(completion.token),
+                            )),
+                        )
+                    }
+                },
+                None => (None, None),
+            };
             drop(old_phase);
-            cell.ready.notify_all();
+            if let Some((token, expected)) = dependency_completion {
+                self.finish_dependency_cleanup(cell, token, expected);
+            } else {
+                cell.ready.notify_all();
+            }
+            if let Some(panic) = hook_panic {
+                resume_unwind(panic);
+            }
             return;
         } else {
             let removed_cell = domain.cells.remove(&cell.key);
@@ -2345,6 +4833,8 @@ impl ArenaInner {
             if !checked_sub(&mut domain.loading_metadata_bytes, CELL_METADATA_BYTES) {
                 domain.invariant_failed = true;
             }
+            let dependency = Self::take_dependency_locked(&mut domain, &mut state);
+            let published_owner = error.to_owned();
             let old_phase = std::mem::replace(&mut state.phase, CellPhase::FlightError(error));
             state.transitioning = false;
             domain.touch = next_touch;
@@ -2352,12 +4842,49 @@ impl ArenaInner {
             drop(state);
             drop(domain);
             drop(victims);
+            let (hook_panic, dependency_completion, cleanup_failed) = match dependency {
+                Some(dependency) => match self.cleanup_member_dependency(cell, dependency) {
+                    Ok(completion) => (
+                        completion.hook_panic,
+                        Some((
+                            completion.token,
+                            DependencyTransition::Acknowledging(completion.token),
+                        )),
+                        false,
+                    ),
+                    Err(failure) => {
+                        let completion = self.rollback_published_dependency_cleanup_failure(
+                            cell,
+                            failure,
+                            PublishedCleanupOwner::Failure(published_owner),
+                        );
+                        (
+                            completion.hook_panic,
+                            Some((
+                                completion.token,
+                                DependencyTransition::CleanupFailed(completion.token),
+                            )),
+                            true,
+                        )
+                    }
+                },
+                None => (None, None, false),
+            };
             drop(old_phase);
             drop(removed_cell);
-            if let Some(metadata) = lock(&cell.metadata).as_mut() {
-                let _ = metadata.transition(OwnershipClass::Bypass);
+            if !cleanup_failed {
+                if let Some(metadata) = lock(&cell.metadata).as_mut() {
+                    let _ = metadata.transition(OwnershipClass::Bypass);
+                }
             }
-            cell.ready.notify_all();
+            if let Some((token, expected)) = dependency_completion {
+                self.finish_dependency_cleanup(cell, token, expected);
+            } else {
+                cell.ready.notify_all();
+            }
+            if let Some(panic) = hook_panic {
+                resume_unwind(panic);
+            }
             return;
         }
     }
@@ -2404,6 +4931,48 @@ impl ArenaInner {
         );
     }
 
+    #[cfg(test)]
+    fn publish_cell_envelope_control_error(
+        &self,
+        cell: &Arc<Cell>,
+        leader_slot: usize,
+        generation: u64,
+        control: CellControlFailure,
+    ) {
+        if !self.claim_publication(cell, leader_slot, generation) {
+            self.leader_terminal(cell, leader_slot, generation);
+            return;
+        }
+        let payload = FailurePayload::Access(control.render());
+        let incoming = payload.retained_weight();
+        if incoming
+            .as_ref()
+            .map_or(true, |bytes| *bytes > CELL_ERROR_ENVELOPE_BYTES)
+        {
+            self.close_exact_invariant(
+                cell,
+                leader_slot,
+                generation,
+                CellControlTag::ErrorAccountingInvariant,
+            );
+            return;
+        }
+        let owner = Arc::new(FailureOwner {
+            payload,
+            retained_weight: incoming.expect("checked emergency failure weight"),
+            charge: Mutex::new(None),
+            _reservation: Mutex::new(None),
+            cell_envelope: true,
+        });
+        self.publish_error(
+            cell,
+            leader_slot,
+            generation,
+            owner,
+            NegativeDisposition::FlightOnly,
+        );
+    }
+
     fn claim_publication(&self, cell: &Arc<Cell>, leader_slot: usize, generation: u64) -> bool {
         let domain = lock(&self.domain.state);
         if !domain
@@ -2417,10 +4986,12 @@ impl ArenaInner {
         let active = state
             .interests
             .get(leader_slot)
-            .is_some_and(|interest| interest.active);
+            .is_some_and(|interest| interest.is_active());
+        let dependency_idle = state.dependency_transition.is_idle();
         let claimed = match &mut state.phase {
             CellPhase::Loading(loading)
                 if active
+                    && dependency_idle
                     && loading.leader_slot == leader_slot
                     && loading.generation == generation
                     && !loading.cancellation.load(Ordering::Acquire) =>
@@ -2437,10 +5008,11 @@ impl ArenaInner {
 
     fn publication_wins(&self, state: &CellState, leader_slot: usize, generation: u64) -> bool {
         !self.closed.load(Ordering::Acquire)
+            && state.dependency_transition.is_idle()
             && state
                 .interests
                 .get(leader_slot)
-                .is_some_and(|slot| slot.active)
+                .is_some_and(|slot| slot.is_active())
             && matches!(&state.phase, CellPhase::Loading(loading) if loading.leader_slot == leader_slot && loading.generation == generation && !loading.cancellation.load(Ordering::Acquire))
     }
 
@@ -2595,7 +5167,7 @@ impl ArenaInner {
         ordinal: u64,
         release: InterestRelease,
     ) {
-        let (broker_cancel, permit, acknowledge_generation) = {
+        let (broker_cancel, permit, leader) = {
             let mut domain = lock(&self.domain.state);
             let mut state = lock(&cell.state);
             if release == InterestRelease::Cancel && !matches!(state.phase, CellPhase::Loading(_)) {
@@ -2604,10 +5176,10 @@ impl ArenaInner {
             let Some(interest) = state.interests.get_mut(slot) else {
                 return;
             };
-            if !interest.active || interest.ordinal != ordinal {
+            if !interest.is_active() || interest.ordinal != ordinal {
                 return;
             }
-            interest.active = false;
+            interest.deactivate();
             state.live_interests -= 1;
             domain.live_interests -= 1;
             let cancel_loading = release != InterestRelease::Complete
@@ -2621,7 +5193,7 @@ impl ArenaInner {
                     (
                         loading.broker_cancellation.clone(),
                         loading.permit.clone(),
-                        (!loading.leader_running).then_some(loading.generation),
+                        Some((loading.generation, loading.leader_running)),
                     )
                 }
                 _ => (None, None, None),
@@ -2633,18 +5205,62 @@ impl ArenaInner {
         if let Some(permit) = permit {
             permit.cancel();
         }
-        if let Some(generation) = acknowledge_generation {
-            self.leader_terminal(cell, slot, generation);
+        let mut hook_panic = None;
+        if let Some((generation, leader_running)) = leader {
+            let mut cleanup_failed = false;
+            self.wait_for_dependency_transition(cell);
+            let dependency = {
+                let mut domain = lock(&self.domain.state);
+                let mut state = lock(&cell.state);
+                let exact = matches!(
+                    &state.phase,
+                    CellPhase::Loading(loading)
+                        if loading.generation == generation && loading.leader_slot == slot
+                ) && state.dependency_transition.is_idle();
+                exact
+                    .then(|| Self::take_dependency_locked(&mut domain, &mut state))
+                    .flatten()
+            };
+            if let Some(dependency) = dependency {
+                match self.cleanup_member_dependency(cell, dependency) {
+                    Ok(completion) => {
+                        hook_panic = completion.hook_panic;
+                        self.finish_successful_dependency_cleanup(cell, completion.token);
+                    }
+                    Err(failure) => {
+                        hook_panic = self.close_loading_dependency_cleanup_failure(cell, failure);
+                        cleanup_failed = true;
+                    }
+                }
+            }
+            if !leader_running && !cleanup_failed {
+                self.leader_terminal(cell, slot, generation);
+            }
         }
         cell.ready.notify_all();
+        if let Some(panic) = hook_panic {
+            resume_unwind(panic);
+        }
     }
 
     fn close(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        let (cells, removed_arena) = {
+        let (cells, removed_arena) = loop {
             let mut domain = lock(&self.domain.state);
+            let pending = domain
+                .cells
+                .iter()
+                .find(|(key, cell)| {
+                    key.epoch == self.epoch && !lock(&cell.state).dependency_transition.is_idle()
+                })
+                .map(|(_, cell)| cell.to_owned());
+            if let Some(cell) = pending {
+                drop(domain);
+                self.wait_for_dependency_transition(&cell);
+                continue;
+            }
             if !checked_add(&mut domain.closes, 1) {
                 domain.invariant_failed = true;
             }
@@ -2663,17 +5279,24 @@ impl ArenaInner {
                         domain.invariant_failed = true;
                     }
                     state.cached = false;
-                    let (broker_cancel, permit) = if let CellPhase::Loading(loading) =
+                    let (broker_cancel, permit, loading) = if let CellPhase::Loading(loading) =
                         &mut state.phase
                     {
                         if !checked_sub(&mut domain.loading_metadata_bytes, CELL_METADATA_BYTES) {
                             domain.invariant_failed = true;
                         }
                         loading.cancellation.store(true, Ordering::Release);
-                        (loading.broker_cancellation.clone(), loading.permit.clone())
+                        (
+                            loading.broker_cancellation.take(),
+                            loading.permit.take(),
+                            true,
+                        )
                     } else {
-                        (None, None)
+                        (None, None, false)
                     };
+                    let dependency = loading
+                        .then(|| Self::take_dependency_locked(&mut domain, &mut state))
+                        .flatten();
                     let external_pins = state.external_pins;
                     let old_phase = std::mem::replace(
                         &mut state.phase,
@@ -2684,10 +5307,17 @@ impl ArenaInner {
                         )),
                     );
                     drop(state);
-                    cells.push((cell, broker_cancel, permit, old_phase, external_pins));
+                    cells.push((
+                        cell,
+                        broker_cancel,
+                        permit,
+                        dependency,
+                        old_phase,
+                        external_pins,
+                    ));
                 }
             }
-            (cells, removed_arena)
+            break (cells, removed_arena);
         };
         drop(removed_arena);
         #[cfg(test)]
@@ -2697,12 +5327,50 @@ impl ArenaInner {
                 hooks.after_phase_replacement();
             }
         }
-        for (cell, broker_cancel, permit, old_phase, external_pins) in cells {
+        let mut hook_panic = None;
+        let mut dependency_completions = Vec::new();
+        for (cell, broker_cancel, permit, dependency, old_phase, external_pins) in cells {
             if let Some(cancel) = broker_cancel {
                 cancel.cancel();
             }
             if let Some(permit) = permit {
                 permit.cancel();
+            }
+            let dependency_completion = if let Some(dependency) = dependency {
+                let (panic, dependency_completion) =
+                    match self.cleanup_member_dependency(&cell, dependency) {
+                        Ok(completion) => (
+                            completion.hook_panic,
+                            Some((
+                                completion.token,
+                                DependencyTransition::Acknowledging(completion.token),
+                            )),
+                        ),
+                        Err(failure) => {
+                            let completion =
+                                self.record_closed_dependency_cleanup_failure(&cell, failure);
+                            (
+                                completion.hook_panic,
+                                Some((
+                                    completion.token,
+                                    DependencyTransition::CleanupFailed(completion.token),
+                                )),
+                            )
+                        }
+                    };
+                if hook_panic.is_none() {
+                    hook_panic = panic;
+                }
+                dependency_completion
+            } else {
+                None
+            };
+            #[cfg(test)]
+            if dependency_completion.is_some() {
+                self.domain.announce_dependency_terminal_cleanup(
+                    cell.key,
+                    DependencyTerminalCleanupOwner::ArenaClose,
+                );
             }
             if let Some(mut metadata) = lock(&cell.metadata).take() {
                 let _ = metadata.transition(OwnershipClass::Bypass);
@@ -2717,12 +5385,33 @@ impl ArenaInner {
                 _ => {}
             }
             drop(old_phase);
-            cell.ready.notify_all();
+            if let Some((token, expected)) = dependency_completion {
+                dependency_completions.push((cell.to_owned(), token, expected));
+            } else {
+                cell.ready.notify_all();
+            }
         }
         if let Some(mut metadata) = lock(&self._metadata).take() {
             let _ = metadata.transition(OwnershipClass::Bypass);
         }
         self.operation.close();
+        for (cell, token, expected) in dependency_completions {
+            self.finish_dependency_cleanup(&cell, token, expected);
+        }
+        #[cfg(test)]
+        {
+            let mut domain = lock(&self.domain.state);
+            if let Some(next) = domain.close_acknowledgements.checked_add(1) {
+                domain.close_acknowledgements = next;
+            } else {
+                domain.invariant_failed = true;
+            }
+        }
+        if let Some(panic) = hook_panic {
+            if !std::thread::panicking() {
+                resume_unwind(panic);
+            }
+        }
     }
 }
 
@@ -2756,6 +5445,157 @@ impl DomainInner {
         }
     }
 
+    fn dependency_event_locked(
+        domain: &mut DomainState,
+        token: DependencyLeaderToken,
+        edge: DependencyEdge,
+        kind: DependencyEventKind,
+        successor: Option<DependencySuccessor>,
+    ) -> Option<DependencyEvent> {
+        let Some(ordinal) = domain.dependency_event_ordinal.checked_add(1) else {
+            domain.invariant_failed = true;
+            return None;
+        };
+        domain.dependency_event_ordinal = ordinal;
+        Some(DependencyEvent {
+            token,
+            edge,
+            kind,
+            ordinal,
+            successor,
+        })
+    }
+
+    fn dispatch_dependency_event(&self, event: DependencyEvent) -> Option<DependencyHookPanic> {
+        let hooks = lock(&self.dependency_hooks).to_owned();
+        hooks.and_then(|hooks| catch_unwind(AssertUnwindSafe(|| hooks.event(event))).err())
+    }
+
+    #[cfg(test)]
+    fn pause_dependency_cleanup_failure(&self, key: CellKey, token: DependencyLeaderToken) {
+        let hooks = test_locked_clone(&self.dependency_cleanup_failure_hooks);
+        if let Some(hooks) = hooks {
+            hooks.failed(key, token);
+        }
+    }
+
+    #[cfg(test)]
+    fn announce_dependency_terminal_cleanup(
+        &self,
+        key: CellKey,
+        owner: DependencyTerminalCleanupOwner,
+    ) {
+        let hooks = test_locked_clone(&self.dependency_terminal_cleanup_hooks);
+        if let Some(hooks) = hooks {
+            hooks.before_metadata(key, owner);
+        }
+    }
+
+    fn cleanup_dependency(
+        &self,
+        cell: &Arc<Cell>,
+        mut detached: DetachedDependency,
+    ) -> Result<DependencyCleanupCompletion, DependencyCleanupFailure> {
+        let mut hook_panic = detached
+            .event
+            .take()
+            .and_then(|event| self.dispatch_dependency_event(event));
+        let token = detached.dependency.token;
+        let edge = detached.dependency.edge;
+        let had_cancellation = detached.dependency.cancellation.is_some();
+        let had_pin = detached.dependency.pin.is_some();
+        if let Some(cancellation) = detached.dependency.cancellation.take() {
+            cancellation.cancel();
+        }
+        drop(detached.dependency.pin.take());
+
+        let events = {
+            let mut domain = lock(&self.state);
+            let mut state = lock(&cell.state);
+            let exact_transition =
+                state.dependency_transition == DependencyTransition::Cleaning(token);
+            let next_cancellations = if had_cancellation {
+                domain.dependency_cancellations.checked_sub(1)
+            } else {
+                Some(domain.dependency_cancellations)
+            };
+            let next_pins = if had_pin {
+                domain.dependency_pins.checked_sub(1)
+            } else {
+                Some(domain.dependency_pins)
+            };
+            let next_edges = domain.dependency_edges.checked_sub(1);
+            let next_leaders = domain.dependency_leaders.checked_sub(1);
+            let next_removes = domain.dependency_edge_removes.checked_add(1);
+            let next_acks = domain.dependency_cleanup_acks.checked_add(1);
+            let ordinal_room = domain.dependency_event_ordinal.checked_add(2);
+            if detached.ordinal_invariant
+                || !exact_transition
+                || next_cancellations.is_none()
+                || next_pins.is_none()
+                || next_edges.is_none()
+                || next_leaders.is_none()
+                || next_removes.is_none()
+                || next_acks.is_none()
+                || ordinal_room.is_none()
+            {
+                domain.invariant_failed = true;
+                state.dependency_transition = DependencyTransition::CleanupFailed(token);
+                None
+            } else {
+                let removed = Self::dependency_event_locked(
+                    &mut domain,
+                    token,
+                    edge,
+                    DependencyEventKind::EdgeRemoved,
+                    None,
+                )
+                .expect("prechecked two cleanup ordinals");
+                let acknowledged = Self::dependency_event_locked(
+                    &mut domain,
+                    token,
+                    edge,
+                    DependencyEventKind::CleanupAcknowledged,
+                    None,
+                )
+                .expect("prechecked two cleanup ordinals");
+                domain.dependency_cancellations = next_cancellations.unwrap();
+                domain.dependency_pins = next_pins.unwrap();
+                domain.dependency_edges = next_edges.unwrap();
+                domain.dependency_leaders = next_leaders.unwrap();
+                domain.dependency_edge_removes = next_removes.unwrap();
+                domain.dependency_cleanup_acks = next_acks.unwrap();
+                state.dependency_transition = DependencyTransition::Acknowledging(token);
+                Some((removed, acknowledged))
+            }
+        };
+
+        let Some((removed, acknowledged)) = events else {
+            #[cfg(test)]
+            self.pause_dependency_cleanup_failure(cell.key, token);
+            return Err(DependencyCleanupFailure {
+                token,
+                control: CellControlFailure::new(
+                    cell.key.id,
+                    AccessKind::Backend,
+                    CellControlTag::DependencyStateInvariant,
+                ),
+                hook_panic,
+            });
+        };
+        if let Some(panic) = self.dispatch_dependency_event(removed) {
+            if hook_panic.is_none() {
+                hook_panic = Some(panic);
+            }
+        }
+        if let Some(panic) = self.dispatch_dependency_event(acknowledged) {
+            if hook_panic.is_none() {
+                hook_panic = Some(panic);
+            }
+        }
+        Ok(DependencyCleanupCompletion { token, hook_panic })
+    }
+
     fn snapshot(&self) -> ObjectCellSnapshot {
         let mut domain = lock(&self.state);
         domain.arenas.retain(|_, arena| arena.strong_count() > 0);
@@ -2774,6 +5614,19 @@ impl DomainInner {
             evictions: domain.evictions,
             cancellations: domain.cancellations,
             closes: domain.closes,
+            dependency_cancellations: domain.dependency_cancellations,
+            dependency_pins: domain.dependency_pins,
+            dependency_edges: domain.dependency_edges,
+            dependency_leaders: domain.dependency_leaders,
+            dependency_edge_adds: domain.dependency_edge_adds,
+            dependency_edge_removes: domain.dependency_edge_removes,
+            dependency_cleanup_acks: domain.dependency_cleanup_acks,
+            #[cfg(test)]
+            parse_active: domain.parse_active,
+            #[cfg(test)]
+            active_generations: domain.active_generations.len(),
+            #[cfg(test)]
+            close_acknowledgements: domain.close_acknowledgements,
             raw: domain.representations[Representation::RawNormalObject.index()],
             containers: domain.representations[Representation::DeclaredObjStmContainer.index()],
             members: domain.representations[Representation::DeclaredObjStmMember.index()],
@@ -2784,7 +5637,17 @@ impl DomainInner {
             let state = lock(&cell.state);
             snapshot.external_pins = snapshot.external_pins.saturating_add(state.external_pins);
             match state.phase {
-                CellPhase::Loading(_) => snapshot.loading += 1,
+                CellPhase::Loading(ref loading) => {
+                    snapshot.loading += 1;
+                    #[cfg(not(test))]
+                    let _ = loading;
+                    #[cfg(test)]
+                    {
+                        snapshot.permit_current += usize::from(loading.permit.clone().is_some());
+                        snapshot.broker_cancellation_current +=
+                            usize::from(loading.broker_cancellation.clone().is_some());
+                    }
+                }
                 CellPhase::Ready(_) => snapshot.ready += 1,
                 CellPhase::Negative(_) => snapshot.negative += 1,
                 CellPhase::FlightError(_) | CellPhase::Closed(_) => {}
@@ -2954,7 +5817,7 @@ fn attach_interest(
     let slot = state
         .interests
         .iter()
-        .position(|slot| !slot.active)
+        .position(|slot| !slot.is_active())
         .ok_or_else(|| {
             CellControlFailure::new(
                 id,
@@ -3094,7 +5957,6 @@ fn attach_interest(
     state.next_interest_ordinal = ordinal;
     state.live_interests = cell_interests;
     state.interests[slot] = InterestSlot {
-        active: true,
         ordinal,
         generation,
     };
@@ -3153,16 +6015,98 @@ fn test_clone_permit(permit: &ScalarResolutionPermit) -> ScalarResolutionPermit 
     permit.clone()
 }
 
+#[cfg(test)]
+fn test_clone_value<T: Clone>(value: &T) -> T {
+    value.clone()
+}
+
+#[cfg(test)]
+fn test_arc_clone<T>(value: &Arc<T>) -> Arc<T> {
+    Arc::clone(value)
+}
+
+#[cfg(test)]
+fn test_locked_clone<T: Clone>(value: &Mutex<T>) -> T {
+    lock(value).clone()
+}
+
+#[cfg(not(test))]
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[cfg(not(test))]
 fn wait<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
     condvar
         .wait(guard)
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+thread_local! {
+    static OBJECT_CELL_LOCK_DEPTH: ThreadCell<usize> = const { ThreadCell::new(0) };
+}
+
+#[cfg(test)]
+struct TrackedMutexGuard<'a, T> {
+    guard: Option<MutexGuard<'a, T>>,
+}
+
+#[cfg(test)]
+impl<T> Deref for TrackedMutexGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_deref().expect("tracked guard owns its lock")
+    }
+}
+
+#[cfg(test)]
+impl<T> DerefMut for TrackedMutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard
+            .as_deref_mut()
+            .expect("tracked guard owns its lock")
+    }
+}
+
+#[cfg(test)]
+impl<T> Drop for TrackedMutexGuard<'_, T> {
+    fn drop(&mut self) {
+        if self.guard.is_some() {
+            OBJECT_CELL_LOCK_DEPTH.with(|depth| depth.set(depth.get() - 1));
+        }
+    }
+}
+
+#[cfg(test)]
+fn lock<T>(mutex: &Mutex<T>) -> TrackedMutexGuard<'_, T> {
+    let guard = mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    OBJECT_CELL_LOCK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    TrackedMutexGuard { guard: Some(guard) }
+}
+
+#[cfg(test)]
+fn wait<'a, T>(condvar: &Condvar, mut guard: TrackedMutexGuard<'a, T>) -> TrackedMutexGuard<'a, T> {
+    let raw = guard
+        .guard
+        .take()
+        .expect("tracked wait guard owns its lock");
+    OBJECT_CELL_LOCK_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    let raw = condvar
+        .wait(raw)
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    OBJECT_CELL_LOCK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    TrackedMutexGuard { guard: Some(raw) }
+}
+
+#[cfg(test)]
+fn caller_thread_lock_depth() -> usize {
+    OBJECT_CELL_LOCK_DEPTH.with(ThreadCell::get)
 }
 
 #[cfg(test)]
@@ -3177,7 +6121,11 @@ mod tests {
     use std::sync::{mpsc, Barrier};
     use std::thread;
 
-    fn assert_gate4_terminal(domain: &ObjectCellDomain, broker: &BudgetBroker) {
+    fn assert_gate4_terminal(
+        domain: &ObjectCellDomain,
+        broker: &BudgetBroker,
+        expected_closes: u64,
+    ) {
         let cells = domain.snapshot();
         assert_eq!(cells.arenas, 0);
         assert_eq!(cells.cells, 0);
@@ -3186,6 +6134,19 @@ mod tests {
         assert_eq!(cells.negative, 0);
         assert_eq!(cells.live_interests, 0);
         assert_eq!(cells.external_pins, 0);
+        assert_eq!(cells.dependency_cancellations, 0);
+        assert_eq!(cells.dependency_pins, 0);
+        assert_eq!(cells.dependency_edges, 0);
+        assert_eq!(cells.dependency_leaders, 0);
+        assert_eq!(cells.dependency_edge_adds, cells.dependency_edge_removes);
+        assert_eq!(cells.dependency_cleanup_acks, cells.dependency_edge_removes);
+        assert_eq!(cells.active_generations, 0);
+        assert!(lock(&domain.inner.state).active_generations.is_empty());
+        assert_eq!(cells.parse_active, 0);
+        assert_eq!(cells.permit_current, 0);
+        assert_eq!(cells.broker_cancellation_current, 0);
+        assert_eq!(cells.closes, expected_closes);
+        assert_eq!(cells.close_acknowledgements, expected_closes);
         assert_eq!(cells.cache_bytes, 0);
         assert_eq!(lock(&domain.inner.state).loading_metadata_bytes, 0);
         assert!(!cells.invariant_failed);
@@ -3211,6 +6172,22 @@ mod tests {
         assert!(ledger.operations.is_empty());
         assert!(!ledger.invariant_failed);
         assert!(!ledger.closed);
+        assert!(ledger.normal_limit_bytes > 0);
+        assert!(ledger.peak_normal_bytes <= ledger.normal_limit_bytes);
+        assert!(ledger.peak_completion_reserve_bytes <= ledger.normal_limit_bytes);
+        assert!(ledger.peak_cache_bytes <= ledger.peak_normal_bytes);
+        assert!(ledger.peak_pin_bytes <= ledger.peak_normal_bytes);
+        assert!(ledger.peak_bypass_bytes <= ledger.peak_normal_bytes);
+        assert!(ledger.reconciliations <= ledger.grants);
+        let _historical_terminal_inventory = (
+            ledger.peak_oversize_bytes,
+            ledger.peak_aggregate_bytes,
+            ledger.grants,
+            ledger.denials,
+            ledger.cancellations,
+            ledger.reconciliations,
+            ledger.maximum_admissible_lag,
+        );
     }
 
     fn assert_representation_counter_sums(snapshot: &ObjectCellSnapshot) {
@@ -3280,6 +6257,11 @@ mod tests {
         assert_eq!(cells.negative, 0);
         assert_eq!(cells.live_interests, 0);
         assert_eq!(cells.external_pins, 0);
+        assert_eq!(cells.dependency_cancellations, 0);
+        assert_eq!(cells.dependency_pins, 0);
+        assert_eq!(cells.dependency_edges, 0);
+        assert_eq!(cells.dependency_leaders, 0);
+        assert_eq!(cells.dependency_edge_adds, cells.dependency_edge_removes);
         assert_eq!(cells.cache_bytes, 0);
         assert_eq!(lock(&domain.inner.state).loading_metadata_bytes, 0);
 
@@ -5588,6 +8570,1546 @@ mod tests {
         action: Mutex<mpsc::Receiver<PhaseAction>>,
     }
 
+    struct PausingDependencyHooks {
+        target: DependencyEventKind,
+        target_generation: Option<u64>,
+        armed: AtomicBool,
+        entered: mpsc::SyncSender<DependencyEvent>,
+        action: Mutex<mpsc::Receiver<PhaseAction>>,
+        events: Mutex<Vec<DependencyEvent>>,
+        lock_probes: AtomicU64,
+    }
+
+    struct RecordingDependencyHooks {
+        events: Mutex<Vec<DependencyEvent>>,
+    }
+
+    struct RecordingFailureDeliveryHooks {
+        deliveries: Mutex<Vec<(CellKey, usize)>>,
+    }
+
+    struct MultiPausingDependencyHooks {
+        target: DependencyEventKind,
+        entered: mpsc::Sender<DependencyEvent>,
+        action: Mutex<mpsc::Receiver<()>>,
+        events: Mutex<Vec<DependencyEvent>>,
+    }
+
+    impl DependencyHooks for MultiPausingDependencyHooks {
+        fn event(&self, event: DependencyEvent) {
+            assert_eq!(caller_thread_lock_depth(), 0);
+            lock(&self.events).push(event);
+            if event.kind == self.target {
+                self.entered.send(event).unwrap();
+                lock(&self.action).recv().unwrap();
+            }
+        }
+    }
+
+    struct PausingScheduledResourceHooks {
+        target: ScheduledResourceShape,
+        entered: mpsc::SyncSender<(CellKey, DependencyLeaderToken, ScheduledResourceShape)>,
+        action: Mutex<mpsc::Receiver<()>>,
+        dropped: mpsc::SyncSender<(CellKey, DependencyLeaderToken, ScheduledResourceShape)>,
+        drop_acknowledgements: AtomicU64,
+    }
+
+    struct PerTokenChainHooks {
+        events: Mutex<Vec<DependencyEvent>>,
+        child_entered: mpsc::Sender<DependencyEvent>,
+        request_entered: mpsc::Sender<DependencyEvent>,
+        grant_entered: mpsc::Sender<DependencyEvent>,
+        child_actions: BTreeMap<ObjectId, Mutex<mpsc::Receiver<()>>>,
+        request_actions: BTreeMap<ObjectId, Mutex<mpsc::Receiver<()>>>,
+        grant_actions: BTreeMap<ObjectId, Mutex<mpsc::Receiver<()>>>,
+    }
+
+    impl DependencyHooks for PerTokenChainHooks {
+        fn event(&self, event: DependencyEvent) {
+            assert_eq!(caller_thread_lock_depth(), 0);
+            lock(&self.events).push(event);
+            let actions = match event.kind {
+                DependencyEventKind::ChildResolved => {
+                    self.child_entered.send(event).unwrap();
+                    Some(&self.child_actions)
+                }
+                DependencyEventKind::MemberRequestCreated => {
+                    self.request_entered.send(event).unwrap();
+                    Some(&self.request_actions)
+                }
+                DependencyEventKind::MemberGranted => {
+                    self.grant_entered.send(event).unwrap();
+                    Some(&self.grant_actions)
+                }
+                _ => None,
+            };
+            if let Some(actions) = actions {
+                lock(actions.get(&event.token.key.id).unwrap())
+                    .recv()
+                    .unwrap();
+            }
+        }
+    }
+
+    impl ScheduledResourceHooks for PausingScheduledResourceHooks {
+        fn enter(&self, key: CellKey, token: DependencyLeaderToken, shape: ScheduledResourceShape) {
+            assert_eq!(caller_thread_lock_depth(), 0);
+            if shape == self.target {
+                self.entered.send((key, token, shape)).unwrap();
+                lock(&self.action).recv().unwrap();
+            }
+        }
+
+        fn dropped(
+            &self,
+            key: CellKey,
+            token: DependencyLeaderToken,
+            shape: ScheduledResourceShape,
+        ) {
+            assert_eq!(caller_thread_lock_depth(), 0);
+            if shape == self.target {
+                let previous = self.drop_acknowledgements.fetch_add(1, Ordering::Relaxed);
+                if previous == 0 {
+                    self.dropped.send((key, token, shape)).unwrap();
+                }
+            }
+        }
+    }
+
+    impl FailureDeliveryHooks for RecordingFailureDeliveryHooks {
+        fn delivered(&self, key: CellKey, owner: usize) {
+            assert_eq!(caller_thread_lock_depth(), 0);
+            lock(&self.deliveries).push((key, owner));
+        }
+    }
+
+    impl DependencyHooks for RecordingDependencyHooks {
+        fn event(&self, event: DependencyEvent) {
+            assert_eq!(caller_thread_lock_depth(), 0);
+            lock(&self.events).push(event);
+        }
+    }
+
+    struct SignallingDependencyHooks {
+        target: DependencyEventKind,
+        first_paused: AtomicBool,
+        entered: mpsc::Sender<DependencyEvent>,
+        first_action: Mutex<mpsc::Receiver<()>>,
+        events: Mutex<Vec<DependencyEvent>>,
+    }
+
+    impl DependencyHooks for SignallingDependencyHooks {
+        fn event(&self, event: DependencyEvent) {
+            assert_eq!(caller_thread_lock_depth(), 0);
+            lock(&self.events).push(event);
+            if event.kind != self.target {
+                return;
+            }
+            self.entered.send(event).unwrap();
+            if self.first_paused.swap(false, Ordering::AcqRel) {
+                lock(&self.first_action).recv().unwrap();
+            }
+        }
+    }
+
+    struct PanickingDependencyHooks;
+
+    impl DependencyHooks for PanickingDependencyHooks {
+        fn event(&self, event: DependencyEvent) {
+            panic!("ready hit emitted dependency event: {event:?}")
+        }
+    }
+
+    struct PausingDependencyWaitHooks {
+        armed: AtomicBool,
+        entered: mpsc::SyncSender<(CellKey, DependencyTransition)>,
+        action: Mutex<mpsc::Receiver<()>>,
+    }
+
+    struct SignallingDependencyWaitHooks {
+        entered: mpsc::Sender<(CellKey, DependencyTransition)>,
+    }
+
+    impl DependencyWaitHooks for SignallingDependencyWaitHooks {
+        fn waiting(&self, key: CellKey, transition: DependencyTransition) {
+            assert_eq!(caller_thread_lock_depth(), 0);
+            self.entered.send((key, transition)).unwrap();
+        }
+    }
+
+    struct PausingDependencyCleanupFailureHooks {
+        armed: AtomicBool,
+        entered: mpsc::SyncSender<(CellKey, DependencyLeaderToken)>,
+        action: Mutex<mpsc::Receiver<()>>,
+    }
+
+    enum R9FollowerOutcome {
+        Waited(DependencyTransition),
+        Returned(Result<(), AccessError>),
+    }
+
+    struct ReportingDependencyWaitHooks {
+        outcome: mpsc::Sender<R9FollowerOutcome>,
+    }
+
+    impl DependencyWaitHooks for ReportingDependencyWaitHooks {
+        fn waiting(&self, _key: CellKey, transition: DependencyTransition) {
+            assert_eq!(caller_thread_lock_depth(), 0);
+            self.outcome
+                .send(R9FollowerOutcome::Waited(transition))
+                .unwrap();
+        }
+    }
+
+    struct SignallingDependencyTerminalCleanupHooks {
+        entered: mpsc::SyncSender<(CellKey, DependencyTerminalCleanupOwner)>,
+    }
+
+    struct PausingDependencyTerminalCleanupHooks {
+        entered: mpsc::SyncSender<(CellKey, DependencyTerminalCleanupOwner)>,
+        action: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl DependencyTerminalCleanupHooks for SignallingDependencyTerminalCleanupHooks {
+        fn before_metadata(&self, key: CellKey, owner: DependencyTerminalCleanupOwner) {
+            assert_eq!(caller_thread_lock_depth(), 0);
+            self.entered.send((key, owner)).unwrap();
+        }
+    }
+
+    impl DependencyTerminalCleanupHooks for PausingDependencyTerminalCleanupHooks {
+        fn before_metadata(&self, key: CellKey, owner: DependencyTerminalCleanupOwner) {
+            assert_eq!(caller_thread_lock_depth(), 0);
+            self.entered.send((key, owner)).unwrap();
+            lock(&self.action).recv().unwrap();
+        }
+    }
+
+    struct PausingDependencyPreWaitHooks {
+        armed: AtomicBool,
+        entered: mpsc::SyncSender<(CellKey, DependencyTransition)>,
+        action: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl DependencyPreWaitHooks for PausingDependencyPreWaitHooks {
+        fn before_wait(&self, key: CellKey, transition: DependencyTransition) {
+            assert!(caller_thread_lock_depth() > 0);
+            if !self.armed.swap(false, Ordering::AcqRel) {
+                return;
+            }
+            self.entered.send((key, transition)).unwrap();
+            lock(&self.action).recv().unwrap();
+        }
+    }
+
+    impl DependencyCleanupFailureHooks for PausingDependencyCleanupFailureHooks {
+        fn failed(&self, key: CellKey, token: DependencyLeaderToken) {
+            assert_eq!(caller_thread_lock_depth(), 0);
+            if !self.armed.swap(false, Ordering::AcqRel) {
+                return;
+            }
+            self.entered.send((key, token)).unwrap();
+            lock(&self.action).recv().unwrap();
+        }
+    }
+
+    impl DependencyWaitHooks for PausingDependencyWaitHooks {
+        fn waiting(&self, key: CellKey, transition: DependencyTransition) {
+            assert_eq!(caller_thread_lock_depth(), 0);
+            if !self.armed.swap(false, Ordering::AcqRel) {
+                return;
+            }
+            self.entered.send((key, transition)).unwrap();
+            lock(&self.action).recv().unwrap();
+        }
+    }
+
+    impl DependencyHooks for PausingDependencyHooks {
+        fn event(&self, event: DependencyEvent) {
+            assert_eq!(
+                caller_thread_lock_depth(),
+                0,
+                "dependency hook caller retained an object-cell lock: {event:?}"
+            );
+            self.lock_probes.fetch_add(1, Ordering::Relaxed);
+            lock(&self.events).push(event);
+            if event.kind != self.target
+                || self
+                    .target_generation
+                    .is_some_and(|generation| event.token.generation != generation)
+                || !self.armed.swap(false, Ordering::AcqRel)
+            {
+                return;
+            }
+            self.entered.send(event).unwrap();
+            match lock(&self.action).recv().unwrap() {
+                PhaseAction::Continue => {}
+                PhaseAction::Panic => panic!("injected dependency-phase panic at {:?}", event.kind),
+            }
+        }
+    }
+
+    fn dependency_hook(
+        domain: &ObjectCellDomain,
+        target: DependencyEventKind,
+    ) -> (
+        Arc<PausingDependencyHooks>,
+        mpsc::Receiver<DependencyEvent>,
+        mpsc::SyncSender<PhaseAction>,
+    ) {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (action_tx, action_rx) = mpsc::sync_channel(0);
+        let hooks = Arc::new(PausingDependencyHooks {
+            target,
+            target_generation: None,
+            armed: AtomicBool::new(true),
+            entered: entered_tx,
+            action: Mutex::new(action_rx),
+            events: Mutex::new(Vec::new()),
+            lock_probes: AtomicU64::new(0),
+        });
+        domain.set_dependency_hooks(hooks.clone());
+        (hooks, entered_rx, action_tx)
+    }
+
+    fn scheduled_resource_hook(
+        domain: &ObjectCellDomain,
+        target: ScheduledResourceShape,
+    ) -> (
+        mpsc::Receiver<(CellKey, DependencyLeaderToken, ScheduledResourceShape)>,
+        mpsc::SyncSender<()>,
+        mpsc::Receiver<(CellKey, DependencyLeaderToken, ScheduledResourceShape)>,
+        Arc<PausingScheduledResourceHooks>,
+    ) {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (action_tx, action_rx) = mpsc::sync_channel(0);
+        let (dropped_tx, dropped_rx) = mpsc::sync_channel(0);
+        let hooks = Arc::new(PausingScheduledResourceHooks {
+            target,
+            entered: entered_tx,
+            action: Mutex::new(action_rx),
+            dropped: dropped_tx,
+            drop_acknowledgements: AtomicU64::new(0),
+        });
+        domain.set_scheduled_resource_hooks(hooks.clone());
+        (entered_rx, action_tx, dropped_rx, hooks)
+    }
+
+    fn multi_dependency_hook(
+        domain: &ObjectCellDomain,
+        target: DependencyEventKind,
+    ) -> (
+        Arc<MultiPausingDependencyHooks>,
+        mpsc::Receiver<DependencyEvent>,
+        mpsc::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (action_tx, action_rx) = mpsc::channel();
+        let hooks = Arc::new(MultiPausingDependencyHooks {
+            target,
+            entered: entered_tx,
+            action: Mutex::new(action_rx),
+            events: Mutex::new(Vec::new()),
+        });
+        domain.set_dependency_hooks(hooks.clone());
+        (hooks, entered_rx, action_tx)
+    }
+
+    fn dependency_hook_for_generation(
+        domain: &ObjectCellDomain,
+        target: DependencyEventKind,
+        generation: u64,
+    ) -> (
+        Arc<PausingDependencyHooks>,
+        mpsc::Receiver<DependencyEvent>,
+        mpsc::SyncSender<PhaseAction>,
+    ) {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (action_tx, action_rx) = mpsc::sync_channel(0);
+        let hooks = Arc::new(PausingDependencyHooks {
+            target,
+            target_generation: Some(generation),
+            armed: AtomicBool::new(true),
+            entered: entered_tx,
+            action: Mutex::new(action_rx),
+            events: Mutex::new(Vec::new()),
+            lock_probes: AtomicU64::new(0),
+        });
+        domain.set_dependency_hooks(hooks.clone());
+        (hooks, entered_rx, action_tx)
+    }
+
+    fn dependency_wait_hook(
+        domain: &ObjectCellDomain,
+    ) -> (
+        mpsc::Receiver<(CellKey, DependencyTransition)>,
+        mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (action_tx, action_rx) = mpsc::sync_channel(0);
+        domain.set_dependency_wait_hooks(Arc::new(PausingDependencyWaitHooks {
+            armed: AtomicBool::new(true),
+            entered: entered_tx,
+            action: Mutex::new(action_rx),
+        }));
+        (entered_rx, action_tx)
+    }
+
+    fn dependency_cleanup_failure_hook(
+        domain: &ObjectCellDomain,
+    ) -> (
+        mpsc::Receiver<(CellKey, DependencyLeaderToken)>,
+        mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (action_tx, action_rx) = mpsc::sync_channel(0);
+        domain.set_dependency_cleanup_failure_hooks(Arc::new(
+            PausingDependencyCleanupFailureHooks {
+                armed: AtomicBool::new(true),
+                entered: entered_tx,
+                action: Mutex::new(action_rx),
+            },
+        ));
+        (entered_rx, action_tx)
+    }
+
+    fn dependency_terminal_cleanup_hook(
+        domain: &ObjectCellDomain,
+    ) -> mpsc::Receiver<(CellKey, DependencyTerminalCleanupOwner)> {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        domain.set_dependency_terminal_cleanup_hooks(Arc::new(
+            SignallingDependencyTerminalCleanupHooks {
+                entered: entered_tx,
+            },
+        ));
+        entered_rx
+    }
+
+    fn pausing_dependency_terminal_cleanup_hook(
+        domain: &ObjectCellDomain,
+    ) -> (
+        mpsc::Receiver<(CellKey, DependencyTerminalCleanupOwner)>,
+        mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (action_tx, action_rx) = mpsc::sync_channel(0);
+        domain.set_dependency_terminal_cleanup_hooks(Arc::new(
+            PausingDependencyTerminalCleanupHooks {
+                entered: entered_tx,
+                action: Mutex::new(action_rx),
+            },
+        ));
+        (entered_rx, action_tx)
+    }
+
+    fn dependency_pre_wait_hook(
+        domain: &ObjectCellDomain,
+    ) -> (
+        mpsc::Receiver<(CellKey, DependencyTransition)>,
+        mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (action_tx, action_rx) = mpsc::sync_channel(0);
+        domain.set_dependency_pre_wait_hooks(Arc::new(PausingDependencyPreWaitHooks {
+            armed: AtomicBool::new(true),
+            entered: entered_tx,
+            action: Mutex::new(action_rx),
+        }));
+        (entered_rx, action_tx)
+    }
+
+    fn prepared_dependency_fixture() -> (
+        BudgetBroker,
+        ObjectCellDomain,
+        ObjectCellArena,
+        ObjectId,
+        ObjectId,
+    ) {
+        let broker = broker();
+        let domain =
+            ObjectCellDomain::new(broker.clone(), ObjectCellConfig::scaled(32 * 1024 * 1024));
+        let arena = domain.open_arena().unwrap();
+        let (reader, member, container, _) = object_stream_reader();
+        let prepared = arena
+            .resolve_object_stream(container, |permit| {
+                reader
+                    .prepare_object_stream_with_permit(container, permit)
+                    .map_err(|error| {
+                        CellLoadError::new(
+                            AccessError::typed(container, AccessKind::Backend, error),
+                            NegativeDisposition::FlightOnly,
+                        )
+                    })
+            })
+            .unwrap();
+        drop(prepared);
+        (broker, domain, arena, member, container)
+    }
+
+    #[derive(Debug, Default, Eq, PartialEq)]
+    struct OperationSnapshotDelta {
+        normal_retained_cap: i128,
+        queued: i128,
+        in_flight: i128,
+        error_owners: i128,
+        grants: i128,
+        granted_bytes: i128,
+        cache_bytes: i128,
+        pin_bytes: i128,
+        bypass_bytes: i128,
+        self_pinned_bytes: i128,
+    }
+
+    fn operation_snapshot_delta(
+        before: &crate::broker::OperationSnapshot,
+        after: &crate::broker::OperationSnapshot,
+    ) -> OperationSnapshotDelta {
+        OperationSnapshotDelta {
+            normal_retained_cap: i128::from(after.normal_retained_cap)
+                - i128::from(before.normal_retained_cap),
+            queued: after.queued as i128 - before.queued as i128,
+            in_flight: after.in_flight as i128 - before.in_flight as i128,
+            error_owners: after.error_owners as i128 - before.error_owners as i128,
+            grants: i128::from(after.grants) - i128::from(before.grants),
+            granted_bytes: i128::from(after.granted_bytes) - i128::from(before.granted_bytes),
+            cache_bytes: i128::from(after.cache_bytes) - i128::from(before.cache_bytes),
+            pin_bytes: i128::from(after.pin_bytes) - i128::from(before.pin_bytes),
+            bypass_bytes: i128::from(after.bypass_bytes) - i128::from(before.bypass_bytes),
+            self_pinned_bytes: i128::from(after.self_pinned_bytes)
+                - i128::from(before.self_pinned_bytes),
+        }
+    }
+
+    #[derive(Debug, Default, Eq, PartialEq)]
+    struct BrokerSnapshotDelta {
+        normal_limit_bytes: i128,
+        normal_payload_bytes: i128,
+        normal_in_flight_estimate_bytes: i128,
+        metadata_bytes: i128,
+        completion_reserve_bytes: i128,
+        oversize_bytes: i128,
+        aggregate_bytes: i128,
+        peak_normal_bytes: i128,
+        peak_completion_reserve_bytes: i128,
+        peak_oversize_bytes: i128,
+        peak_aggregate_bytes: i128,
+        queued: i128,
+        in_flight: i128,
+        live_request_records: i128,
+        error_metadata_bytes: i128,
+        reservation_metadata_bytes: i128,
+        active_operations: i128,
+        grants: i128,
+        denials: i128,
+        cancellations: i128,
+        reconciliations: i128,
+        maximum_admissible_lag: i128,
+        oversize_owners: i128,
+        cache_bytes: i128,
+        pin_bytes: i128,
+        bypass_bytes: i128,
+        peak_cache_bytes: i128,
+        peak_pin_bytes: i128,
+        peak_bypass_bytes: i128,
+        operations: BTreeMap<u64, OperationSnapshotDelta>,
+        invariant_failed_changed: bool,
+        closed_changed: bool,
+    }
+
+    fn broker_snapshot_delta(
+        before: &crate::broker::BrokerSnapshot,
+        after: &crate::broker::BrokerSnapshot,
+    ) -> BrokerSnapshotDelta {
+        assert_eq!(
+            before.operations.keys().collect::<Vec<_>>(),
+            after.operations.keys().collect::<Vec<_>>(),
+            "operation registry changed while computing scoped broker delta"
+        );
+        let operations = before
+            .operations
+            .iter()
+            .map(|(epoch, before_operation)| {
+                (
+                    *epoch,
+                    operation_snapshot_delta(before_operation, &after.operations[epoch]),
+                )
+            })
+            .collect();
+        BrokerSnapshotDelta {
+            normal_limit_bytes: i128::from(after.normal_limit_bytes)
+                - i128::from(before.normal_limit_bytes),
+            normal_payload_bytes: i128::from(after.normal_payload_bytes)
+                - i128::from(before.normal_payload_bytes),
+            normal_in_flight_estimate_bytes: i128::from(after.normal_in_flight_estimate_bytes)
+                - i128::from(before.normal_in_flight_estimate_bytes),
+            metadata_bytes: i128::from(after.metadata_bytes) - i128::from(before.metadata_bytes),
+            completion_reserve_bytes: i128::from(after.completion_reserve_bytes)
+                - i128::from(before.completion_reserve_bytes),
+            oversize_bytes: i128::from(after.oversize_bytes) - i128::from(before.oversize_bytes),
+            aggregate_bytes: i128::from(after.aggregate_bytes) - i128::from(before.aggregate_bytes),
+            peak_normal_bytes: i128::from(after.peak_normal_bytes)
+                - i128::from(before.peak_normal_bytes),
+            peak_completion_reserve_bytes: i128::from(after.peak_completion_reserve_bytes)
+                - i128::from(before.peak_completion_reserve_bytes),
+            peak_oversize_bytes: i128::from(after.peak_oversize_bytes)
+                - i128::from(before.peak_oversize_bytes),
+            peak_aggregate_bytes: i128::from(after.peak_aggregate_bytes)
+                - i128::from(before.peak_aggregate_bytes),
+            queued: after.queued as i128 - before.queued as i128,
+            in_flight: after.in_flight as i128 - before.in_flight as i128,
+            live_request_records: after.live_request_records as i128
+                - before.live_request_records as i128,
+            error_metadata_bytes: i128::from(after.error_metadata_bytes)
+                - i128::from(before.error_metadata_bytes),
+            reservation_metadata_bytes: i128::from(after.reservation_metadata_bytes)
+                - i128::from(before.reservation_metadata_bytes),
+            active_operations: after.active_operations as i128 - before.active_operations as i128,
+            grants: i128::from(after.grants) - i128::from(before.grants),
+            denials: i128::from(after.denials) - i128::from(before.denials),
+            cancellations: i128::from(after.cancellations) - i128::from(before.cancellations),
+            reconciliations: i128::from(after.reconciliations) - i128::from(before.reconciliations),
+            maximum_admissible_lag: i128::from(after.maximum_admissible_lag)
+                - i128::from(before.maximum_admissible_lag),
+            oversize_owners: i128::from(after.oversize_owners) - i128::from(before.oversize_owners),
+            cache_bytes: i128::from(after.cache_bytes) - i128::from(before.cache_bytes),
+            pin_bytes: i128::from(after.pin_bytes) - i128::from(before.pin_bytes),
+            bypass_bytes: i128::from(after.bypass_bytes) - i128::from(before.bypass_bytes),
+            peak_cache_bytes: i128::from(after.peak_cache_bytes)
+                - i128::from(before.peak_cache_bytes),
+            peak_pin_bytes: i128::from(after.peak_pin_bytes) - i128::from(before.peak_pin_bytes),
+            peak_bypass_bytes: i128::from(after.peak_bypass_bytes)
+                - i128::from(before.peak_bypass_bytes),
+            operations,
+            invariant_failed_changed: before.invariant_failed != after.invariant_failed,
+            closed_changed: before.closed != after.closed,
+        }
+    }
+
+    fn assert_broker_snapshot_unchanged(
+        before: &crate::broker::BrokerSnapshot,
+        after: &crate::broker::BrokerSnapshot,
+        context: &str,
+    ) {
+        let mut delta = broker_snapshot_delta(before, after);
+        for (epoch, operation) in &delta.operations {
+            assert_eq!(
+                operation,
+                &OperationSnapshotDelta::default(),
+                "{context}: operation {epoch} changed"
+            );
+        }
+        delta.operations.clear();
+        assert_eq!(delta, BrokerSnapshotDelta::default(), "{context}");
+    }
+
+    fn zero_operation_deltas(
+        snapshot: &crate::broker::BrokerSnapshot,
+    ) -> BTreeMap<u64, OperationSnapshotDelta> {
+        snapshot
+            .operations
+            .keys()
+            .map(|epoch| (*epoch, OperationSnapshotDelta::default()))
+            .collect()
+    }
+
+    fn expected_member_request_delta(
+        before: &crate::broker::BrokerSnapshot,
+        epoch: u64,
+        queued: bool,
+    ) -> BrokerSnapshotDelta {
+        let estimate = Representation::DeclaredObjStmMember.loader_estimate();
+        let metadata = crate::broker::QUEUE_METADATA_WEIGHT;
+        let payload = if queued { 0 } else { estimate };
+        let added = metadata + payload;
+        let current_normal = before.normal_payload_bytes + before.metadata_bytes;
+        let mut operations = zero_operation_deltas(before);
+        let operation = operations.get_mut(&epoch).unwrap();
+        operation.queued = i128::from(queued);
+        operation.in_flight = i128::from(!queued);
+        operation.grants = i128::from(!queued);
+        operation.granted_bytes = i128::from(payload);
+        BrokerSnapshotDelta {
+            normal_payload_bytes: i128::from(payload),
+            normal_in_flight_estimate_bytes: i128::from(payload),
+            metadata_bytes: i128::from(metadata),
+            aggregate_bytes: i128::from(added),
+            peak_normal_bytes: i128::from(
+                (current_normal + added).saturating_sub(before.peak_normal_bytes),
+            ),
+            peak_aggregate_bytes: i128::from(
+                (before.aggregate_bytes + added).saturating_sub(before.peak_aggregate_bytes),
+            ),
+            queued: i128::from(queued),
+            in_flight: i128::from(!queued),
+            live_request_records: 1,
+            reservation_metadata_bytes: i128::from(!queued) * i128::from(metadata),
+            grants: i128::from(!queued),
+            operations,
+            ..BrokerSnapshotDelta::default()
+        }
+    }
+
+    fn expected_bounded_flight_refusal_delta(
+        before: &crate::broker::BrokerSnapshot,
+        epoch: u64,
+        denials: u64,
+        cell_retained_as_bypass: bool,
+    ) -> BrokerSnapshotDelta {
+        let pin = before.operations[&epoch].pin_bytes;
+        let cache_delta = i128::from(pin) - i128::from(CELL_METADATA_BYTES);
+        let dropped_cell = if cell_retained_as_bypass {
+            0
+        } else {
+            CELL_METADATA_BYTES
+        };
+        let bypass = if cell_retained_as_bypass {
+            CELL_METADATA_BYTES
+        } else {
+            0
+        };
+        let mut operations = zero_operation_deltas(before);
+        let operation = operations.get_mut(&epoch).unwrap();
+        operation.cache_bytes = cache_delta;
+        operation.pin_bytes = -i128::from(pin);
+        operation.bypass_bytes = i128::from(bypass);
+        operation.self_pinned_bytes = -i128::from(pin);
+        let next_cache = (i128::from(before.cache_bytes) + cache_delta) as u64;
+        let next_bypass = before.bypass_bytes + bypass;
+        BrokerSnapshotDelta {
+            normal_payload_bytes: -i128::from(dropped_cell),
+            aggregate_bytes: -i128::from(dropped_cell),
+            denials: i128::from(denials),
+            cache_bytes: cache_delta,
+            pin_bytes: -i128::from(pin),
+            bypass_bytes: i128::from(bypass),
+            peak_cache_bytes: i128::from(next_cache.saturating_sub(before.peak_cache_bytes)),
+            peak_bypass_bytes: i128::from(next_bypass.saturating_sub(before.peak_bypass_bytes)),
+            operations,
+            ..BrokerSnapshotDelta::default()
+        }
+    }
+
+    fn expected_member_completion_delta(
+        before: &crate::broker::BrokerSnapshot,
+        epoch: u64,
+        outcome: Result<u64, u64>,
+        peak_bypass_delta: u64,
+    ) -> BrokerSnapshotDelta {
+        let estimate = Representation::DeclaredObjStmMember.loader_estimate();
+        let metadata = crate::broker::QUEUE_METADATA_WEIGHT;
+        let (retained, dropped_cell) = match outcome {
+            Ok(retained) => (retained, 0),
+            Err(_) => (0, CELL_METADATA_BYTES),
+        };
+        let pin = before.operations[&epoch].pin_bytes;
+        let cache_delta = i128::from(pin + retained) - i128::from(dropped_cell);
+        let normal_delta = i128::from(retained) - i128::from(estimate) - i128::from(dropped_cell);
+        let mut operations = zero_operation_deltas(before);
+        let operation = operations.get_mut(&epoch).unwrap();
+        operation.in_flight = -1;
+        operation.cache_bytes = cache_delta;
+        operation.pin_bytes = -i128::from(pin);
+        operation.self_pinned_bytes = -i128::from(pin);
+        let next_cache = (i128::from(before.cache_bytes) + cache_delta) as u64;
+        BrokerSnapshotDelta {
+            normal_payload_bytes: normal_delta,
+            normal_in_flight_estimate_bytes: -i128::from(estimate),
+            metadata_bytes: -i128::from(metadata),
+            aggregate_bytes: normal_delta - i128::from(metadata),
+            in_flight: -1,
+            live_request_records: -1,
+            reservation_metadata_bytes: -i128::from(metadata),
+            reconciliations: 1,
+            cache_bytes: cache_delta,
+            pin_bytes: -i128::from(pin),
+            peak_cache_bytes: i128::from(next_cache.saturating_sub(before.peak_cache_bytes)),
+            peak_pin_bytes: i128::from(retained.saturating_sub(before.peak_pin_bytes)),
+            peak_bypass_bytes: i128::from(peak_bypass_delta),
+            operations,
+            ..BrokerSnapshotDelta::default()
+        }
+    }
+
+    #[test]
+    fn c2_budget_constants_are_frozen_together() {
+        assert_eq!(
+            Representation::DeclaredObjStmMember.loader_estimate(),
+            4_194_304,
+            "M: scheduled member estimate"
+        );
+        assert_eq!(
+            crate::broker::QUEUE_METADATA_WEIGHT,
+            256,
+            "Q: queue record metadata"
+        );
+        assert_eq!(
+            crate::broker::OPERATION_METADATA_WEIGHT,
+            2_048,
+            "E: operation metadata"
+        );
+        assert_eq!(CELL_METADATA_BYTES, 5_120, "C: cell metadata envelope");
+        assert_eq!(
+            CELL_ERROR_ENVELOPE_BYTES, 512,
+            "F: retained flight-error envelope"
+        );
+    }
+
+    struct C2QueuedFixture {
+        broker: BudgetBroker,
+        blocker_operation: BrokerOperation,
+        domain: ObjectCellDomain,
+        arena: ObjectCellArena,
+        member: ObjectId,
+        container: ObjectId,
+        sibling_pointer: usize,
+        blocker: crate::broker::Reservation,
+        cell: Arc<Cell>,
+        token: DependencyLeaderToken,
+        queued_action: mpsc::SyncSender<PhaseAction>,
+        leader_cancel: CellCancellation,
+        leader_join: Option<thread::JoinHandle<Result<ResolvedObjectPin, AccessError>>>,
+        followers: Vec<ObjectCellRequest>,
+        parses: Arc<AtomicU64>,
+        queued_snapshot: crate::broker::BrokerSnapshot,
+    }
+
+    fn c2_queued_fixture(follower_count: usize) -> C2QueuedFixture {
+        let broker = BudgetBroker::new(crate::broker::BrokerConfig {
+            normal_limit: 128 * 1024 * 1024,
+            oversize_limit: 64 * 1024 * 1024,
+            completion_reserve_limit: 0,
+            queue_metadata_weight: crate::broker::QUEUE_METADATA_WEIGHT,
+            operation_metadata_weight: crate::broker::OPERATION_METADATA_WEIGHT,
+            max_active_operations: 128,
+            max_queued_requests: 128,
+        })
+        .unwrap();
+        let blocker_operation = broker.register_operation().unwrap();
+        let domain =
+            ObjectCellDomain::new(broker.clone(), ObjectCellConfig::scaled(32 * 1024 * 1024));
+        let arena = domain.open_arena().unwrap();
+        let (stream_reader, member, container, _) = object_stream_reader();
+        let sibling_reader = reader(1_515);
+        let sibling = arena
+            .resolve((1, 0), |permit| load(&sibling_reader, (1, 0), permit))
+            .unwrap();
+        let sibling_pointer = sibling.pointer();
+        drop(sibling);
+        let (_pin_hooks, pin_entered, pin_action) =
+            dependency_hook(&domain, DependencyEventKind::BeforeMemberAdmission);
+        let leader = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let cell = Arc::clone(&leader.cell);
+        let leader_cancel = leader.cancellation_handle();
+        let followers = (0..follower_count)
+            .map(|_| {
+                arena
+                    .inner
+                    .request_representation(member, Representation::DeclaredObjStmMember)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let parses = Arc::new(AtomicU64::new(0));
+        let parses_for_load = Arc::clone(&parses);
+        let child_reader = Arc::clone(&stream_reader);
+        let member_reader = Arc::clone(&stream_reader);
+        let leader_join = thread::spawn(move || {
+            leader.resolve_scheduled_member_synthetic(
+                container,
+                move |permit| {
+                    child_reader
+                        .prepare_object_stream_with_permit(container, permit)
+                        .map_err(|error| {
+                            CellLoadError::objstm(crate::objstm_failures::classify(
+                                container, error,
+                            ))
+                        })
+                },
+                move |permit| {
+                    parses_for_load.fetch_add(1, Ordering::Relaxed);
+                    load(&member_reader, member, permit)
+                },
+            )
+        });
+        pin_entered.recv().unwrap();
+
+        let before_probe = broker.snapshot();
+        let probe = blocker_operation
+            .reserve(
+                Lane::Normal {
+                    completion_reserve: 0,
+                },
+                1,
+            )
+            .unwrap();
+        let probe_snapshot = broker.snapshot();
+        let reservation_metadata = probe_snapshot.metadata_bytes - before_probe.metadata_bytes;
+        drop(probe);
+        let baseline = broker.snapshot();
+        let estimate = Representation::DeclaredObjStmMember.loader_estimate();
+        let self_pinned = baseline.operations[&arena.epoch()].self_pinned_bytes;
+        let blocker_bytes = baseline
+            .normal_limit_bytes
+            .checked_add(1 + self_pinned)
+            .and_then(|bytes| bytes.checked_sub(baseline.normal_payload_bytes))
+            .and_then(|bytes| bytes.checked_sub(baseline.metadata_bytes))
+            .and_then(|bytes| bytes.checked_sub(reservation_metadata))
+            .and_then(|bytes| bytes.checked_sub(crate::broker::QUEUE_METADATA_WEIGHT))
+            .and_then(|bytes| bytes.checked_sub(estimate))
+            .unwrap();
+        let blocker = blocker_operation
+            .reserve(
+                Lane::Normal {
+                    completion_reserve: 0,
+                },
+                blocker_bytes,
+            )
+            .unwrap();
+        let (_queued_hooks, queued_entered, queued_action) =
+            dependency_hook(&domain, DependencyEventKind::MemberQueued);
+        pin_action.send(PhaseAction::Continue).unwrap();
+        let queued = queued_entered.recv().unwrap();
+        let queued_snapshot = broker.snapshot();
+        let member_operation = &queued_snapshot.operations[&arena.epoch()];
+        assert_eq!(queued.kind, DependencyEventKind::MemberQueued);
+        assert_eq!(queued.token.key, cell.key);
+        assert_eq!(member_operation.queued, 1);
+        assert_eq!(member_operation.in_flight, 0);
+        assert_eq!(parses.load(Ordering::Relaxed), 0);
+        assert_eq!(queued_snapshot.oversize_bytes, 0);
+        assert_eq!(queued_snapshot.completion_reserve_bytes, 0);
+        C2QueuedFixture {
+            broker,
+            blocker_operation,
+            domain,
+            arena,
+            member,
+            container,
+            sibling_pointer,
+            blocker,
+            cell,
+            token: queued.token,
+            queued_action,
+            leader_cancel,
+            leader_join: Some(leader_join),
+            followers,
+            parses,
+            queued_snapshot,
+        }
+    }
+
+    impl C2QueuedFixture {
+        fn join_leader(&mut self) -> thread::Result<Result<ResolvedObjectPin, AccessError>> {
+            self.leader_join.take().unwrap().join()
+        }
+
+        fn assert_member_drained_without_grant(&self) {
+            assert_eq!(self.parses.load(Ordering::Relaxed), 0);
+            let cells = self.domain.snapshot();
+            assert_eq!(cells.dependency_pins, 0);
+            assert_eq!(cells.dependency_edges, 0);
+            let broker = self.broker.snapshot();
+            assert_eq!(broker.grants, self.queued_snapshot.grants);
+            assert_eq!(broker.operations[&self.arena.epoch()].queued, 0);
+            assert_eq!(broker.operations[&self.arena.epoch()].in_flight, 0);
+        }
+
+        fn finish_open(self, context: &str) {
+            assert!(self.leader_join.is_none());
+            self.assert_member_drained_without_grant();
+            drop(self.blocker);
+            self.blocker_operation.close();
+            let sibling = self
+                .arena
+                .resolve((1, 0), |_| panic!("{context}: unrelated sibling reloaded"))
+                .unwrap();
+            assert_eq!(sibling.pointer(), self.sibling_pointer, "{context}");
+            drop(sibling);
+            assert!(self.arena.has_container_cell(self.container), "{context}");
+            drop(self.cell);
+            self.arena.close();
+            drop(self.arena);
+            assert_eq!(self.broker.snapshot().aggregate_bytes, 0, "{context}");
+        }
+
+        fn finish_closed(self, context: &str) {
+            assert!(self.leader_join.is_none());
+            assert_eq!(self.parses.load(Ordering::Relaxed), 0, "{context}");
+            assert_eq!(self.broker.snapshot().grants, self.queued_snapshot.grants);
+            drop(self.blocker);
+            self.blocker_operation.close();
+            drop(self.cell);
+            drop(self.arena);
+            assert_eq!(self.broker.snapshot().aggregate_bytes, 0, "{context}");
+        }
+    }
+
+    #[test]
+    fn c2_queued_follower_cancel_preserves_blocked_leader_and_exact_broker_state() {
+        let mut fixture = c2_queued_fixture(1);
+        let follower = fixture.followers.pop().unwrap();
+        let follower_cancel = follower.cancellation_handle();
+        let container = fixture.container;
+        let follower_join = thread::spawn(move || {
+            follower.resolve_scheduled_member_synthetic(
+                container,
+                |_| panic!("queued follower cannot resolve child"),
+                |_| panic!("queued follower cannot parse"),
+            )
+        });
+        follower_cancel.cancel();
+        assert!(follower_join.join().unwrap().is_err());
+        assert_broker_snapshot_unchanged(
+            &fixture.queued_snapshot,
+            &fixture.broker.snapshot(),
+            "queued follower cancellation",
+        );
+        assert_eq!(fixture.parses.load(Ordering::Relaxed), 0);
+        let state = lock(&fixture.cell.state);
+        let CellPhase::Loading(loading) = &state.phase else {
+            panic!("queued follower cancellation replaced Loading")
+        };
+        assert_eq!(loading.generation, fixture.token.generation);
+        assert_eq!(loading.leader_slot, fixture.token.leader_slot);
+        assert_eq!(
+            loading.dependency.as_ref().unwrap().token.key.id,
+            fixture.member
+        );
+        assert!(loading.broker_cancellation.is_some());
+        assert!(loading.permit.is_none());
+        drop(state);
+
+        let (wait_entered, wait_action) = dependency_wait_hook(&fixture.domain);
+        let cancel = fixture.leader_cancel.clone();
+        let cancel_join = thread::spawn(move || cancel.cancel());
+        let (waited_key, transition) = wait_entered.recv().unwrap();
+        assert_eq!(waited_key, fixture.cell.key);
+        assert_eq!(
+            transition,
+            DependencyTransition::Announcing {
+                token: fixture.token,
+                kind: DependencyEventKind::MemberQueued,
+            }
+        );
+        fixture.queued_action.send(PhaseAction::Continue).unwrap();
+        wait_action.send(()).unwrap();
+        cancel_join.join().unwrap();
+        assert!(fixture.join_leader().unwrap().is_err());
+        assert_eq!(fixture.parses.load(Ordering::Relaxed), 0);
+        let terminal = fixture.domain.snapshot();
+        assert_eq!(terminal.dependency_pins, 0);
+        assert_eq!(terminal.dependency_edges, 0);
+        assert_eq!(terminal.dependency_cleanup_acks, 1);
+        let blocked = fixture.broker.snapshot();
+        assert_eq!(blocked.grants, fixture.queued_snapshot.grants);
+        assert_eq!(blocked.operations[&fixture.arena.epoch()].queued, 0);
+        assert_eq!(blocked.operations[&fixture.arena.epoch()].in_flight, 0);
+        fixture.finish_open("queued follower cancellation");
+    }
+
+    #[test]
+    fn c2_queued_hook_panic_drops_request_pin_and_cancellation_without_granting() {
+        let mut fixture = c2_queued_fixture(0);
+        fixture.queued_action.send(PhaseAction::Panic).unwrap();
+        assert!(fixture.join_leader().is_err());
+        assert_eq!(fixture.parses.load(Ordering::Relaxed), 0);
+        let terminal = fixture.domain.snapshot();
+        assert_eq!(terminal.dependency_pins, 0);
+        assert_eq!(terminal.dependency_edges, 0);
+        assert_eq!(terminal.dependency_cleanup_acks, 1);
+        let blocked = fixture.broker.snapshot();
+        assert_eq!(blocked.grants, fixture.queued_snapshot.grants);
+        assert_eq!(blocked.operations[&fixture.arena.epoch()].queued, 0);
+        assert_eq!(blocked.operations[&fixture.arena.epoch()].in_flight, 0);
+        fixture.finish_open("queued hook panic");
+    }
+
+    #[test]
+    fn c2_queued_arena_close_waits_for_ack_then_cancels_without_granting() {
+        let mut fixture = c2_queued_fixture(0);
+        let terminal_cleanup = dependency_terminal_cleanup_hook(&fixture.domain);
+        let (wait_entered, wait_action) = dependency_wait_hook(&fixture.domain);
+        let closing = fixture.arena.clone();
+        let close_join = thread::spawn(move || closing.close());
+        let (waited_key, transition) = wait_entered.recv().unwrap();
+        assert_eq!(waited_key, fixture.cell.key);
+        assert_eq!(
+            transition,
+            DependencyTransition::Announcing {
+                token: fixture.token,
+                kind: DependencyEventKind::MemberQueued,
+            }
+        );
+        fixture.queued_action.send(PhaseAction::Continue).unwrap();
+        wait_action.send(()).unwrap();
+        let (cleanup_key, cleanup_owner) = terminal_cleanup.recv().unwrap();
+        assert_eq!(cleanup_key, fixture.cell.key);
+        assert!(matches!(
+            cleanup_owner,
+            DependencyTerminalCleanupOwner::ArenaClose
+                | DependencyTerminalCleanupOwner::LeaderTerminal
+        ));
+        let leader_error = fixture.join_leader().unwrap().unwrap_err();
+        assert_eq!(leader_error.detail, CellControlTag::ArenaClosed.detail());
+        close_join.join().unwrap();
+        assert_eq!(fixture.parses.load(Ordering::Relaxed), 0);
+        let terminal = fixture.domain.snapshot();
+        assert_eq!(terminal.cells, 0);
+        assert_eq!(terminal.dependency_pins, 0);
+        assert_eq!(terminal.dependency_edges, 0);
+        let blocked = fixture.broker.snapshot();
+        assert_eq!(blocked.grants, fixture.queued_snapshot.grants);
+        fixture.finish_closed("queued arena close");
+    }
+
+    #[test]
+    fn c2_close_acknowledges_only_after_external_cleanup_and_operation_close() {
+        let broker = broker();
+        let domain =
+            ObjectCellDomain::new(broker.clone(), ObjectCellConfig::scaled(32 * 1024 * 1024));
+        let arena = domain.open_arena().unwrap();
+        let object_reader = reader(1_516);
+        let pin = arena
+            .resolve((1, 0), |permit| load(&object_reader, (1, 0), permit))
+            .unwrap();
+        drop(pin);
+        let hooks = Arc::new(PausingCloseHooks {
+            entered: Barrier::new(2),
+            release: Barrier::new(2),
+        });
+        domain.set_close_hooks(hooks.clone());
+        let closing = arena.clone();
+        let close_join = thread::spawn(move || closing.close());
+        hooks.entered.wait();
+        let paused = domain.snapshot();
+        assert_eq!(paused.closes, 1);
+        assert_eq!(paused.close_acknowledgements, 0);
+        assert_eq!(broker.snapshot().active_operations, 1);
+        hooks.release.wait();
+        close_join.join().unwrap();
+        let acknowledged = domain.snapshot();
+        assert_eq!(acknowledged.closes, 1);
+        assert_eq!(acknowledged.close_acknowledgements, 1);
+        assert_eq!(broker.snapshot().active_operations, 0);
+        drop(arena);
+        assert_gate4_terminal(&domain, &broker, 1);
+    }
+
+    #[test]
+    fn c2_queued_cancelled_leader_acks_before_oldest_successor_queues_without_grant() {
+        let mut fixture = c2_queued_fixture(2);
+        let oldest = fixture.followers.remove(0);
+        let oldest_slot = oldest.slot;
+        let oldest_cancel = oldest.cancellation_handle();
+        let later = fixture.followers.remove(0);
+        let successor_generation = fixture.token.generation + 1;
+        let (successor_hooks, successor_entered, successor_action) = dependency_hook_for_generation(
+            &fixture.domain,
+            DependencyEventKind::MemberQueued,
+            successor_generation,
+        );
+        let (wait_entered, wait_action) = dependency_wait_hook(&fixture.domain);
+        let cancel = fixture.leader_cancel.clone();
+        let cancel_join = thread::spawn(move || cancel.cancel());
+        wait_entered.recv().unwrap();
+        fixture.queued_action.send(PhaseAction::Continue).unwrap();
+        wait_action.send(()).unwrap();
+        cancel_join.join().unwrap();
+        let container = fixture.container;
+        let oldest_join = thread::spawn(move || {
+            oldest.resolve_scheduled_member_synthetic(
+                container,
+                |_| panic!("cached container must hit for queued successor"),
+                |_| panic!("blocked oldest successor cannot parse"),
+            )
+        });
+        let successor = successor_entered.recv().unwrap();
+        assert_eq!(successor.token.generation, successor_generation);
+        assert_eq!(successor.token.leader_slot, oldest_slot);
+        let kinds = lock(&successor_hooks.events)
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
+        let cleanup = kinds
+            .iter()
+            .position(|kind| *kind == DependencyEventKind::CleanupAcknowledged)
+            .unwrap();
+        let queued = kinds
+            .iter()
+            .rposition(|kind| *kind == DependencyEventKind::MemberQueued)
+            .unwrap();
+        assert!(cleanup < queued);
+        let successor_snapshot = fixture.broker.snapshot();
+        assert_eq!(successor_snapshot.grants, fixture.queued_snapshot.grants);
+        assert_eq!(
+            successor_snapshot.operations[&fixture.arena.epoch()].queued,
+            1
+        );
+        assert_eq!(
+            successor_snapshot.operations[&fixture.arena.epoch()].in_flight,
+            0
+        );
+        assert_eq!(fixture.parses.load(Ordering::Relaxed), 0);
+
+        let (cancel_wait_entered, cancel_wait_action) = dependency_wait_hook(&fixture.domain);
+        let successor_cancel_join = thread::spawn(move || oldest_cancel.cancel());
+        cancel_wait_entered.recv().unwrap();
+        successor_action.send(PhaseAction::Continue).unwrap();
+        cancel_wait_action.send(()).unwrap();
+        successor_cancel_join.join().unwrap();
+        assert!(fixture.join_leader().unwrap().is_err());
+        assert!(oldest_join.join().unwrap().is_err());
+        drop(later);
+        assert_eq!(fixture.parses.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            fixture.broker.snapshot().grants,
+            fixture.queued_snapshot.grants
+        );
+        fixture.finish_open("queued FIFO successor cancellation");
+    }
+
+    #[test]
+    fn c2_queued_stale_install_take_and_publication_wait_without_mutating_exact_token() {
+        let mut fixture = c2_queued_fixture(0);
+        let stale = DependencyLeaderToken {
+            generation: fixture.token.generation + 1,
+            ..fixture.token
+        };
+        let external_cancellation = {
+            let state = lock(&fixture.cell.state);
+            let CellPhase::Loading(loading) = &state.phase else {
+                panic!("queued stale cancellation requires Loading")
+            };
+            loading.broker_cancellation.clone().unwrap()
+        };
+        let (external_cancellation, stale_install) = fixture
+            .arena
+            .inner
+            .install_member_broker_cancellation(&fixture.cell, stale, external_cancellation)
+            .expect_err("stale queued cancellation replaced exact owner");
+        assert_eq!(
+            stale_install.detail,
+            CellControlDetail::Static(CellControlTag::DependencyRejectedStale)
+        );
+        drop(external_cancellation);
+        let stale_permit = ScalarResolutionPermit::new(4_194_304);
+        let (stale_permit, stale_permit_error) = fixture
+            .arena
+            .inner
+            .install_member_permit(&fixture.cell, stale, stale_permit)
+            .expect_err("stale queued permit replaced exact owner");
+        assert_eq!(
+            stale_permit_error.detail,
+            CellControlDetail::Static(CellControlTag::DependencyRejectedStale)
+        );
+        drop(stale_permit);
+        assert!(fixture
+            .arena
+            .inner
+            .take_member_permit_after_attempt(&fixture.cell, stale)
+            .unwrap()
+            .is_none());
+
+        let attack_reader = reader(1_616);
+        let attack_permit = ScalarResolutionPermit::new(4_194_304);
+        let attack_object = load(&attack_reader, (1, 0), &attack_permit).unwrap();
+        let attack_owner = Arc::new(ResolvedObjectOwner {
+            payload: CellPayload::Object(attack_object),
+            permit: test_clone_permit(&attack_permit),
+            transition_gate: Mutex::new(()),
+            cache_backed: AtomicBool::new(false),
+            charge: Mutex::new(None),
+            self_pin: Mutex::new(None),
+        });
+        let (wait_entered, wait_action) = dependency_wait_hook(&fixture.domain);
+        let attack_inner = Arc::clone(&fixture.arena.inner);
+        let attack_cell = Arc::clone(&fixture.cell);
+        let attack_join = thread::spawn(move || {
+            attack_inner.publish_ready(
+                &attack_cell,
+                stale.leader_slot,
+                stale.generation,
+                attack_owner,
+                true,
+            );
+        });
+        let (waited_key, transition) = wait_entered.recv().unwrap();
+        assert_eq!(waited_key, fixture.cell.key);
+        assert_eq!(
+            transition,
+            DependencyTransition::Announcing {
+                token: fixture.token,
+                kind: DependencyEventKind::MemberQueued,
+            }
+        );
+        {
+            let state = lock(&fixture.cell.state);
+            let CellPhase::Loading(loading) = &state.phase else {
+                panic!("stale queued attack replaced Loading")
+            };
+            assert_eq!(loading.generation, fixture.token.generation);
+            assert_eq!(loading.leader_slot, fixture.token.leader_slot);
+            assert!(loading.broker_cancellation.is_some());
+            assert!(loading.permit.is_none());
+            assert_eq!(loading.dependency.as_ref().unwrap().token, fixture.token);
+        }
+        fixture.queued_action.send(PhaseAction::Continue).unwrap();
+        wait_action.send(()).unwrap();
+        attack_join.join().unwrap();
+        fixture.leader_cancel.cancel();
+        assert!(fixture.join_leader().unwrap().is_err());
+        fixture.finish_open("queued stale attacks");
+    }
+
+    #[test]
+    fn c2_queued_duplicate_cancellation_invariant_exact_teardown_is_sibling_safe() {
+        let mut fixture = c2_queued_fixture(0);
+        fixture.queued_action.send(PhaseAction::Continue).unwrap();
+        fixture
+            .arena
+            .inner
+            .wait_for_dependency_transition(&fixture.cell);
+        let duplicate = {
+            let state = lock(&fixture.cell.state);
+            let CellPhase::Loading(loading) = &state.phase else {
+                panic!("queued duplicate cancellation requires Loading")
+            };
+            loading.broker_cancellation.clone().unwrap()
+        };
+        let (duplicate, invariant) = fixture
+            .arena
+            .inner
+            .install_member_broker_cancellation(&fixture.cell, fixture.token, duplicate)
+            .expect_err("duplicate exact queued cancellation did not trip invariant");
+        assert_eq!(
+            invariant.detail,
+            CellControlDetail::Static(CellControlTag::DependencyStateInvariant)
+        );
+        drop(duplicate);
+
+        let terminal_cleanup = dependency_terminal_cleanup_hook(&fixture.domain);
+        let teardown_inner = Arc::clone(&fixture.arena.inner);
+        let teardown_cell = Arc::clone(&fixture.cell);
+        let token = fixture.token;
+        let teardown = thread::spawn(move || {
+            teardown_inner.close_exact_control(
+                &teardown_cell,
+                token.leader_slot,
+                token.generation,
+                invariant,
+                true,
+            )
+        });
+        assert_eq!(terminal_cleanup.recv().unwrap().0, fixture.cell.key);
+        assert!(teardown.join().unwrap());
+        assert!(fixture.join_leader().unwrap().is_err());
+        assert!(fixture.domain.snapshot().invariant_failed);
+        fixture.finish_open("queued duplicate-cancellation invariant");
+    }
+
+    fn prepared_member_dependency(
+        arena: &ObjectCellArena,
+        member: ObjectId,
+        container: ObjectId,
+    ) -> (ObjectCellRequest, Arc<Cell>, DependencyLeaderToken) {
+        let request = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let cell = Arc::clone(&request.cell);
+        let token = {
+            let mut state = lock(&cell.state);
+            let CellPhase::Loading(loading) = &mut state.phase else {
+                panic!("prepared member dependency requires a loading cell")
+            };
+            loading.leader_running = true;
+            DependencyLeaderToken {
+                key: cell.key,
+                generation: loading.generation,
+                leader_slot: loading.leader_slot,
+            }
+        };
+        let child = arena
+            .inner
+            .request_representation(container, Representation::DeclaredObjStmContainer)
+            .unwrap();
+        let child_cancellation = child.cancellation_handle();
+        match arena.inner.install_dependency_cancellation(
+            &cell,
+            token,
+            container,
+            child_cancellation,
+        ) {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("dependency preparation unexpectedly captured a hook panic"),
+            Err((_cancellation, control)) => {
+                panic!("dependency cancellation installation failed: {control:?}")
+            }
+        }
+        let pin = child
+            .resolve_object_stream(|_| panic!("prepared dependency container reloaded"))
+            .unwrap();
+        let cancellation = arena
+            .inner
+            .take_dependency_cancellation(&cell, token)
+            .unwrap()
+            .expect("prepared dependency cancellation must remain installed");
+        drop(cancellation);
+        match arena.inner.install_dependency_pin(&cell, token, pin) {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("dependency preparation unexpectedly captured a hook panic"),
+            Err((_pin, control)) => panic!("dependency pin installation failed: {control:?}"),
+        }
+        {
+            let mut state = lock(&cell.state);
+            let CellPhase::Loading(loading) = &mut state.phase else {
+                panic!("prepared dependency lost its loading phase")
+            };
+            loading.leader_running = false;
+        }
+        let snapshot = arena.inner.domain.snapshot();
+        assert_eq!(snapshot.dependency_cancellations, 0);
+        assert_eq!(snapshot.dependency_pins, 1);
+        assert_eq!(snapshot.dependency_edges, 1);
+        assert_eq!(snapshot.dependency_leaders, 1);
+        (request, cell, token)
+    }
+
+    fn assert_dependency_cleanup_failure_closed(cell: &Arc<Cell>) {
+        let state = lock(&cell.state);
+        let CellPhase::Closed(control) = &state.phase else {
+            panic!("cleanup invariant must close the exact owner")
+        };
+        assert_eq!(
+            control.detail,
+            CellControlDetail::Static(CellControlTag::DependencyStateInvariant)
+        );
+        assert!(state.dependency_transition.is_idle());
+        assert!(!state.cached);
+    }
+
+    fn assert_dependency_invariant_access(error: &AccessError) {
+        assert_eq!(error.kind, AccessKind::Backend);
+        assert_eq!(error.detail, "member dependency state invariant");
+    }
+
+    fn assert_closed_transition(
+        cell: &Arc<Cell>,
+        transition: DependencyTransition,
+        tag: CellControlTag,
+    ) {
+        let state = lock(&cell.state);
+        let CellPhase::Closed(control) = &state.phase else {
+            panic!("R7 authority requires a provisional Closed phase")
+        };
+        assert_eq!(control.detail, CellControlDetail::Static(tag));
+        assert_eq!(state.dependency_transition, transition);
+    }
+
+    fn attach_waiting_member_follower(
+        domain: &ObjectCellDomain,
+        arena: &ObjectCellArena,
+        member: ObjectId,
+    ) -> thread::JoinHandle<Result<ResolvedObjectPin, AccessError>> {
+        let follower = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let (wait_tx, wait_rx) = mpsc::channel();
+        domain.set_wait_hooks(Arc::new(SignallingWaitHooks {
+            adds: AtomicU64::new(0),
+            removes: AtomicU64::new(0),
+            entered: wait_tx,
+        }));
+        let join = thread::spawn(move || {
+            follower.resolve(|_| panic!("R7 follower must never become loader"))
+        });
+        wait_rx.recv().unwrap();
+        join
+    }
+
+    fn attach_r9_outcome_follower(
+        domain: &ObjectCellDomain,
+        arena: &ObjectCellArena,
+        member: ObjectId,
+        outcome: mpsc::Sender<R9FollowerOutcome>,
+    ) -> thread::JoinHandle<()> {
+        let follower = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let (wait_tx, wait_rx) = mpsc::channel();
+        domain.set_wait_hooks(Arc::new(SignallingWaitHooks {
+            adds: AtomicU64::new(0),
+            removes: AtomicU64::new(0),
+            entered: wait_tx,
+        }));
+        let join = thread::spawn(move || {
+            let result = follower
+                .resolve(|_| panic!("R9 follower must never become loader"))
+                .map(drop);
+            outcome.send(R9FollowerOutcome::Returned(result)).unwrap();
+        });
+        wait_rx.recv().unwrap();
+        join
+    }
+
+    fn rearm_r9_wait_observer(domain: &ObjectCellDomain, outcome: mpsc::Sender<R9FollowerOutcome>) {
+        domain.set_dependency_wait_hooks(Arc::new(ReportingDependencyWaitHooks { outcome }));
+    }
+
+    fn expect_r9_waited(
+        outcome: &mpsc::Receiver<R9FollowerOutcome>,
+        expected: DependencyTransition,
+    ) {
+        match outcome.recv().unwrap() {
+            R9FollowerOutcome::Waited(transition) => assert_eq!(transition, expected),
+            R9FollowerOutcome::Returned(_) => {
+                panic!("follower returned before caller-owned terminal cleanup")
+            }
+        }
+    }
+
+    fn expect_r9_returned(outcome: &mpsc::Receiver<R9FollowerOutcome>) -> Result<(), AccessError> {
+        match outcome.recv().unwrap() {
+            R9FollowerOutcome::Returned(result) => result,
+            R9FollowerOutcome::Waited(transition) => {
+                panic!("unexpected additional transition wait: {transition:?}")
+            }
+        }
+    }
+
+    fn force_dependency_follower_wait(
+        domain: &ObjectCellDomain,
+        cell: &Arc<Cell>,
+        expected: DependencyTransition,
+    ) {
+        let (wait_entered, wait_action) = dependency_wait_hook(domain);
+        cell.ready.notify_all();
+        let (key, transition) = wait_entered.recv().unwrap();
+        assert_eq!(key, cell.key);
+        assert_eq!(transition, expected);
+        wait_action.send(()).unwrap();
+    }
+
+    fn establish_r10_condvar_wait(
+        domain: &ObjectCellDomain,
+        cell: &Arc<Cell>,
+        transition: DependencyTransition,
+    ) {
+        let (pre_wait_entered, pre_wait_action) = dependency_pre_wait_hook(domain);
+        force_dependency_follower_wait(domain, cell, transition);
+        let (key, observed) = pre_wait_entered.recv().unwrap();
+        assert_eq!(key, cell.key);
+        assert_eq!(observed, transition);
+        pre_wait_action.send(()).unwrap();
+        let state = lock(&cell.state);
+        assert_eq!(state.dependency_transition, transition);
+        drop(state);
+    }
+
     impl LeaderPhaseHooks for PausingLeaderPhaseHooks {
         fn enter(&self, phase: LeaderPhase) {
             if phase != self.target || !self.armed.swap(false, Ordering::AcqRel) {
@@ -5723,7 +10245,7 @@ mod tests {
             container_arena.close();
             drop(raw_arena);
             drop(container_arena);
-            assert_gate4_terminal(&domain, &broker);
+            assert_gate4_terminal(&domain, &broker, 2);
         }
 
         {
@@ -5799,7 +10321,7 @@ mod tests {
             raw_arena.close();
             drop(container_arena);
             drop(raw_arena);
-            assert_gate4_terminal(&domain, &broker);
+            assert_gate4_terminal(&domain, &broker, 2);
         }
     }
 
@@ -6006,7 +10528,7 @@ mod tests {
         arena.close();
         drop(arena);
         assert_eq!(reload_permit.stats().current_bytes, 0);
-        assert_gate4_terminal(&domain, &broker);
+        assert_gate4_terminal(&domain, &broker, 1);
     }
 
     #[test]
@@ -6095,7 +10617,7 @@ mod tests {
         sibling_arena.close();
         drop(stale_arena);
         drop(sibling_arena);
-        assert_gate4_terminal(&domain, &broker);
+        assert_gate4_terminal(&domain, &broker, 2);
     }
 
     #[test]
@@ -6195,7 +10717,7 @@ mod tests {
         sibling_arena.close();
         drop(stale_arena);
         drop(sibling_arena);
-        assert_gate4_terminal(&domain, &broker);
+        assert_gate4_terminal(&domain, &broker, 2);
     }
 
     #[test]
@@ -6787,7 +11309,7 @@ mod tests {
                 u64::from(needs_follower)
             );
             drop(arena);
-            assert_gate4_terminal(&domain, &broker);
+            assert_gate4_terminal(&domain, &broker, 1);
         }
     }
 
@@ -6832,7 +11354,7 @@ mod tests {
             drop(pin);
             assert_eq!(retained_permit.stats().current_bytes, 0);
             drop(arena);
-            assert_gate4_terminal(&domain, &broker);
+            assert_gate4_terminal(&domain, &broker, 1);
         }
 
         {
@@ -6873,7 +11395,7 @@ mod tests {
             assert_gate4_held_after_close(&domain, &broker, epoch, retained, 0, retained, 0);
             drop(error);
             drop(arena);
-            assert_gate4_terminal(&domain, &broker);
+            assert_gate4_terminal(&domain, &broker, 1);
         }
 
         {
@@ -6930,7 +11452,7 @@ mod tests {
             drop(second);
             drop(first);
             drop(arena);
-            assert_gate4_terminal(&domain, &broker);
+            assert_gate4_terminal(&domain, &broker, 1);
         }
 
         {
@@ -6973,7 +11495,7 @@ mod tests {
             drop(pin);
             assert_eq!(retained_permit.stats().current_bytes, 0);
             drop(arena);
-            assert_gate4_terminal(&domain, &broker);
+            assert_gate4_terminal(&domain, &broker, 1);
         }
     }
 
@@ -7103,7 +11625,7 @@ mod tests {
             assert_eq!(hit_permit.stats().current_bytes, 0);
             drop(arena_a);
             drop(arena_b);
-            assert_gate4_terminal(&domain, &broker);
+            assert_gate4_terminal(&domain, &broker, 2);
         }
 
         {
@@ -7209,7 +11731,7 @@ mod tests {
             arena_b.close();
             drop(arena_a);
             drop(arena_b);
-            assert_gate4_terminal(&domain, &broker);
+            assert_gate4_terminal(&domain, &broker, 2);
         }
 
         {
@@ -7357,7 +11879,7 @@ mod tests {
             arena_b.close();
             drop(arena_a);
             drop(arena_b);
-            assert_gate4_terminal(&domain, &broker);
+            assert_gate4_terminal(&domain, &broker, 2);
         }
 
         {
@@ -7489,7 +12011,7 @@ mod tests {
             arena_b.close();
             drop(arena_a);
             drop(arena_b);
-            assert_gate4_terminal(&domain, &broker);
+            assert_gate4_terminal(&domain, &broker, 2);
         }
     }
 
@@ -7980,5 +12502,3752 @@ mod tests {
         drop(cell);
         drop(arena);
         assert_eq!(broker.snapshot().aggregate_bytes, 0);
+    }
+
+    #[test]
+    fn c1_dependency_blocks_member_admission_and_cleans_with_balanced_edges() {
+        let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+        let (hooks, entered, action) =
+            dependency_hook(&domain, DependencyEventKind::InsideChildResolve);
+        let request = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let broker_before = broker.snapshot();
+        let join = thread::spawn(move || request.resolve_dependency_synthetic(container));
+        let blocked = entered.recv().unwrap();
+        assert_eq!(blocked.kind, DependencyEventKind::InsideChildResolve);
+
+        let cells = domain.snapshot();
+        assert_eq!(cells.dependency_cancellations, 1);
+        assert_eq!(cells.dependency_pins, 0);
+        assert_eq!(cells.dependency_edges, 1);
+        assert_eq!(cells.dependency_leaders, 1);
+        assert_eq!(cells.dependency_edge_adds, 1);
+        assert_eq!(cells.dependency_edge_removes, 0);
+        assert_eq!(cells.members.loads, 0);
+        let broker_blocked = broker.snapshot();
+        assert_eq!(broker_blocked, broker_before);
+        assert_eq!(
+            lock(&hooks.events)
+                .iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                DependencyEventKind::BeforeChildInstall,
+                DependencyEventKind::EdgeAdded,
+                DependencyEventKind::InsideChildResolve,
+            ]
+        );
+
+        action.send(PhaseAction::Continue).unwrap();
+        join.join().unwrap().unwrap();
+        let finished = domain.snapshot();
+        assert_eq!(finished.dependency_cancellations, 0);
+        assert_eq!(finished.dependency_pins, 0);
+        assert_eq!(finished.dependency_edges, 0);
+        assert_eq!(finished.dependency_leaders, 0);
+        assert_eq!(finished.dependency_edge_adds, 1);
+        assert_eq!(finished.dependency_edge_removes, 1);
+        assert_eq!(finished.dependency_cleanup_acks, 1);
+        assert_eq!(finished.members.loads, 0);
+        let events = lock(&hooks.events);
+        assert_eq!(
+            events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            vec![
+                DependencyEventKind::BeforeChildInstall,
+                DependencyEventKind::EdgeAdded,
+                DependencyEventKind::InsideChildResolve,
+                DependencyEventKind::ChildResolved,
+                DependencyEventKind::PinInstalled,
+                DependencyEventKind::BeforeMemberAdmission,
+                DependencyEventKind::CleanupDetached,
+                DependencyEventKind::EdgeRemoved,
+                DependencyEventKind::CleanupAcknowledged,
+            ]
+        );
+        assert!(events
+            .windows(2)
+            .all(|window| window[0].ordinal < window[1].ordinal));
+        assert!(hooks.lock_probes.load(Ordering::Relaxed) >= 8);
+        drop(events);
+        arena.close();
+        drop(arena);
+        assert_gate4_terminal(&domain, &broker, 1);
+    }
+
+    #[test]
+    fn c1_active_leader_cleanup_ack_precedes_exactly_one_fifo_successor() {
+        let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+        let (_leader_hooks, entered, action) =
+            dependency_hook(&domain, DependencyEventKind::InsideChildResolve);
+        let leader = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let leader_cell = Arc::clone(&leader.cell);
+        let leader_cancel = leader.cancellation_handle();
+        let first_follower = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let first_slot = first_follower.slot;
+        let first_ordinal = first_follower.ordinal;
+        let later_follower = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let later_cancel = later_follower.cancellation_handle();
+        let leader_join = thread::spawn(move || leader.resolve_dependency_synthetic(container));
+        let first_join =
+            thread::spawn(move || first_follower.resolve_dependency_synthetic(container));
+        let later_join =
+            thread::spawn(move || later_follower.resolve_dependency_synthetic(container));
+        let old = entered.recv().unwrap().token;
+
+        let (hooks, successor_entered, successor_action) =
+            dependency_hook(&domain, DependencyEventKind::SuccessorElected);
+        {
+            let state = lock(&leader_cell.state);
+            let CellPhase::Loading(loading) = &state.phase else {
+                panic!("active dependency leader must remain loading")
+            };
+            loading.cancellation.store(true, Ordering::Release);
+        }
+        let cancel_join = thread::spawn(move || leader_cancel.cancel());
+        action.send(PhaseAction::Continue).unwrap();
+        let successor_event = successor_entered.recv().unwrap();
+        let successor = successor_event
+            .successor
+            .expect("successor event carries selected identity");
+        assert_eq!(successor_event.token, old);
+        assert_eq!(successor.generation, old.generation + 1);
+        assert_eq!(successor.leader_slot, first_slot);
+        assert_eq!(successor.interest_ordinal, first_ordinal);
+        assert!(!lock(&hooks.events).iter().any(|event| {
+            event.token.generation == successor.generation
+                && event.kind == DependencyEventKind::BeforeChildInstall
+        }));
+        later_cancel.cancel();
+        successor_action.send(PhaseAction::Continue).unwrap();
+        cancel_join.join().unwrap();
+        assert!(leader_join.join().unwrap().is_err());
+        first_join.join().unwrap().unwrap();
+        assert!(later_join.join().unwrap().is_err());
+
+        let events = lock(&hooks.events);
+        let cleanup_ordinal = events
+            .iter()
+            .find(|event| {
+                event.kind == DependencyEventKind::CleanupAcknowledged && event.token == old
+            })
+            .expect("active leader cancellation must acknowledge dependency cleanup")
+            .ordinal;
+        let successors: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.kind == DependencyEventKind::SuccessorElected && event.token == old
+            })
+            .collect();
+        assert_eq!(successors.len(), 1);
+        assert!(cleanup_ordinal < successors[0].ordinal);
+        let snapshot = domain.snapshot();
+        assert_eq!(snapshot.dependency_edges, 0);
+        assert_eq!(snapshot.dependency_leaders, 0);
+        assert_eq!(snapshot.dependency_edge_adds, 2);
+        assert_eq!(snapshot.dependency_edge_removes, 2);
+        assert_eq!(snapshot.dependency_cleanup_acks, 2);
+        assert_eq!(snapshot.members.loads, 0);
+        drop(events);
+        drop(leader_cell);
+        arena.close();
+        drop(arena);
+        assert_gate4_terminal(&domain, &broker, 1);
+    }
+
+    #[test]
+    fn c1_follower_cancellation_never_takes_leader_dependency() {
+        let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+        let (hooks, entered, action) =
+            dependency_hook(&domain, DependencyEventKind::InsideChildResolve);
+        let leader = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let follower = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let follower_cancel = follower.cancellation_handle();
+        let leader_join = thread::spawn(move || leader.resolve_dependency_synthetic(container));
+        entered.recv().unwrap();
+
+        follower_cancel.cancel();
+        let paused = domain.snapshot();
+        assert_eq!(paused.dependency_cancellations, 1);
+        assert_eq!(paused.dependency_edges, 1);
+        assert_eq!(paused.dependency_leaders, 1);
+        assert_eq!(paused.dependency_cleanup_acks, 0);
+        assert!(!lock(&hooks.events)
+            .iter()
+            .any(|event| event.kind == DependencyEventKind::CleanupAcknowledged));
+        drop(follower);
+
+        action.send(PhaseAction::Continue).unwrap();
+        leader_join.join().unwrap().unwrap();
+        let snapshot = domain.snapshot();
+        assert_eq!(snapshot.dependency_edges, 0);
+        assert_eq!(snapshot.dependency_leaders, 0);
+        assert_eq!(snapshot.dependency_edge_adds, 1);
+        assert_eq!(snapshot.dependency_edge_removes, 1);
+        assert_eq!(snapshot.dependency_cleanup_acks, 1);
+        arena.close();
+        drop(arena);
+        assert_gate4_terminal(&domain, &broker, 1);
+    }
+
+    #[test]
+    fn c1_panic_and_close_detach_dependency_resources_outside_locks() {
+        for target in [
+            DependencyEventKind::BeforeChildInstall,
+            DependencyEventKind::EdgeAdded,
+            DependencyEventKind::InsideChildResolve,
+            DependencyEventKind::ChildResolved,
+            DependencyEventKind::PinInstalled,
+            DependencyEventKind::BeforeMemberAdmission,
+            DependencyEventKind::CleanupDetached,
+            DependencyEventKind::EdgeRemoved,
+            DependencyEventKind::CleanupAcknowledged,
+            DependencyEventKind::SuccessorElected,
+        ] {
+            let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+            let (hooks, entered, action) = dependency_hook(&domain, target);
+            let leader = arena
+                .inner
+                .request_representation(member, Representation::DeclaredObjStmMember)
+                .unwrap();
+            let follower = (target == DependencyEventKind::SuccessorElected).then(|| {
+                arena
+                    .inner
+                    .request_representation(member, Representation::DeclaredObjStmMember)
+                    .unwrap()
+            });
+            let join = thread::spawn(move || leader.resolve_dependency_synthetic(container));
+            let follower_join = follower.map(|follower| {
+                thread::spawn(move || follower.resolve_dependency_synthetic(container))
+            });
+            entered.recv().unwrap();
+            action.send(PhaseAction::Panic).unwrap();
+            assert!(
+                join.join().is_err(),
+                "hook panic did not propagate at {target:?}"
+            );
+            if let Some(follower_join) = follower_join {
+                follower_join.join().unwrap().unwrap();
+            }
+            let snapshot = domain.snapshot();
+            assert_eq!(snapshot.dependency_cancellations, 0);
+            assert_eq!(snapshot.dependency_pins, 0);
+            assert_eq!(snapshot.dependency_edges, 0);
+            assert_eq!(snapshot.dependency_leaders, 0);
+            assert_eq!(
+                snapshot.dependency_edge_adds,
+                snapshot.dependency_edge_removes
+            );
+            assert_eq!(
+                snapshot.dependency_edge_adds,
+                snapshot.dependency_edge_removes
+            );
+            assert!(hooks.lock_probes.load(Ordering::Relaxed) >= 1);
+            arena.close();
+            drop(arena);
+            assert_gate4_terminal(&domain, &broker, 1);
+        }
+    }
+
+    #[test]
+    fn c1_close_and_exact_teardown_join_detached_cleanup_before_returning() {
+        for close_arena in [true, false] {
+            let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+            let (_hooks, detached_entered, detached_action) =
+                dependency_hook(&domain, DependencyEventKind::CleanupDetached);
+            let request = arena
+                .inner
+                .request_representation(member, Representation::DeclaredObjStmMember)
+                .unwrap();
+            let cell = Arc::clone(&request.cell);
+            let leader_slot = request.slot;
+            let leader_join =
+                thread::spawn(move || request.resolve_dependency_synthetic(container));
+            let detached = detached_entered.recv().unwrap();
+            assert_eq!(
+                lock(&cell.state).dependency_transition,
+                DependencyTransition::Cleaning(detached.token)
+            );
+
+            let (wait_entered, wait_action) = dependency_wait_hook(&domain);
+            if close_arena {
+                let closer = arena.clone();
+                let terminal_join = thread::spawn(move || closer.close());
+                let (key, transition) = wait_entered.recv().unwrap();
+                assert_eq!(key, cell.key);
+                assert_eq!(transition, DependencyTransition::Cleaning(detached.token));
+                detached_action.send(PhaseAction::Continue).unwrap();
+                wait_action.send(()).unwrap();
+                terminal_join.join().unwrap();
+            } else {
+                let inner = Arc::clone(&arena.inner);
+                let teardown_cell = Arc::clone(&cell);
+                let terminal_join = thread::spawn(move || {
+                    inner.teardown_exact_key(
+                        &teardown_cell,
+                        ExactPhaseExpectation::Loading {
+                            leader_slot: Some(leader_slot),
+                            generation: Some(detached.token.generation),
+                            require_publication: false,
+                        },
+                        CellControlFailure::new(
+                            teardown_cell.key.id,
+                            AccessKind::Backend,
+                            CellControlTag::FlightCancelled,
+                        ),
+                        false,
+                    )
+                });
+                let (key, transition) = wait_entered.recv().unwrap();
+                assert_eq!(key, cell.key);
+                assert_eq!(transition, DependencyTransition::Cleaning(detached.token));
+                detached_action.send(PhaseAction::Continue).unwrap();
+                wait_action.send(()).unwrap();
+                let _won_exact_race = terminal_join.join().unwrap();
+            }
+            let _ = leader_join.join().unwrap();
+            let snapshot = domain.snapshot();
+            assert_eq!(snapshot.dependency_cancellations, 0);
+            assert_eq!(snapshot.dependency_pins, 0);
+            assert_eq!(snapshot.dependency_edges, 0);
+            assert_eq!(snapshot.dependency_leaders, 0);
+            assert_eq!(
+                snapshot.dependency_edge_adds,
+                snapshot.dependency_edge_removes
+            );
+            assert_eq!(snapshot.dependency_cleanup_acks, 1);
+            assert!(lock(&cell.state).dependency_transition.is_idle());
+            drop(cell);
+            arena.close();
+            drop(arena);
+            assert_gate4_terminal(&domain, &broker, 1);
+        }
+    }
+
+    #[test]
+    fn c1_lock_depth_observer_is_caller_local_and_condvar_safe() {
+        let (_broker, domain, _arena, member, container) = prepared_dependency_fixture();
+        assert_eq!(caller_thread_lock_depth(), 0);
+        {
+            let _guard = lock(&domain.inner.state);
+            assert_eq!(caller_thread_lock_depth(), 1);
+        }
+        assert_eq!(caller_thread_lock_depth(), 0);
+
+        let (held_tx, held_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let inner = Arc::clone(&domain.inner);
+        let holder = thread::spawn(move || {
+            let _guard = lock(&inner.state);
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+        assert_eq!(caller_thread_lock_depth(), 0);
+        let (hooks, _entered, _action) = dependency_hook(&domain, DependencyEventKind::EdgeAdded);
+        hooks.event(DependencyEvent {
+            token: DependencyLeaderToken {
+                key: CellKey {
+                    epoch: 1,
+                    id: member,
+                    representation: Representation::DeclaredObjStmMember,
+                },
+                generation: 1,
+                leader_slot: 0,
+            },
+            edge: DependencyEdge {
+                from: CellKey {
+                    epoch: 1,
+                    id: member,
+                    representation: Representation::DeclaredObjStmMember,
+                },
+                to: CellKey {
+                    epoch: 1,
+                    id: container,
+                    representation: Representation::DeclaredObjStmContainer,
+                },
+            },
+            kind: DependencyEventKind::BeforeChildInstall,
+            ordinal: 1,
+            successor: None,
+        });
+        assert_eq!(hooks.lock_probes.load(Ordering::Relaxed), 1);
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn c1_checked_event_ordinal_and_install_add_boundaries_are_transactional() {
+        let (_broker, domain, arena, member, container) = prepared_dependency_fixture();
+        let token = DependencyLeaderToken {
+            key: CellKey {
+                epoch: arena.epoch(),
+                id: member,
+                representation: Representation::DeclaredObjStmMember,
+            },
+            generation: 1,
+            leader_slot: 0,
+        };
+        let edge = DependencyEdge {
+            from: token.key,
+            to: CellKey {
+                epoch: arena.epoch(),
+                id: container,
+                representation: Representation::DeclaredObjStmContainer,
+            },
+        };
+        {
+            let mut state = lock(&domain.inner.state);
+            state.dependency_event_ordinal = u64::MAX - 1;
+            let last = DomainInner::dependency_event_locked(
+                &mut state,
+                token,
+                edge,
+                DependencyEventKind::BeforeChildInstall,
+                None,
+            )
+            .unwrap();
+            assert_eq!(last.ordinal, u64::MAX);
+            assert!(DomainInner::dependency_event_locked(
+                &mut state,
+                token,
+                edge,
+                DependencyEventKind::EdgeAdded,
+                None,
+            )
+            .is_none());
+            assert_eq!(state.dependency_event_ordinal, u64::MAX);
+            assert!(state.invariant_failed);
+        }
+        arena.close();
+
+        let (_broker, domain, arena, member, container) = prepared_dependency_fixture();
+        let (_hooks, entered, action) =
+            dependency_hook(&domain, DependencyEventKind::BeforeChildInstall);
+        let request = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let join = thread::spawn(move || request.resolve_dependency_synthetic(container));
+        entered.recv().unwrap();
+        {
+            let mut state = lock(&domain.inner.state);
+            state.dependency_edge_adds = u64::MAX;
+        }
+        action.send(PhaseAction::Continue).unwrap();
+        assert!(join.join().unwrap().is_err());
+        let state = domain.snapshot();
+        assert_eq!(state.dependency_edge_adds, u64::MAX);
+        assert_eq!(state.dependency_edges, 0);
+        assert_eq!(state.dependency_leaders, 0);
+        assert!(state.invariant_failed);
+        arena.close();
+    }
+
+    #[test]
+    fn c1_checked_cleanup_boundaries_never_manufacture_balance_or_successor() {
+        for case in 0..6 {
+            let (_broker, domain, arena, member, container) = prepared_dependency_fixture();
+            let target = if case == 5 {
+                DependencyEventKind::BeforeMemberAdmission
+            } else {
+                DependencyEventKind::InsideChildResolve
+            };
+            let (hooks, entered, action) = dependency_hook(&domain, target);
+            let request = arena
+                .inner
+                .request_representation(member, Representation::DeclaredObjStmMember)
+                .unwrap();
+            let cell = Arc::clone(&request.cell);
+            let join = thread::spawn(move || request.resolve_dependency_synthetic(container));
+            entered.recv().unwrap();
+            {
+                let mut state = lock(&domain.inner.state);
+                match case {
+                    0 => state.dependency_cancellations = 0,
+                    1 => state.dependency_edges = 0,
+                    2 => state.dependency_leaders = 0,
+                    3 => state.dependency_edge_removes = u64::MAX,
+                    4 => state.dependency_cleanup_acks = u64::MAX,
+                    5 => state.dependency_pins = 0,
+                    _ => unreachable!(),
+                }
+            }
+            {
+                let state = lock(&cell.state);
+                let CellPhase::Loading(loading) = &state.phase else {
+                    panic!("boundary dependency must remain loading")
+                };
+                loading.cancellation.store(true, Ordering::Release);
+            }
+            action.send(PhaseAction::Continue).unwrap();
+            assert!(
+                join.join().unwrap().is_err(),
+                "boundary case {case} succeeded"
+            );
+            let snapshot = domain.snapshot();
+            assert!(snapshot.invariant_failed);
+            assert!(
+                snapshot.dependency_edges != 0
+                    || snapshot.dependency_leaders != 0
+                    || snapshot.dependency_edge_adds != snapshot.dependency_edge_removes
+                    || snapshot.dependency_cleanup_acks == u64::MAX
+                    || snapshot.dependency_cancellations != 0
+                    || snapshot.dependency_pins != 0
+            );
+            assert!(!lock(&hooks.events)
+                .iter()
+                .any(|event| event.kind == DependencyEventKind::SuccessorElected));
+            arena.close();
+        }
+    }
+
+    #[test]
+    fn c1_interest_slot_zero_and_max_attach_are_transactional_and_fixed() {
+        assert!(!EMPTY_INTEREST.is_active());
+        assert_eq!(std::mem::size_of::<InterestSlot>(), 16);
+        assert_eq!(
+            std::mem::size_of_val(&DomainState::default().dependency_leaders),
+            std::mem::size_of::<usize>()
+        );
+        assert!(CELL_FIXED_STRUCTURAL_BYTES <= CELL_BASE_METADATA_BYTES as usize);
+
+        let (broker, domain, arena, member, _container) = prepared_dependency_fixture();
+        let request = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let before = domain.snapshot();
+        let (leader_slot, leader_generation, live_interests) = {
+            let mut state = lock(&request.cell.state);
+            state.next_interest_ordinal = u64::MAX;
+            let CellPhase::Loading(loading) = &state.phase else {
+                panic!("member cell must be loading")
+            };
+            (
+                loading.leader_slot,
+                loading.generation,
+                state.live_interests,
+            )
+        };
+        let Err(failure) = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+        else {
+            panic!("MAX ordinal must refuse before slot mutation")
+        };
+        assert_eq!(
+            failure.detail,
+            CellControlDetail::Static(CellControlTag::InterestOrdinalOverflow)
+        );
+        let state = lock(&request.cell.state);
+        assert_eq!(state.next_interest_ordinal, u64::MAX);
+        assert_eq!(state.live_interests, live_interests);
+        assert_eq!(
+            state
+                .interests
+                .iter()
+                .filter(|slot| slot.is_active())
+                .count(),
+            1
+        );
+        let CellPhase::Loading(loading) = &state.phase else {
+            panic!("failed attach cannot replace loading phase")
+        };
+        assert_eq!(loading.leader_slot, leader_slot);
+        assert_eq!(loading.generation, leader_generation);
+        drop(state);
+        let after = domain.snapshot();
+        assert_eq!(after.live_interests, before.live_interests);
+        drop(request);
+        arena.close();
+        drop(arena);
+        assert_gate4_terminal(&domain, &broker, 1);
+    }
+
+    #[test]
+    fn c1_stale_tokens_and_exact_teardown_cannot_touch_current_dependency() {
+        let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+        let (_old_hooks, entered, action) =
+            dependency_hook(&domain, DependencyEventKind::InsideChildResolve);
+        let leader = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let cell = Arc::clone(&leader.cell);
+        let leader_cancel = leader.cancellation_handle();
+        let follower = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let leader_join = thread::spawn(move || leader.resolve_dependency_synthetic(container));
+        let follower_join = thread::spawn(move || follower.resolve_dependency_synthetic(container));
+        let stale = entered.recv().unwrap().token;
+
+        let (_edge_hooks, edge_entered, edge_action) = dependency_hook_for_generation(
+            &domain,
+            DependencyEventKind::EdgeAdded,
+            stale.generation + 1,
+        );
+        {
+            let state = lock(&cell.state);
+            let CellPhase::Loading(loading) = &state.phase else {
+                panic!("old dependency leader must remain loading")
+            };
+            loading.cancellation.store(true, Ordering::Release);
+        }
+        let cancel_join = thread::spawn(move || leader_cancel.cancel());
+        action.send(PhaseAction::Continue).unwrap();
+        let successor_edge = edge_entered.recv().unwrap();
+        assert_eq!(successor_edge.token.generation, stale.generation + 1);
+
+        let stale_child = arena
+            .inner
+            .request_representation(container, Representation::DeclaredObjStmContainer)
+            .unwrap();
+        let stale_cancellation = stale_child.cancellation_handle();
+        let Err((stale_cancellation, control)) = arena.inner.install_dependency_cancellation(
+            &cell,
+            stale,
+            container,
+            stale_cancellation,
+        ) else {
+            panic!("stale dependency token installed a cancellation handle")
+        };
+        assert_eq!(
+            control.detail,
+            CellControlDetail::Static(CellControlTag::DependencyRejectedStale)
+        );
+        drop(stale_cancellation);
+        drop(stale_child);
+
+        let attack_pin = arena
+            .resolve_object_stream(container, |_| {
+                panic!("prepared dependency container unexpectedly reloaded")
+            })
+            .unwrap();
+        let (attack_pin, control) = arena
+            .inner
+            .install_dependency_pin(&cell, stale, attack_pin)
+            .expect_err("stale dependency token installed a build pin");
+        assert_eq!(
+            control.detail,
+            CellControlDetail::Static(CellControlTag::DependencyRejectedStale)
+        );
+        drop(attack_pin);
+        assert!(arena
+            .inner
+            .take_dependency_cancellation(&cell, stale)
+            .unwrap()
+            .is_none());
+        let unchanged = domain.snapshot();
+        assert_eq!(unchanged.dependency_cancellations, 1);
+        assert_eq!(unchanged.dependency_pins, 0);
+        assert_eq!(unchanged.dependency_edges, 1);
+        assert_eq!(unchanged.dependency_leaders, 1);
+        {
+            let state = lock(&cell.state);
+            let CellPhase::Loading(loading) = &state.phase else {
+                panic!("successor must remain loading")
+            };
+            let dependency = loading.dependency.as_ref().unwrap();
+            assert_eq!(dependency.token, successor_edge.token);
+            assert!(dependency.cancellation.is_some());
+        }
+
+        let (_pin_hooks, pin_entered, pin_action) = dependency_hook_for_generation(
+            &domain,
+            DependencyEventKind::PinInstalled,
+            stale.generation + 1,
+        );
+        edge_action.send(PhaseAction::Continue).unwrap();
+        let successor_pin_event = pin_entered.recv().unwrap();
+        assert_eq!(successor_pin_event.token, successor_edge.token);
+        let successor_pin_pointer = {
+            let state = lock(&cell.state);
+            let CellPhase::Loading(loading) = &state.phase else {
+                panic!("successor must remain loading")
+            };
+            loading
+                .dependency
+                .as_ref()
+                .and_then(|dependency| dependency.pin.as_ref())
+                .unwrap()
+                .pointer()
+        };
+        assert!(arena
+            .inner
+            .take_dependency_cancellation(&cell, stale)
+            .unwrap()
+            .is_none());
+        let attack_pin = arena
+            .resolve_object_stream(container, |_| panic!("prepared container reloaded"))
+            .unwrap();
+        let (attack_pin, control) = arena
+            .inner
+            .install_dependency_pin(&cell, stale, attack_pin)
+            .expect_err("old token installed over successor pin");
+        assert_eq!(
+            control.detail,
+            CellControlDetail::Static(CellControlTag::DependencyRejectedStale)
+        );
+        drop(attack_pin);
+        {
+            let state = lock(&cell.state);
+            let CellPhase::Loading(loading) = &state.phase else {
+                panic!("successor must remain loading")
+            };
+            let dependency = loading.dependency.as_ref().unwrap();
+            assert_eq!(dependency.token, successor_edge.token);
+            assert_eq!(
+                dependency.pin.as_ref().unwrap().pointer(),
+                successor_pin_pointer
+            );
+        }
+        let pinned = domain.snapshot();
+        assert_eq!(pinned.dependency_cancellations, 0);
+        assert_eq!(pinned.dependency_pins, 1);
+        assert_eq!(pinned.dependency_edges, 1);
+        assert_eq!(pinned.dependency_leaders, 1);
+
+        pin_action.send(PhaseAction::Continue).unwrap();
+        cancel_join.join().unwrap();
+        assert!(leader_join.join().unwrap().is_err());
+        follower_join.join().unwrap().unwrap();
+        let drained = domain.snapshot();
+        assert_eq!(drained.dependency_cancellations, 0);
+        assert_eq!(drained.dependency_pins, 0);
+        assert_eq!(drained.dependency_edges, 0);
+        assert_eq!(drained.dependency_leaders, 0);
+        assert!(!drained.invariant_failed);
+        assert!(arena.has_container_cell(container));
+        drop(cell);
+        arena.close();
+        drop(arena);
+        assert_gate4_terminal(&domain, &broker, 1);
+    }
+
+    #[test]
+    fn c1_r6_ready_cleanup_failure_rolls_back_before_visibility_and_preserves_hook_panic() {
+        let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+        let (object_reader, loaded_member, loaded_container, _) = object_stream_reader();
+        assert_eq!((loaded_member, loaded_container), (member, container));
+        let sibling_reader = reader(601);
+        let sibling = arena
+            .resolve((1, 0), |permit| load(&sibling_reader, (1, 0), permit))
+            .unwrap();
+        let sibling_pointer = sibling.pointer();
+        drop(sibling);
+
+        let (leader, cell, token) = prepared_member_dependency(&arena, member, container);
+        let follower = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let (ordinary_wait_tx, ordinary_wait_rx) = mpsc::channel();
+        domain.set_wait_hooks(Arc::new(SignallingWaitHooks {
+            adds: AtomicU64::new(0),
+            removes: AtomicU64::new(0),
+            entered: ordinary_wait_tx,
+        }));
+        let follower_join = thread::spawn(move || {
+            follower.resolve(|_| panic!("follower must never load or observe rolled-back Ready"))
+        });
+        ordinary_wait_rx.recv().unwrap();
+
+        {
+            let mut state = lock(&domain.inner.state);
+            state.dependency_cleanup_acks = u64::MAX;
+        }
+        let (_cleanup_hooks, cleanup_entered, cleanup_action) =
+            dependency_hook(&domain, DependencyEventKind::CleanupDetached);
+        let leader_join =
+            thread::spawn(move || leader.resolve(|permit| load(&object_reader, member, permit)));
+        let detached = cleanup_entered.recv().unwrap();
+        assert_eq!(detached.token, token);
+        {
+            let state = lock(&cell.state);
+            assert!(matches!(state.phase, CellPhase::Ready(_)));
+            assert_eq!(
+                state.dependency_transition,
+                DependencyTransition::Cleaning(token)
+            );
+        }
+
+        let (visibility_entered, visibility_action) = dependency_wait_hook(&domain);
+        cell.ready.notify_all();
+        let (waited_key, waited_transition) = visibility_entered.recv().unwrap();
+        assert_eq!(waited_key, cell.key);
+        assert_eq!(waited_transition, DependencyTransition::Cleaning(token));
+        cleanup_action.send(PhaseAction::Panic).unwrap();
+        assert!(leader_join.join().is_err());
+        visibility_action.send(()).unwrap();
+        assert!(follower_join.join().unwrap().is_err());
+        assert_dependency_cleanup_failure_closed(&cell);
+        assert!(domain.snapshot().invariant_failed);
+
+        let sibling = arena
+            .resolve((1, 0), |_| panic!("unrelated cached sibling reloaded"))
+            .unwrap();
+        assert_eq!(sibling.pointer(), sibling_pointer);
+        drop(sibling);
+        drop(cell);
+        arena.close();
+        drop(arena);
+        assert_eq!(broker.snapshot().aggregate_bytes, 0);
+        assert_eq!(broker.snapshot().active_operations, 0);
+    }
+
+    #[test]
+    fn c1_r6_persistent_negative_cleanup_failure_rolls_back_exact_owner() {
+        let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+        let (request, cell, _token) = prepared_member_dependency(&arena, member, container);
+        {
+            let mut state = lock(&domain.inner.state);
+            state.dependency_event_ordinal = u64::MAX;
+        }
+        let error = request
+            .resolve(|_| {
+                Err(CellLoadError::new(
+                    AccessError::typed(member, AccessKind::Backend, "persistent R6 authority"),
+                    NegativeDisposition::Persistent,
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind, AccessKind::Backend);
+        assert_dependency_cleanup_failure_closed(&cell);
+        let snapshot = domain.snapshot();
+        assert!(snapshot.invariant_failed);
+        assert_eq!(snapshot.negative, 0);
+        assert!(!lock(&domain.inner.state).cells.contains_key(&cell.key));
+        drop(cell);
+        arena.close();
+        drop(arena);
+        assert_eq!(broker.snapshot().aggregate_bytes, 0);
+        assert_eq!(broker.snapshot().active_operations, 0);
+    }
+
+    #[test]
+    fn c1_r6_flight_error_cleanup_failure_closes_map_removed_owner() {
+        let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+        let (request, cell, _token) = prepared_member_dependency(&arena, member, container);
+        {
+            let mut state = lock(&domain.inner.state);
+            state.dependency_event_ordinal = u64::MAX;
+        }
+        let error = request
+            .resolve(|_| Err(transient(member, "flight-only R6 authority")))
+            .unwrap_err();
+        assert_eq!(error.kind, AccessKind::Backend);
+        assert_dependency_cleanup_failure_closed(&cell);
+        let snapshot = domain.snapshot();
+        assert!(snapshot.invariant_failed);
+        assert_eq!(snapshot.negative, 0);
+        assert!(!lock(&domain.inner.state).cells.contains_key(&cell.key));
+        drop(cell);
+        arena.close();
+        drop(arena);
+        assert_eq!(broker.snapshot().aggregate_bytes, 0);
+        assert_eq!(broker.snapshot().active_operations, 0);
+    }
+
+    #[test]
+    fn c1_r6_exact_teardown_cleanup_failure_closes_exact_loading_owner_only() {
+        let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+        let sibling_reader = reader(602);
+        let sibling = arena
+            .resolve((1, 0), |permit| load(&sibling_reader, (1, 0), permit))
+            .unwrap();
+        let sibling_pointer = sibling.pointer();
+        drop(sibling);
+        let (request, cell, token) = prepared_member_dependency(&arena, member, container);
+        {
+            let mut state = lock(&domain.inner.state);
+            state.dependency_event_ordinal = u64::MAX;
+        }
+        assert!(arena.inner.teardown_exact_key(
+            &cell,
+            ExactPhaseExpectation::Loading {
+                leader_slot: Some(token.leader_slot),
+                generation: Some(token.generation),
+                require_publication: false,
+            },
+            CellControlFailure::new(member, AccessKind::Backend, CellControlTag::FlightCancelled,),
+            false,
+        ));
+        assert_dependency_cleanup_failure_closed(&cell);
+        assert!(domain.snapshot().invariant_failed);
+        let sibling = arena
+            .resolve((1, 0), |_| {
+                panic!("exact teardown touched an unrelated sibling")
+            })
+            .unwrap();
+        assert_eq!(sibling.pointer(), sibling_pointer);
+        drop(sibling);
+        drop(request);
+        drop(cell);
+        arena.close();
+        drop(arena);
+        assert_eq!(broker.snapshot().aggregate_bytes, 0);
+        assert_eq!(broker.snapshot().active_operations, 0);
+    }
+
+    #[test]
+    fn c1_r6_arena_close_cleanup_failure_finishes_exact_owner_and_operation_cleanup() {
+        let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+        let (request, cell, _token) = prepared_member_dependency(&arena, member, container);
+        {
+            let mut state = lock(&domain.inner.state);
+            state.dependency_event_ordinal = u64::MAX;
+        }
+        arena.close();
+        assert_dependency_cleanup_failure_closed(&cell);
+        let snapshot = domain.snapshot();
+        assert!(snapshot.invariant_failed);
+        assert_eq!(snapshot.cells, 0);
+        assert_eq!(snapshot.arenas, 0);
+        drop(request);
+        assert_eq!(domain.snapshot().live_interests, 0);
+        drop(cell);
+        drop(arena);
+        let broker_snapshot = broker.snapshot();
+        assert_eq!(broker_snapshot.aggregate_bytes, 0);
+        assert_eq!(broker_snapshot.active_operations, 0);
+        assert!(!broker_snapshot.invariant_failed);
+    }
+
+    #[test]
+    fn c1_r7_touch_overflow_ready_keeps_provisional_closed_hidden_until_failure_cleanup() {
+        let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+        let (object_reader, loaded_member, loaded_container, _) = object_stream_reader();
+        assert_eq!((loaded_member, loaded_container), (member, container));
+        let (leader, cell, token) = prepared_member_dependency(&arena, member, container);
+        let follower = attach_waiting_member_follower(&domain, &arena, member);
+        {
+            let mut state = lock(&domain.inner.state);
+            state.touch = u64::MAX;
+            state.dependency_event_ordinal = u64::MAX;
+        }
+        let (failed_entered, failed_action) = dependency_cleanup_failure_hook(&domain);
+        let leader_join =
+            thread::spawn(move || leader.resolve(|permit| load(&object_reader, member, permit)));
+        let (failed_key, failed_token) = failed_entered.recv().unwrap();
+        assert_eq!((failed_key, failed_token), (cell.key, token));
+        assert_closed_transition(
+            &cell,
+            DependencyTransition::CleanupFailed(token),
+            CellControlTag::TouchSequenceOverflow,
+        );
+        force_dependency_follower_wait(&domain, &cell, DependencyTransition::CleanupFailed(token));
+        failed_action.send(()).unwrap();
+        let leader_error = leader_join.join().unwrap().unwrap_err();
+        let follower_error = follower.join().unwrap().unwrap_err();
+        assert_dependency_invariant_access(&leader_error);
+        assert_dependency_invariant_access(&follower_error);
+        assert_dependency_cleanup_failure_closed(&cell);
+        drop(cell);
+        arena.close();
+        drop(arena);
+        assert_eq!(broker.snapshot().aggregate_bytes, 0);
+        assert_eq!(broker.snapshot().active_operations, 0);
+    }
+
+    #[test]
+    fn c1_r7_touch_overflow_error_keeps_provisional_closed_hidden_until_failure_cleanup() {
+        let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+        let (leader, cell, token) = prepared_member_dependency(&arena, member, container);
+        let follower = attach_waiting_member_follower(&domain, &arena, member);
+        {
+            let mut state = lock(&domain.inner.state);
+            state.touch = u64::MAX;
+            state.dependency_event_ordinal = u64::MAX;
+        }
+        let (failed_entered, failed_action) = dependency_cleanup_failure_hook(&domain);
+        let leader_join = thread::spawn(move || {
+            leader.resolve(|_| {
+                Err(CellLoadError::new(
+                    AccessError::typed(member, AccessKind::Backend, "provisional R7 error"),
+                    NegativeDisposition::Persistent,
+                ))
+            })
+        });
+        let (failed_key, failed_token) = failed_entered.recv().unwrap();
+        assert_eq!((failed_key, failed_token), (cell.key, token));
+        assert_closed_transition(
+            &cell,
+            DependencyTransition::CleanupFailed(token),
+            CellControlTag::TouchSequenceOverflow,
+        );
+        force_dependency_follower_wait(&domain, &cell, DependencyTransition::CleanupFailed(token));
+        failed_action.send(()).unwrap();
+        let leader_error = leader_join.join().unwrap().unwrap_err();
+        let follower_error = follower.join().unwrap().unwrap_err();
+        assert_dependency_invariant_access(&leader_error);
+        assert_dependency_invariant_access(&follower_error);
+        assert_dependency_cleanup_failure_closed(&cell);
+        drop(cell);
+        arena.close();
+        drop(arena);
+        assert_eq!(broker.snapshot().aggregate_bytes, 0);
+        assert_eq!(broker.snapshot().active_operations, 0);
+    }
+
+    #[test]
+    fn c1_r7_ready_negative_and_flight_rollbacks_gate_cleanup_failed_followers() {
+        for case in 0..3 {
+            let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+            let (object_reader, loaded_member, loaded_container, _) = object_stream_reader();
+            assert_eq!((loaded_member, loaded_container), (member, container));
+            let (leader, cell, token) = prepared_member_dependency(&arena, member, container);
+            let follower = attach_waiting_member_follower(&domain, &arena, member);
+            lock(&domain.inner.state).dependency_event_ordinal = u64::MAX;
+            let (failed_entered, failed_action) = dependency_cleanup_failure_hook(&domain);
+            let leader_join = thread::spawn(move || {
+                leader.resolve(|permit| match case {
+                    0 => load(&object_reader, member, permit),
+                    1 => Err(CellLoadError::new(
+                        AccessError::typed(member, AccessKind::Backend, "persistent R7 error"),
+                        NegativeDisposition::Persistent,
+                    )),
+                    2 => Err(transient(member, "flight-only R7 error")),
+                    _ => unreachable!(),
+                })
+            });
+            let (failed_key, failed_token) = failed_entered.recv().unwrap();
+            assert_eq!((failed_key, failed_token), (cell.key, token));
+            {
+                let state = lock(&cell.state);
+                assert_eq!(
+                    state.dependency_transition,
+                    DependencyTransition::CleanupFailed(token)
+                );
+                assert!(matches!(
+                    (&state.phase, case),
+                    (CellPhase::Ready(_), 0)
+                        | (CellPhase::Negative(_), 1)
+                        | (CellPhase::FlightError(_), 2)
+                ));
+            }
+            force_dependency_follower_wait(
+                &domain,
+                &cell,
+                DependencyTransition::CleanupFailed(token),
+            );
+            failed_action.send(()).unwrap();
+            let leader_error = leader_join.join().unwrap().unwrap_err();
+            let follower_error = follower.join().unwrap().unwrap_err();
+            assert_dependency_invariant_access(&leader_error);
+            assert_dependency_invariant_access(&follower_error);
+            assert_dependency_cleanup_failure_closed(&cell);
+            drop(cell);
+            arena.close();
+            drop(arena);
+            assert_eq!(broker.snapshot().aggregate_bytes, 0);
+            assert_eq!(broker.snapshot().active_operations, 0);
+        }
+    }
+
+    #[test]
+    fn c1_r7_exact_teardown_gates_closed_followers_for_success_and_cleanup_failure() {
+        for cleanup_fails in [false, true] {
+            let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+            let (request, cell, token) = prepared_member_dependency(&arena, member, container);
+            let follower = attach_waiting_member_follower(&domain, &arena, member);
+            if cleanup_fails {
+                lock(&domain.inner.state).dependency_event_ordinal = u64::MAX;
+            }
+            let failure_hook = cleanup_fails.then(|| dependency_cleanup_failure_hook(&domain));
+            let detached_hook = (!cleanup_fails)
+                .then(|| dependency_hook(&domain, DependencyEventKind::CleanupDetached));
+            let inner = Arc::clone(&arena.inner);
+            let teardown_cell = Arc::clone(&cell);
+            let terminal = thread::spawn(move || {
+                inner.teardown_exact_key(
+                    &teardown_cell,
+                    ExactPhaseExpectation::Loading {
+                        leader_slot: Some(token.leader_slot),
+                        generation: Some(token.generation),
+                        require_publication: false,
+                    },
+                    CellControlFailure::new(
+                        member,
+                        AccessKind::Backend,
+                        CellControlTag::FlightCancelled,
+                    ),
+                    false,
+                )
+            });
+            let (transition, release_failure, release_detached) =
+                if let Some((entered, action)) = failure_hook {
+                    let (key, failed_token) = entered.recv().unwrap();
+                    assert_eq!((key, failed_token), (cell.key, token));
+                    (
+                        DependencyTransition::CleanupFailed(token),
+                        Some(action),
+                        None,
+                    )
+                } else {
+                    let (_hooks, entered, action) = detached_hook.unwrap();
+                    let event = entered.recv().unwrap();
+                    assert_eq!(event.token, token);
+                    (DependencyTransition::Cleaning(token), None, Some(action))
+                };
+            assert_closed_transition(&cell, transition, CellControlTag::FlightCancelled);
+            force_dependency_follower_wait(&domain, &cell, transition);
+            if let Some(action) = release_failure {
+                action.send(()).unwrap();
+            }
+            if let Some(action) = release_detached {
+                action.send(PhaseAction::Continue).unwrap();
+            }
+            assert!(terminal.join().unwrap());
+            let error = follower.join().unwrap().unwrap_err();
+            if cleanup_fails {
+                assert_dependency_invariant_access(&error);
+                assert_dependency_cleanup_failure_closed(&cell);
+            } else {
+                assert_eq!(error.detail, CellControlTag::FlightCancelled.detail());
+                assert!(lock(&cell.state).dependency_transition.is_idle());
+            }
+            drop(request);
+            drop(cell);
+            arena.close();
+            drop(arena);
+            assert_eq!(broker.snapshot().aggregate_bytes, 0);
+            assert_eq!(broker.snapshot().active_operations, 0);
+        }
+    }
+
+    #[test]
+    fn c1_r7_arena_close_gates_closed_followers_through_cleanup_and_operation_close() {
+        for cleanup_fails in [false, true] {
+            let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+            let (request, cell, token) = prepared_member_dependency(&arena, member, container);
+            let follower = attach_waiting_member_follower(&domain, &arena, member);
+            if cleanup_fails {
+                lock(&domain.inner.state).dependency_event_ordinal = u64::MAX;
+            }
+            let failure_hook = cleanup_fails.then(|| dependency_cleanup_failure_hook(&domain));
+            let detached_hook = (!cleanup_fails)
+                .then(|| dependency_hook(&domain, DependencyEventKind::CleanupDetached));
+            let closing = arena.clone();
+            let terminal = thread::spawn(move || closing.close());
+            let (transition, release_failure, release_detached) =
+                if let Some((entered, action)) = failure_hook {
+                    let (key, failed_token) = entered.recv().unwrap();
+                    assert_eq!((key, failed_token), (cell.key, token));
+                    assert_eq!(broker.snapshot().active_operations, 1);
+                    (
+                        DependencyTransition::CleanupFailed(token),
+                        Some(action),
+                        None,
+                    )
+                } else {
+                    let (_hooks, entered, action) = detached_hook.unwrap();
+                    let event = entered.recv().unwrap();
+                    assert_eq!(event.token, token);
+                    (DependencyTransition::Cleaning(token), None, Some(action))
+                };
+            assert_closed_transition(&cell, transition, CellControlTag::ArenaClosed);
+            force_dependency_follower_wait(&domain, &cell, transition);
+            if let Some(action) = release_failure {
+                action.send(()).unwrap();
+            }
+            if let Some(action) = release_detached {
+                action.send(PhaseAction::Continue).unwrap();
+            }
+            terminal.join().unwrap();
+            let error = follower.join().unwrap().unwrap_err();
+            if cleanup_fails {
+                assert_dependency_invariant_access(&error);
+                assert_dependency_cleanup_failure_closed(&cell);
+            } else {
+                assert_eq!(error.detail, CellControlTag::ArenaClosed.detail());
+                assert!(lock(&cell.state).dependency_transition.is_idle());
+            }
+            assert_eq!(broker.snapshot().active_operations, 0);
+            drop(request);
+            drop(cell);
+            drop(arena);
+            assert_eq!(broker.snapshot().aggregate_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn c1_r8_touch_ready_and_error_hold_acknowledging_through_terminal_cleanup_c1_r9_evidence() {
+        for error_publication in [false, true] {
+            let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+            let (object_reader, loaded_member, loaded_container, _) = object_stream_reader();
+            assert_eq!((loaded_member, loaded_container), (member, container));
+            let (leader, cell, token) = prepared_member_dependency(&arena, member, container);
+            let (outcome_tx, outcome_rx) = mpsc::channel();
+            let follower = attach_r9_outcome_follower(&domain, &arena, member, outcome_tx.clone());
+            lock(&domain.inner.state).touch = u64::MAX;
+            let (_hooks, acknowledged, acknowledged_action) =
+                dependency_hook(&domain, DependencyEventKind::CleanupAcknowledged);
+            let leader_join = thread::spawn(move || {
+                leader.resolve(|permit| {
+                    if error_publication {
+                        Err(CellLoadError::new(
+                            AccessError::typed(
+                                member,
+                                AccessKind::Backend,
+                                "healthy R8 touch error",
+                            ),
+                            NegativeDisposition::Persistent,
+                        ))
+                    } else {
+                        load(&object_reader, member, permit)
+                    }
+                })
+            });
+            let event = acknowledged.recv().unwrap();
+            assert_eq!(event.token, token);
+            assert_closed_transition(
+                &cell,
+                DependencyTransition::Acknowledging(token),
+                CellControlTag::TouchSequenceOverflow,
+            );
+            establish_r10_condvar_wait(&domain, &cell, DependencyTransition::Acknowledging(token));
+            let metadata = lock(&cell.metadata);
+            let terminal_cleanup = dependency_terminal_cleanup_hook(&domain);
+            rearm_r9_wait_observer(&domain, outcome_tx);
+            acknowledged_action.send(PhaseAction::Continue).unwrap();
+            assert_eq!(terminal_cleanup.recv().unwrap().0, cell.key);
+            cell.ready.notify_all();
+            expect_r9_waited(&outcome_rx, DependencyTransition::Acknowledging(token));
+            assert_eq!(
+                lock(&cell.state).dependency_transition,
+                DependencyTransition::Acknowledging(token)
+            );
+            drop(metadata);
+            let follower_error = expect_r9_returned(&outcome_rx).unwrap_err();
+            follower.join().unwrap();
+            assert_eq!(follower_error.kind, AccessKind::ResourceLimit);
+            assert_eq!(
+                follower_error.detail,
+                CellControlTag::TouchSequenceOverflow.detail()
+            );
+            let leader_error = leader_join.join().unwrap().unwrap_err();
+            assert_eq!(leader_error, follower_error);
+            assert!(lock(&cell.state).dependency_transition.is_idle());
+            drop(cell);
+            arena.close();
+            drop(arena);
+            assert_eq!(broker.snapshot().aggregate_bytes, 0);
+            assert_eq!(broker.snapshot().active_operations, 0);
+        }
+    }
+
+    #[test]
+    fn c1_r8_exact_teardown_holds_acknowledging_until_external_terminal_cleanup_c1_r9_evidence() {
+        let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+        let (request, cell, token) = prepared_member_dependency(&arena, member, container);
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let follower = attach_r9_outcome_follower(&domain, &arena, member, outcome_tx.clone());
+        let (_hooks, acknowledged, acknowledged_action) =
+            dependency_hook(&domain, DependencyEventKind::CleanupAcknowledged);
+        let inner = Arc::clone(&arena.inner);
+        let teardown_cell = Arc::clone(&cell);
+        let terminal = thread::spawn(move || {
+            inner.teardown_exact_key(
+                &teardown_cell,
+                ExactPhaseExpectation::Loading {
+                    leader_slot: Some(token.leader_slot),
+                    generation: Some(token.generation),
+                    require_publication: false,
+                },
+                CellControlFailure::new(
+                    member,
+                    AccessKind::Backend,
+                    CellControlTag::FlightCancelled,
+                ),
+                false,
+            )
+        });
+        let event = acknowledged.recv().unwrap();
+        assert_eq!(event.token, token);
+        assert_closed_transition(
+            &cell,
+            DependencyTransition::Acknowledging(token),
+            CellControlTag::FlightCancelled,
+        );
+        establish_r10_condvar_wait(&domain, &cell, DependencyTransition::Acknowledging(token));
+        let metadata = lock(&cell.metadata);
+        let terminal_cleanup = dependency_terminal_cleanup_hook(&domain);
+        rearm_r9_wait_observer(&domain, outcome_tx);
+        acknowledged_action.send(PhaseAction::Continue).unwrap();
+        assert_eq!(terminal_cleanup.recv().unwrap().0, cell.key);
+        cell.ready.notify_all();
+        expect_r9_waited(&outcome_rx, DependencyTransition::Acknowledging(token));
+        assert_eq!(
+            lock(&cell.state).dependency_transition,
+            DependencyTransition::Acknowledging(token)
+        );
+        drop(metadata);
+        let follower_error = expect_r9_returned(&outcome_rx).unwrap_err();
+        follower.join().unwrap();
+        assert_eq!(follower_error.kind, AccessKind::Backend);
+        assert_eq!(
+            follower_error.detail,
+            CellControlTag::FlightCancelled.detail()
+        );
+        assert!(terminal.join().unwrap());
+        assert!(lock(&cell.state).dependency_transition.is_idle());
+        drop(request);
+        drop(cell);
+        arena.close();
+        drop(arena);
+        assert_eq!(broker.snapshot().aggregate_bytes, 0);
+        assert_eq!(broker.snapshot().active_operations, 0);
+    }
+
+    #[test]
+    fn c1_r8_arena_close_holds_acknowledging_through_operation_close_c1_r9_evidence() {
+        let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+        let (request, cell, token) = prepared_member_dependency(&arena, member, container);
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let follower = attach_r9_outcome_follower(&domain, &arena, member, outcome_tx.clone());
+        let (_hooks, acknowledged, acknowledged_action) =
+            dependency_hook(&domain, DependencyEventKind::CleanupAcknowledged);
+        let closing = arena.clone();
+        let terminal = thread::spawn(move || closing.close());
+        let event = acknowledged.recv().unwrap();
+        assert_eq!(event.token, token);
+        assert_closed_transition(
+            &cell,
+            DependencyTransition::Acknowledging(token),
+            CellControlTag::ArenaClosed,
+        );
+        assert_eq!(broker.snapshot().active_operations, 1);
+        establish_r10_condvar_wait(&domain, &cell, DependencyTransition::Acknowledging(token));
+        let metadata = lock(&cell.metadata);
+        let terminal_cleanup = dependency_terminal_cleanup_hook(&domain);
+        rearm_r9_wait_observer(&domain, outcome_tx);
+        acknowledged_action.send(PhaseAction::Continue).unwrap();
+        assert_eq!(terminal_cleanup.recv().unwrap().0, cell.key);
+        assert_eq!(broker.snapshot().active_operations, 1);
+        cell.ready.notify_all();
+        expect_r9_waited(&outcome_rx, DependencyTransition::Acknowledging(token));
+        assert_eq!(broker.snapshot().active_operations, 1);
+        drop(metadata);
+        let follower_error = expect_r9_returned(&outcome_rx).unwrap_err();
+        follower.join().unwrap();
+        assert_eq!(follower_error.kind, AccessKind::Backend);
+        assert_eq!(follower_error.detail, CellControlTag::ArenaClosed.detail());
+        assert_eq!(broker.snapshot().active_operations, 0);
+        terminal.join().unwrap();
+        assert!(lock(&cell.state).dependency_transition.is_idle());
+        drop(request);
+        drop(cell);
+        drop(arena);
+        assert_eq!(broker.snapshot().aggregate_bytes, 0);
+    }
+
+    #[test]
+    fn c2_scheduled_member_uses_one_post_pin_grant_then_ready_hits_without_child_work() {
+        let broker = broker();
+        let domain =
+            ObjectCellDomain::new(broker.clone(), ObjectCellConfig::scaled(32 * 1024 * 1024));
+        let arena = domain.open_arena().unwrap();
+        let (stream_reader, member, container, _) = object_stream_reader();
+        let hooks = Arc::new(RecordingDependencyHooks {
+            events: Mutex::new(Vec::new()),
+        });
+        domain.set_dependency_hooks(hooks.clone());
+        let request = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let child_reader = Arc::clone(&stream_reader);
+        let member_reader = Arc::clone(&stream_reader);
+        let pin = request
+            .resolve_scheduled_member_synthetic(
+                container,
+                move |permit| {
+                    child_reader
+                        .prepare_object_stream_with_permit(container, permit)
+                        .map_err(|error| {
+                            CellLoadError::objstm(crate::objstm_failures::classify(
+                                container, error,
+                            ))
+                        })
+                },
+                move |permit| {
+                    assert_eq!(permit.limit_bytes(), 4 * 1024 * 1024);
+                    load(&member_reader, member, permit)
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            pin.owner()
+                .as_object()
+                .as_dict()
+                .unwrap()
+                .get(b"Answer")
+                .unwrap()
+                .as_i64()
+                .unwrap(),
+            42
+        );
+        let pointer = pin.pointer();
+        drop(pin);
+
+        let ordered = [
+            DependencyEventKind::ChildResolved,
+            DependencyEventKind::ChildHandleTaken,
+            DependencyEventKind::PinInstalled,
+            DependencyEventKind::BeforeMemberAdmission,
+            DependencyEventKind::MemberRequestCreated,
+            DependencyEventKind::MemberGranted,
+            DependencyEventKind::MemberParseEnter,
+            DependencyEventKind::MemberParseExit,
+            DependencyEventKind::MemberReconciledBeforePublication,
+            DependencyEventKind::MemberPublished,
+        ];
+        let events = lock(&hooks.events);
+        let scheduled = events
+            .iter()
+            .filter(|event| ordered.contains(&event.kind))
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scheduled.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            ordered
+        );
+        let token = scheduled[0].token;
+        let expected_edge = DependencyEdge {
+            from: token.key,
+            to: CellKey {
+                epoch: token.key.epoch,
+                id: container,
+                representation: Representation::DeclaredObjStmContainer,
+            },
+        };
+        assert_eq!(token.key.id, member);
+        assert_eq!(
+            token.key.representation,
+            Representation::DeclaredObjStmMember
+        );
+        assert!(scheduled.iter().all(|event| event.token == token));
+        assert!(scheduled.iter().all(|event| event.edge == expected_edge));
+        assert!(scheduled
+            .windows(2)
+            .all(|pair| pair[0].ordinal < pair[1].ordinal));
+        drop(events);
+        let first = domain.snapshot();
+        assert_eq!(first.members.calls, 1);
+        assert_eq!(first.members.loads, 1);
+        assert_eq!(first.containers.calls, 1);
+        assert_eq!(first.containers.loads, 1);
+        assert_eq!(first.dependency_cancellations, 0);
+        assert_eq!(first.dependency_pins, 0);
+        assert_eq!(first.dependency_edges, 0);
+
+        let event_count = lock(&hooks.events).len();
+        let hit = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap()
+            .resolve_scheduled_member_synthetic(
+                container,
+                |_| panic!("ready member hit must not resolve its child"),
+                |_| panic!("ready member hit must not request or parse"),
+            )
+            .unwrap();
+        assert_eq!(hit.pointer(), pointer);
+        assert_eq!(lock(&hooks.events).len(), event_count);
+        let second = domain.snapshot();
+        assert_eq!(second.members.calls, 2);
+        assert_eq!(second.members.loads, 1);
+        assert_eq!(second.members.hits, 1);
+        assert_eq!(second.containers.calls, 1);
+        drop(hit);
+        arena.close();
+        drop(arena);
+        assert_eq!(broker.snapshot().aggregate_bytes, 0);
+    }
+
+    #[test]
+    fn c2_each_stage_acknowledgement_is_an_exact_outside_lock_ordering_barrier() {
+        let ordered = [
+            DependencyEventKind::ChildResolved,
+            DependencyEventKind::ChildHandleTaken,
+            DependencyEventKind::PinInstalled,
+            DependencyEventKind::BeforeMemberAdmission,
+            DependencyEventKind::MemberRequestCreated,
+            DependencyEventKind::MemberGranted,
+            DependencyEventKind::MemberParseEnter,
+            DependencyEventKind::MemberParseExit,
+            DependencyEventKind::MemberReconciledBeforePublication,
+            DependencyEventKind::MemberPublished,
+        ];
+        for target_index in 2..ordered.len() {
+            let target = ordered[target_index];
+            let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+            let (hooks, entered, action) = dependency_hook(&domain, target);
+            let request = arena
+                .inner
+                .request_representation(member, Representation::DeclaredObjStmMember)
+                .unwrap();
+            let cell = Arc::clone(&request.cell);
+            let scalar_reader = reader(1_414);
+            let join = thread::spawn(move || {
+                request.resolve_scheduled_member_synthetic(
+                    container,
+                    |_| panic!("prepared child must hit"),
+                    move |permit| load(&scalar_reader, (1, 0), permit),
+                )
+            });
+            let paused = entered.recv().unwrap();
+            assert_eq!(paused.kind, target);
+            assert_eq!(paused.token.key.id, member);
+            assert_eq!(
+                paused.token.key.representation,
+                Representation::DeclaredObjStmMember
+            );
+            assert_eq!(paused.edge.from, paused.token.key);
+            assert_eq!(paused.edge.to.id, container);
+            assert_eq!(
+                paused.edge.to.representation,
+                Representation::DeclaredObjStmContainer
+            );
+            let events = lock(&hooks.events);
+            let prefix = events
+                .iter()
+                .filter(|event| ordered.contains(&event.kind))
+                .copied()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                prefix.iter().map(|event| event.kind).collect::<Vec<_>>(),
+                ordered[..=target_index],
+                "callback returned or a later stage escaped before {target:?} acknowledgement"
+            );
+            assert!(prefix.iter().all(|event| event.token == paused.token));
+            assert!(prefix.iter().all(|event| event.edge == paused.edge));
+            assert!(prefix
+                .windows(2)
+                .all(|pair| pair[0].ordinal < pair[1].ordinal));
+            assert_eq!(prefix.last().unwrap(), &paused);
+            drop(events);
+            assert!(hooks.lock_probes.load(Ordering::Relaxed) >= prefix.len() as u64);
+            let transition = lock(&cell.state).dependency_transition;
+            if target == DependencyEventKind::MemberPublished {
+                assert!(transition.is_idle());
+            } else {
+                assert_eq!(
+                    transition,
+                    DependencyTransition::Announcing {
+                        token: paused.token,
+                        kind: target,
+                    }
+                );
+            }
+            action.send(PhaseAction::Continue).unwrap();
+            let pin = join.join().unwrap().unwrap();
+            assert_eq!(pin.owner().as_object().as_i64().unwrap(), 1_414);
+            drop(pin);
+            drop(cell);
+            arena.close();
+            drop(arena);
+            assert_eq!(broker.snapshot().aggregate_bytes, 0, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn c2_same_member_n_2_4_16_has_one_child_grant_parse_owner_and_second_wave_hits() {
+        for callers in [2usize, 4, 16] {
+            let broker = broker();
+            let domain =
+                ObjectCellDomain::new(broker.clone(), ObjectCellConfig::scaled(32 * 1024 * 1024));
+            let arena = domain.open_arena().unwrap();
+            let (reader, member, container, _) = object_stream_reader();
+            let hooks = Arc::new(RecordingDependencyHooks {
+                events: Mutex::new(Vec::new()),
+            });
+            domain.set_dependency_hooks(hooks.clone());
+            let child_pause = Arc::new(AtomicBool::new(true));
+            let (child_entered_tx, child_entered_rx) = mpsc::sync_channel(0);
+            let (child_action_tx, child_action_rx) = mpsc::sync_channel(0);
+            let child_action_rx = Arc::new(Mutex::new(child_action_rx));
+            let (wait_tx, wait_rx) = mpsc::channel();
+            domain.set_wait_hooks(Arc::new(SignallingWaitHooks {
+                adds: AtomicU64::new(0),
+                removes: AtomicU64::new(0),
+                entered: wait_tx,
+            }));
+            let requests = (0..callers)
+                .map(|_| {
+                    arena
+                        .inner
+                        .request_representation(member, Representation::DeclaredObjStmMember)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let before_child_grants = broker.snapshot().operations[&arena.epoch()].grants;
+            let joins = requests
+                .into_iter()
+                .map(|request| {
+                    let child_reader = Arc::clone(&reader);
+                    let member_reader = Arc::clone(&reader);
+                    let child_pause = Arc::clone(&child_pause);
+                    let child_entered = child_entered_tx.clone();
+                    let child_action = Arc::clone(&child_action_rx);
+                    thread::spawn(move || {
+                        request.resolve_scheduled_member_synthetic(
+                            container,
+                            move |permit| {
+                                if child_pause.swap(false, Ordering::AcqRel) {
+                                    child_entered.send(()).unwrap();
+                                    lock(&child_action).recv().unwrap();
+                                }
+                                child_reader
+                                    .prepare_object_stream_with_permit(container, permit)
+                                    .map_err(|error| {
+                                        CellLoadError::objstm(crate::objstm_failures::classify(
+                                            container, error,
+                                        ))
+                                    })
+                            },
+                            move |permit| load(&member_reader, member, permit),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            child_entered_rx.recv().unwrap();
+            for _ in 1..callers {
+                wait_rx.recv().unwrap();
+            }
+            let blocked = domain.snapshot();
+            assert_eq!(blocked.members.loads, 0, "N={callers}");
+            assert_eq!(blocked.members.waits, (callers - 1) as u64, "N={callers}");
+            assert_eq!(blocked.containers.loads, 1, "N={callers}");
+            let blocked_events = lock(&hooks.events);
+            assert_eq!(
+                blocked_events
+                    .iter()
+                    .filter(|event| matches!(
+                        event.kind,
+                        DependencyEventKind::PinInstalled
+                            | DependencyEventKind::BeforeMemberAdmission
+                            | DependencyEventKind::MemberRequestCreated
+                            | DependencyEventKind::MemberQueued
+                            | DependencyEventKind::MemberGranted
+                            | DependencyEventKind::MemberParseEnter
+                    ))
+                    .count(),
+                0,
+                "N={callers}"
+            );
+            drop(blocked_events);
+            let blocked_operation = broker.snapshot().operations[&arena.epoch()].clone();
+            assert_eq!(
+                blocked_operation.grants,
+                before_child_grants + 2,
+                "N={callers}"
+            );
+            assert_eq!(blocked_operation.in_flight, 1, "N={callers}");
+            child_action_tx.send(()).unwrap();
+            let pins = joins
+                .into_iter()
+                .map(|join| join.join().unwrap().unwrap())
+                .collect::<Vec<_>>();
+            assert!(pins.iter().all(|pin| pin.pointer() == pins[0].pointer()));
+            let first = domain.snapshot();
+            assert_eq!(first.members.calls, callers as u64, "N={callers}");
+            assert_eq!(first.members.loads, 1, "N={callers}");
+            assert_eq!(first.members.waits, (callers - 1) as u64, "N={callers}");
+            assert_eq!(first.members.hits, 0, "N={callers}");
+            assert_eq!(first.containers.calls, 1, "N={callers}");
+            assert_eq!(first.containers.loads, 1, "N={callers}");
+            assert_eq!(first.dependency_edge_adds, 1, "N={callers}");
+            assert_eq!(first.dependency_edge_removes, 1, "N={callers}");
+            assert_eq!(first.dependency_cleanup_acks, 1, "N={callers}");
+            let events = lock(&hooks.events);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.kind == DependencyEventKind::MemberGranted)
+                    .count(),
+                1,
+                "N={callers}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.kind == DependencyEventKind::MemberParseEnter)
+                    .count(),
+                1,
+                "N={callers}"
+            );
+            let event_count = events.len();
+            drop(events);
+            let pointer = pins[0].pointer();
+            drop(pins);
+
+            for _ in 0..callers {
+                let hit = arena
+                    .inner
+                    .request_representation(member, Representation::DeclaredObjStmMember)
+                    .unwrap()
+                    .resolve_scheduled_member_synthetic(
+                        container,
+                        |_| panic!("same-member second wave child work"),
+                        |_| panic!("same-member second wave parse"),
+                    )
+                    .unwrap();
+                assert_eq!(hit.pointer(), pointer);
+            }
+            let second = domain.snapshot();
+            assert_eq!(second.members.calls, (2 * callers) as u64, "N={callers}");
+            assert_eq!(second.members.loads, 1, "N={callers}");
+            assert_eq!(second.members.hits, callers as u64, "N={callers}");
+            assert_eq!(second.containers.calls, 1, "N={callers}");
+            assert_eq!(lock(&hooks.events).len(), event_count, "N={callers}");
+            arena.close();
+            drop(arena);
+            assert_eq!(broker.snapshot().aggregate_bytes, 0, "N={callers}");
+        }
+    }
+
+    #[test]
+    fn c2_distinct_members_n_2_4_16_acknowledge_each_own_child_chain_independently() {
+        for callers in [2usize, 4, 16] {
+            let broker = broker();
+            let domain =
+                ObjectCellDomain::new(broker.clone(), ObjectCellConfig::scaled(32 * 1024 * 1024));
+            let arena = domain.open_arena().unwrap();
+            let (reader, loaded_member, container, _) = object_stream_reader();
+            let member_ids = (0..=callers)
+                .map(|offset| (20_000 + u32::try_from(offset).unwrap(), 0))
+                .collect::<Vec<_>>();
+            let sentinel = *member_ids.last().unwrap();
+
+            let (child_entered_tx, child_entered_rx) = mpsc::channel();
+            let (request_entered_tx, request_entered_rx) = mpsc::channel();
+            let (grant_entered_tx, grant_entered_rx) = mpsc::channel();
+            let mut child_actions = BTreeMap::new();
+            let mut child_senders = BTreeMap::new();
+            let mut request_actions = BTreeMap::new();
+            let mut request_senders = BTreeMap::new();
+            let mut grant_actions = BTreeMap::new();
+            let mut grant_senders = BTreeMap::new();
+            for id in &member_ids {
+                let (child_tx, child_rx) = mpsc::sync_channel(0);
+                child_senders.insert(*id, child_tx);
+                child_actions.insert(*id, Mutex::new(child_rx));
+                let (request_tx, request_rx) = mpsc::sync_channel(0);
+                request_senders.insert(*id, request_tx);
+                request_actions.insert(*id, Mutex::new(request_rx));
+                let (grant_tx, grant_rx) = mpsc::sync_channel(0);
+                grant_senders.insert(*id, grant_tx);
+                grant_actions.insert(*id, Mutex::new(grant_rx));
+            }
+            let hooks = Arc::new(PerTokenChainHooks {
+                events: Mutex::new(Vec::new()),
+                child_entered: child_entered_tx,
+                request_entered: request_entered_tx,
+                grant_entered: grant_entered_tx,
+                child_actions,
+                request_actions,
+                grant_actions,
+            });
+            domain.set_dependency_hooks(hooks.clone());
+
+            let first_child = Arc::new(AtomicBool::new(true));
+            let (loader_entered_tx, loader_entered_rx) = mpsc::sync_channel(0);
+            let (loader_action_tx, loader_action_rx) = mpsc::sync_channel(0);
+            let loader_action = Arc::new(Mutex::new(loader_action_rx));
+            let (container_wait_tx, container_wait_rx) = mpsc::channel();
+            domain.set_wait_hooks(Arc::new(SignallingWaitHooks {
+                adds: AtomicU64::new(0),
+                removes: AtomicU64::new(0),
+                entered: container_wait_tx,
+            }));
+
+            let mut cancellations = Vec::new();
+            let mut joins = Vec::new();
+            for (index, id) in member_ids.iter().copied().enumerate() {
+                let request = arena
+                    .inner
+                    .request_representation(id, Representation::DeclaredObjStmMember)
+                    .unwrap();
+                cancellations.push(request.cancellation_handle());
+                let child_reader = Arc::clone(&reader);
+                let first_child = Arc::clone(&first_child);
+                let loader_entered = loader_entered_tx.clone();
+                let loader_action = Arc::clone(&loader_action);
+                joins.push(thread::spawn(move || {
+                    request.resolve_scheduled_member_synthetic(
+                        container,
+                        move |permit| {
+                            if first_child.swap(false, Ordering::AcqRel) {
+                                loader_entered.send(()).unwrap();
+                                lock(&loader_action).recv().unwrap();
+                            }
+                            child_reader
+                                .prepare_object_stream_with_permit(container, permit)
+                                .map_err(|error| {
+                                    CellLoadError::objstm(crate::objstm_failures::classify(
+                                        container, error,
+                                    ))
+                                })
+                        },
+                        move |permit| {
+                            panic!("per-token chain row must cancel before member parse: {index} {id:?} {permit:?}")
+                        },
+                    )
+                }));
+                if index == 0 {
+                    loader_entered_rx.recv().unwrap();
+                }
+            }
+            for _ in 1..member_ids.len() {
+                container_wait_rx.recv().unwrap();
+            }
+            loader_action_tx.send(()).unwrap();
+            let child_events = (0..member_ids.len())
+                .map(|_| child_entered_rx.recv().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                child_events
+                    .iter()
+                    .map(|event| event.token.key.id)
+                    .collect::<BTreeSet<_>>(),
+                member_ids.iter().copied().collect::<BTreeSet<_>>(),
+                "N={callers}"
+            );
+
+            for id in member_ids.iter().take(callers).copied() {
+                child_senders[&id].send(()).unwrap();
+                let requested = request_entered_rx.recv().unwrap();
+                assert_eq!(requested.token.key.id, id, "N={callers}");
+                let events = lock(&hooks.events);
+                let chain = [
+                    DependencyEventKind::ChildResolved,
+                    DependencyEventKind::ChildHandleTaken,
+                    DependencyEventKind::PinInstalled,
+                    DependencyEventKind::BeforeMemberAdmission,
+                    DependencyEventKind::MemberRequestCreated,
+                ];
+                let ordinals = chain.map(|kind| {
+                    events
+                        .iter()
+                        .find(|event| event.token == requested.token && event.kind == kind)
+                        .unwrap()
+                        .ordinal
+                });
+                assert!(
+                    ordinals.windows(2).all(|pair| pair[0] < pair[1]),
+                    "N={callers}"
+                );
+                assert!(events.iter().all(|event| {
+                    event.token.key.id != sentinel
+                        || !matches!(
+                            event.kind,
+                            DependencyEventKind::ChildHandleTaken
+                                | DependencyEventKind::PinInstalled
+                                | DependencyEventKind::BeforeMemberAdmission
+                                | DependencyEventKind::MemberRequestCreated
+                        )
+                }));
+                drop(events);
+                request_senders[&id].send(()).unwrap();
+                let granted = grant_entered_rx.recv().unwrap();
+                assert_eq!(granted.token, requested.token, "N={callers}");
+                let events = lock(&hooks.events);
+                let chain = [
+                    DependencyEventKind::ChildResolved,
+                    DependencyEventKind::ChildHandleTaken,
+                    DependencyEventKind::PinInstalled,
+                    DependencyEventKind::BeforeMemberAdmission,
+                    DependencyEventKind::MemberRequestCreated,
+                    DependencyEventKind::MemberGranted,
+                ];
+                let ordinals = chain.map(|kind| {
+                    events
+                        .iter()
+                        .find(|event| event.token == granted.token && event.kind == kind)
+                        .unwrap()
+                        .ordinal
+                });
+                assert!(
+                    ordinals.windows(2).all(|pair| pair[0] < pair[1]),
+                    "N={callers}"
+                );
+                assert!(events.iter().all(|event| {
+                    event.token.key.id != sentinel
+                        || !matches!(
+                            event.kind,
+                            DependencyEventKind::ChildHandleTaken
+                                | DependencyEventKind::PinInstalled
+                                | DependencyEventKind::BeforeMemberAdmission
+                                | DependencyEventKind::MemberRequestCreated
+                                | DependencyEventKind::MemberGranted
+                        )
+                }));
+            }
+
+            let (cancel_wait_tx, cancel_wait_rx) = mpsc::channel();
+            domain.set_dependency_wait_hooks(Arc::new(SignallingDependencyWaitHooks {
+                entered: cancel_wait_tx,
+            }));
+            let cancel_joins = cancellations
+                .into_iter()
+                .map(|cancel| thread::spawn(move || cancel.cancel()))
+                .collect::<Vec<_>>();
+            let waits = (0..member_ids.len())
+                .map(|_| cancel_wait_rx.recv().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                waits.iter().map(|(key, _)| key.id).collect::<BTreeSet<_>>(),
+                member_ids.iter().copied().collect::<BTreeSet<_>>(),
+                "N={callers}"
+            );
+            for id in member_ids.iter().take(callers) {
+                grant_senders[id].send(()).unwrap();
+            }
+            child_senders[&sentinel].send(()).unwrap();
+            for join in cancel_joins {
+                join.join().unwrap();
+            }
+            for join in joins {
+                assert!(join.join().unwrap().is_err(), "N={callers}");
+            }
+            let terminal = domain.snapshot();
+            assert_eq!(terminal.members.loads, 0, "N={callers}");
+            assert_eq!(terminal.dependency_edges, 0, "N={callers}");
+            arena.close();
+            drop(arena);
+            assert_gate4_terminal(&domain, &broker, 1);
+            let _ = loaded_member;
+        }
+    }
+
+    #[test]
+    fn c2_distinct_members_n_2_4_16_share_one_container_flight_then_hit_independently() {
+        for callers in [2usize, 4, 16] {
+            let broker = broker();
+            let domain =
+                ObjectCellDomain::new(broker.clone(), ObjectCellConfig::scaled(32 * 1024 * 1024));
+            let arena = domain.open_arena().unwrap();
+            let (reader, loaded_member, container, _) = object_stream_reader();
+            let member_ids = (0..callers)
+                .map(|offset| (10_000 + u32::try_from(offset).unwrap(), 0))
+                .collect::<Vec<_>>();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::sync_channel(0);
+            let hooks = Arc::new(SignallingDependencyHooks {
+                target: DependencyEventKind::InsideChildResolve,
+                first_paused: AtomicBool::new(true),
+                entered: entered_tx,
+                first_action: Mutex::new(action_rx),
+                events: Mutex::new(Vec::new()),
+            });
+            domain.set_dependency_hooks(hooks.clone());
+            let (wait_tx, wait_rx) = mpsc::channel();
+            domain.set_wait_hooks(Arc::new(SignallingWaitHooks {
+                adds: AtomicU64::new(0),
+                removes: AtomicU64::new(0),
+                entered: wait_tx,
+            }));
+
+            let spawn_member = |id: ObjectId| {
+                let request = arena
+                    .inner
+                    .request_representation(id, Representation::DeclaredObjStmMember)
+                    .unwrap();
+                let child_reader = Arc::clone(&reader);
+                let member_reader = Arc::clone(&reader);
+                thread::spawn(move || {
+                    request.resolve_scheduled_member_synthetic(
+                        container,
+                        move |permit| {
+                            child_reader
+                                .prepare_object_stream_with_permit(container, permit)
+                                .map_err(|error| {
+                                    CellLoadError::objstm(crate::objstm_failures::classify(
+                                        container, error,
+                                    ))
+                                })
+                        },
+                        move |permit| load(&member_reader, loaded_member, permit),
+                    )
+                })
+            };
+            let mut joins = vec![spawn_member(member_ids[0])];
+            let first_event = entered_rx.recv().unwrap();
+            assert_eq!(first_event.token.key.id, member_ids[0]);
+            for id in member_ids.iter().skip(1).copied() {
+                joins.push(spawn_member(id));
+            }
+            for _ in 1..callers {
+                entered_rx.recv().unwrap();
+            }
+            for _ in 1..callers {
+                wait_rx.recv().unwrap();
+            }
+            let blocked = domain.snapshot();
+            let blocked_broker = broker.snapshot();
+            assert_eq!(blocked.members.loads, 0, "N={callers}");
+            assert_eq!(blocked.containers.calls, callers as u64, "N={callers}");
+            assert_eq!(blocked.containers.loads, 0, "N={callers}");
+            assert_eq!(
+                blocked.containers.waits,
+                (callers - 1) as u64,
+                "N={callers}"
+            );
+            let (parse_hooks, parse_entered, parse_action) =
+                multi_dependency_hook(&domain, DependencyEventKind::MemberParseEnter);
+            action_tx.send(()).unwrap();
+
+            let parse_events = (0..callers)
+                .map(|_| parse_entered.recv().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                parse_events
+                    .iter()
+                    .map(|event| event.token.key.id)
+                    .collect::<BTreeSet<_>>(),
+                member_ids.iter().copied().collect::<BTreeSet<_>>(),
+                "N={callers}"
+            );
+            let granted = broker.snapshot();
+            let granted_operation = &granted.operations[&arena.epoch()];
+            assert_eq!(granted_operation.in_flight, callers, "N={callers}");
+            assert_eq!(granted_operation.queued, 0, "N={callers}");
+            assert_eq!(
+                granted_operation.grants,
+                blocked_broker.operations[&arena.epoch()].grants + callers as u64 + 1,
+                "N={callers}"
+            );
+            assert_eq!(
+                granted_operation.granted_bytes,
+                blocked_broker.operations[&arena.epoch()].granted_bytes
+                    + 64 * 1024 * 1024
+                    + (callers as u64 * 4 * 1024 * 1024),
+                "N={callers}"
+            );
+            let active_permits = {
+                let state = lock(&domain.inner.state);
+                member_ids
+                    .iter()
+                    .filter(|id| {
+                        state
+                            .cells
+                            .iter()
+                            .find(|(key, _)| {
+                                key.id == **id
+                                    && key.representation == Representation::DeclaredObjStmMember
+                            })
+                            .is_some_and(|(_, cell)| {
+                                matches!(
+                                    &lock(&cell.state).phase,
+                                    CellPhase::Loading(loading) if loading.permit.is_some()
+                                )
+                            })
+                    })
+                    .count()
+            };
+            assert_eq!(active_permits, callers, "N={callers}");
+            let synchronized_events = lock(&parse_hooks.events);
+            for parse in &parse_events {
+                let pin = synchronized_events
+                    .iter()
+                    .find(|event| {
+                        event.token == parse.token
+                            && event.kind == DependencyEventKind::PinInstalled
+                    })
+                    .unwrap();
+                let grant = synchronized_events
+                    .iter()
+                    .find(|event| {
+                        event.token == parse.token
+                            && event.kind == DependencyEventKind::MemberGranted
+                    })
+                    .unwrap();
+                assert!(pin.ordinal < grant.ordinal && grant.ordinal < parse.ordinal);
+            }
+            drop(synchronized_events);
+            for _ in 0..callers {
+                parse_action.send(()).unwrap();
+            }
+
+            let pins = joins
+                .drain(..)
+                .map(|join| join.join().unwrap().unwrap())
+                .collect::<Vec<_>>();
+            for left in 0..pins.len() {
+                for right in (left + 1)..pins.len() {
+                    assert_ne!(pins[left].pointer(), pins[right].pointer(), "N={callers}");
+                }
+            }
+            let first = domain.snapshot();
+            assert_eq!(first.members.calls, callers as u64, "N={callers}");
+            assert_eq!(first.members.loads, callers as u64, "N={callers}");
+            assert_eq!(first.members.waits, 0, "N={callers}");
+            assert_eq!(first.containers.calls, callers as u64, "N={callers}");
+            assert_eq!(first.containers.loads, 1, "N={callers}");
+            assert_eq!(first.containers.waits, (callers - 1) as u64, "N={callers}");
+            assert_eq!(first.dependency_edge_adds, callers as u64, "N={callers}");
+            assert_eq!(first.dependency_edge_removes, callers as u64, "N={callers}");
+            assert_eq!(first.dependency_cleanup_acks, callers as u64, "N={callers}");
+            let events = lock(&parse_hooks.events);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.kind == DependencyEventKind::MemberGranted)
+                    .count(),
+                callers,
+                "N={callers}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.kind == DependencyEventKind::MemberParseEnter)
+                    .count(),
+                callers,
+                "N={callers}"
+            );
+            let event_count = events.len();
+            drop(events);
+            let pointers = pins
+                .iter()
+                .map(ResolvedObjectPin::pointer)
+                .collect::<Vec<_>>();
+            drop(pins);
+
+            for (index, id) in member_ids.iter().copied().enumerate() {
+                let hit = arena
+                    .inner
+                    .request_representation(id, Representation::DeclaredObjStmMember)
+                    .unwrap()
+                    .resolve_scheduled_member_synthetic(
+                        container,
+                        |_| panic!("distinct-member second wave child work"),
+                        |_| panic!("distinct-member second wave parse"),
+                    )
+                    .unwrap();
+                assert_eq!(hit.pointer(), pointers[index]);
+            }
+            let second = domain.snapshot();
+            assert_eq!(second.members.calls, (2 * callers) as u64, "N={callers}");
+            assert_eq!(second.members.loads, callers as u64, "N={callers}");
+            assert_eq!(second.members.hits, callers as u64, "N={callers}");
+            assert_eq!(second.containers.calls, callers as u64, "N={callers}");
+            assert_eq!(lock(&parse_hooks.events).len(), event_count, "N={callers}");
+            arena.close();
+            drop(arena);
+            assert_eq!(broker.snapshot().aggregate_bytes, 0, "N={callers}");
+        }
+    }
+
+    #[test]
+    fn c2_last_interest_cancellation_at_each_post_pin_stage_cleans_exact_resources() {
+        let rows = [
+            (DependencyEventKind::MemberRequestCreated, 0),
+            (DependencyEventKind::MemberGranted, 0),
+            (DependencyEventKind::MemberParseEnter, 0),
+            (DependencyEventKind::MemberParseExit, 1),
+            (DependencyEventKind::MemberReconciledBeforePublication, 1),
+        ];
+        for (phase, expected_parses) in rows {
+            let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+            let (_hooks, entered, action) = dependency_hook(&domain, phase);
+            let request = arena
+                .inner
+                .request_representation(member, Representation::DeclaredObjStmMember)
+                .unwrap();
+            let cancellation = request.cancellation_handle();
+            let parses = Arc::new(AtomicU64::new(0));
+            let parses_for_load = Arc::clone(&parses);
+            let scalar_reader = reader(313);
+            let join = thread::spawn(move || {
+                request.resolve_scheduled_member_synthetic(
+                    container,
+                    |_| panic!("prepared container must hit in cleanup row"),
+                    move |permit| {
+                        parses_for_load.fetch_add(1, Ordering::Relaxed);
+                        load(&scalar_reader, (1, 0), permit)
+                    },
+                )
+            });
+            let event = entered.recv().unwrap();
+            assert_eq!(event.kind, phase);
+            let (wait_entered, wait_action) = dependency_wait_hook(&domain);
+            let cancel_join = thread::spawn(move || cancellation.cancel());
+            wait_entered.recv().unwrap();
+            action.send(PhaseAction::Continue).unwrap();
+            wait_action.send(()).unwrap();
+            cancel_join.join().unwrap();
+            let error = join.join().unwrap().unwrap_err();
+            assert_eq!(error.kind, AccessKind::Backend, "{phase:?}");
+            assert_eq!(parses.load(Ordering::Relaxed), expected_parses, "{phase:?}");
+            let terminal = domain.snapshot();
+            assert_eq!(terminal.dependency_cancellations, 0, "{phase:?}");
+            assert_eq!(terminal.dependency_pins, 0, "{phase:?}");
+            assert_eq!(terminal.dependency_edges, 0, "{phase:?}");
+            assert_eq!(terminal.dependency_leaders, 0, "{phase:?}");
+            assert_eq!(terminal.dependency_edge_adds, 1, "{phase:?}");
+            assert_eq!(terminal.dependency_edge_removes, 1, "{phase:?}");
+            assert_eq!(terminal.dependency_cleanup_acks, 1, "{phase:?}");
+            let operation = broker.snapshot().operations[&arena.epoch()].clone();
+            assert_eq!(operation.queued, 0, "{phase:?}");
+            assert_eq!(operation.in_flight, 0, "{phase:?}");
+            assert_eq!(operation.pin_bytes, 0, "{phase:?}");
+            arena.close();
+            drop(arena);
+            assert_eq!(broker.snapshot().aggregate_bytes, 0, "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn c2_follower_cancel_at_each_post_pin_stage_preserves_exact_leader_resources() {
+        for phase in [
+            DependencyEventKind::MemberRequestCreated,
+            DependencyEventKind::MemberGranted,
+            DependencyEventKind::MemberParseEnter,
+            DependencyEventKind::MemberParseExit,
+            DependencyEventKind::MemberReconciledBeforePublication,
+        ] {
+            let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+            let sibling_reader = reader(414);
+            let sibling = arena
+                .resolve((1, 0), |permit| load(&sibling_reader, (1, 0), permit))
+                .unwrap();
+            let sibling_pointer = sibling.pointer();
+            drop(sibling);
+            let (_hooks, entered, action) = dependency_hook(&domain, phase);
+            let leader = arena
+                .inner
+                .request_representation(member, Representation::DeclaredObjStmMember)
+                .unwrap();
+            let follower = arena
+                .inner
+                .request_representation(member, Representation::DeclaredObjStmMember)
+                .unwrap();
+            let follower_cancel = follower.cancellation_handle();
+            let scalar_reader = reader(415);
+            let leader_join = thread::spawn(move || {
+                leader.resolve_scheduled_member_synthetic(
+                    container,
+                    |_| panic!("prepared child must hit"),
+                    move |permit| load(&scalar_reader, (1, 0), permit),
+                )
+            });
+            assert_eq!(entered.recv().unwrap().kind, phase);
+            let held_before = broker.snapshot();
+            let follower_join = thread::spawn(move || {
+                follower.resolve_scheduled_member_synthetic(
+                    container,
+                    |_| panic!("cancelled follower cannot resolve child"),
+                    |_| panic!("cancelled follower cannot parse"),
+                )
+            });
+            follower_cancel.cancel();
+            assert!(follower_join.join().unwrap().is_err(), "{phase:?}");
+            assert_broker_snapshot_unchanged(
+                &held_before,
+                &broker.snapshot(),
+                &format!("follower cancellation at {phase:?}"),
+            );
+            let held = domain.snapshot();
+            assert_eq!(held.dependency_pins, 1, "{phase:?}");
+            assert_eq!(held.dependency_edges, 1, "{phase:?}");
+            assert_eq!(held.dependency_leaders, 1, "{phase:?}");
+            action.send(PhaseAction::Continue).unwrap();
+            let pin = leader_join.join().unwrap().unwrap();
+            assert_eq!(pin.owner().as_object().as_i64().unwrap(), 415, "{phase:?}");
+            drop(pin);
+            let sibling = arena
+                .resolve((1, 0), |_| panic!("follower cancellation reloaded sibling"))
+                .unwrap();
+            assert_eq!(sibling.pointer(), sibling_pointer, "{phase:?}");
+            drop(sibling);
+            let terminal = domain.snapshot();
+            assert_eq!(terminal.members.calls, 2, "{phase:?}");
+            assert_eq!(terminal.members.loads, 1, "{phase:?}");
+            assert_eq!(terminal.members.cancellations, 1, "{phase:?}");
+            assert_eq!(terminal.dependency_pins, 0, "{phase:?}");
+            assert_eq!(terminal.dependency_edges, 0, "{phase:?}");
+            assert_eq!(terminal.dependency_edge_adds, 1, "{phase:?}");
+            assert_eq!(terminal.dependency_edge_removes, 1, "{phase:?}");
+            assert_eq!(terminal.dependency_cleanup_acks, 1, "{phase:?}");
+            arena.close();
+            drop(arena);
+            assert_eq!(broker.snapshot().aggregate_bytes, 0, "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn c2_hook_panic_at_each_post_pin_stage_drops_every_owned_resource() {
+        for phase in [
+            DependencyEventKind::MemberRequestCreated,
+            DependencyEventKind::MemberGranted,
+            DependencyEventKind::MemberParseEnter,
+            DependencyEventKind::MemberParseExit,
+            DependencyEventKind::MemberReconciledBeforePublication,
+        ] {
+            let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+            let (_hooks, entered, action) = dependency_hook(&domain, phase);
+            let request = arena
+                .inner
+                .request_representation(member, Representation::DeclaredObjStmMember)
+                .unwrap();
+            let scalar_reader = reader(515);
+            let join = thread::spawn(move || {
+                request.resolve_scheduled_member_synthetic(
+                    container,
+                    |_| panic!("prepared child must hit"),
+                    move |permit| load(&scalar_reader, (1, 0), permit),
+                )
+            });
+            assert_eq!(entered.recv().unwrap().kind, phase);
+            action.send(PhaseAction::Panic).unwrap();
+            assert!(join.join().is_err(), "{phase:?}");
+            let terminal = domain.snapshot();
+            assert_eq!(terminal.dependency_cancellations, 0, "{phase:?}");
+            assert_eq!(terminal.dependency_pins, 0, "{phase:?}");
+            assert_eq!(terminal.dependency_edges, 0, "{phase:?}");
+            assert_eq!(terminal.dependency_leaders, 0, "{phase:?}");
+            assert_eq!(terminal.dependency_edge_adds, 1, "{phase:?}");
+            assert_eq!(terminal.dependency_edge_removes, 1, "{phase:?}");
+            assert_eq!(terminal.dependency_cleanup_acks, 1, "{phase:?}");
+            let operation = broker.snapshot().operations[&arena.epoch()].clone();
+            assert_eq!(operation.queued, 0, "{phase:?}");
+            assert_eq!(operation.in_flight, 0, "{phase:?}");
+            arena.close();
+            drop(arena);
+            assert_eq!(broker.snapshot().aggregate_bytes, 0, "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn c2_arena_close_at_each_post_pin_stage_cancels_and_drains_exact_resources() {
+        for (phase, expected_parses) in [
+            (DependencyEventKind::MemberRequestCreated, 0),
+            (DependencyEventKind::MemberGranted, 0),
+            (DependencyEventKind::MemberParseEnter, 0),
+            (DependencyEventKind::MemberParseExit, 1),
+            (DependencyEventKind::MemberReconciledBeforePublication, 1),
+        ] {
+            let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+            let (_hooks, entered, action) = dependency_hook(&domain, phase);
+            let request = arena
+                .inner
+                .request_representation(member, Representation::DeclaredObjStmMember)
+                .unwrap();
+            let parses = Arc::new(AtomicU64::new(0));
+            let parses_for_load = Arc::clone(&parses);
+            let scalar_reader = reader(616);
+            let join = thread::spawn(move || {
+                request.resolve_scheduled_member_synthetic(
+                    container,
+                    |_| panic!("prepared child must hit"),
+                    move |permit| {
+                        parses_for_load.fetch_add(1, Ordering::Relaxed);
+                        load(&scalar_reader, (1, 0), permit)
+                    },
+                )
+            });
+            assert_eq!(entered.recv().unwrap().kind, phase);
+            let (wait_entered, wait_action) = dependency_wait_hook(&domain);
+            let closing = arena.clone();
+            let close_join = thread::spawn(move || closing.close());
+            let (waited_key, _) = wait_entered.recv().unwrap();
+            assert_eq!(waited_key.id, member, "{phase:?}");
+            action.send(PhaseAction::Continue).unwrap();
+            wait_action.send(()).unwrap();
+            assert!(join.join().unwrap().is_err(), "{phase:?}");
+            close_join.join().unwrap();
+            assert_eq!(parses.load(Ordering::Relaxed), expected_parses, "{phase:?}");
+            let terminal = domain.snapshot();
+            assert_eq!(terminal.cells, 0, "{phase:?}");
+            assert_eq!(terminal.dependency_cancellations, 0, "{phase:?}");
+            assert_eq!(terminal.dependency_pins, 0, "{phase:?}");
+            assert_eq!(terminal.dependency_edges, 0, "{phase:?}");
+            assert_eq!(terminal.dependency_edge_adds, 1, "{phase:?}");
+            assert_eq!(terminal.dependency_edge_removes, 1, "{phase:?}");
+            assert_eq!(terminal.dependency_cleanup_acks, 1, "{phase:?}");
+            drop(arena);
+            assert_eq!(broker.snapshot().aggregate_bytes, 0, "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn c2_success_error_and_flight_retry_each_use_one_exact_four_mib_normal_grant() {
+        let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+        let hooks = Arc::new(RecordingDependencyHooks {
+            events: Mutex::new(Vec::new()),
+        });
+        domain.set_dependency_hooks(hooks.clone());
+        let estimate = Representation::DeclaredObjStmMember.loader_estimate();
+        assert_eq!(estimate, 4_194_304);
+        let initial_grants = arena.inner.operation.grant_count();
+        let success_reader = reader(717);
+        let success = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap()
+            .resolve_scheduled_member_synthetic(
+                container,
+                |_| panic!("prepared child must hit"),
+                move |permit| {
+                    let stats = permit.stats();
+                    assert_eq!(stats.limit_bytes, estimate);
+                    assert_eq!(stats.current_bytes, 0);
+                    assert_eq!(stats.peak_bytes, 0);
+                    assert_eq!(stats.reservations, 0);
+                    load(&success_reader, (1, 0), permit)
+                },
+            )
+            .unwrap();
+        drop(success);
+        assert_eq!(arena.inner.operation.grant_count(), initial_grants + 2);
+        assert_eq!(
+            lock(&hooks.events)
+                .iter()
+                .filter(|event| event.kind == DependencyEventKind::MemberGranted)
+                .count(),
+            1
+        );
+
+        let failure_id = (member.0 + 10_000, 0);
+        let leader = arena
+            .inner
+            .request_representation(failure_id, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let follower = arena
+            .inner
+            .request_representation(failure_id, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let failure_cell = Arc::clone(&leader.cell);
+        let failure_calls = Arc::new(AtomicU64::new(0));
+        let failure_calls_for_load = Arc::clone(&failure_calls);
+        let leader_join = thread::spawn(move || {
+            leader.resolve_scheduled_member_synthetic(
+                container,
+                |_| panic!("prepared child must hit"),
+                move |permit| {
+                    assert_eq!(permit.limit_bytes(), estimate);
+                    failure_calls_for_load.fetch_add(1, Ordering::Relaxed);
+                    Err(transient(failure_id, "scheduled member flight failure"))
+                },
+            )
+        });
+        let follower_join = thread::spawn(move || {
+            follower.resolve_scheduled_member_synthetic(
+                container,
+                |_| panic!("failure follower child loader"),
+                |_| panic!("failure follower member loader"),
+            )
+        });
+        let first_error = leader_join.join().unwrap().unwrap_err();
+        let second_error = follower_join.join().unwrap().unwrap_err();
+        assert_eq!(first_error, second_error);
+        assert_eq!(failure_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(arena.inner.operation.grant_count(), initial_grants + 4);
+        assert_eq!(
+            lock(&hooks.events)
+                .iter()
+                .filter(|event| event.kind == DependencyEventKind::MemberGranted)
+                .count(),
+            2
+        );
+        let failure_owner = {
+            let state = lock(&failure_cell.state);
+            let CellPhase::FlightError(owner) = &state.phase else {
+                panic!("attached callers must share one flight owner")
+            };
+            Arc::clone(owner)
+        };
+        assert_eq!(Arc::strong_count(&failure_owner), 2);
+        drop(failure_owner);
+        drop(failure_cell);
+        let after_error = broker.snapshot();
+        assert_eq!(after_error.completion_reserve_bytes, 0);
+        assert_eq!(after_error.oversize_bytes, 0);
+        assert_eq!(after_error.oversize_owners, 0);
+
+        let retry_reader = reader(818);
+        let retry = arena
+            .inner
+            .request_representation(failure_id, Representation::DeclaredObjStmMember)
+            .unwrap()
+            .resolve_scheduled_member_synthetic(
+                container,
+                |_| panic!("prepared child must hit"),
+                move |permit| load(&retry_reader, (1, 0), permit),
+            )
+            .unwrap();
+        assert_eq!(retry.owner().as_object().as_i64().unwrap(), 818);
+        assert_eq!(arena.inner.operation.grant_count(), initial_grants + 6);
+        assert_eq!(
+            lock(&hooks.events)
+                .iter()
+                .filter(|event| event.kind == DependencyEventKind::MemberGranted)
+                .count(),
+            3
+        );
+        let terminal = domain.snapshot();
+        assert_eq!(terminal.members.loads, 3);
+        assert_eq!(terminal.members.negative_hits, 0);
+        drop(retry);
+        arena.close();
+        drop(arena);
+        assert_gate4_terminal(&domain, &broker, 1);
+    }
+
+    #[test]
+    fn c2_cancelled_leader_at_each_post_pin_stage_cleans_before_oldest_successor() {
+        for (phase, expected_loads) in [
+            (DependencyEventKind::MemberRequestCreated, 1),
+            (DependencyEventKind::MemberGranted, 1),
+            (DependencyEventKind::MemberParseEnter, 2),
+            (DependencyEventKind::MemberParseExit, 2),
+            (DependencyEventKind::MemberReconciledBeforePublication, 2),
+        ] {
+            let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+            let (_first_hooks, first_entered, first_action) = dependency_hook(&domain, phase);
+            let leader = arena
+                .inner
+                .request_representation(member, Representation::DeclaredObjStmMember)
+                .unwrap();
+            let leader_cancel = leader.cancellation_handle();
+            let oldest = arena
+                .inner
+                .request_representation(member, Representation::DeclaredObjStmMember)
+                .unwrap();
+            let oldest_slot = oldest.slot;
+            let later = arena
+                .inner
+                .request_representation(member, Representation::DeclaredObjStmMember)
+                .unwrap();
+            let cancelled_reader = reader(918);
+            let leader_join = thread::spawn(move || {
+                leader.resolve_scheduled_member_synthetic(
+                    container,
+                    |_| panic!("prepared child must hit"),
+                    move |permit| load(&cancelled_reader, (1, 0), permit),
+                )
+            });
+            let first = first_entered.recv().unwrap();
+            assert_eq!(first.kind, phase);
+            let successor_generation = first.token.generation + 1;
+            let (successor_hooks, successor_entered, successor_action) =
+                dependency_hook_for_generation(
+                    &domain,
+                    DependencyEventKind::BeforeChildInstall,
+                    successor_generation,
+                );
+            let (wait_entered, wait_action) = dependency_wait_hook(&domain);
+            let cancel_join = thread::spawn(move || leader_cancel.cancel());
+            let (waited_key, _) = wait_entered.recv().unwrap();
+            assert_eq!(waited_key.id, member, "{phase:?}");
+            first_action.send(PhaseAction::Continue).unwrap();
+            wait_action.send(()).unwrap();
+            cancel_join.join().unwrap();
+            let scalar_reader = reader(919);
+            let oldest_join = thread::spawn(move || {
+                oldest.resolve_scheduled_member_synthetic(
+                    container,
+                    |_| panic!("prepared child must hit"),
+                    move |permit| load(&scalar_reader, (1, 0), permit),
+                )
+            });
+            let later_join = thread::spawn(move || {
+                later.resolve_scheduled_member_synthetic(
+                    container,
+                    |_| panic!("later follower cannot resolve child"),
+                    |_| panic!("later follower cannot parse"),
+                )
+            });
+            let successor = successor_entered.recv().unwrap();
+            assert_eq!(
+                successor.token.generation, successor_generation,
+                "{phase:?}"
+            );
+            assert_eq!(successor.token.leader_slot, oldest_slot, "{phase:?}");
+            let successor_kinds = lock(&successor_hooks.events)
+                .iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>();
+            let cleanup_ack = successor_kinds
+                .iter()
+                .position(|kind| *kind == DependencyEventKind::CleanupAcknowledged)
+                .unwrap();
+            let successor_start = successor_kinds
+                .iter()
+                .position(|kind| *kind == DependencyEventKind::BeforeChildInstall)
+                .unwrap();
+            assert!(cleanup_ack < successor_start, "{phase:?}");
+            successor_action.send(PhaseAction::Continue).unwrap();
+            assert!(leader_join.join().unwrap().is_err(), "{phase:?}");
+            let oldest_pin = oldest_join.join().unwrap().unwrap();
+            let later_pin = later_join.join().unwrap().unwrap();
+            assert_eq!(oldest_pin.pointer(), later_pin.pointer(), "{phase:?}");
+            assert_eq!(
+                oldest_pin.owner().as_object().as_i64().unwrap(),
+                919,
+                "{phase:?}"
+            );
+            drop(oldest_pin);
+            drop(later_pin);
+            let terminal = domain.snapshot();
+            assert_eq!(terminal.members.calls, 3, "{phase:?}");
+            assert_eq!(terminal.members.loads, expected_loads, "{phase:?}");
+            assert_eq!(terminal.members.cancellations, 1, "{phase:?}");
+            assert_eq!(terminal.dependency_edge_adds, 2, "{phase:?}");
+            assert_eq!(terminal.dependency_edge_removes, 2, "{phase:?}");
+            assert_eq!(terminal.dependency_cleanup_acks, 2, "{phase:?}");
+            assert_eq!(terminal.dependency_edges, 0, "{phase:?}");
+            arena.close();
+            drop(arena);
+            assert_eq!(broker.snapshot().aggregate_bytes, 0, "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn c2_ready_member_hits_after_its_exact_older_container_is_evicted() {
+        let oracle_broker = broker();
+        let oracle_domain = ObjectCellDomain::new(
+            oracle_broker.clone(),
+            ObjectCellConfig::scaled(32 * 1024 * 1024),
+        );
+        let oracle_arena = oracle_domain.open_arena().unwrap();
+        let (oracle_reader, oracle_member, oracle_container, _) = object_stream_reader();
+        let oracle_child = Arc::clone(&oracle_reader);
+        let oracle_scalar = Arc::clone(&oracle_reader);
+        let oracle_pin = oracle_arena
+            .inner
+            .request_representation(oracle_member, Representation::DeclaredObjStmMember)
+            .unwrap()
+            .resolve_scheduled_member_synthetic(
+                oracle_container,
+                move |permit| {
+                    oracle_child
+                        .prepare_object_stream_with_permit(oracle_container, permit)
+                        .map_err(|error| {
+                            CellLoadError::objstm(crate::objstm_failures::classify(
+                                oracle_container,
+                                error,
+                            ))
+                        })
+                },
+                move |permit| load(&oracle_scalar, oracle_member, permit),
+            )
+            .unwrap();
+        drop(oracle_pin);
+        let exact_target = {
+            let domain = lock(&oracle_domain.inner.state);
+            let container = domain
+                .cells
+                .iter()
+                .find(|(key, _)| {
+                    key.id == oracle_container
+                        && key.representation == Representation::DeclaredObjStmContainer
+                })
+                .unwrap();
+            let member = domain
+                .cells
+                .iter()
+                .find(|(key, _)| {
+                    key.id == oracle_member
+                        && key.representation == Representation::DeclaredObjStmMember
+                })
+                .unwrap();
+            let container_weight = lock(&container.1.state).completed_weight;
+            let member_weight = lock(&member.1.state).completed_weight;
+            container_weight + member_weight
+        };
+        oracle_arena.close();
+        drop(oracle_arena);
+        assert_eq!(oracle_broker.snapshot().aggregate_bytes, 0);
+
+        let broker = broker();
+        let domain = ObjectCellDomain::new(broker.clone(), ObjectCellConfig::scaled(exact_target));
+        let arena = domain.open_arena().unwrap();
+        let (stream_reader, member, container, _) = object_stream_reader();
+        assert_eq!(member, oracle_member);
+        assert_eq!(container, oracle_container);
+        let child_reader = Arc::clone(&stream_reader);
+        let member_reader = Arc::clone(&stream_reader);
+        let member_pin = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap()
+            .resolve_scheduled_member_synthetic(
+                container,
+                move |permit| {
+                    child_reader
+                        .prepare_object_stream_with_permit(container, permit)
+                        .map_err(|error| {
+                            CellLoadError::objstm(crate::objstm_failures::classify(
+                                container, error,
+                            ))
+                        })
+                },
+                move |permit| load(&member_reader, member, permit),
+            )
+            .unwrap();
+        let member_pointer = member_pin.pointer();
+        drop(member_pin);
+        let before_pressure = domain.snapshot();
+        assert_eq!(before_pressure.cache_bytes, exact_target);
+        let raw_reader = reader(1_020);
+        let pressure = arena
+            .resolve((50_000, 0), move |permit| load(&raw_reader, (1, 0), permit))
+            .unwrap();
+        drop(pressure);
+        {
+            let state = lock(&domain.inner.state);
+            assert!(!state.cells.keys().any(|key| {
+                key.id == container && key.representation == Representation::DeclaredObjStmContainer
+            }));
+            assert!(state.cells.keys().any(|key| {
+                key.id == member && key.representation == Representation::DeclaredObjStmMember
+            }));
+        }
+        let after_pressure = domain.snapshot();
+        assert_eq!(after_pressure.containers.evictions, 1);
+        let container_calls = after_pressure.containers.calls;
+        domain.set_dependency_hooks(Arc::new(PanickingDependencyHooks));
+        let hit = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap()
+            .resolve_scheduled_member_synthetic(
+                container,
+                |_| panic!("evicted container must be irrelevant to Ready member"),
+                |_| panic!("Ready member must not parse after container eviction"),
+            )
+            .unwrap();
+        assert_eq!(hit.pointer(), member_pointer);
+        let hit_snapshot = domain.snapshot();
+        assert_eq!(hit_snapshot.containers.calls, container_calls);
+        assert_eq!(hit_snapshot.members.hits, 1);
+        assert_eq!(hit_snapshot.dependency_edges, 0);
+        drop(hit);
+        arena.close();
+        drop(arena);
+        assert_eq!(broker.snapshot().aggregate_bytes, 0);
+    }
+
+    #[test]
+    fn c2_queue_full_after_pin_publishes_one_shared_flight_error_then_retries() {
+        let broker = BudgetBroker::new(crate::broker::BrokerConfig {
+            normal_limit: 128 * 1024 * 1024,
+            oversize_limit: 64 * 1024 * 1024,
+            completion_reserve_limit: 32 * 1024 * 1024,
+            queue_metadata_weight: crate::broker::QUEUE_METADATA_WEIGHT,
+            operation_metadata_weight: crate::broker::OPERATION_METADATA_WEIGHT,
+            max_active_operations: 128,
+            max_queued_requests: 2,
+        })
+        .unwrap();
+        let domain =
+            ObjectCellDomain::new(broker.clone(), ObjectCellConfig::scaled(32 * 1024 * 1024));
+        let delivery_hooks = Arc::new(RecordingFailureDeliveryHooks {
+            deliveries: Mutex::new(Vec::new()),
+        });
+        domain.set_failure_delivery_hooks(delivery_hooks.clone());
+        let arena = domain.open_arena().unwrap();
+        let (stream_reader, member, container, _) = object_stream_reader();
+        let (_hooks, entered, action) =
+            dependency_hook(&domain, DependencyEventKind::BeforeMemberAdmission);
+        let leader = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let follower = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let failure_cell = Arc::clone(&leader.cell);
+        let parses = Arc::new(AtomicU64::new(0));
+        let parses_for_load = Arc::clone(&parses);
+        let child_reader = Arc::clone(&stream_reader);
+        let leader_join = thread::spawn(move || {
+            leader.resolve_scheduled_member_synthetic(
+                container,
+                move |permit| {
+                    child_reader
+                        .prepare_object_stream_with_permit(container, permit)
+                        .map_err(|error| {
+                            CellLoadError::objstm(crate::objstm_failures::classify(
+                                container, error,
+                            ))
+                        })
+                },
+                move |_| {
+                    parses_for_load.fetch_add(1, Ordering::Relaxed);
+                    panic!("QueueFull must precede parser entry")
+                },
+            )
+        });
+        let follower_join = thread::spawn(move || {
+            follower.resolve_scheduled_member_synthetic(
+                container,
+                |_| panic!("failure follower child loader"),
+                |_| panic!("failure follower member loader"),
+            )
+        });
+        assert_eq!(
+            entered.recv().unwrap().kind,
+            DependencyEventKind::BeforeMemberAdmission
+        );
+        let blocker_operation = broker.register_operation().unwrap();
+        let waiting_operation = broker.register_operation().unwrap();
+        let blocker = blocker_operation
+            .reserve(
+                Lane::Normal {
+                    completion_reserve: 0,
+                },
+                80 * 1024 * 1024,
+            )
+            .unwrap();
+        let queued = waiting_operation
+            .request(
+                Lane::Normal {
+                    completion_reserve: 0,
+                },
+                20 * 1024 * 1024,
+            )
+            .unwrap();
+        let saturated = broker.snapshot();
+        assert_eq!(saturated.live_request_records, 2);
+        assert_eq!(saturated.queued, 1);
+        assert_eq!(saturated.oversize_bytes, 0);
+        assert_eq!(saturated.oversize_owners, 0);
+        assert_eq!(saturated.completion_reserve_bytes, 0);
+        let member_before = saturated.operations[&arena.epoch()].clone();
+        action.send(PhaseAction::Continue).unwrap();
+        let first_error = leader_join.join().unwrap().unwrap_err();
+        let second_error = follower_join.join().unwrap().unwrap_err();
+        assert_eq!(first_error, second_error);
+        assert!(first_error.detail.contains("queue is full"));
+        assert_eq!(parses.load(Ordering::Relaxed), 0);
+        let owner = {
+            let state = lock(&failure_cell.state);
+            let CellPhase::FlightError(owner) = &state.phase else {
+                panic!("QueueFull must publish one flight owner")
+            };
+            assert!(owner.cell_envelope);
+            assert!(owner.retained_weight <= CELL_ERROR_ENVELOPE_BYTES);
+            assert!(lock(&owner.charge).is_none());
+            assert!(lock(&owner._reservation).is_none());
+            Arc::clone(owner)
+        };
+        let owner_pointer = Arc::as_ptr(&owner) as usize;
+        let deliveries = lock(&delivery_hooks.deliveries);
+        assert_eq!(deliveries.len(), 2);
+        assert!(deliveries.iter().all(|(key, _)| *key == failure_cell.key));
+        assert!(deliveries
+            .iter()
+            .all(|(_, pointer)| *pointer == owner_pointer));
+        drop(deliveries);
+        assert_eq!(Arc::strong_count(&owner), 2);
+        drop(owner);
+        drop(failure_cell);
+        let refusal = domain.snapshot();
+        assert_eq!(refusal.members.loads, 0);
+        assert_eq!(refusal.members.negative_hits, 0);
+        assert_eq!(refusal.dependency_pins, 0);
+        assert_eq!(refusal.dependency_edges, 0);
+        let refused_broker = broker.snapshot();
+        assert_eq!(
+            broker_snapshot_delta(&saturated, &refused_broker),
+            expected_bounded_flight_refusal_delta(&saturated, arena.epoch(), 1, false),
+            "QueueFull refusal must change only the frozen failure-owner accounting fields"
+        );
+        let refused_member = refused_broker.operations[&arena.epoch()].clone();
+        assert_eq!(refused_broker.denials, saturated.denials + 1);
+        assert_eq!(refused_broker.grants, saturated.grants);
+        assert_eq!(refused_broker.oversize_bytes, saturated.oversize_bytes);
+        assert_eq!(refused_broker.oversize_owners, saturated.oversize_owners);
+        assert_eq!(
+            refused_broker.completion_reserve_bytes,
+            saturated.completion_reserve_bytes
+        );
+        assert_eq!(refused_member.grants, member_before.grants);
+        assert_eq!(refused_member.granted_bytes, member_before.granted_bytes);
+        assert_eq!(refused_member.queued, 0);
+        assert_eq!(refused_member.in_flight, 0);
+        assert_eq!(refused_member.error_owners, 0);
+
+        queued.cancel();
+        if let Ok(reservation) = queued.wait() {
+            reservation.cancel();
+            drop(reservation);
+        }
+        drop(blocker);
+        waiting_operation.close();
+        blocker_operation.close();
+        let retry_reader = Arc::clone(&stream_reader);
+        let retry = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap()
+            .resolve_scheduled_member_synthetic(
+                container,
+                |_| panic!("container remained cached after refusal"),
+                move |permit| load(&retry_reader, member, permit),
+            )
+            .unwrap();
+        assert_eq!(
+            retry
+                .owner()
+                .as_object()
+                .as_dict()
+                .unwrap()
+                .get(b"Answer")
+                .unwrap()
+                .as_i64()
+                .unwrap(),
+            42
+        );
+        let terminal = domain.snapshot();
+        assert_eq!(terminal.members.loads, 1);
+        assert_eq!(terminal.members.negative_hits, 0);
+        drop(retry);
+        arena.close();
+        drop(arena);
+        assert_gate4_terminal(&domain, &broker, 1);
+    }
+
+    #[test]
+    fn c2_exact_and_one_byte_short_four_mib_capacity_are_granted_and_queued_exactly() {
+        for (shortfall, producer_error) in [(0u64, false), (0, true), (1, false), (1, true)] {
+            let broker = BudgetBroker::new(crate::broker::BrokerConfig {
+                normal_limit: 128 * 1024 * 1024,
+                oversize_limit: 64 * 1024 * 1024,
+                completion_reserve_limit: 0,
+                queue_metadata_weight: crate::broker::QUEUE_METADATA_WEIGHT,
+                operation_metadata_weight: crate::broker::OPERATION_METADATA_WEIGHT,
+                max_active_operations: 128,
+                max_queued_requests: 128,
+            })
+            .unwrap();
+            let blocker_operation = broker.register_operation().unwrap();
+            let domain =
+                ObjectCellDomain::new(broker.clone(), ObjectCellConfig::scaled(32 * 1024 * 1024));
+            let arena = domain.open_arena().unwrap();
+            let (stream_reader, member, container, _) = object_stream_reader();
+            let (_pin_hooks, pin_entered, pin_action) =
+                dependency_hook(&domain, DependencyEventKind::BeforeMemberAdmission);
+            let request = arena
+                .inner
+                .request_representation(member, Representation::DeclaredObjStmMember)
+                .unwrap();
+            let flight_cell = Arc::clone(&request.cell);
+            let cancellation = request.cancellation_handle();
+            let parses = Arc::new(AtomicU64::new(0));
+            let parses_for_load = Arc::clone(&parses);
+            let child_reader = Arc::clone(&stream_reader);
+            let member_reader = Arc::clone(&stream_reader);
+            let join = thread::spawn(move || {
+                request.resolve_scheduled_member_synthetic(
+                    container,
+                    move |permit| {
+                        child_reader
+                            .prepare_object_stream_with_permit(container, permit)
+                            .map_err(|error| {
+                                CellLoadError::objstm(crate::objstm_failures::classify(
+                                    container, error,
+                                ))
+                            })
+                    },
+                    move |permit| {
+                        parses_for_load.fetch_add(1, Ordering::Relaxed);
+                        if producer_error {
+                            Err(transient(member, "exact-budget producer error"))
+                        } else {
+                            load(&member_reader, member, permit)
+                        }
+                    },
+                )
+            });
+            pin_entered.recv().unwrap();
+
+            let before_probe = broker.snapshot();
+            let probe = blocker_operation
+                .reserve(
+                    Lane::Normal {
+                        completion_reserve: 0,
+                    },
+                    1,
+                )
+                .unwrap();
+            let probe_snapshot = broker.snapshot();
+            let reservation_metadata = probe_snapshot.metadata_bytes - before_probe.metadata_bytes;
+            drop(probe);
+            let baseline = broker.snapshot();
+            let estimate = Representation::DeclaredObjStmMember.loader_estimate();
+            let self_pinned = baseline.operations[&arena.epoch()].self_pinned_bytes;
+            let self_pin_adjustment = u64::from(shortfall == 1) * self_pinned;
+            let blocker_bytes = baseline
+                .normal_limit_bytes
+                .checked_add(shortfall + self_pin_adjustment)
+                .and_then(|bytes| bytes.checked_sub(baseline.normal_payload_bytes))
+                .and_then(|bytes| bytes.checked_sub(baseline.metadata_bytes))
+                .and_then(|bytes| bytes.checked_sub(reservation_metadata))
+                .and_then(|bytes| bytes.checked_sub(crate::broker::QUEUE_METADATA_WEIGHT))
+                .and_then(|bytes| bytes.checked_sub(estimate))
+                .unwrap();
+            let blocker = blocker_operation
+                .reserve(
+                    Lane::Normal {
+                        completion_reserve: 0,
+                    },
+                    blocker_bytes,
+                )
+                .unwrap();
+            let held = broker.snapshot();
+            assert_eq!(
+                held.metadata_bytes,
+                baseline.metadata_bytes + reservation_metadata
+            );
+            assert_eq!(
+                held.normal_payload_bytes
+                    + held.metadata_bytes
+                    + crate::broker::QUEUE_METADATA_WEIGHT
+                    + estimate,
+                held.normal_limit_bytes + shortfall + self_pin_adjustment
+            );
+            assert_eq!(held.normal_in_flight_estimate_bytes, blocker_bytes);
+            assert!(held.normal_in_flight_estimate_bytes + estimate <= held.normal_limit_bytes);
+            let admission_event = if shortfall == 0 {
+                DependencyEventKind::MemberRequestCreated
+            } else {
+                DependencyEventKind::MemberQueued
+            };
+            let (_queued_hooks, queued_entered, queued_action) =
+                dependency_hook(&domain, admission_event);
+            pin_action.send(PhaseAction::Continue).unwrap();
+            queued_entered.recv().unwrap();
+            let admission = broker.snapshot();
+            assert_eq!(
+                broker_snapshot_delta(&held, &admission),
+                expected_member_request_delta(&held, arena.epoch(), shortfall == 1),
+                "M/M-1 admission must match the exhaustive broker ledger delta"
+            );
+            let member_operation = admission.operations[&arena.epoch()].clone();
+            if shortfall == 0 {
+                assert_eq!(member_operation.queued, 0);
+                assert_eq!(member_operation.in_flight, 1);
+                queued_action.send(PhaseAction::Continue).unwrap();
+                let result = join.join().unwrap();
+                let completion = if producer_error {
+                    assert!(result.is_err());
+                    let state = lock(&flight_cell.state);
+                    let CellPhase::FlightError(owner) = &state.phase else {
+                        panic!("producer error must publish a FlightError owner")
+                    };
+                    Err(owner.retained_weight)
+                } else {
+                    let pin = result.unwrap();
+                    let retained = pin.owner().retained_bytes();
+                    drop(pin);
+                    Ok(retained)
+                };
+                assert_eq!(parses.load(Ordering::Relaxed), 1);
+                drop(flight_cell);
+                let completed = broker.snapshot();
+                assert_eq!(
+                    broker_snapshot_delta(&admission, &completed),
+                    expected_member_completion_delta(
+                        &admission,
+                        arena.epoch(),
+                        completion,
+                        completion.err().unwrap_or(0),
+                    ),
+                    "success/error completion must match the exhaustive reconciliation ledger delta"
+                );
+            } else {
+                assert_eq!(member_operation.queued, 1);
+                assert_eq!(member_operation.in_flight, 0);
+                let (wait_entered, wait_action) = dependency_wait_hook(&domain);
+                let cancel_join = thread::spawn(move || cancellation.cancel());
+                wait_entered.recv().unwrap();
+                queued_action.send(PhaseAction::Continue).unwrap();
+                wait_action.send(()).unwrap();
+                cancel_join.join().unwrap();
+                assert!(join.join().unwrap().is_err());
+                assert_eq!(parses.load(Ordering::Relaxed), 0);
+                drop(flight_cell);
+            }
+            drop(blocker);
+            let terminal = domain.snapshot();
+            assert_eq!(terminal.members.loads, u64::from(shortfall == 0));
+            assert_eq!(terminal.dependency_edges, 0);
+            blocker_operation.close();
+            arena.close();
+            drop(arena);
+            assert_gate4_terminal(&domain, &broker, 1);
+        }
+    }
+
+    #[test]
+    fn c2_retained_exact_grants_success_and_error_while_m_minus_one_shares_flight_refusal() {
+        for (shortfall, producer_error) in [(0u64, false), (0, true), (1, false), (1, true)] {
+            let broker = BudgetBroker::new(crate::broker::BrokerConfig {
+                normal_limit: 128 * 1024 * 1024,
+                oversize_limit: 64 * 1024 * 1024,
+                completion_reserve_limit: 0,
+                queue_metadata_weight: crate::broker::QUEUE_METADATA_WEIGHT,
+                operation_metadata_weight: crate::broker::OPERATION_METADATA_WEIGHT,
+                max_active_operations: 128,
+                max_queued_requests: 128,
+            })
+            .unwrap();
+            let blocker_operation = broker.register_operation().unwrap();
+            let domain =
+                ObjectCellDomain::new(broker.clone(), ObjectCellConfig::scaled(32 * 1024 * 1024));
+            let delivery_hooks = Arc::new(RecordingFailureDeliveryHooks {
+                deliveries: Mutex::new(Vec::new()),
+            });
+            domain.set_failure_delivery_hooks(delivery_hooks.clone());
+            let arena = domain.open_arena().unwrap();
+            let (stream_reader, member, container, _) = object_stream_reader();
+            let (_pin_hooks, pin_entered, pin_action) =
+                dependency_hook(&domain, DependencyEventKind::BeforeMemberAdmission);
+            let leader = arena
+                .inner
+                .request_representation(member, Representation::DeclaredObjStmMember)
+                .unwrap();
+            let follower = arena
+                .inner
+                .request_representation(member, Representation::DeclaredObjStmMember)
+                .unwrap();
+            let mut flight_cell = Some(Arc::clone(&leader.cell));
+            let parses = Arc::new(AtomicU64::new(0));
+            let parses_for_load = Arc::clone(&parses);
+            let child_reader = Arc::clone(&stream_reader);
+            let member_reader = Arc::clone(&stream_reader);
+            let leader_join = thread::spawn(move || {
+                leader.resolve_scheduled_member_synthetic(
+                    container,
+                    move |permit| {
+                        child_reader
+                            .prepare_object_stream_with_permit(container, permit)
+                            .map_err(|error| {
+                                CellLoadError::objstm(crate::objstm_failures::classify(
+                                    container, error,
+                                ))
+                            })
+                    },
+                    move |permit| {
+                        parses_for_load.fetch_add(1, Ordering::Relaxed);
+                        assert_eq!(permit.limit_bytes(), 4_194_304);
+                        let stats = permit.stats();
+                        assert_eq!(stats.current_bytes, 0);
+                        assert_eq!(stats.peak_bytes, 0);
+                        if producer_error {
+                            Err(transient(member, "retained exact producer error"))
+                        } else {
+                            load(&member_reader, member, permit)
+                        }
+                    },
+                )
+            });
+            let follower_join = thread::spawn(move || {
+                follower.resolve_scheduled_member_synthetic(
+                    container,
+                    |_| panic!("retained follower cannot resolve child"),
+                    |_| panic!("retained follower cannot produce"),
+                )
+            });
+            pin_entered.recv().unwrap();
+            let baseline = broker.snapshot();
+            let estimate = Representation::DeclaredObjStmMember.loader_estimate();
+            let payload_headroom = baseline.normal_limit_bytes
+                - (baseline.normal_payload_bytes
+                    + baseline.completion_reserve_bytes
+                    + baseline.metadata_bytes
+                    + crate::broker::QUEUE_METADATA_WEIGHT);
+            let blocker_bytes = payload_headroom - (estimate - shortfall);
+            let blocker_reservation = blocker_operation
+                .reserve(
+                    Lane::Normal {
+                        completion_reserve: 0,
+                    },
+                    blocker_bytes,
+                )
+                .unwrap();
+            let blocker = blocker_reservation.reconcile(blocker_bytes).unwrap();
+            let held = broker.snapshot();
+            assert_eq!(held.normal_in_flight_estimate_bytes, 0);
+            assert_eq!(held.metadata_bytes, baseline.metadata_bytes);
+            assert_eq!(
+                held.normal_limit_bytes
+                    - (held.normal_payload_bytes
+                        + held.completion_reserve_bytes
+                        + held.metadata_bytes
+                        + crate::broker::QUEUE_METADATA_WEIGHT),
+                estimate - shortfall
+            );
+
+            if shortfall == 0 {
+                let (_request_hooks, requested, requested_action) =
+                    dependency_hook(&domain, DependencyEventKind::MemberRequestCreated);
+                pin_action.send(PhaseAction::Continue).unwrap();
+                requested.recv().unwrap();
+                let admitted = broker.snapshot();
+                assert_eq!(
+                    broker_snapshot_delta(&held, &admitted),
+                    expected_member_request_delta(&held, arena.epoch(), false),
+                    "retained exact admission must match the exhaustive broker ledger delta"
+                );
+                let operation = admitted.operations[&arena.epoch()].clone();
+                assert_eq!(operation.queued, 0);
+                assert_eq!(operation.in_flight, 1);
+                assert_eq!(admitted.denials, held.denials);
+                requested_action.send(PhaseAction::Continue).unwrap();
+                let leader_result = leader_join.join().unwrap();
+                let follower_result = follower_join.join().unwrap();
+                assert_eq!(parses.load(Ordering::Relaxed), 1);
+                let completion = if producer_error {
+                    assert_eq!(leader_result.unwrap_err(), follower_result.unwrap_err());
+                    let state = lock(&flight_cell.as_ref().unwrap().state);
+                    let CellPhase::FlightError(owner) = &state.phase else {
+                        panic!("retained producer error must publish a FlightError owner")
+                    };
+                    Err(owner.retained_weight)
+                } else {
+                    let leader_pin = leader_result.unwrap();
+                    let follower_pin = follower_result.unwrap();
+                    assert_eq!(leader_pin.pointer(), follower_pin.pointer());
+                    let retained = leader_pin.owner().retained_bytes();
+                    drop(leader_pin);
+                    drop(follower_pin);
+                    Ok(retained)
+                };
+                drop(flight_cell.take());
+                let completed = broker.snapshot();
+                assert_eq!(
+                    broker_snapshot_delta(&admitted, &completed),
+                    expected_member_completion_delta(
+                        &admitted,
+                        arena.epoch(),
+                        completion,
+                        match completion {
+                            Ok(retained) => retained,
+                            Err(failure_weight) => CELL_METADATA_BYTES + failure_weight,
+                        },
+                    ),
+                    "retained success/error completion must match the exhaustive reconciliation ledger delta"
+                );
+            } else {
+                pin_action.send(PhaseAction::Continue).unwrap();
+                let first_error = leader_join.join().unwrap().unwrap_err();
+                let second_error = follower_join.join().unwrap().unwrap_err();
+                assert_eq!(first_error, second_error);
+                assert_eq!(
+                    first_error.detail,
+                    CellControlTag::LoaderHeadroomUnavailable.detail()
+                );
+                assert_eq!(parses.load(Ordering::Relaxed), 0);
+                let refused = broker.snapshot();
+                assert_eq!(
+                    broker_snapshot_delta(&held, &refused),
+                    expected_bounded_flight_refusal_delta(&held, arena.epoch(), 0, true),
+                    "retained M-1 refusal must change only the frozen failure-owner accounting fields"
+                );
+                assert_eq!(refused.queued, held.queued);
+                assert_eq!(refused.in_flight, held.in_flight);
+                assert_eq!(refused.grants, held.grants);
+                let owner = {
+                    let state = lock(&flight_cell.as_ref().unwrap().state);
+                    let CellPhase::FlightError(owner) = &state.phase else {
+                        panic!("retained M-1 must publish a FlightError")
+                    };
+                    assert!(owner.cell_envelope);
+                    assert!(owner.retained_weight <= CELL_ERROR_ENVELOPE_BYTES);
+                    assert!(lock(&owner.charge).is_none());
+                    assert!(lock(&owner._reservation).is_none());
+                    Arc::clone(owner)
+                };
+                let owner_pointer = Arc::as_ptr(&owner) as usize;
+                let deliveries = lock(&delivery_hooks.deliveries);
+                assert_eq!(deliveries.len(), 2);
+                assert!(deliveries
+                    .iter()
+                    .all(|(key, _)| *key == flight_cell.as_ref().unwrap().key));
+                assert!(deliveries
+                    .iter()
+                    .all(|(_, pointer)| *pointer == owner_pointer));
+                drop(deliveries);
+                assert_eq!(Arc::strong_count(&owner), 2);
+                drop(owner);
+                drop(blocker);
+                blocker_operation.close();
+                let retry_reader = Arc::clone(&stream_reader);
+                let retry = arena
+                    .inner
+                    .request_representation(member, Representation::DeclaredObjStmMember)
+                    .unwrap()
+                    .resolve_scheduled_member_synthetic(
+                        container,
+                        |_| panic!("retained-refusal retry container must hit"),
+                        move |permit| load(&retry_reader, member, permit),
+                    )
+                    .unwrap();
+                drop(retry);
+                let retried = domain.snapshot();
+                assert_eq!(retried.members.negative_hits, 0);
+                assert_eq!(retried.members.loads, 1);
+                drop(flight_cell);
+                arena.close();
+                drop(arena);
+                assert_gate4_terminal(&domain, &broker, 1);
+                continue;
+            }
+            drop(blocker);
+            blocker_operation.close();
+            drop(flight_cell);
+            arena.close();
+            drop(arena);
+            assert_gate4_terminal(&domain, &broker, 1);
+        }
+    }
+
+    #[test]
+    fn c2_scheduled_success_that_cannot_cache_closes_instead_of_returning_bypass_ready() {
+        let broker = broker();
+        let domain = ObjectCellDomain::new(
+            broker.clone(),
+            ObjectCellConfig::scaled(CELL_METADATA_BYTES),
+        );
+        let arena = domain.open_arena().unwrap();
+        let (stream_reader, member, container, _) = object_stream_reader();
+        let child_reader = Arc::clone(&stream_reader);
+        let member_reader = Arc::clone(&stream_reader);
+        let error = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap()
+            .resolve_scheduled_member_synthetic(
+                container,
+                move |permit| {
+                    child_reader
+                        .prepare_object_stream_with_permit(container, permit)
+                        .map_err(|error| {
+                            CellLoadError::objstm(crate::objstm_failures::classify(
+                                container, error,
+                            ))
+                        })
+                },
+                move |permit| load(&member_reader, member, permit),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.detail,
+            CellControlTag::ObjectStreamCacheBypassInvariant.detail()
+        );
+        let snapshot = domain.snapshot();
+        assert!(snapshot.invariant_failed);
+        assert_eq!(snapshot.ready, 0);
+        assert_eq!(snapshot.dependency_pins, 0);
+        assert_eq!(snapshot.dependency_edges, 0);
+        arena.close();
+        drop(arena);
+        assert_eq!(broker.snapshot().aggregate_bytes, 0);
+    }
+
+    #[test]
+    fn c2_stale_install_take_and_publication_at_each_stage_cannot_mutate_exact_flight() {
+        for (phase, permit_present) in [
+            (DependencyEventKind::MemberRequestCreated, false),
+            (DependencyEventKind::MemberGranted, true),
+            (DependencyEventKind::MemberParseEnter, true),
+            (DependencyEventKind::MemberParseExit, true),
+            (
+                DependencyEventKind::MemberReconciledBeforePublication,
+                false,
+            ),
+        ] {
+            let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+            let sibling_reader = reader(1_110);
+            let sibling = arena
+                .resolve((1, 0), |permit| load(&sibling_reader, (1, 0), permit))
+                .unwrap();
+            let sibling_pointer = sibling.pointer();
+            drop(sibling);
+            let (_hooks, entered, action) = dependency_hook(&domain, phase);
+            let request = arena
+                .inner
+                .request_representation(member, Representation::DeclaredObjStmMember)
+                .unwrap();
+            let cell = Arc::clone(&request.cell);
+            let scalar_reader = reader(1_111);
+            let join = thread::spawn(move || {
+                request.resolve_scheduled_member_synthetic(
+                    container,
+                    |_| panic!("prepared child must hit"),
+                    move |permit| load(&scalar_reader, (1, 0), permit),
+                )
+            });
+            assert_eq!(entered.recv().unwrap().kind, phase);
+            let (token, pin_pointer, cancellation_present) = {
+                let state = lock(&cell.state);
+                let CellPhase::Loading(loading) = &state.phase else {
+                    panic!("paused stage must retain Loading: {phase:?}")
+                };
+                let dependency = loading.dependency.as_ref().unwrap();
+                assert_eq!(loading.permit.is_some(), permit_present, "{phase:?}");
+                (
+                    dependency.token,
+                    dependency.pin.as_ref().unwrap().pointer(),
+                    dependency.cancellation.is_some(),
+                )
+            };
+            let stale = DependencyLeaderToken {
+                generation: token.generation + 1,
+                ..token
+            };
+            let attack_permit = ScalarResolutionPermit::new(4_194_304);
+            let (attack_permit, install_error) = arena
+                .inner
+                .install_member_permit(&cell, stale, attack_permit)
+                .expect_err("stale permit installed into exact flight");
+            assert_eq!(
+                install_error.detail,
+                CellControlDetail::Static(CellControlTag::DependencyRejectedStale),
+                "{phase:?}"
+            );
+            drop(attack_permit);
+            assert!(
+                arena
+                    .inner
+                    .take_member_permit_after_attempt(&cell, stale)
+                    .unwrap()
+                    .is_none(),
+                "{phase:?}"
+            );
+
+            let attack_operation = broker.register_operation().unwrap();
+            let attack_reservation = attack_operation
+                .reserve(
+                    Lane::Normal {
+                        completion_reserve: 0,
+                    },
+                    4_194_304,
+                )
+                .unwrap();
+            let attack_scalar_reader = reader(1_212);
+            let attack_scalar_permit = ScalarResolutionPermit::new(4_194_304);
+            let attack_object = load(&attack_scalar_reader, (1, 0), &attack_scalar_permit).unwrap();
+            let attack_charge = attack_reservation
+                .reconcile(attack_object.retained_bytes())
+                .unwrap();
+            let attack_owner = Arc::new(ResolvedObjectOwner {
+                payload: CellPayload::Object(attack_object),
+                permit: test_clone_permit(&attack_scalar_permit),
+                transition_gate: Mutex::new(()),
+                cache_backed: AtomicBool::new(false),
+                charge: Mutex::new(Some(attack_charge)),
+                self_pin: Mutex::new(None),
+            });
+            let (wait_entered, wait_action) = dependency_wait_hook(&domain);
+            let attack_inner = Arc::clone(&arena.inner);
+            let attack_cell = Arc::clone(&cell);
+            let attack_join = thread::spawn(move || {
+                attack_inner.publish_ready(
+                    &attack_cell,
+                    stale.leader_slot,
+                    stale.generation,
+                    attack_owner,
+                    true,
+                );
+            });
+            let (waited_key, waited_transition) = wait_entered.recv().unwrap();
+            assert_eq!(waited_key, cell.key, "{phase:?}");
+            assert_eq!(
+                waited_transition,
+                DependencyTransition::Announcing { token, kind: phase },
+                "{phase:?}"
+            );
+            {
+                let state = lock(&cell.state);
+                let CellPhase::Loading(loading) = &state.phase else {
+                    panic!("stale publication replaced exact Loading: {phase:?}")
+                };
+                let dependency = loading.dependency.as_ref().unwrap();
+                assert_eq!(loading.generation, token.generation, "{phase:?}");
+                assert_eq!(loading.leader_slot, token.leader_slot, "{phase:?}");
+                assert_eq!(loading.permit.is_some(), permit_present, "{phase:?}");
+                assert_eq!(dependency.token, token, "{phase:?}");
+                assert_eq!(
+                    dependency.pin.as_ref().unwrap().pointer(),
+                    pin_pointer,
+                    "{phase:?}"
+                );
+                assert_eq!(
+                    dependency.cancellation.is_some(),
+                    cancellation_present,
+                    "{phase:?}"
+                );
+            }
+            action.send(PhaseAction::Continue).unwrap();
+            wait_action.send(()).unwrap();
+            attack_join.join().unwrap();
+            attack_operation.close();
+            let pin = join.join().unwrap().unwrap();
+            assert_eq!(
+                pin.owner().as_object().as_i64().unwrap(),
+                1_111,
+                "{phase:?}"
+            );
+            drop(pin);
+            let sibling = arena
+                .resolve((1, 0), |_| {
+                    panic!("stale attack reloaded unrelated sibling")
+                })
+                .unwrap();
+            assert_eq!(sibling.pointer(), sibling_pointer, "{phase:?}");
+            drop(sibling);
+            drop(cell);
+            arena.close();
+            drop(arena);
+            assert_eq!(broker.snapshot().aggregate_bytes, 0, "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn c2_exact_duplicate_permit_invariant_tears_down_only_its_token() {
+        let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+        let request = arena
+            .inner
+            .request_representation(member, Representation::DeclaredObjStmMember)
+            .unwrap();
+        let cell = Arc::clone(&request.cell);
+        let (parse_entered_tx, parse_entered_rx) = mpsc::sync_channel(0);
+        let (parse_release_tx, parse_release_rx) = mpsc::sync_channel(0);
+        let scalar_reader = reader(1_313);
+        let join = thread::spawn(move || {
+            request.resolve_scheduled_member_synthetic(
+                container,
+                |_| panic!("prepared child must hit"),
+                move |permit| {
+                    parse_entered_tx.send(()).unwrap();
+                    parse_release_rx.recv().unwrap();
+                    load(&scalar_reader, (1, 0), permit)
+                },
+            )
+        });
+        parse_entered_rx.recv().unwrap();
+        let token = {
+            let state = lock(&cell.state);
+            let CellPhase::Loading(loading) = &state.phase else {
+                panic!("paused parser must retain Loading")
+            };
+            loading.dependency.as_ref().unwrap().token
+        };
+        let duplicate = ScalarResolutionPermit::new(4_194_304);
+        let (duplicate, invariant) = arena
+            .inner
+            .install_member_permit(&cell, token, duplicate)
+            .expect_err("duplicate exact permit did not trip invariant");
+        assert_eq!(
+            invariant.detail,
+            CellControlDetail::Static(CellControlTag::DependencyStateInvariant)
+        );
+        drop(duplicate);
+        assert!(arena.inner.close_exact_control(
+            &cell,
+            token.leader_slot,
+            token.generation,
+            invariant,
+            true,
+        ));
+        parse_release_tx.send(()).unwrap();
+        let error = join.join().unwrap().unwrap_err();
+        assert_eq!(
+            error.detail,
+            CellControlTag::DependencyStateInvariant.detail()
+        );
+        let terminal = domain.snapshot();
+        assert!(terminal.invariant_failed);
+        assert_eq!(terminal.dependency_pins, 0);
+        assert_eq!(terminal.dependency_edges, 0);
+        assert_eq!(terminal.dependency_edge_adds, 1);
+        assert_eq!(terminal.dependency_edge_removes, 1);
+        assert_eq!(terminal.dependency_cleanup_acks, 1);
+        drop(cell);
+        arena.close();
+        drop(arena);
+        assert_eq!(broker.snapshot().aggregate_bytes, 0);
+    }
+
+    #[test]
+    fn c2_exact_invariant_teardown_covers_each_owned_scheduled_resource_shape() {
+        for (shape, expected_parses, permit_present) in [
+            (ScheduledResourceShape::Requested, 0, false),
+            (ScheduledResourceShape::Granted, 0, true),
+            (ScheduledResourceShape::Returned, 1, false),
+            (ScheduledResourceShape::Reconciled, 1, false),
+        ] {
+            let (broker, domain, arena, member, container) = prepared_dependency_fixture();
+            let sibling_reader = reader(1_717);
+            let sibling = arena
+                .resolve((1, 0), |permit| load(&sibling_reader, (1, 0), permit))
+                .unwrap();
+            let sibling_pointer = sibling.pointer();
+            drop(sibling);
+            let (entered, action, dropped, resource_hooks) =
+                scheduled_resource_hook(&domain, shape);
+            let request = arena
+                .inner
+                .request_representation(member, Representation::DeclaredObjStmMember)
+                .unwrap();
+            let cell = Arc::clone(&request.cell);
+            let parses = Arc::new(AtomicU64::new(0));
+            let parses_for_load = Arc::clone(&parses);
+            let scalar_reader = reader(1_718);
+            let join = thread::spawn(move || {
+                request.resolve_scheduled_member_synthetic(
+                    container,
+                    |_| panic!("prepared child must hit"),
+                    move |permit| {
+                        parses_for_load.fetch_add(1, Ordering::Relaxed);
+                        load(&scalar_reader, (1, 0), permit)
+                    },
+                )
+            });
+            let (entered_key, token, entered_shape) = entered.recv().unwrap();
+            assert_eq!(entered_key, cell.key, "{shape:?}");
+            assert_eq!(entered_shape, shape);
+            {
+                let state = lock(&cell.state);
+                let CellPhase::Loading(loading) = &state.phase else {
+                    panic!("resource-shape pause must retain Loading: {shape:?}")
+                };
+                assert_eq!(loading.generation, token.generation, "{shape:?}");
+                assert_eq!(loading.leader_slot, token.leader_slot, "{shape:?}");
+                assert!(loading.broker_cancellation.is_some(), "{shape:?}");
+                assert_eq!(loading.permit.is_some(), permit_present, "{shape:?}");
+                assert_eq!(loading.dependency.as_ref().unwrap().token, token);
+            }
+            assert_eq!(domain.snapshot().active_generations, 1, "{shape:?}");
+            {
+                let ledger = lock(&domain.inner.state);
+                assert_eq!(ledger.active_generations.len(), 1, "{shape:?}");
+                assert!(ledger.active_generations.contains(&token), "{shape:?}");
+            }
+            let (terminal_cleanup, terminal_action) =
+                pausing_dependency_terminal_cleanup_hook(&domain);
+            let teardown_inner = Arc::clone(&arena.inner);
+            let teardown_cell = Arc::clone(&cell);
+            let teardown = thread::spawn(move || {
+                teardown_inner.close_exact_control(
+                    &teardown_cell,
+                    token.leader_slot,
+                    token.generation,
+                    CellControlFailure::new(
+                        token.key.id,
+                        AccessKind::Backend,
+                        CellControlTag::DependencyStateInvariant,
+                    ),
+                    true,
+                )
+            });
+            let (cleanup_key, cleanup_owner) = terminal_cleanup.recv().unwrap();
+            assert_eq!(cleanup_key, cell.key, "{shape:?}");
+            assert_eq!(
+                cleanup_owner,
+                DependencyTerminalCleanupOwner::ExactTeardown,
+                "{shape:?}"
+            );
+            let cleanup_paused = domain.snapshot();
+            assert_eq!(cleanup_paused.loading, 0, "{shape:?}");
+            assert_eq!(cleanup_paused.active_generations, 1, "{shape:?}");
+            {
+                let ledger = lock(&domain.inner.state);
+                assert_eq!(ledger.active_generations.len(), 1, "{shape:?}");
+                assert!(ledger.active_generations.contains(&token), "{shape:?}");
+            }
+            terminal_action.send(()).unwrap();
+            assert!(teardown.join().unwrap(), "{shape:?}");
+            assert_eq!(domain.snapshot().active_generations, 0, "{shape:?}");
+            action.send(()).unwrap();
+            if matches!(
+                shape,
+                ScheduledResourceShape::Returned | ScheduledResourceShape::Reconciled
+            ) {
+                let (dropped_key, dropped_token, dropped_shape) = dropped.recv().unwrap();
+                assert_eq!(dropped_key, cell.key, "{shape:?}");
+                assert_eq!(dropped_token, token, "{shape:?}");
+                assert_eq!(dropped_shape, shape, "{shape:?}");
+                assert_eq!(
+                    resource_hooks.drop_acknowledgements.load(Ordering::Relaxed),
+                    1,
+                    "{shape:?}"
+                );
+                let broker_at_drop = broker.snapshot();
+                let operation_at_drop = &broker_at_drop.operations[&arena.epoch()];
+                assert_eq!(operation_at_drop.queued, 0, "{shape:?}");
+                assert_eq!(operation_at_drop.in_flight, 0, "{shape:?}");
+                assert_eq!(broker_at_drop.live_request_records, 0, "{shape:?}");
+                assert_eq!(broker_at_drop.reservation_metadata_bytes, 0, "{shape:?}");
+                let _headroom = lock(&domain.inner.headroom);
+                let _domain = lock(&domain.inner.state);
+                assert_eq!(caller_thread_lock_depth(), 2, "{shape:?}");
+                drop(_domain);
+                drop(_headroom);
+            }
+            let error = join.join().unwrap().unwrap_err();
+            if matches!(
+                shape,
+                ScheduledResourceShape::Returned | ScheduledResourceShape::Reconciled
+            ) {
+                assert_eq!(
+                    resource_hooks.drop_acknowledgements.load(Ordering::Relaxed),
+                    1,
+                    "{shape:?}"
+                );
+                assert!(dropped.try_recv().is_err(), "{shape:?}");
+            }
+            assert_eq!(
+                error.detail,
+                CellControlTag::DependencyStateInvariant.detail(),
+                "{shape:?}"
+            );
+            assert_eq!(parses.load(Ordering::Relaxed), expected_parses, "{shape:?}");
+            let terminal = domain.snapshot();
+            assert!(terminal.invariant_failed, "{shape:?}");
+            assert_eq!(terminal.dependency_pins, 0, "{shape:?}");
+            assert_eq!(terminal.dependency_edges, 0, "{shape:?}");
+            assert_eq!(terminal.dependency_cleanup_acks, 1, "{shape:?}");
+            let operation = broker.snapshot().operations[&arena.epoch()].clone();
+            assert_eq!(operation.queued, 0, "{shape:?}");
+            assert_eq!(operation.in_flight, 0, "{shape:?}");
+            assert_eq!(operation.pin_bytes, 0, "{shape:?}");
+            let sibling = arena
+                .resolve((1, 0), |_| panic!("{shape:?}: sibling reloaded"))
+                .unwrap();
+            assert_eq!(sibling.pointer(), sibling_pointer, "{shape:?}");
+            drop(sibling);
+            assert!(arena.has_container_cell(container), "{shape:?}");
+            drop(cell);
+            arena.close();
+            drop(arena);
+            assert_eq!(broker.snapshot().aggregate_bytes, 0, "{shape:?}");
+        }
     }
 }
