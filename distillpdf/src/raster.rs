@@ -656,9 +656,11 @@ pub(crate) fn codec_payload(stream: &lopdf::Stream) -> Vec<u8> {
         return stream.content.clone();
     }
     let mut s = stream.clone();
+    let generic_len = lead.len();
     s.dict.set("Filter", Object::Array(lead));
-    s.dict.remove(b"DecodeParms"); // codec parms don't apply to the generic layers
-    s.dict.remove(b"DP");
+    // Codec parms don't apply to the generic layers; an array `/DecodeParms` is parallel to
+    // `/Filter`, so its leading entries do and are kept (see `pdfobj::keep_generic_decode_parms`).
+    crate::pdfobj::keep_generic_decode_parms(&mut s.dict, generic_len);
     if crate::pdfobj::has_legacy_unsupported_filter(&s.dict) {
         return stream.content.clone();
     }
@@ -928,6 +930,36 @@ mod tests {
         let mut s = stream(&["ASCII85Decode", "CCITTFaxDecode"], b"88/~>".to_vec()); // "Hi"
         s.dict.set("DecodeParms", dictionary! { "K" => -1i64, "Columns" => 1728i64 });
         assert_eq!(codec_payload(&s).as_slice(), b"Hi");
+    }
+
+    #[test]
+    fn codec_payload_keeps_the_generic_entries_of_an_array_decode_parms() {
+        // An array `/DecodeParms` is positional (ISO 32000-1 7.4.1), so peeling the codec off
+        // the tail must TRUNCATE it, not drop it: entry 0 still governs the Flate layer, and
+        // a live predictor there is the difference between the payload and garbage.
+        let rows: Vec<u8> = (0..32u8).collect();
+        let predicted: Vec<u8> = rows
+            .chunks(8)
+            .scan(vec![0u8; 8], |previous, row| {
+                let mut out = vec![2u8];
+                out.extend(row.iter().zip(previous.iter()).map(|(byte, before)| byte.wrapping_sub(*before)));
+                previous.copy_from_slice(row);
+                Some(out)
+            })
+            .flatten()
+            .collect();
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        std::io::Write::write_all(&mut encoder, &predicted).unwrap();
+        let mut s = stream(&["FlateDecode", "DCTDecode"], encoder.finish().unwrap());
+        s.dict.set(
+            "DecodeParms",
+            Object::Array(vec![
+                lopdf::dictionary! { "Predictor" => 12i64, "Columns" => 8i64, "Colors" => 1i64, "BitsPerComponent" => 8i64 }
+                    .into(),
+                Object::Null,
+            ]),
+        );
+        assert_eq!(codec_payload(&s), rows);
     }
 
     #[test]

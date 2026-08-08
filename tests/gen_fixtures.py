@@ -4546,6 +4546,16 @@ _OBJSTM_FORMS = [
      lambda raw: _ascii85(zlib.compress(raw, 9))),
     (b"/Filter [/ASCIIHexDecode /FlateDecode]",
      lambda raw: _asciihex(zlib.compress(raw, 9))),
+    # ISO 32000-1 7.4.1: against an array `/Filter`, `/DecodeParms` is an array parallel to
+    # it, `null` for the layers that take no parameters. A reader that reads only the
+    # dictionary form hands the Flate layer NO predictor and decodes the container to
+    # garbage without erroring.
+    (b"/Filter [/ASCIIHexDecode /FlateDecode] /DecodeParms "
+     b"[null << /Predictor 12 /Columns 8 /Colors 1 /BitsPerComponent 8 >>]",
+     lambda raw: _asciihex(zlib.compress(_png_up_predict(raw, 8), 9))),
+    (b"/Filter [/FlateDecode] /DecodeParms "
+     b"[<< /Predictor 2 /Columns 8 /Colors 1 /BitsPerComponent 8 >>]",
+     lambda raw: zlib.compress(_tiff_predict2(raw, 8), 9)),
 ]
 
 
@@ -4560,10 +4570,13 @@ def gen_objstm_filter_forms():
 
     Every container here holds the same *kind* of payload (page dictionaries, resources and
     an indirect ``/MediaBox``) and differs only in how it is encoded: bare Flate, Flate in a
-    one-element array, Flate under a PNG predictor, Flate under TIFF Predictor 2, and Flate
-    behind an ASCII85 or ASCIIHex prefix. A single container outside the envelope drops the
-    whole file to the eager engine, so "all six forms are admitted" is checkable as the
-    route the document takes, and their correctness as byte-identical output against eager.
+    one-element array, Flate under a PNG predictor, Flate under TIFF Predictor 2, Flate
+    behind an ASCII85 or ASCIIHex prefix, and — the two array-``/DecodeParms`` forms — a
+    predictor named in the array parallel to an array ``/Filter``, once behind an ASCIIHex
+    prefix with a ``null`` opposite it and once as a lone entry against a one-element
+    ``/Filter``. A single container outside the envelope drops the whole file to the eager
+    engine, so "all eight forms are admitted" is checkable as the route the document takes,
+    and their correctness as byte-identical output against eager.
 
     The predictor payloads are padded to a whole number of predictor rows with spaces, which
     land past the last member body where the container's own index never reads.
@@ -4663,6 +4676,119 @@ def gen_objstm_filter_forms():
         "text_contains": ["Container 1: encoding form",
                           "Container %d: encoding form" % pages,
                           "marker %02d-18" % pages],
+    }
+
+
+def gen_array_decode_parms():
+    """``/DecodeParms`` as the **array parallel to a ``/Filter`` array** — ISO 32000-1 7.4.1.
+
+    Whenever ``/Filter`` is an array, the parameters for its layers travel as an array of the
+    same shape, ``null`` standing in for the layers that take none::
+
+        /Filter [/ASCII85Decode /FlateDecode]
+        /DecodeParms [null << /Predictor 12 /Columns 96 /Colors 1 /BitsPerComponent 8 >>]
+
+    A reader that reads the key with "as a dictionary" gets *nothing* from that array, so the
+    Flate layer runs with **no predictor**. The failure is silent and total: every byte after
+    the first row is wrong, so a content stream comes back as PNG filter-type bytes
+    interleaved with differences rather than operators, and an image comes back as noise.
+    Nobody is told — there is no error to report.
+
+    Page 1's content stream is the ASCII85 + Flate chain above with a live PNG ``Up``
+    predictor, and it paints the page's prose plus a figure whose image XObject is encoded
+    the same way (``/Colors 3`` over an RGB ramp, so a dropped predictor shows as scrambled
+    pixels rather than a plausible picture). Page 2 uses the other spelling a single filter
+    may take, a **one-element array** ``/Filter [/FlateDecode]`` with a one-element
+    ``/DecodeParms``, under TIFF Predictor 2.
+
+    The prefix filter is ``ASCII85Decode`` on purpose: ``ASCIIHexDecode`` is in
+    ``pdfobj::has_legacy_unsupported_filter``, so a chain containing it degrades to the raw
+    bytes before the decoder is ever reached and the predictor would never be the thing under
+    test. (The ASCIIHex spelling *is* covered, in ``objstm_filter_forms.pdf``, where the
+    container is decoded by lopdf itself.)
+
+    Predictors and array parameters are beyond reportlab, so this is assembled by hand."""
+    path = os.path.join(OUT, "array_decode_parms.pdf")
+    TITLE = "Decode Parameters Carried As An Array"
+    CAPTION = "Figure 1: An RGB ramp whose predictor is named in the array."
+    LINES = [
+        "The content stream of this page declares two filters, so the parameters for",
+        "them travel as an array parallel to that list, with a null opposite the layer",
+        "that takes none. Dropping the array leaves the Flate layer with no predictor,",
+        "which decodes to bytes no content-stream parser can read.",
+    ]
+    PAGE2 = [
+        "A single filter may still be written as a one-element array, and then its",
+        "parameters are a one-element array too. This page uses TIFF Predictor 2.",
+    ]
+
+    def png_chain(raw, columns, colors=1):
+        """Encode `raw` the way page 1 declares it: PNG Up predictor, Flate, then ASCII85."""
+        row = columns * colors
+        raw = raw + b" " * (-len(raw) % row) if colors == 1 else raw
+        assert len(raw) % row == 0
+        return _ascii85(zlib.compress(_png_up_predict(raw, row), 9))
+
+    # An RGB ramp: rows differ from their predecessors, so the Up predictor is doing work and
+    # a decode that skips it cannot land on the same pixels.
+    IW, IH = 32, 24
+    pixels = bytearray()
+    for y in range(IH):
+        for x in range(IW):
+            pixels += bytes(((x * 8) % 256, (y * 10) % 256, ((x + y) * 5) % 256))
+    image_stream = png_chain(bytes(pixels), IW, colors=3)
+
+    ops = [b"BT /F1 19 Tf 72 712 Td (%s) Tj ET" % TITLE.encode()]
+    for i, line in enumerate(LINES):
+        ops.append(b"BT /F1 10.5 Tf 72 %d Td (%s) Tj ET"
+                   % (670 - i * LEAD, line.encode()))
+    ops.append(b"q 192 0 0 144 72 430 cm /Im1 Do Q")
+    ops.append(b"BT /F1 9 Tf 72 412 Td (%s) Tj ET" % CAPTION.encode())
+    page1 = b"\n".join(ops)
+    COLUMNS = 96
+    page1_stream = png_chain(page1, COLUMNS)
+
+    ops2 = [b"BT /F1 19 Tf 72 712 Td (A One Element Filter Array) Tj ET"]
+    for i, line in enumerate(PAGE2):
+        ops2.append(b"BT /F1 10.5 Tf 72 %d Td (%s) Tj ET"
+                    % (670 - i * LEAD, line.encode()))
+    page2 = b"\n".join(ops2)
+    page2 += b" " * (-len(page2) % COLUMNS)
+    page2_stream = zlib.compress(_tiff_predict2(page2, COLUMNS), 9)
+
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 5 0 R >> /XObject << /Im1 7 0 R >> >> /Contents 4 0 R >>"),
+        4: (b"<< /Length %d /Filter [/ASCII85Decode /FlateDecode] /DecodeParms "
+            b"[null << /Predictor 12 /Columns %d /Colors 1 /BitsPerComponent 8 >>] "
+            b">>\nstream\n%s\nendstream" % (len(page1_stream), COLUMNS, page1_stream)),
+        5: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        6: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 5 0 R >> >> /Contents 8 0 R >>"),
+        7: (b"<< /Type /XObject /Subtype /Image /Width %d /Height %d "
+            b"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Length %d "
+            b"/Filter [/ASCII85Decode /FlateDecode] /DecodeParms "
+            b"[null << /Predictor 12 /Columns %d /Colors 3 /BitsPerComponent 8 >>] "
+            b">>\nstream\n%s\nendstream" % (IW, IH, len(image_stream), IW, image_stream)),
+        8: (b"<< /Length %d /Filter [/FlateDecode] /DecodeParms "
+            b"[<< /Predictor 2 /Columns %d /Colors 1 /BitsPerComponent 8 >>] "
+            b">>\nstream\n%s\nendstream" % (len(page2_stream), COLUMNS, page2_stream)),
+    }
+    _assemble_pdf(objs, path)
+    GT["array_decode_parms.pdf"] = {
+        "pages": 2,
+        "title": TITLE,
+        "caption": CAPTION,
+        "text_contains": [TITLE, LINES[0], LINES[-1], CAPTION,
+                          "A One Element Filter Array", PAGE2[-1]],
+        "image_width": IW,
+        "image_height": IH,
+        # The top-left pixel of the ramp, which only survives a predictor that actually ran.
+        "image_first_pixel": [0, 0, 0],
+        "image_last_pixel": [(IW - 1) * 8 % 256, (IH - 1) * 10 % 256,
+                             ((IW - 1) + (IH - 1)) * 5 % 256],
     }
 
 
@@ -5625,6 +5751,7 @@ def main():
     gen_freed_object_revision()
     gen_damaged_startxref()
     gen_objstm_filter_forms()
+    gen_array_decode_parms()
     with open(os.path.join(OUT, "groundtruth.json"), "w") as f:
         # sort_keys: the dict's insertion order is main()'s call order, so adding or
         # reordering one generator reshuffled the whole file and buried the real change
