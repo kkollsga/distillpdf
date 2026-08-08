@@ -63,6 +63,9 @@ fn malformed_record(name: &str) -> Value {
         .unwrap();
     let (mut model, _) = load_dpdf(&temp).unwrap();
     model.source.generated_at = "<normalized>".into();
+    // Volatile by construction: `source.distillpdf` is `CARGO_PKG_VERSION`, so a release
+    // bump would re-hash this frozen model. Only the version token is neutralised.
+    model.source.distillpdf = "<normalized>".into();
     for space in &mut model.embedding_spaces {
         space.generated_at = "<normalized>".into();
     }

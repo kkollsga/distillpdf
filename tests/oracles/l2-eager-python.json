@@ -31,8 +31,8 @@
         "stage": "model_build",
         "value": {
           "kind": "bytes",
-          "length": 600,
-          "sha256": "c0f0a0923c590040beb561dbfddbc9cece5e8f912dc09925d0d3f6397515b1fa"
+          "length": 607,
+          "sha256": "3477da4c15a118249025fd6887550c024332a913e8031b3771e98ebc4a8b1187"
         }
       },
       "page_count": {
@@ -93,8 +93,8 @@
         "stage": "model_build",
         "value": {
           "kind": "bytes",
-          "length": 598,
-          "sha256": "9243a0734333770ef1a27945f1d44937a239d34ebbe9233017f8e6a8f0e287fe"
+          "length": 605,
+          "sha256": "7f9e2ba42eca0a09ae538caf51d50a1f5b5186a256f20f208d7cfeff1d6c4c09"
         }
       },
       "page_count": {

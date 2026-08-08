@@ -33,5 +33,6 @@ def test_oracles_are_independent_and_cover_required_surface_groups():
         assert prefixes <= present
         assert manifest["normalizations"] == [
             "source.generated_at=<normalized>",
+            "source.distillpdf=<normalized>",
             "embedding_spaces[*].generated_at=<normalized>",
         ]

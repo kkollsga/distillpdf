@@ -144,6 +144,10 @@ def build_manifest(temp: Path) -> dict:
     core.distill(str(dpdf), assets="none")
     model = json.loads(distillpdf.load_model(str(dpdf)))
     model["source"]["generated_at"] = "<normalized>"
+    # The generator version is volatile by construction: `source.distillpdf` carries the
+    # package version, so every release bump would otherwise re-hash this frozen surface.
+    # Neutralise the token only — structure and content stay byte-locked.
+    model["source"]["distillpdf"] = "<normalized>"
     for space in model.get("embedding_spaces", []):
         space["generated_at"] = "<normalized>"
     canonical = (json.dumps(model, indent=2, sort_keys=True) + "\n").encode()
@@ -212,6 +216,7 @@ def build_manifest(temp: Path) -> dict:
         "layer": "python",
         "normalizations": [
             "source.generated_at=<normalized>",
+            "source.distillpdf=<normalized>",
             "embedding_spaces[*].generated_at=<normalized>",
         ],
         "sources": sources,

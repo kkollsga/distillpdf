@@ -3,6 +3,7 @@
   "layer": "rust",
   "normalizations": [
     "source.generated_at=<normalized>",
+    "source.distillpdf=<normalized>",
     "embedding_spaces[*].generated_at=<normalized>"
   ],
   "sources": {
@@ -51,8 +52,8 @@
     },
     "container.normalized_resave": {
       "kind": "bytes",
-      "length": 8848,
-      "sha256": "582d523c138112a90f8f7b3cdec0379ba92f91054c919023ac31a400c0918646",
+      "length": 8855,
+      "sha256": "e6c10bfaa8f8695c82dedd09ce23c9c8697083eddebdb6f363f87ae002c06dc7",
       "stage": "container_resave"
     },
     "error.container_invalid": {
@@ -274,8 +275,8 @@
     },
     "model.canonical": {
       "kind": "bytes",
-      "length": 8730,
-      "sha256": "b469b60f76a294c4a5f4eb90b620c5f3a2b76b30aa3fd05db293b873491cb7f3",
+      "length": 8737,
+      "sha256": "b065eb1d987c750dd186ab496df3d93d1768719f139c733d7ce69d78271a3609",
       "stage": "model_load"
     },
     "model.render_html": {

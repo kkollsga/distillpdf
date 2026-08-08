@@ -327,6 +327,10 @@ mod tests {
             .unwrap();
         let (mut model, members) = load_dpdf(&dpdf).unwrap();
         model.source.generated_at = "<normalized>".into();
+        // The generator version is volatile by construction: `source.distillpdf` carries
+        // `CARGO_PKG_VERSION`, so every release bump would otherwise re-hash this frozen
+        // surface. Neutralise the token only — structure and content stay byte-locked.
+        model.source.distillpdf = "<normalized>".into();
         for space in &mut model.embedding_spaces {
             space.generated_at = "<normalized>".into();
         }
@@ -428,6 +432,7 @@ mod tests {
             "layer": "rust",
             "normalizations": [
                 "source.generated_at=<normalized>",
+                "source.distillpdf=<normalized>",
                 "embedding_spaces[*].generated_at=<normalized>"
             ],
             "sources": sources,

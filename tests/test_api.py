@@ -28,13 +28,32 @@ RULED_BLANK = os.path.join(FIX, "ruled_blank_cells.pdf")
 TABLE_CORPUS = os.path.join(os.path.dirname(__file__), "table_corpus")
 
 
+# `model["source"]` carries two fields that are volatile *by construction* and therefore
+# never part of what a frozen digest locks: `generated_at` (wall clock) and `distillpdf`
+# (the package version, stamped from CARGO_PKG_VERSION — it changes on every release bump).
+# Neutralise both to a fixed token before comparing or digesting; everything else about the
+# model stays byte-locked. Mutates and returns the model for use inline.
+MODEL_SOURCE_NORMALIZED = "<normalized>"
+
+
+def _normalize_model_source(model):
+    source = model["source"]
+    source.pop("generated_at", None)
+    source["distillpdf"] = MODEL_SOURCE_NORMALIZED
+    return model
+
+
 # SHA-256 locks derived from the preregistered frozen parent owned-surface artifact at
 # dadad4fa8cc7e31bfd08671a87082e05e59d4cab. Tests contain the constants and never depend on
 # that local artifact. Order: raw, analyzed, HTML, Markdown, canonical model JSON.
+# The model digests were re-locked once (2026-08-08) when `source.distillpdf` started being
+# normalized above: previously they hashed the literal package version, so every release
+# bump drifted them. The four non-model digests are byte-identical to the frozen parent —
+# only the version token changed, and it is now neutral for good.
 GROUP_HEADER_HARD_NEGATIVE_SURFACES = {
-    "t1_booktabs_in_prose.pdf": ("1ef8e39c16d5baff549ed094c21035732723e2ef35ea9667e62e6b09ae682722", "1948d1777589d8dd1424f1cebcb7b3075f6d8d0213e91e0936059b8dc1d8f8cc", "1a6aa9e417e210436a6d9f8247acede867796d190948db0bb34355e8b028a17c", "9f2ed8ced0e395e377aeee756dc3908ab16227a6dc0553665bf5388e2a636866", "ce11ff5c5dfc0054f2315b1c9095865ce0dec589caab9189ec0a3cb63bdd2a14"),
-    "t1_booktabs_small.pdf": ("0249d11443229afb38d14acad716bcc33bdcf13cd661e5dd5774c3389939c736", "47112ca224cd3da2593dbc9854ecf4aff4d56cecbb878e6bd72b2f931ec1fef4", "cdab294f091bb61d4c4eee2a6cb07fdee96fea4fa19f9aee97f14e1593442a61", "5e3a704f440b06db4909d221e042025a8aa85b3c6f449e95b372c36cd28b96b9", "cd53b843b2f0c5536206da49b9a7fd2d6f2addeddeaf8c1bebd5143ae6c9f663"),
-    "t1_booktabs_source_median.pdf": ("6a557ffe681de641a726ca99204294e383e8b0aebc596053ba9c2e44c7c8e9be", "e95c3ebc979600d6d6db9a58b00c7f8cea9c83bb5b389d9575170b7133c6f02a", "320d1812f5d2b523e6afaaee327c38e8ac5669b4a802dea6a7a10e61d61fc82f", "69165b292f10b20e8de166547594833bba8ace0d4b186cea6f8d17978c8ab8a2", "54061df686832c13f4ff90eb3248cc9577abdf43aefad0f5e4a9fd963a19ade8"),
+    "t1_booktabs_in_prose.pdf": ("1ef8e39c16d5baff549ed094c21035732723e2ef35ea9667e62e6b09ae682722", "1948d1777589d8dd1424f1cebcb7b3075f6d8d0213e91e0936059b8dc1d8f8cc", "1a6aa9e417e210436a6d9f8247acede867796d190948db0bb34355e8b028a17c", "9f2ed8ced0e395e377aeee756dc3908ab16227a6dc0553665bf5388e2a636866", "ecfb59b249a8c9107b4b37d4cce237b52eb292be4f672ae5908515298a82d518"),
+    "t1_booktabs_small.pdf": ("0249d11443229afb38d14acad716bcc33bdcf13cd661e5dd5774c3389939c736", "47112ca224cd3da2593dbc9854ecf4aff4d56cecbb878e6bd72b2f931ec1fef4", "cdab294f091bb61d4c4eee2a6cb07fdee96fea4fa19f9aee97f14e1593442a61", "5e3a704f440b06db4909d221e042025a8aa85b3c6f449e95b372c36cd28b96b9", "662519d45d59f0b44c055adc5b16f3ada6af57cf6aca68fd1a8a68b7af212d8b"),
+    "t1_booktabs_source_median.pdf": ("6a557ffe681de641a726ca99204294e383e8b0aebc596053ba9c2e44c7c8e9be", "e95c3ebc979600d6d6db9a58b00c7f8cea9c83bb5b389d9575170b7133c6f02a", "320d1812f5d2b523e6afaaee327c38e8ac5669b4a802dea6a7a10e61d61fc82f", "69165b292f10b20e8de166547594833bba8ace0d4b186cea6f8d17978c8ab8a2", "0643bdf2d14853acddeea18381d7a316606006f7f0076b15c64674415da20e2f"),
     # HTML / Markdown / model re-locked 2026-08-08 with `fix(headings): stop form and grid
     # furniture reading as sections`. This file's only prominent line is its table caption
     # ("Table 1. booktabs, declared"), so `find_document_title` published it as the document
@@ -42,15 +61,15 @@ GROUP_HEADER_HARD_NEGATIVE_SURFACES = {
     # now the table's own `<caption>` (and the table carries the caption's `tab-1` anchor), so
     # the caption appears exactly once on all three surfaces. The two table surfaces (raw,
     # analyzed) are byte-identical to the frozen parent and are unchanged below.
-    "t1_booktabs_tagged.pdf": ("b2986b61dfc8f50ca8605a13720f99263b6c06fa207f855988fbfe68b238b648", "ea2fe0bd8ea85e506073735c3de7a0608154646232cfc6256a41b7101e6ad38a", "cb34e197e117ea19ff52a09fe109274b93d1513afbb9ccabecf9b2613d53d084", "3ab9f34ba023ed650b903ff3e274a27307cf8f4930b7d0cff874586e68d0dc12", "ad651c59c11ba693edb1880dd9be2cda0155811263d5cba5dfd4eb7ed341fb09"),
-    "t2_blank_cells_grid_10pct.pdf": ("35be0fe770d111f20f3b8dbfd166383dc346848d081708b8a3e734501625b7c3", "8dcc4cad594ebe0e99a7fe8cd7c0dd88eb747804fd8c401054f7992eb13c7622", "e1f9f651477ba8494c0db3f49d594b67a6d9192ec9aadd4f770cbc5b8ab7be61", "e282904302fad8bc0843c6779c39e9145aae0fc207d103b8ee6f0c99e1fff1be", "c6ad3c55fdf205616d6d013b45274a9f7a0c92fbd3f90165aecac4c4d59c2c94"),
-    "t2_blank_cells_grid_30pct.pdf": ("81ccf3442cca9f7491906a770bf6f7e539fe21ff15a362172b14b79c2c1bb1a2", "999a277f3322821ff7ff3d32f50c9d15698edb1b4ea9c5cac9e69eae37aca8bb", "e561011a597aff35fc096921ca4c4591a42f2abd7d1e38eff6baf2d12744ed83", "bbfd960a129e038e9c9976f3b9f747636857e27fbd556fbb503c727b109a01a9", "fdcfaf8c6c703e9fe2ce585a73284551ee7d1742a61aa2b09c3cf53425ac86e4"),
-    "t2_multitier_header_four_tier.pdf": ("6b319958f476eb544d9dcf789edc35f6807eb7e76a5e370183b999fa031a23bd", "0f06ec64040bbcbea6b1e6a6926f4a5d4ac7765cb87a4a94fe193dde92d3ca61", "2c32b238cae1c70db8f6e0e8a1b8aae466700e8a0ebeb5ecc403ed45babdf4a6", "0c7d1bcdc5f3c266fd6d43330b0d97c653486bb905d7f0071f0702039c140253", "43d4e5c5c67fb906eb327912cc925a54b3316dbbb211520a9b478fe1aa4fec82"),
-    "t2_multitier_header_two_tier.pdf": ("b61d9be65bd334726fa3d5d241116dcdf09278ea772b80771b2f63f09e575538", "5a493d9be8b72420fd654413a003afb57584db3f7af249315063624cce66c5cb", "8a82f3e3cb0278609b074aeef74de4c68d00d4731d1b79b5c631d3dc0205a380", "560c5cc3cf12f3f488bebe98d83093a81c91c8de3c932eb15b0aa17d54d4ed7e", "5c98f81f85dbd660418d3868cb62d288a4d8c4c09380b3348c26038c174c85d3"),
-    "t2_no_header_borderless.pdf": ("9003e063ce6009af150f03153aab3f1464d5b3b7bd8c022b1fed265709b4e7dd", "fba82dcae0ddd045e299ca95399c0a5b211013890eaea3ed4fa28adcfcd62482", "c3ecf778b2e84b9c9c43bee474303805259924664ac6ad896ba5fd004972310f", "68b63ded276afd13725e6411a6cd44176a2b297c0c148e8ea64f4d6bc71bc48d", "0c569ca04464c9e3dd757409b35c6c14a5f08e4cb7b928dd405ab8590831e88d"),
-    "t2_no_header_grid.pdf": ("c843aa61246ed38dd59b8012b8b0d5a54d2dab112eaa8e6f59265873e5c2e137", "38530b8093bde7774c22ad184aa32a86b5b717c1432c40706c5261a4f4bf8aa8", "ae0d2b0f0af07a839b3f161e07f2bca01aecee1642f2f6c0f05849b8f638ff8d", "ee65731df6d6fc94e75128e06a1bc31a6edb5c6c9407e69f0e7bc6b6aa4753b5", "2f8e16c1456cb463ea7c90d1e949a606531c6b00f6664822bdfd92eee3bd8a30"),
-    "t3_blank_borderless.pdf": ("d08def3b19655ea33396daa3c65d7f2663e4d74cb15bb522c6fa63f63940984d", "7aed89fecf24e9e80f00ebb7dd9466af681ffaecbadf037c2e0125230ebad1f0", "c45ee612418075586d46e6fd82e7acedd1ab31d96dd6514641e92da6a0357fab", "25e541b48ab6c398161c0625245a30be3b627cefc3cc766bb019b40068a8d7f4", "b2397d487b4370c60b69bd6dab56d3990153baf2e7e5c159964f3e3d17f03dae"),
-    "t3_spacer_cols.pdf": ("d7db0d8caa46dadd225cefcaf5dbe445688d71dccf3518a5d2bc11d87c86e0df", "8739e1c9728a3175fe439f1df7a27493113e394e00319cd04b7fb695d0eca209", "622b1cbe12335f15f94673e42e661ccceec347e2e20db5064f1eedf765b5c59e", "3c0fb5bfbc2cd953e8b812df5b2c57423369c3b9ea02c304ea4790f309d43ddc", "78118c817eee34c8b1a46c7a1384ac0a89268159eebb86f0b827e9c46d17fe76"),
+    "t1_booktabs_tagged.pdf": ("b2986b61dfc8f50ca8605a13720f99263b6c06fa207f855988fbfe68b238b648", "ea2fe0bd8ea85e506073735c3de7a0608154646232cfc6256a41b7101e6ad38a", "cb34e197e117ea19ff52a09fe109274b93d1513afbb9ccabecf9b2613d53d084", "3ab9f34ba023ed650b903ff3e274a27307cf8f4930b7d0cff874586e68d0dc12", "a5282eac012c2c8d168ef5fe0852fbc7ae1880c5553ac0b9dabdfde2472b7fa8"),
+    "t2_blank_cells_grid_10pct.pdf": ("35be0fe770d111f20f3b8dbfd166383dc346848d081708b8a3e734501625b7c3", "8dcc4cad594ebe0e99a7fe8cd7c0dd88eb747804fd8c401054f7992eb13c7622", "e1f9f651477ba8494c0db3f49d594b67a6d9192ec9aadd4f770cbc5b8ab7be61", "e282904302fad8bc0843c6779c39e9145aae0fc207d103b8ee6f0c99e1fff1be", "3c79dd1e9b93624b3e307bd6184e6911a498ebeadf6493aeaf6ddcc2ff8296a3"),
+    "t2_blank_cells_grid_30pct.pdf": ("81ccf3442cca9f7491906a770bf6f7e539fe21ff15a362172b14b79c2c1bb1a2", "999a277f3322821ff7ff3d32f50c9d15698edb1b4ea9c5cac9e69eae37aca8bb", "e561011a597aff35fc096921ca4c4591a42f2abd7d1e38eff6baf2d12744ed83", "bbfd960a129e038e9c9976f3b9f747636857e27fbd556fbb503c727b109a01a9", "16e436d012e5fb1db56c9c002a8ae2cab7935113f56d20512b58fd70cc43bf73"),
+    "t2_multitier_header_four_tier.pdf": ("6b319958f476eb544d9dcf789edc35f6807eb7e76a5e370183b999fa031a23bd", "0f06ec64040bbcbea6b1e6a6926f4a5d4ac7765cb87a4a94fe193dde92d3ca61", "2c32b238cae1c70db8f6e0e8a1b8aae466700e8a0ebeb5ecc403ed45babdf4a6", "0c7d1bcdc5f3c266fd6d43330b0d97c653486bb905d7f0071f0702039c140253", "cc1ee555d6b2a250da6a7a6054910a30cb6d1ee59ef22ef3accb90fd20d208c7"),
+    "t2_multitier_header_two_tier.pdf": ("b61d9be65bd334726fa3d5d241116dcdf09278ea772b80771b2f63f09e575538", "5a493d9be8b72420fd654413a003afb57584db3f7af249315063624cce66c5cb", "8a82f3e3cb0278609b074aeef74de4c68d00d4731d1b79b5c631d3dc0205a380", "560c5cc3cf12f3f488bebe98d83093a81c91c8de3c932eb15b0aa17d54d4ed7e", "bad689aa6044227ef9c2a8ccc8d2d98f9796aa9477826b74b7ba227f194ef57d"),
+    "t2_no_header_borderless.pdf": ("9003e063ce6009af150f03153aab3f1464d5b3b7bd8c022b1fed265709b4e7dd", "fba82dcae0ddd045e299ca95399c0a5b211013890eaea3ed4fa28adcfcd62482", "c3ecf778b2e84b9c9c43bee474303805259924664ac6ad896ba5fd004972310f", "68b63ded276afd13725e6411a6cd44176a2b297c0c148e8ea64f4d6bc71bc48d", "ab0e4ba9c982046829772486fef83dc5e1ac96a65a083e279f29720931cf8f59"),
+    "t2_no_header_grid.pdf": ("c843aa61246ed38dd59b8012b8b0d5a54d2dab112eaa8e6f59265873e5c2e137", "38530b8093bde7774c22ad184aa32a86b5b717c1432c40706c5261a4f4bf8aa8", "ae0d2b0f0af07a839b3f161e07f2bca01aecee1642f2f6c0f05849b8f638ff8d", "ee65731df6d6fc94e75128e06a1bc31a6edb5c6c9407e69f0e7bc6b6aa4753b5", "d9eac27e9694ea9dae1aef4b7191fc884fbe92f979199396de3a845806175ef9"),
+    "t3_blank_borderless.pdf": ("d08def3b19655ea33396daa3c65d7f2663e4d74cb15bb522c6fa63f63940984d", "7aed89fecf24e9e80f00ebb7dd9466af681ffaecbadf037c2e0125230ebad1f0", "c45ee612418075586d46e6fd82e7acedd1ab31d96dd6514641e92da6a0357fab", "25e541b48ab6c398161c0625245a30be3b627cefc3cc766bb019b40068a8d7f4", "89add2af2f179b0038f3656e2beeb53a252c4e738ca0337dcdfca69488e1fb50"),
+    "t3_spacer_cols.pdf": ("d7db0d8caa46dadd225cefcaf5dbe445688d71dccf3518a5d2bc11d87c86e0df", "8739e1c9728a3175fe439f1df7a27493113e394e00319cd04b7fb695d0eca209", "622b1cbe12335f15f94673e42e661ccceec347e2e20db5064f1eedf765b5c59e", "3c0fb5bfbc2cd953e8b812df5b2c57423369c3b9ea02c304ea4790f309d43ddc", "5e518ac543ed891098285046dabafcfb0d9b41d9290ccd022dc5eb7008030b45"),
 }
 
 
@@ -543,11 +562,8 @@ def test_ruled_group_header_moves_into_table_prose_and_model_atomically(tmp_path
     assert model["ocr_passes"] == []
     assert model["metadata"] == {}
     assert model["pages"] == [{"height_pts": 792.0, "n": 1, "width_pts": 612.0}]
-    assert {
-        key: value for key, value in model["source"].items()
-        if key != "generated_at"
-    } == {
-        "distillpdf": "0.1.0",
+    assert _normalize_model_source(model)["source"] == {
+        "distillpdf": MODEL_SOURCE_NORMALIZED,
         "file": "t2_merged_colspan_over_grid.pdf",
         "pages": 1,
         "sha256": "6d28e5570ff2708b21a047f882bc2423d97647d6645ad5aa00256fccdf5082bb",
@@ -690,8 +706,7 @@ def test_persistent_internal_gutter_targets_are_exact_on_every_public_projection
     assert _surface_sha(pdf._dbg_spans_xy(1)) == frozen["spans_sha"]
 
     dpdf = pdf.distill(str(tmp_path / f"{name}.dpdf"))
-    model = json.loads(distillpdf.load_model(dpdf))
-    model["source"].pop("generated_at", None)
+    model = _normalize_model_source(json.loads(distillpdf.load_model(dpdf)))
     table_block = {
         "bbox": [
             79.5999984741211,
@@ -740,7 +755,7 @@ def test_persistent_internal_gutter_targets_are_exact_on_every_public_projection
         "schema_version": 0,
         "sections": [],
         "source": {
-            "distillpdf": "0.1.0",
+            "distillpdf": MODEL_SOURCE_NORMALIZED,
             "file": name,
             "pages": 1,
             "sha256": frozen["file_sha"],
@@ -773,8 +788,7 @@ def test_group_header_hard_negatives_keep_all_parent_public_surfaces_exact(
 ):
     pdf = distillpdf.Pdf.open(os.path.join(TABLE_CORPUS, name))
     dpdf = pdf.distill(str(tmp_path / f"{name}.dpdf"))
-    model = json.loads(distillpdf.load_model(dpdf))
-    model["source"].pop("generated_at", None)
+    model = _normalize_model_source(json.loads(distillpdf.load_model(dpdf)))
     surfaces = (
         pdf.extract_tables(),
         pdf.analyze_tables(),

@@ -45,6 +45,9 @@ def _malformed_record(path: Path, temp: Path) -> dict:
     document.distill(str(model_path), assets="none")
     model = json.loads(distillpdf.load_model(str(model_path)))
     model["source"]["generated_at"] = "<normalized>"
+    # Volatile by construction: `source.distillpdf` is the package version, so a release
+    # bump would re-hash this frozen model. Only the version token is neutralised.
+    model["source"]["distillpdf"] = "<normalized>"
     for space in model.get("embedding_spaces", []):
         space["generated_at"] = "<normalized>"
     canonical = (json.dumps(model, indent=2, sort_keys=True) + "\n").encode()
