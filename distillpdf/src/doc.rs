@@ -1942,30 +1942,97 @@ pub(crate) mod tests {
         );
     }
 
+    /// The public constructors carry honest route provenance for whichever engine the internal
+    /// `DISTILLPDF_ENGINE` selector picked.
+    ///
+    /// This used to assert "public constructors are eager, full stop" — a restatement of the old
+    /// plan's "indexed is unreachable from production" rule, which the Phase B selector
+    /// deliberately retires. The invariants worth keeping are the ones checked here: the
+    /// *default* (unset selector) is still eager on both constructors, an indexed route reports
+    /// indexed provenance, and no route ever claims both engines at once.
     #[test]
-    fn public_constructors_remain_eager_compatibility_routes() {
+    fn public_constructors_carry_honest_route_provenance_for_the_selected_engine() {
         let (fixture, raw) = route_fixture();
         let file = PdfDocument::open(fixture.to_str().unwrap()).unwrap();
         let bytes = PdfDocument::from_bytes(&raw).unwrap();
-        for (actual, route, mode) in [
+        let indexed_selected = engine_selection().prefers_indexed();
+        for (actual, eager_route, eager_mode, indexed_route, indexed_mode) in [
             (
                 file.route_diagnostics(),
                 OpenRoute::EagerFile,
                 SourceMode::EagerMaterializedFile,
+                OpenRoute::IndexedFile,
+                SourceMode::FileDescriptor,
             ),
             (
                 bytes.route_diagnostics(),
                 OpenRoute::EagerBytes,
                 SourceMode::SharedBytes,
+                OpenRoute::IndexedBytes,
+                SourceMode::SharedBytes,
             ),
         ] {
-            assert_eq!(actual.route, route);
-            assert_eq!(actual.reason, OpenReason::PublicCompatibility);
-            assert_eq!(actual.source_mode, mode);
-            assert_eq!(actual.eager_opens, 1);
-            assert_eq!(actual.indexed_opens, 0);
-            assert_eq!(actual.fallback_opens, 0);
+            // Exactly one engine opened this handle, and the fallback counter is only ever set
+            // together with an eager open — a silent fallback would break this.
+            assert_eq!(actual.eager_opens + actual.indexed_opens, 1);
+            assert!(actual.fallback_opens <= actual.eager_opens);
+            if !indexed_selected {
+                assert_eq!(actual.route, eager_route);
+                assert_eq!(actual.reason, OpenReason::PublicCompatibility);
+                assert_eq!(actual.source_mode, eager_mode);
+                assert_eq!(actual.eager_opens, 1);
+                assert_eq!(actual.indexed_opens, 0);
+                assert_eq!(actual.fallback_opens, 0);
+            } else if actual.indexed_opens == 1 {
+                assert_eq!(actual.route, indexed_route);
+                assert_eq!(actual.reason, OpenReason::InternalMeasurement);
+                assert_eq!(actual.source_mode, indexed_mode);
+                assert_eq!(actual.fallback_opens, 0);
+            } else {
+                // Counted eager fallback: the indexed open refused this document.
+                assert_eq!(actual.route, eager_route);
+                assert_eq!(actual.source_mode, eager_mode);
+                assert_eq!(actual.fallback_opens, 1);
+            }
         }
+    }
+
+    /// The selector is off unless `DISTILLPDF_ENGINE` names a route — the property that keeps
+    /// released builds eager no matter what else changes in `open`/`from_bytes`.
+    #[test]
+    fn engine_selector_defaults_to_eager_for_unset_and_unknown_values() {
+        for value in [
+            None,
+            Some(""),
+            Some("eager"),
+            Some("lazy"),
+            Some("INDEXED"),
+            Some("indexed "),
+            Some("indexed-strictly"),
+            Some("1"),
+        ] {
+            assert_eq!(
+                parse_engine_selection(value),
+                EngineSelection::Eager,
+                "{value:?} must stay eager"
+            );
+        }
+        assert_eq!(
+            parse_engine_selection(Some("indexed")),
+            EngineSelection::Indexed
+        );
+        assert_eq!(
+            parse_engine_selection(Some("indexed-strict")),
+            EngineSelection::IndexedStrict
+        );
+        assert!(!EngineSelection::Eager.prefers_indexed());
+        assert!(EngineSelection::Indexed.prefers_indexed());
+        assert!(EngineSelection::IndexedStrict.prefers_indexed());
+        // The process-wide selection agrees with the grammar for this process's environment.
+        assert_eq!(
+            engine_selection(),
+            parse_engine_selection(std::env::var("DISTILLPDF_ENGINE").ok().as_deref())
+        );
     }
 
     #[test]
