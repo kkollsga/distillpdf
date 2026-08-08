@@ -5,7 +5,11 @@
 
 use crate::pdfobj::filters_of;
 use crate::raster::{assemble_png, codec_payload, filter_to_format, image_bpc, image_color_space, normalized_jpeg_png};
-use crate::text::{self, Span};
+use crate::table::{
+    AnalyzedTable, CandidateKey, CandidateProducer, CellAnalysis, CellRole,
+    PositionedTableAnalysis, TableAnalysis, TableClaim, TableEvidence,
+};
+use crate::text::{self, SourceSlice, Span};
 use crate::{access::DictionaryHandle, walker::ResourceScope};
 use lopdf::{Dictionary, ObjectId};
 #[cfg(test)]
@@ -872,31 +876,6 @@ fn incoherent_reason(grid: &[Vec<String>]) -> Option<&'static str> {
     None
 }
 
-/// Detect tables: runs of >=3 consecutive rows that each have >=2 gutter-separated
-/// cells and share >=2 columns occupied in a majority of rows. This rejects
-/// word-positioned prose (whose words merge into a single cell).
-/// A detected table with its vertical extent (PDF user space, y increases up).
-#[derive(Clone)]
-pub struct PosTable {
-    pub y_top: f32,
-    pub y_bottom: f32,
-    pub x_left: f32,
-    pub x_right: f32,
-    pub grid: Vec<Vec<String>>,
-    /// Grouped/multi-level HEADER rows mapped onto the data column grid, each cell as
-    /// (text, colspan): a header cell spanning several data columns ("Masking Rates"
-    /// over MASK/SAME/RND) carries colspan>1; cells over one column carry colspan 1.
-    /// Empty when the table has no detached header (the data grid's row 0 is the header).
-    pub header: Vec<Vec<(String, usize)>>,
-    /// Number of leading rows in `header + grid` that are semantic header rows.
-    ///
-    /// This is deliberately separate from `header.len()`: `header` records detached rows
-    /// that belong to the table's visible cell sequence, while this field records which of
-    /// those rows should render as `<th>`. Keeping the two independent lets ownership fixes
-    /// correct semantics without dropping, moving, or duplicating cells.
-    pub header_rows: usize,
-}
-
 fn clone_span(s: &Span) -> Span {
     Span {
         x: s.x,
@@ -910,6 +889,7 @@ fn clone_span(s: &Span) -> Span {
         angle: s.angle,
         font: s.font,
         mcid: s.mcid,
+        source: s.source,
     }
 }
 
@@ -1159,7 +1139,7 @@ pub(crate) enum Refusal {
 /// A page's declared tables after the trust rule has run.
 pub(crate) struct Declared {
     /// Accepted declarations, ready to place like any other detected table.
-    pub tables: Vec<PosTable>,
+    pub tables: Vec<PositionedTableAnalysis>,
     /// Refusals, in declaration order.
     pub refused: Vec<Refusal>,
 }
@@ -1208,14 +1188,17 @@ pub(crate) fn declared_pos_tables(declared: &[crate::structtree::DeclaredTable],
         Rect::new(s.x, s.y, s.x + s.width.max(s.size * 0.3), s.y + s.size)
     };
 
-    for t in declared {
+    for (declared_ordinal, t) in declared.iter().enumerate() {
         let cols = t.cols();
+        let mut declared_claim_rows: Vec<Vec<SourceSlice>> = Vec::with_capacity(t.rows.len());
         // Resolve every cell: its span set, its box, and whether it resolved at all.
         let rows: Vec<Vec<(String, Rect, bool)>> = t
             .rows
             .iter()
             .map(|r| {
-                r.iter()
+                let mut row_claim = Vec::new();
+                let resolved = r
+                    .iter()
                     .map(|c| {
                         let mut idx: Vec<usize> = c.mcids.iter().filter_map(|m| by_mcid.get(m)).flatten().copied().collect();
                         let mut bx = Rect::EMPTY;
@@ -1231,10 +1214,13 @@ pub(crate) fn declared_pos_tables(declared: &[crate::structtree::DeclaredTable],
                         }
                         idx.sort_unstable();
                         idx.dedup();
+                        row_claim.extend(idx.iter().map(|&i| spans[i].source));
                         bx = idx.iter().fold(bx, |a, &i| a.union(sbox(i)));
                         (cell_text(spans, &idx), bx, resolved)
                     })
-                    .collect()
+                    .collect();
+                declared_claim_rows.push(row_claim);
+                resolved
             })
             .collect();
         // Rows the page really carries. `structtree` filtered by what the tree *claims*;
@@ -1261,7 +1247,16 @@ pub(crate) fn declared_pos_tables(declared: &[crate::structtree::DeclaredTable],
         let kept: Vec<&Vec<(String, Rect, bool)>> = live.iter().map(|&i| &rows[i]).collect();
         let spans_of: Vec<Vec<(usize, usize)>> =
             live.iter().map(|&i| t.rows[i].iter().map(|c| (c.rowspan, c.colspan)).collect()).collect();
-        let grid = lay_out_grid(&kept, &spans_of, cols);
+        let roles: Vec<Vec<CellRole>> = live
+            .iter()
+            .map(|&i| {
+                t.rows[i]
+                    .iter()
+                    .map(|c| if c.header { CellRole::Header } else { CellRole::Data })
+                    .collect()
+            })
+            .collect();
+        let mut rows = lay_out_grid(&kept, &spans_of, &roles, cols);
         // Leading rows that are entirely header cells become the table's `<th>` rows; a
         // header cell further down stays a `<td>`, which is the same simplification the
         // inference path makes and costs nothing the scorer sees.
@@ -1269,17 +1264,18 @@ pub(crate) fn declared_pos_tables(declared: &[crate::structtree::DeclaredTable],
             .iter()
             .take_while(|&&i| !t.rows[i].is_empty() && t.rows[i].iter().all(|c| c.header))
             .count()
-            .min(grid.len().saturating_sub(1));
-        let header: Vec<Vec<(String, usize)>> =
-            grid[..nhdr].iter().map(|r| r.iter().map(|c| (c.clone(), 1usize)).collect()).collect();
-        out.tables.push(PosTable {
-            y_top: region.y1,
-            y_bottom: region.y0,
-            x_left: region.x0,
-            x_right: region.x1,
-            grid: grid[nhdr..].to_vec(),
-            header,
-            header_rows: nhdr,
+            .min(rows.len().saturating_sub(1));
+        let grid = rows.split_off(nhdr);
+        out.tables.push(PositionedTableAnalysis {
+            bbox: region,
+            table: TableAnalysis::from_cells(rows, grid, nhdr, vec![TableEvidence::Declared]),
+            key: CandidateKey::new(
+                CandidateProducer::Declared,
+                u32::try_from(declared_ordinal).expect("declared table ordinal must fit u32"),
+            ),
+            claim: TableClaim::from_rows(
+                live.iter().map(|&i| declared_claim_rows[i].clone()).collect(),
+            ),
         });
     }
     out
@@ -1307,10 +1303,17 @@ fn cell_text(spans: &[Span], idx: &[usize]) -> String {
 /// it continues over are empty. The declared merge is preserved as *shape* — the grid is the
 /// one a reader sees — while the emitted HTML stays a plain cell matrix; scoring merges needs
 /// a ground-truth extension this phase does not have.
-fn lay_out_grid(rows: &[&Vec<(String, crate::geom::Rect, bool)>], spans: &[Vec<(usize, usize)>], cols: usize) -> Vec<Vec<String>> {
+fn lay_out_grid(
+    rows: &[&Vec<(String, crate::geom::Rect, bool)>],
+    spans: &[Vec<(usize, usize)>],
+    roles: &[Vec<CellRole>],
+    cols: usize,
+) -> Vec<Vec<CellAnalysis>> {
     let cols = cols.max(1);
     let mut occupied: Vec<Vec<bool>> = vec![vec![false; cols]; rows.len()];
-    let mut grid: Vec<Vec<String>> = vec![vec![String::new(); cols]; rows.len()];
+    let mut grid: Vec<Vec<CellAnalysis>> = (0..rows.len())
+        .map(|r| (0..cols).map(|c| CellAnalysis::new(String::new(), r, c, 1, 1, None)).collect())
+        .collect();
     for (r, row) in rows.iter().enumerate() {
         let mut c = 0usize;
         for (i, cell) in row.iter().enumerate() {
@@ -1321,11 +1324,18 @@ fn lay_out_grid(rows: &[&Vec<(String, crate::geom::Rect, bool)>], spans: &[Vec<(
                 break;
             }
             let (rs, cs) = spans[r].get(i).copied().unwrap_or((1, 1));
-            grid[r][c] = cell.0.clone();
+            let role = roles[r].get(i).copied().unwrap_or(CellRole::Data);
+            let content_bbox = (cell.2 && cell.1.is_valid()).then_some(cell.1);
+            grid[r][c] = CellAnalysis::declared(
+                cell.0.clone(), r, c, rs.max(1), cs.max(1), role, content_bbox,
+            );
             for dr in 0..rs.max(1) {
                 for dc in 0..cs.max(1) {
                     if let Some(slot) = occupied.get_mut(r + dr).and_then(|row| row.get_mut(c + dc)) {
                         *slot = true;
+                        if dr != 0 || dc != 0 {
+                            grid[r + dr][c + dc] = CellAnalysis::covered(r + dr, c + dc);
+                        }
                     }
                 }
             }
@@ -1366,6 +1376,7 @@ pub(crate) fn span_extent(s: &Span) -> (f32, f32) {
 fn split_span_at(s: &Span, bounds: &[f32]) -> Vec<Span> {
     let (x0, x1) = span_extent(s);
     let n = s.text.chars().count();
+    debug_assert_eq!(s.source.char_len() as usize, n, "source range must cover the span text");
     if n < 2 || x1 <= x0 {
         return vec![clone_span(s)];
     }
@@ -1391,6 +1402,7 @@ fn split_span_at(s: &Span, bounds: &[f32]) -> Vec<Span> {
                 x: x0 + per * from as f32,
                 width: per * (c - from) as f32,
                 text,
+                source: s.source.sub_slice(from, c),
                 ..clone_span(s)
             });
         }
@@ -1431,11 +1443,15 @@ pub(crate) struct Candidate<'a> {
     /// Vertical rules inside it.
     pub v_rules: usize,
     /// The grid the ALIGNMENT path already built here, when it built one.
-    pub aligned: Option<PosTable>,
+    pub aligned: Option<PositionedTableAnalysis>,
+    /// Original page text contains rotated content inside the optional abutting ruled band.
+    /// Alignment and cell binding remain upright-only; this preserves the ambiguity they
+    /// intentionally filter out so the Phase 6B consumer can refuse the tier.
+    pub band_has_rotated_text: bool,
 }
 
 /// An **L3 grid handler**: turn one candidate into a table, or refuse it.
-type L3 = fn(&Candidate, &[Span]) -> Option<PosTable>;
+type L3 = fn(&Candidate, &[Span]) -> Option<PositionedTableAnalysis>;
 
 /// **L2 — the table types, as DATA.**
 ///
@@ -1473,7 +1489,7 @@ pub(crate) fn classify<'t>(types: &'t [TypeRule], c: &Candidate) -> Option<&'t T
 }
 
 /// L2 + L3 for one candidate: classify, then dispatch.
-fn build_table(types: &[TypeRule], c: &Candidate, spans: &[Span]) -> Option<PosTable> {
+fn build_table(types: &[TypeRule], c: &Candidate, spans: &[Span]) -> Option<PositionedTableAnalysis> {
     (classify(types, c)?.handler)(c, spans)
 }
 
@@ -1483,7 +1499,7 @@ fn build_table(types: &[TypeRule], c: &Candidate, spans: &[Span]) -> Option<PosT
 /// where the words sit; that work already happened in [`detect_tables_region`]. Keeping this
 /// handler an identity is deliberate: it is what makes "outside any frame, behaviour is
 /// byte-identical" a property of the code rather than a hope.
-fn l3_aligned(c: &Candidate, _spans: &[Span]) -> Option<PosTable> {
+fn l3_aligned(c: &Candidate, _spans: &[Span]) -> Option<PositionedTableAnalysis> {
     c.aligned.clone()
 }
 
@@ -1527,6 +1543,22 @@ fn uniform_header_depth(
     1
 }
 
+fn all_nonempty_contributors_bold<'a>(
+    contributors: impl IntoIterator<Item = (&'a str, bool)>,
+) -> bool {
+    let mut found = false;
+    for (text, bold) in contributors {
+        if text.trim().is_empty() {
+            continue;
+        }
+        found = true;
+        if !bold {
+            return false;
+        }
+    }
+    found
+}
+
 /// A lattice bigger than this is a chart's gridlines or a calendar of nothing; building a grid
 /// of that size from spans is pure cost.
 const MAX_LATTICE_CELLS: usize = 4096;
@@ -1549,6 +1581,203 @@ const LATTICE_CUT_PCT: usize = 10;
 /// Swept — see the note at the L1b replacement in [`detect_tables_pos`].
 const FRAME_COVERS: f32 = 0.5;
 
+/// A ruled leading tier whose geometry, text and aligned ownership have all been proven.
+/// Construction is kept separate from mutation so a failed clause is a byte-identical no-op.
+struct RuledTierInsertion {
+    bbox: crate::geom::Rect,
+    cells: Vec<CellAnalysis>,
+    claim_row: Vec<SourceSlice>,
+}
+
+fn analysis_shape(table: &TableAnalysis) -> (usize, usize) {
+    table
+        .header
+        .iter()
+        .chain(&table.grid)
+        .flatten()
+        .filter(|cell| !cell.covered)
+        .fold((0, 0), |(rows, cols), cell| {
+            (
+                rows.max(cell.row.saturating_add(cell.rowspan.max(1))),
+                cols.max(cell.col.saturating_add(cell.colspan.max(1))),
+            )
+        })
+}
+
+/// Whether two detector rows own exactly the same painted source intervals.  Either producer
+/// may have split a run more finely, so equality is mutual coverage rather than vector equality.
+fn claim_rows_equivalent(left: &[SourceSlice], right: &[SourceSlice]) -> bool {
+    let left_claim = TableClaim::from_rows(vec![left.to_vec()]);
+    let right_claim = TableClaim::from_rows(vec![right.to_vec()]);
+    left.iter().all(|&source| right_claim.covers(source))
+        && right.iter().all(|&source| left_claim.covers(source))
+}
+
+/// Prove the one Phase 6B shape: one closed grouped band immediately above a ruled table,
+/// independently corroborated by the selected aligned candidate's exact source ownership.
+fn prove_ruled_leading_tier(
+    candidate: &Candidate,
+    frame: &crate::lattice::Frame,
+    base_grid: &[Vec<String>],
+    base_claim_rows: &[Vec<SourceSlice>],
+    ruled_header_rows: usize,
+    spans: &[Span],
+) -> Option<RuledTierInsertion> {
+    if candidate.band_has_rotated_text {
+        return None;
+    }
+    let band = frame.abutting_band.as_ref()?;
+    let aligned = candidate.aligned.as_ref()?;
+    let ncols = frame.xs.len().checked_sub(1)?;
+    let (aligned_rows, aligned_cols) = analysis_shape(&aligned.table);
+    if aligned.table.evidence.as_slice() != [TableEvidence::Aligned]
+        || !aligned.table.header.is_empty()
+        || ruled_header_rows != 1
+        || aligned.table.header_rows != 2
+        || aligned_rows != base_grid.len() + 1
+        || aligned_cols != ncols
+        || aligned.table.grid.len() != base_grid.len() + 1
+        || aligned.claim.row_count() != base_grid.len() + 1
+        || base_claim_rows.len() != base_grid.len()
+        || base_grid.len() < 3
+        || base_grid.first()?.len() != ncols
+        || base_grid.first()?.iter().any(|cell| cell.trim().is_empty())
+    {
+        return None;
+    }
+
+    let aligned_top = aligned.table.grid.first()?;
+    let aligned_leaves = aligned.table.grid.get(1)?;
+    let dense_row = |row: &[CellAnalysis], logical_row: usize| {
+        row.len() == ncols
+            && row.iter().enumerate().all(|(col, cell)| {
+                cell.row == logical_row
+                    && cell.col == col
+                    && cell.rowspan == 1
+                    && cell.render_colspan == 1
+                    && cell.role == CellRole::Header
+            })
+    };
+    if !dense_row(aligned_top, 0)
+        || !dense_row(aligned_leaves, 1)
+        || aligned_leaves.iter().any(|cell| cell.covered || cell.colspan != 1)
+        || aligned_leaves
+            .iter()
+            .zip(base_grid.first()?)
+            .any(|(cell, text)| cell.text.trim() != text.trim())
+    {
+        return None;
+    }
+
+    let groups = &band.groups;
+    if groups.len() < 2
+        || groups.first()?.start != 0
+        || groups.last()?.end != ncols
+        || groups.windows(2).any(|pair| pair[0].end != pair[1].start)
+        || groups.iter().any(|group| group.end - group.start < 2)
+    {
+        return None;
+    }
+    let mut group_xs = Vec::with_capacity(groups.len() + 1);
+    group_xs.push(frame.xs[0]);
+    group_xs.extend(groups.iter().map(|group| frame.xs[group.end]));
+    let ys = [band.bbox.y0, band.bbox.y1];
+    let axes = crate::grid::GridAxes::new(&group_xs, &ys, band.bbox)?;
+
+    // Bind only text whose glyph-body probe is exactly inside and whose x extent overlaps the
+    // band. `bind_contained` deliberately has a one-point tolerance for ordinary cells; giving
+    // it the whole page here would allow an out-of-band label to manufacture a grouped tier.
+    let band_spans: Vec<Span> = spans
+        .iter()
+        .filter(|span| {
+            if span.text.trim().is_empty() {
+                return false;
+            }
+            let cy = span.y + span.size * 0.25;
+            let (x0, x1) = span_extent(span);
+            cy >= band.bbox.y0
+                && cy <= band.bbox.y1
+                && x1 > band.bbox.x0
+                && x0 < band.bbox.x1
+        })
+        .map(clone_span)
+        .collect();
+    // Rotated or boundary-crossing text is ambiguity, not content to ignore. Demand exact
+    // horizontal enclosure before the generic binder can split or assign anything.
+    for span in &band_spans {
+        let cy = span.y + span.size * 0.25;
+        let (x0, x1) = span_extent(span);
+        debug_assert!(cy >= band.bbox.y0 && cy <= band.bbox.y1);
+        if span.angle.abs() >= 0.01 || x0 < band.bbox.x0 || x1 > band.bbox.x1 {
+            return None;
+        }
+    }
+    let bound = crate::grid::bind_contained(&axes, &band_spans, span_extent, split_span_at);
+    if bound.seen != groups.len()
+        || bound.cut != 0
+        || bound.nrows != 1
+        || bound.ncols != groups.len()
+        || bound.cells.iter().any(|cell| cell.len() != 1)
+    {
+        return None;
+    }
+
+    let mut cells = Vec::with_capacity(groups.len());
+    let mut claim_row = Vec::with_capacity(groups.len());
+    for (group, pieces) in groups.iter().zip(&bound.cells) {
+        let span = &pieces[0];
+        let text = span.text.trim();
+        if text.is_empty()
+            || !text.chars().any(char::is_alphabetic)
+            || is_num_token(text)
+        {
+            return None;
+        }
+        let mut cell = CellAnalysis::new(
+            text.to_string(),
+            0,
+            group.start,
+            1,
+            group.end - group.start,
+            Some(crate::geom::Rect::new(
+                frame.xs[group.start],
+                band.bbox.y0,
+                frame.xs[group.end],
+                band.bbox.y1,
+            )),
+        );
+        cell.role = CellRole::Header;
+        cells.push(cell);
+        claim_row.push(span.source);
+    }
+
+    // The independent alignment path must prove this exact tier and every shifted base row,
+    // not merely own the same global union. This rejects row-shifted and same-shape impostors.
+    if !claim_rows_equivalent(aligned.claim.row(0)?, &claim_row)
+        || base_claim_rows.iter().enumerate().any(|(row, sources)| {
+            !aligned
+                .claim
+                .row(row + 1)
+                .is_some_and(|owned| claim_rows_equivalent(owned, sources))
+        })
+    {
+        return None;
+    }
+    for (group, cell) in groups.iter().zip(&cells) {
+        let anchor = &aligned_top[group.start];
+        if anchor.covered
+            || anchor.colspan != group.end - group.start
+            || anchor.text.trim() != cell.text.trim()
+            || aligned_top[group.start + 1..group.end]
+                .iter()
+                .any(|slot| !slot.covered || !slot.text.trim().is_empty())
+        {
+            return None;
+        }
+    }
+    Some(RuledTierInsertion { bbox: band.bbox, cells, claim_row })
+}
+
 /// **L3, ruled** — read the grid straight off the frame's lattice, binding text by GEOMETRIC
 /// CONTAINMENT.
 ///
@@ -1564,7 +1793,7 @@ const FRAME_COVERS: f32 = 0.5;
 ///
 /// The only judgement is admission: a lattice with almost no text in it is a figure's
 /// gridlines or a form's decorative border, not a table.
-fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PosTable> {
+fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PositionedTableAnalysis> {
     let f = c.frame?;
     let axes = f.axes();
     let (ncols, nrows) = (axes.ncols(), axes.nrows());
@@ -1611,20 +1840,92 @@ fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PosTable> {
     if filled < MIN_LATTICE_FILLED || rows_used < 2 || cols_used < 2 {
         return None;
     }
-    Some(PosTable {
-        y_top: axes.bbox.y1,
-        y_bottom: axes.bbox.y0,
-        x_left: axes.bbox.x0,
-        x_right: axes.bbox.x1,
-        grid,
-        header: Vec::new(),
+    let mut claim_rows: Vec<Vec<SourceSlice>> = (0..bound.nrows)
+        .map(|r| {
+            bound.cells[r * bound.ncols..(r + 1) * bound.ncols]
+                .iter()
+                .flatten()
+                .filter(|span| !span.text.trim().is_empty())
+                .map(|span| span.source)
+                .collect()
+        })
+        .collect();
+    let header_rows = c.aligned.as_ref().map_or(ruled_header_rows, |t| {
+        ruled_header_rows.max(t.table.header_rows)
+    });
+    let insertion = prove_ruled_leading_tier(
+        c,
+        f,
+        &grid,
+        &claim_rows,
+        ruled_header_rows,
+        spans,
+    );
+    let row_offset = usize::from(insertion.is_some());
+    let final_header_rows = if insertion.is_some() { 2 } else { header_rows };
+    let analyzed_grid: Vec<Vec<CellAnalysis>> = grid
+        .into_iter()
+        .enumerate()
+        .map(|(r, row)| {
+            row.into_iter()
+                .enumerate()
+                .map(|(col, text)| {
+                    let band = nrows - 1 - r;
+                    let row = r + row_offset;
+                    let bbox = crate::geom::Rect::new(
+                        axes.xs[col], axes.ys[band], axes.xs[col + 1], axes.ys[band + 1],
+                    );
+                    let mut cell = CellAnalysis::new(text, row, col, 1, 1, Some(bbox));
+                    if row < final_header_rows {
+                        cell.role = CellRole::Header;
+                    }
+                    cell
+                })
+                .collect()
+        })
+        .collect();
+    let (header, bbox) = match insertion {
+        Some(tier) => {
+            claim_rows.insert(0, tier.claim_row);
+            (vec![tier.cells], axes.bbox.union(tier.bbox))
+        }
+        None => (Vec::new(), axes.bbox),
+    };
+    let cell_boxes = analyzed_grid
+        .iter()
+        .map(|row| row.iter().filter_map(|cell| cell.bbox).collect())
+        .collect();
+    let mut table = TableAnalysis::from_cells(
+        header,
+        analyzed_grid,
         // A merged top tier can leave no closed cells and therefore sit just outside the
-        // lattice frame.  Where alignment independently found the same region, its uniform
-        // tier chain supplies semantic ownership only; the ruled grid/cells/bbox stay exact.
-        header_rows: c
-            .aligned
-            .as_ref()
-            .map_or(ruled_header_rows, |t| ruled_header_rows.max(t.header_rows)),
+        // lattice frame. Where alignment independently found the same region, its uniform
+        // tier chain supplies semantic ownership only; ruled cells/bbox stay exact.
+        final_header_rows,
+        if c.aligned.is_some() {
+            vec![TableEvidence::Ruled, TableEvidence::Aligned]
+        } else {
+            vec![TableEvidence::Ruled]
+        },
+    );
+    let leading_styled = bound.cells[..bound.ncols]
+        .iter()
+        .flatten()
+        .filter(|span| !span.text.trim().is_empty())
+        .all(|span| span.bold)
+        && bound.cells[..bound.ncols]
+            .iter()
+            .flatten()
+            .any(|span| !span.text.trim().is_empty());
+    table.set_ruled_continuation_draft(cell_boxes, leading_styled);
+    if row_offset == 1 {
+        table.project_header_into_legacy_grid();
+    }
+    Some(PositionedTableAnalysis {
+        bbox,
+        table,
+        key: CandidateKey::synthetic(),
+        claim: TableClaim::from_rows(claim_rows),
     })
 }
 
@@ -1637,8 +1938,8 @@ fn l3_ruled(c: &Candidate, spans: &[Span]) -> Option<PosTable> {
 /// one wide grid). **Columns**: the two share a column model and their rows overlap at all —
 /// which catches the partial frame, where the ruling closes only the header band of a table
 /// whose body the alignment path read separately. Emitting both would count one table twice.
-fn owns(outer: &crate::geom::Rect, t: &PosTable) -> bool {
-    let tr = crate::geom::Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
+fn owns(outer: &crate::geom::Rect, t: &PositionedTableAnalysis) -> bool {
+    let tr = t.bbox;
     let area = outer.overlap_area(tr) >= 0.5 * tr.area().min(outer.area()).max(1.0);
     let same_columns = outer.overlap_w(tr) >= 0.6 * outer.width().min(tr.width()).max(1.0) && outer.overlap_h(tr) > 0.0;
     area || same_columns
@@ -1648,6 +1949,107 @@ fn owns(outer: &crate::geom::Rect, t: &PosTable) -> bool {
 /// booktabs candidate from a borderless one.
 fn bands_over(bands: &[(f32, f32, f32)], r: &crate::geom::Rect) -> usize {
     bands.iter().filter(|&&(a, b, y)| y >= r.y0 && y <= r.y1 && b.min(r.x1) - a.max(r.x0) >= r.width() * 0.7).count()
+}
+
+/// Deterministic, text-free ownership inventory for Phase 5 diagnostics. Coordinates are
+/// encoded as IEEE-754 bits so locale/rounding cannot change the trace, and the claim digest
+/// hashes only occurrence ids and character ranges.
+pub(crate) fn table_owner_diagnostics(
+    page: u32,
+    scope: &str,
+    tables: &[PositionedTableAnalysis],
+) -> String {
+    let mut out = String::new();
+    for table in tables {
+        if let Some(diagnostic) = table.table.ownership_diagnostic() {
+            out.push_str(&table_analysis_owner_diagnostic(
+                diagnostic.anchor_page,
+                scope,
+                table.bbox,
+                &table.table,
+            ));
+        } else {
+            out.push_str(&format_table_owner_diagnostic(
+                page,
+                scope,
+                table.key,
+                table.bbox,
+                &table.table,
+                table.claim.row_count(),
+                table.claim.len(),
+                table.claim.stable_hash(),
+            ));
+        }
+    }
+    out
+}
+
+fn format_table_owner_diagnostic(
+    page: u32,
+    scope: &str,
+    key: CandidateKey,
+    bbox: crate::geom::Rect,
+    table: &TableAnalysis,
+    claim_rows: usize,
+    slices: usize,
+    hash: u64,
+) -> String {
+    let evidence = table
+        .evidence
+        .iter()
+        .map(|item| item.as_str())
+        .collect::<Vec<_>>()
+        .join("+");
+    format!(
+        "DPDF_TABLE_OWNERS page={page} scope={scope} candidate={} bbox={:08x},{:08x},{:08x},{:08x} evidence={} rows={} claim_rows={} slices={} hash={:016x}\n",
+        key.label(),
+        bbox.x0.to_bits(),
+        bbox.y0.to_bits(),
+        bbox.x1.to_bits(),
+        bbox.y1.to_bits(),
+        if evidence.is_empty() { "none" } else { &evidence },
+        table.header.len() + table.grid.len(),
+        claim_rows,
+        slices,
+        hash,
+    )
+}
+
+pub(crate) fn table_analysis_owner_diagnostic(
+    page: u32,
+    scope: &str,
+    bbox: crate::geom::Rect,
+    table: &TableAnalysis,
+) -> String {
+    let Some(diagnostic) = table.ownership_diagnostic() else {
+        return String::new();
+    };
+    debug_assert_eq!(page, diagnostic.anchor_page);
+    format_table_owner_diagnostic(
+        diagnostic.anchor_page,
+        scope,
+        diagnostic.key,
+        bbox,
+        table,
+        diagnostic.claim_rows,
+        diagnostic.slices,
+        diagnostic.hash,
+    )
+}
+
+pub(crate) fn table_owner_diagnostics_enabled() -> bool {
+    std::env::var_os("DPDF_TABLE_OWNERS").is_some()
+}
+
+fn ordered_table_owner_diagnostics(mut pages: Vec<(u32, String)>) -> String {
+    pages.sort_by_key(|(page, _)| *page);
+    pages.into_iter().map(|(_, diagnostics)| diagnostics).collect()
+}
+
+pub(crate) fn emit_ordered_table_owner_diagnostics(pages: Vec<(u32, String)>) {
+    if table_owner_diagnostics_enabled() {
+        eprint!("{}", ordered_table_owner_diagnostics(pages));
+    }
 }
 
 /// Detect tables. On a two-column page we split down the middle and detect each
@@ -1664,7 +2066,8 @@ fn bands_over(bands: &[(f32, f32, f32)], r: &crate::geom::Rect) -> usize {
 /// and one whose in-grid band titles terminate every text run are found at all. Frame evidence
 /// only ever ADDS a candidate or replaces the fragments inference made inside that same frame;
 /// it never deletes content and never re-splits a cell.
-pub fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Vec<PosTable> {
+pub(crate) fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Vec<PositionedTableAnalysis> {
+    let original_spans = spans;
     // Tables are built from upright text only — rotated labels (axis titles etc.) must
     // not perturb gutter detection or column structure (they're figure labels).
     let upright: Vec<Span> = spans.iter().filter(|s| s.angle.abs() < 0.01).map(clone_span).collect();
@@ -1674,24 +2077,28 @@ pub fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Ve
     // needs to trust a run too short to trust on alignment alone.
     let bands = if rules.h.is_empty() { Vec::new() } else { crate::lattice::h_bands(rules) };
     let mut out = detect_aligned_tables(spans, &bands);
+    for (ordinal, table) in out.iter_mut().enumerate() {
+        table.key = CandidateKey::new(
+            CandidateProducer::Aligned,
+            u32::try_from(ordinal).expect("aligned table ordinal must fit u32"),
+        );
+    }
     // ── L1b: the ruling ────────────────────────────────────────────────────────────────
     let frames = if rules.h.is_empty() || rules.v.is_empty() { Vec::new() } else { crate::lattice::frames(rules) };
     if !frames.is_empty() {
-        let mut framed: Vec<PosTable> = Vec::new();
-        for f in &frames {
+        let mut framed: Vec<PositionedTableAnalysis> = Vec::new();
+        for (frame_ordinal, f) in frames.iter().enumerate() {
             let aligned = out
                 .iter()
                 .filter(|t| owns(&f.bbox, t))
                 .max_by(|a, b| {
-                    let region = |t: &PosTable| {
-                        crate::geom::Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top)
-                    };
+                    let region = |t: &PositionedTableAnalysis| t.bbox;
                     // Header ownership comes from the candidate at the TOP of the ruled
                     // frame.  A band row can split alignment into several owned fragments;
                     // choosing the largest would select a body fragment and discard the
                     // independent header evidence (the kitchen-sink fixture is exactly this
                     // shape).  Overlap area breaks ties without iteration-order dependence.
-                    a.y_top.total_cmp(&b.y_top).then(
+                    a.bbox.y1.total_cmp(&b.bbox.y1).then(
                         f.bbox
                             .overlap_area(region(a))
                             .total_cmp(&f.bbox.overlap_area(region(b))),
@@ -1703,6 +2110,19 @@ pub fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Ve
                 long_h: bands_over(&bands, &f.bbox),
                 v_rules: 0,
                 aligned,
+                band_has_rotated_text: f.abutting_band.as_ref().is_some_and(|band| {
+                    original_spans.iter().any(|span| {
+                        if span.angle.abs() < 0.01 || span.text.trim().is_empty() {
+                            return false;
+                        }
+                        let cy = span.y + span.size * 0.25;
+                        let (x0, x1) = span_extent(span);
+                        cy >= band.bbox.y0
+                            && cy <= band.bbox.y1
+                            && x1 > band.bbox.x0
+                            && x0 < band.bbox.x1
+                    })
+                }),
             };
             let built = build_table(TABLE_TYPES, &c, spans);
             // Per-page dispatch trace, off unless asked for (`DPDF_TABLES=1`), the same idiom
@@ -1721,7 +2141,11 @@ pub fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Ve
                     if built.is_some() { "kept" } else { "refused" }
                 );
             }
-            if let Some(t) = built {
+            if let Some(mut t) = built {
+                t.key = CandidateKey::new(
+                    CandidateProducer::Frame,
+                    u32::try_from(frame_ordinal).expect("frame ordinal must fit u32"),
+                );
                 framed.push(t);
             }
         }
@@ -1743,14 +2167,14 @@ pub fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Ve
             // metric is within 0.0006 of its unguarded value (0.4925 vs 0.4928 md), while 0.75
             // and above cost it 0.007. Below 0.5 `owns` is already the binding constraint.
             let pad = 2.0;
-            let covers = |r: &crate::geom::Rect, t: &PosTable| {
-                let tr = crate::geom::Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
-                owns(r, t) && r.overlap_h(tr) + pad >= FRAME_COVERS * (t.y_top - t.y_bottom)
+            let covers = |r: &crate::geom::Rect, t: &PositionedTableAnalysis| {
+                let tr = t.bbox;
+                owns(r, t) && r.overlap_h(tr) + pad >= FRAME_COVERS * t.bbox.height()
             };
             crate::grid::reconcile_preferred(
                 &mut out,
                 framed,
-                |t| crate::geom::Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top),
+                |t| t.bbox,
                 owns,
                 covers,
             );
@@ -1759,16 +2183,23 @@ pub fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules) -> Ve
     // Every surviving alignment table goes through the same L2/L3 dispatch, with no frame
     // evidence to offer — so it reaches an alignment handler, which hands it back unchanged.
     // The round trip is not ceremony: it is what makes the identity a property of the code.
-    out.into_iter()
+    let out: Vec<PositionedTableAnalysis> = out.into_iter()
         .filter_map(|t| {
-            let c = Candidate { frame: None, long_h: 0, v_rules: 0, aligned: Some(t) };
+            let c = Candidate {
+                frame: None,
+                long_h: 0,
+                v_rules: 0,
+                aligned: Some(t),
+                band_has_rotated_text: false,
+            };
             build_table(TABLE_TYPES, &c, spans)
         })
-        .collect()
+        .collect();
+    out
 }
 
 /// L1a — the text-alignment detector: the whole page, or one lane per text column.
-fn detect_aligned_tables(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTable> {
+fn detect_aligned_tables(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PositionedTableAnalysis> {
     match central_split(spans) {
         None => detect_lanes(spans, bands),
         Some((g, rejoin)) => {
@@ -1794,7 +2225,7 @@ fn detect_aligned_tables(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTa
                 &lt,
                 rt,
                 rejoin,
-                |t| crate::geom::Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top),
+                |t| t.bbox,
                 |yb, yt| {
                     let pad = 2.0;
                     let band: Vec<Span> = spans
@@ -1913,21 +2344,21 @@ pub(crate) fn column_gutters(spans: &[Span]) -> Vec<f32> {
 /// Detect tables on a page that has no clean CENTRE gutter: either three-or-more prose columns
 /// (each detected independently, then rejoined where one table spans them) or, far more often,
 /// a single region.
-fn detect_lanes(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTable> {
+fn detect_lanes(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PositionedTableAnalysis> {
     let gutters = column_gutters(spans);
     if gutters.len() < 2 {
         return detect_tables_region(spans, bands);
     }
     let lane_of = |s: &Span| gutters.iter().filter(|&&g| s.x + s.width.max(0.0) * 0.5 >= g).count();
     let nlanes = gutters.len() + 1;
-    let per_lane: Vec<Vec<PosTable>> =
+    let per_lane: Vec<Vec<PositionedTableAnalysis>> =
         (0..nlanes).map(|k| detect_tables_region(&spans.iter().filter(|s| lane_of(s) == k).map(clone_span).collect::<Vec<_>>(), bands)).collect();
     // A table spanning the columns was cut into pieces occupying the SAME rows. Chain each
     // lane's table to an unused overlapping one to its right, then re-detect across the full
     // width within only that vertical band. A single-column table has no mate and is retained.
     crate::grid::rejoin_lane_chains(
         &per_lane,
-        |t| crate::geom::Rect::new(0.0, t.y_bottom, 1.0, t.y_top),
+        |t| crate::geom::Rect::new(0.0, t.bbox.y0, 1.0, t.bbox.y1),
         |yb, yt| {
             let pad = 2.0;
             let band: Vec<Span> = spans.iter().filter(|s| s.y >= yb - pad && s.y <= yt + pad).map(clone_span).collect();
@@ -1936,10 +2367,234 @@ fn detect_lanes(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTable> {
     )
 }
 
+/// Split one already-admitted aligned column only when its source geometry proves two
+/// persistent lanes.  This is deliberately a refinement of a chosen model, not another model
+/// producer: every row must publish the same maximal open corridor, both sides must remain
+/// populated and horizontally aligned, and rebinding must preserve the exact source multiset
+/// of every row.
+fn persistent_internal_gutter(
+    bands: &[(f32, f32)],
+    raw_rows: &[&[Span]],
+) -> Option<Vec<(f32, f32)>> {
+    if bands.len() < 2 || raw_rows.len() < 3 {
+        return None;
+    }
+    let extent = |span: &Span| -> Option<(f32, f32)> {
+        if !span.angle.is_finite()
+            || span.angle.abs() >= 0.01
+            || span.text.trim().is_empty()
+            || !span.width.is_finite()
+            || span.width <= 0.1
+        {
+            return None;
+        }
+        let hi = span.x + span.width;
+        (span.x.is_finite() && hi.is_finite() && hi > span.x).then_some((span.x, hi))
+    };
+    // A proof may not repair missing geometry from the text itself. Every painted source in
+    // the candidate rows must publish one finite positive extent, and every raw row must be a
+    // real single baseline rather than vertically stacked lines coalesced by the table-row
+    // model. PDF coordinates are stored as f32, so exact bits are categorical evidence here;
+    // a tolerance would merely retune which multi-line layouts are allowed to masquerade as a
+    // row.
+    if raw_rows.iter().any(|row| {
+        let mut baseline: Option<u32> = None;
+        row.iter()
+            .filter(|span| !span.text.trim().is_empty())
+            .any(|span| {
+                if extent(span).is_none() || !span.y.is_finite() {
+                    return true;
+                }
+                let y = span.y.to_bits();
+                match baseline {
+                    Some(expected) => expected != y,
+                    None => {
+                        baseline = Some(y);
+                        false
+                    }
+                }
+            })
+    }) {
+        return None;
+    }
+    let center = |span: &Span| {
+        extent(span)
+            .map(|(lo, hi)| (lo + hi) * 0.5)
+            .unwrap_or(span.x)
+    };
+    let original = crate::grid::bind_rows_by_center(bands, raw_rows, center);
+    let expected_sources: Vec<Vec<SourceSlice>> = raw_rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .filter(|span| !span.text.trim().is_empty())
+                .map(|span| span.source)
+                .collect()
+        })
+        .collect();
+
+    let mut proven: Option<(usize, f32)> = None;
+    for col in 0..bands.len() {
+        let mut corridor: Option<(f32, f32)> = None;
+        let mut row_extents: Vec<Vec<(f32, f32)>> = Vec::with_capacity(original.len());
+        let mut invalid = false;
+        for row in &original {
+            let mut extents = Vec::new();
+            for span in &row[col] {
+                let Some(pair) = extent(span) else {
+                    invalid = true;
+                    break;
+                };
+                extents.push(pair);
+            }
+            if invalid {
+                break;
+            }
+            extents.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let gaps: Vec<(f32, f32)> = extents
+                .windows(2)
+                .filter_map(|pair| (pair[0].1 < pair[1].0).then_some((pair[0].1, pair[1].0)))
+                .collect();
+            if gaps.is_empty() {
+                invalid = true;
+                break;
+            }
+            let max_width = gaps
+                .iter()
+                .map(|&(lo, hi)| hi - lo)
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .expect("a nonempty finite gap set has a maximum");
+            let mut maximal = gaps
+                .iter()
+                .copied()
+                .filter(|&(lo, hi)| hi - lo == max_width);
+            let gap = maximal.next().expect("the maximum came from one gap");
+            if maximal.next().is_some() {
+                // Equal maxima do not prove which corridor carries the latent boundary.
+                invalid = true;
+                break;
+            }
+            if let Some(expected) = corridor {
+                // PDF coordinates enter Span as f32, and extent arithmetic is also f32. The
+                // owned fixtures publish identical endpoint bits in every row, so exact bits
+                // are the proof: an epsilon would turn nearby, drifting whitespace into a
+                // tunable acceptance threshold. Finite positive extents above exclude NaNs.
+                if expected.0.to_bits() != gap.0.to_bits()
+                    || expected.1.to_bits() != gap.1.to_bits()
+                {
+                    invalid = true;
+                    break;
+                }
+            } else {
+                corridor = Some(gap);
+            }
+            row_extents.push(extents);
+        }
+        if invalid {
+            continue;
+        }
+        let corridor = corridor.expect("every valid row published one exact maximal gap");
+        let cut = (corridor.0 + corridor.1) * 0.5;
+        if !cut.is_finite() || cut <= bands[col].0 || cut >= bands[col].1 {
+            continue;
+        }
+        // The candidate-column binding is only a way to discover a possible corridor. Its
+        // emptiness is a page-space fact, so prove it against every source in every row. A
+        // wide span whose centre belongs to a neighbouring column still paints this corridor
+        // and must veto the split.
+        if raw_rows.iter().any(|row| {
+            row.iter().filter(|span| !span.text.trim().is_empty()).any(|span| {
+                let (lo, hi) = extent(span).expect("all nonempty source extents were validated");
+                (lo < corridor.1 && hi > corridor.0) || (lo < cut && hi > cut)
+            })
+        }) {
+            continue;
+        }
+
+        // Each side is a lane, rather than merely a row-local pair: its painted hulls have a
+        // non-zero common horizontal overlap across every row.  The corridor itself proves
+        // ordering and that no source span crosses the cut.
+        let mut left_overlap = (f32::NEG_INFINITY, f32::INFINITY);
+        let mut right_overlap = (f32::NEG_INFINITY, f32::INFINITY);
+        for extents in &row_extents {
+            let left: Vec<(f32, f32)> = extents.iter().copied().filter(|&(_, hi)| hi <= cut).collect();
+            let right: Vec<(f32, f32)> = extents.iter().copied().filter(|&(lo, _)| lo >= cut).collect();
+            if left.is_empty()
+                || right.is_empty()
+                || extents.iter().any(|&(lo, hi)| lo < cut && cut < hi)
+            {
+                invalid = true;
+                break;
+            }
+            let hull = |items: &[(f32, f32)]| {
+                items.iter().fold(
+                    (f32::INFINITY, f32::NEG_INFINITY),
+                    |(lo, hi), &(a, b)| (lo.min(a), hi.max(b)),
+                )
+            };
+            let l = hull(&left);
+            let r = hull(&right);
+            left_overlap = (left_overlap.0.max(l.0), left_overlap.1.min(l.1));
+            right_overlap = (right_overlap.0.max(r.0), right_overlap.1.min(r.1));
+        }
+        if invalid
+            || left_overlap.0 >= left_overlap.1
+            || right_overlap.0 >= right_overlap.1
+            || proven.is_some()
+        {
+            // More than one column carrying a complete proof is ambiguous: the refinement is
+            // atomic, so do not select one by position or text.
+            if !invalid && left_overlap.0 < left_overlap.1 && right_overlap.0 < right_overlap.1 {
+                return None;
+            }
+            continue;
+        }
+        proven = Some((col, cut));
+    }
+
+    let (col, cut) = proven?;
+    let mut refined = Vec::with_capacity(bands.len() + 1);
+    refined.extend_from_slice(&bands[..col]);
+    refined.push((bands[col].0, cut));
+    refined.push((cut, bands[col].1));
+    refined.extend_from_slice(&bands[col + 1..]);
+
+    let rebound = crate::grid::bind_rows_by_center(&refined, raw_rows, center);
+    let actual_sources: Vec<Vec<SourceSlice>> = rebound
+        .iter()
+        .map(|row| {
+            row.iter()
+                .flatten()
+                .filter(|span| !span.text.trim().is_empty())
+                .map(|span| span.source)
+                .collect()
+        })
+        .collect();
+    if !exact_source_partition(&expected_sources, &actual_sources)
+        || rebound
+            .iter()
+            .any(|row| row[col].is_empty() || row[col + 1].is_empty())
+    {
+        return None;
+    }
+    Some(refined)
+}
+
+fn exact_source_partition(expected: &[Vec<SourceSlice>], actual: &[Vec<SourceSlice>]) -> bool {
+    expected.len() == actual.len()
+        && expected.iter().zip(actual).all(|(expected, actual)| {
+            let mut expected = expected.clone();
+            let mut actual = actual.clone();
+            expected.sort_unstable();
+            actual.sort_unstable();
+            expected == actual
+        })
+}
+
 /// Detect tables within a single region (one text column, or the whole page):
 /// runs of >=3 consecutive multi-cell rows sharing >=2 aligned columns (occupied
 /// in a majority of rows). Rejects word-positioned prose (words merge to a cell).
-fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTable> {
+fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PositionedTableAnalysis> {
     let avg_size = if spans.is_empty() {
         10.0
     } else {
@@ -2048,7 +2703,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
         }
     }
 
-    let flush = |run: &Vec<&(f32, Vec<Cell>, Vec<Span>)>, headers: &[&(f32, Vec<Cell>, Vec<Span>)], tables: &mut Vec<PosTable>| {
+    let flush = |run: &Vec<&(f32, Vec<Cell>, Vec<Span>)>, headers: &[&(f32, Vec<Cell>, Vec<Span>)], tables: &mut Vec<PositionedTableAnalysis>| {
         if trace {
             eprintln!(
                 "FLUSH run={} hdr={} y={:.1}..{:.1}",
@@ -2083,6 +2738,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
         // IS, and the ruling is not accidental. Measured: five World Bank status pages publish
         // their disbursement and key-dates tables as header + one data row between two rules,
         // and no amount of alignment work can reach them.
+        let mut rule_banded_evidence = false;
         if run.len() < 3 {
             // …and at least three columns in every row. Two rows and two columns is a BOX, and
             // a boxed pair of fields is the commonest ruled thing on a page that is not a
@@ -2104,6 +2760,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
                 }
                 return;
             }
+            rule_banded_evidence = true;
         }
         // Build a grid from the RAW SPANS for a candidate set of kept columns (expressed as
         // x-bands) by assigning each span to the band containing its CENTRE, then ADMIT it
@@ -2112,7 +2769,8 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
         // 0 for the band model (its header-named keep legitimately produces sparse wide
         // tables), but raised for the left-x fallback so a sparse symbol SCATTER (a
         // commutative diagram, a math array) isn't clustered into a spurious table.
-        let try_model = |kept: Vec<(f32, f32)>, min_fill: f32| -> Option<(Vec<Vec<String>>, Vec<f32>)> {
+        type BoundModel = (Vec<Vec<String>>, Vec<f32>, Vec<bool>, Vec<(f32, f32)>);
+        let try_model = |kept: Vec<(f32, f32)>, min_fill: f32| -> Option<BoundModel> {
             if kept.len() < 2 {
                 return None;
             }
@@ -2151,6 +2809,23 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
                         .collect()
                 })
                 .collect();
+            // Retain only the minimum style proof needed after model selection: whether every
+            // contributing non-empty span in each top-row cell is bold.  The strings alone
+            // cannot distinguish a genuine grouped header from a sparse data row, and
+            // recomputing this after `kept` is discarded would no longer follow the chosen
+            // binding.
+            let top_anchor_styled: Vec<bool> = bound
+                .first()
+                .map(|row| {
+                    row.iter()
+                        .map(|spans| {
+                            all_nonempty_contributors_bold(
+                                spans.iter().map(|span| (span.text.as_str(), span.bold)),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             if min_fill > 0.0 {
                 let total = grid.len() * kept.len();
                 let filled = grid.iter().flatten().filter(|c| !c.trim().is_empty()).count();
@@ -2159,7 +2834,12 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
                 }
             }
             match incoherent_reason(&grid) {
-                None => Some((grid, kept.iter().map(|b| b.0).collect())),
+                None => Some((
+                    grid,
+                    kept.iter().map(|b| b.0).collect(),
+                    top_anchor_styled,
+                    kept,
+                )),
                 Some(why) => {
                     if trace {
                         eprintln!("    INCOHERENT[{why}] {}x{} :: {:?}", grid.len(), kept.len(), &grid[..grid.len().min(3)]);
@@ -2262,7 +2942,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
         //
         // The 0.008 micro that "left-x first" buys over this is bought by giving up a committed
         // structural guarantee, so it is not taken.
-        let (grid, kept_x) = match {
+        let (mut grid, mut kept_x, mut top_anchor_styled, kept_bands) = match {
             let (lx, nb) = (leftx_kept(), band_kept.len());
             let nl = lx.len();
             let by_alignment = try_model(lx, 0.5);
@@ -2287,9 +2967,47 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
                 return;
             }
         };
+        // The general models are intentionally conservative about column creation. Once one
+        // has been admitted, allow one stricter operation: recover an internal boundary whose
+        // empty corridor and two source lanes are independently present in every row. This is
+        // aligned-only evidence; two-row rule-banded admission and the ruled/declared grid
+        // producers retain their own topology byte for byte.
+        if !rule_banded_evidence && headers.is_empty() {
+            let raw_rows: Vec<&[Span]> = run.iter().map(|(_, _, spans)| spans.as_slice()).collect();
+            if let Some(refined_bands) = persistent_internal_gutter(&kept_bands, &raw_rows) {
+                if let Some((refined_grid, refined_x, refined_style, _)) =
+                    try_model(refined_bands, 0.0)
+                {
+                    let depth = |candidate: &[Vec<String>]| {
+                        uniform_header_depth(candidate, |ri| {
+                            run.get(ri).is_some_and(|(_, _, spans)| {
+                                spans.iter().any(|span| {
+                                    !span.text.trim().is_empty() && span.bold
+                                })
+                            })
+                        })
+                    };
+                    if depth(&refined_grid) == depth(&grid) {
+                        grid = refined_grid;
+                        kept_x = refined_x;
+                        top_anchor_styled = refined_style;
+                    }
+                }
+            }
+        }
         if trace {
             eprintln!("  ADMIT {}x{}", grid.len(), kept_x.len());
         }
+        let data_claim_rows: Vec<Vec<SourceSlice>> = run
+            .iter()
+            .map(|(_, _, spans)| {
+                spans
+                    .iter()
+                    .filter(|span| !span.text.trim().is_empty())
+                    .map(|span| span.source)
+                    .collect()
+            })
+            .collect();
 
         // Now that the data table is ACCEPTED (past every prose/equation guard), attach
         // the grouped/multi-level HEADER rows the run-builder skipped — they don't form
@@ -2302,6 +3020,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
         let m = tol * 0.5;
         let mut y_top = run.first().map(|(y, _, _)| *y).unwrap_or(0.0);
         let mut header: Vec<Vec<(String, usize)>> = Vec::new();
+        let mut header_claim_rows: Vec<Vec<SourceSlice>> = Vec::new();
         for hr in headers.iter() {
             let (hx0, hx1) = hr.1.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), c| (a.min(c.x), b.max(c.end)));
             if hx1 < x_left - m || hx0 > x_right + m {
@@ -2370,6 +3089,13 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
                 }
             }
             header.push(hrow);
+            header_claim_rows.push(
+                hr.2
+                    .iter()
+                    .filter(|span| !span.text.trim().is_empty())
+                    .map(|span| span.source)
+                    .collect(),
+            );
             y_top = y_top.max(hr.0);
         }
         // The upward attachment walk deliberately preserves visible content even when it
@@ -2394,15 +3120,33 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
         } else {
             header.len()
         };
-        tables.push(PosTable {
-            y_top,
-            y_bottom: run.last().map(|(y, _, _)| *y).unwrap_or(0.0),
-            x_left,
-            x_right,
+        let uniform_depth_selected =
+            header.is_empty() && header_rows >= 2 && header_rows == uniform_header_rows;
+        header_claim_rows.extend(data_claim_rows);
+        let claim = TableClaim::from_rows(header_claim_rows);
+        let mut table = PositionedTableAnalysis::from_parts(
+            crate::geom::Rect::new(
+                x_left,
+                run.last().map(|(y, _, _)| *y).unwrap_or(0.0),
+                x_right,
+                y_top,
+            ),
+            header,
             grid,
             header_rows,
-            header,
-        });
+            if rule_banded_evidence {
+                vec![TableEvidence::Aligned, TableEvidence::Ruled]
+            } else {
+                vec![TableEvidence::Aligned]
+            },
+        )
+        .with_ownership(CandidateKey::synthetic(), claim);
+        if uniform_depth_selected {
+            table
+                .table
+                .compress_aligned_leading_group_header(&top_anchor_styled);
+        }
+        tables.push(table);
     };
 
     let n = celled.len();
@@ -2468,7 +3212,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
         // than silence. So the truncate is now conditional on the re-flush actually replacing
         // what it discards.
         if tables.len() - before < 2 {
-            let survivors: Vec<PosTable> = tables.split_off(before);
+            let survivors: Vec<PositionedTableAnalysis> = tables.split_off(before);
             flush(&run_slice, &headers, &mut tables);
             if tables.len() == before {
                 tables.extend(survivors);
@@ -2478,37 +3222,120 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<PosTab
     tables
 }
 
-fn detect_tables(spans: Vec<Span>, rules: &crate::vector::PageRules) -> Vec<Vec<Vec<String>>> {
-    detect_tables_pos(&spans, rules).into_iter().map(|t| t.grid).collect()
-}
-
-
 /// Extract tables from all pages as owned [`TableInfo`] rows (row-major grids).
 ///
 /// Detection runs per page in PARALLEL: `extract_spans` is an independent read-only walk with
-/// its own [`crate::WalkBudget`], and `detect_tables` is pure over one page's spans, so no
+/// its own [`crate::WalkBudget`], and table detection is pure over one page's spans, so no
 /// page can see another. The rows are re-sorted by page number before they are flattened —
 /// completion order decides nothing — which makes the output byte-identical to the sequential
 /// loop, including each page's internal table order.
-pub fn extract_tables(
-    access: &dyn crate::access::DocumentAccess,
-) -> Vec<TableInfo> {
+pub fn extract_tables(access: &dyn crate::access::DocumentAccess) -> Vec<TableInfo> {
     let pages = access.pages_or_empty();
-    let mut per_page: Vec<(u32, Vec<Vec<Vec<String>>>)> = pages
+    let diagnostics_enabled = table_owner_diagnostics_enabled();
+    let mut per_page: Vec<(u32, Vec<PositionedTableAnalysis>, String)> = pages
         .par_iter()
         .map(|page| {
             let (pno, page_id) = (page.number, page.id);
             let rules = crate::vector::page_rules(access, page_id);
-            (
-                pno,
-                detect_tables(text::extract_spans(access, page_id).unwrap_or_default(), &rules),
-            )
+            let spans = text::extract_spans(access, page_id).unwrap_or_default();
+            let turn = crate::geom::PageTurn::new(
+                crate::pdfobj::page_rotation(access, page_id),
+                crate::pdfobj::page_box(access, page_id).unwrap_or([
+                    0.0,
+                    0.0,
+                    crate::pdfobj::DEFAULT_PAGE_PTS.0,
+                    crate::pdfobj::DEFAULT_PAGE_PTS.1,
+                ]),
+            );
+            let mut tables = detect_tables_pos(&spans, &rules);
+            crate::table::finalize_continuation_proofs(pno, &spans, &mut tables, turn, false);
+            (pno, tables, String::new())
         })
         .collect();
-    per_page.sort_by_key(|(pno, _)| *pno);
+    per_page.sort_by_key(|(pno, _, _)| *pno);
+    let mut grouped: Vec<(u32, Vec<PositionedTableAnalysis>)> = per_page
+        .iter_mut()
+        .map(|(pno, tables, _)| (*pno, std::mem::take(tables)))
+        .collect();
+    crate::table::group_positioned_continuations(&mut grouped);
+    for ((_, tables, _), (_, grouped_tables)) in per_page.iter_mut().zip(grouped) {
+        *tables = grouped_tables;
+    }
+    if diagnostics_enabled {
+        for (pno, tables, diagnostics) in &mut per_page {
+            *diagnostics = table_owner_diagnostics(*pno, "detected", tables);
+        }
+        emit_ordered_table_owner_diagnostics(
+            per_page
+                .iter()
+                .map(|(pno, _, diagnostics)| (*pno, diagnostics.clone()))
+                .collect(),
+        );
+    }
     per_page
         .into_iter()
-        .flat_map(|(pno, grids)| grids.into_iter().map(move |cells| TableInfo { page: pno, cells }))
+        .flat_map(|(pno, tables, _)| {
+            tables.into_iter().map(move |table| TableInfo {
+                page: pno,
+                cells: table.table.into_grid_parts(),
+            })
+        })
+        .collect()
+}
+
+/// Analyze the same raw detector results as [`extract_tables`], adding detector-owned
+/// topology and normalized display geometry without applying the renderer's later figure,
+/// structure-tree or caption reconciliation.
+pub fn analyze_tables(access: &dyn crate::access::DocumentAccess) -> Vec<AnalyzedTable> {
+    let pages = access.pages_or_empty();
+    let diagnostics_enabled = table_owner_diagnostics_enabled();
+    let mut per_page: Vec<(u32, crate::geom::PageTurn, Vec<PositionedTableAnalysis>, String)> = pages
+        .par_iter()
+        .map(|page| {
+            let (pno, page_id) = (page.number, page.id);
+            let spans = text::extract_spans(access, page_id).unwrap_or_default();
+            let rules = crate::vector::page_rules(access, page_id);
+            let turn = crate::geom::PageTurn::new(
+                crate::pdfobj::page_rotation(access, page_id),
+                crate::pdfobj::page_box(access, page_id).unwrap_or([
+                    0.0,
+                    0.0,
+                    crate::pdfobj::DEFAULT_PAGE_PTS.0,
+                    crate::pdfobj::DEFAULT_PAGE_PTS.1,
+                ]),
+            );
+            let mut detected = detect_tables_pos(&spans, &rules);
+            crate::table::finalize_continuation_proofs(pno, &spans, &mut detected, turn, false);
+            (pno, turn, detected, String::new())
+        })
+        .collect();
+    per_page.sort_by_key(|(pno, _, _, _)| *pno);
+    let mut grouped: Vec<(u32, Vec<PositionedTableAnalysis>)> = per_page
+        .iter_mut()
+        .map(|(pno, _, tables, _)| (*pno, std::mem::take(tables)))
+        .collect();
+    crate::table::group_positioned_continuations(&mut grouped);
+    for ((_, _, tables, _), (_, grouped_tables)) in per_page.iter_mut().zip(grouped) {
+        *tables = grouped_tables;
+    }
+    if diagnostics_enabled {
+        for (pno, _, tables, diagnostics) in &mut per_page {
+            *diagnostics = table_owner_diagnostics(*pno, "detected", tables);
+        }
+        emit_ordered_table_owner_diagnostics(
+            per_page
+                .iter()
+                .map(|(pno, _, _, diagnostics)| (*pno, diagnostics.clone()))
+                .collect(),
+        );
+    }
+    per_page
+        .into_iter()
+        .flat_map(|(pno, turn, tables, _)| {
+            tables
+                .into_iter()
+                .map(move |table| table.into_public(pno, |rect| turn.normalized_rect(rect)))
+        })
         .collect()
 }
 
@@ -2674,6 +3501,410 @@ mod tests {
         );
     }
 
+    #[test]
+    fn grouped_header_style_proof_rejects_a_mixed_bold_anchor() {
+        assert!(all_nonempty_contributors_bold([
+            ("Group", true),
+            (" ", false),
+            ("A", true),
+        ]));
+        assert!(!all_nonempty_contributors_bold([
+            ("Group", true),
+            ("A", false),
+        ]));
+        assert!(!all_nonempty_contributors_bold([(" ", true)]));
+    }
+
+    #[test]
+    fn persistent_internal_gutter_requires_one_complete_source_geometric_proof() {
+        let span = |ordinal: u32, x: f32, text: &str| Span {
+            x,
+            y: 100.0 - ordinal as f32,
+            size: 10.0,
+            width: 8.0,
+            text: text.into(),
+            bold: false,
+            italic: false,
+            mono: false,
+            angle: 0.0,
+            font: 0,
+            mcid: None,
+            source: SourceSlice::test_occurrence(ordinal, text.chars().count()),
+        };
+        let rows = |right_x: &[f32]| -> Vec<Vec<Span>> {
+            right_x
+                .iter()
+                .enumerate()
+                .map(|(row, &right)| {
+                    let id = row as u32 * 10;
+                    let mut spans = vec![
+                        span(id + 1, 2.0, "id"),
+                        span(id + 2, 30.0, "31.2"),
+                        span(id + 3, right, "0"),
+                    ];
+                    let baseline = 100.0 - row as f32;
+                    for span in &mut spans {
+                        span.y = baseline;
+                    }
+                    spans
+                })
+                .collect()
+        };
+        let bands = [(0.0, 20.0), (20.0, 90.0)];
+        let numeric = rows(&[60.0, 60.0, 60.0, 60.0]);
+        fn refs(rows: &[Vec<Span>]) -> Vec<&[Span]> {
+            rows.iter().map(Vec::as_slice).collect()
+        }
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(&numeric)),
+            Some(vec![(0.0, 20.0), (20.0, 49.0), (49.0, 90.0)]),
+            "text-free proof accepts exact single-baseline numeric lanes"
+        );
+
+        let mut exact_edges = numeric.clone();
+        for (row, spans) in exact_edges.iter_mut().enumerate() {
+            spans[1].x += row as f32;
+            spans[1].width -= row as f32;
+            spans[2].width += row as f32;
+        }
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(&exact_edges)),
+            Some(vec![(0.0, 20.0), (20.0, 49.0), (49.0, 90.0)]),
+            "varying lane geometry is accepted when both maximal gap edges remain exact"
+        );
+
+        let mut left_edge_drift = numeric.clone();
+        left_edge_drift[1][1].width = 9.0;
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(&left_edge_drift)),
+            None,
+            "an overlapping corridor with one drifting painted-left edge is not persistent"
+        );
+
+        let mut both_edges_drift = rows(&[60.0, 61.0, 62.0, 61.0]);
+        for (row, spans) in both_edges_drift.iter_mut().enumerate() {
+            spans[1].width += (row % 3) as f32;
+        }
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(&both_edges_drift)),
+            None,
+            "a wide common intersection cannot substitute for exact row-local edges"
+        );
+
+        let mut multi_baseline = numeric.clone();
+        multi_baseline[1][2].y += 1.0;
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(&multi_baseline)),
+            None,
+            "one coalesced off-baseline source invalidates the row proof"
+        );
+
+        let chart_like: Vec<Vec<Span>> = (0..3)
+            .map(|row| {
+                let id = 800 + row * 10;
+                let baseline = 100.0 - row as f32 * 10.0;
+                let mut id_span = span(id, 2.0, "anchor");
+                id_span.y = baseline;
+                let mut upper_left = span(id + 1, 30.0, "label");
+                upper_left.y = baseline + 3.0;
+                let mut lower_left = span(id + 2, 30.0, "label");
+                lower_left.y = baseline - 3.0;
+                let mut upper_right = span(id + 3, 60.0, "1");
+                upper_right.y = baseline + 3.0;
+                let mut lower_right = span(id + 4, 60.0, "2");
+                lower_right.y = baseline - 3.0;
+                vec![id_span, upper_left, lower_left, upper_right, lower_right]
+            })
+            .collect();
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(&chart_like)),
+            None,
+            "stacked chart labels cannot use their exact repeated x-gap as a column proof"
+        );
+
+        let mut missing = numeric.clone();
+        missing[2].pop();
+        assert_eq!(persistent_internal_gutter(&bands, &refs(&missing)), None);
+        let mut missing_header_lane = numeric.clone();
+        missing_header_lane[0].pop();
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(&missing_header_lane)),
+            None
+        );
+
+        let mut empty = numeric.clone();
+        empty[1][2].text = " ".into();
+        assert_eq!(persistent_internal_gutter(&bands, &refs(&empty)), None);
+
+        let drifting = rows(&[48.0, 48.0, 78.0, 78.0]);
+        assert_eq!(persistent_internal_gutter(&bands, &refs(&drifting)), None);
+
+        let mut crossing = numeric.clone();
+        let crossing_y = crossing[1][0].y;
+        crossing[1].insert(2, {
+            let mut s = span(901, 36.0, "bridge");
+            s.width = 30.0;
+            s.y = crossing_y;
+            s
+        });
+        assert_eq!(persistent_internal_gutter(&bands, &refs(&crossing)), None);
+
+        let mut rotated = numeric.clone();
+        rotated[0][2].angle = 0.5;
+        assert_eq!(persistent_internal_gutter(&bands, &refs(&rotated)), None);
+
+        for invalid_angle in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut invalid_geometry = numeric.clone();
+            invalid_geometry[0][2].angle = invalid_angle;
+            assert_eq!(
+                persistent_internal_gutter(&bands, &refs(&invalid_geometry)),
+                None,
+                "non-finite angle {invalid_angle:?} cannot prove source geometry"
+            );
+        }
+
+        for invalid_y in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut invalid_geometry = numeric.clone();
+            invalid_geometry[0][2].y = invalid_y;
+            assert_eq!(
+                persistent_internal_gutter(&bands, &refs(&invalid_geometry)),
+                None,
+                "non-finite y {invalid_y:?} cannot prove a source baseline"
+            );
+        }
+
+        for invalid_width in [0.0, 0.1, f32::NAN, f32::INFINITY] {
+            let mut invalid_geometry = numeric.clone();
+            invalid_geometry[0][1].width = invalid_width;
+            assert_eq!(
+                persistent_internal_gutter(&bands, &refs(&invalid_geometry)),
+                None,
+                "unusable width {invalid_width:?} cannot be synthesized from text"
+            );
+        }
+
+        let mut adjacent_crossing = numeric.clone();
+        let mut wide = span(925, -30.0, "adjacent");
+        wide.width = 100.0; // centre 20: first band; paint reaches through the second's gap
+        wide.y = adjacent_crossing[1][0].y;
+        adjacent_crossing[1].insert(1, wide);
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(&adjacent_crossing)),
+            None,
+            "a source center-bound to an adjacent column still paints the corridor"
+        );
+
+        let mut ambiguous = numeric.clone();
+        for (row, spans) in ambiguous.iter_mut().enumerate() {
+            let mut middle = span(950 + row as u32, 45.0, "middle");
+            middle.y = spans[0].y;
+            spans.insert(2, middle);
+        }
+        assert_eq!(persistent_internal_gutter(&bands, &refs(&ambiguous)), None);
+
+        let short = &numeric[..2];
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(short)),
+            None,
+            "non-aligned two-row input is outside this proof"
+        );
+
+        let two_split_columns: Vec<Vec<Span>> = (0..3)
+            .map(|row| {
+                let id = 1_000 + row * 10;
+                let mut spans = vec![
+                    span(id, 2.0, "a"),
+                    span(id + 1, 12.0, "b"),
+                    span(id + 2, 30.0, "c"),
+                    span(id + 3, 60.0, "d"),
+                ];
+                for span in &mut spans {
+                    span.y = 100.0 - row as f32;
+                }
+                spans
+            })
+            .collect();
+        assert_eq!(
+            persistent_internal_gutter(&bands, &refs(&two_split_columns)),
+            None,
+            "two independently splittable columns are ambiguous"
+        );
+
+        let expected = vec![vec![numeric[0][0].source, numeric[0][1].source]];
+        let mut lost = expected.clone();
+        lost[0].pop();
+        assert!(!exact_source_partition(&expected, &lost));
+        let mut duplicated = expected.clone();
+        duplicated[0].push(expected[0][0]);
+        assert!(!exact_source_partition(&expected, &duplicated));
+    }
+
+    #[test]
+    fn footnote_marker_fixtures_recover_the_persistent_notes_lane_exactly() {
+        for (name, expected_claim_hash) in [
+            ("t2_footnote_markers_asterisks.pdf", 0xfdb5ddf0e65392d4),
+            ("t2_footnote_markers_daggers.pdf", 0x6f8fe00d70bd9f46),
+        ] {
+            let path = format!(
+                "{}/../tests/table_corpus/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("{name} readable: {e}"));
+            let doc = Document::load_mem(&raw).unwrap_or_else(|e| panic!("{name} loads: {e}"));
+            let page = *doc.get_pages().get(&1).expect("page 1");
+            let access = crate::access::test_adapter_with_source(&doc, &raw);
+            let spans = crate::text::extract_spans(&access, page).unwrap();
+            let tables = detect_tables_pos(&spans, &crate::vector::page_rules(&access, page));
+            assert_eq!(tables.len(), 1, "{name}");
+            let table = &tables[0];
+            assert_eq!(table.table.evidence, vec![TableEvidence::Aligned], "{name}");
+            assert_eq!(table.table.header_rows, 1, "{name}");
+            assert_eq!((table.table.grid.len(), table.table.grid[0].len()), (5, 4), "{name}");
+            assert_eq!(
+                table.table.grid[0].iter().map(|cell| cell.text.as_str()).collect::<Vec<_>>(),
+                vec!["Model", "Params", "BLEU", "Notes"],
+                "{name}"
+            );
+            for (row, expected_note) in ["seed 0", "seed 1", "seed 2", "seed 3"].iter().enumerate() {
+                assert_eq!(table.table.grid[row + 1][3].text, *expected_note, "{name} row {row}");
+            }
+            assert_eq!(table.claim.row_count(), 5, "{name}");
+            assert!(
+                (0..5).all(|row| table.claim.row(row).is_some_and(|sources| !sources.is_empty())),
+                "{name} keeps exact per-row ownership"
+            );
+            let mut expected_sources: Vec<SourceSlice> = spans
+                .iter()
+                .filter(|span| {
+                    !span.text.trim().is_empty()
+                        && span.x >= table.bbox.x0
+                        && span.x <= table.bbox.x1
+                        && span.y >= table.bbox.y0
+                        && span.y <= table.bbox.y1
+                })
+                .map(|span| span.source)
+                .collect();
+            expected_sources.sort_unstable();
+            assert_eq!(table.claim.slices, expected_sources, "{name} source union");
+            assert_eq!(table.claim.stable_hash(), expected_claim_hash, "{name} claim hash");
+            assert_eq!(
+                table_owner_diagnostics(1, "detected", &tables),
+                format!(
+                    "DPDF_TABLE_OWNERS page=1 scope=detected candidate=aligned:0 \
+                     bbox=429f3333,4423799a,43e15bc7,4433799a evidence=aligned \
+                     rows=5 claim_rows=5 slices=24 hash={expected_claim_hash:016x}\n"
+                ),
+                "{name} ownership diagnostic"
+            );
+            assert!(table.table.grid.iter().flatten().all(|cell| cell.bbox.is_none()), "{name}");
+        }
+    }
+
+    #[test]
+    fn rule_banded_admission_does_not_use_the_aligned_internal_gutter_refinement() {
+        let span = |ordinal: u32, x: f32, y: f32, text: &str| Span {
+            x,
+            y,
+            size: 10.0,
+            width: 8.0,
+            text: text.into(),
+            bold: y > 90.0,
+            italic: false,
+            mono: false,
+            angle: 0.0,
+            font: 0,
+            mcid: None,
+            source: SourceSlice::test_occurrence(ordinal, text.chars().count()),
+        };
+        let spans = vec![
+            span(1, 10.0, 100.0, "Name"),
+            span(2, 110.0, 100.0, "Count"),
+            span(3, 210.0, 100.0, "Rate"),
+            span(4, 225.0, 100.0, "Note"),
+            span(5, 10.0, 80.0, "Alpha"),
+            span(6, 110.0, 80.0, "12"),
+            span(7, 210.0, 80.0, "4.2"),
+            span(8, 225.0, 80.0, "seed"),
+        ];
+        let tables = detect_tables_region(
+            &spans,
+            &[(0.0, 250.0, 112.0), (0.0, 250.0, 68.0)],
+        );
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].table.evidence, vec![TableEvidence::Aligned, TableEvidence::Ruled]);
+        assert_eq!((tables[0].table.grid.len(), tables[0].table.grid[0].len()), (2, 3));
+        assert_eq!(tables[0].table.grid[0][2].text, "Rate Note");
+        assert_eq!(tables[0].table.grid[1][2].text, "4.2 seed");
+        assert_eq!(tables[0].claim.len(), 8);
+    }
+
+    #[test]
+    fn two_row_booktabs_records_the_rule_evidence_that_admits_it() {
+        let span = |x: f32, y: f32, text: &str| Span {
+            x,
+            y,
+            size: 10.0,
+            width: 30.0,
+            text: text.into(),
+            bold: y > 90.0,
+            italic: false,
+            mono: false,
+            angle: 0.0,
+            font: 0,
+            mcid: None,
+            source: SourceSlice::test_occurrence(
+                (x.to_bits() ^ y.to_bits()).wrapping_add(1),
+                text.chars().count(),
+            ),
+        };
+        let spans = vec![
+            span(10.0, 100.0, "Name"),
+            span(110.0, 100.0, "Count"),
+            span(210.0, 100.0, "Rate"),
+            span(10.0, 80.0, "Alpha"),
+            span(110.0, 80.0, "12"),
+            span(210.0, 80.0, "4.2"),
+        ];
+        let tables = detect_tables_region(&spans, &[(0.0, 250.0, 112.0), (0.0, 250.0, 68.0)]);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].claim.row_count(), 2);
+        assert_eq!(tables[0].claim.len(), 6);
+        assert_eq!(tables[0].claim.stable_hash(), 0xcc2445d4ebe2b52c);
+        let diagnostics = table_owner_diagnostics(7, "test", &tables);
+        assert_eq!(diagnostics, table_owner_diagnostics(7, "test", &tables));
+        assert!(diagnostics.contains("page=7 scope=test"));
+        assert!(diagnostics.contains("candidate=synthetic:0"));
+        assert!(diagnostics.contains("claim_rows=2 slices=6 hash=cc2445d4ebe2b52c"));
+        for text in ["Name", "Count", "Rate", "Alpha"] {
+            assert!(!diagnostics.contains(text), "ownership diagnostics leaked cell text");
+        }
+        assert_eq!(
+            tables[0].table.evidence,
+            vec![TableEvidence::Aligned, TableEvidence::Ruled]
+        );
+        assert!(tables[0].table.grid.iter().flatten().all(|cell| cell.bbox.is_none()));
+    }
+
+    #[test]
+    fn owner_diagnostics_are_page_tagged_and_aggregated_in_page_order() {
+        let table = PositionedTableAnalysis::from_parts(
+            crate::geom::Rect::new(1.0, 2.0, 3.0, 4.0),
+            Vec::new(),
+            vec![vec!["private cell text".into(), "42".into()]],
+            0,
+            vec![TableEvidence::Aligned],
+        );
+        let page_nine = table_owner_diagnostics(9, "detected", std::slice::from_ref(&table));
+        let page_two = table_owner_diagnostics(2, "declared", std::slice::from_ref(&table));
+
+        let report = ordered_table_owner_diagnostics(vec![(9, page_nine), (2, page_two)]);
+        let lines: Vec<&str> = report.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("DPDF_TABLE_OWNERS page=2 scope=declared "));
+        assert!(lines[1].starts_with("DPDF_TABLE_OWNERS page=9 scope=detected "));
+        assert!(!report.contains("private cell text"), "ordered diagnostics leaked table text");
+    }
+
     /// The owned form-XObject raster fixture (`tests/gen_fixtures.py::gen_form_image`).
     fn form_image_doc() -> Document {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/form_image.pdf");
@@ -2682,7 +3913,7 @@ mod tests {
 
     /// One committed fixture's page 1, detected exactly as the product detects it: spans and
     /// ruling from the same page, through the same entry point.
-    fn detect_fixture(name: &str) -> Vec<PosTable> {
+    fn detect_fixture(name: &str) -> Vec<PositionedTableAnalysis> {
         let path = format!("{}/../tests/fixtures_pdf/{name}", env!("CARGO_MANIFEST_DIR"));
         let doc = Document::load(&path).unwrap_or_else(|e| panic!("{name} must load: {e}"));
         let raw = std::fs::read(&path).expect("fixture readable");
@@ -2712,12 +3943,49 @@ mod tests {
         // column is a column and each band title is its own row, neither of which text
         // clustering can see.
         let spans = crate::text::extract_spans(&crate::access::test_adapter_with_source(&doc, &raw), page).unwrap();
+        let direct = l3_ruled(
+            &Candidate {
+                frame: Some(&frames[0]),
+                long_h: 0,
+                v_rules: 0,
+                aligned: None,
+                band_has_rotated_text: false,
+            },
+            &spans,
+        ).expect("the owned lattice is admitted");
+        assert_eq!(direct.evidence, vec![TableEvidence::Ruled]);
+        let corroborated = l3_ruled(
+            &Candidate {
+                frame: Some(&frames[0]),
+                long_h: 0,
+                v_rules: 0,
+                aligned: Some(direct.clone()),
+                band_has_rotated_text: false,
+            },
+            &spans,
+        ).expect("aligned header evidence does not change lattice admission");
+        assert_eq!(corroborated.evidence, vec![TableEvidence::Ruled, TableEvidence::Aligned]);
+        assert_eq!(corroborated.bbox, direct.bbox);
+        assert_eq!(corroborated.claim, direct.claim, "an unproven band cannot move ownership");
         let tables = detect_tables_pos(&spans, &rules);
         assert_eq!(tables.len(), 1, "one table, got {shape:?}", shape = tables.iter().map(|t| (t.grid.len(), t.grid[0].len())).collect::<Vec<_>>());
         assert_eq!((tables[0].grid.len(), tables[0].grid[0].len()), (6, 4));
         assert_eq!(tables[0].grid[0], vec!["Site", "Depth", "", "Yield"]);
         assert_eq!(tables[0].grid[1], vec!["Northern district", "", "", ""]);
         assert_eq!(tables[0].grid[5], vec!["Delta", "42.5", "", "128"]);
+        let axes = frames[0].axes();
+        assert_eq!(tables[0].grid[0][0].row, 0);
+        assert_eq!(tables[0].grid[0][0].col, 0);
+        assert_eq!(
+            tables[0].grid[0][0].bbox,
+            Some(crate::geom::Rect::new(axes.xs[0], axes.ys[5], axes.xs[1], axes.ys[6])),
+            "the first reading-order row is the lattice's top band"
+        );
+        assert_eq!(
+            tables[0].grid[5][3].bbox,
+            Some(crate::geom::Rect::new(axes.xs[3], axes.ys[0], axes.xs[4], axes.ys[1])),
+            "the last reading-order row is the lattice's bottom band"
+        );
     }
 
     #[test]
@@ -2730,23 +3998,34 @@ mod tests {
             y: 0.0,
             size: 10.0,
             width: 40.0, // 8 chars, 5pt each
-            text: "ABCDEFGH".into(),
+            text: "Aé文🙂EFGH".into(),
             bold: false,
             italic: false,
             mono: false,
             angle: 0.0,
             font: 0,
             mcid: None,
+            source: SourceSlice::test_occurrence(7, 8),
         };
         // A boundary at 120 is 4 characters in.
         let pieces = split_span_at(&s, &[100.0, 120.0, 140.0]);
-        assert_eq!(pieces.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), vec!["ABCD", "EFGH"]);
+        assert_eq!(pieces.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), vec!["Aé文🙂", "EFGH"]);
+        assert_eq!(pieces[0].source.source(), s.source.source());
+        assert_eq!(pieces[1].source.source(), s.source.source());
+        assert_eq!((pieces[0].source.char_start(), pieces[0].source.char_end()), (0, 4));
+        assert_eq!((pieces[1].source.char_start(), pieces[1].source.char_end()), (4, 8));
+        assert_eq!(pieces[0].source.char_len() + pieces[1].source.char_len(), s.source.char_len());
         assert_eq!(pieces[1].x, 120.0, "the second piece starts at the boundary");
         assert_eq!(pieces[0].width + pieces[1].width, 40.0, "the advance is conserved");
         // The frame's own edges are not interior, so a run inside one cell is left whole.
         assert_eq!(split_span_at(&s, &[100.0, 140.0]).len(), 1);
         // A single character cannot be cut.
-        let one = Span { text: "X".into(), width: 5.0, ..clone_span(&s) };
+        let one = Span {
+            text: "X".into(),
+            width: 5.0,
+            source: SourceSlice::test_occurrence(8, 1),
+            ..clone_span(&s)
+        };
         assert_eq!(split_span_at(&one, &[102.0]).len(), 1);
     }
 
@@ -2766,7 +4045,13 @@ mod tests {
         let frames = crate::lattice::frames(&rules);
         assert!(!frames.is_empty(), "the ruling does close cells — that is the point");
         let spans = crate::text::extract_spans(&crate::access::test_adapter_with_source(&doc, &raw), page).unwrap();
-        let c = Candidate { frame: Some(&frames[0]), long_h: 0, v_rules: 0, aligned: None };
+        let c = Candidate {
+            frame: Some(&frames[0]),
+            long_h: 0,
+            v_rules: 0,
+            aligned: None,
+            band_has_rotated_text: false,
+        };
         assert_eq!(classify(TABLE_TYPES, &c).map(|t| t.name), Some("full-grid"), "it classifies");
         assert!(l3_ruled(&c, &spans).is_none(), "…and the handler refuses it");
     }
@@ -2778,16 +4063,14 @@ mod tests {
         // Register a dummy type that claims every framed candidate and returns a fixed 1x1
         // grid, and show (a) the classifier dispatches to it, (b) the candidates L1 produced
         // are exactly the same ones.
-        fn l3_dummy(_c: &Candidate, _s: &[Span]) -> Option<PosTable> {
-            Some(PosTable {
-                y_top: 1.0,
-                y_bottom: 0.0,
-                x_left: 0.0,
-                x_right: 1.0,
-                grid: vec![vec!["dummy".into()]],
-                header: Vec::new(),
-                header_rows: 1,
-            })
+        fn l3_dummy(_c: &Candidate, _s: &[Span]) -> Option<PositionedTableAnalysis> {
+            Some(PositionedTableAnalysis::from_parts(
+                crate::geom::Rect::new(0.0, 0.0, 1.0, 1.0),
+                Vec::new(),
+                vec![vec!["dummy".into()]],
+                1,
+                vec![TableEvidence::Aligned],
+            ))
         }
         const EXTENDED: &[TypeRule] = &[
             TypeRule { name: "dummy", matches: |c| c.frame.is_some(), handler: l3_dummy },
@@ -2802,10 +4085,19 @@ mod tests {
         let frames = crate::lattice::frames(&rules);
         assert_eq!(frames.len(), 1, "L1 found one frame");
 
-        let framed = Candidate { frame: Some(&frames[0]), long_h: 0, v_rules: 0, aligned: None };
+        let framed = Candidate {
+            frame: Some(&frames[0]),
+            long_h: 0,
+            v_rules: 0,
+            aligned: None,
+            band_has_rotated_text: false,
+        };
         assert_eq!(classify(TABLE_TYPES, &framed).map(|t| t.name), Some("full-grid"));
         assert_eq!(classify(EXTENDED, &framed).map(|t| t.name), Some("dummy"), "the new row wins");
-        assert_eq!(build_table(EXTENDED, &framed, &spans).map(|t| t.grid), Some(vec![vec!["dummy".to_string()]]));
+        assert_eq!(
+            build_table(EXTENDED, &framed, &spans).map(|t| t.table.into_grid_parts()),
+            Some(vec![vec!["dummy".to_string()]])
+        );
 
         // L1 is untouched: the same page, detected with the production table, still produces
         // the same frame — the type table changed what a candidate BECOMES, never what is found.
@@ -3141,7 +4433,15 @@ mod tests {
             let Ok(doc) = Document::load_mem(&raw) else { continue }; // encrypted / damaged
             let mut want: Vec<(u32, Vec<Vec<String>>)> = Vec::new();
             for (&pno, &page_id) in &doc.get_pages() {
-                for grid in detect_tables(text::extract_spans(&crate::access::test_adapter_with_source(&doc, &raw), page_id).unwrap(), &crate::vector::page_rules(&test_adapter(&doc), page_id)) {
+                let access = crate::access::test_adapter_with_source(&doc, &raw);
+                let spans = text::extract_spans(&access, page_id).unwrap();
+                for grid in detect_tables_pos(
+                    &spans,
+                    &crate::vector::page_rules(&access, page_id),
+                )
+                .into_iter()
+                .map(|table| table.table.into_grid_parts())
+                {
                     want.push((pno, grid));
                 }
             }
@@ -3620,6 +4920,37 @@ mod tests {
             vec!["North".to_string(), "Alpha".into(), "11".into()],
             vec![String::new(), "Beta".into(), "22".into()],
         ], "the /RowSpan 2 cell holds column 0 of the row below it");
+        assert_eq!(t.evidence, vec![TableEvidence::Declared]);
+        let anchors: Vec<_> = t
+            .header
+            .iter()
+            .chain(&t.grid)
+            .flatten()
+            .filter(|cell| !cell.covered)
+            .map(|cell| (cell.text.as_str(), cell.row, cell.col, cell.rowspan, cell.colspan, cell.role))
+            .collect();
+        assert_eq!(
+            anchors,
+            vec![
+                ("Region", 0, 0, 1, 2, CellRole::Header),
+                ("Total", 0, 2, 1, 1, CellRole::Header),
+                ("North", 1, 0, 2, 1, CellRole::Data),
+                ("Alpha", 1, 1, 1, 1, CellRole::Data),
+                ("11", 1, 2, 1, 1, CellRole::Data),
+                ("Beta", 2, 1, 1, 1, CellRole::Data),
+                ("22", 2, 2, 1, 1, CellRole::Data),
+            ],
+            "canonical anchors retain declared span and TH/TD semantics"
+        );
+        assert!(
+            t.header
+                .iter()
+                .chain(&t.grid)
+                .flatten()
+                .filter(|cell| !cell.covered)
+                .all(|cell| cell.bbox.is_none() && cell.content_bbox.is_some()),
+            "declared glyph unions are content geometry, not exact cell boundaries"
+        );
     }
 
     #[test]
@@ -3650,5 +4981,439 @@ mod tests {
         let out = declared_pos_tables(&declared[&page], &[], &[]);
         assert!(out.tables.is_empty());
         assert!(out.refused.iter().all(|r| *r == Refusal::TooFewRows), "got {:?}", out.refused);
+    }
+
+    #[test]
+    fn rich_raw_analysis_keeps_the_exact_legacy_projection() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/numeric.pdf");
+        let raw = std::fs::read(path).expect("numeric fixture bytes");
+        let doc = Document::load_mem(&raw).expect("numeric fixture loads");
+        let pages = doc.get_pages();
+        let (&page, &page_id) = pages.first_key_value().expect("one page");
+        let access = crate::access::test_adapter_with_source(&doc, &raw);
+        let expected: Vec<Vec<Vec<String>>> = detect_tables_pos(
+            &text::extract_spans(&access, page_id).unwrap(),
+            &crate::vector::page_rules(&access, page_id),
+        )
+        .into_iter()
+        .map(|table| table.table.into_grid_parts())
+        .collect();
+        let legacy = extract_tables(&access);
+        assert_eq!(
+            legacy.iter().map(|table| table.cells.clone()).collect::<Vec<_>>(),
+            expected
+        );
+        let analyzed = analyze_tables(&access);
+        assert_eq!(legacy.len(), analyzed.len());
+        for (old, rich) in legacy.iter().zip(&analyzed) {
+            assert_eq!(old.page, rich.page);
+            assert_eq!(old.page, page);
+            let mut dense = vec![vec![String::new(); rich.n_cols]; rich.n_rows];
+            for cell in &rich.cells {
+                dense[cell.row][cell.col] = cell.text.clone();
+            }
+            assert_eq!(old.cells, dense, "numeric.pdf has no detached header ambiguity");
+        }
+    }
+
+    #[test]
+    fn aligned_grouped_header_is_logical_only_and_keeps_the_dense_legacy_grid() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/table_corpus/t2_merged_colspan_over_booktabs.pdf"
+        );
+        let raw = std::fs::read(path).expect("owned grouped-header fixture bytes");
+        let doc = Document::load_mem(&raw).expect("owned grouped-header fixture loads");
+        let access = crate::access::test_adapter_with_source(&doc, &raw);
+
+        let analyzed = analyze_tables(&access);
+        assert_eq!(analyzed.len(), 1);
+        let table = &analyzed[0];
+        assert_eq!((table.n_rows, table.n_cols, table.header_rows), (8, 6, 2));
+        assert_eq!(table.evidence, vec![TableEvidence::Aligned]);
+        assert_eq!(table.cells.len(), 44);
+        assert_eq!(
+            table
+                .cells
+                .iter()
+                .filter(|cell| cell.row == 0)
+                .map(|cell| (cell.col, cell.colspan, cell.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, 3, "Geochemistry"), (3, 3, "Location")]
+        );
+        let data = table
+            .cells
+            .iter()
+            .find(|cell| cell.row == 2 && cell.col == 2)
+            .expect("first data row, third column");
+        assert_eq!(data.header_path, vec![[0, 0], [1, 2]]);
+        let data = table
+            .cells
+            .iter()
+            .find(|cell| cell.row == 2 && cell.col == 4)
+            .expect("first data row, fifth column");
+        assert_eq!(data.header_path, vec![[0, 3], [1, 4]]);
+
+        let legacy = extract_tables(&access);
+        assert_eq!(legacy.len(), 1);
+        assert_eq!((legacy[0].cells.len(), legacy[0].cells[0].len()), (8, 6));
+        assert_eq!(
+            legacy[0].cells[0],
+            vec!["Geochemistry", "", "", "Location", "", ""]
+        );
+    }
+
+    #[test]
+    fn ruled_grouped_header_moves_atomically_into_topology_and_ownership() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/table_corpus/t2_merged_colspan_over_grid.pdf"
+        );
+        let raw = std::fs::read(path).expect("owned ruled grouped-header fixture bytes");
+        let doc = Document::load_mem(&raw).expect("owned ruled grouped-header fixture loads");
+        let page = *doc.get_pages().get(&1).expect("page 1");
+        let access = crate::access::test_adapter_with_source(&doc, &raw);
+        let spans = crate::text::extract_spans(&access, page).unwrap();
+        let rules = crate::vector::page_rules(&access, page);
+        let frames = crate::lattice::frames(&rules);
+        let frame = frames
+            .iter()
+            .find(|frame| frame.abutting_band.is_some())
+            .expect("target frame has the grouped leading band");
+        let prior = l3_ruled(
+            &Candidate {
+                frame: Some(frame),
+                long_h: 0,
+                v_rules: 0,
+                aligned: None,
+                band_has_rotated_text: false,
+            },
+            &spans,
+        )
+        .expect("prior ruled table");
+        assert_eq!(prior.table.grid.iter().flatten().count(), 42);
+        let tables = detect_tables_pos(&spans, &rules);
+        assert_eq!(tables.len(), 1);
+        let table = &tables[0];
+        assert_eq!(table.table.evidence, vec![TableEvidence::Ruled, TableEvidence::Aligned]);
+        assert_eq!(table.table.header_rows, 2);
+        assert_eq!((table.table.header.len(), table.table.grid.len()), (1, 7));
+        assert_eq!(table.claim.row_count(), 8);
+        assert_eq!(table.table.header[0].len(), 2);
+        assert_eq!(
+            table.table.header[0]
+                .iter()
+                .map(|cell| (cell.text.as_str(), cell.row, cell.col, cell.colspan, cell.role))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Geochemistry", 0, 0, 3, CellRole::Header),
+                ("Location", 0, 3, 3, CellRole::Header),
+            ]
+        );
+        assert!(table.table.header[0].iter().all(|cell| cell.bbox.is_some()));
+        assert_eq!(table.table.grid[0][0].row, 1);
+        assert_eq!(table.table.grid[0][0].role, CellRole::Header);
+        assert_eq!(table.table.grid[1][0].row, 2);
+        assert_eq!(table.table.grid[1][0].role, CellRole::Data);
+        for (prior_row, shifted_row) in prior.table.grid.iter().zip(&table.table.grid) {
+            assert_eq!(prior_row.len(), shifted_row.len());
+            for (old, new) in prior_row.iter().zip(shifted_row) {
+                assert_eq!(new.row, old.row + 1);
+                assert_eq!(new.col, old.col);
+                assert_eq!(new.text, old.text);
+                assert_eq!(new.bbox, old.bbox);
+                assert_eq!(new.content_bbox, old.content_bbox);
+                assert_eq!(new.rowspan, old.rowspan);
+                assert_eq!(new.colspan, old.colspan);
+                assert_eq!(new.render_colspan, old.render_colspan);
+                assert_eq!(new.covered, old.covered);
+                assert_eq!(new.role, old.role);
+            }
+        }
+        assert_eq!(
+            table.bbox.y1,
+            table.table.header[0][0].bbox.expect("exact ruled group bbox").y1
+        );
+        for label in ["Geochemistry", "Location"] {
+            let source = spans
+                .iter()
+                .find(|span| span.text.trim() == label)
+                .unwrap_or_else(|| panic!("{label} source span"))
+                .source;
+            assert!(table.claim.covers(source), "the accepted tier owns {label}");
+        }
+        assert_eq!(table.claim.len(), prior.claim.len() + 2);
+        assert_eq!(table.claim.row_count(), prior.claim.row_count() + 1);
+        let tier_sources = table.claim.row(0).expect("inserted ownership row");
+        assert_eq!(tier_sources.len(), 2);
+        for label in ["Geochemistry", "Location"] {
+            let source = spans
+                .iter()
+                .find(|span| span.text.trim() == label)
+                .expect("tier source")
+                .source;
+            assert!(tier_sources.contains(&source));
+        }
+        for row in 0..prior.claim.row_count() {
+            assert_eq!(table.claim.row(row + 1), prior.claim.row(row));
+        }
+        let hash = table.claim.stable_hash();
+        assert_eq!(
+            detect_tables_pos(&spans, &rules)[0].claim.stable_hash(),
+            hash,
+            "ownership is deterministic"
+        );
+
+        let public = analyze_tables(&access);
+        assert_eq!(public.len(), 1);
+        assert_eq!((public[0].n_rows, public[0].n_cols, public[0].cells.len()), (8, 6, 44));
+        assert_eq!(
+            public[0]
+                .cells
+                .iter()
+                .filter(|cell| cell.row == 0)
+                .map(|cell| (cell.col, cell.colspan, cell.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, 3, "Geochemistry"), (3, 3, "Location")]
+        );
+        let data = public[0]
+            .cells
+            .iter()
+            .find(|cell| (cell.row, cell.col) == (2, 4))
+            .expect("first data row, fifth column");
+        assert_eq!(data.role, CellRole::Data);
+        assert_eq!(data.header_path, vec![[0, 3], [1, 4]]);
+
+        let prior_public = prior.clone().into_public(1, |rect| Some(rect.into()));
+        let shifted_public = table.clone().into_public(1, |rect| Some(rect.into()));
+        assert_eq!(prior_public.cells.len(), 42);
+        for old in &prior_public.cells {
+            let new = shifted_public
+                .cells
+                .iter()
+                .find(|cell| cell.row == old.row + 1 && cell.col == old.col)
+                .expect("every prior anchor shifts exactly one row");
+            assert_eq!(new.text, old.text);
+            assert_eq!(new.bbox_norm, old.bbox_norm);
+            assert_eq!(new.rowspan, old.rowspan);
+            assert_eq!(new.colspan, old.colspan);
+            assert_eq!(new.role, old.role);
+            if old.role == CellRole::Header {
+                assert!(old.header_path.is_empty() && new.header_path.is_empty());
+            } else {
+                let group_col = if old.col < 3 { 0 } else { 3 };
+                let mut expected_path = vec![[0, group_col]];
+                expected_path.extend(old.header_path.iter().map(|&[row, col]| [row + 1, col]));
+                assert_eq!(new.header_path, expected_path);
+            }
+        }
+
+        let legacy = extract_tables(&access);
+        assert_eq!((legacy[0].cells.len(), legacy[0].cells[0].len()), (8, 6));
+        assert_eq!(
+            legacy[0].cells[0],
+            vec!["Geochemistry", "", "", "Location", "", ""]
+        );
+    }
+
+    #[test]
+    fn ruled_grouped_header_proof_rejects_impostors_without_partial_mutation() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/table_corpus/t2_merged_colspan_over_grid.pdf"
+        );
+        let raw = std::fs::read(path).expect("owned ruled grouped-header fixture bytes");
+        let doc = Document::load_mem(&raw).expect("owned ruled grouped-header fixture loads");
+        let page = *doc.get_pages().get(&1).expect("page 1");
+        let access = crate::access::test_adapter_with_source(&doc, &raw);
+        let spans = crate::text::extract_spans(&access, page).unwrap();
+        let rules = crate::vector::page_rules(&access, page);
+        let frames = crate::lattice::frames(&rules);
+        let frame = frames
+            .iter()
+            .find(|frame| frame.abutting_band.is_some())
+            .expect("target frame has the optional grouped band");
+        let upright: Vec<Span> = spans
+            .iter()
+            .filter(|span| span.angle.abs() < 0.01)
+            .map(clone_span)
+            .collect();
+        let bands = crate::lattice::h_bands(&rules);
+        let aligned = detect_aligned_tables(&upright, &bands)
+            .into_iter()
+            .find(|table| {
+                table.table.header_rows == 2 && analysis_shape(&table.table) == (8, 6)
+            })
+            .expect("alignment independently reads the target topology");
+        let base = l3_ruled(
+            &Candidate {
+                frame: Some(frame),
+                long_h: 0,
+                v_rules: 0,
+                aligned: None,
+                band_has_rotated_text: false,
+            },
+            &upright,
+        )
+        .expect("the closed base lattice is independently valid");
+        assert!(base.table.header.is_empty());
+        assert_eq!(base.table.grid.len(), 7);
+
+        let assert_no_tier = |aligned: PositionedTableAnalysis,
+                              test_spans: &[Span],
+                              rotated: bool,
+                              expected_header_rows: usize| {
+            let expected_base = l3_ruled(
+                &Candidate {
+                    frame: Some(frame),
+                    long_h: 0,
+                    v_rules: 0,
+                    aligned: None,
+                    band_has_rotated_text: false,
+                },
+                test_spans,
+            )
+            .expect("the same mutated input retains a valid base lattice");
+            let rejected = l3_ruled(
+                &Candidate {
+                    frame: Some(frame),
+                    long_h: 0,
+                    v_rules: 0,
+                    aligned: Some(aligned),
+                    band_has_rotated_text: rotated,
+                },
+                test_spans,
+            )
+            .expect("a rejected optional tier must not reject the base table");
+            assert!(rejected.table.header.is_empty());
+            assert_eq!(rejected.table.grid.len(), 7);
+            assert_eq!(rejected.bbox, expected_base.bbox, "bbox must not partially grow");
+            assert_eq!(
+                rejected.claim, expected_base.claim,
+                "claim must equal the base reading of the same input"
+            );
+            assert_eq!(rejected.table.header_rows, expected_header_rows);
+            for (row, cells) in rejected.table.grid.iter().enumerate() {
+                assert!(cells.iter().all(|cell| {
+                    cell.row == row
+                        && cell.role
+                            == if row < expected_header_rows {
+                                CellRole::Header
+                            } else {
+                                CellRole::Data
+                            }
+                }));
+            }
+        };
+
+        // Candidate-local rotated ambiguity is an atomic no-op at the L3 boundary.
+        assert_no_tier(aligned.clone(), &upright, true, 2);
+
+        // Width, depth and row-count must match the shifted ruled table exactly.
+        let mut wrong_width = aligned.clone();
+        for row in &mut wrong_width.table.grid {
+            row.pop();
+        }
+        wrong_width.table.grid[0][3].colspan = 2;
+        assert_no_tier(wrong_width, &upright, false, 2);
+
+        let mut wrong_depth = aligned.clone();
+        wrong_depth.table.header_rows = 1;
+        assert_no_tier(wrong_depth, &upright, false, 1);
+
+        let mut wrong_rows = aligned.clone();
+        wrong_rows.table.grid.pop();
+        let rows: Vec<Vec<SourceSlice>> = (0..wrong_rows.claim.row_count() - 1)
+            .map(|row| wrong_rows.claim.row(row).expect("claim row").to_vec())
+            .collect();
+        wrong_rows.claim = TableClaim::from_rows(rows);
+        assert_no_tier(wrong_rows, &upright, false, 2);
+
+        // Same global source union is insufficient: leading and base rows must correspond.
+        let claim_rows: Vec<Vec<SourceSlice>> = (0..aligned.claim.row_count())
+            .map(|row| aligned.claim.row(row).expect("claim row").to_vec())
+            .collect();
+        let mut shifted_claim = aligned.clone();
+        let mut shifted_rows = claim_rows.clone();
+        shifted_rows.swap(0, 1);
+        shifted_claim.claim = TableClaim::from_rows(shifted_rows);
+        assert_no_tier(shifted_claim, &upright, false, 2);
+
+        let mut wrong_source_row = aligned.clone();
+        let mut source_rows = claim_rows.clone();
+        let moved = source_rows[1].pop().expect("leaf source");
+        source_rows[2].push(moved);
+        wrong_source_row.claim = TableClaim::from_rows(source_rows);
+        assert_no_tier(wrong_source_row, &upright, false, 2);
+
+        let mut missing_ownership = aligned.clone();
+        let mut owned_rows = claim_rows.clone();
+        owned_rows[0].pop();
+        missing_ownership.claim = TableClaim::from_rows(owned_rows);
+        assert_no_tier(missing_ownership, &upright, false, 2);
+
+        // Shape alone cannot corroborate a label moved to the wrong anchor or an impostor.
+        let mut wrong_leading_mapping = aligned.clone();
+        wrong_leading_mapping.table.grid[0].swap(0, 3);
+        assert_no_tier(wrong_leading_mapping, &upright, false, 2);
+
+        let mut same_shape_impostor = aligned.clone();
+        same_shape_impostor.table.grid[0][0].text = "Impostor".into();
+        assert_no_tier(same_shape_impostor, &upright, false, 2);
+
+        let band = frame.abutting_band.as_ref().expect("target band");
+        let label_index = |items: &[Span], label: &str| {
+            items
+                .iter()
+                .position(|span| span.text.trim() == label)
+                .unwrap_or_else(|| panic!("{label} span"))
+        };
+
+        // Exactly one alphabetic label per group is mandatory.
+        let mut zero = upright.clone();
+        let index = label_index(&zero, "Geochemistry");
+        zero[index].text.clear();
+        assert_no_tier(aligned.clone(), &zero, false, 2);
+
+        let mut multiple = upright.clone();
+        let mut duplicate = clone_span(&multiple[label_index(&multiple, "Geochemistry")]);
+        duplicate.source = SourceSlice::test_occurrence(900_001, duplicate.text.chars().count());
+        multiple.push(duplicate);
+        assert_no_tier(aligned.clone(), &multiple, false, 2);
+
+        for replacement in ["123", "!!!"] {
+            let mut invalid = upright.clone();
+            let index = label_index(&invalid, "Geochemistry");
+            invalid[index].text = replacement.into();
+            invalid[index].source =
+                SourceSlice::test_occurrence(900_010, invalid[index].text.chars().count());
+            assert_no_tier(aligned.clone(), &invalid, false, 2);
+        }
+
+        // The generic binder's one-point tolerance must not admit probes just outside this
+        // optional band, and exact-overlap text that crosses an edge is ambiguity.
+        for probe in [band.bbox.y0 - 0.5, band.bbox.y1 + 0.5] {
+            let mut outside = upright.clone();
+            let index = label_index(&outside, "Geochemistry");
+            outside[index].y = probe - outside[index].size * 0.25;
+            assert_no_tier(aligned.clone(), &outside, false, 2);
+        }
+        let mut crossing = upright.clone();
+        let index = label_index(&crossing, "Geochemistry");
+        crossing[index].x = band.bbox.x0 - 0.5;
+        assert_no_tier(aligned.clone(), &crossing, false, 2);
+
+        // Production detection must retain rotated ambiguity from the original span slice even
+        // though alignment and ruled binding correctly continue to use upright text only.
+        let mut with_rotated = spans.clone();
+        let mut rotated = clone_span(&with_rotated[label_index(&with_rotated, "Geochemistry")]);
+        rotated.angle = 90.0;
+        rotated.source = SourceSlice::test_occurrence(900_002, rotated.text.chars().count());
+        with_rotated.push(rotated);
+        let detected = detect_tables_pos(&with_rotated, &rules);
+        assert_eq!(detected.len(), 1);
+        assert!(detected[0].table.header.is_empty());
+        assert_eq!(detected[0].table.grid.len(), 7);
+        assert_eq!(detected[0].bbox, frame.bbox);
     }
 }

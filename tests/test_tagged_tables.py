@@ -30,12 +30,45 @@ NAME = "tagged_table.pdf"
 def _tables(page_html):
     out = []
     for t in re.findall(r"<table\b.*?</table>", page_html, re.DOTALL):
-        rows = []
-        for tr in re.findall(r"<tr\b.*?</tr>", t, re.DOTALL):
-            rows.append([re.sub(r"<[^>]+>", "", c).strip()
-                         for c in re.findall(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", tr, re.DOTALL)])
+        anchors = _semantic_cells(t)
+        n_rows = max((r + rs for r, _, _, _, rs, _, _ in anchors), default=0)
+        n_cols = max((c + cs for _, c, _, _, _, cs, _ in anchors), default=0)
+        rows = [["" for _ in range(n_cols)] for _ in range(n_rows)]
+        for row, col, _, _, _, _, text in anchors:
+            rows[row][col] = text
         out.append(rows)
     return out
+
+
+def _semantic_cells(table_html):
+    """Logical anchors emitted by one HTML table, including accessibility attributes."""
+    out, occupied = [], set()
+    for row, tr in enumerate(re.findall(r"<tr\b.*?</tr>", table_html, re.DOTALL)):
+        col = 0
+        for match in re.finditer(r"<(th|td)\b([^>]*)>(.*?)</\1>", tr, re.DOTALL):
+            while (row, col) in occupied:
+                col += 1
+            tag, attrs, inner = match.groups()
+            get = lambda name: re.search(fr'\b{name}="([^"]+)"', attrs)
+            rowspan = int(get("rowspan").group(1)) if get("rowspan") else 1
+            colspan = int(get("colspan").group(1)) if get("colspan") else 1
+            scope = get("scope").group(1) if get("scope") else None
+            text = re.sub(r"<[^>]+>", "", inner).strip()
+            out.append((row, col, tag, scope, rowspan, colspan, text))
+            occupied.update(
+                (row + dr, col + dc)
+                for dr in range(rowspan)
+                for dc in range(colspan)
+                if dr or dc
+            )
+            col += colspan
+    return out
+
+
+def _semantic_projection_score(table_html, expected):
+    """Exact anchor/role/scope/span score; absent and wrong attributes both lose credit."""
+    got = _semantic_cells(table_html)
+    return len(set(got) & set(expected)) / max(len(got), len(expected), 1)
 
 
 @pytest.fixture(scope="module")
@@ -56,8 +89,34 @@ def test_the_declared_header_row_is_th_and_the_data_rows_are_td():
     body = html(NAME)
     first = re.search(r"<table\b.*?</table>", body, re.DOTALL).group(0)
     rows = re.findall(r"<tr\b.*?</tr>", first, re.DOTALL)
-    assert rows[0].count("<th") == 3 and "<td" not in rows[0]
+    assert rows[0].count("<th") == 2 and "<td" not in rows[0]
     assert all("<th" not in r for r in rows[1:])
+
+
+def test_declared_table_semantic_projection_is_exact_and_metric_is_sensitive():
+    first = re.search(r"<table\b.*?</table>", html(NAME), re.DOTALL).group(0)
+    expected = [
+        (0, 0, "th", "colgroup", 1, 2, "Region"),
+        (0, 2, "th", "col", 1, 1, "Total"),
+        (1, 0, "td", None, 2, 1, "North"),
+        (1, 1, "td", None, 1, 1, "Alpha"),
+        (1, 2, "td", None, 1, 1, "11"),
+        (2, 1, "td", None, 1, 1, "Beta"),
+        (2, 2, "td", None, 1, 1, "22"),
+    ]
+    assert _semantic_projection_score(first, expected) == 1.0
+    assert _semantic_projection_score(first.replace(' scope="col"', "", 1), expected) < 1.0
+    assert _semantic_projection_score(first.replace(' rowspan="2"', "", 1), expected) < 1.0
+
+
+def test_semantic_spans_do_not_change_legacy_raw_extraction():
+    raw = distillpdf.Pdf.open(os.path.join(FIX, NAME)).extract_tables()
+    assert raw == [
+        {"page": 1, "n_rows": 4, "n_cols": 3,
+         "cells": GT[NAME]["declared_grid"] + [["one", "row", "only"]]},
+        {"page": 1, "n_rows": 4, "n_cols": 3,
+         "cells": GT[NAME]["undeclared_rows"]},
+    ]
 
 
 def test_an_indirect_mcid_still_resolves_to_its_cell(tables):

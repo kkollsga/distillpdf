@@ -1111,6 +1111,91 @@ fn decode_words(elems: &[Show], font: Option<&FontInfo>, size: f32, tc: f32, tw:
 
 /// 2x3 affine matrix (PDF row-vector convention): [a b c d e f].
 /// A positioned run of text (origin in PDF user space, y increases upward).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct SourceId(u32);
+
+impl SourceId {
+    const UNASSIGNED: Self = Self(u32::MAX);
+
+    pub(crate) const fn ordinal(self) -> u32 {
+        self.0
+    }
+}
+
+/// The exact character interval contributed by one painted text occurrence.
+///
+/// Occurrence ids are assigned only after coincident-paint de-duplication, so two uses of the
+/// same Form XObject at different page positions remain distinct while faux-bold overpainting
+/// at one position remains one visible source. Character offsets, rather than byte offsets,
+/// let a ruled-cell cut preserve Unicode text without exposing this bookkeeping publicly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct SourceSlice {
+    source: SourceId,
+    char_start: u32,
+    char_end: u32,
+}
+
+impl SourceSlice {
+    fn unassigned() -> Self {
+        Self {
+            source: SourceId::UNASSIGNED,
+            char_start: 0,
+            char_end: 0,
+        }
+    }
+
+    fn whole(source: SourceId, char_len: usize) -> Self {
+        Self {
+            source,
+            char_start: 0,
+            char_end: u32::try_from(char_len).expect("one text span cannot exceed u32 characters"),
+        }
+    }
+
+    pub(crate) fn source(self) -> SourceId {
+        self.source
+    }
+
+    pub(crate) const fn char_start(self) -> u32 {
+        self.char_start
+    }
+
+    pub(crate) const fn char_end(self) -> u32 {
+        self.char_end
+    }
+
+    pub(crate) const fn char_len(self) -> u32 {
+        self.char_end - self.char_start
+    }
+
+    pub(crate) fn merge_if_touching(self, other: Self) -> Option<Self> {
+        if self.source != other.source || other.char_start > self.char_end || other.char_end < self.char_start {
+            return None;
+        }
+        Some(Self {
+            source: self.source,
+            char_start: self.char_start.min(other.char_start),
+            char_end: self.char_end.max(other.char_end),
+        })
+    }
+
+    pub(crate) fn sub_slice(self, relative_start: usize, relative_end: usize) -> Self {
+        let start = u32::try_from(relative_start).expect("span split offset must fit u32");
+        let end = u32::try_from(relative_end).expect("span split offset must fit u32");
+        debug_assert!(start <= end && end <= self.char_len());
+        Self {
+            source: self.source,
+            char_start: self.char_start + start,
+            char_end: self.char_start + end,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_occurrence(ordinal: u32, char_len: usize) -> Self {
+        Self::whole(SourceId(ordinal), char_len)
+    }
+}
+
 #[derive(Clone)]
 pub struct Span {
     pub x: f32,
@@ -1138,6 +1223,9 @@ pub struct Span {
     /// associate a cell with unrelated text; those spans stay `None` and resolve by geometry
     /// or not at all.
     pub mcid: Option<u32>,
+    /// Private painted-occurrence provenance. Assigned after coincident de-duplication and
+    /// preserved by every geometry-only clone/turn; never projected into a public result.
+    pub(crate) source: SourceSlice,
 }
 
 /// Extract positioned text spans for one page via content-stream interpretation,
@@ -1209,6 +1297,7 @@ pub fn extract_spans(
         )?;
     }
     dedup_coincident(&mut spans);
+    assign_occurrence_provenance(&mut spans);
     Ok(spans)
 }
 
@@ -1280,6 +1369,7 @@ fn push_positioned_span(spans: &mut Vec<Span>, wtm: &Mat, ctm: &Mat, base_size: 
                 angle,
                 font: style.3,
                 mcid: None, // stamped by the caller's marked-content stack (see `decode_spans`)
+                source: SourceSlice::unassigned(),
             });
         }
 }
@@ -1643,6 +1733,18 @@ fn clip_spans_to(spans: &mut Vec<Span>, from: usize, bb: crate::geom::Rect) {
 fn dedup_coincident(spans: &mut Vec<Span>) {
     let mut seen = std::collections::HashSet::new();
     spans.retain(|s| seen.insert((s.x.round() as i32, s.y.round() as i32, s.text.clone())));
+}
+
+/// Number the visible paint occurrences in retained content-walk order.
+///
+/// This deliberately runs after [`dedup_coincident`]. Form invocations are decoded once per
+/// placement and therefore receive different ids; only occurrences that a viewer overprints
+/// at the same rounded position have already collapsed to one.
+fn assign_occurrence_provenance(spans: &mut [Span]) {
+    for (i, span) in spans.iter_mut().enumerate() {
+        let source = SourceId(u32::try_from(i).expect("one page cannot contain more than u32 spans"));
+        span.source = SourceSlice::whole(source, span.text.chars().count());
+    }
 }
 
 /// Effective span width (fall back to a char estimate if widths were absent).
@@ -2477,6 +2579,44 @@ mod tests {
         ys.sort_unstable();
         ys.dedup();
         assert_eq!(ys.len(), 3, "the three occurrences must land at three offsets, got {ys:?}");
+        let mut source_ids: Vec<u32> = hits.iter().map(|s| s.source.source().ordinal()).collect();
+        source_ids.sort_unstable();
+        source_ids.dedup();
+        assert_eq!(source_ids.len(), 3, "each painted form invocation needs its own source id");
+        assert!(hits.iter().all(|s| {
+            s.source.char_start() == 0
+                && s.source.char_end() as usize == s.text.chars().count()
+        }));
+    }
+
+    #[test]
+    fn occurrence_ids_are_assigned_after_visible_coincident_deduplication() {
+        let span = |x: f32| Span {
+            x,
+            y: 20.0,
+            size: 10.0,
+            width: 20.0,
+            text: "same".into(),
+            bold: false,
+            italic: false,
+            mono: false,
+            angle: 0.0,
+            font: 0,
+            mcid: None,
+            source: SourceSlice::unassigned(),
+        };
+        let mut spans = vec![span(10.0), span(10.0), span(40.0)];
+
+        dedup_coincident(&mut spans);
+        assign_occurrence_provenance(&mut spans);
+
+        assert_eq!(spans.len(), 2, "coincident overpaint is one visible occurrence");
+        assert_eq!(
+            spans.iter().map(|s| s.source.source().ordinal()).collect::<Vec<_>>(),
+            vec![0, 1],
+            "surviving paint sites are numbered in retained content order"
+        );
+        assert!(spans.iter().all(|s| (s.source.char_start(), s.source.char_end()) == (0, 4)));
     }
 
     #[test]

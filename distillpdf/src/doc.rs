@@ -19,6 +19,7 @@ use crate::access::{
 };
 use crate::error::Error;
 use crate::extract::{self, FontInfo, ImageInfo, TableInfo};
+use crate::table::AnalyzedTable;
 use crate::model::container::AssetBytes;
 use crate::model::{self, AssetProfile, DocModel};
 use crate::{frontmatter, html, links, markdown, nav, ocr, text};
@@ -1015,6 +1016,15 @@ impl PdfDocument {
     /// Extract tables from all pages.
     pub fn extract_tables(&self) -> Vec<TableInfo> {
         extract::extract_tables(self.access.as_ref())
+    }
+
+    /// Analyze raw table detections with semantic anchors and normalized display geometry.
+    ///
+    /// This deliberately shares [`Self::extract_tables`]' raw detector source. Rendered
+    /// HTML/Markdown may differ because rendering subsequently filters figure-like grids,
+    /// reconciles tagged declarations and attaches captions.
+    pub fn analyze_tables(&self) -> Vec<AnalyzedTable> {
+        extract::analyze_tables(self.access.as_ref())
     }
 
     /// Extract hyperlinks from all pages.

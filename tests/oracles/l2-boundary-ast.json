@@ -89,19 +89,24 @@
     "clone-call|c2346f0396505a086c0accbd5df2da1876191f315fa19f89fe738efd10578b78|text . clone ()",
     "clone-call|c2346f0396505a086c0accbd5df2da1876191f315fa19f89fe738efd10578b78|text . clone ()",
     "clone-call|c2346f0396505a086c0accbd5df2da1876191f315fa19f89fe738efd10578b78|text . clone ()",
-    "clone-call|c2346f0396505a086c0accbd5df2da1876191f315fa19f89fe738efd10578b78|text . clone ()"
+    "clone-call|c2346f0396505a086c0accbd5df2da1876191f315fa19f89fe738efd10578b78|text . clone ()",
+    "clone-call|f292c207912f2b602bc77641caac28db0841dd8d68c00350a597b77cbbea46b9|anchor . clone ()"
   ],
   "extract.rs": [
     "clone-call|1b328262b779300ca6b82ac4de0be39372984529ad9b979980367c9268878af6|name . clone ()",
     "clone-call|456dffc7874879616c15cc0bd6fa1b4e7aef7de51ec2133d909ed6082044251d|x . text . clone ()",
-    "clone-call|45bbd0d9e4fdaae6b0e835474f2252cebfd75e0037dfb0c9582976df547058ef|out . iter () . filter (| t | owns (& f . bbox , t)) . max_by (| a , b | { let region = | t : & PosTable | { crate :: ge",
-    "clone-call|6597544c04a40c93a552d17df09c0afbe347f0d4e79c54e08adc86e5894eca60|c . clone ()",
+    "clone-call|6ffc618183a9f4651cd40802ccb3b06b3608cec7e39d78b9ae8952aed84b6707|out . iter () . filter (| t | owns (& f . bbox , t)) . max_by (| a , b | { let region = | t : & PositionedTableAnalysis ",
     "clone-call|7244a625441cbfeb80b7a1bb2236bad85482dc5719147457fb138a36d1c05327|gaps . clone ()",
     "clone-call|795bf9030d7a4fab83c62bdd4eaf9172755c5099f3d8bc521b296cc8513630ae|res . clone ()",
+    "clone-call|80508999649dd3b83064aba32ecbf31138e5aec16c54207fe4029430099c4402|actual . clone ()",
     "clone-call|99787e0d94a737347708386988b195d58b53f6ac162eb229b6987bc8b888484b|c . aligned . clone ()",
     "clone-call|9c0ffb2c04c1984cd04a01bdc398d94c182ad044689c6a11d95faf1582835d5f|headers . clone ()",
     "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
+    "clone-call|b35362ee6ae3f1ce895a8852eee51178c03eb99669e779754b485c477db3cd59|diagnostics . clone ()",
+    "clone-call|b35362ee6ae3f1ce895a8852eee51178c03eb99669e779754b485c477db3cd59|diagnostics . clone ()",
     "clone-call|c08285b199d650a1b5018845452a9b162a62889824e2a0a292186c8457695a4c|s . text . clone ()",
+    "clone-call|d3de14fdce16d3af897532fdcd01a352782dc6501ad611cf443dee0c2ee09549|declared_claim_rows [i] . clone ()",
+    "clone-call|edc4fa001222c3450a6068f2ec350a31d75020ddcf5296ffab37bc3097af09f9|expected . clone ()",
     "clone-call|fb3e906394d5adec2ad8604b89eb513794ddf848b726325a304c321ac8d6dad9|cell . 0 . clone ()"
   ],
   "frontmatter.rs": [
@@ -132,6 +137,7 @@
     "clone-call|004346267af5c0eb5a95fc77fe674ce5e13192218eb147f6f54fbb86edd36a05|cap . clone ()",
     "clone-call|004346267af5c0eb5a95fc77fe674ce5e13192218eb147f6f54fbb86edd36a05|cap . clone ()",
     "clone-call|06c6631ff36ddce20522ba682cfd7325274d31858224b9d8ac69b11514421b75|u . clone ()",
+    "clone-call|1c7b29163818194b1b355bb8849ba17512f1d7fc79c3d08c796b3c14821e0a0c|tables [* j] . table . clone ()",
     "clone-call|2c8a89e629d146cfa56130d49a2598d1a30a1f64b0ad95b749d5ebabd2ce8000|s . clone ()",
     "clone-call|5ad90a1b13282db6387b809fd1215fa0b52fe9ac944e24e3b56b603fdcdc88a4|meta . 0 . clone ()",
     "clone-call|6597544c04a40c93a552d17df09c0afbe347f0d4e79c54e08adc86e5894eca60|c . clone ()",
@@ -143,8 +149,6 @@
     "clone-call|6a20204a60273f0861c55ae16f26479dcea3d0075cb1a79cdaa71712891c44dd|num . clone ()",
     "clone-call|6a20204a60273f0861c55ae16f26479dcea3d0075cb1a79cdaa71712891c44dd|num . clone ()",
     "clone-call|6a20204a60273f0861c55ae16f26479dcea3d0075cb1a79cdaa71712891c44dd|num . clone ()",
-    "clone-call|8dc62b19d9b59d9ced67c9c0ed7ebe362d178cd13daab2c30f7345e1883a628a|tables [* j] . header . clone ()",
-    "clone-call|ae0b62525d40ba0d079016d3e86a7914c964aada2352122e6ceb949d9888d2a0|tables [* j] . grid . clone ()",
     "clone-call|b398906d49d2fa6d29f18f022204e32bed429edd7ade30c7fb8455457c8fbcce|overlays . clone ()",
     "clone-call|b9d3b86fa426f4c96925eb366328e7f012da40d298c2feffe0005b90e7dc1d7e|html . clone ()",
     "clone-call|b9d3b86fa426f4c96925eb366328e7f012da40d298c2feffe0005b90e7dc1d7e|html . clone ()",
@@ -186,6 +190,7 @@
     "clone-call|0e879a64c976888b0a3a75c665f77f159903e5f02e337b1458e15d83b096edaa|path . clone ()",
     "clone-call|0e879a64c976888b0a3a75c665f77f159903e5f02e337b1458e15d83b096edaa|path . clone ()",
     "clone-call|0e879a64c976888b0a3a75c665f77f159903e5f02e337b1458e15d83b096edaa|path . clone ()",
+    "clone-call|287f419e8de155346718a8d730139480cabf650fefccf209772e0354e462409a|value . clone ()",
     "clone-call|57740878d5ea5fa59a839cb56c4aeb09071564f40d7478c0ab805a3d9de22a6a|t . clone ()",
     "clone-call|6b01b06498f1c34f9345ee807a1efec51b5557779ec8547dccfb832fb6c534b0|attrs . clone ()",
     "clone-call|9f2f9624ec6396a166166552bf2bafb09d5c94a3deac825006d883bab0fd8a91|tag . clone ()",
@@ -194,13 +199,12 @@
     "clone-call|a8ab72102185003c0b6fdfb01457bdffef7f181021cc58227232508fa75d16e7|svg . clone ()"
   ],
   "model/build.rs": [
+    "clone-call|005385abc243d6b950c0d073fefb2e900081c6d786dc17fbcf6cdb76672bbd29|caption . html . clone ()",
     "clone-call|025243e0b15f2b6c6f6ced7a8323c753d5a3c31d6296bc1384933f61f7430002|s . parent . clone ()",
-    "clone-call|13b30fcc00b2def2a66502ea62db1698f8b5bf57862c334b1bcea524347a9a1d|header . clone ()",
     "clone-call|26e925a53852d7c42582343131a2a0dbb547b1b229c0a2fb0957bd05ccbf966e|id . clone ()",
     "clone-call|26e925a53852d7c42582343131a2a0dbb547b1b229c0a2fb0957bd05ccbf966e|id . clone ()",
     "clone-call|26e925a53852d7c42582343131a2a0dbb547b1b229c0a2fb0957bd05ccbf966e|id . clone ()",
     "clone-call|26e925a53852d7c42582343131a2a0dbb547b1b229c0a2fb0957bd05ccbf966e|id . clone ()",
-    "clone-call|35ff50091ecd4d68bbd6494e8aa708812c85499130d9ceb34530ac3a70f8bf9c|grid . clone ()",
     "clone-call|37c9107fe18d7745df5f058f59fff062a149fef1314d8aaab1d0c518a949e3de|sid . clone ()",
     "clone-call|37c9107fe18d7745df5f058f59fff062a149fef1314d8aaab1d0c518a949e3de|sid . clone ()",
     "clone-call|37c9107fe18d7745df5f058f59fff062a149fef1314d8aaab1d0c518a949e3de|sid . clone ()",
@@ -210,9 +214,9 @@
     "clone-call|4deb925e931cd6d90001d9e00104c39e0f71dc6ab28953ea4523c5f9dce760e3|s . title . clone ()",
     "clone-call|570303c9a1414efe7825b9b7da7fee57bed21cf62851d23a584217c092c28e35|s . id . clone ()",
     "clone-call|570303c9a1414efe7825b9b7da7fee57bed21cf62851d23a584217c092c28e35|s . id . clone ()",
-    "clone-call|6597544c04a40c93a552d17df09c0afbe347f0d4e79c54e08adc86e5894eca60|c . clone ()",
-    "clone-call|6a20204a60273f0861c55ae16f26479dcea3d0075cb1a79cdaa71712891c44dd|num . clone ()",
     "clone-call|719a1cffc113b71afab984d15a2506f46669b9b77699f0cc68f10b7ff8d169a5|fm . keywords . clone ()",
+    "clone-call|72733409a27ee7859522c4828477a448738a4e4213d011c6e49e5877f80e3469|final_id . clone ()",
+    "clone-call|72733409a27ee7859522c4828477a448738a4e4213d011c6e49e5877f80e3469|final_id . clone ()",
     "clone-call|865e7b52d9b951026e53c35727ced315e207f8afa67fd465173d7b45092ef41f|data . clone ()",
     "clone-call|a47cf33a9b63f0909f765a5731f5623bc11abc258ac46514029ef5f34776343f|aid . clone ()",
     "clone-call|a47cf33a9b63f0909f765a5731f5623bc11abc258ac46514029ef5f34776343f|aid . clone ()",
@@ -227,6 +231,7 @@
     "clone-call|c2396967dea822236bb519b54fdc071c2a10bce853e3e0de057d7a01d418d044|sec_ids . get (heading_idx) . cloned ()",
     "clone-call|d7e9de3fa4c0ac829edab48c06900e2b0b32dab1ebfbb6e6b36245b66eb6c870|deduped . clone ()",
     "clone-call|d8b17babe8847934e2fc5e14816315886601972ff14dbc4f7d3e0db1bbc093c0|fm . abstract_text . clone ()",
+    "clone-call|d8b34eebaba93ef43d2b9abc999b75a39e02309621c132344ac37087028a0096|caption . number . clone ()",
     "clone-call|f026eed38bd21ddf40f57155425e49a1483ebb7a4146d52d99948cf58a63653f|pid . clone ()",
     "clone-call|f026eed38bd21ddf40f57155425e49a1483ebb7a4146d52d99948cf58a63653f|pid . clone ()",
     "clone-call|f2d4dc0f1239e47600638a7382bba13c5c999491832e575bf4904a8bd2a936f8|label . clone ()",
@@ -245,6 +250,7 @@
     "clone-call|c70221ccd727683d91d3e50300c62161980c7aa629b54cce048a24babbbf9f44|b . id . clone ()"
   ],
   "model/render.rs": [
+    "clone-call|0bd097d817f3345eb33e315ab807ec551ed0feaeef3969db22c77b435ba9ac45|b . el_html . clone ()",
     "clone-call|0bd097d817f3345eb33e315ab807ec551ed0feaeef3969db22c77b435ba9ac45|b . el_html . clone ()",
     "clone-call|0bd097d817f3345eb33e315ab807ec551ed0feaeef3969db22c77b435ba9ac45|b . el_html . clone ()",
     "clone-call|0bd097d817f3345eb33e315ab807ec551ed0feaeef3969db22c77b435ba9ac45|b . el_html . clone ()",
@@ -346,6 +352,9 @@
     "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
     "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()"
   ],
+  "postprocess.rs": [
+    "clone-call|6c664227c1150a7f3ddf58815905310170b31f748ffb82231dcfe38055ed9042|candidate . clone ()"
+  ],
   "raster.rs": [
     "clone-call|0196e7bdf620d14b5211a06aa677e198b05b8ca295a794bea1cb3e18a1b2cebc|f . clone ()",
     "clone-call|22efae8bc5ab0006db232c54522fc6d6c83b70c3cdf2862234a73bce5576c024|stream . clone ()",
@@ -358,6 +367,21 @@
     "clone-call|1940026b4cd992b1aee631e6b2d26751634d69f32fb31cc455cf03fb957456ae|element . clone ()",
     "clone-call|1974688a7e0d26d30fc7eca34e263215af2382bd4c9fc520a4d27e9dd630538c|self . roles . get (& raw) . cloned ()",
     "direct-backend-method|04e7f46dfaa5cbfe77b5455425f6ba51c78c0b0549b5451ed52a03aeda09ca9b|access . catalog ()"
+  ],
+  "table/mod.rs": [
+    "clone-call|032bf9078f7e073ccbd70bb364059ac8233771c5139459719cf752bce9241510|follow_ownership . row_claims [0] . iter () . cloned ()",
+    "clone-call|3aa840de87b096d18b85267658b106680c96f186ca95fcb34b38360be6818265|follow_ownership . union_claims . iter () . cloned ()",
+    "clone-call|490f42c3147591b1224be2e40fdd5d60bceb88a020ca803d0a4305e938e5ddce|range . clone ()",
+    "clone-call|57ef3c80485df6109105ad39f3c8e4025128c6145662c8d9e895d27c9dddff49|row_slices . clone ()",
+    "clone-call|628ba11a81b4d8c32ee3abb6bb6366402f7324532ec27ab8f396dd020c572153|cell . text . clone ()",
+    "clone-call|628ba11a81b4d8c32ee3abb6bb6366402f7324532ec27ab8f396dd020c572153|cell . text . clone ()",
+    "clone-call|628ba11a81b4d8c32ee3abb6bb6366402f7324532ec27ab8f396dd020c572153|cell . text . clone ()",
+    "clone-call|670ef37722b527bdee43b43e60ba8cd4a5b52347341a4b686c866b627ed6c847|self . ownership . clone ()",
+    "clone-call|87215aa5f8dc6cdd08106f759846ca615cbcac7174ab8a65035c7ca493b54d1e|row . clone ()",
+    "clone-call|bb6881b1d81bb302057c61abde64c2aae3ccbe3d1a2a43fd0c5c830beda3367f|next . proven_continuation () . cloned ()",
+    "clone-call|dbaa64df6236e453c85e2395b97ed9cb488c25847b157edf2021defceaa875a0|follow_ownership . row_claims . iter () . skip (skip) . cloned ()",
+    "clone-call|eb709f59db02d11d23cd3e0d175581e877fc6a002a29e877893e74a830e30e0c|self . proven_continuation () . cloned ()",
+    "clone-call|f292c207912f2b602bc77641caac28db0841dd8d68c00350a597b77cbbea46b9|anchor . clone ()"
   ],
   "text.rs": [
     "clone-call|1625dd558585a92f10cc68356aa425a36f802104b704104b31805b21f4a0176f|vint . clone ()",

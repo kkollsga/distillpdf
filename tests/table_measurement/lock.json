@@ -1,0 +1,78 @@
+{
+  "schema": 1,
+  "dataset": "pdf-parse-bench/2026-q1-tables-only",
+  "packages": {
+    "flatbuffers": {
+      "version": "25.12.19",
+      "artifact": "flatbuffers-25.12.19-py2.py3-none-any.whl",
+      "sha256": "7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4"
+    },
+    "numpy": {
+      "version": "2.5.1",
+      "artifact": "numpy-2.5.1-cp314-cp314-macosx_14_0_arm64.whl",
+      "sha256": "efd736408cc97c79b9e6917338dfc8f06013b2274f992e96b1d9a81a71e2a2c2"
+    },
+    "onnxruntime": {
+      "version": "1.28.0",
+      "artifact": "onnxruntime-1.28.0-cp314-cp314-macosx_14_0_arm64.whl",
+      "sha256": "8adff67a3f28257b37cfe945a7e952e4122666aa8c91a0380862e9fd4c2ed19f"
+    },
+    "packaging": {
+      "version": "26.3",
+      "artifact": "packaging-26.3-py3-none-any.whl",
+      "sha256": "d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c"
+    },
+    "pdf-parse-bench": {
+      "version": "0.4.0",
+      "artifact": "pdf_parse_bench-0.4.0-py3-none-any.whl",
+      "sha256": "a13eabab80d7c8984589f38c7c1a23144d5b7dc9eebb703dd49017db46a09b0d"
+    },
+    "pdfplumber": {
+      "version": "0.11.7",
+      "artifact": "pdfplumber-0.11.7-py3-none-any.whl",
+      "sha256": "edd2195cca68bd770da479cf528a737e362968ec2351e62a6c0b71ff612ac25e"
+    },
+    "protobuf": {
+      "version": "7.35.1",
+      "artifact": "protobuf-7.35.1-cp310-abi3-macosx_10_9_universal2.whl",
+      "sha256": "24f857477359a85c0c235261b8ba905fd51b2562f4a64ca1df5473f29850cbf6"
+    },
+    "pylatexenc": {
+      "version": "2.11",
+      "artifact": "pylatexenc-2.11-py2.py3-none-any.whl",
+      "sha256": "e78e7391d6c104f1ed150e21cfaa58016cdb50aa54406a2eecb793649ffdfdd0"
+    },
+    "PyMuPDF": {
+      "version": "1.28.0",
+      "artifact": "pymupdf-1.28.0-cp310-abi3-macosx_11_0_arm64.whl",
+      "sha256": "4d692dcf44d3566ae96bc6f6346c6ad432274a29ba617bf7a9fe18009e24adb4"
+    },
+    "pymupdf4llm": {
+      "version": "1.28.0",
+      "artifact": "pymupdf4llm-1.28.0-py3-none-any.whl",
+      "sha256": "6e74e8666806cc6040d9159053130f0761d21ef17e2a9c938df8108f15160cb3"
+    },
+    "tabulate": {
+      "version": "0.10.0",
+      "artifact": "tabulate-0.10.0-py3-none-any.whl",
+      "sha256": "f0b0622e567335c8fabaaa659f1b33bcb6ddfe2e496071b743aa113f8774f2d3"
+    }
+  },
+  "runner": {
+    "system": "Darwin",
+    "machine": "arm64",
+    "repeats": 5,
+    "warmups": 1,
+    "pythonhashseed": "0",
+    "threads": 1
+  },
+  "capabilities": {
+    "analysis_bbox_iou": true,
+    "analysis_cell_localization": true,
+    "analysis_span_topology": true,
+    "legacy_bbox_iou": false,
+    "legacy_span_topology": false,
+    "semantic_header_depth": true,
+    "pymupdf_layout": false
+  }
+}

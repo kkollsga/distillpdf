@@ -232,6 +232,21 @@ Pdf.extract_tables() -> list[dict]
 
 Detected tables from all pages, each a dict with its cell grid.
 
+### Pdf.analyze_tables
+
+```python
+Pdf.analyze_tables() -> list[dict]
+```
+
+Structured raw table detections. Table keys are `page`, `bbox_norm`, `n_rows`, `n_cols`,
+`header_rows`, `cells`, `caption`, and `evidence`. Cell keys are `text`, `row`, `col`,
+`rowspan`, `colspan`, `bbox_norm`, `role`, and `header_path`.
+
+Coordinates are `[left, top, right, bottom]` fractions of the post-rotation display box.
+Cell geometry is `None` unless an exact boundary was observed. This surface precedes the
+renderer-only figure filtering, tagged-table reconciliation, and caption attachment described
+in the [extraction guide](../guide/extraction.md#analyze_tables).
+
 ### Pdf.extract_links
 
 ```python
