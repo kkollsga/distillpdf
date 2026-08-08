@@ -3348,6 +3348,11 @@ def gen_form_bomb():
         "deep_page_tree": "deep_page_tree.pdf",
         "deep_page_tree_depth": DEEP_PAGE_TREE_DEPTH,
         "deep_page_tree_word": "deep page tree",
+        "deep_broad_page_tree": "deep_broad_page_tree.pdf",
+        "deep_broad_page_tree_depth": DEEP_BROAD_PAGE_TREE_DEPTH,
+        # Leaf order is deepest-first, so page 1 is the innermost level.
+        "deep_broad_first_word": "broad level %d" % (DEEP_BROAD_PAGE_TREE_DEPTH - 1),
+        "deep_broad_last_word": "broad level 0",
     }
 
 
@@ -3388,6 +3393,54 @@ def gen_deep_page_tree():
     objs[content] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(body), body)
     objs[font] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
     _assemble_pdf(objs, os.path.join(ADV_OUT, "deep_page_tree.pdf"))
+
+
+# Deep *and* broad: past the 256-level cap, with a `/Page` sibling retained at every level.
+DEEP_BROAD_PAGE_TREE_DEPTH = 300
+
+
+def gen_deep_broad_page_tree():
+    """300 nested ``/Pages`` nodes, each holding the next node **and** a real page.
+
+    The single-kid chain in ``deep_page_tree.pdf`` is only half the shape. The eager walk
+    keeps a stack of the levels that still have siblings pending, and a one-element ``/Kids``
+    leaves none — so a chain, however deep, pushed nothing and read correctly. Retain a
+    ``/Page`` beside each nested node and every level pushes a frame, which is what the old
+    256-frame cap counted: past it the walk skipped the subtree and simply kept going, so the
+    file lost 43 of its 300 pages with no error, no marker and no way for a caller to tell.
+
+    A page tree that is both deep and broad is what an assembler produces when it appends one
+    page per merge and keeps the previous document as a sibling subtree, so this is a real
+    shape and not only a hardening probe. Every page carries its own numbered line, so a lost
+    subtree is visible as missing text and not only as a smaller page count.
+
+    Leaf order is the tree's left-to-right leaf order, which here runs deepest-first: page 1 is
+    ``level 299`` and page 300 is ``level 0``.
+
+    It lives in ``adversarial/`` because it exercises a structural limit, not layout fidelity.
+    """
+    os.makedirs(ADV_OUT, exist_ok=True)
+    depth = DEEP_BROAD_PAGE_TREE_DEPTH
+    font = 2
+
+    def node(i):
+        return 3 + 3 * i
+
+    objs = {1: b"<< /Type /Catalog /Pages %d 0 R >>" % node(0),
+            font: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"}
+    for i in range(depth):
+        page, content = node(i) + 1, node(i) + 2
+        kids = (b"[%d 0 R %d 0 R]" % (node(i + 1), page) if i + 1 < depth
+                else b"[%d 0 R]" % page)
+        parent = b" /Parent %d 0 R" % node(i - 1) if i else b""
+        objs[node(i)] = (b"<< /Type /Pages /Kids %s /Count %d%s >>"
+                         % (kids, depth - i, parent))
+        objs[page] = (b"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 612 792] "
+                      b"/Resources << /Font << /F1 %d 0 R >> >> /Contents %d 0 R >>"
+                      % (node(i), font, content))
+        body = b"BT /F1 12 Tf 72 700 Td (broad level %d) Tj ET" % i
+        objs[content] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(body), body)
+    _assemble_pdf(objs, os.path.join(ADV_OUT, "deep_broad_page_tree.pdf"))
 
 
 # ------------------------------------------------------------------- table evidence
@@ -4263,6 +4316,80 @@ def _assemble_pdf(objs, path, info=None):
              % (n, info_ref, xref_off))
     with open(path, "wb") as f:
         f.write(bytes(body))
+
+
+def gen_freed_object_revision():
+    """A **redaction**: revision 2 frees an object revision 1 defined, and the reference to
+    it stays behind.
+
+    Freeing is how a PDF deletes. A redaction or a form flatten drops the object from the
+    newest cross-reference section and, because rewriting every referrer is expensive, often
+    leaves the reference dangling — which ISO 32000-1 7.3.10 defines as a reference to the
+    null object, not an error. So the deleted content is *gone* by the rules of the format
+    even though its bytes are still in the file, sitting in the previous revision.
+
+    A reader that discards free entries never sees the deletion: its newest section has no
+    entry for the object, the `/Prev` section's `Normal` entry wins the merge, and the
+    redacted words come back. Here the page's `/Contents` is the two-element array
+    ``[5 0 R 6 0 R]`` and object 6 is what revision 2 frees, so the resurrection is visible as
+    rendered text rather than as an xref-table detail — a reader that gets this wrong prints
+    the sentence the file deleted.
+
+    Free entries and incremental sections are both beyond reportlab, so this is assembled byte
+    by byte."""
+    path = os.path.join(OUT, "freed_object_revision.pdf")
+    KEPT = "Public summary paragraph."
+    REDACTED = "Case officer home address on file."
+
+    def content(y, text):
+        body = b"BT /F1 12 Tf 72 %d Td (%s) Tj ET" % (y, text.encode())
+        return b"<< /Length %d >>\nstream\n%s\nendstream" % (len(body), body)
+
+    body_bytes = bytearray(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n")
+    offsets = {}
+
+    def append(num, payload):
+        offsets[num] = len(body_bytes)
+        body_bytes.extend(b"%d 0 obj\n" % num + payload + b"\nendobj\n")
+
+    # --- revision 1: both paragraphs, both live -----------------------------------------
+    append(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+    append(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+    append(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+              b"/Resources << /Font << /F1 4 0 R >> >> /Contents [5 0 R 6 0 R] >>")
+    append(4, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+              b"/Encoding /WinAnsiEncoding >>")
+    append(5, content(700, KEPT))
+    append(6, content(660, REDACTED))
+
+    base_xref = len(body_bytes)
+    body_bytes.extend(b"xref\n0 7\n0000000000 65535 f \n")
+    for num in range(1, 7):
+        body_bytes.extend(b"%010d 00000 n \n" % offsets[num])
+    body_bytes.extend(b"trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % base_xref)
+
+    # --- revision 2: object 6 is freed, and nothing else about the page changes ----------
+    # The free-list head points at 6; 6 points back at the head and carries the generation a
+    # reuse would take. The page still says `/Contents [5 0 R 6 0 R]`.
+    append(7, b"<< /Title (Public summary) /Producer (redaction pass) >>")
+    redact_xref = len(body_bytes)
+    body_bytes.extend(b"xref\n0 1\n0000000006 65535 f \n"
+                      b"6 2\n0000000000 00001 f \n%010d 00000 n \n" % offsets[7])
+    body_bytes.extend(b"trailer\n<< /Size 8 /Root 1 0 R /Info 7 0 R /Prev %d >>"
+                      b"\nstartxref\n%d\n%%%%EOF\n" % (base_xref, redact_xref))
+
+    with open(path, "wb") as f:
+        f.write(bytes(body_bytes))
+
+    GT["freed_object_revision.pdf"] = {
+        "revisions": 2,
+        # The object the newest revision deletes, and the one it keeps beside it.
+        "freed_object": 6,
+        "kept_object": 5,
+        "text_contains": [KEPT],
+        # A reader that resurrects the freed object prints this. Nothing may.
+        "text_excludes": [REDACTED],
+    }
 
 
 def gen_damaged_streams():
@@ -5218,8 +5345,10 @@ def main():
     gen_encrypted()
     gen_form_bomb()
     gen_deep_page_tree()
+    gen_deep_broad_page_tree()
     gen_objstm_pages()
     gen_hybrid_xref_revision()
+    gen_freed_object_revision()
     with open(os.path.join(OUT, "groundtruth.json"), "w") as f:
         # sort_keys: the dict's insertion order is main()'s call order, so adding or
         # reordering one generator reshuffled the whole file and buried the real change

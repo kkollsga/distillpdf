@@ -4,6 +4,10 @@
     "control": "form_repeat.pdf",
     "control_repeats": 3,
     "control_word": "REPEAT",
+    "deep_broad_first_word": "broad level 299",
+    "deep_broad_last_word": "broad level 0",
+    "deep_broad_page_tree": "deep_broad_page_tree.pdf",
+    "deep_broad_page_tree_depth": 300,
     "deep_page_tree": "deep_page_tree.pdf",
     "deep_page_tree_depth": 300,
     "deep_page_tree_word": "deep page tree"
@@ -436,6 +440,17 @@
     "panel_opacity": 0.5,
     "word": "INHERIT",
     "x": 172
+  },
+  "freed_object_revision.pdf": {
+    "freed_object": 6,
+    "kept_object": 5,
+    "revisions": 2,
+    "text_contains": [
+      "Public summary paragraph."
+    ],
+    "text_excludes": [
+      "Case officer home address on file."
+    ]
   },
   "frontmatter.pdf": {
     "abstract_contains": "verify front-matter extraction",

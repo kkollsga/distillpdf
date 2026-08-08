@@ -16,18 +16,21 @@ The oversized-catalog fallback fixture is generated here rather than committed b
 pad is not worth carrying in the tree: a catalog object padded past the indexed reader's 4 MiB
 per-object decode envelope is the smallest honest refusal — a perfectly valid PDF that the eager
 engine reads without complaint. The second refusal, a page tree nested past the 256-level cap, is
-small enough to commit and lives at ``fixtures_pdf/adversarial/deep_page_tree.pdf``.
+small enough to commit and lives at ``fixtures_pdf/adversarial/deep_page_tree.pdf``; its
+deep-*and*-broad twin, ``deep_broad_page_tree.pdf``, is what makes the eager side of that
+fallback trustworthy.
 """
 import os
 
 import pytest
 
 import distillpdf
-from _fixtures import FIX
+from _fixtures import FIX, GT
 from _rawpdf import HELV, assemble_pdf, stream, text_op
 
 HEADINGS = os.path.join(FIX, "headings.pdf")
 DEEP_PAGE_TREE = os.path.join(FIX, "adversarial", "deep_page_tree.pdf")
+DEEP_BROAD_PAGE_TREE = os.path.join(FIX, "adversarial", "deep_broad_page_tree.pdf")
 
 #: What an open that names no engine must route to, given this process's environment. The
 #: public default is eager; the internal selector is the only thing that can move it.
@@ -106,6 +109,33 @@ def test_a_page_tree_past_the_depth_cap_falls_back_instead_of_rendering_blank():
     assert doc.page_count() == eager.page_count() == 1
     assert "deep page tree" in doc.extract_text()
     assert doc.extract_text() == eager.extract_text()
+    assert doc.to_html(return_string=True) == eager.to_html(return_string=True)
+
+
+def test_a_deep_and_broad_page_tree_keeps_every_page_on_both_routes():
+    """The eager half of the same depth question — and the reason the fallback above is safe.
+
+    The chain fixture never retains a sibling while it descends, so the eager walk pushed no
+    stack frames and read it correctly at any depth. Retain a ``/Page`` beside each nested
+    ``/Pages`` node and every level pushes one, which is what eager's old 256-*frame* cap
+    counted: past it the subtree was skipped and the walk simply kept going, so a 300-level
+    tree yielded 257 pages with no error and no marker. That made eager an unsafe floor under
+    exactly the fallback the lazy depth cap depends on."""
+    ground = GT["adversarial"]
+    depth = ground["deep_broad_page_tree_depth"]
+    doc = distillpdf.Pdf.open(DEEP_BROAD_PAGE_TREE, engine="lazy")
+    eager = distillpdf.Pdf.open(DEEP_BROAD_PAGE_TREE, engine="eager")
+    # Past the indexed cap, so the index refuses and the counted fallback runs.
+    assert doc.engine == "lazy (eager fallback)"
+    assert eager.engine == "eager"
+    assert doc.page_count() == eager.page_count() == depth
+    body = eager.extract_text()
+    # Leaf order runs deepest-first, and the levels that used to vanish are the deep ones.
+    assert ground["deep_broad_first_word"] in body
+    assert ground["deep_broad_last_word"] in body
+    for level in (0, 255, 256, 257, depth - 1):
+        assert f"broad level {level}" in body, level
+    assert doc.extract_text() == body
     assert doc.to_html(return_string=True) == eager.to_html(return_string=True)
 
 
