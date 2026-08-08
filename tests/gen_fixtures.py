@@ -3877,6 +3877,123 @@ def _one_page(stream):
     }
 
 
+# ------------------------------------------------------- object streams / lazy determinism
+def gen_objstm_pages():
+    """A many-page PDF whose structure objects live in **object streams**, behind an xref
+    stream — the shape the lazy (indexed) engine resolves differently from the eager one.
+
+    The lazy route's compressed-object resolution was, for a while, charged against a single
+    process-wide 64 MiB allowance handed out as "whatever is left right now". At one rayon
+    thread nothing else held it and every object resolved; at N threads concurrent page
+    workers took race-dependent slices of it, resolution failed with a resource limit, and the
+    consumer-level ``*_or_empty`` suppression turned that into a *silently shorter page*. The
+    same 40-page corpus document rendered 3,021,537 / 4,003,887 / 1,714,229 bytes on three
+    consecutive runs. Nothing in the committed fixture set could see it: every other fixture
+    is one or two pages of ordinary uncompressed objects, so no run ever resolved a compressed
+    object under contention.
+
+    This fixture is the shape that does. Every page dictionary, its ``/Resources``, its
+    ``/MediaBox`` (written as an indirect array, so a page needs a *second* compressed
+    resolution) and the shared font all live inside two ``/ObjStm`` containers; only the
+    content streams, the containers and the xref stream are ordinary objects. Rendering it
+    therefore hits compressed resolution once per page per thread. The pages carry distinct,
+    position-bearing text so a dropped or reordered page changes the output bytes.
+
+    reportlab cannot emit object streams, so this is assembled by hand."""
+    pages = 40
+    lines_per_page = 26
+    path = os.path.join(OUT, "objstm_pages.pdf")
+
+    # --- object numbering -------------------------------------------------------------
+    # 1 catalog, 2 page tree, then per page: dict / resources / mediabox, then the font.
+    catalog, tree = 1, 2
+    page_num = {i: 3 + i * 3 for i in range(pages)}
+    res_num = {i: 4 + i * 3 for i in range(pages)}
+    box_num = {i: 5 + i * 3 for i in range(pages)}
+    font = 3 + pages * 3
+    content_num = {i: font + 1 + i for i in range(pages)}
+    first_container = font + 1 + pages
+    containers = [first_container, first_container + 1]
+    xref_num = first_container + 2
+
+    compressed = {
+        catalog: b"<< /Type /Catalog /Pages %d 0 R >>" % tree,
+        tree: (b"<< /Type /Pages /Count %d /Kids [%s] >>"
+               % (pages, b" ".join(b"%d 0 R" % page_num[i] for i in range(pages)))),
+        font: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+              b"/Encoding /WinAnsiEncoding >>",
+    }
+    regular = {}
+    for i in range(pages):
+        compressed[page_num[i]] = (
+            b"<< /Type /Page /Parent %d 0 R /MediaBox %d 0 R /Resources %d 0 R "
+            b"/Contents %d 0 R >>" % (tree, box_num[i], res_num[i], content_num[i]))
+        compressed[res_num[i]] = b"<< /Font << /F1 %d 0 R >> >>" % font
+        compressed[box_num[i]] = b"[0 0 %d %d]" % (int(PAGE_W), int(PAGE_H))
+        body = [b"BT /F1 15 Tf 72 %d Td (Section %d: object stream residency) Tj ET"
+                % (int(PAGE_H) - 72, i + 1)]
+        for line in range(lines_per_page):
+            y = int(PAGE_H) - 100 - line * LEAD
+            body.append(b"BT /F1 10.5 Tf 72 %d Td (Page %d line %d carries the marker "
+                        b"%04d-%02d so a dropped page changes the bytes.) Tj ET"
+                        % (y, i + 1, line + 1, i + 1, line + 1))
+        content = b"\n".join(body)
+        regular[content_num[i]] = (b"<< /Length %d >>\nstream\n" % len(content)
+                                   + content + b"\nendstream")
+
+    # --- pack the compressed objects into two /ObjStm containers -----------------------
+    ordered = sorted(compressed)
+    half = (len(ordered) + 1) // 2
+    groups = [ordered[:half], ordered[half:]]
+    location = {}
+    for container, members in zip(containers, groups):
+        pairs, payload = [], bytearray()
+        for index, num in enumerate(members):
+            pairs.append(b"%d %d" % (num, len(payload)))
+            payload += compressed[num] + b" "
+            location[num] = (container, index)
+        header = b" ".join(pairs) + b"\n"
+        raw = bytes(header) + bytes(payload)
+        packed = zlib.compress(raw, 9)
+        regular[container] = (
+            b"<< /Type /ObjStm /N %d /First %d /Length %d /Filter /FlateDecode >>\n"
+            b"stream\n" % (len(members), len(header), len(packed)) + packed + b"\nendstream")
+
+    # --- body + xref stream -----------------------------------------------------------
+    body = bytearray(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n")
+    offsets = {}
+    for num in sorted(regular):
+        offsets[num] = len(body)
+        body += b"%d 0 obj\n" % num + regular[num] + b"\nendobj\n"
+    xref_offset = len(body)
+    size = xref_num + 1
+    rows = bytearray(b"\x00" + (0).to_bytes(4, "big") + (65535).to_bytes(2, "big"))
+    for num in range(1, size):
+        if num in location:
+            container, index = location[num]
+            rows += b"\x02" + container.to_bytes(4, "big") + index.to_bytes(2, "big")
+        elif num == xref_num:
+            rows += b"\x01" + xref_offset.to_bytes(4, "big") + (0).to_bytes(2, "big")
+        else:
+            rows += b"\x01" + offsets[num].to_bytes(4, "big") + (0).to_bytes(2, "big")
+    packed = zlib.compress(bytes(rows), 9)
+    body += (b"%d 0 obj\n<< /Type /XRef /Size %d /W [1 4 2] /Root %d 0 R /Length %d "
+             b"/Filter /FlateDecode >>\nstream\n" % (xref_num, size, catalog, len(packed))
+             + packed + b"\nendstream\nendobj\n")
+    body += b"startxref\n%d\n%%%%EOF\n" % xref_offset
+    with open(path, "wb") as f:
+        f.write(bytes(body))
+
+    GT["objstm_pages.pdf"] = {
+        "pages": pages,
+        "compressed_objects": len(compressed),
+        "object_streams": len(containers),
+        "text_contains": ["Section 1: object stream residency",
+                          "Section %d: object stream residency" % pages,
+                          "marker %04d-%02d" % (pages, lines_per_page)],
+    }
+
+
 # ------------------------------------------------------------------------------ links
 def _assemble_pdf(objs, path, info=None):
     """Write a minimal PDF from {objnum: bytes} (numbers contiguous from 1).
@@ -4852,6 +4969,7 @@ def main():
     gen_profile_heads()
     gen_encrypted()
     gen_form_bomb()
+    gen_objstm_pages()
     with open(os.path.join(OUT, "groundtruth.json"), "w") as f:
         # sort_keys: the dict's insertion order is main()'s call order, so adding or
         # reordering one generator reshuffled the whole file and buried the real change

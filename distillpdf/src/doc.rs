@@ -1944,6 +1944,45 @@ pub(crate) mod tests {
         assert_eq!(diagnostics.snapshot().route, OpenRoute::IndexedFile);
     }
 
+    /// The lazy route's output is a pure function of the document — not of the thread count.
+    ///
+    /// The bug this locks: compressed-object resolution used to draw its allowance from one
+    /// process-wide 64 MiB budget with `acquire_available` — "however much is left right now".
+    /// One rayon thread always saw the whole budget and every object resolved; several threads
+    /// saw race-dependent slices, resolution failed with a resource limit, and the consumers'
+    /// legacy `*_or_empty` suppression turned that into a *shorter page*, so the same document
+    /// rendered different bytes on every run. `objstm_pages.pdf` is the committed repro (40
+    /// pages whose page dicts, resources and mediaboxes all live in two `/ObjStm` containers);
+    /// against the pre-fix build it rendered four distinct outputs in four runs, all far short
+    /// of eager. The rendering below is pinned to a four-thread pool so the test does not
+    /// depend on how many cores the machine running it has.
+    #[test]
+    fn indexed_render_is_thread_count_independent_and_matches_eager() {
+        let _test_lock = crate::access::indexed_test_lock();
+        let path = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures_pdf/objstm_pages.pdf"
+        ));
+        let raw = std::fs::read(&path).expect("committed object-stream fixture");
+        let eager = PdfDocument::from_bytes(&raw)
+            .expect("eager open")
+            .render(crate::Mode::Page, false, false);
+        assert!(eager.contains("Section 40: object stream residency"), "fixture text");
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("four-thread pool builds");
+        let mut renders = Vec::new();
+        for _ in 0..2 {
+            let control = open_indexed_file_internal(&path, None).expect("indexed open");
+            let document = PdfDocument::finish_indexed_open(control, Some(path.clone()));
+            renders.push(pool.install(|| document.render(crate::Mode::Page, false, false)));
+        }
+        assert_eq!(renders[0], renders[1], "two indexed renders at 4 threads differ");
+        assert_eq!(renders[0], eager, "indexed render differs from eager");
+    }
+
     /// The public constructors carry honest route provenance for whichever engine the internal
     /// `DISTILLPDF_ENGINE` selector picked.
     ///

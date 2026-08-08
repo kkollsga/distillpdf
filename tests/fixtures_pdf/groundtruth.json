@@ -753,6 +753,16 @@
       ]
     ]
   },
+  "objstm_pages.pdf": {
+    "compressed_objects": 123,
+    "object_streams": 2,
+    "pages": 40,
+    "text_contains": [
+      "Section 1: object stream residency",
+      "Section 40: object stream residency",
+      "marker 0040-26"
+    ]
+  },
   "pagelabels.pdf": {
     "arabic_pages": [
       "1",
