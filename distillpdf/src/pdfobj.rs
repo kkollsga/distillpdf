@@ -268,6 +268,31 @@ pub(crate) fn is_generic_filter(f: &[u8]) -> bool {
     )
 }
 
+/// Cut `dict`'s `/DecodeParms` down to the `generic_len` leading layers a peeled probe keeps.
+///
+/// ISO 32000-1 7.4.1: against an array `/Filter`, `/DecodeParms` is an **array parallel to
+/// it** — entry *i* is layer *i*'s parameters. Peeling the codec off the tail therefore means
+/// *truncating* that array, not dropping it: a live `/Predictor` on a generic layer is the
+/// difference between the real payload and garbage, and lopdf's decoder now reads the array
+/// form (fork `Stream::decode_parms`), so what survives here is what reaches the layer.
+///
+/// A single dictionary is not positional, and on a chain that carries a codec it describes
+/// that codec (CCITT `/K`, `/Columns`), so it still goes — as does the abbreviated `/DP`,
+/// which the decoder does not read at all.
+pub(crate) fn keep_generic_decode_parms(dict: &mut Dictionary, generic_len: usize) {
+    let truncated = match dict.get(b"DecodeParms") {
+        Ok(Object::Array(items)) if generic_len > 0 => {
+            Some(items.iter().take(generic_len).cloned().collect::<Vec<_>>())
+        }
+        _ => None,
+    };
+    dict.remove(b"DecodeParms");
+    dict.remove(b"DP");
+    if let Some(items) = truncated {
+        dict.set("DecodeParms", Object::Array(items));
+    }
+}
+
 /// One stream whose encoded bytes did **not** decode cleanly, and what the reader did about
 /// it. Produced by [`stream_issues`] and surfaced as `PdfDocument::stream_integrity`.
 ///
@@ -397,9 +422,10 @@ fn stream_issue(id: ObjectId, s: &lopdf::Stream) -> Option<StreamIssue> {
         return None;
     }
     let mut probe = s.clone();
+    let generic_len = lead.len();
     probe.dict.set("Filter", Object::Array(lead));
-    probe.dict.remove(b"DecodeParms"); // a codec's parms do not apply to the generic layers
-    probe.dict.remove(b"DP");
+    // A codec's parms do not apply to the generic layers; an array's leading entries do.
+    keep_generic_decode_parms(&mut probe.dict, generic_len);
     if has_legacy_unsupported_filter(&probe.dict) {
         return Some(StreamIssue { object: id, kind: "filter-unapplied", filter, recovered: s.content.len() });
     }

@@ -113,6 +113,31 @@
       550
     ]
   },
+  "array_decode_parms.pdf": {
+    "caption": "Figure 1: An RGB ramp whose predictor is named in the array.",
+    "image_first_pixel": [
+      0,
+      0,
+      0
+    ],
+    "image_height": 24,
+    "image_last_pixel": [
+      248,
+      230,
+      14
+    ],
+    "image_width": 32,
+    "pages": 2,
+    "text_contains": [
+      "Decode Parameters Carried As An Array",
+      "The content stream of this page declares two filters, so the parameters for",
+      "which decodes to bytes no content-stream parser can read.",
+      "Figure 1: An RGB ramp whose predictor is named in the array.",
+      "A One Element Filter Array",
+      "parameters are a one-element array too. This page uses TIFF Predictor 2."
+    ],
+    "title": "Decode Parameters Carried As An Array"
+  },
   "banded_one_table.pdf": {
     "tables": 1
   },
@@ -851,14 +876,16 @@
       "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 8 /Colors 1 /BitsPerComponent 8 >>",
       "/Filter /FlateDecode /DecodeParms << /Predictor 2 /Columns 8 /Colors 1 /BitsPerComponent 8 >>",
       "/Filter [/ASCII85Decode /FlateDecode]",
-      "/Filter [/ASCIIHexDecode /FlateDecode]"
+      "/Filter [/ASCIIHexDecode /FlateDecode]",
+      "/Filter [/ASCIIHexDecode /FlateDecode] /DecodeParms [null << /Predictor 12 /Columns 8 /Colors 1 /BitsPerComponent 8 >>]",
+      "/Filter [/FlateDecode] /DecodeParms [<< /Predictor 2 /Columns 8 /Colors 1 /BitsPerComponent 8 >>]"
     ],
-    "object_streams": 6,
-    "pages": 6,
+    "object_streams": 8,
+    "pages": 8,
     "text_contains": [
       "Container 1: encoding form",
-      "Container 6: encoding form",
-      "marker 06-18"
+      "Container 8: encoding form",
+      "marker 08-18"
     ]
   },
   "objstm_pages.pdf": {

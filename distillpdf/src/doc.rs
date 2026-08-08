@@ -2145,12 +2145,13 @@ pub(crate) mod tests {
     ///
     /// `objstm_filter_forms.pdf` (see `tests/gen_fixtures.py`) carries one `/ObjStm` container
     /// per admitted encoding — bare `/FlateDecode`, Flate in a one-element `/Filter` array,
-    /// Flate under a PNG predictor, Flate under TIFF Predictor 2, and Flate behind an ASCII85
-    /// or ASCIIHex prefix — each holding the page dictionary, resources and indirect
-    /// `/MediaBox` of one page. The indexed reader decodes a container under a charged
-    /// allowance and so admits only what it can reproduce inside that budget; before this,
-    /// the envelope was "no filter or a bare `/FlateDecode`" and *five* of these six
-    /// containers refused, dropping the whole document to the eager engine.
+    /// Flate under a PNG predictor, Flate under TIFF Predictor 2, Flate behind an ASCII85 or
+    /// ASCIIHex prefix, and the two forms that name their predictor in an **array
+    /// `/DecodeParms`** parallel to an array `/Filter` — each holding the page dictionary,
+    /// resources and indirect `/MediaBox` of one page. The indexed reader decodes a container
+    /// under a charged allowance and so admits only what it can reproduce inside that budget;
+    /// before this, the envelope was "no filter or a bare `/FlateDecode`" and *seven* of these
+    /// eight containers refused, dropping the whole document to the eager engine.
     #[test]
     fn every_admitted_object_stream_encoding_stays_lazy_and_matches_eager() {
         let _test_lock = crate::access::indexed_test_lock();
@@ -2162,13 +2163,13 @@ pub(crate) mod tests {
         let eager = PdfDocument::from_bytes_with_engine(&raw, Engine::Eager)
             .expect("eager open")
             .render(crate::Mode::Page, false, false);
-        assert!(eager.contains("Container 6: encoding form"), "fixture text");
+        assert!(eager.contains("Container 8: encoding form"), "fixture text");
 
         let control = open_indexed_file_internal(&path, None).expect("indexed open");
         let document = PdfDocument::finish_indexed_open(control, Some(path.clone()));
         assert_eq!(document.engine(), EngineRoute::Lazy);
         assert_eq!(document.route_diagnostics().fallback_opens, 0);
-        assert_eq!(document.page_count(), 6);
+        assert_eq!(document.page_count(), 8);
         assert_eq!(document.render(crate::Mode::Page, false, false), eager);
 
         // The route above resolves containers through the shared resolver, which is not the
@@ -2184,11 +2185,63 @@ pub(crate) mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(containers.len(), 6, "one container per encoding form");
+        assert_eq!(containers.len(), 8, "one container per encoding form");
         for container in containers {
             prepare_objstm(&reader, container)
                 .unwrap_or_else(|error| panic!("container {container:?} refused: {error:?}"));
         }
+    }
+
+    /// A content stream and an image whose predictor is named in an **array `/DecodeParms`**
+    /// both decode, on both engines.
+    ///
+    /// ISO 32000-1 7.4.1: whenever `/Filter` is an array, `/DecodeParms` is an array parallel
+    /// to it, `null` for the layers that take no parameters. lopdf read the key with
+    /// `Object::as_dict`, so that array reached every layer as `None` and the Flate layer ran
+    /// with **no predictor** — decoding to wrong bytes with no error at all, on every stream
+    /// kind and both engines. `array_decode_parms.pdf` (see `tests/gen_fixtures.py`) is page
+    /// 1 as `[/ASCII85Decode /FlateDecode]` + `[null << /Predictor 12 … >>]` carrying a
+    /// figure whose image is the same chain over `/Colors 3`, and page 2 as the one-element
+    /// spelling `[/FlateDecode]` + `[<< /Predictor 2 … >>]`.
+    ///
+    /// Before the fix this rendered as *nothing*: the undecoded predictor bytes parse as no
+    /// operator at all, so the page came back blank rather than wrong-looking.
+    #[test]
+    fn array_decode_parms_decode_on_both_engines() {
+        let _test_lock = crate::access::indexed_test_lock();
+        let path = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures_pdf/array_decode_parms.pdf"
+        ));
+        let raw = std::fs::read(&path).expect("committed array-decode-parms fixture");
+        let expected = [
+            "Decode Parameters Carried As An Array",
+            "them travel as an array parallel to that list, with a null opposite the layer",
+            "Figure 1: An RGB ramp whose predictor is named in the array.",
+            "A One Element Filter Array",
+            "parameters are a one-element array too. This page uses TIFF Predictor 2.",
+        ];
+
+        let eager = PdfDocument::from_bytes_with_engine(&raw, Engine::Eager).expect("eager open");
+        assert_eq!(eager.page_count(), 2);
+        let eager_html = eager.render(crate::Mode::Page, false, false);
+        for needle in expected {
+            assert!(eager_html.contains(needle), "eager lost {needle:?}");
+        }
+
+        // The figure's image must survive too: a dropped predictor turns the ramp into noise,
+        // which is not something a text assertion can see.
+        let images = eager.extract_images();
+        assert_eq!(images.len(), 1, "one image XObject");
+        let decoded = image::load_from_memory(&images[0].data).expect("the image decodes").to_rgb8();
+        assert_eq!((decoded.width(), decoded.height()), (32, 24));
+        assert_eq!(decoded.get_pixel(0, 0).0, [0, 0, 0], "the ramp's origin");
+        assert_eq!(decoded.get_pixel(31, 23).0, [248, 230, 14], "the ramp's far corner");
+
+        let control = open_indexed_file_internal(&path, None).expect("indexed open");
+        let lazy = PdfDocument::finish_indexed_open(control, Some(path.clone()));
+        assert_eq!(lazy.engine(), EngineRoute::Lazy);
+        assert_eq!(lazy.render(crate::Mode::Page, false, false), eager_html, "lazy must match eager");
     }
 
     /// Both engines read the *newest* structure tree of a hybrid-reference file whose
