@@ -2,9 +2,9 @@
  "schema": 1,
  "what": "Committed trust anchors for the bench100 accuracy floor gate (dev-docs/bench/scripts/bench100_gate.py). The corpus, the ground truth and the frozen baseline are license-encumbered or local-only and stay gitignored; their HASHES are not, and committing the hashes is what gives the gate an external reference to verify against. Every run compares the live baseline to this file and exits 2 on any mismatch.",
  "how_to_verify": "python dev-docs/bench/scripts/bench100_gate.py --rescore   # exits 2 on any mismatch with this file. If it disagrees, `git diff accuracy/bench100_anchors.json` shows what someone changed; a legitimate move arrives as a reviewed diff to this file in the same commit as the phase that earned it.",
- "ratchet_seq": 8,
- "frozen_utc": "2026-08-08T20:13:56Z",
- "git_commit": "304290b",
+ "ratchet_seq": 9,
+ "frozen_utc": "2026-08-08T21:27:23Z",
+ "git_commit": "42cd0bf",
  "distillpdf_version": "0.1.0",
  "pages": 256,
  "docs": 88,
@@ -15,7 +15,7 @@
   "groundtruth_judge3.json": "97db9c56bd84aebd"
  },
  "corpus_sha256_16": "d576d3cc536f67ae",
- "baseline_sha256_16": "97a8c7f1baae2787",
+ "baseline_sha256_16": "c74dbf12b2d9d40f",
  "floors": {
   "ALL|headings": 0.6616,
   "ALL|images": 0.632,
