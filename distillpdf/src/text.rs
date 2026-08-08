@@ -5,7 +5,7 @@
 //! ourselves, decode show-text operators through each font's ToUnicode CMap, and
 //! recover real Unicode — including 2-byte CID codes and diacritics.
 
-use crate::access::{AccessError, AccessKind, DictionaryHandle, DocumentAccess, ObjectHandle, PayloadCharge, read_resolved};
+use crate::access::{AccessError, AccessKind, DictionaryHandle, DocumentAccess, ObjectHandle, read_resolved};
 use crate::geom::Mat;
 use crate::pdfobj::num;
 use crate::walker::{descend_form, xobject_at, Descend, ScopePolicy, XMap};
@@ -2205,7 +2205,6 @@ pub fn debug_page(access: &dyn DocumentAccess, page_id: ObjectId) -> Result<Stri
 /// Returns None if the page content cannot be decoded.
 struct FallbackEncoding {
     owned: OwnedEncoding,
-    _payload_charge: Option<PayloadCharge>,
     object: ObjectId,
 }
 
@@ -2242,10 +2241,10 @@ fn fallback_to_unicode(
 ) -> Result<FallbackEncoding, AccessError> {
     let stream = font.dictionary_entry(access, b"ToUnicode")?;
     let object = stream.root_id();
-    let (bytes, charge) = stream.decoded_stream_bytes(64 * 1024 * 1024)?.into_parts();
+    let bytes = stream.decoded_stream_bytes(64 * 1024 * 1024)?;
     let owned = OwnedEncoding::from_to_unicode_for_extraction(bytes)
         .map_err(|error| fallback_error(object, error))?;
-    Ok(FallbackEncoding { owned, _payload_charge: Some(charge), object: font.root_id() })
+    Ok(FallbackEncoding { owned, object: font.root_id() })
 }
 
 fn fallback_named_encoding(
@@ -2258,7 +2257,7 @@ fn fallback_named_encoding(
     }
     let owned = OwnedEncoding::from_named(name, None)
         .map_err(|error| fallback_error(font.root_id(), error))?;
-    Ok(FallbackEncoding { owned, _payload_charge: None, object: font.root_id() })
+    Ok(FallbackEncoding { owned, object: font.root_id() })
 }
 
 fn fallback_encoding_value(
@@ -2289,15 +2288,10 @@ fn fallback_encoding_value(
                 Some(name) => fallback_named_encoding(access, font, &name)?,
                 None => FallbackEncoding {
                     owned: OwnedEncoding::standard(),
-                    _payload_charge: None,
                     object: font.root_id(),
                 },
             };
-            let FallbackEncoding {
-                owned: base_owned,
-                _payload_charge,
-                ..
-            } = base;
+            let FallbackEncoding { owned: base_owned, .. } = base;
             let encoding_id = encoding.root_id();
             let owned = encoding.read(|object| {
                 let differences = object
@@ -2314,7 +2308,6 @@ fn fallback_encoding_value(
             })??;
             Ok(FallbackEncoding {
                 owned,
-                _payload_charge,
                 object: font.root_id(),
             })
         }
@@ -2348,7 +2341,6 @@ fn fallback_font_encoding(
         }
         Ok(FallbackEncoding {
             owned: OwnedEncoding::standard(),
-            _payload_charge: None,
             object: font.root_id(),
         })
     })();
@@ -2356,7 +2348,6 @@ fn fallback_font_encoding(
         Err(error) if fallback_fatal(&error) => Err(error),
         Err(_) => Ok(FallbackEncoding {
             owned: OwnedEncoding::standard(),
-            _payload_charge: None,
             object: font.root_id(),
         }),
         result => result,

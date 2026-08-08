@@ -19,7 +19,6 @@ pub mod ocr;
 // module (which would drag their `pub` helper fns into the public API).
 mod afm;
 mod access;
-mod broker;
 mod captions;
 mod elem_passes;
 mod encoding;
@@ -35,8 +34,6 @@ mod lattice;
 mod layout;
 mod links;
 mod nav;
-mod object_cells;
-mod objstm_failures;
 mod pdfobj;
 mod postprocess;
 mod profile;

@@ -229,7 +229,6 @@ pub(crate) struct RouteDiagnosticsSnapshot {
     pub(crate) index_estimated_bytes: u64,
     pub(crate) index_objects: u64,
     pub(crate) index_pages: u64,
-    pub(crate) document_object_o_admitted_bytes: u64,
 }
 
 impl RouteDiagnostics {
@@ -269,11 +268,6 @@ impl RouteDiagnostics {
                 .map_or(0, |counters| counters.index_objects.load(Ordering::Relaxed)),
             index_pages: indexed
                 .map_or(0, |counters| counters.index_pages.load(Ordering::Relaxed)),
-            document_object_o_admitted_bytes: indexed.map_or(0, |counters| {
-                counters
-                    .retained_object_admitted_bytes
-                    .load(Ordering::Relaxed)
-            }),
         }
     }
 }
@@ -1799,11 +1793,23 @@ pub(crate) mod tests {
                 .map(|control| control.diagnostics())
                 .unwrap_or_else(|error| error.diagnostics.snapshot());
             if matches!(name, "stream-missing-length.pdf" | "stream-short-length.pdf") {
-                let decoded: &[u8] = b"";
+                // A malformed stream's page content is asserted against the *eager* route
+                // rather than a frozen literal: the contract is parity, and the lazy route
+                // now recovers the same frame eager does.
+                let eager = PdfDocument::from_bytes(&raw).unwrap();
+                let eager_content = eager
+                    .access
+                    .page_content(eager.access.pages().unwrap()[0].id)
+                    .unwrap();
                 let recovered = b"BT /F1 12 Tf 72 720 Td (malformed stream) Tj ET";
                 for control in [file.as_ref().unwrap(), bytes.as_ref().unwrap()] {
                     let page = control.pages().unwrap()[0].id;
-                    assert!(control.checked_page_content_matches(page, decoded).unwrap(), "{name}");
+                    assert!(
+                        control
+                            .checked_page_content_matches(page, eager_content.as_ref())
+                            .unwrap(),
+                        "{name}"
+                    );
                     assert!(control.checked_recovered_stream_matches(4, recovered).unwrap(), "{name}");
                 }
             }
@@ -1909,7 +1915,6 @@ pub(crate) mod tests {
         assert!(bytes_diag.index_objects > 0);
         assert!(bytes_diag.index_pages > 0);
         assert!(bytes_diag.index_estimated_bytes > 0);
-        assert_eq!(bytes_diag.document_object_o_admitted_bytes, 0);
 
         let file = open_indexed_file_internal(&fixture, None).unwrap();
         assert!(file.shared_bytes().is_none());
@@ -1936,10 +1941,7 @@ pub(crate) mod tests {
 
         let diagnostics = Arc::clone(&file.diagnostics);
         drop(file);
-        assert_eq!(
-            diagnostics.snapshot().document_object_o_admitted_bytes,
-            0
-        );
+        assert_eq!(diagnostics.snapshot().route, OpenRoute::IndexedFile);
     }
 
     /// The public constructors carry honest route provenance for whichever engine the internal
