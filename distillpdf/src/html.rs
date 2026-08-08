@@ -15,11 +15,132 @@ use crate::links;
 use crate::nav::*;
 use crate::postprocess::*;
 use crate::profile::{DocProfile, HeadingTier};
-use crate::text::{self, Span};
+use crate::table::TableAnalysis;
+use crate::text::{self, SourceId, SourceSlice, Span};
 use crate::vector;
-use lopdf::{Document, ObjectId};
+use lopdf::ObjectId;
+#[cfg(test)]
+use lopdf::Document;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashSet};
+
+/// Canonical per-page lookup from one painted occurrence to its accepted table intervals.
+/// Built once from the final winning table set; prose-span splitting never rescans tables.
+struct TableClaimIndex {
+    by_source: BTreeMap<SourceId, Vec<(u32, u32)>>,
+}
+
+impl TableClaimIndex {
+    fn new(tables: &[crate::table::PositionedTableAnalysis]) -> Self {
+        let mut by_source: BTreeMap<SourceId, Vec<(u32, u32)>> = BTreeMap::new();
+        for claim in tables.iter().flat_map(|table| &table.claim.slices) {
+            by_source
+                .entry(claim.source())
+                .or_default()
+                .push((claim.char_start(), claim.char_end()));
+        }
+        for ranges in by_source.values_mut() {
+            ranges.sort_unstable();
+            let mut union: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+            for &(start, end) in ranges.iter() {
+                if let Some((_, previous_end)) = union.last_mut() {
+                    if start <= *previous_end {
+                        *previous_end = (*previous_end).max(end);
+                        continue;
+                    }
+                }
+                union.push((start, end));
+            }
+            *ranges = union;
+        }
+        Self { by_source }
+    }
+
+    fn overlapping(&self, source: SourceSlice) -> &[(u32, u32)] {
+        let Some(ranges) = self.by_source.get(&source.source()) else {
+            return &[];
+        };
+        let first = ranges.partition_point(|&(_, end)| end <= source.char_start());
+        let tail = &ranges[first..];
+        let count = tail.partition_point(|&(start, _)| start < source.char_end());
+        &tail[..count]
+    }
+}
+
+/// Push only the unclaimed fragments of one painted span into the page's prose input.
+/// Geometry advances along the span's baseline, so this is valid for both page-space rotated
+/// text and display-space upright prose. Untouched spans remain value-for-value clones; a
+/// wholly claimed span returns without cloning, visiting, or allocating.
+fn push_unclaimed_fragments(
+    span: &Span,
+    claims: &TableClaimIndex,
+    out: &mut Vec<Span>,
+) {
+    let source = span.source;
+    let overlapping = claims.overlapping(source);
+    if overlapping.is_empty() {
+        out.push(clone_span(span));
+        return;
+    }
+    if overlapping.len() == 1
+        && overlapping[0].0 <= source.char_start()
+        && overlapping[0].1 >= source.char_end()
+    {
+        return;
+    }
+
+    let chars: Vec<char> = span.text.chars().collect();
+    debug_assert_eq!(source.char_len() as usize, chars.len());
+    let mut cuts = vec![source.char_start(), source.char_end()];
+    for &(start, end) in overlapping {
+        cuts.push(start.max(source.char_start()));
+        cuts.push(end.min(source.char_end()));
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    let width = if span.width > 0.1 {
+        span.width
+    } else {
+        chars.len() as f32 * span.size * 0.5
+    };
+    let per_char = if chars.is_empty() { 0.0 } else { width / chars.len() as f32 };
+    let (dx, dy) = (span.angle.cos() * per_char, span.angle.sin() * per_char);
+    for range in cuts.windows(2) {
+        let (start, end) = (range[0], range[1]);
+        if start == end {
+            continue;
+        }
+        let from = (start - source.char_start()) as usize;
+        let to = (end - source.char_start()) as usize;
+        let owned = overlapping.iter().any(|&(lo, hi)| start >= lo && end <= hi);
+        if owned {
+            continue;
+        }
+        let text: String = chars[from..to].iter().collect();
+        out.push(Span {
+            x: span.x + dx * from as f32,
+            y: span.y + dy * from as f32,
+            width: per_char * (to - from) as f32,
+            text,
+            source: source.sub_slice(from, to),
+            ..clone_span(span)
+        });
+    }
+}
+
+fn prose_spans_without_table_claims(
+    spans: &[Span],
+    claims: &TableClaimIndex,
+) -> Vec<Span> {
+    if claims.by_source.is_empty() {
+        return spans.iter().map(clone_span).collect();
+    }
+    let mut out = Vec::with_capacity(spans.len());
+    for span in spans {
+        push_unclaimed_fragments(span, claims, &mut out);
+    }
+    out
+}
 
 /// A PDF named-destination name (e.g. "cite.devlin2018", "section.3.1") → a valid,
 /// stable HTML id/fragment: keep [A-Za-z0-9._-], map anything else to '-'. Used for
@@ -425,13 +546,7 @@ pub(crate) enum ElKind {
     /// A `<table>` (with optional `<caption>`). Carries the full cell structure for projection:
     /// `header` rows preserve detached cells/colspans, while `header_rows` records how many
     /// leading rows of `header + grid` render as `<th>`. `caption` is `(num, html, below)`.
-    Table {
-        header: Vec<Vec<(String, usize)>>,
-        grid: Vec<Vec<String>>,
-        /// Number of leading rows in `header + grid` rendered as `<th>`.
-        header_rows: usize,
-        caption: Option<(String, String, bool)>,
-    },
+    Table(TableAnalysis),
     /// A `<figure>` (raster `<img>`/`<image N>`, vector `<svg>`, or composite). `html` is the
     /// exact fragment; `id` is the `fig-N` number (or empty); `caption` the figcaption inner;
     /// `image` the asset id when a raster placeholder is present; `svg` the inline SVG markup
@@ -484,14 +599,7 @@ impl ElKind {
                 s.push_str("</aside>");
                 s
             }
-            Table { header, grid, header_rows, caption } => {
-                table_html_from_parts(
-                    header,
-                    grid,
-                    *header_rows,
-                    caption.as_ref().map(|(n, c, b)| (n.as_str(), c.as_str(), *b)),
-                )
-            }
+            Table(table) => table_html(table),
             Figure { html, .. } | Caption { html, .. } => html.clone(),
         }
     }
@@ -509,18 +617,29 @@ pub(crate) fn emit_page_elements(els: &[PageElement]) -> String {
 }
 
 /// The table-emit core, over the bare parts (`header` rows of `(text, colspan)`, the data
-/// `grid`, optional caption). Shared by [`table_html`] (parse path, from a [`PosTable`]) and
-/// [`PageElement::html`] (model path, from the serialized cell structure) so a `<table>`
-/// renders byte-identically whichever side built it.
-fn table_html_from_parts(
-    header: &[Vec<(String, usize)>],
-    grid: &[Vec<String>],
-    header_rows: usize,
-    cap: Option<(&str, &str, bool)>,
-) -> String {
+/// `grid`, optional caption). The parse and model paths now both construct the canonical
+/// analysis before reaching this emitter, so a `<table>` renders byte-identically whichever
+/// side built it.
+fn table_html(table: &TableAnalysis) -> String {
+    if let Some(html) = table.fidelity_html() {
+        return html.to_string();
+    }
+    let cap = table.caption.as_ref().map(|c| (c.number.as_str(), c.html.as_str(), c.below));
+    let provenance = if table.has_proven_leading_tier() {
+        " data-dpdf-proven-leading-tier"
+    } else {
+        ""
+    };
+    let semantic_spans = if table.has_semantic_spans() {
+        " data-dpdf-semantic-spans"
+    } else {
+        ""
+    };
     let mut tbl = match cap {
-        Some((num, _, _)) => format!("<table id=\"tab-{}\">", num_id(num)),
-        None => String::from("<table>"),
+        Some((num, _, _)) => {
+            format!("<table id=\"tab-{}\"{provenance}{semantic_spans}>", num_id(num))
+        }
+        None => format!("<table{provenance}{semantic_spans}>"),
     };
     // Caption as the table's own `<caption>` (the required first child) so it is
     // semantically LINKED to the table for an LLM reader — a sibling block can't be
@@ -537,25 +656,35 @@ fn table_html_from_parts(
     // `header` preserves the visible cell sequence/colspans while `header_rows` alone decides
     // which leading rows are `<th>`. This permits exact no-header and multi-tier declarations,
     // and lets inference reclassify over-attached rows without moving or dropping content.
-    for (ri, hrow) in header.iter().enumerate() {
+    let mut emit_row = |row: &[crate::table::CellAnalysis], semantic_header: bool| {
         tbl.push_str("<tr>");
-        let tag = if ri < header_rows { "th" } else { "td" };
-        for (text, span) in hrow {
-            if *span > 1 {
-                tbl.push_str(&format!("<{tag} colspan=\"{span}\">{}</{tag}>", esc(text.trim())));
-            } else {
-                tbl.push_str(&format!("<{tag}>{}</{tag}>", esc(text.trim())));
-            }
-        }
-        tbl.push_str("</tr>");
-    }
-    for (ri, row) in grid.iter().enumerate() {
-        tbl.push_str("<tr>");
-        let tag = if header.len() + ri < header_rows { "th" } else { "td" };
         for cell in row {
-            tbl.push_str(&format!("<{tag}>{}</{tag}>", esc(cell.trim())));
+            if cell.covered {
+                continue;
+            }
+            let tag = if semantic_header { "th" } else { "td" };
+            let mut attrs = String::new();
+            let colspan = cell.colspan.max(1);
+            let rowspan = cell.rowspan.max(1);
+            if semantic_header {
+                let scope = if colspan > 1 { "colgroup" } else { "col" };
+                attrs.push_str(&format!(" scope=\"{scope}\""));
+            }
+            if colspan > 1 {
+                attrs.push_str(&format!(" colspan=\"{colspan}\""));
+            }
+            if rowspan > 1 {
+                attrs.push_str(&format!(" rowspan=\"{rowspan}\""));
+            }
+            tbl.push_str(&format!("<{tag}{attrs}>{}</{tag}>", esc(cell.text.trim())));
         }
         tbl.push_str("</tr>");
+    };
+    for (ri, hrow) in table.header.iter().enumerate() {
+        emit_row(hrow, ri < table.header_rows);
+    }
+    for (ri, row) in table.grid.iter().enumerate() {
+        emit_row(row, table.header.len() + ri < table.header_rows);
     }
     tbl.push_str("</table>");
     tbl
@@ -1099,8 +1228,13 @@ fn build_doc_profile(page_spans: &[(u32, ObjectId, Vec<Span>)], body: f32, title
 /// `include_toc`: when true, an auto-generated `<nav>` table of contents is prepended
 /// to `<body>`. When false it is omitted — heading/section `id=` anchors are still
 /// assigned (so `#sec-…` links and `section()` keep working), only the visible TOC drops.
-pub fn to_html(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool, include_toc: bool) -> String {
-    let (body, img_uris, outline) = render_doc(doc, raw, mode, inline_images);
+pub fn to_html(
+    access: &dyn crate::access::DocumentAccess,
+    mode: Mode,
+    inline_images: bool,
+    include_toc: bool,
+) -> String {
+    let (body, img_uris, outline) = render_doc(access, mode, inline_images);
     assemble(body, mode, include_toc, &outline, &img_uris, inline_images)
 }
 
@@ -1115,7 +1249,11 @@ pub(crate) type PageIR = (u32, Vec<PageElement>, Vec<String>);
 /// PDF's own outline. [`render_doc`] emits + merges this into the PRE-id, PRE-nav body; the model
 /// build path ([`crate::model::build`]) projects the SAME elements into blocks. Splitting the IR
 /// from the emit is what lets HTML and the model derive from one materialized structure.
-pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool) -> (Vec<PageIR>, Vec<links::OutlineEntry>) {
+pub(crate) fn render_doc_elements(
+    access: &dyn crate::access::DocumentAccess,
+    mode: Mode,
+    inline_images: bool,
+) -> (Vec<PageIR>, Vec<links::OutlineEntry>) {
     // Optional coarse phase profiler: set DPDF_PROFILE=1 to print per-phase WALL time to
     // stderr. `prof_phase(label, ||…)` times a closure; zero cost when unset.
     let prof = std::env::var_os("DPDF_PROFILE").is_some();
@@ -1126,7 +1264,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         }
     };
 
-    let pages = doc.get_pages();
+    let pages = access.pages_or_empty();
 
     // Document-wide body font size = most common rounded span size. Spans are extracted
     // per page in PARALLEL (each page is independent and read-only on the document); the
@@ -1134,7 +1272,13 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
     let t = std::time::Instant::now();
     let mut page_spans: Vec<(u32, ObjectId, Vec<Span>)> = pages
         .par_iter()
-        .map(|(&pno, &pid)| (pno, pid, text::extract_spans(doc, pid, raw)))
+        .map(|page| {
+            (
+                page.number,
+                page.id,
+                text::extract_spans(access, page.id).unwrap_or_default(),
+            )
+        })
         .collect();
     page_spans.sort_by_key(|(pno, _, _)| *pno);
     phase("01_spans", t);
@@ -1164,7 +1308,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
     // (#cite.x / #figure.n / #equation.n / #section.x) — resolving to the exact
     // target — and only falls back to "#page-N" when there is no name.
     let mut links_by_page: std::collections::HashMap<u32, Vec<LinkBox>> = std::collections::HashMap::new();
-    for lk in links::extract_links(doc) {
+    for lk in links::extract_links(access) {
         let href = match (&lk.uri, &lk.dest_name, lk.dest_page) {
             (Some(u), _, _) => u.clone(),
             (None, Some(name), _) => format!("#{}", slug(name)),
@@ -1178,14 +1322,14 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
     // Named-destination targets, grouped by page: each becomes an anchor id at (or
     // near) its position so the semantic links above actually resolve.
     let mut dests_by_page: std::collections::HashMap<u32, Vec<(String, Option<f32>)>> = std::collections::HashMap::new();
-    for d in links::named_destinations(doc) {
+    for d in links::named_destinations(access) {
         dests_by_page.entry(d.page).or_default().push((slug(&d.name), d.y));
     }
 
     // The PDF's own outline (bookmarks): used both to drive the nav and — per target
     // page — to promote matching lines to headings (so body-size section titles the
     // visual cues miss are still recognised, and the outline TOC links resolve).
-    let outline = links::outline(doc);
+    let outline = links::outline(access);
     // Each entry carries the author's own nesting depth (`OutlineEntry::level`, 0-based)
     // alongside the match key, so a promoted line lands at the level the author declared
     // instead of being flattened to a top-level section.
@@ -1202,7 +1346,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
     // L0 evidence: the tables the document DECLARES (`/StructTreeRoot`), keyed by page. Read
     // once for the whole document — the tree is document-wide and a table may straddle a page
     // break — and empty for the untagged majority.
-    let declared_tables = crate::structtree::declared_tables(doc);
+    let declared_tables = crate::structtree::declared_tables(access);
     // Global heading pre-detection: distrust over-used emphasis/label styles so a filing's
     // line-item flood doesn't read as hundreds of headings (see plan_headings).
     let head_plan = plan_headings(&page_spans, body, &profile);
@@ -1212,6 +1356,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
     // page-LOCAL `\0<idx>\0` sentinels (so the string passes never touch the base64) and
     // remapped to global indices during the sequential merge below.
     let t = std::time::Instant::now();
+    let owner_diagnostics_enabled = extract::table_owner_diagnostics_enabled();
     let renders: Vec<(u32, Vec<PageElement>, Vec<String>)> = page_spans
         .par_iter()
         .enumerate()
@@ -1255,8 +1400,8 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         // touches, and the page-space originals kept only for the SVG emitters (which do
         // their own turn from page space — see `PlacedSvg::rot`).
         let turn = geom::PageTurn::new(
-            crate::pdfobj::page_rotation(doc, *_pid),
-            crate::pdfobj::page_box(doc, *_pid).unwrap_or([0.0, 0.0, crate::pdfobj::DEFAULT_PAGE_PTS.0, crate::pdfobj::DEFAULT_PAGE_PTS.1]),
+            crate::pdfobj::page_rotation(access, *_pid),
+            crate::pdfobj::page_box(access, *_pid).unwrap_or([0.0, 0.0, crate::pdfobj::DEFAULT_PAGE_PTS.0, crate::pdfobj::DEFAULT_PAGE_PTS.1]),
         );
         // Display-space spans. `turned` owns them only on a turned page; upright, `dspans` IS
         // `spans`, so no page in any upright document allocates or copies anything here.
@@ -1266,12 +1411,12 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         // goes through these; `v.x_left`/`im.x_left` stay page-space for the SVG emitters.
         let dvbox = |v: &vector::PlacedSvg| turn.rect(v.x_left, v.x_right, v.y_bottom, v.y_top);
         let dibox = |im: &img::Placed| turn.rect(im.x_left, im.x_right, im.y_bottom, im.y_top);
-        let mut images = img::positioned_images(doc, *_pid, inline_images);
+        let mut images = img::positioned_images(access, *_pid, inline_images);
         // One vector walk, two answers: the figures, and the page's RULING — L1's second
         // evidence source for tables (`extract::detect_tables_pos`). The ruling arrives in
         // page space like every other geometry the walk produces, so it takes the same turn
         // the spans did, or a rotated page's lattice lands nowhere.
-        let (raw_vectors, weak_vectors, page_rules) = vector::positioned_vectors_ruled(doc, *_pid);
+        let (raw_vectors, weak_vectors, page_rules) = vector::positioned_vectors_ruled(access, *_pid);
         let page_rules = turn_rules(turn, page_rules);
         let mut tables = extract::detect_tables_pos(dspans, &page_rules);
         // Vector figures that carry a "Figure N" caption — their *internal* text (a diagram's
@@ -1318,7 +1463,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         // suppresses the overlapping vector, fragmenting a raster+vector plot (a Vp-depth
         // crossplot) into a lone raster plus loose axis text.
         tables.retain(|t| {
-            let tr = Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
+            let tr = t.bbox;
             let ta = tr.area().max(1.0);
             let raster_covered = images.iter().any(|im| {
                 let (ixl, ixr, iyb, iyt) = dibox(im);
@@ -1352,11 +1497,11 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
             //     vector-ink bbox didn't quite cover (a scatter's top-edge legend).
             // A REAL data table that merely sits near a figure is column-offset or vertically
             // separated from the ink, so neither shape matches and it survives.
-            let (tcx, tcy) = ((t.x_left + t.x_right) * 0.5, (t.y_bottom + t.y_top) * 0.5);
+            let (tcx, tcy) = ((t.bbox.x0 + t.bbox.x1) * 0.5, (t.bbox.y0 + t.bbox.y1) * 0.5);
             let label_grid_in_fig = captioned_fig_boxes.iter().any(|&(xl, xr, yb, yt)| {
                 let fr = Rect::new(xl, yb, xr, yt);
                 let center_in = fr.contains(tcx, tcy);
-                let v_overlap = yt.min(t.y_top) > yb.max(t.y_bottom);
+                let v_overlap = yt.min(t.bbox.y1) > yb.max(t.bbox.y0);
                 let x_aligned = tcx >= xl && tcx <= xr;
                 let va = fr.area().max(1.0);
                 // The table blankets the figure horizontally: its x-extent covers most of the
@@ -1386,7 +1531,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         // already answered; running them over a declared table would let a heuristic overrule
         // the file's own statement.
         if let Some(decl) = declared_tables.get(_pid) {
-            let annots: Vec<(ObjectId, Rect)> = crate::walker::annot_rects(doc, *_pid)
+            let annots: Vec<(ObjectId, Rect)> = crate::walker::annot_rects(access, *_pid)
                 .into_iter()
                 .map(|(id, r)| {
                     let (x0, x1, y0, y1) = turn.rect(r.x0, r.x1, r.y0, r.y1);
@@ -1401,7 +1546,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                 eprintln!("  L0 page {pno}: declared={} accepted={} refused={:?}", decl.len(), found.tables.len(), found.refused);
             }
             if !found.tables.is_empty() {
-                let regions: Vec<Rect> = found.tables.iter().map(|t| Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top)).collect();
+                let regions: Vec<Rect> = found.tables.iter().map(|t| t.bbox).collect();
                 // An inferred table that substantially coincides with a declared region is
                 // the same table read worse — the USGS grid inference splits six ways is
                 // declared once — so it goes. "Substantially" is measured against the
@@ -1411,12 +1556,16 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                 // wide grid). Either way the declaration owns the structure there. A table
                 // that merely clips a corner of the region is a different table and survives.
                 tables.retain(|t| {
-                    let tr = Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
+                    let tr = t.bbox;
                     !regions.iter().any(|r| r.overlap_area(tr) >= 0.5 * tr.area().min(r.area()).max(1.0))
                 });
                 tables.extend(found.tables);
             }
         }
+        // Complete ruled continuation evidence against the FINAL accepted owner set. Caption
+        // text deliberately remains unclaimed here, so it is an exact boundary barrier shared
+        // by raw, rich and rendered grouping without caption-label interpretation.
+        crate::table::finalize_continuation_proofs(*pno, dspans, &mut tables, turn, true);
         // Link rectangles are page-space too, and they are hit-tested against the spans in
         // `lines_of` — so they take the same turn, or a turned page's links land nowhere.
         let page_links = links_by_page.get(pno).unwrap_or(&no_links);
@@ -1430,7 +1579,18 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                 .collect()
         });
         let plinks: &[LinkBox] = turned_links.as_deref().unwrap_or(page_links.as_slice());
-        let mut lines = lines_of(dspans.iter().map(clone_span).collect(), plinks);
+        // The final accepted table set owns exact painted source intervals. Remove precisely
+        // that union before prose line assembly: a partial ruled-cell cut keeps its unclaimed
+        // Unicode fragments, while neighbouring prose inside the table bbox/margin survives.
+        // This happens only after declared-table replacement and false-table filtering, so a
+        // rejected/stale candidate can never consume a surface.
+        let table_claims = TableClaimIndex::new(&tables);
+        debug_assert!(
+            tables.iter().all(|table| !table.claim.slices.is_empty()),
+            "every accepted table must carry exact source ownership"
+        );
+        let prose_spans = prose_spans_without_table_claims(dspans, &table_claims);
+        let mut lines = lines_of(prose_spans, plinks);
         // Drop running page numbers: a line that is just a 1–4 digit number sitting
         // in the top or bottom margin band of the page (a running footer/header
         // number). Structural — keyed on position + lone-number shape, not per-doc.
@@ -1517,10 +1677,10 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
             let vr = Rect::new(vxl, vyb, vxr, vyt);
             let va = vr.area().max(1.0);
             !tables.iter().any(|t| {
-                if !(vxl < t.x_right && vxr > t.x_left && vyb < t.y_top && vyt > t.y_bottom) {
+                if !(vxl < t.bbox.x1 && vxr > t.bbox.x0 && vyb < t.bbox.y1 && vyt > t.bbox.y0) {
                     return false;
                 }
-                let tr = Rect::new(t.x_left, t.y_bottom, t.x_right, t.y_top);
+                let tr = t.bbox;
                 !(v.graphic_ink() && vr.overlap_area(tr) < va * 0.5)
             })
         };
@@ -1588,7 +1748,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
         // all table filtering so it sees the final table set.
         let in_table = |x0: f32, x1: f32, y: f32| {
             tables.iter().any(|t| {
-                y <= t.y_top + body && y >= t.y_bottom - body && x1 > t.x_left && x0 < t.x_right
+                y <= t.bbox.y1 + body && y >= t.bbox.y0 - body && x1 > t.bbox.x0 && x0 < t.bbox.x1
             })
         };
         // A vector figure's bbox — used to attach its labels and to keep that text
@@ -1828,7 +1988,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
             // `vector::PlacedSvg::attach`. Display space, like every other box test here.
             let mut label_in_table: Vec<bool> = Vec::new();
             let in_table = |x: f32, y: f32| {
-                tables.iter().any(|t| x >= t.x_left && x <= t.x_right && y >= t.y_bottom && y <= t.y_top)
+                tables.iter().any(|t| x >= t.bbox.x0 && x <= t.bbox.x1 && y >= t.bbox.y0 && y <= t.bbox.y1)
             };
             // Which spans a figure claims is decided in DISPLAY space (`ds`), against the
             // display-space figure boxes; what is HANDED to the figure is the PAGE-space span
@@ -1994,9 +2154,9 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
             } else {
                 tables.iter().enumerate()
                     .filter(|(j, _)| tab_cap[*j].is_none())
-                    .min_by(|(_, a), (_, b)| (a.y_top - cy).abs().partial_cmp(&(b.y_top - cy).abs()).unwrap_or(std::cmp::Ordering::Equal))
+                    .min_by(|(_, a), (_, b)| (a.bbox.y1 - cy).abs().partial_cmp(&(b.bbox.y1 - cy).abs()).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(j, t)| {
-                        let below = cy < (t.y_top + t.y_bottom) * 0.5; // caption sits below the table (y up)
+                        let below = cy < (t.bbox.y1 + t.bbox.y0) * 0.5; // caption sits below the table (y up)
                         tab_cap[j] = Some((num.clone(), html.clone(), below));
                     })
                     .is_some()
@@ -2067,14 +2227,14 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                 && !in_prose(fig_cx, l.y)
                 && (axis_label || detect_header(l, body, Some(&profile)).is_none()))
                 || in_captioned_fig;
-            if !in_table(l.x0, l.x1, l.y) && !consumed_caption.contains(&idx) && !fig_label {
+            if !consumed_caption.contains(&idx) && !fig_label {
                 items.push(Item::L(l));
                 boxes.push((l.x0, l.x1.max(l.x0 + 0.1), l.y, l.y + l.size.max(1.0)));
             }
         }
         for (j, t) in tables.iter().enumerate() {
             items.push(Item::T(j));
-            boxes.push((t.x_left, t.x_right.max(t.x_left + 0.1), t.y_bottom, t.y_top));
+            boxes.push((t.bbox.x0, t.bbox.x1.max(t.bbox.x0 + 0.1), t.bbox.y0, t.bbox.y1));
         }
         // Pair an overlapping raster + vector into ONE composite figure (only inline, so
         // the raster actually renders). The direction depends on which mostly contains the
@@ -2160,12 +2320,7 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
                 Item::T(j) => {
                     flush(&mut run, &mut els);
                     let caption = tab_cap[*j].as_ref().map(|(n, c, b)| (n.clone(), c.clone(), *b));
-                    els.push(PageElement::at(ElKind::Table {
-                        header: tables[*j].header.clone(),
-                        grid: tables[*j].grid.clone(),
-                        header_rows: tables[*j].header_rows,
-                        caption,
-                    }, ibox));
+                    els.push(PageElement::at(ElKind::Table(tables[*j].table.clone().with_caption(caption)), ibox));
                 }
                 Item::Img(j) => {
                     flush(&mut run, &mut els);
@@ -2335,6 +2490,31 @@ pub(crate) fn render_doc_elements(doc: &Document, raw: &[u8], mode: Mode, inline
     let t = std::time::Instant::now();
     let mut pages_els: Vec<PageIR> = renders;
     crate::elem_passes::run_cross_page_passes(&mut pages_els, mode);
+    if owner_diagnostics_enabled {
+        extract::emit_ordered_table_owner_diagnostics(
+            pages_els
+                .iter()
+                .map(|(pno, elements, _)| {
+                    let diagnostics: String = elements
+                        .iter()
+                        .filter_map(|element| {
+                            let ElKind::Table(table) = &element.kind else {
+                                return None;
+                            };
+                            let bbox = element.bbox.map(Rect::from)?;
+                            Some(extract::table_analysis_owner_diagnostic(
+                                *pno,
+                                "detected",
+                                bbox,
+                                table,
+                            ))
+                        })
+                        .collect();
+                    (*pno, diagnostics)
+                })
+                .collect(),
+        );
+    }
     phase("04_elem_passes", t);
     if let Some(t0) = prof_start {
         eprintln!("[DPDF_PROFILE] {} pages, total {:.1}ms", page_spans.len(), t0.elapsed().as_secs_f64() * 1e3);
@@ -2371,8 +2551,12 @@ pub(crate) fn emit_and_merge(pages_els: &[PageIR], mode: Mode) -> (String, Vec<S
 /// merge, producing the PRE-id, PRE-nav `body`, the global image-URI list, and the PDF's own
 /// outline. A thin composition of [`render_doc_elements`] (the IR) + [`emit_and_merge`] (the
 /// HTML), kept so [`to_html`] and the legacy callers have one entry point.
-pub(crate) fn render_doc(doc: &Document, raw: &[u8], mode: Mode, inline_images: bool) -> (String, Vec<String>, Vec<links::OutlineEntry>) {
-    let (pages_els, outline) = render_doc_elements(doc, raw, mode, inline_images);
+pub(crate) fn render_doc(
+    access: &dyn crate::access::DocumentAccess,
+    mode: Mode,
+    inline_images: bool,
+) -> (String, Vec<String>, Vec<links::OutlineEntry>) {
+    let (pages_els, outline) = render_doc_elements(access, mode, inline_images);
     let (body, img_uris) = emit_and_merge(&pages_els, mode);
     (body, img_uris, outline)
 }
@@ -2478,6 +2662,7 @@ pub(crate) fn clone_span(s: &Span) -> Span {
         angle: s.angle,
         font: s.font,
         mcid: s.mcid,
+        source: s.source,
     }
 }
 
@@ -2485,6 +2670,7 @@ pub(crate) fn clone_span(s: &Span) -> Span {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table::{CellAnalysis, TableCellRole, TableEvidence};
 
     fn line(text: &str, y: f32) -> Line {
         Line {
@@ -2497,6 +2683,114 @@ mod tests {
             tot_w: text.chars().count(),
             runs: vec![Run { text: text.to_string(), bold: false, italic: false, href: None, script: 0 }],
             font: 1,
+        }
+    }
+
+    fn claimed_table(claim: SourceSlice) -> crate::table::PositionedTableAnalysis {
+        crate::table::PositionedTableAnalysis::from_parts(
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            Vec::new(),
+            vec![vec!["owned".to_string()]],
+            0,
+            Vec::new(),
+        )
+        .with_ownership(
+            crate::table::CandidateKey::synthetic(),
+            crate::table::TableClaim::from_rows(vec![vec![claim]]),
+        )
+    }
+
+    #[test]
+    fn exact_table_claim_splitting_is_unicode_safe_and_follows_the_baseline() {
+        let source = SourceSlice::test_occurrence(7, 4);
+        let span = Span {
+            x: 10.0,
+            y: 20.0,
+            size: 10.0,
+            width: 40.0,
+            text: "Aé中Z".to_string(),
+            bold: false,
+            italic: false,
+            mono: false,
+            angle: std::f32::consts::FRAC_PI_2,
+            font: 1,
+            mcid: None,
+            source,
+        };
+        let tables = [claimed_table(source.sub_slice(1, 3))];
+        let claims = TableClaimIndex::new(&tables);
+        let mut pieces = Vec::new();
+        push_unclaimed_fragments(&span, &claims, &mut pieces);
+        assert_eq!(pieces.iter().map(|piece| piece.text.as_str()).collect::<Vec<_>>(), vec!["A", "Z"]);
+        assert!((pieces[1].x - 10.0).abs() < 0.001);
+        assert!((pieces[1].y - 50.0).abs() < 0.001);
+        assert_eq!((pieces[1].source.char_start(), pieces[1].source.char_end()), (3, 4));
+    }
+
+    #[test]
+    fn table_claim_index_handles_empty_whole_overlapping_and_sub_sliced_sources() {
+        let source = SourceSlice::test_occurrence(19, 5);
+        let span = Span {
+            x: 10.0,
+            y: 20.0,
+            size: 10.0,
+            width: 50.0,
+            text: "Aé中Z!".to_string(),
+            bold: true,
+            italic: false,
+            mono: false,
+            angle: 0.0,
+            font: 4,
+            mcid: Some(8),
+            source,
+        };
+
+        let empty = TableClaimIndex::new(&[]);
+        let unchanged = prose_spans_without_table_claims(std::slice::from_ref(&span), &empty);
+        assert_eq!(unchanged.len(), 1);
+        assert_eq!(unchanged[0].text, span.text);
+        assert_eq!((unchanged[0].x, unchanged[0].y, unchanged[0].width), (span.x, span.y, span.width));
+        assert_eq!(unchanged[0].source, span.source);
+
+        let whole = TableClaimIndex::new(&[claimed_table(source)]);
+        assert!(prose_spans_without_table_claims(std::slice::from_ref(&span), &whole).is_empty());
+
+        let overlapping = TableClaimIndex::new(&[
+            claimed_table(source.sub_slice(1, 3)),
+            claimed_table(source.sub_slice(2, 4)),
+        ]);
+        let survivors = prose_spans_without_table_claims(std::slice::from_ref(&span), &overlapping);
+        assert_eq!(survivors.iter().map(|piece| piece.text.as_str()).collect::<Vec<_>>(), vec!["A", "!"]);
+        assert_eq!(
+            survivors.iter().map(|piece| (piece.source.char_start(), piece.source.char_end())).collect::<Vec<_>>(),
+            vec![(0, 1), (4, 5)]
+        );
+
+        let sub_source = source.sub_slice(2, 5);
+        let sub_span = Span { x: 30.0, width: 30.0, text: "中Z!".to_string(), source: sub_source, ..clone_span(&span) };
+        let sub_claim = TableClaimIndex::new(&[claimed_table(source.sub_slice(2, 4))]);
+        let sub_survivors = prose_spans_without_table_claims(&[sub_span], &sub_claim);
+        assert_eq!(sub_survivors.len(), 1);
+        assert_eq!(sub_survivors[0].text, "!");
+        assert_eq!((sub_survivors[0].source.char_start(), sub_survivors[0].source.char_end()), (4, 5));
+        assert!((sub_survivors[0].x - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn prose_below_a_table_survives_when_the_table_does_not_claim_it() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/three_column_prose.pdf");
+        let raw = std::fs::read(path).expect("fixture bytes");
+        let doc = Document::load(path).expect("fixture loads");
+        let html = to_html(
+            &crate::access::test_adapter_with_source(&doc, &raw),
+            Mode::Page,
+            false,
+            false,
+        );
+        assert_eq!(html.matches("for this reach is incomplete before").count(), 3, "all three columns keep the disjoint line below the middle-column table");
+        assert_eq!(html.matches("<table").count(), 1, "the real table is unchanged");
+        for cell in ["Zone", "Depth", "18.2", "42.5", "128"] {
+            assert_eq!(html.matches(cell).count(), 1, "{cell:?} is emitted exactly once");
         }
     }
 
@@ -2554,20 +2848,64 @@ mod tests {
             vec![("A".to_string(), 1), ("B".to_string(), 1)],
         ];
         let grid = vec![vec!["1".to_string(), "2".to_string()]];
+        let render = |header_rows| {
+            table_html(&TableAnalysis::from_parts(
+                header.clone(), grid.clone(), header_rows, None, Vec::new(),
+            ))
+        };
 
-        let none = table_html_from_parts(&header, &grid, 0, None);
+        let none = render(0);
         assert_eq!(none.matches("<th").count(), 0);
         assert_eq!(none.matches("<td").count(), 5);
         assert!(none.contains("<td colspan=\"2\">All columns</td>"));
 
-        let two = table_html_from_parts(&header, &grid, 2, None);
+        let two = render(2);
         assert_eq!(two.matches("<th").count(), 3);
         assert_eq!(two.matches("<td").count(), 2);
-        assert!(two.contains("<th colspan=\"2\">All columns</th>"));
+        assert!(two.contains(
+            "<th scope=\"colgroup\" colspan=\"2\">All columns</th>"
+        ));
 
-        let through_grid = table_html_from_parts(&header, &grid, 3, None);
+        let through_grid = render(3);
         assert_eq!(through_grid.matches("<th").count(), 5);
         assert_eq!(through_grid.matches("<td").count(), 0);
+    }
+
+    #[test]
+    fn canonical_table_cells_emit_column_scope_and_materialized_spans() {
+        let mut group = CellAnalysis::declared(
+            "Group".into(), 0, 0, 1, 2, TableCellRole::Header, None,
+        );
+        group.role = TableCellRole::Header;
+        let mut solo = CellAnalysis::declared(
+            "Solo".into(), 0, 2, 1, 1, TableCellRole::Header, None,
+        );
+        solo.role = TableCellRole::Header;
+        let grid = vec![
+            vec![group, CellAnalysis::covered(0, 1), solo],
+            vec![
+                CellAnalysis::declared(
+                    "North".into(), 1, 0, 2, 1, TableCellRole::Data, None,
+                ),
+                CellAnalysis::new("10".into(), 1, 1, 1, 1, None),
+                CellAnalysis::new("20".into(), 1, 2, 1, 1, None),
+            ],
+            vec![
+                CellAnalysis::covered(2, 0),
+                CellAnalysis::new("11".into(), 2, 1, 1, 1, None),
+                CellAnalysis::new("21".into(), 2, 2, 1, 1, None),
+            ],
+        ];
+        let html = table_html(&TableAnalysis::from_cells(
+            Vec::new(), grid, 1, vec![TableEvidence::Declared],
+        ));
+
+        assert_eq!(
+            html,
+            "<table data-dpdf-semantic-spans><tr><th scope=\"colgroup\" colspan=\"2\">Group</th>\
+             <th scope=\"col\">Solo</th></tr><tr><td rowspan=\"2\">North</td>\
+             <td>10</td><td>20</td></tr><tr><td>11</td><td>21</td></tr></table>"
+        );
     }
 
     /// `tests/gen_fixtures.py::gen_rotated_body` — the same displayed page at `/Rotate`
@@ -2583,7 +2921,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/rotated_body.pdf");
         let raw = std::fs::read(path).expect("rotated_body.pdf fixture must exist");
         let doc = Document::load(path).expect("rotated_body.pdf fixture must load");
-        let html = to_html(&doc, &raw, Mode::Page, false, false);
+        let html = to_html(&crate::access::test_adapter_with_source(&doc, &raw), Mode::Page, false, false);
         let pages: Vec<&str> = html.split("<section data-page=").skip(1).collect();
         assert_eq!(pages.len(), 4, "fixture has one page per rotation");
         let want = [

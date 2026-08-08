@@ -18,6 +18,12 @@ benchmarking/
 CLAUDE.md
 .build-venv/
 
+# Local dev working folder + cross-project coordination channel — never committed.
+# See dev-docs/README.md and inbox/README.md for the canonical layouts, and the
+# dev-docs-cleanup / read-inbox skills for the auto-purged time-boxed tiers within.
+/dev-docs/
+/inbox/
+
 # Python build artifacts
 dist/
 

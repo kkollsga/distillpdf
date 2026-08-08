@@ -459,10 +459,20 @@ fn render_list(children: &[Node], out: &mut String, ctx: &mut Ctx, ordered: bool
 }
 
 fn render_table(children: &[Node], attrs: &[(String, String)], out: &mut String, ctx: &mut Ctx) {
+    const MAX_MARKDOWN_SPAN: usize = 4096;
+    const MAX_MARKDOWN_EXPANDED_CELLS: usize = 4096;
+    let expand_colspans = attr(attrs, "data-dpdf-proven-leading-tier").is_some()
+        || attr(attrs, "data-dpdf-semantic-spans").is_some();
     // Optional <caption> before the grid.
     let mut caption = String::new();
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    fn walk_rows(nodes: &[Node], rows: &mut Vec<Vec<String>>, caption: &mut String, ctx: &mut Ctx) {
+    let mut source_rows: Vec<Vec<(String, usize, usize)>> = Vec::new();
+    fn walk_rows(
+        nodes: &[Node],
+        rows: &mut Vec<Vec<(String, usize, usize)>>,
+        caption: &mut String,
+        ctx: &mut Ctx,
+        expand_colspans: bool,
+    ) {
         for n in nodes {
             if let Node::Elem { tag, children, .. } = n {
                 match tag.as_str() {
@@ -470,23 +480,88 @@ fn render_table(children: &[Node], attrs: &[(String, String)], out: &mut String,
                     "tr" => {
                         let mut cells = Vec::new();
                         for c in children {
-                            if let Node::Elem { tag: ct, children: cc, .. } = c {
+                            if let Node::Elem { tag: ct, attrs, children: cc, .. } = c {
                                 if ct == "td" || ct == "th" {
                                     let v = inline(cc, ctx).replace('|', "\\|").replace('\n', " ");
-                                    cells.push(v.trim().to_string());
+                                    let colspan = if expand_colspans {
+                                        attr(attrs, "colspan")
+                                            .and_then(|value| value.parse::<usize>().ok())
+                                            .filter(|&span| {
+                                                (1..=MAX_MARKDOWN_SPAN).contains(&span)
+                                            })
+                                            .unwrap_or(1)
+                                    } else {
+                                        1
+                                    };
+                                    let rowspan = if expand_colspans {
+                                        attr(attrs, "rowspan")
+                                            .and_then(|value| value.parse::<usize>().ok())
+                                            .filter(|&span| {
+                                                (1..=MAX_MARKDOWN_SPAN).contains(&span)
+                                            })
+                                            .unwrap_or(1)
+                                    } else {
+                                        1
+                                    };
+                                    cells.push((v.trim().to_string(), rowspan, colspan));
                                 }
                             }
                         }
                         rows.push(cells);
                     }
-                    "thead" | "tbody" | "tfoot" => walk_rows(children, rows, caption, ctx),
+                    "thead" | "tbody" | "tfoot" => {
+                        walk_rows(children, rows, caption, ctx, expand_colspans)
+                    }
                     _ => {}
                 }
             }
         }
     }
-    let _ = attrs;
-    walk_rows(children, &mut rows, &mut caption, ctx);
+    walk_rows(children, &mut source_rows, &mut caption, ctx, expand_colspans);
+    let source_row_count = source_rows.len();
+    let materialized = (|| {
+        let mut expanded_cells = 0usize;
+        let mut occupied = std::collections::HashSet::new();
+        let mut rows = Vec::with_capacity(source_row_count);
+        for (row, source) in source_rows.iter().enumerate() {
+            let mut dense = Vec::new();
+            let mut col = 0usize;
+            for (value, rowspan, colspan) in source {
+                while occupied.contains(&(row, col)) {
+                    dense.push(String::new());
+                    col = col.checked_add(1)?;
+                }
+                let rowspan = (*rowspan).min(source_row_count - row);
+                let area = rowspan.checked_mul(*colspan)?;
+                expanded_cells = expanded_cells.checked_add(area)?;
+                if expanded_cells > MAX_MARKDOWN_EXPANDED_CELLS {
+                    return None;
+                }
+                dense.push(value.clone());
+                dense.extend(std::iter::repeat_n(String::new(), colspan - 1));
+                for dr in 0..rowspan {
+                    for dc in 0..*colspan {
+                        if dr != 0 || dc != 0 {
+                            occupied.insert((row.checked_add(dr)?, col.checked_add(dc)?));
+                        }
+                    }
+                }
+                col = col.checked_add(*colspan)?;
+            }
+            while occupied.contains(&(row, col)) {
+                dense.push(String::new());
+                col = col.checked_add(1)?;
+            }
+            rows.push(dense);
+        }
+        Some(rows)
+    })();
+    let mut rows = materialized.unwrap_or_else(|| {
+        source_rows
+            .into_iter()
+            .map(|row| row.into_iter().map(|(value, _, _)| value).collect())
+            .collect()
+    });
     rows.retain(|r| !r.is_empty());
     if rows.is_empty() {
         return;
@@ -845,5 +920,150 @@ mod md_tests {
         let html = "<body><p>Antes</p><svg><text>Inválido Ré Ção</text></svg><p>Depois</p></body>";
         let (md, _) = html_to_markdown(html, false, ImgMode::Placeholder);
         assert!(md.contains("Antes") && md.contains("Depois"));
+    }
+
+    #[test]
+    fn table_colspans_expand_to_anchor_and_blank_markdown_slots() {
+        let html = concat!(
+            "<table data-dpdf-proven-leading-tier><tr><th colspan=\"3\">Geochemistry</th>",
+            "<th colspan=\"3\">Location</th></tr>",
+            "<tr><th>Sample</th><th>Depth</th><th>Grade</th>",
+            "<th>Lat</th><th>Lon</th><th>Zone</th></tr></table>"
+        );
+        let (md, _) = html_to_markdown(html, false, ImgMode::Placeholder);
+        assert_eq!(
+            md,
+            concat!(
+                "| Geochemistry |  |  | Location |  |  |\n",
+                "| --- | --- | --- | --- | --- | --- |\n",
+                "| Sample | Depth | Grade | Lat | Lon | Zone |\n"
+            )
+        );
+    }
+
+    #[test]
+    fn canonical_semantic_spans_preserve_the_dense_markdown_projection() {
+        let html = concat!(
+            "<table data-dpdf-semantic-spans><tr>",
+            "<th scope=\"colgroup\" colspan=\"3\">Geochemistry</th>",
+            "<th scope=\"colgroup\" colspan=\"3\">Location</th></tr>",
+            "<tr><th scope=\"col\">Sample</th><th scope=\"col\">Depth</th>",
+            "<th scope=\"col\">Grade</th><th scope=\"col\">Lat</th>",
+            "<th scope=\"col\">Lon</th><th scope=\"col\">Zone</th></tr></table>"
+        );
+        let (md, _) = html_to_markdown(html, false, ImgMode::Placeholder);
+        assert_eq!(
+            md,
+            concat!(
+                "| Geochemistry |  |  | Location |  |  |\n",
+                "| --- | --- | --- | --- | --- | --- |\n",
+                "| Sample | Depth | Grade | Lat | Lon | Zone |\n"
+            )
+        );
+    }
+
+    #[test]
+    fn canonical_rowspans_preserve_the_dense_markdown_projection() {
+        let html = concat!(
+            "<table data-dpdf-semantic-spans>",
+            "<tr><th scope=\"colgroup\" colspan=\"2\">Region</th>",
+            "<th scope=\"col\">Total</th></tr>",
+            "<tr><td rowspan=\"2\">North</td><td>Alpha</td><td>11</td></tr>",
+            "<tr><td>Beta</td><td>22</td></tr></table>"
+        );
+        let (md, _) = html_to_markdown(html, false, ImgMode::Placeholder);
+        assert_eq!(
+            md,
+            concat!(
+                "| Region |  | Total |\n",
+                "| --- | --- | --- |\n",
+                "| North | Alpha | 11 |\n",
+                "|  | Beta | 22 |\n"
+            )
+        );
+    }
+
+    #[test]
+    fn semantic_rowspans_are_clipped_to_the_actual_source_rows() {
+        let html = concat!(
+            "<table data-dpdf-semantic-spans>",
+            "<tr><td rowspan=\"4096\">A</td><td>X</td></tr>",
+            "<tr><td>Y</td></tr></table>"
+        );
+        let (md, _) = html_to_markdown(html, false, ImgMode::Placeholder);
+        assert_eq!(
+            md,
+            concat!(
+                "| A | X |\n",
+                "| --- | --- |\n",
+                "|  | Y |\n"
+            )
+        );
+    }
+
+    #[test]
+    fn semantic_many_cell_expansion_is_bounded_table_wide() {
+        let mut html = String::from("<table data-dpdf-semantic-spans><tr>");
+        for i in 0..2049 {
+            html.push_str(&format!("<td colspan=\"2\">{i}</td>"));
+        }
+        html.push_str("</tr></table>");
+
+        let (md, _) = html_to_markdown(&html, false, ImgMode::Placeholder);
+        let header = md.lines().next().unwrap();
+        assert_eq!(header.matches(" | ").count() + 1, 2049);
+        assert!(!header.contains("|  |"), "over-budget spans fall back atomically");
+    }
+
+    #[test]
+    fn ordinary_colspan_tables_keep_the_legacy_markdown_projection() {
+        let html = concat!(
+            "<table><tr><th colspan=\"3\">Geochemistry</th>",
+            "<th colspan=\"3\">Location</th></tr>",
+            "<tr><th>Sample</th><th>Depth</th><th>Grade</th>",
+            "<th>Lat</th><th>Lon</th><th>Zone</th></tr></table>"
+        );
+        let (md, _) = html_to_markdown(html, false, ImgMode::Placeholder);
+        assert_eq!(
+            md,
+            concat!(
+                "| Geochemistry | Location |  |  |  |  |\n",
+                "| --- | --- | --- | --- | --- | --- |\n",
+                "| Sample | Depth | Grade | Lat | Lon | Zone |\n"
+            )
+        );
+    }
+
+    #[test]
+    fn unmarked_external_colspan_shapes_retain_one_slot_per_html_cell() {
+        let cases = [
+            (
+                concat!(
+                    "<table><tr><th></th><th colspan=\"2\">Partition 1</th>",
+                    "<th colspan=\"2\">Partition 2</th><th colspan=\"2\">Partition 4</th></tr>",
+                    "<tr><td>A</td><td>B</td><td>C</td><td>D</td><td>E</td><td>F</td><td>G</td></tr></table>"
+                ),
+                "|  | Partition 1 | Partition 2 | Partition 4 |",
+            ),
+            (
+                concat!(
+                    "<table><tr><th></th><th>Easy</th><th></th>",
+                    "<th colspan=\"2\">Medium</th><th>Hard</th><th></th></tr>",
+                    "<tr><td>A</td><td>B</td><td>C</td><td>D</td><td>E</td><td>F</td><td>G</td></tr></table>"
+                ),
+                "|  | Easy |  | Medium | Hard |  |",
+            ),
+        ];
+        for (html, expected_prefix) in cases {
+            let (md, _) = html_to_markdown(html, false, ImgMode::Placeholder);
+            assert!(md.lines().next().is_some_and(|line| line.starts_with(expected_prefix)));
+        }
+    }
+
+    #[test]
+    fn hostile_or_invalid_table_colspans_are_not_expanded() {
+        let html = "<table data-dpdf-proven-leading-tier><tr><th colspan=\"4097\">A</th><th colspan=\"0\">B</th><th colspan=\"x\">C</th></tr></table>";
+        let (md, _) = html_to_markdown(html, false, ImgMode::Placeholder);
+        assert_eq!(md, "| A | B | C |\n| --- | --- | --- |\n");
     }
 }

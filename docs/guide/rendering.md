@@ -35,6 +35,14 @@ is an error — pass `path=` or `return_string=True`.
 scanned PDFs — see [OCR for scanned PDFs](ocr.md). This page covers the born-digital
 rendering path.
 
+### Semantic tables
+
+When the canonical table analysis proves a merged cell, HTML emits one anchor with its
+`rowspan` / `colspan` and omits the covered slots. Leading column headers use
+`scope="col"`; a header spanning several columns uses `scope="colgroup"`. distillPDF does
+not infer row-header scope when the source supplies no such proof. The legacy
+`extract_tables()` dense grid remains unchanged.
+
 ## File output vs. returning a string
 
 By default `to_html` and `to_markdown` **write a file and return `1`**. The destination

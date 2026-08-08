@@ -27,7 +27,6 @@ pub struct Author {
 use crate::html::{esc, initials_count, looks_like_reference, numbered_level, roman_section, FOOTNOTE_MARKERS};
 use crate::layout::{lines_of, Line};
 use crate::text;
-use lopdf::Document;
 use std::collections::HashSet;
 
 /// Split an affiliation line `"1Institut …"` / `"* University …"` into its marker key
@@ -572,12 +571,14 @@ pub(crate) fn emit_document_title(lines: &mut Vec<Line>, body: f32, out: &mut Ve
 
 /// Extract the front-matter (title/authors/abstract/keywords) of `doc` from page 1.
 /// Standalone path for `pdf.metadata()` — does not run the full HTML pipeline.
-pub(crate) fn extract_front_matter(doc: &Document, raw: &[u8]) -> FrontMatter {
-    let first = match doc.get_pages().into_iter().min_by_key(|(n, _)| *n) {
-        Some((_, id)) => id,
+pub(crate) fn extract_front_matter(
+    access: &dyn crate::access::DocumentAccess,
+) -> FrontMatter {
+    let first = match access.pages_or_empty().into_iter().min_by_key(|page| page.number) {
+        Some(page) => page.id,
         None => return FrontMatter::default(),
     };
-    let spans = text::extract_spans(doc, first, raw);
+    let spans = text::extract_spans(access, first).unwrap_or_default();
     // BTreeMap, for the same reason as `html::render`'s body histogram: `max_by_key`
     // returns the LAST maximum in iteration order, and a `HashMap`'s order varies per map
     // instance — so a tie between two equally-common sizes resolved differently run to run.

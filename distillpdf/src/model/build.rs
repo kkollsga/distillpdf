@@ -15,7 +15,9 @@
 //! gives a position for (100% of content blocks on the born-digital path). The figure raster
 //! bytes (sha256 + dims) are still captured under the `assets` profile.
 
-use lopdf::{Document, Object};
+use lopdf::Object;
+#[cfg(test)]
+use lopdf::Document;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 
@@ -25,29 +27,39 @@ use super::{
     Metadata, NamedDest, OcrDecision, Page, Regen, Section, Source, TocEntry, NATIVE_CONFIDENCE,
     SCHEMA_VERSION,
 };
+use crate::access::DocumentAccess;
 use crate::html::{Bbox, ElKind, PageIR};
-use crate::{frontmatter, html, links, nav, ocr};
+use crate::{frontmatter, html, links, nav, ocr, postprocess};
 
-/// Build the document model from a parsed PDF plus its raw bytes (the raw bytes back the
-/// source hash and lenient stream recovery). `file` is the display name recorded in
+/// Build the document model from a parsed PDF. Source hashing and lenient stream recovery are
+/// owned by the document-access boundary. `file` is the display name recorded in
 /// `source.file` (the source PDF's basename, typically). `generated_at` is the ONE timestamp
 /// in the file — taken once by the caller so the model is otherwise fully deterministic.
 /// `profile` chooses which asset bytes are captured/embedded (see [`AssetProfile`]).
 ///
 /// Returns the model plus the embedded-asset bytes map (keyed by asset id) the container
 /// writer needs; it is empty under `assets="none"` or when no figure raster was recoverable.
-pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: String, profile: AssetProfile) -> (DocModel, AssetBytes) {
-    let page_map = doc.get_pages(); // BTreeMap<u32, ObjectId> — 1-indexed, sorted
+pub(crate) fn build_model(
+    access: &dyn crate::access::DocumentAccess,
+    file: &str,
+    generated_at: String,
+    profile: AssetProfile,
+) -> Result<(DocModel, AssetBytes), crate::access::AccessError> {
+    // Hash first so a changed/failed source never produces a partially-derived model or a
+    // fabricated empty digest. The typed source failure remains intact at the access boundary.
+    let source_sha256 = access.source_sha256()?;
+    let page_map = access.pages_or_empty(); // detached, 1-indexed, sorted by the adapter
     let page_count = page_map.len() as u32;
 
     // Per-page geometry + OCR decision + PDF page labels. Built first so blocks can be
     // attributed and the page index is complete even for pages with no extracted blocks.
-    let labels = page_labels(doc, page_count);
+    let labels = page_labels(access, page_count);
     let pages: Vec<Page> = page_map
         .iter()
-        .map(|(&n, &pid)| {
-            let (w, h) = ocr::page_size_pts(doc, pid);
-            let decision: OcrDecision = ocr::detect::decide(doc, pid, raw).into();
+        .map(|page| {
+            let (n, pid) = (page.number, page.id);
+            let (w, h) = ocr::page_size_pts(access, pid);
+            let decision: OcrDecision = ocr::detect::decide(access, pid).into();
             let mut lmap: BTreeMap<String, String> = BTreeMap::new();
             if let Some(lbl) = labels.get(&n) {
                 lmap.insert("pdf".to_string(), lbl.clone());
@@ -70,7 +82,7 @@ pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: 
     // — no HTML round-trip, no stored fidelity body. The blocks ARE the render source of truth
     // (`render::render_html` rebuilds the IR from them byte-identically), so the page's content
     // is held once, in `blocks`.
-    let (pages_ir, _outline) = html::render_doc_elements(doc, raw, html::Mode::Page, false);
+    let (pages_ir, _outline) = html::render_doc_elements(access, html::Mode::Page, false);
     // The post-dedup id map (`fig-3` → `fig-3-2` when ids collide) and the `sec-…` minting both
     // key off the deduped body's id namespace, exactly as the renderer's `build_toc` does —
     // computed directly from the IR's element fragments in document order (no full-body emit).
@@ -80,7 +92,7 @@ pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: 
 
     // Front-matter / metadata: reuse the dedicated extractor (the same one the public
     // `metadata()` method exposes) rather than re-deriving from the HTML <header>.
-    let fm = frontmatter::extract_front_matter(doc, raw);
+    let fm = frontmatter::extract_front_matter(access);
     let metadata = Metadata {
         title: (!fm.title.trim().is_empty()).then(|| fm.title.clone()),
         authors: fm.authors.iter().map(|a| a.name.clone()).collect(),
@@ -90,7 +102,7 @@ pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: 
     };
 
     // Links, named destinations, TOC — straight from the existing extractors.
-    let links: Vec<Link> = links::extract_links(doc)
+    let links: Vec<Link> = links::extract_links(access)
         .into_iter()
         .map(|l| Link {
             page: l.page,
@@ -100,25 +112,25 @@ pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: 
             remote_file: l.remote_file,
         })
         .collect();
-    let named_dests: Vec<NamedDest> = links::named_destinations(doc)
+    let named_dests: Vec<NamedDest> = links::named_destinations(access)
         .into_iter()
         .map(|d| NamedDest { name: d.name, page: d.page })
         .collect();
     // Prefer the PDF's own outline; fall back to the section tree (same precedence as the
     // rendered <nav>). The fallback is derived from `sections` — the heading tree we already
     // reconstructed — so anchors are exactly the section ids.
-    let toc = build_toc(doc, &sections);
+    let toc = build_toc(access, &sections);
 
     // Assets: one per figure block that carried an image. Under `assets="figures"`/`"full"`
     // we capture the figure's actual bytes (re-rendering inline once), fill sha256 + width +
     // height, and embed them; under `"none"` (or when a figure's graphic is vector-only / not
     // recoverable as a raster) the bytes are dropped and only the regen STUB remains — a named,
     // reversible hole. The asset table is always complete (every figure image id has an entry).
-    let (assets, asset_bytes) = build_assets(doc, raw, &mut blocks, profile);
+    let (assets, asset_bytes) = build_assets(access, &mut blocks, profile);
 
     let source = Source {
         file: file.to_string(),
-        sha256: sha256_hex(raw),
+        sha256: source_sha256,
         pages: page_count,
         distillpdf: env!("CARGO_PKG_VERSION").to_string(),
         generated_at,
@@ -142,7 +154,7 @@ pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: 
         named_dests,
         toc,
     };
-    (model, asset_bytes)
+    Ok((model, asset_bytes))
 }
 
 /// Read the PDF `/PageLabels` number tree into a `{1-based page: label}` map (e.g. roman
@@ -151,53 +163,94 @@ pub(crate) fn build_model(doc: &Document, raw: &[u8], file: &str, generated_at: 
 /// it handles the standard label dictionary (`/S` style `D`/`r`/`R`/`a`/`A`, `/P` prefix,
 /// `/St` start) over the `/Nums` array; ranges it can't interpret are simply left unlabeled
 /// (a missing label is an honest absence, not a wrong one).
-fn page_labels(doc: &Document, page_count: u32) -> BTreeMap<u32, String> {
+fn page_labels(
+    access: &dyn crate::access::DocumentAccess,
+    page_count: u32,
+) -> BTreeMap<u32, String> {
     let mut out = BTreeMap::new();
-    let Ok(catalog) = doc.catalog() else { return out };
-    let Ok(pl) = catalog.get(b"PageLabels") else { return out };
-    let pl = match resolve(doc, pl) {
-        Some(Object::Dictionary(d)) => d,
-        _ => return out,
+    let Ok(catalog) = access.catalog() else {
+        return out;
     };
-    let nums = match pl.get(b"Nums").ok().and_then(|o| resolve(doc, o)) {
-        Some(Object::Array(a)) => a,
-        _ => return out,
+    let Ok(Some(mut ranges)) = catalog.read(|catalog| {
+        let page_labels = catalog.get(b"PageLabels").ok()?;
+        crate::access::read_resolved(access, page_labels, |page_labels| {
+            let page_labels = page_labels.as_dict().ok()?;
+            let nums = page_labels.get(b"Nums").ok()?;
+            crate::access::read_resolved(access, nums, |nums| {
+                let nums = nums.as_array().ok()?;
+                // /Nums is alternating [start_index, label_dict, start_index, …]. Keep
+                // only interpreted scalars; no source-owned array or dictionary escapes.
+                let mut ranges: Vec<(i64, String, String, i64)> = Vec::new();
+                let mut i = 0;
+                while i + 1 < nums.len() {
+                    let Object::Integer(start) = &nums[i] else {
+                        i += 2;
+                        continue;
+                    };
+                    if let Ok(Some(range)) = crate::access::read_resolved(
+                        access,
+                        &nums[i + 1],
+                        |label| {
+                            let label = label.as_dict().ok()?;
+                            let style = label
+                                .get(b"S")
+                                .ok()
+                                .and_then(|value| {
+                                    crate::access::read_resolved(access, value, |value| {
+                                        value.as_name().ok().map(|name| {
+                                            String::from_utf8_lossy(name).into_owned()
+                                        })
+                                    })
+                                    .ok()
+                                    .flatten()
+                                })
+                                .unwrap_or_default();
+                            let prefix = label
+                                .get(b"P")
+                                .ok()
+                                .and_then(|value| {
+                                    crate::access::read_resolved(access, value, |value| {
+                                        let bytes = value.as_str().ok()?;
+                                        Some(crate::pdfobj::decode_text_string(bytes))
+                                    })
+                                    .ok()
+                                    .flatten()
+                                })
+                                .unwrap_or_default();
+                            let counter = label
+                                .get(b"St")
+                                .ok()
+                                .and_then(|value| {
+                                    crate::access::read_resolved(access, value, |value| {
+                                        value.as_i64().ok()
+                                    })
+                                    .ok()
+                                    .flatten()
+                                })
+                                .unwrap_or(1);
+                            Some((*start, style, prefix, counter))
+                        },
+                    ) {
+                        ranges.push(range);
+                    }
+                    i += 2;
+                }
+                Some(ranges)
+            })
+            .ok()
+            .flatten()
+        })
+        .ok()
+        .flatten()
+    }) else {
+        return out;
     };
-    // /Nums is a flat array of alternating [start_index, label_dict, start_index, …].
-    // Collect (start_page0, dict) pairs, sorted by start.
-    let mut ranges: Vec<(i64, lopdf::Dictionary)> = Vec::new();
-    let mut i = 0;
-    while i + 1 < nums.len() {
-        let start = match &nums[i] {
-            Object::Integer(n) => *n,
-            _ => {
-                i += 2;
-                continue;
-            }
-        };
-        if let Some(Object::Dictionary(d)) = resolve(doc, &nums[i + 1]) {
-            ranges.push((start, d.clone()));
-        }
-        i += 2;
-    }
-    ranges.sort_by_key(|(s, _)| *s);
-    for (ri, (start0, d)) in ranges.iter().enumerate() {
-        let end0 = ranges.get(ri + 1).map(|(s, _)| *s).unwrap_or(page_count as i64);
-        let style = match d.get(b"S").ok().and_then(|o| resolve(doc, o)) {
-            Some(Object::Name(n)) => String::from_utf8_lossy(&n).to_string(),
-            _ => String::new(),
-        };
-        // `/P` is a PDF **text string**, so it needs the one decoder: a non-ASCII prefix is
-        // routinely written UTF-16BE behind a BOM, which `from_utf8_lossy` turns into
-        // NUL-interleaved replacement characters.
-        let prefix = match d.get(b"P").ok().and_then(|o| resolve(doc, o)) {
-            Some(Object::String(s, _)) => crate::pdfobj::decode_text_string(&s),
-            _ => String::new(),
-        };
-        let st = match d.get(b"St").ok().and_then(|o| resolve(doc, o)) {
-            Some(Object::Integer(n)) => n,
-            _ => 1,
-        };
+    ranges.sort_by_key(|(start, _, _, _)| *start);
+    for (ri, (start0, style, prefix, st)) in ranges.iter().enumerate() {
+        let end0 = ranges
+            .get(ri + 1)
+            .map(|(start, _, _, _)| *start)
+            .unwrap_or(page_count as i64);
         for p0 in *start0..end0 {
             if p0 < 0 {
                 continue;
@@ -218,12 +271,6 @@ fn page_labels(doc: &Document, page_count: u32) -> BTreeMap<u32, String> {
         }
     }
     out
-}
-
-/// An OWNED resolve: [`pdfobj::deref`] plus the clone this walk needs (it re-borrows the
-/// document while holding the result, so a borrowed view will not do).
-fn resolve(doc: &Document, o: &Object) -> Option<Object> {
-    crate::pdfobj::deref(doc, o).cloned()
 }
 
 /// Lowercase/uppercase roman numeral for a PDF page label (1 → i/I, 4 → iv/IV, …).
@@ -277,8 +324,8 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 /// Build the model TOC: the PDF's own outline when present (the author's clean TOC, with
 /// `page-N` anchors), else the heading tree derived from `sections` (with `sec-…` anchors
 /// that resolve into both the HTML and the model's section ids).
-fn build_toc(doc: &Document, sections: &[Section]) -> Vec<TocEntry> {
-    let outline = links::outline(doc);
+fn build_toc(access: &dyn DocumentAccess, sections: &[Section]) -> Vec<TocEntry> {
+    let outline = links::outline(access);
     if !outline.is_empty() {
         return outline
             .into_iter()
@@ -310,12 +357,20 @@ fn build_toc(doc: &Document, sections: &[Section]) -> Vec<TocEntry> {
 /// vector/SVG figure, or one whose graphic the inline render didn't materialise) keeps a
 /// DROPPED stub with a `regen` recipe — a named, reversible hole, never silent. Under
 /// `assets="none"` every figure is a dropped stub.
-fn build_assets(doc: &Document, raw: &[u8], blocks: &mut [Block], profile: AssetProfile) -> (Vec<Asset>, AssetBytes) {
+fn build_assets(
+    access: &dyn crate::access::DocumentAccess,
+    blocks: &mut [Block],
+    profile: AssetProfile,
+) -> (Vec<Asset>, AssetBytes) {
     let mut assets = Vec::new();
     let mut bytes_map = AssetBytes::new();
     // The figure-id → raster bytes map, built only when the profile keeps figures (re-rendering
     // inline is the cost we pay exactly once, and only when bytes are wanted).
-    let rasters = if profile.keeps_figures() { figure_rasters(doc, raw) } else { BTreeMap::new() };
+    let rasters = if profile.keeps_figures() {
+        figure_rasters(access)
+    } else {
+        BTreeMap::new()
+    };
 
     for b in blocks.iter_mut() {
         let Some(id) = b.image.clone() else { continue };
@@ -360,9 +415,11 @@ type FigureRaster = (Vec<u8>, String, Option<u32>, Option<u32>);
 /// Re-render the document with images INLINE (once) and decode each figure's raster into
 /// `figure_number → `[`FigureRaster`]. Vector-only figures yield no entry (their graphic is
 /// `<svg>`, not a raster). Width/height come from decoding the image header.
-fn figure_rasters(doc: &Document, raw: &[u8]) -> BTreeMap<String, FigureRaster> {
+fn figure_rasters(
+    access: &dyn crate::access::DocumentAccess,
+) -> BTreeMap<String, FigureRaster> {
     let mut out = BTreeMap::new();
-    let html = html::to_html(doc, raw, html::Mode::Page, true, false);
+    let html = html::to_html(access, html::Mode::Page, true, false);
     // Walk `<figure id="fig-N"> … <img src="data:…"> … </figure>` occurrences. We only need the
     // FIRST raster `<img>` inside each figure (a composite figure's base raster).
     let mut rest = html.as_str();
@@ -414,18 +471,17 @@ fn image_dims(bytes: &[u8]) -> (Option<u32>, Option<u32>) {
 /// return, for each occurrence index of a base id, its post-dedup form. Keyed `(base_id ->
 /// Vec<deduped_id>)` in occurrence order; the projection consumes them in the same walk order.
 fn post_dedup_id_map(pages_ir: &[PageIR]) -> BTreeMap<String, Vec<String>> {
-    let mut seen: BTreeMap<String, u32> = BTreeMap::new();
+    let mut deduper = postprocess::IdDeduper::default();
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut bump = |raw: &str, out: &mut BTreeMap<String, Vec<String>>| {
-        let n = seen.entry(raw.to_string()).or_insert(0);
-        *n += 1;
-        let deduped = if *n == 1 { raw.to_string() } else { format!("{raw}-{n}") };
-        out.entry(raw.to_string()).or_default().push(deduped);
-    };
-    for (_pno, els, _uris) in pages_ir {
+    for (pno, els, _uris) in pages_ir {
+        // Page-mode emission inserts this wrapper immediately before the page's elements. It
+        // participates in the live global id namespace, but is framing rather than a block id,
+        // so reserve it without adding an occurrence to the element lookup map.
+        deduper.allocate(&format!("page-{pno}"));
         for e in els {
             for raw in ids_in_fragment(&e.html()) {
-                bump(&raw, &mut out);
+                let deduped = deduper.allocate(&raw);
+                out.entry(raw).or_default().push(deduped);
             }
         }
     }
@@ -516,9 +572,16 @@ fn project_blocks(
             let bbox = e.bbox;
             match &e.kind {
                 ElKind::DestAnchors(s) => {
-                    // Page-head named-destination anchors: a fidelity-only chrome carrier. Store
-                    // its FINAL (deduped, image-substituted) fragment so render reproduces it.
-                    let frag = finalize_fragment(s, &mut dedup_cursor, &mut global_img, &deduped);
+                    // Page-head destination anchors can collide with the Page-mode wrapper,
+                    // which Section mode does not emit. Consume their Page-mode ids for model
+                    // addressing, but retain the raw fragment so each mode crosses its own exact
+                    // global dedup boundary. Generated destination anchors have no image sentinels.
+                    let (frag, _) = prepare_fidelity_fragment(
+                        s,
+                        &mut dedup_cursor,
+                        &mut global_img,
+                        &deduped,
+                    );
                     let mut b = text_block(next_id(&mut ord), BlockKind::DestAnchors, String::new(), page, bbox, &stack);
                     b.el_html = Some(frag);
                     blocks.push(b);
@@ -526,8 +589,13 @@ fn project_blocks(
                 ElKind::Header(_) => {
                     // The first-page front-matter `<header>`: a fidelity carrier (rebuilding it
                     // from `metadata` is lossy — sup author markers, the affiliation `<ol>`), so
-                    // store its FINAL fragment verbatim.
-                    let frag = finalize_fragment(&e.html(), &mut dedup_cursor, &mut global_img, &deduped);
+                    // store its raw-id fidelity fragment verbatim.
+                    let (frag, _) = prepare_fidelity_fragment(
+                        &e.html(),
+                        &mut dedup_cursor,
+                        &mut global_img,
+                        &deduped,
+                    );
                     let mut b = text_block(next_id(&mut ord), BlockKind::Header, String::new(), page, bbox, &stack);
                     b.el_html = Some(frag);
                     blocks.push(b);
@@ -601,40 +669,67 @@ fn project_blocks(
                         }
                     }
                 }
-                ElKind::Table { header, grid, header_rows, caption } => {
-                    // Consume the table's `tab-N` id (post-dedup) in walk order, carrying the
-                    // deduped caption number so re-emit lands the same `<table id>`.
-                    let mut deduped_tab: Option<String> = None;
-                    for raw in ids_in_fragment(&e.html()) {
-                        let d = deduped(&raw, &mut dedup_cursor);
-                        if raw.starts_with("tab-") {
-                            deduped_tab = Some(d);
+                ElKind::Table(table) => {
+                    // Semantic-only spans are not added to the public model. When the legacy
+                    // structured fields cannot reconstruct them, use the existing exact-fragment
+                    // carrier and keep that fallback private in `TableAnalysis` during rebuild.
+                    let raw_frag = e.html();
+                    // Preserve raw ids for the requested render mode; consume Page-mode final ids
+                    // separately for the block's structured address fields.
+                    let fidelity = table.has_semantic_spans().then(|| {
+                        prepare_fidelity_fragment(
+                            &raw_frag,
+                            &mut dedup_cursor,
+                            &mut global_img,
+                            &deduped,
+                        )
+                    });
+                    let mut deduped_tab = fidelity.as_ref().and_then(|(_, ids)| {
+                        ids.iter()
+                            .find(|(raw, _)| raw.starts_with("tab-"))
+                            .map(|(_, final_id)| final_id.clone())
+                    });
+                    if fidelity.is_none() {
+                        for raw in ids_in_fragment(&raw_frag) {
+                            let d = deduped(&raw, &mut dedup_cursor);
+                            if raw.starts_with("tab-") {
+                                deduped_tab = Some(d);
+                            }
                         }
                     }
                     let mut b = text_block(next_id(&mut ord), BlockKind::Table, String::new(), page, bbox, &stack);
-                    b.cells = Some(table_cells(header, grid));
-                    b.caption = caption.as_ref().map(|(_, c, _)| nav::strip_inline(c).trim().to_string());
+                    b.cells = Some(table.expanded_cells());
+                    b.caption = table.caption.as_ref().map(|caption| nav::strip_inline(&caption.html).trim().to_string());
                     b.label = b.caption.as_deref().and_then(caption_label);
                     // Fidelity parts for byte-exact re-emit: the detached header rows, the data
                     // grid, and the caption `(number, html, below)` with the number re-keyed to
                     // its post-dedup `tab-N` form.
-                    b.table_header = Some(header.clone());
-                    b.table_header_rows = Some(*header_rows);
-                    b.table_grid = Some(grid.clone());
-                    b.table_caption = caption.as_ref().map(|(num, c, below)| {
-                        let n = deduped_tab.as_deref().map(strip_tab_prefix).unwrap_or_else(|| num.clone());
-                        (n, c.clone(), *below)
+                    b.table_header = Some(table.header_parts());
+                    b.table_header_rows = Some(table.header_rows);
+                    b.table_proven_leading_tier =
+                        table.has_proven_leading_tier().then_some(true);
+                    b.table_grid = Some(table.grid_parts());
+                    b.table_caption = table.caption.as_ref().map(|caption| {
+                        let n = deduped_tab.as_deref().map(strip_tab_prefix).unwrap_or_else(|| caption.number.clone());
+                        (n, caption.html.clone(), caption.below)
                     });
+                    b.el_html = fidelity.map(|(frag, _)| frag);
                     blocks.push(b);
                 }
                 ElKind::Figure { id, caption, .. } => {
-                    // Store the figure's FINAL (deduped, image-substituted) fragment as the
-                    // fidelity surface, and re-key the image asset id to the figure's post-dedup
-                    // `fig-N`. `finalize_fragment` applies the SAME dedup + image substitution the
-                    // body does, so the stored fragment is byte-identical to its place in the body.
+                    // Store the figure's raw-id, image-substituted fidelity fragment, and re-key
+                    // the image asset id to the figure's Page-mode post-dedup `fig-N`.
                     let raw_frag = e.html();
-                    let frag = finalize_fragment(&raw_frag, &mut dedup_cursor, &mut global_img, &deduped);
-                    let deduped_fig = ids_in_fragment(&frag).into_iter().find(|d| d.starts_with("fig-"));
+                    let (frag, ids) = prepare_fidelity_fragment(
+                        &raw_frag,
+                        &mut dedup_cursor,
+                        &mut global_img,
+                        &deduped,
+                    );
+                    let deduped_fig = ids
+                        .iter()
+                        .find(|(raw, _)| raw.starts_with("fig-"))
+                        .map(|(_, final_id)| final_id.clone());
                     let mut b = text_block(next_id(&mut ord), BlockKind::Figure, String::new(), page, bbox, &stack);
                     b.caption = caption.as_ref().map(|c| nav::strip_inline(c).trim().to_string());
                     b.label = b.caption.as_deref().and_then(caption_label);
@@ -647,7 +742,12 @@ fn project_blocks(
                     blocks.push(b);
                 }
                 ElKind::Caption { text, .. } => {
-                    let frag = finalize_fragment(&e.html(), &mut dedup_cursor, &mut global_img, &deduped);
+                    let (frag, _) = prepare_fidelity_fragment(
+                        &e.html(),
+                        &mut dedup_cursor,
+                        &mut global_img,
+                        &deduped,
+                    );
                     let cap_text = nav::strip_inline(text).trim().to_string();
                     let mut b = text_block(next_id(&mut ord), BlockKind::Caption, text.clone(), page, bbox, &stack);
                     b.label = caption_label(&cap_text);
@@ -678,79 +778,29 @@ fn strip_tab_prefix(id: &str) -> String {
     id.strip_prefix("tab-").unwrap_or(id).to_string()
 }
 
-/// Finalize an element's emitted HTML fragment into the FORM IT TAKES IN THE FINAL BODY, so the
-/// model can store it as a byte-exact fidelity surface (and a model-only re-render reproduces it
-/// even though `emit_and_merge`/`assemble` are idempotent over already-finalized fragments):
-/// (1) every `id="…"` is renamed to its post-dedup form (via the running `dedup_cursor` over the
-/// document-order `dedup_map`), exactly as `dedup_ids` does; (2) every page-local `\0idx\0` image
-/// sentinel becomes its FINAL `<image N>` placeholder (drop mode), with `N` the 1-based GLOBAL
-/// image index — `global_img` is the running count of images seen in document order, which
-/// reproduces `emit_and_merge`'s per-page offset accumulation.
-fn finalize_fragment(
+/// Prepare an opaque fidelity fragment for the model while preserving its raw `id` attributes.
+/// The returned id pairs separately consume the Page-mode replay and expose `(raw, final)` for
+/// address fields. Keeping raw ids in the fragment lets Page and Section renderers apply their
+/// own document-wide dedup order. Image sentinels are mode-independent and become their final
+/// global `<image N>` placeholders here.
+fn prepare_fidelity_fragment(
     frag: &str,
     dedup_cursor: &mut BTreeMap<String, usize>,
     global_img: &mut usize,
     deduped: &impl Fn(&str, &mut BTreeMap<String, usize>) -> String,
-) -> String {
-    let mut out = String::with_capacity(frag.len());
-    let bytes = frag.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // An `id="…"` literal → emit the deduped id.
-        if frag[i..].starts_with("id=\"") {
-            out.push_str("id=\"");
-            i += 4;
-            let start = i;
-            while i < bytes.len() && bytes[i] != b'"' {
-                i += 1;
-            }
-            let raw = &frag[start..i];
-            out.push_str(&deduped(raw, dedup_cursor));
-            // keep the closing quote
-            if i < bytes.len() {
-                out.push('"');
-                i += 1;
-            }
-            continue;
-        }
-        // A `\0idx\0` image sentinel → its final global `<image N>` number (drop mode).
-        if bytes[i] == 0 {
-            let start = i + 1;
-            let mut j = start;
-            while j < bytes.len() && bytes[j] != 0 {
-                j += 1;
-            }
-            // (idx is page-local; the number we emit is the running global index + 1.)
-            out.push_str(&(*global_img + 1).to_string());
-            *global_img += 1;
-            i = j + 1; // skip past the closing NUL
-            continue;
-        }
-        let c = frag[i..].chars().next().unwrap();
-        out.push(c);
-        i += c.len_utf8();
-    }
-    out
-}
-
-/// A table's row-major cell grid for the block projection: detached header rows (text only,
-/// colspans expanded to one cell per spanned column) followed by the data grid — the same cell
-/// sequence the rendered `<table>` shows, so `find`/markdown over `cells` matches the HTML.
-fn table_cells(header: &[Vec<(String, usize)>], grid: &[Vec<String>]) -> Vec<Vec<String>> {
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    for hrow in header {
-        let mut row = Vec::new();
-        for (text, span) in hrow {
-            for _ in 0..(*span).max(1) {
-                row.push(text.trim().to_string());
-            }
-        }
-        rows.push(row);
-    }
-    for r in grid {
-        rows.push(r.iter().map(|c| c.trim().to_string()).collect());
-    }
-    rows
+) -> (String, Vec<(String, String)>) {
+    let ids = ids_in_fragment(frag)
+        .into_iter()
+        .map(|raw| {
+            let final_id = deduped(&raw, dedup_cursor);
+            (raw, final_id)
+        })
+        .collect();
+    let out = postprocess::rewrite_sentinels(frag, 0, |_idx, out| {
+        out.push_str(&(*global_img + 1).to_string());
+        *global_img += 1;
+    });
+    (out, ids)
 }
 
 /// Make a block carrying the common fields (the kind-specific fields are filled by the caller),
@@ -775,6 +825,7 @@ fn mk_block(id: String, kind: BlockKind, text: String, page: u32, bbox: Option<B
         el_group: None,
         table_header: None,
         table_header_rows: None,
+        table_proven_leading_tier: None,
         table_grid: None,
         table_caption: None,
         el_html: None,
@@ -869,6 +920,40 @@ mod tests {
         PageElement::at(ElKind::Para { text: text.into() }, None)
     }
 
+    fn model_with_blocks(npages: u32, blocks: Vec<Block>) -> DocModel {
+        DocModel {
+            schema_version: SCHEMA_VERSION,
+            source: Source {
+                file: "x.pdf".into(),
+                sha256: "ab".into(),
+                pages: npages,
+                distillpdf: "0".into(),
+                generated_at: "t".into(),
+            },
+            metadata: Metadata::default(),
+            pages: (1..=npages)
+                .map(|n| Page {
+                    n,
+                    width_pts: crate::pdfobj::DEFAULT_PAGE_PTS.0,
+                    height_pts: crate::pdfobj::DEFAULT_PAGE_PTS.1,
+                    labels: BTreeMap::new(),
+                    ocr_decision: None,
+                    active_ocr_pass: None,
+                })
+                .collect(),
+            ocr_passes: Vec::new(),
+            sections: Vec::new(),
+            indexes: derive_indexes(&blocks),
+            blocks,
+            assets: Vec::new(),
+            chunks: None,
+            embedding_spaces: Vec::new(),
+            links: Vec::new(),
+            named_dests: Vec::new(),
+            toc: Vec::new(),
+        }
+    }
+
     #[test]
     fn projects_sections_blocks_and_pages() {
         let ir: Vec<PageIR> = vec![
@@ -901,12 +986,13 @@ mod tests {
     #[test]
     fn projects_table_and_figure() {
         let table = PageElement::at(
-            ElKind::Table {
-                header: vec![vec![("A".into(), 1), ("B".into(), 1)]],
-                grid: vec![vec!["1".into(), "2".into()]],
-                header_rows: 1,
-                caption: None,
-            },
+            ElKind::Table(crate::table::TableAnalysis::from_parts(
+                vec![vec![("A".into(), 1), ("B".into(), 1)]],
+                vec![vec!["1".into(), "2".into()]],
+                1,
+                None,
+                Vec::new(),
+            )),
             None,
         );
         let fig = PageElement::at(
@@ -927,6 +1013,229 @@ mod tests {
         assert_eq!(fig.caption.as_deref(), Some("Figure 3: A chart."));
         assert_eq!(fig.label.as_deref(), Some("Figure 3"));
         assert_eq!(fig.image.as_deref(), Some("img/fig_3.png"));
+    }
+
+    #[test]
+    fn page_wrapper_destination_collisions_round_trip_exactly() {
+        let pages = vec![
+            (
+                1,
+                vec![PageElement::at(
+                    ElKind::DestAnchors(
+                        "<a id=\"page-1\"></a><a id=\"page-1\"></a>".into(),
+                    ),
+                    None,
+                )],
+                vec![],
+            ),
+            (2, vec![para("Ordinary page two.")], vec![]),
+        ];
+        let (blocks, _) = project(&pages);
+        assert_eq!(
+            blocks[0].el_html.as_deref(),
+            Some("<a id=\"page-1\"></a><a id=\"page-1\"></a>")
+        );
+
+        let (live_body, image_uris) = html::emit_and_merge(&pages, html::Mode::Page);
+        let live_html = html::assemble(
+            live_body,
+            html::Mode::Page,
+            false,
+            &[],
+            &image_uris,
+            false,
+        );
+        assert_eq!(
+            ids_in_fragment(&live_html),
+            ["page-1", "page-1-2", "page-1-3", "page-2"]
+        );
+        assert_eq!(live_html.matches("<section data-page=\"2\" id=\"page-2\">").count(), 1);
+        assert!(live_html.contains("<p>Ordinary page two.</p>"));
+
+        let model = model_with_blocks(2, blocks);
+        let model_html = crate::model::render::render_html(&model, html::Mode::Page, false);
+        assert_eq!(model_html, live_html);
+        let live_markdown = crate::markdown::html_to_markdown(
+            &live_html,
+            false,
+            crate::markdown::ImgMode::Placeholder,
+        )
+        .0;
+        let model_markdown = crate::model::render::render_markdown(
+            &model,
+            html::Mode::Page,
+            false,
+            "drop",
+        )
+        .unwrap()
+        .0;
+        assert_eq!(model_markdown, live_markdown);
+        assert_eq!(model_markdown, "Ordinary page two.\n");
+
+        let (live_section_body, section_image_uris) =
+            html::emit_and_merge(&pages, html::Mode::Section);
+        let live_section_html = html::assemble(
+            live_section_body,
+            html::Mode::Section,
+            false,
+            &[],
+            &section_image_uris,
+            false,
+        );
+        assert_eq!(
+            ids_in_fragment(&live_section_html),
+            ["page-1", "page-1-2"]
+        );
+        assert!(!live_section_html.contains("data-page="));
+        assert_eq!(live_section_html.matches("<p>Ordinary page two.</p>").count(), 1);
+        let model_section_html =
+            crate::model::render::render_html(&model, html::Mode::Section, false);
+        assert_eq!(model_section_html, live_section_html);
+        let live_section_markdown = crate::markdown::html_to_markdown(
+            &live_section_html,
+            false,
+            crate::markdown::ImgMode::Placeholder,
+        )
+        .0;
+        let model_section_markdown = crate::model::render::render_markdown(
+            &model,
+            html::Mode::Section,
+            false,
+            "drop",
+        )
+        .unwrap()
+        .0;
+        assert_eq!(model_section_markdown, live_section_markdown);
+        assert_eq!(model_section_markdown, "Ordinary page two.\n");
+    }
+
+    #[test]
+    fn semantic_table_fidelity_uses_el_html_and_dedupes_caption_ids() {
+        let make_table = |number: &str| {
+            let mut table = crate::table::TableAnalysis::from_parts(
+                Vec::new(),
+                vec![
+                    vec![
+                        "Group A".into(),
+                        String::new(),
+                        String::new(),
+                        "Group B".into(),
+                        String::new(),
+                        String::new(),
+                    ],
+                    vec![
+                        "A".into(), "B".into(), "C".into(), "D".into(), "E".into(),
+                        "F".into(),
+                    ],
+                    vec![
+                        "1".into(), "2".into(), "3".into(), "4".into(), "5".into(),
+                        "6".into(),
+                    ],
+                ],
+                2,
+                None,
+                vec![crate::table::TableEvidence::Aligned],
+            );
+            table.compress_aligned_leading_group_header(&[
+                true, false, false, true, false, false,
+            ]);
+            table.with_caption(Some((
+                number.into(),
+                format!("Table {number}: <b>Grouped</b>"),
+                false,
+            )))
+        };
+        let pages = vec![(
+            1,
+            vec![
+                PageElement::at(ElKind::Table(make_table("3")), None),
+                PageElement::at(ElKind::Table(make_table("3")), None),
+                PageElement::at(ElKind::Table(make_table("3-2")), None),
+            ],
+            vec![],
+        )];
+
+        let (blocks, _) = project(&pages);
+        assert_eq!(blocks.len(), 3);
+        let first = blocks[0].el_html.as_deref().unwrap();
+        let second = blocks[1].el_html.as_deref().unwrap();
+        let third = blocks[2].el_html.as_deref().unwrap();
+        assert!(first.starts_with(
+            "<table id=\"tab-3\" data-dpdf-semantic-spans><caption>Table 3: <b>Grouped</b></caption>"
+        ));
+        assert!(second.starts_with(
+            "<table id=\"tab-3\" data-dpdf-semantic-spans><caption>Table 3: <b>Grouped</b></caption>"
+        ));
+        assert!(third.starts_with(
+            "<table id=\"tab-3-2\" data-dpdf-semantic-spans><caption>Table 3-2: <b>Grouped</b></caption>"
+        ));
+        assert_eq!(blocks[0].table_caption.as_ref().unwrap().0, "3");
+        assert_eq!(blocks[1].table_caption.as_ref().unwrap().0, "3-2");
+        assert_eq!(blocks[2].table_caption.as_ref().unwrap().0, "3-2-2");
+        assert_eq!(serde_json::to_value(&blocks[0]).unwrap().get("table_semantic_spans"), None);
+
+        let (live_body, image_uris) = html::emit_and_merge(&pages, html::Mode::Page);
+        let live_html = html::assemble(
+            live_body,
+            html::Mode::Page,
+            false,
+            &[],
+            &image_uris,
+            false,
+        );
+        assert_eq!(
+            ids_in_fragment(&live_html)
+                .into_iter()
+                .filter(|id| id.starts_with("tab-"))
+                .collect::<Vec<_>>(),
+            ["tab-3", "tab-3-2", "tab-3-2-2"]
+        );
+        let model = DocModel {
+            schema_version: SCHEMA_VERSION,
+            source: Source {
+                file: "x.pdf".into(),
+                sha256: "ab".into(),
+                pages: 1,
+                distillpdf: "0".into(),
+                generated_at: "t".into(),
+            },
+            metadata: Metadata::default(),
+            pages: vec![Page {
+                n: 1,
+                width_pts: crate::pdfobj::DEFAULT_PAGE_PTS.0,
+                height_pts: crate::pdfobj::DEFAULT_PAGE_PTS.1,
+                labels: BTreeMap::new(),
+                ocr_decision: None,
+                active_ocr_pass: None,
+            }],
+            ocr_passes: Vec::new(),
+            sections: Vec::new(),
+            indexes: derive_indexes(&blocks),
+            blocks,
+            assets: Vec::new(),
+            chunks: None,
+            embedding_spaces: Vec::new(),
+            links: Vec::new(),
+            named_dests: Vec::new(),
+            toc: Vec::new(),
+        };
+        let model_html = crate::model::render::render_html(&model, html::Mode::Page, false);
+        assert_eq!(model_html, live_html);
+        let live_markdown = crate::markdown::html_to_markdown(
+            &live_html,
+            false,
+            crate::markdown::ImgMode::Placeholder,
+        )
+        .0;
+        let model_markdown = crate::model::render::render_markdown(
+            &model,
+            html::Mode::Page,
+            false,
+            "drop",
+        )
+        .unwrap()
+        .0;
+        assert_eq!(model_markdown, live_markdown);
     }
 
     #[test]
@@ -987,7 +1296,7 @@ mod tests {
         // "\u{FFFD}\u{FFFD}\0A\0p…" and every label in the range was unusable.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/pagelabels.pdf");
         let doc = Document::load(path).expect("pagelabels.pdf fixture must load");
-        let labels = page_labels(&doc, 6);
+        let labels = page_labels(&crate::access::test_adapter(&doc), 6);
         assert_eq!(labels.get(&1).map(String::as_str), Some("i"));
         assert_eq!(labels.get(&4).map(String::as_str), Some("2"));
         assert_eq!(labels.get(&5).map(String::as_str), Some("Apêndice 1"), "UTF-16BE /P prefix mangled");

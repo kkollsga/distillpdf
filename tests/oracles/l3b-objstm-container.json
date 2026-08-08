@@ -1,0 +1,706 @@
+{
+  "fixtures": [
+    {
+      "bytes": 802,
+      "facts": {
+        "containers": [
+          6
+        ],
+        "decoded_lengths": [
+          51
+        ],
+        "encoded_lengths": [
+          51
+        ],
+        "encoding": "plain",
+        "expected_preparation": "ready",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-plain.pdf",
+      "sha256": "db1f91e1639a0902c6e0b209d04392213b47949a17d9ead46bbcd148f2048191",
+      "startxref": 563
+    },
+    {
+      "bytes": 824,
+      "facts": {
+        "containers": [
+          6
+        ],
+        "decoded_lengths": [
+          51
+        ],
+        "encoded_lengths": [
+          52
+        ],
+        "encoding": "flate",
+        "expected_preparation": "ready",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-flate.pdf",
+      "sha256": "d5dbce398d0c7e28774406d95752589589d81b3200452eec3915ab7f66b750c5",
+      "startxref": 585
+    },
+    {
+      "bytes": 937,
+      "facts": {
+        "containers": [
+          6,
+          9
+        ],
+        "decoded_lengths": [
+          51,
+          29
+        ],
+        "encoded_lengths": [
+          51,
+          29
+        ],
+        "encoding": "plain",
+        "expected_preparation": "ready-both",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          },
+          {
+            "container": 9,
+            "index": 0,
+            "object": 10
+          }
+        ]
+      },
+      "name": "objstm-two-containers.pdf",
+      "sha256": "bf4e26ed62a10f122717bc87896d0f149482339a45275905f8660666d2450019",
+      "startxref": 675
+    },
+    {
+      "bytes": 722,
+      "facts": {
+        "containers": [
+          6
+        ],
+        "decoded_lengths": [
+          0
+        ],
+        "encoded_lengths": [
+          0
+        ],
+        "encoding": "none",
+        "expected_preparation": "container-not-stream",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-container-nonstream.pdf",
+      "sha256": "7905279dd0a85b6d33eabcf00f1a6a58da9d3ce7251955b74460c9bb78afdb57",
+      "startxref": 483
+    },
+    {
+      "bytes": 793,
+      "facts": {
+        "containers": [
+          6
+        ],
+        "decoded_lengths": [
+          51
+        ],
+        "encoded_lengths": [
+          51
+        ],
+        "encoding": "plain",
+        "expected_preparation": "first-missing",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-first-missing.pdf",
+      "sha256": "99f1c309602b0ddfbb71d76d8a258f8903ea1c57dd63df5212cbd090de63722b",
+      "startxref": 554
+    },
+    {
+      "bytes": 803,
+      "facts": {
+        "containers": [
+          6
+        ],
+        "decoded_lengths": [
+          51
+        ],
+        "encoded_lengths": [
+          51
+        ],
+        "encoding": "plain",
+        "expected_preparation": "first-negative",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-first-negative.pdf",
+      "sha256": "aff5495f9b6a32adfb43bb1889696d572945c6bda9b6be8cf4f09b70ed0d3eba",
+      "startxref": 564
+    },
+    {
+      "bytes": 803,
+      "facts": {
+        "containers": [
+          6
+        ],
+        "decoded_lengths": [
+          51
+        ],
+        "encoded_lengths": [
+          51
+        ],
+        "encoding": "plain",
+        "expected_preparation": "first-past-end",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-first-past-end.pdf",
+      "sha256": "9101d43361f23bc50279938fa957899204c963b5520f00f6aadd65404c1d02fe",
+      "startxref": 564
+    },
+    {
+      "bytes": 797,
+      "facts": {
+        "containers": [
+          6
+        ],
+        "decoded_lengths": [
+          51
+        ],
+        "encoded_lengths": [
+          51
+        ],
+        "encoding": "plain",
+        "expected_preparation": "n-missing",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-n-missing.pdf",
+      "sha256": "475535b6f7c13b5c7cb7c936f11103389346fcafc7271a9d8c378362b68b4d34",
+      "startxref": 558
+    },
+    {
+      "bytes": 803,
+      "facts": {
+        "containers": [
+          6
+        ],
+        "decoded_lengths": [
+          51
+        ],
+        "encoded_lengths": [
+          51
+        ],
+        "encoding": "plain",
+        "expected_preparation": "n-negative",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-n-negative.pdf",
+      "sha256": "94e01de639d255250ad031619f188469e1ba84438ed2854050ffee8cd83afde0",
+      "startxref": 564
+    },
+    {
+      "bytes": 807,
+      "facts": {
+        "containers": [
+          6
+        ],
+        "decoded_lengths": [
+          51
+        ],
+        "encoded_lengths": [
+          51
+        ],
+        "encoding": "plain",
+        "expected_preparation": "n-over-131072",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-n-over-131072.pdf",
+      "sha256": "f3fc519ddfb976a18b0d11e21222464103a31d2a57cdf9b3565e1b554025cc2b",
+      "startxref": 568
+    },
+    {
+      "bytes": 842,
+      "facts": {
+        "containers": [
+          6
+        ],
+        "decoded_lengths": [
+          51
+        ],
+        "encoded_lengths": [
+          52
+        ],
+        "encoding": "filter-chain",
+        "expected_preparation": "unsupported-filter",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-filter-chain.pdf",
+      "sha256": "4692f5889560d0b703af429ac88370d0ce4f2575236fcec3d539bfc62f9e8846",
+      "startxref": 603
+    },
+    {
+      "bytes": 857,
+      "facts": {
+        "containers": [
+          6
+        ],
+        "decoded_lengths": [
+          51
+        ],
+        "encoded_lengths": [
+          52
+        ],
+        "encoding": "flate-predictor-12",
+        "expected_preparation": "unsupported-filter",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-predictor.pdf",
+      "sha256": "529e0ad03599d1ba40aa958e8199f4929f7017dd3c12d8144fbddb144fe5e45d",
+      "startxref": 618
+    },
+    {
+      "bytes": 799,
+      "facts": {
+        "containers": [
+          6
+        ],
+        "decoded_lengths": [
+          0
+        ],
+        "encoded_lengths": [
+          27
+        ],
+        "encoding": "flate-corrupt",
+        "expected_preparation": "selected-member-absent-after-corrupt-flate",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-flate-corrupt.pdf",
+      "sha256": "852fc8497f8126d05a1489665d3e220ecb84ef2019f7f6ac88a6701ebaf3ef28",
+      "startxref": 560
+    },
+    {
+      "bytes": 791,
+      "facts": {
+        "containers": [
+          6
+        ],
+        "decoded_lengths": [
+          51
+        ],
+        "encoded_lengths": [
+          51
+        ],
+        "encoding": "plain",
+        "expected_preparation": "unsupported-length",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-length-missing.pdf",
+      "sha256": "bac4ff916e5a800718b346131e7d3f8587131a9687a19eeaa3bc50b741ad65a7",
+      "startxref": 552
+    },
+    {
+      "bytes": 802,
+      "facts": {
+        "containers": [
+          6
+        ],
+        "decoded_lengths": [
+          51
+        ],
+        "encoded_lengths": [
+          51
+        ],
+        "encoding": "plain",
+        "expected_preparation": "unsupported-length",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-length-negative.pdf",
+      "sha256": "488299ea168d5637aafede31b32fbbd9e46b6994da57a1aec4748401d3c92d0d",
+      "startxref": 563
+    },
+    {
+      "bytes": 806,
+      "facts": {
+        "containers": [
+          6
+        ],
+        "decoded_lengths": [
+          51
+        ],
+        "encoded_lengths": [
+          51
+        ],
+        "encoding": "plain",
+        "expected_preparation": "unsupported-length",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-length-indirect-missing.pdf",
+      "sha256": "62756d421665f9bdc2d5881d70f23cc29512a3af000f561a0daccc0e519a16e1",
+      "startxref": 567
+    },
+    {
+      "bytes": 792,
+      "facts": {
+        "containers": [
+          6
+        ],
+        "decoded_lengths": [
+          51
+        ],
+        "encoded_lengths": [
+          51
+        ],
+        "encoding": "plain",
+        "expected_preparation": "missing-endstream",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-endstream-missing.pdf",
+      "sha256": "f063c3f9fd0ed0c6b549c3a95e89dde8e2386e19b2b47be3989f9e00a828ac51",
+      "startxref": 553
+    },
+    {
+      "bytes": 798,
+      "facts": {
+        "containers": [
+          6
+        ],
+        "decoded_lengths": [
+          51
+        ],
+        "encoded_lengths": [
+          51
+        ],
+        "encoding": "plain",
+        "expected_preparation": "missing-endstream",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-endstream-truncated.pdf",
+      "sha256": "b03c184e8e04a96298f6df461c109a07c6ab0c8edfa1647be8083a5b10cc977e",
+      "startxref": 559
+    },
+    {
+      "bytes": 802,
+      "facts": {
+        "containers": [
+          6
+        ],
+        "decoded_lengths": [
+          51
+        ],
+        "encoded_lengths": [
+          51
+        ],
+        "encoding": "plain",
+        "expected_preparation": "generation-mismatch-on-6-1",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 6,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 6,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-container-generation.pdf",
+      "sha256": "db1f91e1639a0902c6e0b209d04392213b47949a17d9ead46bbcd148f2048191",
+      "startxref": 563
+    },
+    {
+      "bytes": 9175,
+      "facts": {
+        "containers": [
+          6,
+          10
+        ],
+        "decoded_lengths": [
+          50,
+          51
+        ],
+        "encoded_lengths": [
+          50,
+          51
+        ],
+        "encoding": "plain",
+        "expected_preparation": "declared-container-10-only",
+        "storage": "generated-small",
+        "xref_declarations": [
+          {
+            "container": 10,
+            "index": 0,
+            "object": 7
+          },
+          {
+            "container": 10,
+            "index": 1,
+            "object": 8
+          }
+        ]
+      },
+      "name": "objstm-xref-authority.pdf",
+      "sha256": "35b7c847887b334aaa11e1d6f90161056e6c28ab590fe5016c414fc24656d0ee",
+      "startxref": 8912
+    },
+    {
+      "bytes": 1128,
+      "facts": {
+        "cipher": "RC4-128",
+        "containers": [
+          2
+        ],
+        "decoded_lengths": [
+          252
+        ],
+        "encoded_lengths": [
+          182
+        ],
+        "encoding": "flate-encrypted-r4-rc4",
+        "encrypt_metadata": false,
+        "encrypted": true,
+        "encryption_revision": 4,
+        "expected_preparation": "ready",
+        "generator": "pikepdf-10.7.3/libqpdf-12.3.2",
+        "owner_password": "owner",
+        "storage": "committed-small",
+        "user_password": "",
+        "xref_declarations": [
+          {
+            "container": 2,
+            "index": 0,
+            "object": 3
+          },
+          {
+            "container": 2,
+            "index": 1,
+            "object": 4
+          },
+          {
+            "container": 2,
+            "index": 2,
+            "object": 5
+          },
+          {
+            "container": 2,
+            "index": 3,
+            "object": 6
+          }
+        ]
+      },
+      "name": "objstm-r4-rc4.pdf",
+      "sha256": "afadac4e544281ce0abf12f459f1927da983469a2cc40c2a0c1f7d26f2894694",
+      "startxref": 817
+    }
+  ],
+  "profile": "objstm-container",
+  "schema": 1
+}

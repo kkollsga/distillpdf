@@ -6,15 +6,20 @@
 //! typed [`DistillOptions`]. NO pyo3 appears here — the binding does all Python-object
 //! assembly and maps [`Error`] → `PyValueError`.
 
-use lopdf::dictionary;
-use lopdf::Document;
+use lopdf::{BytesSource, Document, FileSource, RandomAccessSource, SourceError, SourceResult};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::access::{
+    AccessError, DocumentAccess, EagerDocumentAdapter, IndexedAdapterCounters,
+    IndexedDocumentAdapter, PageRef,
+};
 use crate::error::Error;
 use crate::extract::{self, FontInfo, ImageInfo, TableInfo};
+use crate::table::AnalyzedTable;
 use crate::model::container::AssetBytes;
 use crate::model::{self, AssetProfile, DocModel};
 use crate::{frontmatter, html, links, markdown, nav, ocr, text};
@@ -99,13 +104,353 @@ pub struct OcrPlanEntry {
 
 /// A loaded PDF document — the reusable pure-Rust handle.
 pub struct PdfDocument {
-    pub(crate) doc: Document,
-    /// Raw PDF bytes, kept for lenient recovery of malformed streams.
-    pub(crate) raw: Vec<u8>,
+    /// Runtime-selectable immutable access route. L2 uses the eager oracle adapter; L3 adds
+    /// the bounded indexed implementation without reopening consumer signatures.
+    pub(crate) access: Arc<dyn DocumentAccess>,
+    /// Route provenance for this handle. The write side is live (both engines populate it);
+    /// the read side is crate-internal and has test/measurement callers only.
+    #[allow(dead_code)]
+    diagnostics: Arc<RouteDiagnostics>,
     /// Source path (`open`); `None` when constructed from bytes.
     pub(crate) source: Option<PathBuf>,
     /// Cached OCR results: `{1-based page: DocTags}`, populated once by `set_ocr`.
     pub(crate) ocr_cache: Mutex<HashMap<u32, String>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OpenRoute {
+    EagerFile,
+    EagerBytes,
+    IndexedFile,
+    IndexedBytes,
+    IndexedSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OpenReason {
+    PublicCompatibility,
+    InternalMeasurement,
+    ExplicitSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceMode {
+    FileDescriptor,
+    SharedBytes,
+    EagerMaterializedFile,
+    FullSnapshot,
+}
+
+#[derive(Default)]
+struct RouteSourceCounters {
+    requests: AtomicU64,
+    reads: AtomicU64,
+    max_request: AtomicU64,
+}
+
+struct ObservedSource {
+    inner: Arc<dyn RandomAccessSource>,
+    counters: Arc<RouteSourceCounters>,
+}
+
+impl RandomAccessSource for ObservedSource {
+    fn len(&self) -> SourceResult<u64> {
+        self.counters.requests.fetch_add(1, Ordering::Relaxed);
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> SourceResult<usize> {
+        const PHYSICAL_READ_BYTES: usize = 64 * 1024;
+        let mut read = 0;
+        while read < out.len() {
+            let request = (out.len() - read).min(PHYSICAL_READ_BYTES);
+            let physical_offset = offset.checked_add(read as u64).ok_or(
+                SourceError::RangeOverflow {
+                    offset,
+                    length: out.len() as u64,
+                },
+            )?;
+            self.counters.requests.fetch_add(1, Ordering::Relaxed);
+            self.counters.reads.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .max_request
+                .fetch_max(request as u64, Ordering::Relaxed);
+            let actual = self
+                .inner
+                .read_at(physical_offset, &mut out[read..read + request])?;
+            if actual > request {
+                return Err(SourceError::InvalidReadCount {
+                    returned: actual,
+                    buffer_len: request,
+                });
+            }
+            read += actual;
+            if actual < request {
+                break;
+            }
+        }
+        Ok(read)
+    }
+
+    fn validate_unchanged(&self) -> SourceResult<()> {
+        self.counters.requests.fetch_add(1, Ordering::Relaxed);
+        self.inner.validate_unchanged()
+    }
+}
+
+pub(crate) struct RouteDiagnostics {
+    pub(crate) route: OpenRoute,
+    #[allow(dead_code)] // reported through `snapshot`, which only tests/measurement read
+    pub(crate) reason: OpenReason,
+    #[allow(dead_code)] // reported through `snapshot`, which only tests/measurement read
+    pub(crate) source_mode: SourceMode,
+    eager_opens: AtomicU64,
+    indexed_opens: AtomicU64,
+    fallback_opens: AtomicU64,
+    source: Arc<RouteSourceCounters>,
+    indexed: OnceLock<Arc<IndexedAdapterCounters>>,
+}
+
+/// Read-side view of [`RouteDiagnostics`]. Populated by live code; consumed only by tests and
+/// the internal measurement harness, so it reads as dead in a plain build.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RouteDiagnosticsSnapshot {
+    pub(crate) route: OpenRoute,
+    pub(crate) reason: OpenReason,
+    pub(crate) source_mode: SourceMode,
+    pub(crate) eager_opens: u64,
+    pub(crate) indexed_opens: u64,
+    pub(crate) fallback_opens: u64,
+    pub(crate) source_requests: u64,
+    pub(crate) source_reads: u64,
+    pub(crate) source_max_request: u64,
+    pub(crate) page_map_builds: u64,
+    pub(crate) index_estimated_bytes: u64,
+    pub(crate) index_objects: u64,
+    pub(crate) index_pages: u64,
+}
+
+impl RouteDiagnostics {
+    fn new(route: OpenRoute, reason: OpenReason, source_mode: SourceMode) -> Arc<Self> {
+        Arc::new(Self {
+            route,
+            reason,
+            source_mode,
+            eager_opens: AtomicU64::new(0),
+            indexed_opens: AtomicU64::new(0),
+            fallback_opens: AtomicU64::new(0),
+            source: Arc::new(RouteSourceCounters::default()),
+            indexed: OnceLock::new(),
+        })
+    }
+
+    #[allow(dead_code)] // diagnostics read side: tests and the internal measurement harness
+    pub(crate) fn snapshot(&self) -> RouteDiagnosticsSnapshot {
+        let indexed = self.indexed.get();
+        RouteDiagnosticsSnapshot {
+            route: self.route,
+            reason: self.reason,
+            source_mode: self.source_mode,
+            eager_opens: self.eager_opens.load(Ordering::Relaxed),
+            indexed_opens: self.indexed_opens.load(Ordering::Relaxed),
+            fallback_opens: self.fallback_opens.load(Ordering::Relaxed),
+            source_requests: self.source.requests.load(Ordering::Relaxed),
+            source_reads: self.source.reads.load(Ordering::Relaxed),
+            source_max_request: self.source.max_request.load(Ordering::Relaxed),
+            page_map_builds: indexed.map_or(0, |counters| {
+                counters.page_map_builds.load(Ordering::Relaxed)
+            }),
+            index_estimated_bytes: indexed.map_or(0, |counters| {
+                counters.index_estimated_bytes.load(Ordering::Relaxed)
+            }),
+            index_objects: indexed
+                .map_or(0, |counters| counters.index_objects.load(Ordering::Relaxed)),
+            index_pages: indexed
+                .map_or(0, |counters| counters.index_pages.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+#[allow(dead_code)] // payloads exist for the `Debug` report the strict selector surfaces
+#[derive(Debug)]
+pub(crate) enum RouteFailure {
+    Source(SourceError),
+    Access(AccessError),
+}
+
+pub(crate) struct RouteOpenError {
+    pub(crate) failure: RouteFailure,
+    pub(crate) diagnostics: Arc<RouteDiagnostics>,
+}
+
+impl std::fmt::Debug for RouteOpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RouteOpenError")
+            .field("failure", &self.failure)
+            .field("route", &self.diagnostics.route)
+            .finish()
+    }
+}
+
+pub(crate) struct IndexedOpenControl {
+    access: Arc<IndexedDocumentAdapter>,
+    diagnostics: Arc<RouteDiagnostics>,
+    source_owner: Option<Arc<[u8]>>,
+}
+
+#[allow(dead_code)] // pre-adoption inspection helpers; used by tests and measurement
+impl IndexedOpenControl {
+    pub(crate) fn diagnostics(&self) -> RouteDiagnosticsSnapshot {
+        self.diagnostics.snapshot()
+    }
+
+    pub(crate) fn pages(&self) -> Result<Vec<PageRef>, AccessError> {
+        self.access.pages()
+    }
+
+    pub(crate) fn source_sha256(&self) -> Result<String, AccessError> {
+        self.access.source_sha256()
+    }
+
+    #[cfg(test)]
+    fn shared_bytes(&self) -> Option<&Arc<[u8]>> {
+        self.source_owner.as_ref()
+    }
+
+    #[cfg(test)]
+    fn check_page_content(&self, page: lopdf::ObjectId) -> Result<(), AccessError> {
+        self.access.page_content(page).map(|_| ())
+    }
+
+    #[cfg(test)]
+    fn checked_page_content_matches(
+        &self,
+        page: lopdf::ObjectId,
+        expected: &[u8],
+    ) -> Result<bool, AccessError> {
+        self.access
+            .page_content(page)
+            .map(|content| content.as_ref() == expected)
+    }
+
+    #[cfg(test)]
+    fn checked_recovered_stream_matches(
+        &self,
+        object: u32,
+        expected: &[u8],
+    ) -> Result<bool, AccessError> {
+        self.access
+            .recover_source_stream(object)
+            .map(|stream| stream.is_some_and(|stream| stream.as_ref() == expected))
+    }
+
+    #[cfg(test)]
+    fn checked_fingerprint(&self) -> Result<String, AccessError> {
+        checked_access_fingerprint(self.access.as_ref())
+    }
+}
+
+#[cfg(test)]
+fn canonical_object(value: &lopdf::Object, output: &mut Vec<u8>) {
+    use lopdf::Object;
+    match value {
+        Object::Null => output.extend_from_slice(b"null;"),
+        Object::Boolean(value) => output.extend_from_slice(if *value { b"true;" } else { b"false;" }),
+        Object::Integer(value) => output.extend_from_slice(format!("i{value};").as_bytes()),
+        Object::Real(value) => output.extend_from_slice(format!("r{value:?};").as_bytes()),
+        Object::Name(value) => {
+            output.extend_from_slice(b"n");
+            output.extend_from_slice(format!("{}:", value.len()).as_bytes());
+            output.extend_from_slice(value);
+        }
+        Object::String(value, format) => {
+            output.extend_from_slice(format!("s{format:?}:{}:", value.len()).as_bytes());
+            output.extend_from_slice(value);
+        }
+        Object::Array(values) => {
+            output.extend_from_slice(format!("a{}[", values.len()).as_bytes());
+            for value in values {
+                canonical_object(value, output);
+            }
+            output.extend_from_slice(b"]");
+        }
+        Object::Dictionary(dictionary) => canonical_dictionary(dictionary, output),
+        Object::Stream(stream) => {
+            output.extend_from_slice(b"stream{");
+            canonical_dictionary(&stream.dict, output);
+            output.extend_from_slice(format!("bytes{}:", stream.content.len()).as_bytes());
+            output.extend_from_slice(&stream.content);
+            output.extend_from_slice(b"}");
+        }
+        Object::Reference((object, generation)) => {
+            output.extend_from_slice(format!("ref{object}:{generation};").as_bytes());
+        }
+    }
+}
+
+#[cfg(test)]
+fn canonical_dictionary(dictionary: &lopdf::Dictionary, output: &mut Vec<u8>) {
+    let mut entries: Vec<_> = dictionary.iter().collect();
+    entries.sort_by(|left, right| left.0.cmp(right.0));
+    output.extend_from_slice(format!("d{}{{", entries.len()).as_bytes());
+    for (key, value) in entries {
+        output.extend_from_slice(format!("k{}:", key.len()).as_bytes());
+        output.extend_from_slice(key);
+        canonical_object(value, output);
+    }
+    output.extend_from_slice(b"}");
+}
+
+#[cfg(test)]
+fn checked_access_fingerprint(access: &dyn DocumentAccess) -> Result<String, AccessError> {
+    use sha2::{Digest, Sha256};
+
+    let mut canonical = Vec::new();
+    {
+        let root = access.trailer_entry(b"Root")?;
+        canonical.extend_from_slice(b"trailer-root:");
+        root.read(|value| canonical_object(value, &mut canonical))?;
+    }
+
+    let catalog = access.catalog()?;
+    canonical.extend_from_slice(b"catalog:");
+    catalog.read(|dictionary| canonical_dictionary(dictionary, &mut canonical))?;
+    if catalog.read(|dictionary| dictionary.has(b"Probe"))? {
+        canonical.extend_from_slice(b"probe:");
+        catalog
+            .entry(access, b"Probe")?
+            .read(|value| canonical_object(value, &mut canonical))?;
+    }
+
+    let object_ids = access.object_ids();
+    canonical.extend_from_slice(format!("objects{}:", object_ids.len()).as_bytes());
+    for (object, generation) in object_ids {
+        canonical.extend_from_slice(format!("{object}:{generation};").as_bytes());
+    }
+
+    let pages = access.pages()?;
+    canonical.extend_from_slice(format!("pages{}:", pages.len()).as_bytes());
+    for page in pages {
+        canonical.extend_from_slice(
+            format!("page{}@{}:{};", page.number, page.id.0, page.id.1).as_bytes(),
+        );
+        let content = access.page_content(page.id)?;
+        canonical.extend_from_slice(format!("content{}:", content.len()).as_bytes());
+        canonical.extend_from_slice(content.as_ref());
+
+        let resources = access.page_resource_chain(page.id)?;
+        canonical.extend_from_slice(format!("resources{}:", resources.len()).as_bytes());
+        for resource in resources {
+            resource.read(|dictionary| canonical_dictionary(dictionary, &mut canonical))?;
+        }
+
+        let fallback = access.fallback_page_text(page.number)?;
+        canonical.extend_from_slice(format!("text{}:", fallback.len()).as_bytes());
+        canonical.extend_from_slice(fallback.as_bytes());
+    }
+    Ok(format!("{:x}", Sha256::digest(canonical)))
 }
 
 /// A private one-thread rayon pool, used for **nothing but** `Document::load_mem`.
@@ -193,7 +538,7 @@ fn load_mem_with_pool(
 /// directly reintroduces the race. Pool creation therefore fails closed: a thread-spawn
 /// failure is returned to the caller and a later load may retry, but the known-racy unscoped
 /// loader is never used.
-fn load_mem_deterministic(raw: &[u8]) -> Result<Document, lopdf::Error> {
+pub(crate) fn load_mem_deterministic(raw: &[u8]) -> Result<Document, lopdf::Error> {
     static POOL: LoadPool = LoadPool::new();
     load_mem_with_pool(raw, &POOL, || {
         rayon::ThreadPoolBuilder::new()
@@ -201,6 +546,15 @@ fn load_mem_deterministic(raw: &[u8]) -> Result<Document, lopdf::Error> {
             .thread_name(|_| "distillpdf-load".to_string())
             .build()
     })
+}
+
+/// Lopdf-0.44-compatible display for public errors whose nested cause the fork redacts.
+fn eager_error_message(error: &lopdf::Error) -> String {
+    match error {
+        lopdf::Error::Parse(source) => format!("couldn't parse input: {source}"),
+        lopdf::Error::IO(source) => format!("IO error: {source}"),
+        other => other.to_string(),
+    }
 }
 
 /// The trailer key whose value is the encryption dictionary.
@@ -328,26 +682,304 @@ fn ensure_decrypted(raw: &[u8], doc: &mut Document) -> Result<(), Error> {
     Ok(())
 }
 
+/// Which access engine the public constructors build — **internal and unstable**.
+///
+/// Selected once per process by the `DISTILLPDF_ENGINE` environment variable. This is not
+/// public API: it exists so Phase B can run the existing suites and the corpus measurement
+/// harness over the bounded indexed route without changing what a released build does. The
+/// default — and the value for every unset/unrecognised string — is [`EngineSelection::Eager`],
+/// so published behaviour is untouched.
+///
+/// * unset / anything else — [`EngineSelection::Eager`], the eager `lopdf::Document` route.
+/// * `indexed` — the bounded indexed route, with an **explicit, counted** eager fallback when
+///   the indexed open itself fails (xref recovery, an encryption shape the index cannot take,
+///   a bounded-decode envelope refusal). The fallback is recorded in the resulting document's
+///   [`RouteDiagnostics::fallback_opens`]; it is never silent.
+/// * `indexed-strict` — the same route with the fallback *disabled*, so an indexed open failure
+///   surfaces as [`Error::Open`]. Measurement uses this to tell a true-indexed run from a run
+///   that quietly ended up on the eager engine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EngineSelection {
+    Eager,
+    Indexed,
+    IndexedStrict,
+}
+
+impl EngineSelection {
+    fn prefers_indexed(self) -> bool {
+        !matches!(self, EngineSelection::Eager)
+    }
+}
+
+/// The `DISTILLPDF_ENGINE` grammar, as a pure function so it is testable without the process
+/// environment. Unset and every unrecognised value mean eager — the selector can only ever be
+/// turned on deliberately.
+fn parse_engine_selection(value: Option<&str>) -> EngineSelection {
+    match value {
+        Some("indexed") => EngineSelection::Indexed,
+        Some("indexed-strict") => EngineSelection::IndexedStrict,
+        _ => EngineSelection::Eager,
+    }
+}
+
+/// Read `DISTILLPDF_ENGINE` once per process. Internal/unstable — see [`EngineSelection`].
+fn engine_selection() -> EngineSelection {
+    static SELECTION: OnceLock<EngineSelection> = OnceLock::new();
+    *SELECTION.get_or_init(|| {
+        parse_engine_selection(std::env::var("DISTILLPDF_ENGINE").ok().as_deref())
+    })
+}
+
+fn open_indexed_source(
+    source: Arc<dyn RandomAccessSource>,
+    source_owner: Option<Arc<[u8]>>,
+    diagnostics: Arc<RouteDiagnostics>,
+    password: Option<Vec<u8>>,
+) -> Result<IndexedOpenControl, RouteOpenError> {
+    diagnostics.indexed_opens.store(1, Ordering::Relaxed);
+    let observed: Arc<dyn RandomAccessSource> = Arc::new(ObservedSource {
+        inner: source,
+        counters: Arc::clone(&diagnostics.source),
+    });
+    let access = IndexedDocumentAdapter::open(observed, password).map_err(|failure| {
+        RouteOpenError {
+            failure: RouteFailure::Access(failure),
+            diagnostics: Arc::clone(&diagnostics),
+        }
+    })?;
+    let access = Arc::new(access);
+    assert!(
+        diagnostics.indexed.set(access.counters()).is_ok(),
+        "route diagnostics indexed counters are assigned once"
+    );
+    Ok(IndexedOpenControl {
+        access,
+        diagnostics,
+        source_owner,
+    })
+}
+
+pub(crate) fn open_indexed_file_internal(
+    path: &Path,
+    password: Option<Vec<u8>>,
+) -> Result<IndexedOpenControl, RouteOpenError> {
+    let diagnostics = RouteDiagnostics::new(
+        OpenRoute::IndexedFile,
+        OpenReason::InternalMeasurement,
+        SourceMode::FileDescriptor,
+    );
+    let source: Arc<dyn RandomAccessSource> = Arc::new(FileSource::open(path).map_err(|failure| {
+        RouteOpenError {
+            failure: RouteFailure::Source(failure),
+            diagnostics: Arc::clone(&diagnostics),
+        }
+    })?);
+    open_indexed_source(
+        source,
+        None,
+        diagnostics,
+        password,
+    )
+}
+
+pub(crate) fn open_indexed_bytes_internal(
+    bytes: Arc<[u8]>,
+    password: Option<Vec<u8>>,
+) -> Result<IndexedOpenControl, RouteOpenError> {
+    let diagnostics = RouteDiagnostics::new(
+        OpenRoute::IndexedBytes,
+        OpenReason::InternalMeasurement,
+        SourceMode::SharedBytes,
+    );
+    let source: Arc<dyn RandomAccessSource> = Arc::new(BytesSource::new(Arc::clone(&bytes)));
+    open_indexed_source(
+        source,
+        Some(bytes),
+        diagnostics,
+        password,
+    )
+}
+
+#[allow(dead_code)] // the only indexed route authorized to materialize a complete file
+pub(crate) fn open_indexed_snapshot_internal(
+    path: &Path,
+    password: Option<Vec<u8>>,
+) -> Result<IndexedOpenControl, RouteOpenError> {
+    let diagnostics = RouteDiagnostics::new(
+        OpenRoute::IndexedSnapshot,
+        OpenReason::ExplicitSnapshot,
+        SourceMode::FullSnapshot,
+    );
+    let bytes: Arc<[u8]> = std::fs::read(path)
+        .map_err(SourceError::Io)
+        .map_err(|failure| RouteOpenError {
+            failure: RouteFailure::Source(failure),
+            diagnostics: Arc::clone(&diagnostics),
+        })?
+        .into();
+    let source: Arc<dyn RandomAccessSource> = Arc::new(BytesSource::new(Arc::clone(&bytes)));
+    open_indexed_source(
+        source,
+        Some(bytes),
+        diagnostics,
+        password,
+    )
+}
+
 impl PdfDocument {
-    /// Open a PDF from a filesystem path. Only loads/parses the container.
-    pub fn open(path: &str) -> Result<Self, Error> {
-        let raw = std::fs::read(path).map_err(Error::Read)?;
-        let mut doc = load_mem_deterministic(&raw).map_err(|e| Error::Open(e.to_string()))?;
+    fn finish_open(
+        access: Arc<dyn DocumentAccess>,
+        diagnostics: Arc<RouteDiagnostics>,
+        source: Option<PathBuf>,
+    ) -> Self {
+        PdfDocument {
+            access,
+            diagnostics,
+            source,
+            ocr_cache: Default::default(),
+        }
+    }
+
+    fn finish_eager_open(
+        doc: Document,
+        raw: Arc<[u8]>,
+        source: Option<PathBuf>,
+        diagnostics: Arc<RouteDiagnostics>,
+        make_access: impl FnOnce(Arc<Document>, Arc<[u8]>) -> Arc<dyn DocumentAccess>,
+    ) -> Self {
+        let doc = Arc::new(doc);
+        let access = make_access(Arc::clone(&doc), raw);
+        Self::finish_open(access, diagnostics, source)
+    }
+
+    /// Adopt a successful indexed open as the document's access route.
+    ///
+    /// The control's `source_owner` is only the *second* handle on the shared bytes — the
+    /// `BytesSource` inside the adapter holds its own — so the handle is dropped here rather
+    /// than adding a byte-retaining field to [`PdfDocument`].
+    fn finish_indexed_open(control: IndexedOpenControl, source: Option<PathBuf>) -> Self {
+        let IndexedOpenControl { access, diagnostics, source_owner } = control;
+        drop(source_owner);
+        Self::finish_open(access, diagnostics, source)
+    }
+
+    /// Decide what an indexed open failure means for the selected engine: `Err` under
+    /// `indexed-strict`, `Ok(())` ("fall back, and count it") under `indexed`.
+    fn indexed_failure_disposition(error: RouteOpenError) -> Result<(), Error> {
+        if engine_selection() == EngineSelection::IndexedStrict {
+            return Err(Error::Open(format!(
+                "DISTILLPDF_ENGINE=indexed-strict: indexed open failed: {:?}",
+                error.failure
+            )));
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)] // access-injection seam for tests; production uses `from_bytes`
+    fn from_bytes_with_access_factory(
+        data: &[u8],
+        make_access: impl FnOnce(Arc<Document>, Arc<[u8]>) -> Arc<dyn DocumentAccess>,
+    ) -> Result<Self, Error> {
+        Self::from_bytes_eager(data, make_access, false)
+    }
+
+    fn from_bytes_eager(
+        data: &[u8],
+        make_access: impl FnOnce(Arc<Document>, Arc<[u8]>) -> Arc<dyn DocumentAccess>,
+        after_indexed_failure: bool,
+    ) -> Result<Self, Error> {
+        let diagnostics = RouteDiagnostics::new(
+            OpenRoute::EagerBytes,
+            OpenReason::PublicCompatibility,
+            SourceMode::SharedBytes,
+        );
+        diagnostics.eager_opens.store(1, Ordering::Relaxed);
+        if after_indexed_failure {
+            diagnostics.fallback_opens.store(1, Ordering::Relaxed);
+        }
+        let raw: Arc<[u8]> = Arc::from(data);
+        let mut doc = load_mem_deterministic(&raw)
+            .map_err(|error| Error::Parse(eager_error_message(&error)))?;
         ensure_decrypted(&raw, &mut doc)?;
-        Ok(PdfDocument { doc, raw, source: Some(PathBuf::from(path)), ocr_cache: Default::default() })
+        Ok(Self::finish_eager_open(
+            doc,
+            raw,
+            None,
+            diagnostics,
+            make_access,
+        ))
+    }
+
+    /// Open a PDF from a filesystem path. Only loads/parses the container.
+    ///
+    /// Eager by default; `DISTILLPDF_ENGINE=indexed` routes through the bounded indexed engine
+    /// with a counted eager fallback (internal/unstable — see [`EngineSelection`]).
+    pub fn open(path: &str) -> Result<Self, Error> {
+        let mut after_indexed_failure = false;
+        if engine_selection().prefers_indexed() {
+            match open_indexed_file_internal(Path::new(path), None) {
+                Ok(control) => {
+                    return Ok(Self::finish_indexed_open(control, Some(PathBuf::from(path))));
+                }
+                Err(error) => {
+                    Self::indexed_failure_disposition(error)?;
+                    after_indexed_failure = true;
+                }
+            }
+        }
+        let diagnostics = RouteDiagnostics::new(
+            OpenRoute::EagerFile,
+            OpenReason::PublicCompatibility,
+            SourceMode::EagerMaterializedFile,
+        );
+        diagnostics.eager_opens.store(1, Ordering::Relaxed);
+        if after_indexed_failure {
+            diagnostics.fallback_opens.store(1, Ordering::Relaxed);
+        }
+        let raw: Arc<[u8]> = std::fs::read(path).map_err(Error::Read)?.into();
+        let mut doc = load_mem_deterministic(&raw).map_err(|e| Error::Open(eager_error_message(&e)))?;
+        ensure_decrypted(&raw, &mut doc)?;
+        Ok(Self::finish_eager_open(
+            doc,
+            raw,
+            Some(PathBuf::from(path)),
+            diagnostics,
+            |document, source| Arc::new(EagerDocumentAdapter::new(document, source)),
+        ))
     }
 
     /// Open a PDF from raw bytes. There is no source path.
+    ///
+    /// Honours the same internal [`EngineSelection`] as [`PdfDocument::open`].
     pub fn from_bytes(data: &[u8]) -> Result<Self, Error> {
-        let raw = data.to_vec();
-        let mut doc = load_mem_deterministic(&raw).map_err(|e| Error::Parse(e.to_string()))?;
-        ensure_decrypted(&raw, &mut doc)?;
-        Ok(PdfDocument { doc, raw, source: None, ocr_cache: Default::default() })
+        let mut after_indexed_failure = false;
+        if engine_selection().prefers_indexed() {
+            match open_indexed_bytes_internal(Arc::from(data), None) {
+                Ok(control) => return Ok(Self::finish_indexed_open(control, None)),
+                Err(error) => {
+                    Self::indexed_failure_disposition(error)?;
+                    after_indexed_failure = true;
+                }
+            }
+        }
+        Self::from_bytes_eager(
+            data,
+            |document, source| Arc::new(EagerDocumentAdapter::new(document, source)),
+            after_indexed_failure,
+        )
+    }
+
+    /// Route provenance for the open that produced this handle — crate-internal, no public
+    /// surface. The `fallback_opens` counter is how a counted eager fallback from the indexed
+    /// selector is observed.
+    #[allow(dead_code)] // diagnostics read side: tests and the internal measurement harness
+    pub(crate) fn route_diagnostics(&self) -> RouteDiagnosticsSnapshot {
+        self.diagnostics.snapshot()
     }
 
     /// Number of pages.
     pub fn page_count(&self) -> usize {
-        self.doc.get_pages().len()
+        self.access.pages().map_or(0, |pages| pages.len())
     }
 
     /// Extract plain text from all pages (concatenated, page order). Hybrid: our
@@ -359,17 +991,17 @@ impl PdfDocument {
     /// loop by construction, not by luck: nothing crosses pages, and the pieces are re-sorted
     /// by page number before they are joined, so completion order is never observed.
     pub fn extract_text(&self) -> String {
-        let pages = self.doc.get_pages();
+        let pages = self.access.pages_or_empty();
         let mut per_page: Vec<(u32, String)> = pages
             .par_iter()
-            .map(|(&p, &page_id)| {
-                let mine = text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default();
+            .map(|page| {
+                let mine = text::extract_page(self.access.as_ref(), page.id).unwrap_or_default();
                 let s = if mine.trim().chars().count() >= 2 {
                     mine
                 } else {
-                    self.doc.extract_text(&[p]).unwrap_or_default() // per-page lopdf fallback
+                    self.access.fallback_page_text_or_empty(page.number)
                 };
-                (p, s)
+                (page.number, s)
             })
             .collect();
         per_page.sort_by_key(|(p, _)| *p);
@@ -383,20 +1015,22 @@ impl PdfDocument {
 
     /// Extract text from a single 1-indexed page (hybrid).
     pub fn extract_page_text(&self, page: u32) -> Result<String, Error> {
-        let page_id = *self.doc.get_pages().get(&page).ok_or(Error::NoPage(Some(page)))?;
-        let mine = text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default();
+        let page_id = self.access.pages_or_empty().into_iter()
+            .find(|entry| entry.number == page).map(|entry| entry.id)
+            .ok_or(Error::NoPage(Some(page)))?;
+        let mine = text::extract_page(self.access.as_ref(), page_id).unwrap_or_default();
         Ok(if mine.trim().chars().count() >= 2 {
             mine
         } else {
-            self.doc.extract_text(&[page]).unwrap_or_default()
+            self.access.fallback_page_text_or_empty(page)
         })
     }
 
     /// Diagnostic: force our ToUnicode extractor for all pages.
     pub fn mine_text(&self) -> String {
         let mut out = String::new();
-        for &page_id in self.doc.get_pages().values() {
-            out.push_str(&text::extract_page(&self.doc, page_id, &self.raw).unwrap_or_default());
+        for page in self.access.pages_or_empty() {
+            out.push_str(&text::extract_page(self.access.as_ref(), page.id).unwrap_or_default());
             out.push('\n');
         }
         out
@@ -404,8 +1038,11 @@ impl PdfDocument {
 
     /// Diagnostic: raw spans (text, x, width, size) for a 1-indexed page.
     pub fn dbg_spans(&self, page: u32) -> Result<Vec<(String, f32, f32, f32)>, Error> {
-        let page_id = *self.doc.get_pages().get(&page).ok_or(Error::NoPage(None))?;
-        Ok(text::extract_spans(&self.doc, page_id, &self.raw)
+        let page_id = self.access.pages_or_empty().into_iter()
+            .find(|entry| entry.number == page).map(|entry| entry.id)
+            .ok_or(Error::NoPage(None))?;
+        Ok(text::extract_spans(self.access.as_ref(), page_id)
+            .map_err(|error| Error::Model(error.to_string()))?
             .into_iter()
             .map(|s| (s.text, s.x, s.width, s.size))
             .collect())
@@ -414,8 +1051,11 @@ impl PdfDocument {
     /// Diagnostic: spans with y for a 1-indexed page (text, x, y, width, size).
     #[allow(clippy::type_complexity)] // a flat diagnostic tuple mirroring the Python `_dbg_spans_xy`
     pub fn dbg_spans_xy(&self, page: u32) -> Result<Vec<(String, f32, f32, f32, f32)>, Error> {
-        let page_id = *self.doc.get_pages().get(&page).ok_or(Error::NoPage(None))?;
-        Ok(text::extract_spans(&self.doc, page_id, &self.raw)
+        let page_id = self.access.pages_or_empty().into_iter()
+            .find(|entry| entry.number == page).map(|entry| entry.id)
+            .ok_or(Error::NoPage(None))?;
+        Ok(text::extract_spans(self.access.as_ref(), page_id)
+            .map_err(|error| Error::Model(error.to_string()))?
             .into_iter()
             .map(|s| (s.text, s.x, s.y, s.width, s.size))
             .collect())
@@ -434,16 +1074,15 @@ impl PdfDocument {
     /// document, so a filter can never quietly start eating real figures.
     pub fn figure_gate_stats(&self) -> (u32, u32, Vec<u32>) {
         let (mut accepted, mut suppressed, mut pages) = (0u32, 0u32, Vec::new());
-        let map = self.doc.get_pages();
-        let mut nums: Vec<u32> = map.keys().copied().collect();
-        nums.sort_unstable();
-        for n in nums {
-            let (strong, weak) = crate::vector::positioned_vectors(&self.doc, map[&n]);
+        let mut page_map = self.access.pages_or_empty();
+        page_map.sort_by_key(|page| page.number);
+        for page in page_map {
+            let (strong, weak) = crate::vector::positioned_vectors(self.access.as_ref(), page.id);
             let dropped = weak.iter().filter(|v| v.demoted()).count() as u32;
             accepted += strong.len() as u32;
             suppressed += dropped;
             if dropped > 0 {
-                pages.push(n);
+                pages.push(page.number);
             }
         }
         (accepted, suppressed, pages)
@@ -462,48 +1101,60 @@ impl PdfDocument {
     /// full inflate per stream, a price no page should pay to answer a question almost every
     /// document answers with "nothing wrong".
     pub fn stream_integrity(&self) -> Vec<crate::pdfobj::StreamIssue> {
-        crate::pdfobj::stream_issues(&self.doc)
+        crate::pdfobj::stream_issues(self.access.as_ref())
     }
 
     /// Diagnostic for one 1-indexed page.
     pub fn debug_page(&self, page: u32) -> Result<String, Error> {
-        let page_id = *self.doc.get_pages().get(&page).ok_or(Error::NoPage(Some(page)))?;
-        Ok(text::debug_page(&self.doc, page_id, &self.raw))
+        let page_id = self.access.pages_or_empty().into_iter()
+            .find(|entry| entry.number == page).map(|entry| entry.id)
+            .ok_or(Error::NoPage(Some(page)))?;
+        text::debug_page(self.access.as_ref(), page_id)
+            .map_err(|error| Error::Model(error.to_string()))
     }
 
     /// Extract images from all pages.
     pub fn extract_images(&self) -> Vec<ImageInfo> {
-        extract::extract_images(&self.doc)
+        extract::extract_images(self.access.as_ref())
     }
 
     /// Extract per-page font info.
     pub fn extract_fonts(&self) -> Vec<FontInfo> {
-        extract::extract_fonts(&self.doc)
+        extract::extract_fonts(self.access.as_ref())
     }
 
     /// Extract tables from all pages.
     pub fn extract_tables(&self) -> Vec<TableInfo> {
-        extract::extract_tables(&self.doc, &self.raw)
+        extract::extract_tables(self.access.as_ref())
+    }
+
+    /// Analyze raw table detections with semantic anchors and normalized display geometry.
+    ///
+    /// This deliberately shares [`Self::extract_tables`]' raw detector source. Rendered
+    /// HTML/Markdown may differ because rendering subsequently filters figure-like grids,
+    /// reconciles tagged declarations and attaches captions.
+    pub fn analyze_tables(&self) -> Vec<AnalyzedTable> {
+        extract::analyze_tables(self.access.as_ref())
     }
 
     /// Extract hyperlinks from all pages.
     pub fn extract_links(&self) -> Vec<links::Link> {
-        links::extract_links(&self.doc)
+        links::extract_links(self.access.as_ref())
     }
 
     /// Render the document to HTML.
     pub fn render(&self, mode: html::Mode, images: bool, toc: bool) -> String {
-        html::to_html(&self.doc, &self.raw, mode, images, toc)
+        html::to_html(self.access.as_ref(), mode, images, toc)
     }
 
     /// The detected-heading outline: `(level, title, page, anchor_id)` in reading order.
     pub fn toc(&self, mode: html::Mode) -> Vec<(u8, String, u32, String)> {
-        nav::toc(&html::to_html(&self.doc, &self.raw, mode, false, true))
+        nav::toc(&html::to_html(self.access.as_ref(), mode, false, true))
     }
 
     /// The PDF's OWN `/Outlines` bookmarks as `(level, title, page, anchor)`.
     pub fn outline(&self) -> Vec<(u8, String, u32, String)> {
-        links::outline(&self.doc)
+        links::outline(self.access.as_ref())
             .into_iter()
             .map(|e| ((e.level + 1), e.title, e.page, format!("page-{}", e.page)))
             .collect()
@@ -511,27 +1162,27 @@ impl PdfDocument {
 
     /// HTML of a single section resolved by `name`.
     pub fn section(&self, mode: html::Mode, name: &str, images: bool) -> Option<String> {
-        nav::section(&html::to_html(&self.doc, &self.raw, mode, images, true), name)
+        nav::section(&html::to_html(self.access.as_ref(), mode, images, true), name)
     }
 
     /// Structured front-matter of an academic paper (page 1).
     pub fn front_matter(&self) -> frontmatter::FrontMatter {
-        frontmatter::extract_front_matter(&self.doc, &self.raw)
+        frontmatter::extract_front_matter(self.access.as_ref())
     }
 
     /// OCR plan: per page, whether OCR is needed and (if so) the page raster bytes.
     pub fn ocr_plan(&self) -> Vec<OcrPlanEntry> {
         let mut out = Vec::new();
-        for (&pno, &page_id) in &self.doc.get_pages() {
-            let decision = ocr::detect::decide(&self.doc, page_id, &self.raw);
+        for page in self.access.pages_or_empty() {
+            let decision = ocr::detect::decide(self.access.as_ref(), page.id);
             let needs = !matches!(decision, ocr::detect::OcrDecision::NotNeeded);
-            let (w, h) = ocr::page_size_pts(&self.doc, page_id);
+            let (w, h) = ocr::page_size_pts(self.access.as_ref(), page.id);
             let image = if needs {
-                ocr::page_main_image(&self.doc, page_id).map(|(b, _)| b)
+                ocr::page_main_image(self.access.as_ref(), page.id).map(|(b, _)| b)
             } else {
                 None
             };
-            out.push(OcrPlanEntry { page: pno, needs_ocr: needs, reason: format!("{decision:?}"), width_pts: w, height_pts: h, image });
+            out.push(OcrPlanEntry { page: page.number, needs_ocr: needs, reason: format!("{decision:?}"), width_pts: w, height_pts: h, image });
         }
         out
     }
@@ -556,48 +1207,8 @@ impl PdfDocument {
     /// Build a searchable PDF from OCR results. `remove_raster` selects clean-reflow vs
     /// invisible-overlay. Returns the saved PDF bytes; the caller writes the file.
     pub fn build_searchable_pdf(&self, ocr: &HashMap<u32, String>, remove_raster: bool) -> Result<Vec<u8>, Error> {
-        let build = || -> Result<Vec<u8>, String> {
-            let mut doc = load_mem_deterministic(&self.raw).map_err(|e| e.to_string())?;
-            let (helv, helv_b) = ocr::pdf::add_fonts(&mut doc);
-            let pages = doc.get_pages();
-            for (&pno, &page_id) in &pages {
-                let Some(dt) = ocr.get(&pno) else { continue };
-                let (w, h) = ocr::page_size_pts(&doc, page_id);
-                if remove_raster {
-                    // Clean reflow: replace the page's content with our text + cropped figures.
-                    let image = ocr::page_main_image(&doc, page_id).map(|(_, img)| img);
-                    let pin = ocr::pdf::PageInput { page: ocr::doctags::parse(dt), width: w, height: h, image };
-                    let (content, xobjs) = ocr::pdf::build_page_content(&mut doc, &pin)?;
-                    let data = content.encode().map_err(|e| e.to_string())?;
-                    let stream_id = doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), data));
-                    let mut xo = lopdf::Dictionary::new();
-                    for (name, id) in &xobjs {
-                        xo.set(name.as_bytes().to_vec(), lopdf::Object::Reference(*id));
-                    }
-                    let res = dictionary! {
-                        "Font" => dictionary! { "F1" => helv, "F2" => helv_b },
-                        "XObject" => xo,
-                    };
-                    let page = doc.get_object_mut(page_id).map_err(|e| e.to_string())?.as_dict_mut().map_err(|e| e.to_string())?;
-                    page.set("Contents", lopdf::Object::Reference(stream_id));
-                    page.set("Resources", lopdf::Object::Dictionary(res));
-                } else {
-                    // Keep the scan: append an invisible OCR text layer over the original page.
-                    let pin = ocr::pdf::PageInput { page: ocr::doctags::parse(dt), width: w, height: h, image: None };
-                    let data = ocr::pdf::build_text_overlay(&pin).encode().map_err(|e| e.to_string())?;
-                    let stream_id = doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), data));
-                    append_page_content(&mut doc, page_id, stream_id);
-                    add_overlay_fonts(&mut doc, page_id, helv, helv_b);
-                }
-            }
-            if remove_raster {
-                doc.prune_objects();
-            }
-            let mut buf = Vec::new();
-            doc.save_to(&mut buf).map_err(|e| e.to_string())?;
-            Ok(buf)
-        };
-        build().map_err(Error::Model)
+        ocr::searchable::build(self.access.as_ref(), ocr, remove_raster)
+            .map_err(Error::Model)
     }
 
     /// Resolve where rendered output is written for the given default extension.
@@ -643,48 +1254,18 @@ impl PdfDocument {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "document.pdf".to_string());
         let generated_at = iso8601_now();
-        let (model, asset_bytes) = model::build::build_model(&self.doc, &self.raw, &file, generated_at, opts.profile);
+        let (model, asset_bytes) = model::build::build_model(
+            self.access.as_ref(),
+            &file,
+            generated_at,
+            opts.profile,
+        )
+        .map_err(|error| Error::Model(error.to_string()))?;
         if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(Error::Mkdir)?;
         }
         model::container::save(&model, &dest, &asset_bytes, None).map_err(Error::Model)?;
         Ok(dest.to_string_lossy().into_owned())
-    }
-}
-
-/// Append `stream_id` to a page's `/Contents` so an extra content stream (the invisible OCR
-/// text overlay) draws after the page's own content while leaving it untouched.
-fn append_page_content(doc: &mut Document, page_id: lopdf::ObjectId, stream_id: lopdf::ObjectId) {
-    let Ok(page) = doc.get_object_mut(page_id).and_then(|o| o.as_dict_mut()) else { return };
-    let new = match page.get(b"Contents").ok().cloned() {
-        Some(lopdf::Object::Array(mut a)) => {
-            a.push(lopdf::Object::Reference(stream_id));
-            lopdf::Object::Array(a)
-        }
-        Some(existing @ lopdf::Object::Reference(_)) => lopdf::Object::Array(vec![existing, lopdf::Object::Reference(stream_id)]),
-        _ => lopdf::Object::Reference(stream_id),
-    };
-    page.set("Contents", new);
-}
-
-/// Give a page its own `/Resources` carrying the OCR overlay fonts (under names distinct from
-/// the page's own fonts), preserving its existing resources. Used by the keep-raster path.
-fn add_overlay_fonts(doc: &mut Document, page_id: lopdf::ObjectId, helv: lopdf::ObjectId, helv_b: lopdf::ObjectId) {
-    let mut res = match doc.get_page_resources(page_id) {
-        Ok((Some(d), _)) => d.clone(),
-        Ok((None, ids)) => ids.first().and_then(|id| doc.get_dictionary(*id).ok()).cloned().unwrap_or_default(),
-        Err(_) => lopdf::Dictionary::new(),
-    };
-    let mut fonts = match res.get(b"Font").ok().cloned() {
-        Some(lopdf::Object::Dictionary(d)) => d,
-        Some(lopdf::Object::Reference(r)) => doc.get_dictionary(r).cloned().unwrap_or_default(),
-        _ => lopdf::Dictionary::new(),
-    };
-    fonts.set(ocr::pdf::OVERLAY_FONT, lopdf::Object::Reference(helv));
-    fonts.set(ocr::pdf::OVERLAY_FONT_BOLD, lopdf::Object::Reference(helv_b));
-    res.set("Font", fonts);
-    if let Ok(page) = doc.get_object_mut(page_id).and_then(|o| o.as_dict_mut()) {
-        page.set("Resources", lopdf::Object::Dictionary(res));
     }
 }
 
@@ -713,6 +1294,15 @@ fn iso8601_now() -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::access::tests::{AccessCounts, FaultAccess, FaultPoint};
+    use crate::access::AccessKind;
+    use lopdf::{
+        dictionary, IndexedObjectLocation, IndexedReader, IndexedReaderError, IndexedReaderOptions,
+        Object, ScalarResolutionPermit,
+    };
+    use std::io::{Seek, Write};
+    use std::process::Command;
+    use std::sync::atomic::Ordering;
 
     /// The owned encrypted fixtures (`tests/gen_fixtures.py::gen_encrypted`). They live in
     /// their own subfolder so the Python whole-fixture-set sweeps skip them.
@@ -721,6 +1311,1055 @@ pub(crate) mod tests {
     }
 
     const ENC_SENTENCE: &str = "Encrypted fixture sentinel phrase for distillPDF.";
+
+    fn route_fixture() -> (PathBuf, Vec<u8>) {
+        let path = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures_pdf/sec_structure.pdf"
+        ));
+        let raw = std::fs::read(&path).unwrap();
+        (path, raw)
+    }
+
+    fn route_temp(label: &str, raw: &[u8]) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "distillpdf-l3a-route-{}-{label}-{}.pdf",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, raw).unwrap();
+        path
+    }
+
+    struct GeneratedDir(PathBuf);
+
+    impl GeneratedDir {
+        fn new(label: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "distillpdf-l3a-terminal-{}-{label}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for GeneratedDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn generate_lazy_fixtures(output: &Path, arguments: &[&str]) {
+        let generator = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/lazy_engine_fixtures.py"
+        );
+        let status = Command::new("python3")
+            .arg(generator)
+            .arg("generate")
+            .arg("--out")
+            .arg(output)
+            .args(arguments)
+            .status()
+            .expect("run deterministic lazy fixture generator");
+        assert!(status.success(), "lazy fixture generation failed");
+    }
+
+    fn objstm_reader(path: &Path) -> IndexedReader {
+        let raw = std::fs::read(path).unwrap();
+        IndexedReader::open(BytesSource::from(raw)).unwrap()
+    }
+
+    fn prepare_objstm(
+        reader: &IndexedReader,
+        container: lopdf::ObjectId,
+    ) -> Result<(u64, u64), IndexedReaderError> {
+        let permit = ScalarResolutionPermit::new(64 * 1024 * 1024);
+        match reader.prepare_object_stream_with_permit(container, &permit) {
+            Ok(owner) => {
+                let retained = owner.retained_bytes();
+                let stats = permit.stats();
+                assert_eq!(owner.container_id(), container);
+                assert_eq!(stats.current_bytes, retained);
+                assert!(stats.peak_bytes <= 64 * 1024 * 1024);
+                drop(owner);
+                assert_eq!(permit.close().unwrap().current_bytes, 0);
+                Ok((retained, stats.peak_bytes))
+            }
+            Err(error) => {
+                assert_eq!(permit.close().unwrap().current_bytes, 0);
+                Err(error)
+            }
+        }
+    }
+
+    fn assert_objstm_reader_cache_neutral(reader: &IndexedReader, case: &str) {
+        assert_eq!(reader.cache_stats(), Default::default(), "{case}");
+        assert_eq!(reader.object_cache_stats(), Default::default(), "{case}");
+        assert_eq!(
+            reader.object_stream_cache_stats(),
+            Default::default(),
+            "{case}"
+        );
+    }
+
+    struct ObjStmTracingSource {
+        bytes: Arc<[u8]>,
+        requests: Mutex<Vec<(u64, usize)>>,
+    }
+
+    impl RandomAccessSource for ObjStmTracingSource {
+        fn len(&self) -> SourceResult<u64> {
+            u64::try_from(self.bytes.len()).map_err(|_| SourceError::RangeOverflow {
+                offset: 0,
+                length: u64::MAX,
+            })
+        }
+
+        fn read_at(&self, offset: u64, output: &mut [u8]) -> SourceResult<usize> {
+            let offset =
+                usize::try_from(offset).map_err(|_| SourceError::PlatformLimitExceeded {
+                    requested: offset,
+                    limit: usize::MAX as u64,
+                })?;
+            let length = output.len().min(self.bytes.len().saturating_sub(offset));
+            output[..length].copy_from_slice(&self.bytes[offset..offset + length]);
+            self.requests
+                .lock()
+                .unwrap()
+                .push((u64::try_from(offset).unwrap(), length));
+            Ok(length)
+        }
+    }
+
+    #[test]
+    fn l3b_gate1_objstm_fixture_manifest_and_direct_fork_oracles() {
+        let generated = GeneratedDir::new("objstm-gate1");
+        generate_lazy_fixtures(generated.path(), &["--profile", "objstm-container"]);
+        let actual_manifest =
+            std::fs::read_to_string(generated.path().join("manifest.json")).unwrap();
+        let frozen_manifest = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/oracles/l3b-objstm-container.json"
+        ))
+        .unwrap();
+        assert_eq!(actual_manifest, frozen_manifest);
+
+        let plain = objstm_reader(&generated.path().join("objstm-plain.pdf"));
+        let flate = objstm_reader(&generated.path().join("objstm-flate.pdf"));
+        for reader in [&plain, &flate] {
+            assert_eq!(
+                reader.object_location((7, 0)).unwrap(),
+                IndexedObjectLocation::Compressed {
+                    container: (6, 0),
+                    index: 0,
+                }
+            );
+            assert_objstm_reader_cache_neutral(reader, "plain/Flate before preparation");
+        }
+        let plain_facts = prepare_objstm(&plain, (6, 0)).unwrap();
+        let flate_facts = prepare_objstm(&flate, (6, 0)).unwrap();
+        assert!(plain_facts.0 > 0);
+        assert!(flate_facts.0 > 0);
+        assert_objstm_reader_cache_neutral(&plain, "plain after preparation");
+        assert_objstm_reader_cache_neutral(&flate, "Flate after preparation");
+
+        let two = objstm_reader(&generated.path().join("objstm-two-containers.pdf"));
+        assert!(prepare_objstm(&two, (6, 0)).is_ok());
+        assert!(prepare_objstm(&two, (9, 0)).is_ok());
+        assert_objstm_reader_cache_neutral(&two, "two independent containers");
+
+        let encrypted = objstm_reader(&generated.path().join("objstm-r4-rc4.pdf"));
+        let encrypted_compressed: Vec<_> = encrypted
+            .object_ids()
+            .into_iter()
+            .filter_map(|id| match encrypted.object_location(id).unwrap() {
+                IndexedObjectLocation::Compressed { container, index } => {
+                    Some((id, container, index))
+                }
+                IndexedObjectLocation::Normal => None,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            encrypted_compressed,
+            vec![
+                ((3, 0), (2, 0), 0),
+                ((4, 0), (2, 0), 1),
+                ((5, 0), (2, 0), 2),
+                ((6, 0), (2, 0), 3),
+            ]
+        );
+        assert!(prepare_objstm(&encrypted, (2, 0)).is_ok());
+        assert_objstm_reader_cache_neutral(&encrypted, "encrypted preparation");
+
+        let cases = [
+            "objstm-container-nonstream.pdf",
+            "objstm-first-missing.pdf",
+            "objstm-first-negative.pdf",
+            "objstm-first-past-end.pdf",
+            "objstm-n-missing.pdf",
+            "objstm-n-negative.pdf",
+            "objstm-n-over-131072.pdf",
+            "objstm-filter-chain.pdf",
+            "objstm-predictor.pdf",
+            "objstm-flate-corrupt.pdf",
+            "objstm-length-missing.pdf",
+            "objstm-length-negative.pdf",
+            "objstm-length-indirect-missing.pdf",
+            "objstm-endstream-missing.pdf",
+            "objstm-endstream-truncated.pdf",
+        ];
+        for name in cases {
+            let reader = objstm_reader(&generated.path().join(name));
+            let error = prepare_objstm(&reader, (6, 0)).unwrap_err();
+            match name {
+                "objstm-container-nonstream.pdf" => assert!(matches!(
+                    error,
+                    IndexedReaderError::ObjectStreamContainerNotStream {
+                        id: (6, 0),
+                        container: (6, 0),
+                    }
+                )),
+                "objstm-first-missing.pdf" | "objstm-first-negative.pdf" => match error {
+                    IndexedReaderError::ObjectStreamMember {
+                        id: (6, 0),
+                        container: (6, 0),
+                        index: 0,
+                        source: lopdf::Error::InvalidObjectStream(detail),
+                    } => assert_eq!(detail, "invalid object stream /First"),
+                    other => panic!("{name}: {other:?}"),
+                },
+                "objstm-first-past-end.pdf" => assert!(matches!(
+                    error,
+                    IndexedReaderError::ObjectStreamMember {
+                        id: (6, 0),
+                        container: (6, 0),
+                        index: 0,
+                        source: lopdf::Error::InvalidOffset(52),
+                    }
+                )),
+                "objstm-n-missing.pdf" | "objstm-n-negative.pdf" | "objstm-n-over-131072.pdf" => {
+                    match error {
+                        IndexedReaderError::ObjectStreamMember {
+                            id: (6, 0),
+                            container: (6, 0),
+                            index: 0,
+                            source: lopdf::Error::InvalidObjectStream(detail),
+                        } => assert_eq!(detail, "invalid object stream /N"),
+                        other => panic!("{name}: {other:?}"),
+                    }
+                }
+                "objstm-filter-chain.pdf" | "objstm-predictor.pdf" => assert!(matches!(
+                    error,
+                    IndexedReaderError::UnsupportedBoundedScalar {
+                        id: (6, 0),
+                        reason:
+                            "object-stream filter chains or predictors outside plain/FlateDecode",
+                    }
+                )),
+                "objstm-flate-corrupt.pdf" => match error {
+                    IndexedReaderError::ObjectStreamMember {
+                        id: (6, 0),
+                        container: (6, 0),
+                        index: 0,
+                        source: lopdf::Error::InvalidObjectStream(detail),
+                    } => assert_eq!(detail, "selected object stream member is not present"),
+                    other => panic!("{name}: {other:?}"),
+                },
+                "objstm-length-missing.pdf"
+                | "objstm-length-negative.pdf"
+                | "objstm-length-indirect-missing.pdf" => assert!(matches!(
+                    error,
+                    IndexedReaderError::UnsupportedBoundedScalar {
+                        id: (6, 0),
+                        reason: "object streams without a bounded nonnegative /Length",
+                    }
+                )),
+                "objstm-endstream-missing.pdf" | "objstm-endstream-truncated.pdf" => {
+                    assert!(matches!(
+                        error,
+                        IndexedReaderError::MissingEndstream { id: (6, 0) }
+                    ))
+                }
+                _ => unreachable!(),
+            }
+            assert_objstm_reader_cache_neutral(&reader, name);
+        }
+
+        let generation = objstm_reader(&generated.path().join("objstm-container-generation.pdf"));
+        assert!(matches!(
+            prepare_objstm(&generation, (6, 1)),
+            Err(IndexedReaderError::GenerationMismatch {
+                id: (6, 1),
+                indexed: 0,
+            })
+        ));
+        assert_objstm_reader_cache_neutral(&generation, "container generation mismatch");
+
+        let authority_raw: Arc<[u8]> =
+            std::fs::read(generated.path().join("objstm-xref-authority.pdf"))
+                .unwrap()
+                .into();
+        let duplicate_start = authority_raw
+            .windows(b"6 0 obj\n".len())
+            .position(|window| window == b"6 0 obj\n")
+            .unwrap();
+        let selected_start = authority_raw
+            .windows(b"10 0 obj\n".len())
+            .position(|window| window == b"10 0 obj\n")
+            .unwrap();
+        let selected_end = authority_raw
+            .windows(b"11 0 obj\n".len())
+            .position(|window| window == b"11 0 obj\n")
+            .unwrap();
+        assert!(duplicate_start < selected_start && selected_start < selected_end);
+        let duplicate_interval = duplicate_start as u64..selected_start as u64;
+        let selected_interval = selected_start as u64..selected_end as u64;
+        let source = Arc::new(ObjStmTracingSource {
+            bytes: Arc::clone(&authority_raw),
+            requests: Mutex::new(Vec::new()),
+        });
+        let erased: Arc<dyn RandomAccessSource> = source.clone();
+        let authority =
+            IndexedReader::open_shared(erased, IndexedReaderOptions::default()).unwrap();
+        assert_eq!(
+            authority.object_location((7, 0)).unwrap(),
+            IndexedObjectLocation::Compressed {
+                container: (10, 0),
+                index: 0,
+            }
+        );
+        source.requests.lock().unwrap().clear();
+        let permit = ScalarResolutionPermit::new(64 * 1024 * 1024);
+        let prepared = authority
+            .prepare_object_stream_with_permit((10, 0), &permit)
+            .unwrap();
+        assert_eq!(prepared.container_id(), (10, 0));
+        assert_eq!(permit.stats().current_bytes, prepared.retained_bytes());
+        let reads_after_prepare = source.requests.lock().unwrap().len();
+        let selected = prepared.resolve_member((7, 0), 0).unwrap();
+        assert_eq!(selected.as_object().as_str().unwrap(), b"compressed-value");
+        assert_eq!(source.requests.lock().unwrap().len(), reads_after_prepare);
+        let requests = source.requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        assert!(
+            requests.iter().all(|(offset, returned)| {
+                let end = offset
+                    .checked_add(u64::try_from(*returned).unwrap())
+                    .expect("traced returned interval must not overflow");
+                end <= duplicate_interval.start || *offset >= duplicate_interval.end
+            }),
+            "declared container preparation returned bytes from the undeclared duplicate interval \
+             {duplicate_interval:?}: {requests:?}"
+        );
+        assert!(
+            requests.iter().all(|(offset, returned)| {
+                let end = offset
+                    .checked_add(u64::try_from(*returned).unwrap())
+                    .expect("traced returned interval must not overflow");
+                *offset >= selected_interval.start && end <= selected_interval.end
+            }),
+            "declared container preparation returned bytes outside the selected container interval \
+             {selected_interval:?}: {requests:?}"
+        );
+        assert!(
+            requests.iter().any(|(offset, returned)| {
+                let end = offset.saturating_add(u64::try_from(*returned).unwrap());
+                *offset < selected_interval.end && end > selected_interval.start
+            }),
+            "selected container interval {selected_interval:?} was never returned: {requests:?}"
+        );
+        drop(requests);
+        drop(selected);
+        assert_eq!(permit.stats().current_bytes, prepared.retained_bytes());
+        drop(prepared);
+        assert_eq!(permit.close().unwrap().current_bytes, 0);
+        assert_objstm_reader_cache_neutral(&authority, "xref-authoritative selected container");
+    }
+
+    fn indexed_outcome(
+        opened: Result<IndexedOpenControl, RouteOpenError>,
+    ) -> Result<String, AccessKind> {
+        match opened {
+            Ok(control) => control
+                .checked_fingerprint()
+                .map_err(|error| error.kind),
+            Err(error) => match error.failure {
+                RouteFailure::Access(error) => Err(error.kind),
+                RouteFailure::Source(_) => Err(AccessKind::SourceIo),
+            },
+        }
+    }
+
+    fn eager_outcome(raw: &[u8]) -> Result<String, AccessKind> {
+        let document = PdfDocument::from_bytes(raw).map_err(|_| AccessKind::Backend)?;
+        checked_access_fingerprint(document.access.as_ref()).map_err(|error| error.kind)
+    }
+
+    fn inherited_resources_pdf(parent_depth: usize, malformed_parent: bool) -> Vec<u8> {
+        let mut document = Document::with_version("1.7");
+        let content = document.add_object(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            b"BT /F1 12 Tf (resource-depth) Tj ET".to_vec(),
+        ));
+        let font = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        }));
+        let resources = document.add_object(Object::Dictionary(dictionary! {
+            "Font" => dictionary! { "F1" => Object::Reference(font) },
+            "DepthMarker" => parent_depth as i64,
+        }));
+        let page = document.new_object_id();
+        let parent = if malformed_parent {
+            (999_999, 0)
+        } else {
+            let mut next = None;
+            for depth in (1..=parent_depth).rev() {
+                let mut dictionary = dictionary! { "Type" => "Pages" };
+                if let Some(next) = next {
+                    dictionary.set("Parent", Object::Reference(next));
+                }
+                if depth == parent_depth {
+                    dictionary.set("Resources", Object::Reference(resources));
+                }
+                next = Some(document.add_object(Object::Dictionary(dictionary)));
+            }
+            next.expect("resource fixture has at least one parent")
+        };
+        document.objects.insert(
+            page,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page", "Parent" => Object::Reference(parent),
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Contents" => Object::Reference(content),
+            }),
+        );
+        let pages = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Count" => 1,
+            "Kids" => vec![Object::Reference(page)],
+        }));
+        let catalog = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Catalog", "Pages" => Object::Reference(pages),
+        }));
+        document.trailer.set("Root", Object::Reference(catalog));
+        let mut raw = Vec::new();
+        document.save_to(&mut raw).unwrap();
+        raw
+    }
+
+    #[test]
+    fn l3a_terminal_all_small_fixtures_have_checked_file_bytes_parity() {
+        let _test_lock = crate::access::indexed_test_lock();
+        let generated = GeneratedDir::new("small");
+        generate_lazy_fixtures(generated.path(), &["--profile", "small"]);
+        let names = [
+            "classic.pdf",
+            "xref-stream.pdf",
+            "incremental.pdf",
+            "object-stream.pdf",
+            "reference-one-hop.pdf",
+            "reference-at-limit.pdf",
+            "reference-over-limit.pdf",
+            "reference-dangling.pdf",
+            "reference-cycle.pdf",
+            "generation-match.pdf",
+            "generation-mismatch.pdf",
+            "stream-missing-length.pdf",
+            "stream-short-length.pdf",
+        ];
+        for name in names {
+            let path = generated.path().join(name);
+            let raw = std::fs::read(&path).unwrap();
+            let file = open_indexed_file_internal(&path, None);
+            let file_diagnostics = file
+                .as_ref()
+                .map(|control| {
+                    assert!(control.shared_bytes().is_none(), "{name}");
+                    control.diagnostics()
+                })
+                .unwrap_or_else(|error| error.diagnostics.snapshot());
+            let bytes = open_indexed_bytes_internal(Arc::from(raw.clone()), None);
+            let bytes_diagnostics = bytes
+                .as_ref()
+                .map(|control| control.diagnostics())
+                .unwrap_or_else(|error| error.diagnostics.snapshot());
+            if matches!(name, "stream-missing-length.pdf" | "stream-short-length.pdf") {
+                // A malformed stream's page content is asserted against the *eager* route
+                // rather than a frozen literal: the contract is parity, and the lazy route
+                // now recovers the same frame eager does.
+                let eager = PdfDocument::from_bytes(&raw).unwrap();
+                let eager_content = eager
+                    .access
+                    .page_content(eager.access.pages().unwrap()[0].id)
+                    .unwrap();
+                let recovered = b"BT /F1 12 Tf 72 720 Td (malformed stream) Tj ET";
+                for control in [file.as_ref().unwrap(), bytes.as_ref().unwrap()] {
+                    let page = control.pages().unwrap()[0].id;
+                    assert!(
+                        control
+                            .checked_page_content_matches(page, eager_content.as_ref())
+                            .unwrap(),
+                        "{name}"
+                    );
+                    assert!(control.checked_recovered_stream_matches(4, recovered).unwrap(), "{name}");
+                }
+            }
+            let file_outcome = indexed_outcome(file);
+            let bytes_outcome = indexed_outcome(bytes);
+            assert_eq!(file_outcome, bytes_outcome, "file/bytes {name}");
+            match name {
+                "reference-over-limit.pdf" => {
+                    assert_eq!(file_outcome, Err(AccessKind::ResourceLimit), "{name}");
+                }
+                "reference-dangling.pdf" | "generation-mismatch.pdf" => {
+                    assert_eq!(file_outcome, Err(AccessKind::Backend), "{name}");
+                }
+                "reference-cycle.pdf" => {
+                    assert_eq!(file_outcome, Err(AccessKind::Backend), "{name}");
+                }
+                "stream-missing-length.pdf" | "stream-short-length.pdf" => {
+                    assert!(file_outcome.is_ok(), "{name}");
+                }
+                _ => assert_eq!(file_outcome, eager_outcome(&raw), "eager parity {name}"),
+            }
+            for diagnostics in [file_diagnostics, bytes_diagnostics] {
+                assert_eq!(diagnostics.indexed_opens, 1, "{name}");
+                assert_eq!(diagnostics.fallback_opens, 0, "{name}");
+            }
+            assert!(file_diagnostics.source_max_request <= 64 * 1024, "{name}");
+        }
+    }
+
+    #[test]
+    fn l3a_terminal_inherited_resources_enforce_frozen_parent_boundary() {
+        let _test_lock = crate::access::indexed_test_lock();
+        let at_limit = inherited_resources_pdf(100, false);
+        let eager = eager_outcome(&at_limit);
+        assert!(eager.is_ok());
+        let indexed = indexed_outcome(open_indexed_bytes_internal(Arc::from(at_limit), None));
+        assert_eq!(indexed, eager);
+
+        let over_limit = inherited_resources_pdf(101, false);
+        let indexed = indexed_outcome(open_indexed_bytes_internal(Arc::from(over_limit), None));
+        assert_eq!(indexed, Err(AccessKind::ResourceLimit));
+
+        let malformed = inherited_resources_pdf(1, true);
+        let indexed = indexed_outcome(open_indexed_bytes_internal(Arc::from(malformed), None));
+        assert_eq!(indexed, Err(AccessKind::Backend));
+    }
+
+    #[test]
+    fn l3a_terminal_scale_axes_obey_frozen_metadata_formula() {
+        let _test_lock = crate::access::indexed_test_lock();
+        let generated = GeneratedDir::new("scale");
+        for axis in ["objects", "pages"] {
+            for count in [1_000_u64, 5_000, 10_000] {
+                generate_lazy_fixtures(
+                    generated.path(),
+                    &["--profile", "scale", "--axis", axis, "--count", &count.to_string()],
+                );
+                let path = generated.path().join(format!("{axis}-{count}.pdf"));
+                let raw: Arc<[u8]> = std::fs::read(&path).unwrap().into();
+                let file = open_indexed_file_internal(&path, None).unwrap();
+                let bytes = open_indexed_bytes_internal(raw, None).unwrap();
+                let expected_objects = if axis == "objects" { count + 5 } else { 2 * count + 3 };
+                let expected_pages = if axis == "pages" { count } else { 1 };
+                for diagnostics in [file.diagnostics(), bytes.diagnostics()] {
+                    assert_eq!(diagnostics.index_objects, expected_objects, "{axis}-{count}");
+                    assert_eq!(diagnostics.index_pages, expected_pages, "{axis}-{count}");
+                    assert_eq!(diagnostics.page_map_builds, 1, "{axis}-{count}");
+                    assert_eq!(diagnostics.indexed_opens, 1, "{axis}-{count}");
+                    assert_eq!(diagnostics.fallback_opens, 0, "{axis}-{count}");
+                    let cap = 33_554_432_u64
+                        + 1_536_u64 * expected_objects
+                        + 3_072_u64 * expected_pages;
+                    assert!(
+                        diagnostics.index_estimated_bytes <= cap,
+                        "{axis}-{count}: retained={} cap={cap}",
+                        diagnostics.index_estimated_bytes
+                    );
+                }
+                assert!(file.shared_bytes().is_none(), "{axis}-{count}");
+                assert!(
+                    file.diagnostics().source_max_request <= 64 * 1024,
+                    "{axis}-{count}: max request {}",
+                    file.diagnostics().source_max_request
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_file_bytes_and_snapshot_are_single_open_explicit_routes() {
+        let (fixture, raw) = route_fixture();
+        let shared: Arc<[u8]> = Arc::from(raw.clone());
+        let bytes = open_indexed_bytes_internal(Arc::clone(&shared), None).unwrap();
+        assert!(Arc::ptr_eq(bytes.shared_bytes().unwrap(), &shared));
+        let expected_sha = bytes.source_sha256().unwrap();
+        let bytes_diag = bytes.diagnostics();
+        assert_eq!(bytes_diag.route, OpenRoute::IndexedBytes);
+        assert_eq!(bytes_diag.source_mode, SourceMode::SharedBytes);
+        assert_eq!(bytes_diag.eager_opens, 0);
+        assert_eq!(bytes_diag.indexed_opens, 1);
+        assert_eq!(bytes_diag.fallback_opens, 0);
+        assert_eq!(bytes_diag.page_map_builds, 1);
+        assert!(bytes_diag.index_objects > 0);
+        assert!(bytes_diag.index_pages > 0);
+        assert!(bytes_diag.index_estimated_bytes > 0);
+
+        let file = open_indexed_file_internal(&fixture, None).unwrap();
+        assert!(file.shared_bytes().is_none());
+        assert_eq!(file.pages().unwrap().len(), bytes.pages().unwrap().len());
+        assert_eq!(file.source_sha256().unwrap(), expected_sha);
+        let file_diag = file.diagnostics();
+        assert_eq!(file_diag.route, OpenRoute::IndexedFile);
+        assert_eq!(file_diag.source_mode, SourceMode::FileDescriptor);
+        assert_eq!(file_diag.indexed_opens, 1);
+        assert_eq!(file_diag.fallback_opens, 0);
+        assert!(file_diag.source_requests >= file_diag.source_reads);
+        assert!(file_diag.source_reads > 0);
+        assert!(file_diag.source_max_request <= 64 * 1024);
+
+        let snapshot = open_indexed_snapshot_internal(&fixture, None).unwrap();
+        assert!(snapshot.shared_bytes().is_some());
+        assert_eq!(snapshot.source_sha256().unwrap(), expected_sha);
+        let snapshot_diag = snapshot.diagnostics();
+        assert_eq!(snapshot_diag.route, OpenRoute::IndexedSnapshot);
+        assert_eq!(snapshot_diag.reason, OpenReason::ExplicitSnapshot);
+        assert_eq!(snapshot_diag.source_mode, SourceMode::FullSnapshot);
+        assert_eq!(snapshot_diag.indexed_opens, 1);
+        assert_eq!(snapshot_diag.fallback_opens, 0);
+
+        let diagnostics = Arc::clone(&file.diagnostics);
+        drop(file);
+        assert_eq!(diagnostics.snapshot().route, OpenRoute::IndexedFile);
+    }
+
+    /// The lazy route's output is a pure function of the document — not of the thread count.
+    ///
+    /// The bug this locks: compressed-object resolution used to draw its allowance from one
+    /// process-wide 64 MiB budget with `acquire_available` — "however much is left right now".
+    /// One rayon thread always saw the whole budget and every object resolved; several threads
+    /// saw race-dependent slices, resolution failed with a resource limit, and the consumers'
+    /// legacy `*_or_empty` suppression turned that into a *shorter page*, so the same document
+    /// rendered different bytes on every run. `objstm_pages.pdf` is the committed repro (40
+    /// pages whose page dicts, resources and mediaboxes all live in two `/ObjStm` containers);
+    /// against the pre-fix build it rendered four distinct outputs in four runs, all far short
+    /// of eager. The rendering below is pinned to a four-thread pool so the test does not
+    /// depend on how many cores the machine running it has.
+    #[test]
+    fn indexed_render_is_thread_count_independent_and_matches_eager() {
+        let _test_lock = crate::access::indexed_test_lock();
+        let path = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures_pdf/objstm_pages.pdf"
+        ));
+        let raw = std::fs::read(&path).expect("committed object-stream fixture");
+        let eager = PdfDocument::from_bytes(&raw)
+            .expect("eager open")
+            .render(crate::Mode::Page, false, false);
+        assert!(eager.contains("Section 40: object stream residency"), "fixture text");
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("four-thread pool builds");
+        let mut renders = Vec::new();
+        for _ in 0..2 {
+            let control = open_indexed_file_internal(&path, None).expect("indexed open");
+            let document = PdfDocument::finish_indexed_open(control, Some(path.clone()));
+            renders.push(pool.install(|| document.render(crate::Mode::Page, false, false)));
+        }
+        assert_eq!(renders[0], renders[1], "two indexed renders at 4 threads differ");
+        assert_eq!(renders[0], eager, "indexed render differs from eager");
+    }
+
+    /// The public constructors carry honest route provenance for whichever engine the internal
+    /// `DISTILLPDF_ENGINE` selector picked.
+    ///
+    /// This used to assert "public constructors are eager, full stop" — a restatement of the old
+    /// plan's "indexed is unreachable from production" rule, which the Phase B selector
+    /// deliberately retires. The invariants worth keeping are the ones checked here: the
+    /// *default* (unset selector) is still eager on both constructors, an indexed route reports
+    /// indexed provenance, and no route ever claims both engines at once.
+    #[test]
+    fn public_constructors_carry_honest_route_provenance_for_the_selected_engine() {
+        let (fixture, raw) = route_fixture();
+        let file = PdfDocument::open(fixture.to_str().unwrap()).unwrap();
+        let bytes = PdfDocument::from_bytes(&raw).unwrap();
+        let indexed_selected = engine_selection().prefers_indexed();
+        for (actual, eager_route, eager_mode, indexed_route, indexed_mode) in [
+            (
+                file.route_diagnostics(),
+                OpenRoute::EagerFile,
+                SourceMode::EagerMaterializedFile,
+                OpenRoute::IndexedFile,
+                SourceMode::FileDescriptor,
+            ),
+            (
+                bytes.route_diagnostics(),
+                OpenRoute::EagerBytes,
+                SourceMode::SharedBytes,
+                OpenRoute::IndexedBytes,
+                SourceMode::SharedBytes,
+            ),
+        ] {
+            // Exactly one engine opened this handle, and the fallback counter is only ever set
+            // together with an eager open — a silent fallback would break this.
+            assert_eq!(actual.eager_opens + actual.indexed_opens, 1);
+            assert!(actual.fallback_opens <= actual.eager_opens);
+            if !indexed_selected {
+                assert_eq!(actual.route, eager_route);
+                assert_eq!(actual.reason, OpenReason::PublicCompatibility);
+                assert_eq!(actual.source_mode, eager_mode);
+                assert_eq!(actual.eager_opens, 1);
+                assert_eq!(actual.indexed_opens, 0);
+                assert_eq!(actual.fallback_opens, 0);
+            } else if actual.indexed_opens == 1 {
+                assert_eq!(actual.route, indexed_route);
+                assert_eq!(actual.reason, OpenReason::InternalMeasurement);
+                assert_eq!(actual.source_mode, indexed_mode);
+                assert_eq!(actual.fallback_opens, 0);
+            } else {
+                // Counted eager fallback: the indexed open refused this document.
+                assert_eq!(actual.route, eager_route);
+                assert_eq!(actual.source_mode, eager_mode);
+                assert_eq!(actual.fallback_opens, 1);
+            }
+        }
+    }
+
+    /// The selector is off unless `DISTILLPDF_ENGINE` names a route — the property that keeps
+    /// released builds eager no matter what else changes in `open`/`from_bytes`.
+    #[test]
+    fn engine_selector_defaults_to_eager_for_unset_and_unknown_values() {
+        for value in [
+            None,
+            Some(""),
+            Some("eager"),
+            Some("lazy"),
+            Some("INDEXED"),
+            Some("indexed "),
+            Some("indexed-strictly"),
+            Some("1"),
+        ] {
+            assert_eq!(
+                parse_engine_selection(value),
+                EngineSelection::Eager,
+                "{value:?} must stay eager"
+            );
+        }
+        assert_eq!(
+            parse_engine_selection(Some("indexed")),
+            EngineSelection::Indexed
+        );
+        assert_eq!(
+            parse_engine_selection(Some("indexed-strict")),
+            EngineSelection::IndexedStrict
+        );
+        assert!(!EngineSelection::Eager.prefers_indexed());
+        assert!(EngineSelection::Indexed.prefers_indexed());
+        assert!(EngineSelection::IndexedStrict.prefers_indexed());
+        // The process-wide selection agrees with the grammar for this process's environment.
+        assert_eq!(
+            engine_selection(),
+            parse_engine_selection(std::env::var("DISTILLPDF_ENGINE").ok().as_deref())
+        );
+    }
+
+    #[test]
+    fn indexed_file_descriptor_survives_path_replacement_and_fails_on_mutation() {
+        let (_, raw) = route_fixture();
+        let expected = open_indexed_bytes_internal(Arc::from(raw.clone()), None)
+            .unwrap()
+            .source_sha256()
+            .unwrap();
+
+        let path = route_temp("replace", &raw);
+        let displaced = path.with_extension("held.pdf");
+        let control = open_indexed_file_internal(&path, None).unwrap();
+        std::fs::rename(&path, &displaced).unwrap();
+        std::fs::write(&path, b"replacement path bytes").unwrap();
+        assert_eq!(control.source_sha256().unwrap(), expected);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&displaced).unwrap();
+
+        let path = route_temp("rewrite", &raw);
+        let control = open_indexed_file_internal(&path, None).unwrap();
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file.write_all(b"%QDF-").unwrap();
+        file.sync_all().unwrap();
+        let error = control.source_sha256().unwrap_err();
+        assert_eq!(error.kind, AccessKind::SourceChanged);
+        std::fs::remove_file(&path).unwrap();
+
+        let path = route_temp("truncate", &raw);
+        let control = open_indexed_file_internal(&path, None).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len((raw.len() / 2) as u64)
+            .unwrap();
+        let error = control.source_sha256().unwrap_err();
+        assert_eq!(error.kind, AccessKind::SourceChanged);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn indexed_route_keeps_post_open_source_io_typed_and_never_falls_back() {
+        struct SwitchedSource {
+            bytes: Arc<[u8]>,
+            mode: Arc<AtomicU64>,
+        }
+        impl RandomAccessSource for SwitchedSource {
+            fn len(&self) -> SourceResult<u64> {
+                Ok(self.bytes.len() as u64)
+            }
+            fn read_at(&self, offset: u64, out: &mut [u8]) -> SourceResult<usize> {
+                match self.mode.load(Ordering::Acquire) {
+                    1 => return Ok(0),
+                    2 => return Ok(out.len() + 1),
+                    3 => return Err(SourceError::Io(std::io::Error::other("injected I/O"))),
+                    _ => {}
+                }
+                let start = offset as usize;
+                let take = out.len().min(self.bytes.len().saturating_sub(start));
+                out[..take].copy_from_slice(&self.bytes[start..start + take]);
+                Ok(take)
+            }
+        }
+
+        let (_, raw) = route_fixture();
+        for failure_mode in 1..=3 {
+            let mode = Arc::new(AtomicU64::new(0));
+            let diagnostics = RouteDiagnostics::new(
+                OpenRoute::IndexedBytes,
+                OpenReason::InternalMeasurement,
+                SourceMode::SharedBytes,
+            );
+            let source: Arc<dyn RandomAccessSource> = Arc::new(SwitchedSource {
+                bytes: Arc::from(raw.clone()),
+                mode: Arc::clone(&mode),
+            });
+            let control = open_indexed_source(source, None, diagnostics, None).unwrap();
+            mode.store(failure_mode, Ordering::Release);
+            let error = control.source_sha256().unwrap_err();
+            assert_eq!(error.kind, AccessKind::SourceIo);
+            assert_eq!(control.diagnostics().indexed_opens, 1);
+            assert_eq!(control.diagnostics().fallback_opens, 0);
+        }
+    }
+
+    #[test]
+    fn indexed_route_preserves_encryption_open_categories() {
+        for name in [
+            "rc4_40.pdf",
+            "rc4_128.pdf",
+            "aes_128.pdf",
+            "aes_256.pdf",
+            "inline_encrypt_aes_128.pdf",
+            "inline_encrypt_rc4_128.pdf",
+        ] {
+            let raw: Arc<[u8]> = std::fs::read(enc_fixture(name)).unwrap().into();
+            let control = open_indexed_bytes_internal(raw, None)
+                .unwrap_or_else(|error| panic!("{name} owner-password route failed: {error:?}"));
+            assert!(!control.pages().unwrap().is_empty(), "{name}");
+            assert_eq!(control.diagnostics().indexed_opens, 1);
+            assert_eq!(control.diagnostics().fallback_opens, 0);
+        }
+
+        for name in ["userpw.pdf", "inline_encrypt_userpw.pdf"] {
+            let raw: Arc<[u8]> = std::fs::read(enc_fixture(name)).unwrap().into();
+            let error = open_indexed_bytes_internal(Arc::clone(&raw), None)
+                .err()
+                .expect("password required");
+            assert!(matches!(
+                error.failure,
+                RouteFailure::Access(AccessError {
+                    kind: AccessKind::PasswordRequired,
+                    ..
+                })
+            ));
+            assert_eq!(error.diagnostics.snapshot().indexed_opens, 1);
+            assert_eq!(error.diagnostics.snapshot().fallback_opens, 0);
+
+            let error = open_indexed_bytes_internal(raw, Some(b"wrong".to_vec()))
+                .err()
+                .expect("wrong password");
+            assert!(matches!(
+                error.failure,
+                RouteFailure::Access(AccessError {
+                    kind: AccessKind::InvalidPassword,
+                    ..
+                })
+            ));
+        }
+
+        let mut document = Document::with_version("1.7");
+        let pages = document.add_object(dictionary! {
+            "Type" => "Pages", "Count" => 0, "Kids" => Vec::<lopdf::Object>::new(),
+        });
+        let catalog = document.add_object(dictionary! {
+            "Type" => "Catalog", "Pages" => pages,
+        });
+        document.trailer.set("Root", catalog);
+        document.trailer.set("Encrypt", 7);
+        let mut raw = Vec::new();
+        document.save_to(&mut raw).unwrap();
+        let error = open_indexed_bytes_internal(Arc::from(raw), None)
+            .err()
+            .expect("invalid Encrypt value");
+        assert!(matches!(
+            error.failure,
+            RouteFailure::Access(AccessError {
+                kind: AccessKind::InvalidEncryptDictionary,
+                ..
+            })
+        ));
+
+        let mut corrupted = std::fs::read(enc_fixture("inline_encrypt_userpw.pdf")).unwrap();
+        let endstream = corrupted
+            .windows(b"endstream".len())
+            .position(|window| window == b"endstream")
+            .expect("generated AES fixture has a page-content stream");
+        let mut last_payload = endstream;
+        while corrupted
+            .get(last_payload.saturating_sub(1))
+            .is_some_and(|byte| matches!(byte, b'\r' | b'\n'))
+        {
+            last_payload -= 1;
+        }
+        corrupted[last_payload - 1] ^= 0xff;
+        let control = open_indexed_bytes_internal(
+            Arc::from(corrupted),
+            Some(b"secret".to_vec()),
+        )
+        .expect("encryption bootstrap remains valid");
+        let page = control.pages().unwrap()[0].id;
+        let error = control
+            .check_page_content(page)
+            .expect_err("corrupted AES padding must fail object decryption");
+        assert_eq!(error.kind, AccessKind::ObjectDecryption);
+    }
+
+    #[test]
+    fn indexed_constructor_region_has_no_eager_retry_or_implicit_snapshot() {
+        let source = include_str!("doc.rs");
+        let terminal_start = source.find("fn check_page_content(").unwrap();
+        let terminal_end = source[terminal_start..]
+            .find("/// A private one-thread rayon pool")
+            .map(|offset| terminal_start + offset)
+            .unwrap();
+        let checked_terminal = &source[terminal_start..terminal_end];
+        for forbidden in [
+            "std::fs::read",
+            "read_to_end",
+            "load_mem_deterministic",
+            "EagerDocumentAdapter",
+            "materialize_source_bounded",
+            "Arc<[u8]>",
+            "source_owner",
+            "fallback_open",
+            "Default::default",
+            "unwrap_or_default",
+            "_or_empty",
+        ] {
+            assert!(!checked_terminal.contains(forbidden), "terminal forbidden {forbidden}");
+        }
+        let indexed_start = source.find("fn open_indexed_source(").unwrap();
+        let snapshot_start = source
+            .find("pub(crate) fn open_indexed_snapshot_internal(")
+            .unwrap();
+        let implementation_end = source[snapshot_start..]
+            .find("\nimpl PdfDocument")
+            .map(|offset| snapshot_start + offset)
+            .unwrap();
+        let bounded_routes = &source[indexed_start..snapshot_start];
+        let all_indexed_routes = &source[indexed_start..implementation_end];
+        for forbidden in [
+            "load_mem_deterministic",
+            "Document::load",
+            "EagerDocumentAdapter",
+            "std::fs::read",
+            "_or_empty",
+        ] {
+            assert!(!bounded_routes.contains(forbidden), "forbidden {forbidden}");
+        }
+        assert_eq!(all_indexed_routes.matches("std::fs::read").count(), 1);
+        assert!(!all_indexed_routes.contains("load_mem_deterministic"));
+        assert!(!all_indexed_routes.contains("EagerDocumentAdapter"));
+        assert!(!all_indexed_routes.contains("fallback_open"));
+        assert!(!all_indexed_routes.contains("_or_empty"));
+    }
+
+    #[test]
+    fn indexed_route_open_failures_keep_route_and_zero_fallback_provenance() {
+        let missing = route_temp("missing", b"");
+        std::fs::remove_file(&missing).unwrap();
+        let error = open_indexed_file_internal(&missing, None)
+            .err()
+            .expect("missing file");
+        assert!(matches!(error.failure, RouteFailure::Source(SourceError::Io(_))));
+        let diagnostics = error.diagnostics.snapshot();
+        assert_eq!(diagnostics.route, OpenRoute::IndexedFile);
+        assert_eq!(diagnostics.indexed_opens, 0);
+        assert_eq!(diagnostics.fallback_opens, 0);
+
+        let error = open_indexed_bytes_internal(Arc::from(&b"not a PDF"[..]), None)
+            .err()
+            .expect("invalid bytes");
+        assert!(matches!(error.failure, RouteFailure::Access(_)));
+        let diagnostics = error.diagnostics.snapshot();
+        assert_eq!(diagnostics.route, OpenRoute::IndexedBytes);
+        assert_eq!(diagnostics.indexed_opens, 1);
+        assert_eq!(diagnostics.fallback_opens, 0);
+    }
+
+    #[test]
+    fn actual_access_factory_opens_once_and_a_faulted_consumer_never_retries() {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures_pdf/sec_structure.pdf"
+        ))
+        .unwrap();
+        let counts = Arc::new(AccessCounts::default());
+        let factory_counts = Arc::clone(&counts);
+        let document = PdfDocument::from_bytes_with_access_factory(
+            &bytes,
+            move |eager_document, source| {
+                factory_counts.opens.fetch_add(1, Ordering::Relaxed);
+                let eager: Arc<dyn DocumentAccess> = Arc::new(EagerDocumentAdapter::new(
+                    eager_document,
+                    source,
+                ));
+                Arc::new(FaultAccess::new(
+                    eager,
+                    Some(FaultPoint::Pages),
+                    Arc::clone(&factory_counts),
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(counts.opens.load(Ordering::Relaxed), 1);
+        assert_eq!(document.page_count(), 0);
+        assert_eq!(document.page_count(), 0);
+        assert_eq!(counts.opens.load(Ordering::Relaxed), 1, "no eager retry");
+        assert_eq!(counts.page_reads.load(Ordering::Relaxed), 2);
+        let _ = document.stream_integrity();
+        assert_eq!(counts.object_lists.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.opens.load(Ordering::Relaxed), 1, "no fallback opener");
+    }
 
     /// Every committed fixture PDF, in sorted path order — the sweep corpus a unit test uses
     /// when its claim is about *all* documents (parallelism agreeing with the sequential path,
@@ -827,9 +2466,10 @@ pub(crate) mod tests {
                 .spawn_handler(|_| Err(std::io::Error::other("injected loader thread failure")))
                 .build()
         });
-        let err = failed.err().expect("pool creation failure must fail the load");
+        let err = failed.expect_err("pool creation failure must fail the load");
         assert!(matches!(err, lopdf::Error::IO(_)), "pool failure must remain an IO error: {err}");
-        assert!(err.to_string().contains("injected loader thread failure"));
+        let lopdf::Error::IO(source) = &err else { unreachable!() };
+        assert!(source.to_string().contains("injected loader thread failure"));
         assert!(pool.pool.get().is_none(), "a transient build failure must leave the pool retryable");
 
         // Initialize while already executing in another rayon registry. `ThreadPool::install`
@@ -872,12 +2512,17 @@ pub(crate) mod tests {
                 continue; // encrypted / deliberately damaged
             };
             let mut want = String::new();
-            for (&p, &page_id) in &pdf.doc.get_pages() {
-                let mine = text::extract_page(&pdf.doc, page_id, &pdf.raw).unwrap_or_default();
+            let pages = pdf.access.pages().expect("public eager route pages");
+            for page in pages {
+                let mine = text::extract_page(pdf.access.as_ref(), page.id).unwrap_or_default();
                 if mine.trim().chars().count() >= 2 {
                     want.push_str(&mine);
                 } else {
-                    want.push_str(&pdf.doc.extract_text(&[p]).unwrap_or_default());
+                    want.push_str(
+                        &pdf.access
+                            .fallback_page_text(page.number)
+                            .unwrap_or_default(),
+                    );
                 }
                 want.push('\n');
             }

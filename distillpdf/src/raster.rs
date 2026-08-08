@@ -27,9 +27,12 @@
 //! - Colour-space indirection is bounded by [`MAX_CS_DEPTH`], so a cyclic `/ColorSpace`
 //!   chain terminates.
 
-use crate::pdfobj::{content_bytes, deref, filters_of, is_generic_filter, sub_dict};
-use lopdf::{Dictionary, Document, Object};
-use std::borrow::Cow;
+use crate::access::{read_resolved, DocumentAccess};
+use crate::pdfobj::{content_bytes, filters_of, is_generic_filter, num};
+use crate::walker::ResourceScope;
+use lopdf::{Dictionary, Object};
+#[cfg(test)]
+use lopdf::Document;
 
 pub(crate) fn filter_to_format(filters: &Option<Vec<String>>) -> &'static str {
     match filters {
@@ -86,19 +89,47 @@ pub(crate) const MAX_CS_DEPTH: u32 = 8;
 ///   * per PDF 32000-1 §8.6.3 an image may name a space *defined in the resource
 ///     dictionary's `/ColorSpace` sub-dictionary* (`/ColorSpace /CS0`) rather than a
 ///     device space, so the name has to be looked up in `res` before it means anything.
-pub(crate) fn resolve_cs<'a>(doc: &'a Document, res: &'a Dictionary, o: &'a Object, depth: u32) -> Option<&'a Object> {
+pub(crate) fn read_color_space<R>(
+    access: &dyn DocumentAccess,
+    resources: &ResourceScope,
+    object: &Object,
+    depth: u32,
+    mut inspect: impl FnMut(&Object) -> R,
+) -> Option<R> {
+    read_color_space_inner(access, resources, object, depth, &mut inspect)
+}
+
+fn read_color_space_inner<R>(
+    access: &dyn DocumentAccess,
+    resources: &ResourceScope,
+    object: &Object,
+    depth: u32,
+    inspect: &mut impl FnMut(&Object) -> R,
+) -> Option<R> {
     if depth > MAX_CS_DEPTH {
         return None;
     }
-    match o {
-        Object::Reference(r) => resolve_cs(doc, res, doc.get_object(*r).ok()?, depth + 1),
+    match object {
+        Object::Reference(_) => read_resolved(access, object, |resolved| {
+            read_color_space_inner(access, resources, resolved, depth + 1, inspect)
+        })
+        .ok()
+        .flatten(),
         Object::Name(n) if !is_builtin_cs_name(n) => {
-            match sub_dict(doc, res, b"ColorSpace").and_then(|d| d.get(n.as_slice()).ok()) {
-                Some(v) => resolve_cs(doc, res, v, depth + 1),
-                None => Some(o), // no such resource: report the name verbatim, honestly
+            match resources.read_named(access, b"ColorSpace", n, |value| {
+                    read_color_space_inner(
+                        access,
+                        resources,
+                        value,
+                        depth + 1,
+                        inspect,
+                    )
+                }) {
+                Some(result) => result,
+                None => Some(inspect(object)),
             }
         }
-        other => Some(other),
+        other => Some(inspect(other)),
     }
 }
 
@@ -124,15 +155,20 @@ fn canonical_cs_name(n: &[u8]) -> String {
 /// The image's colour-space **family** name (`DeviceRGB`, `ICCBased`, `Indexed`, …),
 /// after [`resolve_cs`]. The family is what pymupdf reports too; the component count an
 /// `ICCBased`/`Indexed` space implies is what [`cs_model`] derives for PNG assembly.
-pub(crate) fn image_color_space(doc: &Document, res: &Dictionary, dict: &Dictionary) -> Option<String> {
-    match resolve_cs(doc, res, dict.get(b"ColorSpace").ok()?, 0)? {
+pub(crate) fn image_color_space(
+    access: &dyn DocumentAccess,
+    res: &ResourceScope,
+    dict: &Dictionary,
+) -> Option<String> {
+    read_color_space(access, res, dict.get(b"ColorSpace").ok()?, 0, |resolved| match resolved {
         Object::Name(n) => Some(canonical_cs_name(n)),
-        Object::Array(a) => {
-            let head = deref(doc, a.first()?)?.as_name().ok()?;
-            Some(canonical_cs_name(head))
-        }
+        Object::Array(a) => read_resolved(access, a.first()?, |head| {
+            head.as_name().ok().map(canonical_cs_name)
+        })
+        .ok()
+        .flatten(),
         _ => None,
-    }
+    })?
 }
 
 /// A colour space reduced to what PNG assembly needs: how many samples make a pixel and
@@ -227,20 +263,43 @@ fn tint_lut(k: usize, f: &crate::function::Function, alt: &Cs) -> Vec<[u8; 3]> {
     lut
 }
 
-pub(crate) fn cs_model(doc: &Document, res: &Dictionary, o: &Object, depth: u32) -> Option<Cs> {
+pub(crate) fn cs_model(
+    access: &dyn crate::access::DocumentAccess,
+    res: &ResourceScope,
+    o: &Object,
+    depth: u32,
+) -> Option<Cs> {
     if depth > MAX_CS_DEPTH {
         return None;
     }
-    match resolve_cs(doc, res, o, 0)? {
+    read_color_space(access, res, o, 0, |resolved| match resolved {
         Object::Name(n) => match n.as_slice() {
             b"DeviceGray" | b"G" | b"CalGray" => Some(Cs::Gray),
             b"DeviceRGB" | b"RGB" | b"CalRGB" => Some(Cs::Rgb),
             b"DeviceCMYK" | b"CMYK" => Some(Cs::Cmyk),
             _ => None,
         },
-        Object::Array(a) => match deref(doc, a.first()?)?.as_name().ok()? {
+        Object::Array(a) => match read_resolved(access, a.first()?, |head| {
+            head.as_name().ok().map(<[u8]>::to_vec)
+        })
+        .ok()
+        .flatten()?
+        .as_slice()
+        {
             // An ICC profile's `/N` is the component count — the whole point of reading it.
-            b"ICCBased" => match deref(doc, a.get(1)?)?.as_stream().ok()?.dict.get(b"N").ok()?.as_i64().ok()? {
+            b"ICCBased" => match read_resolved(access, a.get(1)?, |profile| {
+                profile
+                    .as_stream()
+                    .ok()?
+                    .dict
+                    .get(b"N")
+                    .ok()?
+                    .as_i64()
+                    .ok()
+            })
+            .ok()
+            .flatten()?
+            {
                 1 => Some(Cs::Gray),
                 3 => Some(Cs::Rgb),
                 4 => Some(Cs::Cmyk),
@@ -249,15 +308,17 @@ pub(crate) fn cs_model(doc: &Document, res: &Dictionary, o: &Object, depth: u32)
             b"CalGray" => Some(Cs::Gray),
             b"CalRGB" => Some(Cs::Rgb),
             b"Indexed" | b"I" => {
-                let base = cs_model(doc, res, a.get(1)?, depth + 1)?;
+                let base = cs_model(access, res, a.get(1)?, depth + 1)?;
                 if matches!(base, Cs::Indexed { .. }) {
                     return None; // an Indexed base is illegal (§8.6.6.3); don't guess
                 }
-                let lookup = match deref(doc, a.get(3)?)? {
-                    Object::String(s, _) => s.clone(),
-                    Object::Stream(st) => content_bytes(st).into_owned(),
-                    _ => return None,
-                };
+                let lookup = read_resolved(access, a.get(3)?, |lookup| match lookup {
+                    Object::String(bytes, _) => Some(bytes.clone()),
+                    Object::Stream(stream) => Some(content_bytes(stream)),
+                    _ => None,
+                })
+                .ok()
+                .flatten()?;
                 Some(Cs::Indexed { base: Box::new(base), lookup })
             }
             // A spot space's samples are tints; the tint transform is what makes them a
@@ -265,15 +326,27 @@ pub(crate) fn cs_model(doc: &Document, res: &Dictionary, o: &Object, depth: u32)
             // an alternate we cannot reduce) the image stays `raw` rather than being
             // decoded as if the tints were intensities.
             b"Separation" | b"DeviceN" => {
-                let k = if a.first()?.as_name().ok()? == b"Separation" { 1 } else { deref(doc, a.get(1)?)?.as_array().ok()?.len() };
+                let k = if read_resolved(access, a.first()?, |head| {
+                    head.as_name().is_ok_and(|name| name == b"Separation")
+                })
+                .unwrap_or(false)
+                {
+                    1
+                } else {
+                    read_resolved(access, a.get(1)?, |names| {
+                        names.as_array().ok().map(Vec::len)
+                    })
+                    .ok()
+                    .flatten()?
+                };
                 if k == 0 || k > MAX_TINT_COLORANTS {
                     return None;
                 }
-                let alt = cs_model(doc, res, a.get(2)?, depth + 1)?;
+                let alt = cs_model(access, res, a.get(2)?, depth + 1)?;
                 if matches!(alt, Cs::Indexed { .. } | Cs::Tint { .. }) {
                     return None; // an Indexed or spot alternate is illegal (§8.6.6.4)
                 }
-                let tint = crate::function::Function::parse(doc, a.get(3)?)?;
+                let tint = crate::function::Function::parse(access, a.get(3)?)?;
                 // A transform whose output arity disagrees with the space it feeds is not
                 // one to trust — the same refusal `vector.rs::parse_cs` makes.
                 if tint.n_outputs().is_some_and(|n| n != alt.components()) {
@@ -284,7 +357,7 @@ pub(crate) fn cs_model(doc: &Document, res: &Dictionary, o: &Object, depth: u32)
             _ => None, // Lab / Pattern: not reducible to RGB here
         },
         _ => None,
-    }
+    })?
 }
 
 /// Per-dimension and total-pixel ceilings: a malformed or hostile stream can declare an
@@ -301,18 +374,23 @@ pub(crate) fn dims_sane(w: u32, h: u32) -> bool {
 }
 
 /// The `/Decode` array as floats, when it has the 2·n entries the sample layout needs.
-fn decode_array(doc: &Document, dict: &Dictionary, n: usize) -> Option<Vec<f32>> {
-    let a = deref(doc, dict.get(b"Decode").ok()?)?.as_array().ok()?;
-    if a.len() != n * 2 {
-        return None;
-    }
-    a.iter()
-        .map(|o| match o {
-            Object::Integer(i) => Some(*i as f32),
-            Object::Real(r) => Some(*r),
-            _ => None,
-        })
-        .collect()
+fn decode_array(access: &dyn DocumentAccess, dict: &Dictionary, n: usize) -> Option<Vec<f32>> {
+    read_resolved(access, dict.get(b"Decode").ok()?, |decode| {
+        let decode = decode.as_array().ok()?;
+        if decode.len() != n * 2 {
+            return None;
+        }
+        decode
+            .iter()
+            .map(|value| match value {
+                Object::Integer(value) => Some(*value as f32),
+                Object::Real(value) => Some(*value),
+                _ => None,
+            })
+            .collect()
+    })
+    .ok()
+    .flatten()
 }
 
 /// Everything about a sampled image that is decidable from its *dictionary* alone: the
@@ -332,9 +410,17 @@ struct SamplePlan {
 
 /// The dictionary-only half of the decode gate — see [`SamplePlan`]. Touches no stream
 /// bytes, so a caller may ask it about every image on a page for free.
-fn sample_plan(doc: &Document, res: &Dictionary, dict: &Dictionary) -> Option<SamplePlan> {
-    let w = deref(doc, dict.get(b"Width").ok()?)?.as_i64().ok()?;
-    let h = deref(doc, dict.get(b"Height").ok()?)?.as_i64().ok()?;
+fn sample_plan(
+    access: &dyn crate::access::DocumentAccess,
+    res: &ResourceScope,
+    dict: &Dictionary,
+) -> Option<SamplePlan> {
+    let w = read_resolved(access, dict.get(b"Width").ok()?, |value| value.as_i64().ok())
+        .ok()
+        .flatten()?;
+    let h = read_resolved(access, dict.get(b"Height").ok()?, |value| value.as_i64().ok())
+        .ok()
+        .flatten()?;
     if w <= 0 || h <= 0 || w > MAX_IMAGE_DIM || h > MAX_IMAGE_DIM {
         return None;
     }
@@ -347,8 +433,8 @@ fn sample_plan(doc: &Document, res: &Dictionary, dict: &Dictionary) -> Option<Sa
     let (cs, bpc) = if is_mask {
         (Cs::Gray, 1i64)
     } else {
-        let cs = cs_model(doc, res, dict.get(b"ColorSpace").ok()?, 0)?;
-        let bpc = image_bpc(doc, dict)?;
+        let cs = cs_model(access, res, dict.get(b"ColorSpace").ok()?, 0)?;
+        let bpc = image_bpc(access, dict)?;
         (cs, bpc)
     };
     if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
@@ -363,8 +449,12 @@ fn sample_plan(doc: &Document, res: &Dictionary, dict: &Dictionary) -> Option<Sa
 ///
 /// Only ever over-reports (a truncated stream still says `true`), never under-reports —
 /// which is the direction a placeholder count can afford to be wrong in.
-pub(crate) fn samples_decodable(doc: &Document, res: &Dictionary, dict: &Dictionary) -> bool {
-    sample_plan(doc, res, dict).is_some()
+pub(crate) fn samples_decodable(
+    access: &dyn crate::access::DocumentAccess,
+    res: &ResourceScope,
+    dict: &Dictionary,
+) -> bool {
+    sample_plan(access, res, dict).is_some()
 }
 
 /// A decoded sample block, in the narrowest form that holds it without loss: an achromatic
@@ -410,9 +500,13 @@ impl Samples {
 /// Reads the stream through [`crate::pdfobj::content_bytes`], so an **unfiltered** raster
 /// keeps its bytes — `decompressed_content()` alone errors when a stream has no `/Filter`,
 /// which is how the render path's own copy silently lost every uncompressed image.
-pub(crate) fn decode_samples(doc: &Document, res: &Dictionary, stream: &lopdf::Stream) -> Option<Samples> {
+pub(crate) fn decode_samples(
+    access: &dyn crate::access::DocumentAccess,
+    res: &ResourceScope,
+    stream: &lopdf::Stream,
+) -> Option<Samples> {
     let dict = &stream.dict;
-    let SamplePlan { cs, bpc, w: wu, h: hu } = sample_plan(doc, res, dict)?;
+    let SamplePlan { cs, bpc, w: wu, h: hu } = sample_plan(access, res, dict)?;
     let nc = cs.components();
 
     let samples = content_bytes(stream);
@@ -423,7 +517,7 @@ pub(crate) fn decode_samples(doc: &Document, res: &Dictionary, stream: &lopdf::S
     }
 
     let maxval = ((1u32 << bpc) - 1) as f32;
-    let decode = decode_array(doc, dict, nc);
+    let decode = decode_array(access, dict, nc);
     let gray_out = cs.is_gray();
     let out_ch = if gray_out { 1 } else { 3 };
     let mut out: Vec<u8> = Vec::new();
@@ -508,8 +602,12 @@ pub(crate) fn decode_samples(doc: &Document, res: &Dictionary, stream: &lopdf::S
 /// The extract path's container for `format:"png"` — 1167 of 2604 corpus rows, none of
 /// which opened as an image file before (the caller got back compressed samples with no
 /// container at all).
-pub(crate) fn assemble_png(doc: &Document, res: &Dictionary, stream: &lopdf::Stream) -> Option<Vec<u8>> {
-    png_bytes(decode_samples(doc, res, stream)?.into_dynamic())
+pub(crate) fn assemble_png(
+    access: &dyn crate::access::DocumentAccess,
+    res: &ResourceScope,
+    stream: &lopdf::Stream,
+) -> Option<Vec<u8>> {
+    png_bytes(decode_samples(access, res, stream)?.into_dynamic())
 }
 
 /// The `i`-th `bpc`-bit sample of a packed row.
@@ -538,8 +636,8 @@ pub(crate) fn png_bytes(img: image::DynamicImage) -> Option<Vec<u8>> {
 /// back as a JPEG file and not as a blob nothing can open.
 ///
 /// The filter chain is read from the stream's own dict, so no caller can peel against a
-/// list that disagrees with the bytes. Borrows when there is nothing to peel (the common
-/// single-codec case), so the passthrough path copies no pixels.
+/// list that disagrees with the bytes. The returned leaf payload is owned so it cannot
+/// outlive a short resolver read through a stream-derived borrow.
 ///
 /// **Not a decode of the generic layers lopdf cannot apply.** `ASCIIHexDecode`/`AHx` are
 /// in the set above, but lopdf 0.40 answers `Unimplemented` for them, so a chain that
@@ -548,40 +646,43 @@ pub(crate) fn png_bytes(img: image::DynamicImage) -> Option<Vec<u8>> {
 /// degradation is *reported*, not silent: `pdfobj::stream_issues` flags exactly this stream
 /// as `filter-unapplied`, and a truncated Flate wrapper — which lopdf reports as `Ok` —
 /// as `flate-truncated`.
-pub(crate) fn codec_payload(stream: &lopdf::Stream) -> Cow<'_, [u8]> {
+pub(crate) fn codec_payload(stream: &lopdf::Stream) -> Vec<u8> {
     let lead: Vec<Object> = filters_of(&stream.dict)
         .iter()
         .take_while(|f| is_generic_filter(f))
         .map(|f| Object::Name(f.clone()))
         .collect();
     if lead.is_empty() {
-        return Cow::Borrowed(&stream.content);
+        return stream.content.clone();
     }
     let mut s = stream.clone();
     s.dict.set("Filter", Object::Array(lead));
     s.dict.remove(b"DecodeParms"); // codec parms don't apply to the generic layers
     s.dict.remove(b"DP");
+    if crate::pdfobj::has_legacy_unsupported_filter(&s.dict) {
+        return stream.content.clone();
+    }
     match s.decompressed_content() {
-        Ok(b) => Cow::Owned(b),
-        Err(_) => Cow::Borrowed(&stream.content),
+        Ok(bytes) => bytes,
+        Err(_) => stream.content.clone(),
     }
 }
 
 /// True when the image dict carries an inverting `/Decode` array (`[1 0 …]`).
 ///
 /// Follows an indirect `/Decode`, which the render path's own copy could not see.
-pub(crate) fn decode_inverts(doc: &Document, dict: &Dictionary) -> bool {
-    match dict.get(b"Decode").ok().and_then(|o| deref(doc, o)) {
-        Some(Object::Array(a)) if a.len() >= 2 => {
-            let n = |o: &Object| match o {
-                Object::Integer(i) => *i as f32,
-                Object::Real(r) => *r,
-                _ => 0.0,
-            };
-            n(&a[0]) > n(&a[1])
-        }
-        _ => false,
-    }
+pub(crate) fn decode_inverts(access: &dyn DocumentAccess, dict: &Dictionary) -> bool {
+    let Ok(decode) = dict.get(b"Decode") else {
+        return false;
+    };
+    read_resolved(access, decode, |decode| {
+        decode
+            .as_array()
+            .ok()
+            .filter(|values| values.len() >= 2)
+            .is_some_and(|values| num(&values[0]) > num(&values[1]))
+    })
+    .unwrap_or(false)
 }
 
 /// Component count from a JPEG's SOF (start-of-frame) marker, without decoding pixels.
@@ -686,8 +787,12 @@ fn maybe_invert(mut px: Vec<u8>, invert: bool) -> Vec<u8> {
 /// A normalized PNG for a JPEG whose bytes a consumer would decode to the wrong colour:
 /// a 4-component (CMYK/YCCK) stream, or any stream with an inverting `/Decode` the JPEG
 /// file itself cannot express. Everything else keeps its lossless JPEG passthrough.
-pub(crate) fn normalized_jpeg_png(doc: &Document, dict: &Dictionary, jpeg: &[u8]) -> Option<Vec<u8>> {
-    let decode_inv = decode_inverts(doc, dict);
+pub(crate) fn normalized_jpeg_png(
+    access: &dyn DocumentAccess,
+    dict: &Dictionary,
+    jpeg: &[u8],
+) -> Option<Vec<u8>> {
+    let decode_inv = decode_inverts(access, dict);
     if jpeg_components(jpeg) != Some(4) && !decode_inv {
         return None;
     }
@@ -695,11 +800,14 @@ pub(crate) fn normalized_jpeg_png(doc: &Document, dict: &Dictionary, jpeg: &[u8]
 }
 
 /// `/BitsPerComponent`, or the value the spec implies when the key is absent.
-pub(crate) fn image_bpc(doc: &Document, dict: &Dictionary) -> Option<i64> {
+pub(crate) fn image_bpc(access: &dyn DocumentAccess, dict: &Dictionary) -> Option<i64> {
     dict.get(b"BitsPerComponent")
         .ok()
-        .and_then(|o| deref(doc, o))
-        .and_then(|o| o.as_i64().ok())
+        .and_then(|object| {
+            read_resolved(access, object, |value| value.as_i64().ok())
+                .ok()
+                .flatten()
+        })
         // A stencil mask is 1-bit by definition and may omit the key (§8.9.6.2).
         .or_else(|| dict.get(b"ImageMask").and_then(|o| o.as_bool()).unwrap_or(false).then_some(1))
 }
@@ -707,7 +815,38 @@ pub(crate) fn image_bpc(doc: &Document, dict: &Dictionary) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::test_adapter;
     use lopdf::{dictionary, Stream, StringFormat};
+
+    fn cs_model(doc: &Document, resources: &Dictionary, object: &Object, depth: u32) -> Option<Cs> {
+        super::cs_model(&test_adapter(doc), &ResourceScope::test_owned(resources), object, depth)
+    }
+
+    fn samples_decodable(doc: &Document, resources: &Dictionary, dict: &Dictionary) -> bool {
+        super::samples_decodable(&test_adapter(doc), &ResourceScope::test_owned(resources), dict)
+    }
+
+    fn decode_samples(doc: &Document, resources: &Dictionary, stream: &Stream) -> Option<Samples> {
+        super::decode_samples(&test_adapter(doc), &ResourceScope::test_owned(resources), stream)
+    }
+
+    fn assemble_png(doc: &Document, resources: &Dictionary, stream: &Stream) -> Option<Vec<u8>> {
+        super::assemble_png(&test_adapter(doc), &ResourceScope::test_owned(resources), stream)
+    }
+
+    fn image_color_space(doc: &Document, resources: &Dictionary, dict: &Dictionary) -> Option<String> {
+        super::image_color_space(&test_adapter(doc), &ResourceScope::test_owned(resources), dict)
+    }
+
+    fn resolve_cs(doc: &Document, resources: &Dictionary, object: &Object, depth: u32) -> Option<Object> {
+        super::read_color_space(
+            &test_adapter(doc),
+            &ResourceScope::test_owned(resources),
+            object,
+            depth,
+            Clone::clone,
+        )
+    }
 
     fn stream(filters: &[&str], content: Vec<u8>) -> Stream {
         let mut d = Dictionary::new();
@@ -754,7 +893,7 @@ mod tests {
         // as the ASCII blob nothing can open — the shape reportlab writes.
         let jpeg = b"\xff\xd8\xff\xe0hello";
         let s = stream(&["ASCII85Decode", "DCTDecode"], b"s4IA0BOu!rDZ~>".to_vec());
-        assert_eq!(codec_payload(&s).as_ref(), jpeg);
+        assert_eq!(codec_payload(&s).as_slice(), jpeg);
     }
 
     #[test]
@@ -765,15 +904,15 @@ mod tests {
         // Pinned here so no later phase claims a decode this stack does not perform.
         let hex = b"ffd8ffe068656c6c6f>".to_vec();
         let s = stream(&["ASCIIHexDecode", "DCTDecode"], hex.clone());
-        assert!(s.decompressed_content().is_err(), "the premise: lopdf cannot apply AHx");
-        assert_eq!(codec_payload(&s).as_ref(), hex);
+        assert!(crate::pdfobj::has_legacy_unsupported_filter(&s.dict));
+        assert_eq!(codec_payload(&s).as_slice(), hex);
     }
 
     #[test]
     fn codec_payload_hands_back_the_stream_verbatim_when_there_is_nothing_to_peel() {
         // A bare codec stream: no generic layer, so the bytes ARE the payload.
         let s = stream(&["DCTDecode"], b"\xff\xd8raw jpeg".to_vec());
-        assert_eq!(codec_payload(&s).as_ref(), b"\xff\xd8raw jpeg");
+        assert_eq!(codec_payload(&s).as_slice(), b"\xff\xd8raw jpeg");
         // A stream whose declared Flate wrapper is not actually deflate comes back EMPTY,
         // not raw: lopdf's zlib reader swallows its error and returns the partial output it
         // managed (the same lopdf quirk `pdfobj::content_bytes` documents), so the
@@ -788,7 +927,7 @@ mod tests {
         // leaving it on the peeling copy makes lopdf misapply it.
         let mut s = stream(&["ASCII85Decode", "CCITTFaxDecode"], b"88/~>".to_vec()); // "Hi"
         s.dict.set("DecodeParms", dictionary! { "K" => -1i64, "Columns" => 1728i64 });
-        assert_eq!(codec_payload(&s).as_ref(), b"Hi");
+        assert_eq!(codec_payload(&s).as_slice(), b"Hi");
     }
 
     #[test]
@@ -820,18 +959,18 @@ mod tests {
         let mut doc = Document::with_version("1.5");
         let mut d = Dictionary::new();
         d.set("Decode", vec![1.into(), 0.into(), 1.into(), 0.into(), 1.into(), 0.into()]);
-        assert_eq!(decode_array(&doc, &d, 3), Some(vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0]));
-        assert_eq!(decode_array(&doc, &d, 4), None, "a 3-channel array is not a 4-channel one");
-        assert_eq!(decode_array(&doc, &Dictionary::new(), 3), None);
+        assert_eq!(decode_array(&test_adapter(&doc), &d, 3), Some(vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0]));
+        assert_eq!(decode_array(&test_adapter(&doc), &d, 4), None, "a 3-channel array is not a 4-channel one");
+        assert_eq!(decode_array(&test_adapter(&doc), &Dictionary::new(), 3), None);
         // Written indirectly — legal, and the reader must follow it.
         let id = doc.add_object(Object::Array(vec![0.into(), 1.into()]));
         let mut ind = Dictionary::new();
         ind.set("Decode", Object::Reference(id));
-        assert_eq!(decode_array(&doc, &ind, 1), Some(vec![0.0, 1.0]));
+        assert_eq!(decode_array(&test_adapter(&doc), &ind, 1), Some(vec![0.0, 1.0]));
         // A non-numeric entry makes the whole array unusable rather than half-read.
         let mut bad = Dictionary::new();
         bad.set("Decode", vec![Object::Name(b"nope".to_vec()), 1.into()]);
-        assert_eq!(decode_array(&doc, &bad, 1), None);
+        assert_eq!(decode_array(&test_adapter(&doc), &bad, 1), None);
     }
 
     #[test]
@@ -842,14 +981,14 @@ mod tests {
             d.set("Decode", v);
             d
         };
-        assert!(decode_inverts(&doc, &mk(vec![1.into(), 0.into()])));
-        assert!(!decode_inverts(&doc, &mk(vec![0.into(), 1.into()])));
-        assert!(!decode_inverts(&doc, &Dictionary::new()));
+        assert!(decode_inverts(&test_adapter(&doc), &mk(vec![1.into(), 0.into()])));
+        assert!(!decode_inverts(&test_adapter(&doc), &mk(vec![0.into(), 1.into()])));
+        assert!(!decode_inverts(&test_adapter(&doc), &Dictionary::new()));
         // `img.rs`'s copy cannot see this shape at all — the reason there is one here.
         let id = doc.add_object(Object::Array(vec![1.into(), 0.into()]));
         let mut ind = Dictionary::new();
         ind.set("Decode", Object::Reference(id));
-        assert!(decode_inverts(&doc, &ind), "an indirect /Decode array must be followed");
+        assert!(decode_inverts(&test_adapter(&doc), &ind), "an indirect /Decode array must be followed");
     }
 
     #[test]
@@ -879,7 +1018,7 @@ mod tests {
         let a = Object::Name(b"A".to_vec());
         assert_eq!(resolve_cs(&doc, &loopy, &a, 0), None);
         // A name nothing defines is reported honestly rather than guessed at.
-        assert_eq!(resolve_cs(&doc, &Dictionary::new(), &a, 0), Some(&a));
+        assert_eq!(resolve_cs(&doc, &Dictionary::new(), &a, 0), Some(a));
     }
 
     #[test]
@@ -989,13 +1128,13 @@ mod tests {
     fn image_bpc_falls_back_to_the_stencil_masks_implied_depth() {
         let mut doc = Document::with_version("1.5");
         let mut d = Dictionary::new();
-        assert_eq!(image_bpc(&doc, &d), None, "no key and no mask: unknown, not guessed");
+        assert_eq!(image_bpc(&test_adapter(&doc), &d), None, "no key and no mask: unknown, not guessed");
         d.set("ImageMask", true);
-        assert_eq!(image_bpc(&doc, &d), Some(1), "a stencil mask is 1-bit by definition");
+        assert_eq!(image_bpc(&test_adapter(&doc), &d), Some(1), "a stencil mask is 1-bit by definition");
         let id = doc.add_object(Object::Integer(16));
         let mut ind = Dictionary::new();
         ind.set("BitsPerComponent", Object::Reference(id));
-        assert_eq!(image_bpc(&doc, &ind), Some(16), "an indirect /BitsPerComponent resolves");
+        assert_eq!(image_bpc(&test_adapter(&doc), &ind), Some(16), "an indirect /BitsPerComponent resolves");
     }
 
     #[test]
@@ -1039,12 +1178,12 @@ mod tests {
         let doc = Document::with_version("1.5");
         let mut rgb = vec![0xFF, 0xD8];
         rgb.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03]);
-        assert!(normalized_jpeg_png(&doc, &Dictionary::new(), &rgb).is_none());
+        assert!(normalized_jpeg_png(&test_adapter(&doc), &Dictionary::new(), &rgb).is_none());
         // With an inverting /Decode the gate opens (the decode itself then fails on this
         // header-only buffer, which is the honest `None` rather than a fabricated image).
         let mut inv = Dictionary::new();
         inv.set("Decode", vec![1.into(), 0.into()]);
-        assert!(normalized_jpeg_png(&doc, &inv, &rgb).is_none());
+        assert!(normalized_jpeg_png(&test_adapter(&doc), &inv, &rgb).is_none());
         assert!(decode_dct_rgb(&rgb, true).is_none(), "a truncated JPEG decodes to nothing, never to noise");
     }
 

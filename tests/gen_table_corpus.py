@@ -53,7 +53,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet      # noqa
 from reportlab.lib.units import inch                                      # noqa: E402
 from reportlab.pdfgen import canvas as rl_canvas                          # noqa: E402
 from reportlab.platypus import (BaseDocTemplate, Frame, PageTemplate,     # noqa: E402
-                                Paragraph, SimpleDocTemplate, Spacer,
+                                PageBreak, Paragraph, SimpleDocTemplate, Spacer,
                                 Table, TableStyle)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -222,7 +222,25 @@ def mkgrid(case_id, rows, cols, header=True, numeric=(), blank_frac=0.0, long_te
     return out
 
 
-def to_cells(grid, header_rows=1, spans=()):
+def _authored_value_traits(value):
+    """Semantic traits for a value the generator owns, before PDF rendering."""
+    s = str(value)
+    traits = ["numeric"]
+    if s.startswith("-") or (s.startswith("(") and s.endswith(")")):
+        traits.append("signed")
+    # A lone comma followed by exactly three digits is an authored grouping separator
+    # (`1,234`), not a decimal. Dot decimals and mixed US/EU separators remain decimal.
+    comma_tail = s.rsplit(",", 1)[-1] if "," in s else ""
+    if "." in s or ("," in s and ("." in s or len(comma_tail.rstrip(")")) != 3)):
+        traits.append("decimal")
+    if "%" in s:
+        traits.append("percent")
+    if "$" in s or "€" in s or any(ch.isalpha() for ch in s):
+        traits.append("unit")
+    return traits
+
+
+def to_cells(grid, header_rows=1, spans=(), *, numeric=()):
     """The §7 explicit cell list from a rectangular grid of strings.
 
     `spans` is a list of (r, c, rowspan, colspan); covered slots are OMITTED (span text lives
@@ -235,6 +253,13 @@ def to_cells(grid, header_rows=1, spans=()):
             for dc in range(cs):
                 if (dr, dc) != (0, 0):
                     covered.add((r + dr, c + dc))
+    header_anchors = []
+    for r in range(min(header_rows, len(grid))):
+        for c in range(len(grid[r])):
+            if (r, c) in covered:
+                continue
+            _, cs = span_at.get((r, c), (1, 1))
+            header_anchors.append((r, c, cs))
     out = []
     for r, row in enumerate(grid):
         for c, txt in enumerate(row):
@@ -248,8 +273,16 @@ def to_cells(grid, header_rows=1, spans=()):
                 rec["colspan"] = cs
             if r < header_rows:
                 rec["header"] = True
+                rec["role"] = "header"
+                rec["header_path"] = []
+            else:
+                rec["role"] = "data"
+                rec["header_path"] = [[hr, hc] for hr, hc, hcs in header_anchors
+                                      if hc <= c < hc + hcs]
             if not str(txt):
                 rec["blank"] = True
+            if r >= header_rows and c in numeric and str(txt):
+                rec["value_traits"] = _authored_value_traits(txt)
             out.append(rec)
     return out
 
@@ -272,7 +305,9 @@ class LocTable(Table):
     def draw(self):
         x, y = self.canv.absolutePosition(0, 0)
         _DRAWS.append({"tid": self.tid, "page": self.canv.getPageNumber() - 1,
-                       "x": x, "y": y, "w": self._width, "h": self._height})
+                       "x": x, "y": y, "w": self._width, "h": self._height,
+                       "col_widths": list(self._colWidths),
+                       "row_heights": list(self._rowHeights)})
         Table.draw(self)
 
     def split(self, aW, aH):
@@ -286,6 +321,21 @@ class LocTable(Table):
 def _norm_bbox(d, pw=PW, ph=PH):
     return [round(d["x"] / pw, 4), round((ph - d["y"] - d["h"]) / ph, 4),
             round((d["x"] + d["w"]) / pw, 4), round((ph - d["y"]) / ph, 4)]
+
+
+def _cell_axes(d, grid, pw=PW, ph=PH):
+    """Compact exact authored cell boundaries as normalized column/row edges."""
+    widths, heights = d.get("col_widths", ()), d.get("row_heights", ())
+    if len(widths) != max(len(row) for row in grid) or len(heights) != len(grid):
+        return None  # split/hand-authored geometry is unavailable, never guessed
+    xs = [d["x"]]
+    for width in widths:
+        xs.append(xs[-1] + width)
+    ys = [ph - (d["y"] + d["h"])]
+    for height in heights:
+        ys.append(ys[-1] + height)
+    return {"col_edges_norm": [round(x / pw, 4) for x in xs],
+            "row_edges_norm": [round(y / ph, 4) for y in ys]}
 
 
 def build_doc(fname, story, pagesize=(PW, PH), frames=None):
@@ -310,9 +360,29 @@ def build_doc(fname, story, pagesize=(PW, PH), frames=None):
     return grouped
 
 
+def _enrich_truth_table(table):
+    """Complete schema-3 roles and authored column-header paths for every producer."""
+    header_anchors = [
+        (cell["r"], cell["c"], cell.get("colspan", 1))
+        for cell in table["cells"]
+        if cell.get("header") or cell["r"] < table.get("header_rows", 1)
+    ]
+    for cell in table["cells"]:
+        if cell.get("header") or cell["r"] < table.get("header_rows", 1):
+            cell["header"] = True
+            cell["role"] = "header"
+            cell["header_path"] = []
+        else:
+            cell["role"] = "data"
+            cell["header_path"] = [[r, c] for r, c, colspan in header_anchors
+                                   if c <= cell["c"] < c + colspan]
+
+
 def emit(fname, *, tier, family, variant, tagged, tables, expect,
          source=None, invented=None, pages=1, note=None, parity=None):
     assert source or invented, f"{fname}: every case names a source or is marked invented (§4.1)"
+    for table in tables:
+        _enrich_truth_table(table)
     rec = {"tier": tier, "family": family, "variant": variant, "tagged": tagged,
            "pages": pages, "tables": tables, "expect": expect}
     if source:
@@ -331,12 +401,16 @@ def emit(fname, *, tier, family, variant, tagged, tables, expect,
     return rec
 
 
-def tbl(draws, grid, *, style, header_rows=1, spans=(), page=0):
+def tbl(draws, grid, *, style, header_rows=1, spans=(), page=0, numeric=()):
     d = draws[0]
-    return {"page": d.get("page", page), "bbox_norm": _norm_bbox(d),
-            "n_rows": len(grid), "n_cols": max(len(r) for r in grid),
-            "style": style, "header_rows": header_rows,
-            "cells": to_cells(grid, header_rows, spans)}
+    table = {"page": d.get("page", page), "bbox_norm": _norm_bbox(d),
+             "n_rows": len(grid), "n_cols": max(len(r) for r in grid),
+             "style": style, "header_rows": header_rows,
+             "cells": to_cells(grid, header_rows, spans, numeric=numeric)}
+    axes = _cell_axes(d, grid)
+    if axes:
+        table.update(axes)
+    return table
 
 
 def flow(grid, style, *, tid, colw=None, header_rows=1, numeric=(), spans=(),
@@ -803,12 +877,12 @@ def t2_confounds():
         def build(cid):
             r = rng_for(cid)
             grid = [["Indicator", "2019", "2020", "2021", "2022", "2023", "Trend"],
-                    ["GDP growth", *[f"{r.randint(-3, 9)}.{r.randint(0, 9)}" for _ in range(5)],
+                    ["GDP growth", *[f"{r.randint(-3, 9)}.{r.randint(0, 9)}%" for _ in range(5)],
                      r.choice(["rising", "flat", "falling"])]]
             g = build_doc(f"{cid}.pdf", [Paragraph(PROSE, BODY), Spacer(1, 12),
                                          flow(grid, style, tid=cid, numeric=(1, 2, 3, 4, 5)),
                                          Spacer(1, 12), Paragraph(PROSE, BODY)])
-            return ([tbl(g[0]["draws"], grid, style=style)], {"table_count": 1},
+            return ([tbl(g[0]["draws"], grid, style=style, numeric=(1, 2, 3, 4, 5))], {"table_count": 1},
                     "found at 2x7 — not merged into the surrounding prose, not read "
                     "column-major; a 5x5 default never produces this shape")
         return build
@@ -885,7 +959,7 @@ def t2_confounds():
                 grid.append([f"Item{i + 1}", f"{(i + 1) * 3}", a])
             g = build_doc(f"{cid}.pdf", [flow(grid, "borderless", tid=cid, numeric=(1, 2),
                                               colw=[1.3 * inch, 0.9 * inch, 1.2 * inch])])
-            return ([tbl(g[0]["draws"], grid, style="borderless")], {"table_count": 1},
+            return ([tbl(g[0]["draws"], grid, style="borderless", numeric=(1, 2))], {"table_count": 1},
                     "right-aligned values 1-7 digits wide scatter their LEFT edges row to "
                     "row; the column count must stay 3 and each value keep its own cell")
         return build
@@ -915,7 +989,7 @@ def t2_confounds():
                 grid.append([name, *vals])
             g = build_doc(f"{cid}.pdf", [flow(grid, "booktabs", tid=cid, numeric=(1, 2),
                                               colw=[2.2 * inch, 1.6 * inch, 1.6 * inch])])
-            return ([tbl(g[0]["draws"], grid, style="booktabs")], {"table_count": 1},
+            return ([tbl(g[0]["draws"], grid, style="booktabs", numeric=(1, 2))], {"table_count": 1},
                     "cell text compares LITERALLY: `1,234.56` != `1234.56`, and the "
                     "parenthesised negative and the currency mark are part of the value")
         return build
@@ -1241,6 +1315,166 @@ def t3_adversarial():
                        "every page and must not become a body row"),
              note=f"{npages} pages; cells in row order, no dropped boundary rows. Placement "
                   f"is gated, the stitching POLICY is not (`table_count_any`).")
+
+    # --- Phase 7A cross-page preregistration -------------------------------------------
+    # These four cases freeze the continuation proof boundary before any product change:
+    # three accepted-parent negatives and one deliberately red genuine continuation.  All
+    # are two-page, four-column controlled pairs so a future stitcher cannot hide behind a
+    # page-count, shape, or column-count distinction.
+
+    cid = "t3_crosspage_independent_geometry"
+    first = [["Site", "Region", "Depth", "Grade"],
+             ["Aster", "North", "12.4", "2.1"],
+             ["Birch", "North", "18.0", "1.7"],
+             ["Cedar", "West", "24.8", "3.0"],
+             ["Dune", "South", "31.6", "2.6"],
+             ["Elm", "East", "37.3", "1.9"]]
+    second = [["Model", "Family", "Params", "Score"],
+              ["Atlas", "Linear", "12M", "31.4"],
+              ["Beacon", "Tree", "48M", "35.2"],
+              ["Cobalt", "Kernel", "27M", "33.8"],
+              ["Drift", "Linear", "19M", "32.6"],
+              ["Ember", "Tree", "61M", "36.1"]]
+    first_widths = [1.10 * inch, 1.10 * inch, 0.85 * inch, 0.85 * inch]
+    second_widths = [0.80 * inch, 1.35 * inch, 0.70 * inch, 1.25 * inch]
+    pieces = build_doc(
+        f"{cid}.pdf",
+        [Spacer(1, 430),
+         Paragraph("Table A. Northern field observations", CELL), Spacer(1, 6),
+         flow(first, "full_grid", tid=cid + "_a", colw=first_widths),
+         PageBreak(),
+         Paragraph("Table B. Independent model evaluation", CELL), Spacer(1, 6),
+         flow(second, "full_grid", tid=cid + "_b", colw=second_widths)],
+    )
+    emit(f"{cid}.pdf", tier=3, family=cid, variant="only", tagged=False, pages=2,
+         tables=[tbl(pieces[0]["draws"], first, style="full_grid"),
+                 tbl(pieces[1]["draws"], second, style="full_grid")],
+         expect={"table_count": 2, "must_not_merge": True},
+         invented="Phase 7 preregistered negative: independent tables on adjacent pages "
+                  "have the same four-column count but different x-edges and ownership",
+         note="accepted parent contract: exactly two tables; cross-page shape similarity "
+              "alone never licenses a merge")
+
+    cid = "t3_crosspage_independent_caption"
+    headers = ["Item", "Region", "Value", "Status"]
+    first = [headers,
+             ["Permit A", "North", "14", "open"],
+             ["Permit B", "South", "19", "closed"],
+             ["Permit C", "East", "23", "open"],
+             ["Permit D", "West", "28", "review"],
+             ["Permit E", "North", "34", "closed"]]
+    second = [headers,
+              ["Audit D", "North", "71", "passed"],
+              ["Audit E", "South", "64", "passed"],
+              ["Audit F", "West", "58", "review"],
+              ["Audit G", "East", "76", "passed"],
+              ["Audit H", "North", "69", "review"]]
+    widths = [1.25 * inch, 1.15 * inch, 0.85 * inch, 1.15 * inch]
+    pieces = build_doc(
+        f"{cid}.pdf",
+        [Spacer(1, 430),
+         flow(first, "full_grid", tid=cid + "_a", colw=widths), Spacer(1, 6),
+         Paragraph("Table 7. Permit register", CELL),
+         PageBreak(),
+         Paragraph("Table 8. Audit outcomes", CELL), Spacer(1, 6),
+         flow(second, "full_grid", tid=cid + "_b", colw=widths)],
+    )
+    emit(f"{cid}.pdf", tier=3, family=cid, variant="only", tagged=False, pages=2,
+         tables=[tbl(pieces[0]["draws"], first, style="full_grid"),
+                 tbl(pieces[1]["draws"], second, style="full_grid")],
+         expect={"table_count": 2, "must_not_merge": True},
+         invented="Phase 7 preregistered negative: adjacent-page tables deliberately share "
+                  "literal headers and exact x-edges but have distinct captions/ownership",
+         note="accepted parent contract: both tables retain their identical header row and "
+              "their caption-distinguished contents remain separate")
+
+    cid = "t3_crosspage_aligned_prose"
+    grid = [["Station", "Region", "Depth", "Status"],
+            ["Delta-1", "North", "11.2", "active"],
+            ["Delta-2", "South", "16.8", "active"],
+            ["Delta-3", "West", "22.5", "closed"],
+            ["Delta-4", "East", "27.9", "active"],
+            ["Delta-5", "North", "33.1", "closed"]]
+    x0, x1, top, row_h = 72.0, 540.0, 210.0, 20.0
+    col_w = (x1 - x0) / 4
+    c = rl_canvas.Canvas(os.path.join(OUT, f"{cid}.pdf"), pagesize=(PW, PH))
+    c.setFont("Helvetica", 8)
+    c.drawString(x0, top + 18, "Table 11. Stations at the end of the reporting page")
+    c.setLineWidth(1.0)
+    c.line(x0, top, x1, top)
+    c.setLineWidth(0.5)
+    c.line(x0, top - row_h, x1, top - row_h)
+    c.setLineWidth(1.0)
+    c.line(x0, top - len(grid) * row_h, x1, top - len(grid) * row_h)
+    for ri, row in enumerate(grid):
+        c.setFont("Helvetica-Bold" if ri == 0 else "Helvetica", 8.5)
+        y = top - (ri + 1) * row_h + 6
+        for ci, value in enumerate(row):
+            c.drawString(x0 + ci * col_w + 4, y, value)
+    c.showPage()
+    c.setFont("Helvetica", 9)
+    aligned = ["The field team", "continued its", "regional survey", "after dawn."]
+    for ci, value in enumerate(aligned):
+        c.drawString(x0 + ci * col_w + 4, 724, value)
+    prose = [
+        "These four aligned fragments form one sentence, not a continuation row.",
+        "The narrative then resumes across the full text width on the second page.",
+        "No word on this page belongs to the station table on the previous page.",
+    ]
+    for i, line in enumerate(prose):
+        c.drawString(x0, 694 - i * 18, line)
+    c.save()
+    bbox = [round(x0 / PW, 4), round((PH - top) / PH, 4), round(x1 / PW, 4),
+            round((PH - (top - len(grid) * row_h)) / PH, 4)]
+    emit(f"{cid}.pdf", tier=3, family=cid, variant="only", tagged=False, pages=2,
+         tables=[{"page": 0, "bbox_norm": bbox, "n_rows": len(grid), "n_cols": 4,
+                  "style": "booktabs", "header_rows": 1, "cells": to_cells(grid),
+                  "col_edges_norm": [round((x0 + i * col_w) / PW, 4) for i in range(5)],
+                  "row_edges_norm": [round((PH - top + i * row_h) / PH, 4)
+                                     for i in range(len(grid) + 1)]}],
+         expect={"table_count": 1},
+         invented="Phase 7 preregistered negative: a bottom-page table is followed by a "
+                  "top-page sentence whose four fragments align with the table columns",
+         note="accepted parent contract: one table only; exact page-2 prose survives once "
+              "and creates neither a continuation row nor a phantom table")
+
+    cid = "t3_crosspage_header_text_data"
+    headers = ["Metric", "Region", "Value", "Status"]
+    first = [headers,
+             ["Yield", "North", "41.2", "final"],
+             ["Moisture", "South", "8.7", "final"],
+             ["Density", "East", "2.4", "draft"],
+             ["Purity", "West", "97.1", "final"]]
+    # Row zero on page 2 is intentionally text-equal to the header, but it is ordinary body
+    # data: no bold/fill and no header separator.  A stitcher may suppress only independently
+    # evidenced repeated headers, never strings that merely compare equal.
+    second = [headers,
+              ["Recovery", "North", "88.0", "final"],
+              ["Loss", "South", "4.1", "draft"],
+              ["Variance", "East", "1.8", "final"],
+              ["Output", "West", "73.6", "final"]]
+    widths = [1.25 * inch, 1.15 * inch, 0.85 * inch, 1.15 * inch]
+    pieces = build_doc(
+        f"{cid}.pdf",
+        [Spacer(1, 410),
+         Paragraph("Table 14. Production measures (continued on next page)", CELL),
+         Spacer(1, 6),
+         flow(first, "full_grid", tid=cid + "_a", colw=widths),
+         PageBreak(),
+         flow(second, "full_grid", tid=cid + "_b", colw=widths, header_rows=0)],
+    )
+    logical = first + second
+    d0 = pieces[0]["draws"][0]
+    emit(f"{cid}.pdf", tier=3, family=cid, variant="only", tagged=False, pages=2,
+         tables=[{"page": d0["page"], "bbox_norm": _norm_bbox(d0),
+                  "n_rows": len(logical), "n_cols": 4, "style": "full_grid",
+                  "header_rows": 1, "cells": to_cells(logical, header_rows=1)}],
+         expect={"table_count": 1},
+         invented="Phase 7 preregistered positive: one genuine adjacent-page continuation "
+                  "whose first page-2 data row is text-equal to the four headers",
+         note="KNOWN FAIL until continuation lands: merge to one 10x4 table, retain the "
+              "text-equal page-2 row as data, and suppress no row without independent "
+              "header styling/separator ownership")
 
     # --- t3_tagged_degenerate -----------------------------------------------------------
     cid = "t3_tagged_degenerate"
@@ -1649,7 +1883,7 @@ def generate():
     t1_clean_singles()
     t2_confounds()
     t3_adversarial()
-    doc = {"schema": 2, "seed": SEED, "files": TRUTH}
+    doc = {"schema": 3, "seed": SEED, "files": TRUTH}
     with open(os.path.join(OUT, "truth.json"), "w") as f:
         json.dump(doc, f, indent=1, sort_keys=True)
         f.write("\n")

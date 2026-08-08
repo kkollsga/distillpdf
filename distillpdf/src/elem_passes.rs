@@ -26,6 +26,7 @@ use crate::postprocess;
 /// passes whose effect is mode-dependent (none currently — the adjacency passes are page-local
 /// in both modes, see the module docs).
 pub(crate) fn run_cross_page_passes(pages: &mut [(u32, Vec<PageElement>, Vec<String>)], mode: crate::html::Mode) {
+    group_ruled_table_continuations(pages);
     // Passes run in the legacy string-pipeline order — demote_running_headings, then
     // merge_adjacent_links, then …, then merge_math_fragments, … — because an earlier pass's
     // output can be a later pass's input (e.g. a math merge that joins two paragraphs can create
@@ -52,6 +53,40 @@ pub(crate) fn run_cross_page_passes(pages: &mut [(u32, Vec<PageElement>, Vec<Str
     if mode == crate::html::Mode::Section {
         merge_fragmented_lists_across_pages(pages);
         merge_math_fragments_across_pages(pages);
+    }
+}
+
+/// Apply the same private proof used by raw/rich projection. The later fragment has already
+/// consumed its exact page-local sources before this pass; removing its element therefore
+/// transfers emission to the anchor without releasing duplicate prose.
+fn group_ruled_table_continuations(pages: &mut [(u32, Vec<PageElement>, Vec<String>)]) {
+    for current in 1..pages.len() {
+        if pages[current - 1].0.checked_add(1) != Some(pages[current].0) {
+            continue;
+        }
+        let mut matches = Vec::new();
+        for (next_i, next_el) in pages[current].1.iter().enumerate() {
+            let ElKind::Table(next) = &next_el.kind else {
+                continue;
+            };
+            for anchor_page in 0..current {
+                for (anchor_i, anchor_el) in pages[anchor_page].1.iter().enumerate() {
+                    let ElKind::Table(anchor) = &anchor_el.kind else {
+                        continue;
+                    };
+                    let mut merged = anchor.clone();
+                    if merged.merge_proven_fragment(next) {
+                        matches.push((anchor_page, anchor_i, next_i, merged));
+                    }
+                }
+            }
+        }
+        if let Some((anchor_page, anchor_i, next_i, merged)) =
+            (matches.len() == 1).then(|| matches.pop().unwrap())
+        {
+            pages[anchor_page].1[anchor_i].kind = ElKind::Table(merged);
+            pages[current].1.remove(next_i);
+        }
     }
 }
 
@@ -234,19 +269,19 @@ fn map_inline_html(e: &mut PageElement, f: impl Fn(&str) -> String) {
                 *n = f(n);
             }
         }
-        Table { header, grid, caption, .. } => {
-            for row in header.iter_mut() {
-                for (t, _) in row.iter_mut() {
-                    *t = f(t);
+        Table(table) => {
+            for row in table.header.iter_mut() {
+                for cell in row.iter_mut() {
+                    cell.text = f(&cell.text);
                 }
             }
-            for row in grid.iter_mut() {
-                for c in row.iter_mut() {
-                    *c = f(c);
+            for row in table.grid.iter_mut() {
+                for cell in row.iter_mut() {
+                    cell.text = f(&cell.text);
                 }
             }
-            if let Some((_, cap, _)) = caption {
-                *cap = f(cap);
+            if let Some(caption) = &mut table.caption {
+                caption.html = f(&caption.html);
             }
         }
         Figure { html, .. } | Caption { html, .. } => *html = f(html),

@@ -3,6 +3,8 @@ plain-text extraction (whole-doc + per-page), and the structured extractors
 (fonts/images/tables/links) plus the diagnostic span dumps — shapes, types, and basic
 invariants. Guards the API contract that downstream callers depend on."""
 import io
+import hashlib
+import json
 import os
 import re
 
@@ -22,6 +24,27 @@ COLORSPACE_IMAGES = os.path.join(FIX, "colorspace_images.pdf")
 CMYK_JPEG = os.path.join(FIX, "cmyk_jpeg.pdf")
 DECODE_JPEG = os.path.join(FIX, "decode_jpeg.pdf")
 ANNOT_APPEARANCE = os.path.join(FIX, "annot_appearance.pdf")
+RULED_BLANK = os.path.join(FIX, "ruled_blank_cells.pdf")
+TABLE_CORPUS = os.path.join(os.path.dirname(__file__), "table_corpus")
+
+
+# SHA-256 locks derived from the preregistered frozen parent owned-surface artifact at
+# dadad4fa8cc7e31bfd08671a87082e05e59d4cab. Tests contain the constants and never depend on
+# that local artifact. Order: raw, analyzed, HTML, Markdown, canonical model JSON.
+GROUP_HEADER_HARD_NEGATIVE_SURFACES = {
+    "t1_booktabs_in_prose.pdf": ("1ef8e39c16d5baff549ed094c21035732723e2ef35ea9667e62e6b09ae682722", "1948d1777589d8dd1424f1cebcb7b3075f6d8d0213e91e0936059b8dc1d8f8cc", "1a6aa9e417e210436a6d9f8247acede867796d190948db0bb34355e8b028a17c", "9f2ed8ced0e395e377aeee756dc3908ab16227a6dc0553665bf5388e2a636866", "ce11ff5c5dfc0054f2315b1c9095865ce0dec589caab9189ec0a3cb63bdd2a14"),
+    "t1_booktabs_small.pdf": ("0249d11443229afb38d14acad716bcc33bdcf13cd661e5dd5774c3389939c736", "47112ca224cd3da2593dbc9854ecf4aff4d56cecbb878e6bd72b2f931ec1fef4", "cdab294f091bb61d4c4eee2a6cb07fdee96fea4fa19f9aee97f14e1593442a61", "5e3a704f440b06db4909d221e042025a8aa85b3c6f449e95b372c36cd28b96b9", "cd53b843b2f0c5536206da49b9a7fd2d6f2addeddeaf8c1bebd5143ae6c9f663"),
+    "t1_booktabs_source_median.pdf": ("6a557ffe681de641a726ca99204294e383e8b0aebc596053ba9c2e44c7c8e9be", "e95c3ebc979600d6d6db9a58b00c7f8cea9c83bb5b389d9575170b7133c6f02a", "320d1812f5d2b523e6afaaee327c38e8ac5669b4a802dea6a7a10e61d61fc82f", "69165b292f10b20e8de166547594833bba8ace0d4b186cea6f8d17978c8ab8a2", "54061df686832c13f4ff90eb3248cc9577abdf43aefad0f5e4a9fd963a19ade8"),
+    "t1_booktabs_tagged.pdf": ("b2986b61dfc8f50ca8605a13720f99263b6c06fa207f855988fbfe68b238b648", "ea2fe0bd8ea85e506073735c3de7a0608154646232cfc6256a41b7101e6ad38a", "3ad71ba6c71c0b5436a013b93f7d389cc920d0c0e1794f8475c096c9265199ec", "2e6cb814e358723c911294636d0486749da0ea4e7e001d187a524107875f17ac", "0825ca73848756e1ab4ca5cb80e3f8cc7380037a1e69339b8e890773790abd40"),
+    "t2_blank_cells_grid_10pct.pdf": ("35be0fe770d111f20f3b8dbfd166383dc346848d081708b8a3e734501625b7c3", "8dcc4cad594ebe0e99a7fe8cd7c0dd88eb747804fd8c401054f7992eb13c7622", "e1f9f651477ba8494c0db3f49d594b67a6d9192ec9aadd4f770cbc5b8ab7be61", "e282904302fad8bc0843c6779c39e9145aae0fc207d103b8ee6f0c99e1fff1be", "c6ad3c55fdf205616d6d013b45274a9f7a0c92fbd3f90165aecac4c4d59c2c94"),
+    "t2_blank_cells_grid_30pct.pdf": ("81ccf3442cca9f7491906a770bf6f7e539fe21ff15a362172b14b79c2c1bb1a2", "999a277f3322821ff7ff3d32f50c9d15698edb1b4ea9c5cac9e69eae37aca8bb", "e561011a597aff35fc096921ca4c4591a42f2abd7d1e38eff6baf2d12744ed83", "bbfd960a129e038e9c9976f3b9f747636857e27fbd556fbb503c727b109a01a9", "fdcfaf8c6c703e9fe2ce585a73284551ee7d1742a61aa2b09c3cf53425ac86e4"),
+    "t2_multitier_header_four_tier.pdf": ("6b319958f476eb544d9dcf789edc35f6807eb7e76a5e370183b999fa031a23bd", "0f06ec64040bbcbea6b1e6a6926f4a5d4ac7765cb87a4a94fe193dde92d3ca61", "2c32b238cae1c70db8f6e0e8a1b8aae466700e8a0ebeb5ecc403ed45babdf4a6", "0c7d1bcdc5f3c266fd6d43330b0d97c653486bb905d7f0071f0702039c140253", "43d4e5c5c67fb906eb327912cc925a54b3316dbbb211520a9b478fe1aa4fec82"),
+    "t2_multitier_header_two_tier.pdf": ("b61d9be65bd334726fa3d5d241116dcdf09278ea772b80771b2f63f09e575538", "5a493d9be8b72420fd654413a003afb57584db3f7af249315063624cce66c5cb", "8a82f3e3cb0278609b074aeef74de4c68d00d4731d1b79b5c631d3dc0205a380", "560c5cc3cf12f3f488bebe98d83093a81c91c8de3c932eb15b0aa17d54d4ed7e", "5c98f81f85dbd660418d3868cb62d288a4d8c4c09380b3348c26038c174c85d3"),
+    "t2_no_header_borderless.pdf": ("9003e063ce6009af150f03153aab3f1464d5b3b7bd8c022b1fed265709b4e7dd", "fba82dcae0ddd045e299ca95399c0a5b211013890eaea3ed4fa28adcfcd62482", "c3ecf778b2e84b9c9c43bee474303805259924664ac6ad896ba5fd004972310f", "68b63ded276afd13725e6411a6cd44176a2b297c0c148e8ea64f4d6bc71bc48d", "0c569ca04464c9e3dd757409b35c6c14a5f08e4cb7b928dd405ab8590831e88d"),
+    "t2_no_header_grid.pdf": ("c843aa61246ed38dd59b8012b8b0d5a54d2dab112eaa8e6f59265873e5c2e137", "38530b8093bde7774c22ad184aa32a86b5b717c1432c40706c5261a4f4bf8aa8", "ae0d2b0f0af07a839b3f161e07f2bca01aecee1642f2f6c0f05849b8f638ff8d", "ee65731df6d6fc94e75128e06a1bc31a6edb5c6c9407e69f0e7bc6b6aa4753b5", "2f8e16c1456cb463ea7c90d1e949a606531c6b00f6664822bdfd92eee3bd8a30"),
+    "t3_blank_borderless.pdf": ("d08def3b19655ea33396daa3c65d7f2663e4d74cb15bb522c6fa63f63940984d", "7aed89fecf24e9e80f00ebb7dd9466af681ffaecbadf037c2e0125230ebad1f0", "c45ee612418075586d46e6fd82e7acedd1ab31d96dd6514641e92da6a0357fab", "25e541b48ab6c398161c0625245a30be3b627cefc3cc766bb019b40068a8d7f4", "b2397d487b4370c60b69bd6dab56d3990153baf2e7e5c159964f3e3d17f03dae"),
+    "t3_spacer_cols.pdf": ("d7db0d8caa46dadd225cefcaf5dbe445688d71dccf3518a5d2bc11d87c86e0df", "8739e1c9728a3175fe439f1df7a27493113e394e00319cd04b7fb695d0eca209", "622b1cbe12335f15f94673e42e661ccceec347e2e20db5064f1eedf765b5c59e", "3c0fb5bfbc2cd953e8b812df5b2c57423369c3b9ea02c304ea4790f309d43ddc", "78118c817eee34c8b1a46c7a1384ac0a89268159eebb86f0b827e9c46d17fe76"),
+}
 
 
 def test_open_and_page_count():
@@ -327,6 +350,437 @@ def test_extract_tables():
         assert key in t, f"table dict missing {key!r}"
     flat = [c for row in t["cells"] for c in row]
     assert "System" in " ".join(flat) and "84.6" in " ".join(flat), "table cells wrong"
+
+
+def test_analyze_tables_surface_and_document_delegation():
+    direct = distillpdf.Pdf.open(NUMERIC).analyze_tables()
+    assert direct == distillpdf.open(NUMERIC).analyze_tables()
+    assert direct
+    table_keys = {
+        "page", "bbox_norm", "n_rows", "n_cols", "header_rows", "cells",
+        "caption", "evidence",
+    }
+    cell_keys = {
+        "text", "row", "col", "rowspan", "colspan", "bbox_norm", "role",
+        "header_path",
+    }
+    for table in direct:
+        assert set(table) == table_keys
+        assert table["page"] >= 1
+        assert table["bbox_norm"] is None or len(table["bbox_norm"]) == 4
+        assert table["n_rows"] >= 2 and table["n_cols"] >= 2
+        assert table["header_rows"] <= table["n_rows"]
+        assert table["evidence"] and set(table["evidence"]) <= {"ruled", "aligned"}
+        anchors = {(cell["row"], cell["col"]) for cell in table["cells"]}
+        for cell in table["cells"]:
+            assert set(cell) == cell_keys
+            assert cell["rowspan"] >= 1 and cell["colspan"] >= 1
+            assert cell["role"] in {"header", "data"}
+            assert all(tuple(anchor) in anchors for anchor in cell["header_path"])
+            assert cell["bbox_norm"] is None or len(cell["bbox_norm"]) == 4
+            assert "confidence" not in cell and "rejection" not in cell
+        assert "confidence" not in table and "rejections" not in table
+
+
+def test_analyze_tables_only_claims_exact_ruled_cell_boundaries():
+    tables = distillpdf.Pdf.open(RULED_BLANK).analyze_tables()
+    assert len(tables) == 1
+    assert "ruled" in tables[0]["evidence"]
+    assert tables[0]["cells"]
+    assert all(cell["bbox_norm"] is not None for cell in tables[0]["cells"])
+
+    inferred = distillpdf.Pdf.open(NUMERIC).analyze_tables()
+    assert any("aligned" in table["evidence"] for table in inferred)
+    assert all(
+        cell["bbox_norm"] is None
+        for table in inferred if "ruled" not in table["evidence"]
+        for cell in table["cells"]
+    )
+
+
+def test_analyze_tables_recovers_aligned_group_header_topology_only(tmp_path):
+    path = os.path.join(TABLE_CORPUS, "t2_merged_colspan_over_booktabs.pdf")
+    pdf = distillpdf.Pdf.open(path)
+    tables = pdf.analyze_tables()
+    assert len(tables) == 1
+    table = tables[0]
+    assert (table["n_rows"], table["n_cols"], table["header_rows"]) == (8, 6, 2)
+    assert table["evidence"] == ["aligned"]
+    assert len(table["cells"]) == 44
+    assert [
+        (cell["col"], cell["colspan"], cell["text"])
+        for cell in table["cells"] if cell["row"] == 0
+    ] == [(0, 3, "Geochemistry"), (3, 3, "Location")]
+    assert next(
+        cell for cell in table["cells"] if (cell["row"], cell["col"]) == (2, 2)
+    )["header_path"] == [[0, 0], [1, 2]]
+    assert next(
+        cell for cell in table["cells"] if (cell["row"], cell["col"]) == (2, 4)
+    )["header_path"] == [[0, 3], [1, 4]]
+
+    # The logical annotation must not alter the legacy raw projection. Semantic HTML consumes
+    # the canonical anchors, suppresses covered slots, and identifies grouped column headers.
+    assert pdf.extract_tables()[0]["cells"][0] == [
+        "Geochemistry", "", "", "Location", "", "",
+    ]
+    html = pdf.to_html(return_string=True)
+    html_table = "<table" + html.split("<table", 1)[1].split(
+        "</table>", 1
+    )[0] + "</table>"
+    assert html_table.startswith(
+        '<table data-dpdf-semantic-spans><tr><th scope="colgroup" colspan="3">Geochemistry</th>'
+        '<th scope="colgroup" colspan="3">Location</th></tr>'
+    )
+    markdown = pdf.to_markdown(return_string=True)
+    assert markdown.startswith(
+        "| Geochemistry |  |  | Location |  |  |\n"
+        "| --- | --- | --- | --- | --- | --- |\n"
+    )
+
+    dpdf = pdf.distill(str(tmp_path / "aligned-semantic.dpdf"))
+    assert distillpdf.render_html(dpdf) == html
+    assert distillpdf.render_markdown(dpdf, image_mode="drop") == markdown
+    block = json.loads(distillpdf.load_model(dpdf))["blocks"][0]
+    assert block["el_html"] == html_table
+    assert "table_semantic_spans" not in block
+
+
+def test_ruled_group_header_moves_into_table_prose_and_model_atomically(tmp_path):
+    path = os.path.join(TABLE_CORPUS, "t2_merged_colspan_over_grid.pdf")
+    pdf = distillpdf.Pdf.open(path)
+    tables = pdf.analyze_tables()
+    assert len(tables) == 1
+    table = tables[0]
+    assert (table["n_rows"], table["n_cols"], table["header_rows"]) == (8, 6, 2)
+    assert table["evidence"] == ["ruled", "aligned"]
+    assert len(table["cells"]) == 44
+    assert [
+        (cell["col"], cell["colspan"], cell["text"], cell["role"])
+        for cell in table["cells"] if cell["row"] == 0
+    ] == [
+        (0, 3, "Geochemistry", "header"),
+        (3, 3, "Location", "header"),
+    ]
+    data = next(cell for cell in table["cells"] if (cell["row"], cell["col"]) == (2, 4))
+    assert data["role"] == "data"
+    assert data["header_path"] == [[0, 3], [1, 4]]
+    assert all(cell["bbox_norm"] is not None for cell in table["cells"])
+
+    # The exact proven tier is physically part of this ruled table's legacy grid too. Covered
+    # colspan slots stay explicit and blank; ordinary detached headers remain unchanged.
+    legacy = pdf.extract_tables()[0]["cells"]
+    assert (len(legacy), len(legacy[0])) == (8, 6)
+    assert legacy[0] == ["Geochemistry", "", "", "Location", "", ""]
+
+    html = pdf.to_html(
+        mode="page", toc=False, image_mode="drop", return_string=True,
+    )
+    html_table = "<table" + html.split("<table", 1)[1].split("</table>", 1)[0] + "</table>"
+    assert html_table.startswith(
+        '<table data-dpdf-proven-leading-tier><tr>'
+        '<th scope="colgroup" colspan="3">Geochemistry</th>'
+        '<th scope="colgroup" colspan="3">Location</th></tr>'
+    )
+    for label in ("Geochemistry", "Location"):
+        assert html.count(label) == 1
+        assert label in html_table
+
+    markdown = pdf.to_markdown(
+        mode="page", toc=False, image_mode="drop", return_string=True,
+    )
+    assert (
+        "| Geochemistry |  |  | Location |  |  |\n"
+        "| --- | --- | --- | --- | --- | --- |\n"
+        "| Sample | Depth | Grade | Lat | Lon | Zone |"
+    ) in markdown
+    for label in ("Geochemistry", "Location"):
+        assert markdown.count(label) == 1
+
+    dpdf = pdf.distill(str(tmp_path / "ruled-group.dpdf"))
+    assert distillpdf.render_html(dpdf, mode="page", toc=False) == html
+    assert distillpdf.render_markdown(
+        dpdf, mode="page", toc=False, image_mode="drop",
+    ) == markdown
+
+    model = json.loads(distillpdf.load_model(dpdf))
+    assert len(model["blocks"]) == 1
+    block = model["blocks"][0]
+    assert (block["id"], block["kind"], block["page"]) == ("b0001", "table", 1)
+    assert block["bbox"] == [
+        75.5999984741211, 600.4000244140625,
+        536.3999633789062, 728.4000244140625,
+    ]
+    assert len(block["cells"]) == 8 and all(len(row) == 6 for row in block["cells"])
+    assert block["cells"][0] == [
+        "Geochemistry", "Geochemistry", "Geochemistry",
+        "Location", "Location", "Location",
+    ]
+    assert block["table_header"] == [
+        [["Geochemistry", 3], ["Location", 3]],
+    ]
+    assert block["table_header_rows"] == 2
+    assert block["table_proven_leading_tier"] is True
+    assert block["table_grid"] == legacy[1:]
+    assert "el_html" not in block
+    assert "table_semantic_spans" not in block
+    assert not any(item["kind"] == "heading" for item in model["blocks"])
+    assert model["sections"] == []
+    assert model["toc"] == []
+    assert model["indexes"] == {
+        "coverage": {"sectioned": 0.0, "unsectioned_blocks": ["b0001"]},
+        "kinds": {"table": [{"id": "b0001", "page": 1}]},
+        "pages": {"1": ["b0001"]},
+        "sections": {},
+    }
+    assert model["links"] == model["assets"] == model["named_dests"] == []
+    assert model["ocr_passes"] == []
+    assert model["metadata"] == {}
+    assert model["pages"] == [{"height_pts": 792.0, "n": 1, "width_pts": 612.0}]
+    assert {
+        key: value for key, value in model["source"].items()
+        if key != "generated_at"
+    } == {
+        "distillpdf": "0.1.0",
+        "file": "t2_merged_colspan_over_grid.pdf",
+        "pages": 1,
+        "sha256": "6d28e5570ff2708b21a047f882bc2423d97647d6645ad5aa00256fccdf5082bb",
+    }
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("t2_blank_cells_grid_10pct.pdf", [(10, 6, 1, ("ruled", "aligned"), 60, 0)]),
+        ("t2_blank_cells_grid_30pct.pdf", [(10, 6, 1, ("ruled", "aligned"), 60, 0)]),
+        ("t3_blank_borderless.pdf", [(8, 5, 1, ("aligned",), 40, 0)]),
+        ("t3_spacer_cols.pdf", [(6, 11, 1, ("aligned",), 66, 0)]),
+        ("t1_booktabs_in_prose.pdf", [(5, 4, 1, ("aligned",), 20, 0)]),
+        ("t1_booktabs_small.pdf", [(5, 4, 1, ("aligned",), 20, 0)]),
+        ("t1_booktabs_tagged.pdf", [(5, 5, 1, ("aligned",), 25, 0)]),
+        ("t1_booktabs_source_median.pdf", [(6, 5, 1, ("aligned",), 28, 1)]),
+        ("t2_multitier_header_two_tier.pdf", [(7, 7, 2, ("ruled", "aligned"), 49, 0)]),
+        ("t2_multitier_header_three_tier.pdf", [(8, 9, 3, ("ruled", "aligned"), 72, 0)]),
+        ("t2_multitier_header_four_tier.pdf", [(9, 9, 4, ("ruled", "aligned"), 81, 0)]),
+        ("t2_no_header_borderless.pdf", [(27, 4, 1, ("aligned",), 108, 0)]),
+        ("t2_no_header_grid.pdf", [(28, 4, 1, ("ruled", "aligned"), 112, 0)]),
+    ],
+)
+def test_group_header_topology_proof_leaves_hard_negatives_unchanged(name, expected):
+    tables = distillpdf.Pdf.open(os.path.join(TABLE_CORPUS, name)).analyze_tables()
+    signature = [
+        (
+            table["n_rows"],
+            table["n_cols"],
+            table["header_rows"],
+            tuple(table["evidence"]),
+            len(table["cells"]),
+            sum(cell["rowspan"] > 1 or cell["colspan"] > 1 for cell in table["cells"]),
+        )
+        for table in tables
+    ]
+    assert signature == expected
+
+
+@pytest.mark.parametrize(
+    "name, rows",
+    [
+        (
+            "t2_footnote_markers_asterisks.pdf",
+            [
+                ["Model", "Params", "BLEU", "Notes"],
+                ["Alpha-1*", "80M", "31.2", "seed 0"],
+                ["Calcite-2**", "68M", "21.2", "seed 1"],
+                ["East-3***", "36M", "26.5", "seed 2"],
+                ["Quartz-4*", "17M", "25.1", "seed 3"],
+            ],
+        ),
+        (
+            "t2_footnote_markers_daggers.pdf",
+            [
+                ["Model", "Params", "BLEU", "Notes"],
+                ["Layer-1†", "22M", "37.9", "seed 0"],
+                ["Shale-2‡", "90M", "31.0", "seed 1"],
+                ["East-3§", "16M", "21.7", "seed 2"],
+                ["East-4†", "6M", "36.4", "seed 3"],
+            ],
+        ),
+    ],
+)
+def test_persistent_internal_gutter_targets_are_exact_on_every_public_projection(
+    name, rows, tmp_path,
+):
+    frozen = {
+        "t2_footnote_markers_asterisks.pdf": {
+            "file_sha": "61ccf865eebce7d0e51380150267e587d68e42ed9b2cd7b77a7b3976f82033b2",
+            "spans_sha": "33f55098914ba5efb91156ae281faa988e676e8d2715ca507221886c83684173",
+        },
+        "t2_footnote_markers_daggers.pdf": {
+            "file_sha": "b59575e5213e1f50815cf9870f2826702d86aff92cefe74831bad3252074b181",
+            "spans_sha": "d71d1096b3124ab496daa28a0043ce9f5723b685f51f4d2e228c9699b2f2c45b",
+        },
+    }[name]
+    pdf = distillpdf.Pdf.open(os.path.join(TABLE_CORPUS, name))
+    assert pdf.extract_tables() == [
+        {"page": 1, "n_rows": 5, "n_cols": 4, "cells": rows}
+    ]
+
+    analyzed = pdf.analyze_tables()
+    assert len(analyzed) == 1
+    table = analyzed[0]
+    assert table["bbox_norm"] == [
+        0.13006535172462463,
+        0.09356057643890381,
+        0.7364656925201416,
+        0.17436867952346802,
+    ]
+    assert (
+        table["n_rows"],
+        table["n_cols"],
+        table["header_rows"],
+        table["evidence"],
+        table["caption"],
+    ) == (5, 4, 1, ["aligned"], None)
+    assert [cell["text"] for cell in table["cells"]] == sum(rows, [])
+    assert all(cell["bbox_norm"] is None for cell in table["cells"])
+    assert all(cell["rowspan"] == cell["colspan"] == 1 for cell in table["cells"])
+    assert [cell["role"] for cell in table["cells"]] == ["header"] * 4 + ["data"] * 16
+    assert [cell["header_path"] for cell in table["cells"][:4]] == [[], [], [], []]
+    assert [cell["header_path"] for cell in table["cells"][4:8]] == [
+        [[0, 0]], [[0, 1]], [[0, 2]], [[0, 3]],
+    ]
+
+    expected_html = "<table>" + "".join(
+        "<tr>" + "".join(
+            (f'<th scope="col">{text}</th>' if row == 0 else f"<td>{text}</td>")
+            for text in cells
+        ) + "</tr>"
+        for row, cells in enumerate(rows)
+    ) + "</table>"
+    html = pdf.to_html(image_mode="drop", return_string=True)
+    html_table = "<table" + html.split("<table", 1)[1].split("</table>", 1)[0] + "</table>"
+    assert html_table == expected_html
+    assert html == (
+        '<!doctype html>\n<html>\n<head>\n<meta charset="utf-8">\n<style>\n'
+        'body{max-width:48rem;margin:auto;padding:1rem}\n'
+        'img,svg{max-width:100%;height:auto}\n</style>\n</head>\n<body>\n'
+        + expected_html
+        + '<ul><li>trained for 100 epochs. ** ablation. *** ours.</li></ul>'
+        '</body>\n</html>\n'
+    )
+
+    expected_markdown = "\n".join(
+        [
+            "| " + " | ".join(rows[0]) + " |",
+            "| --- | --- | --- | --- |",
+            *("| " + " | ".join(row) + " |" for row in rows[1:]),
+        ]
+    )
+    markdown = pdf.to_markdown(image_mode="drop", return_string=True)
+    assert markdown == (
+        expected_markdown
+        + "\n\n- trained for 100 epochs. ** ablation. *** ours.\n"
+    )
+    assert _surface_sha(pdf._dbg_spans_xy(1)) == frozen["spans_sha"]
+
+    dpdf = pdf.distill(str(tmp_path / f"{name}.dpdf"))
+    model = json.loads(distillpdf.load_model(dpdf))
+    model["source"].pop("generated_at", None)
+    table_block = {
+        "bbox": [
+            79.5999984741211,
+            653.9000244140625,
+            450.7170104980469,
+            717.9000244140625,
+        ],
+        "cells": rows,
+        "confidence": 1.0,
+        "id": "b0001",
+        "kind": "table",
+        "page": 1,
+        "table_grid": rows,
+        "table_header": [],
+        "table_header_rows": 1,
+    }
+    prose_block = {
+        "bbox": [
+            78.0,
+            632.4000244140625,
+            237.6399688720703,
+            640.4000244140625,
+        ],
+        "confidence": 1.0,
+        "el_group": 1,
+        "id": "b0002",
+        "kind": "list_item",
+        "list_ordered": False,
+        "page": 1,
+        "text": "trained for 100 epochs. ** ablation. *** ours.",
+    }
+    assert model == {
+        "assets": [],
+        "blocks": [table_block, prose_block],
+        "indexes": {
+            "coverage": {"sectioned": 0.0, "unsectioned_blocks": ["b0001", "b0002"]},
+            "kinds": {"table": [{"id": "b0001", "page": 1}]},
+            "pages": {"1": ["b0001", "b0002"]},
+            "sections": {},
+        },
+        "links": [],
+        "metadata": {"title": "BLEU Notes"},
+        "named_dests": [],
+        "ocr_passes": [],
+        "pages": [{"height_pts": 792.0, "n": 1, "width_pts": 612.0}],
+        "schema_version": 0,
+        "sections": [],
+        "source": {
+            "distillpdf": "0.1.0",
+            "file": name,
+            "pages": 1,
+            "sha256": frozen["file_sha"],
+        },
+        "toc": [],
+    }
+    assert distillpdf.render_html(dpdf) == html
+    assert distillpdf.render_markdown(dpdf, image_mode="drop") == markdown
+
+
+def _surface_sha(value):
+    if not isinstance(value, str):
+        value = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        )
+    else:
+        # Phase 8 intentionally enriches every proven column header. The exact hard-negative
+        # locks continue to protect all pre-existing bytes after removing only that separately
+        # tested semantic attribute; their registered hashes do not need a baseline rewrite.
+        value = re.sub(r' scope="(?:col|colgroup)"', "", value)
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    GROUP_HEADER_HARD_NEGATIVE_SURFACES.items(),
+)
+def test_group_header_hard_negatives_keep_all_parent_public_surfaces_exact(
+    name, expected, tmp_path,
+):
+    pdf = distillpdf.Pdf.open(os.path.join(TABLE_CORPUS, name))
+    dpdf = pdf.distill(str(tmp_path / f"{name}.dpdf"))
+    model = json.loads(distillpdf.load_model(dpdf))
+    model["source"].pop("generated_at", None)
+    surfaces = (
+        pdf.extract_tables(),
+        pdf.analyze_tables(),
+        pdf.to_html(image_mode="drop", return_string=True),
+        pdf.to_markdown(image_mode="drop", return_string=True),
+        model,
+    )
+    assert tuple(map(_surface_sha, surfaces)) == expected
+    assert "data-dpdf-proven-leading-tier" not in surfaces[2]
+    assert all(
+        block.get("table_proven_leading_tier") is None
+        for block in surfaces[4]["blocks"]
+    )
 
 
 def test_extract_links_shapes():

@@ -23,8 +23,9 @@
 //! panic, an unbounded loop, or an allocation sized by the file. The caps below are the
 //! whole of the hostile-input story — a function is parsed from attacker-controlled bytes.
 
-use crate::pdfobj::{content_bytes, deref, num_deref};
-use lopdf::{Dictionary, Document, Object};
+use crate::access::{read_resolved, DocumentAccess};
+use crate::pdfobj::{content_bytes, num_resolved};
+use lopdf::{Dictionary, Object};
 
 /// Nesting cap for a Type 3 stitching function whose sub-functions are themselves Type 3
 /// (or an array of arrays). Without it a self-referential `/Functions` entry recurses until
@@ -86,9 +87,19 @@ fn interpolate(x: f32, xmin: f32, xmax: f32, ymin: f32, ymax: f32) -> f32 {
 
 /// A numeric array as `f32`s, following indirect references (array entries may legally be
 /// indirect). `None` when the key is absent or is not an array.
-fn floats(doc: &Document, d: &Dictionary, key: &[u8]) -> Option<Vec<f32>> {
-    let a = deref(doc, d.get(key).ok()?)?.as_array().ok()?;
-    Some(a.iter().map(|o| num_deref(doc, o)).collect())
+fn floats(access: &dyn DocumentAccess, dictionary: &Dictionary, key: &[u8]) -> Option<Vec<f32>> {
+    read_resolved(access, dictionary.get(key).ok()?, |resolved| {
+        Some(
+            resolved
+                .as_array()
+                .ok()?
+                .iter()
+                .map(|object| num_resolved(access, object))
+                .collect(),
+        )
+    })
+    .ok()
+    .flatten()
 }
 
 /// A flat `[lo, hi, lo, hi, …]` array as pairs; `None` unless the length is a positive
@@ -107,40 +118,50 @@ impl Function {
     /// `None` means **"do not evaluate this"**, never "the answer is zero": an unsupported
     /// type (1 or 4), a malformed dictionary, or a sampled function whose stream is empty.
     /// Callers degrade on that signal; nothing here fabricates a value.
-    pub(crate) fn parse(doc: &Document, o: &Object) -> Option<Function> {
-        Function::parse_at(doc, o, 0)
+    pub(crate) fn parse(access: &dyn DocumentAccess, object: &Object) -> Option<Function> {
+        Function::parse_at(access, object, 0)
     }
 
-    fn parse_at(doc: &Document, o: &Object, depth: u32) -> Option<Function> {
+    fn parse_at(access: &dyn DocumentAccess, object: &Object, depth: u32) -> Option<Function> {
         if depth > MAX_FN_DEPTH {
             return None;
         }
-        let o = deref(doc, o)?;
+        read_resolved(access, object, |resolved| Function::parse_direct(access, resolved, depth))
+            .ok()
+            .flatten()
+    }
+
+    fn parse_direct(access: &dyn DocumentAccess, object: &Object, depth: u32) -> Option<Function> {
         // An ARRAY of n one-output functions is legal wherever one n-output function is
         // (§8.7.4.5.5). Its domain is the shared domain of its members.
-        if let Object::Array(a) = o {
+        if let Object::Array(a) = object {
             if a.is_empty() || a.len() > MAX_OUTPUTS {
                 return None;
             }
-            let funcs: Vec<Function> = a.iter().map(|e| Function::parse_at(doc, e, depth + 1)).collect::<Option<_>>()?;
+            let funcs: Vec<Function> = a
+                .iter()
+                .map(|element| Function::parse_at(access, element, depth + 1))
+                .collect::<Option<_>>()?;
             let domain = funcs[0].domain.clone();
             return Some(Function { domain, range: None, kind: Kind::Array(funcs) });
         }
-        let dict = match o {
+        let dict = match object {
             Object::Dictionary(d) => d,
             Object::Stream(s) => &s.dict,
             _ => return None,
         };
-        let domain = pairs(floats(doc, dict, b"Domain")?, MAX_INPUTS)?;
-        let range = floats(doc, dict, b"Range").and_then(|v| pairs(v, MAX_OUTPUTS));
-        let ftype = deref(doc, dict.get(b"FunctionType").ok()?)?.as_i64().ok()?;
+        let domain = pairs(floats(access, dict, b"Domain")?, MAX_INPUTS)?;
+        let range = floats(access, dict, b"Range").and_then(|v| pairs(v, MAX_OUTPUTS));
+        let ftype = read_resolved(access, dict.get(b"FunctionType").ok()?, |value| value.as_i64().ok())
+            .ok()
+            .flatten()?;
         let kind = match ftype {
             0 => {
-                let stream = match o {
+                let stream = match object {
                     Object::Stream(s) => s,
                     _ => return None, // a Type 0 function IS a stream; a dict alone is malformed
                 };
-                Kind::Sampled(Sampled::parse(doc, dict, stream, &domain, range.as_ref()?)?)
+                Kind::Sampled(Sampled::parse(access, dict, stream, &domain, range.as_ref()?)?)
             }
             2 => {
                 // 1-in by definition (§7.10.3). `/C0`/`/C1` default to [0.0]/[1.0], and
@@ -148,12 +169,12 @@ impl Function {
                 if domain.len() != 1 {
                     return None;
                 }
-                let c0 = floats(doc, dict, b"C0").unwrap_or_else(|| vec![0.0]);
-                let c1 = floats(doc, dict, b"C1").unwrap_or_else(|| vec![1.0]);
+                let c0 = floats(access, dict, b"C0").unwrap_or_else(|| vec![0.0]);
+                let c1 = floats(access, dict, b"C1").unwrap_or_else(|| vec![1.0]);
                 if c0.is_empty() || c0.len() != c1.len() || c0.len() > MAX_OUTPUTS {
                     return None;
                 }
-                let n = num_deref(doc, dict.get(b"N").ok()?);
+                let n = num_resolved(access, dict.get(b"N").ok()?);
                 if !n.is_finite() {
                     return None;
                 }
@@ -163,13 +184,19 @@ impl Function {
                 if domain.len() != 1 {
                     return None;
                 }
-                let subs = deref(doc, dict.get(b"Functions").ok()?)?.as_array().ok()?;
-                if subs.is_empty() || subs.len() > MAX_OUTPUTS {
-                    return None;
-                }
-                let funcs: Vec<Function> = subs.iter().map(|f| Function::parse_at(doc, f, depth + 1)).collect::<Option<_>>()?;
-                let bounds = floats(doc, dict, b"Bounds")?;
-                let encode = pairs(floats(doc, dict, b"Encode")?, MAX_OUTPUTS)?;
+                let funcs = read_resolved(access, dict.get(b"Functions").ok()?, |value| {
+                    let subs = value.as_array().ok()?;
+                    if subs.is_empty() || subs.len() > MAX_OUTPUTS {
+                        return None;
+                    }
+                    subs.iter()
+                        .map(|function| Function::parse_at(access, function, depth + 1))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .ok()
+                .flatten()?;
+                let bounds = floats(access, dict, b"Bounds")?;
+                let encode = pairs(floats(access, dict, b"Encode")?, MAX_OUTPUTS)?;
                 if bounds.len() + 1 != funcs.len() || encode.len() != funcs.len() {
                     return None;
                 }
@@ -284,8 +311,14 @@ fn read_bits(data: &[u8], bit_off: u64, bits: u32) -> u32 {
 }
 
 impl Sampled {
-    fn parse(doc: &Document, dict: &Dictionary, stream: &lopdf::Stream, domain: &[[f32; 2]], range: &[[f32; 2]]) -> Option<Sampled> {
-        let size: Vec<usize> = floats(doc, dict, b"Size")?
+    fn parse(
+        access: &dyn DocumentAccess,
+        dict: &Dictionary,
+        stream: &lopdf::Stream,
+        domain: &[[f32; 2]],
+        range: &[[f32; 2]],
+    ) -> Option<Sampled> {
+        let size: Vec<usize> = floats(access, dict, b"Size")?
             .iter()
             .map(|v| if *v >= 1.0 && *v <= MAX_SAMPLE_GRID as f32 { Some(*v as usize) } else { None })
             .collect::<Option<_>>()?;
@@ -299,20 +332,22 @@ impl Sampled {
         if cells == 0 || cells > MAX_SAMPLE_GRID || n_out == 0 || cells.checked_mul(n_out).is_none() {
             return None;
         }
-        let bps = deref(doc, dict.get(b"BitsPerSample").ok()?)?.as_i64().ok()? as u32;
+        let bps = read_resolved(access, dict.get(b"BitsPerSample").ok()?, |value| value.as_i64().ok())
+            .ok()
+            .flatten()? as u32;
         if !matches!(bps, 1 | 2 | 4 | 8 | 12 | 16 | 24 | 32) {
             return None;
         }
         // `/Encode` defaults to [0 Size_i-1] per dimension, `/Decode` to `/Range`.
-        let encode = match floats(doc, dict, b"Encode").and_then(|v| pairs(v, MAX_INPUTS)) {
+        let encode = match floats(access, dict, b"Encode").and_then(|v| pairs(v, MAX_INPUTS)) {
             Some(e) if e.len() == size.len() => e,
             _ => size.iter().map(|s| [0.0, (*s - 1) as f32]).collect(),
         };
-        let decode = match floats(doc, dict, b"Decode").and_then(|v| pairs(v, MAX_OUTPUTS)) {
+        let decode = match floats(access, dict, b"Decode").and_then(|v| pairs(v, MAX_OUTPUTS)) {
             Some(d) if d.len() == n_out => d,
             _ => range.to_vec(),
         };
-        let data = content_bytes(stream).into_owned();
+        let data = content_bytes(stream);
         if data.is_empty() {
             return None; // a sampled function with no samples has nothing to say
         }
@@ -393,7 +428,12 @@ impl Sampled {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lopdf::{dictionary, Stream};
+    use crate::access::test_adapter;
+    use lopdf::{dictionary, Document, Stream};
+
+    fn parse(doc: &Document, object: &Object) -> Option<Function> {
+        Function::parse(&test_adapter(doc), object)
+    }
 
     fn nums(v: &[f32]) -> Object {
         Object::Array(v.iter().map(|x| Object::Real(*x)).collect())
@@ -429,7 +469,7 @@ mod tests {
         // white — the value that used to be read as the grey level 0.1, i.e. near-BLACK.
         let pale = [0.776, 0.776, 0.878]; // (198,198,224)
         let (doc, r) = one(exp_fn(&[1.0, 1.0, 1.0], &pale, 1.0));
-        let f = Function::parse(&doc, &r).expect("a Type 2 function must parse");
+        let f = parse(&doc, &r).expect("a Type 2 function must parse");
         approx(&f.eval(&[0.0]).unwrap(), &[1.0, 1.0, 1.0]);
         approx(&f.eval(&[1.0]).unwrap(), &pale);
         approx(&f.eval(&[0.5]).unwrap(), &[0.888, 0.888, 0.939]);
@@ -443,14 +483,14 @@ mod tests {
         // N=2 bends the ramp; reading N as a no-op (or applying it after the lerp) gives
         // 0.5 here instead of 0.25.
         let (doc, r) = one(exp_fn(&[0.0], &[1.0], 2.0));
-        let f = Function::parse(&doc, &r).unwrap();
+        let f = parse(&doc, &r).unwrap();
         approx(&f.eval(&[0.5]).unwrap(), &[0.25]);
         approx(&f.eval(&[1.0]).unwrap(), &[1.0]);
         // C0/C1 default to [0.0]/[1.0] when absent (§7.10.3).
         let (doc, r) = one(Object::Dictionary(dictionary! {
             "FunctionType" => 2, "Domain" => nums(&[0.0, 1.0]), "N" => 1,
         }));
-        approx(&Function::parse(&doc, &r).unwrap().eval(&[0.25]).unwrap(), &[0.25]);
+        approx(&parse(&doc, &r).unwrap().eval(&[0.25]).unwrap(), &[0.25]);
     }
 
     /// A Type 0 sampled function: `size` grid, `bps` bits per sample, `n_out` outputs.
@@ -473,7 +513,7 @@ mod tests {
         // Two samples, 0 and 255 at 8 bits: the midpoint is the linear interpolation, not
         // the nearest sample. (A nearest-sample reading gives 0.0 or 1.0 here.)
         let (doc, r) = one(sampled(&[2], 8, 1, vec![0, 255], None));
-        let f = Function::parse(&doc, &r).expect("a Type 0 function must parse");
+        let f = parse(&doc, &r).expect("a Type 0 function must parse");
         approx(&f.eval(&[0.0]).unwrap(), &[0.0]);
         approx(&f.eval(&[1.0]).unwrap(), &[1.0]);
         approx(&f.eval(&[0.5]).unwrap(), &[0.5]);
@@ -494,13 +534,13 @@ mod tests {
             (16, vec![0, 0, 255, 255]),
         ] {
             let (doc, r) = one(sampled(&[2], bps as i64, 1, data, None));
-            let f = Function::parse(&doc, &r).unwrap_or_else(|| panic!("bps {bps} must parse"));
+            let f = parse(&doc, &r).unwrap_or_else(|| panic!("bps {bps} must parse"));
             approx(&f.eval(&[0.0]).unwrap(), &[0.0]);
             approx(&f.eval(&[1.0]).unwrap(), &[1.0]);
         }
         // 3 bits per sample is not a legal depth — refuse it rather than mis-read the stream.
         let (doc, r) = one(sampled(&[2], 3, 1, vec![0xFF], None));
-        assert!(Function::parse(&doc, &r).is_none(), "an illegal /BitsPerSample must not parse");
+        assert!(parse(&doc, &r).is_none(), "an illegal /BitsPerSample must not parse");
     }
 
     #[test]
@@ -509,7 +549,7 @@ mod tests {
         // function — a DeviceN tint transform would then swap its colorants.
         // 2x2 grid, one output: cells (0,0)=0 (1,0)=85 (0,1)=170 (1,1)=255.
         let (doc, r) = one(sampled(&[2, 2], 8, 1, vec![0, 85, 170, 255], None));
-        let f = Function::parse(&doc, &r).unwrap();
+        let f = parse(&doc, &r).unwrap();
         approx(&f.eval(&[0.0, 0.0]).unwrap(), &[0.0]);
         approx(&f.eval(&[1.0, 0.0]).unwrap(), &[85.0 / 255.0]);
         approx(&f.eval(&[0.0, 1.0]).unwrap(), &[170.0 / 255.0]);
@@ -526,7 +566,7 @@ mod tests {
         // `/Decode` defaults to `/Range`; stating it inverts or rescales the ramp.
         let inv = Some(("Decode", nums(&[1.0, 0.0])));
         let (doc, r) = one(sampled(&[2], 8, 1, vec![0, 255], inv));
-        let f = Function::parse(&doc, &r).unwrap();
+        let f = parse(&doc, &r).unwrap();
         approx(&f.eval(&[0.0]).unwrap(), &[1.0]);
         approx(&f.eval(&[1.0]).unwrap(), &[0.0]);
     }
@@ -544,7 +584,7 @@ mod tests {
             "Bounds" => nums(&[0.5]),
             "Encode" => nums(&[0.0, 1.0, 0.0, 1.0]),
         }));
-        let f = Function::parse(&doc, &Object::Reference(id)).expect("a Type 3 must parse");
+        let f = parse(&doc, &Object::Reference(id)).expect("a Type 3 must parse");
         approx(&f.eval(&[0.0]).unwrap(), &[0.0]);
         approx(&f.eval(&[0.25]).unwrap(), &[0.5]);
         approx(&f.eval(&[0.5]).unwrap(), &[1.0]); // the seam, from the RIGHT piece
@@ -557,7 +597,7 @@ mod tests {
             "Functions" => Object::Array(vec![Object::Reference(up), Object::Reference(down)]),
             "Bounds" => nums(&[0.3, 0.6]), "Encode" => nums(&[0.0, 1.0, 0.0, 1.0]),
         }));
-        assert!(Function::parse(&doc, &Object::Reference(bad)).is_none());
+        assert!(parse(&doc, &Object::Reference(bad)).is_none());
     }
 
     #[test]
@@ -568,7 +608,7 @@ mod tests {
             .iter()
             .map(|v| Object::Reference(doc.add_object(exp_fn(&[0.0], &[*v], 1.0))))
             .collect();
-        let f = Function::parse(&doc, &Object::Array(ids)).expect("an array of functions must parse");
+        let f = parse(&doc, &Object::Array(ids)).expect("an array of functions must parse");
         approx(&f.eval(&[1.0]).unwrap(), &[0.2, 0.4, 0.6]);
         approx(&f.eval(&[0.5]).unwrap(), &[0.1, 0.2, 0.3]);
         assert_eq!(f.n_outputs(), Some(3));
@@ -583,7 +623,7 @@ mod tests {
             "Range" => nums(&[0.0, 0.5]),
             "C0" => nums(&[0.0]), "C1" => nums(&[1.0]), "N" => 1,
         }));
-        let f = Function::parse(&doc, &r).unwrap();
+        let f = parse(&doc, &r).unwrap();
         approx(&f.eval(&[5.0]).unwrap(), &[0.5]); // domain-clamped to 1, then range-clamped
         approx(&f.eval(&[-5.0]).unwrap(), &[0.0]);
         approx(&f.eval(&[f32::NAN]).unwrap(), &[0.0]);
@@ -592,7 +632,7 @@ mod tests {
             "FunctionType" => 2, "Domain" => nums(&[-1.0, 1.0]),
             "C0" => nums(&[0.0]), "C1" => nums(&[1.0]), "N" => Object::Real(0.5),
         }));
-        let out = Function::parse(&doc, &r).unwrap().eval(&[-1.0]).unwrap();
+        let out = parse(&doc, &r).unwrap().eval(&[-1.0]).unwrap();
         assert!(out[0].is_finite(), "a negative base with a fractional exponent must not be NaN");
     }
 
@@ -606,30 +646,30 @@ mod tests {
                 dictionary! { "FunctionType" => t, "Domain" => nums(&[0.0, 1.0]), "Range" => nums(&[0.0, 1.0]) },
                 b"{ dup }".to_vec(),
             )));
-            assert!(Function::parse(&doc, &r).is_none(), "FunctionType {t} must not evaluate");
+            assert!(parse(&doc, &r).is_none(), "FunctionType {t} must not evaluate");
         }
         // No /Domain at all is not a function either.
         let (doc, r) = one(Object::Dictionary(dictionary! { "FunctionType" => 2, "N" => 1 }));
-        assert!(Function::parse(&doc, &r).is_none());
+        assert!(parse(&doc, &r).is_none());
     }
 
     #[test]
     fn hostile_sampled_definitions_are_refused_before_anything_is_allocated() {
         // A zero-size sample stream says nothing …
         let (doc, r) = one(sampled(&[2], 8, 1, vec![], None));
-        assert!(Function::parse(&doc, &r).is_none(), "an empty sample stream must not parse");
+        assert!(parse(&doc, &r).is_none(), "an empty sample stream must not parse");
         // … an absurd /Size must not be trusted to size an index …
         for size in [&[0i64][..], &[i64::MAX][..], &[1 << 20, 1 << 20][..]] {
             let (doc, r) = one(sampled(size, 8, 1, vec![1, 2, 3, 4], None));
-            assert!(Function::parse(&doc, &r).is_none(), "/Size {size:?} must be refused");
+            assert!(parse(&doc, &r).is_none(), "/Size {size:?} must be refused");
         }
         // … a /Size of the wrong arity for /Domain is malformed …
         let (doc, r) = one(sampled(&[2, 2], 8, 1, vec![0, 1, 2, 3], Some(("Domain", nums(&[0.0, 1.0])))));
-        assert!(Function::parse(&doc, &r).is_none(), "/Size must match /Domain's arity");
+        assert!(parse(&doc, &r).is_none(), "/Size must match /Domain's arity");
         // … and a stream shorter than its declared grid degrades to zero at the tail rather
         // than reading past the buffer.
         let (doc, r) = one(sampled(&[4], 8, 1, vec![255], None));
-        let f = Function::parse(&doc, &r).expect("a short stream still parses");
+        let f = parse(&doc, &r).expect("a short stream still parses");
         approx(&f.eval(&[0.0]).unwrap(), &[1.0]);
         assert!(f.eval(&[1.0]).unwrap()[0].is_finite(), "reading past the samples must be finite");
     }
@@ -645,7 +685,7 @@ mod tests {
             "Bounds" => Object::Array(vec![]), "Encode" => nums(&[0.0, 1.0]),
         }));
         let t = std::time::Instant::now();
-        assert!(Function::parse(&doc, &Object::Reference(id)).is_none());
+        assert!(parse(&doc, &Object::Reference(id)).is_none());
         assert!(t.elapsed().as_secs() < 5, "the depth cap is not bounding the parse");
         // An array of arrays nests too, and is bounded by the same cap.
         let mut deep = Object::Array(vec![exp_fn(&[0.0], &[1.0], 1.0)]);
@@ -653,6 +693,6 @@ mod tests {
             deep = Object::Array(vec![deep]);
         }
         let (doc2, _) = one(Object::Null);
-        assert!(Function::parse(&doc2, &deep).is_none(), "nesting past the cap must refuse");
+        assert!(parse(&doc2, &deep).is_none(), "nesting past the cap must refuse");
     }
 }

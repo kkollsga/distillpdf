@@ -18,6 +18,7 @@ pub mod ocr;
 // result types are surfaced by the root re-exports below rather than by opening the whole
 // module (which would drag their `pub` helper fns into the public API).
 mod afm;
+mod access;
 mod captions;
 mod elem_passes;
 mod encoding;
@@ -38,6 +39,7 @@ mod postprocess;
 mod profile;
 mod raster;
 mod structtree;
+mod table;
 mod text;
 mod textutil;
 mod vector;
@@ -164,6 +166,9 @@ pub use model::{AssetProfile, DocModel};
 // those public method signatures are legal (the types are already `pub`, just held in
 // crate-private modules) without exposing the modules' internal helper fns.
 pub use extract::{FontInfo, ImageInfo, TableInfo};
+pub use table::{
+    AnalyzedCaption, AnalyzedCell, AnalyzedTable, TableCellRole, TableEvidence,
+};
 pub use frontmatter::{Author, FrontMatter};
 pub use html::Mode;
 pub use links::Link;
@@ -188,6 +193,19 @@ pub use pdfobj::StreamIssue;
 #[cfg(test)]
 mod structure {
     use std::path::{Path, PathBuf};
+
+    // L1's eager-surface snapshot is a test-only consumer of the public core API. Keeping it
+    // independent of the Python binding gives resolver migrations a checked-in behavior lock.
+    #[path = "eager_oracle.rs"]
+    mod eager_oracle;
+
+    // L2-specific targets are deliberately separate from the admitted L1 manifests. They lock
+    // behavior that the resolver migration needs but must not rewrite L1 evidence to obtain.
+    #[path = "l2_oracle.rs"]
+    mod l2_oracle;
+
+    #[path = "boundary_audit.rs"]
+    mod boundary_audit;
 
     fn core_src() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -216,13 +234,24 @@ mod structure {
 
     /// `src` up to its `#[cfg(test)]` module. These rules govern production code: a test may
     /// name a banned spelling in order to *exercise* it (`pdfobj`'s tests call the real
-    /// `deref`; this module's own rules are written out as string literals). Every file in
+    /// indirect resolution; this module's own rules are written out as string literals). Every file in
     /// this crate puts its test module last and has at most one, which is asserted rather
     /// than assumed — a second one would mean this truncation silently dropped real code.
     fn production_code(src: &str) -> String {
         // A top-level test module's attribute is the whole line, at column 0 — which is what
         // distinguishes it from this module's own prose and string literals naming it.
-        let marks: Vec<usize> = src.lines().enumerate().filter(|(_, l)| *l == TEST_ATTR).map(|(i, _)| i).collect();
+        let lines = src.lines().collect::<Vec<_>>();
+        let marks: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(index, line)| {
+                **line == TEST_ATTR
+                    && lines
+                        .get(index + 1)
+                        .is_some_and(|next| next.contains("mod "))
+            })
+            .map(|(index, _)| index)
+            .collect();
         assert!(marks.len() <= 1, "a file with two top-level test modules would truncate wrongly");
         match marks.first() {
             Some(&i) => src.lines().take(i).collect::<Vec<_>>().join("\n"),
@@ -258,10 +287,9 @@ mod structure {
 
     #[test]
     fn the_primitives_have_exactly_one_definition_each() {
-        // `deref` had five byte-identical copies, `num` four plus a divergent fifth that was
-        // the only one following an indirect reference, `xobjects_of` three. Each now lives
-        // in one module; a redefinition anywhere else is the drift starting over.
-        for (name, owner) in [("fn deref", "pdfobj.rs"), ("fn num(", "pdfobj.rs"), ("fn num_deref", "pdfobj.rs"), ("fn xobjects_of", "walker.rs")] {
+        // `num` had four copies plus a divergent fifth, and `xobjects_of` had three. Each
+        // remaining primitive now lives in one module; a redefinition elsewhere is drift.
+        for (name, owner) in [("fn num(", "pdfobj.rs"), ("fn xobjects_of", "walker.rs")] {
             for (file, src) in rust_files(&core_src()) {
                 // The owner's own definition and any module's `use`/test may name it.
                 if file == owner {

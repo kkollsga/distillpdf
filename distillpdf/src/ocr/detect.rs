@@ -16,7 +16,9 @@
 //! scan wrapped in a single Form XObject (e.g. iText-produced e-filing PDFs) — every
 //! such page would otherwise be (wrongly) reported as having no image.
 
-use lopdf::{Document, Object, ObjectId};
+use lopdf::ObjectId;
+#[cfg(test)]
+use lopdf::Document;
 
 use crate::pdfobj::decode_text_string;
 use crate::text;
@@ -72,14 +74,17 @@ fn decide_from(has_image: bool, coverage: f32, n_text: usize, producer: &str, ga
 }
 
 /// Per-page OCR decision against a real document.
-pub(crate) fn decide(doc: &Document, page_id: ObjectId, raw: &[u8]) -> OcrDecision {
-    let coverage = image_coverage(doc, page_id);
+pub(crate) fn decide(
+    access: &dyn crate::access::DocumentAccess,
+    page_id: ObjectId,
+) -> OcrDecision {
+    let coverage = image_coverage(access, page_id);
     if coverage <= 0.0 {
         return OcrDecision::NotNeeded; // no renderable image → leave the page alone
     }
-    let txt = text::extract_page(doc, page_id, raw).unwrap_or_default();
+    let txt = text::extract_page(access, page_id).unwrap_or_default();
     let n = txt.trim().chars().count();
-    let producer = doc_producer(doc).unwrap_or_default();
+    let producer = doc_producer(access).unwrap_or_default();
     decide_from(true, coverage, n, &producer, text_is_garbled(&txt))
 }
 
@@ -87,12 +92,15 @@ pub(crate) fn decide(doc: &Document, page_id: ObjectId, raw: &[u8]) -> OcrDecisi
 /// (recurses into Form XObjects, stitches tile mosaics into one bbox). `0.0` means no
 /// renderable figure-sized image — the same view the OCR image extractor (`page_main_image`)
 /// has, so detection never flags a page whose image we couldn't actually read.
-fn image_coverage(doc: &Document, page_id: ObjectId) -> f32 {
-    let placed = crate::img::positioned_images(doc, page_id, false);
+fn image_coverage(
+    access: &dyn crate::access::DocumentAccess,
+    page_id: ObjectId,
+) -> f32 {
+    let placed = crate::img::positioned_images(access, page_id, false);
     if placed.is_empty() {
         return 0.0;
     }
-    let (w, h) = super::page_size_pts(doc, page_id);
+    let (w, h) = super::page_size_pts(access, page_id);
     let page_area = (w * h).max(1.0);
     placed
         .iter()
@@ -137,24 +145,21 @@ fn text_is_garbled(text: &str) -> bool {
 /// Read the document's Info /Producer (falling back to /Creator) as a PDF **text string**,
 /// via the one decoder ([`crate::pdfobj::decode_text_string`]) — UTF-16BE behind a BOM,
 /// PDFDocEncoding otherwise.
-fn doc_producer(doc: &Document) -> Option<String> {
-    let info = doc.trailer.get(b"Info").ok()?;
-    let dict = match info {
-        Object::Reference(id) => doc.get_object(*id).ok()?.as_dict().ok()?,
-        Object::Dictionary(d) => d,
-        _ => return None,
-    };
-    for key in [b"Producer".as_slice(), b"Creator".as_slice()] {
-        if let Ok(v) = dict.get(key) {
-            if let Ok(bytes) = v.as_str() {
-                let s = decode_text_string(bytes);
-                if !s.trim().is_empty() {
-                    return Some(s);
+fn doc_producer(access: &dyn crate::access::DocumentAccess) -> Option<String> {
+    access.trailer_entry(b"Info").ok()?.read(|info| {
+        let dict = info.as_dict().ok()?;
+        for key in [b"Producer".as_slice(), b"Creator".as_slice()] {
+            if let Ok(v) = dict.get(key) {
+                if let Ok(bytes) = v.as_str() {
+                    let s = decode_text_string(bytes);
+                    if !s.trim().is_empty() {
+                        return Some(s);
+                    }
                 }
             }
         }
-    }
-    None
+        None
+    }).ok().flatten()
 }
 
 #[cfg(test)]
@@ -252,6 +257,6 @@ mod tests {
         // not just that the decoder exists.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/pagelabels.pdf");
         let doc = Document::load(path).expect("pagelabels.pdf fixture must load");
-        assert_eq!(doc_producer(&doc).as_deref(), Some("distillPDF™ “fixture” writer"));
+        assert_eq!(doc_producer(&crate::access::test_adapter(&doc)).as_deref(), Some("distillPDF™ “fixture” writer"));
     }
 }

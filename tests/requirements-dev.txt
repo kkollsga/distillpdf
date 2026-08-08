@@ -1,6 +1,7 @@
 pytest
 reportlab
 pillow
-# fixture generation only (tests/gen_fixtures.py): writes the AES-128/AES-256 encrypted
-# fixtures reportlab's pdfencrypt cannot emit without the optional pyaes package.
-pikepdf
+# Fixture generation only: writes the AES fixtures and is the frozen maintainer authority
+# for tests/fixtures_pdf/objstm/objstm-r4-rc4.pdf. The latter deliberately pins both
+# pikepdf and its wheel's libqpdf version in lazy_engine_fixtures.py.
+pikepdf==10.7.3

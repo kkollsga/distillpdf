@@ -154,6 +154,65 @@ impl Pdf {
         Ok(list)
     }
 
+    /// Analyze raw table detections with semantic cell anchors and normalized geometry.
+    ///
+    /// Coordinates are `[left, top, right, bottom]` fractions of the post-rotation display
+    /// box. A cell `bbox_norm` is `None` unless the detector observed its exact boundary.
+    /// This raw-analysis surface intentionally precedes renderer-only figure filtering,
+    /// structure-tree reconciliation and caption attachment.
+    fn analyze_tables<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        for table in self.inner.analyze_tables() {
+            let d = PyDict::new(py);
+            d.set_item("page", table.page)?;
+            d.set_item("bbox_norm", table.bbox_norm.map(|bbox| bbox.to_vec()))?;
+            d.set_item("n_rows", table.n_rows)?;
+            d.set_item("n_cols", table.n_cols)?;
+            d.set_item("header_rows", table.header_rows)?;
+
+            let cells = PyList::empty(py);
+            for cell in table.cells {
+                let c = PyDict::new(py);
+                c.set_item("text", cell.text)?;
+                c.set_item("row", cell.row)?;
+                c.set_item("col", cell.col)?;
+                c.set_item("rowspan", cell.rowspan)?;
+                c.set_item("colspan", cell.colspan)?;
+                c.set_item("bbox_norm", cell.bbox_norm.map(|bbox| bbox.to_vec()))?;
+                c.set_item("role", cell.role.as_str())?;
+                c.set_item(
+                    "header_path",
+                    cell.header_path
+                        .into_iter()
+                        .map(|anchor| anchor.to_vec())
+                        .collect::<Vec<_>>(),
+                )?;
+                cells.append(c)?;
+            }
+            d.set_item("cells", cells)?;
+
+            if let Some(caption) = table.caption {
+                let c = PyDict::new(py);
+                c.set_item("number", caption.number)?;
+                c.set_item("text", caption.text)?;
+                c.set_item("below", caption.below)?;
+                d.set_item("caption", c)?;
+            } else {
+                d.set_item("caption", py.None())?;
+            }
+            d.set_item(
+                "evidence",
+                table
+                    .evidence
+                    .into_iter()
+                    .map(|evidence| evidence.as_str())
+                    .collect::<Vec<_>>(),
+            )?;
+            list.append(d)?;
+        }
+        Ok(list)
+    }
+
     /// Extract hyperlinks from all pages. Each dict:
     /// {page, rect:[x0,y0,x1,y1], kind:"uri"|"internal"|"remote",
     ///  uri:str|None, dest_page:int|None, dest_name:str|None, remote_file:str|None}.

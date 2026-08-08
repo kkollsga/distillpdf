@@ -96,6 +96,37 @@ tokens.
     strings. For multi-level headers as rendered markup, use
     [`to_html()`](rendering.md) or the [.dpdf document model](dpdf.md) instead.
 
+## analyze_tables
+
+```python
+doc.analyze_tables() -> list[dict]
+```
+
+Returns the raw detector's richer table analysis without changing the legacy
+`extract_tables()` result. Each table contains `page`, `bbox_norm`, `n_rows`, `n_cols`,
+`header_rows`, `cells`, `caption`, and `evidence`. Cells are semantic anchors rather than
+repeated span slots:
+
+```python
+for table in doc.analyze_tables():
+    print(table["page"], table["bbox_norm"], table["evidence"])
+    for cell in table["cells"]:
+        print(cell["row"], cell["col"], cell["rowspan"], cell["colspan"], cell["text"])
+```
+
+`bbox_norm` uses `[left, top, right, bottom]` fractions of the post-rotation display box,
+with a top-left origin. A cell bbox is `None` unless the detector observed an exact physical
+boundary (currently the ruled-lattice path); text extents are never presented as cell
+boundaries. `role` is `"header"` or `"data"`, and a data cell's `header_path` lists the
+`[row, col]` anchors of its column headers from outermost to innermost. Row-header,
+continuation, confidence, and rejection semantics are not inferred.
+
+!!! note "Raw analysis versus rendering"
+    `analyze_tables()` deliberately describes the same raw detector source as
+    `extract_tables()`. HTML/Markdown rendering subsequently filters figure-like grids,
+    reconciles tagged structure-tree declarations, and attaches captions, so the rendered
+    table set may differ. The API does not claim parity with that finalized render surface.
+
 ## extract_images
 
 ```python

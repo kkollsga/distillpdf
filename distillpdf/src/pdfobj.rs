@@ -3,21 +3,23 @@
 //! Reading a PDF means doing the same five things over and over: follow an indirect
 //! reference, read a number, get a stream's bytes, decode a text string, list a stream's
 //! filters. Before this module each of those lived as a private copy in whichever file
-//! needed it — `deref` in five files, `num` in four, the stream reader in two strong and
+//! needed it — indirect resolution in five files, `num` in four, the stream reader in two strong and
 //! two weak spellings, the text-string decoder in three — and the copies drifted. That
 //! drift has shipped bugs (the CMYK polarity split between extract and render) and is the
 //! reason a fourth walker could be written that silently loses uncompressed form streams.
 //!
 //! **The rule this module encodes:** mechanics and policy live here; interpretation stays
 //! with the consumer. Where two consumers legitimately want different behaviour that
-//! difference is a *named function* with a documented invariant ([`num`] vs [`num_deref`]),
+//! difference is a *named function* with a documented invariant ([`num`] vs [`num_resolved`]),
 //! never two copies of one name.
 //!
 //! Every function here is total: malformed input degrades (a default, `None`, or the raw
 //! bytes) and never panics, never fabricates data, and never loops unboundedly.
 
-use lopdf::{Dictionary, Document, Object, ObjectId};
-use std::borrow::Cow;
+use crate::access::{read_resolved, DocumentAccess};
+use lopdf::{Dictionary, Object, ObjectId};
+#[cfg(test)]
+use lopdf::Document;
 
 /// The page size assumed when a document states no page box at all: US Letter, in points.
 ///
@@ -27,20 +29,6 @@ use std::borrow::Cow;
 /// letter-sized" — [`page_box`] returning `None` is the only thing that should lead here.
 pub const DEFAULT_PAGE_PTS: (f32, f32) = (612.0, 792.0);
 
-/// Follow one indirect reference; pass a direct object straight through.
-///
-/// **Invariants callers may rely on and must not re-check:**
-/// - The result is **never** an [`Object::Reference`]. lopdf's `Document::get_object`
-///   walks a whole reference chain itself, bounded by its own `DEREF_LIMIT`, so a cyclic
-///   or absurdly long chain terminates inside lopdf. Callers must **not** loop on this.
-/// - A dangling reference (target not in the document) yields `None`, not a panic.
-pub(crate) fn deref<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Object> {
-    match o {
-        Object::Reference(r) => doc.get_object(*r).ok(),
-        other => Some(other),
-    }
-}
-
 /// A **direct** numeric object as `f32`; `0.0` for anything else.
 ///
 /// This is the operand reader for **content streams**, where PDF 32000-1 §7.8.2 forbids
@@ -49,7 +37,7 @@ pub(crate) fn deref<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Object> 
 ///
 /// It is the **wrong** reader for a value pulled out of a dictionary or array, where an
 /// indirect number is perfectly legal (`/MediaBox [0 0 12 0 R 13 0 R]`): use
-/// [`num_deref`] there, or the number silently becomes `0.0`.
+/// [`num_resolved`] there, or the number silently becomes `0.0`.
 pub(crate) fn num(o: &Object) -> f32 {
     match o {
         Object::Integer(i) => *i as f32,
@@ -58,13 +46,10 @@ pub(crate) fn num(o: &Object) -> f32 {
     }
 }
 
-/// A numeric object as `f32`, **following an indirect reference** first; `0.0` for a
-/// non-numeric or dangling value.
-///
-/// The reader for dictionary and array values (page boxes, `/Decode`, `/Matrix` stored
-/// indirectly). Terminates for the same reason [`deref`] does.
-pub(crate) fn num_deref(doc: &Document, o: &Object) -> f32 {
-    deref(doc, o).map(num).unwrap_or(0.0)
+/// A numeric object as `f32`, resolving an indirect reference through the selected backend
+/// first; `0.0` for a non-numeric or dangling value.
+pub(crate) fn num_resolved(access: &dyn DocumentAccess, object: &Object) -> f32 {
+    read_resolved(access, object, num).unwrap_or(0.0)
 }
 
 /// A stream's decoded bytes, decompressed when it carries a `/Filter`.
@@ -73,12 +58,13 @@ pub(crate) fn num_deref(doc: &Document, o: &Object) -> f32 {
 /// returns an *error* for a stream with no `/Filter` key, and some producers store content
 /// and Form XObject streams raw — so calling it bare and taking `unwrap_or_default()`
 /// decodes those streams as **empty**, silently losing every glyph and path inside them.
-/// This reader returns the verbatim content instead. Borrowed when no decode happened, so
-/// the common path allocates nothing.
+/// This reader returns the verbatim content instead. The owned result is the interpreted
+/// leaf payload which may safely outlive a short resolver read.
 ///
 /// The `Err` arm covers the filters lopdf does not implement (JBIG2, CCITT, DCT — image
 /// codecs that reach here only on a malformed content stream), which likewise degrade to
-/// raw bytes. Note what it does **not** cover: lopdf's Flate path swallows a decode error
+/// raw bytes. The result is owned so no stream-derived borrow crosses the resolver boundary.
+/// Note what it does **not** cover: lopdf's Flate path swallows a decode error
 /// and hands back whatever partial output it managed, so a *truncated* Flate stream comes
 /// back short or empty rather than raw. That is lopdf's call, not ours — raw deflate bytes
 /// would not parse as a content stream either — and it is stated here so no caller assumes
@@ -89,14 +75,29 @@ pub(crate) fn num_deref(doc: &Document, o: &Object) -> f32 {
 /// `PdfDocument::debug_page`), so a caller can ask whether the page it just rendered is the
 /// whole page. The check stays *out* of this function on purpose — it costs a second full
 /// inflate, which no render should pay per stream.
-pub(crate) fn content_bytes(stream: &lopdf::Stream) -> Cow<'_, [u8]> {
+pub(crate) fn content_bytes(stream: &lopdf::Stream) -> Vec<u8> {
     if stream.dict.get(b"Filter").is_err() {
-        return Cow::Borrowed(&stream.content);
+        return stream.content.clone();
+    }
+    // The L0 fork is based beyond the crates.io 0.44 tag and implements these two filters.
+    // The eager compatibility oracle did not: either filter made `decompressed_content`
+    // return `Unimplemented`, and every distillPDF surface deliberately fell back to the
+    // raw encoded bytes. Keep that behavior on the eager route through L9; the lazy route
+    // may only change it under an explicit, separately-oracled policy.
+    if has_legacy_unsupported_filter(&stream.dict) {
+        return stream.content.clone();
     }
     match stream.decompressed_content() {
-        Ok(b) => Cow::Owned(b),
-        Err(_) => Cow::Borrowed(&stream.content),
+        Ok(bytes) => bytes,
+        Err(_) => stream.content.clone(),
     }
+}
+
+/// Filters newly implemented by the pinned fork but unsupported by the prior eager 0.44 route.
+pub(crate) fn has_legacy_unsupported_filter(dict: &Dictionary) -> bool {
+    filters_of(dict)
+        .iter()
+        .any(|name| matches!(name.as_slice(), b"ASCIIHexDecode" | b"AHx" | b"RunLengthDecode" | b"RL"))
 }
 
 /// The page's effective box as `[x0, y0, x1, y1]`: `/MediaBox`, else `/CropBox`, inherited
@@ -106,7 +107,7 @@ pub(crate) fn content_bytes(stream: &lopdf::Stream) -> Cow<'_, [u8]> {
 /// - `/MediaBox` and `/CropBox` are **inheritable** page attributes (PDF 32000-1 §7.7.3.4):
 ///   a writer may state one once on a `/Pages` node and omit it from every page. The walk
 ///   climbs `/Parent` until it finds a box, and takes the *nearest* ancestor's.
-/// - Extents are read with [`num_deref`], because an array element may legally be an
+/// - Extents are read with [`num_resolved`], because an array element may legally be an
 ///   indirect reference (`/MediaBox [0 0 12 0 R 13 0 R]`). Reading them with [`num`] makes
 ///   such a box measure zero — which is how a real page becomes a guessed US-Letter one.
 /// - Termination is bounded twice over: a visited set (a `/Parent` cycle returns `None`)
@@ -115,7 +116,7 @@ pub(crate) fn content_bytes(stream: &lopdf::Stream) -> Cow<'_, [u8]> {
 ///   mean US Letter — that decision belongs to the caller, which should reach for
 ///   [`DEFAULT_PAGE_PTS`]. The box is returned as authored: it may be inverted or
 ///   degenerate, so callers take `.abs()` of the extents they care about.
-pub(crate) fn page_box(doc: &Document, page_id: ObjectId) -> Option<[f32; 4]> {
+pub(crate) fn page_box(access: &dyn DocumentAccess, page_id: ObjectId) -> Option<[f32; 4]> {
     let mut node = page_id;
     let mut seen: Vec<ObjectId> = Vec::new();
     for _ in 0..crate::MAX_FORM_DEPTH {
@@ -123,21 +124,34 @@ pub(crate) fn page_box(doc: &Document, page_id: ObjectId) -> Option<[f32; 4]> {
             return None; // cyclic /Parent chain
         }
         seen.push(node);
-        let dict = doc.get_object(node).ok()?.as_dict().ok()?;
-        let found = dict
-            .get(b"MediaBox")
-            .ok()
-            .or_else(|| dict.get(b"CropBox").ok())
-            .and_then(|o| deref(doc, o))
-            .and_then(|o| o.as_array().ok())
-            .filter(|a| a.len() >= 4);
-        if let Some(a) = found {
-            return Some([num_deref(doc, &a[0]), num_deref(doc, &a[1]), num_deref(doc, &a[2]), num_deref(doc, &a[3])]);
+        let handle = access.page(node).ok()?;
+        let (found, parent) = handle
+            .read(|dict| {
+                let found = dict
+                    .get(b"MediaBox")
+                    .ok()
+                    .or_else(|| dict.get(b"CropBox").ok())
+                    .and_then(|value| {
+                        read_resolved(access, value, |resolved| {
+                            let values = resolved.as_array().ok()?.get(..4)?;
+                            Some([
+                                num_resolved(access, &values[0]),
+                                num_resolved(access, &values[1]),
+                                num_resolved(access, &values[2]),
+                                num_resolved(access, &values[3]),
+                            ])
+                        })
+                        .ok()
+                        .flatten()
+                    });
+                let parent = dict.get(b"Parent").ok().and_then(|value| value.as_reference().ok());
+                (found, parent)
+            })
+            .ok()?;
+        if found.is_some() {
+            return found;
         }
-        node = match dict.get(b"Parent") {
-            Ok(Object::Reference(r)) => *r,
-            _ => return None,
-        };
+        node = parent?;
     }
     None
 }
@@ -157,7 +171,7 @@ pub(crate) fn page_box(doc: &Document, page_id: ObjectId) -> Option<[f32; 4]> {
 ///   non-number, a dangling reference — is **`0`**: a page we cannot turn squarely is left
 ///   alone rather than skewed.
 /// - Never panics, never loops (visited set + [`crate::MAX_FORM_DEPTH`]).
-pub(crate) fn page_rotation(doc: &Document, page_id: ObjectId) -> i32 {
+pub(crate) fn page_rotation(access: &dyn DocumentAccess, page_id: ObjectId) -> i32 {
     let mut node = page_id;
     let mut seen: Vec<ObjectId> = Vec::new();
     for _ in 0..crate::MAX_FORM_DEPTH {
@@ -165,18 +179,25 @@ pub(crate) fn page_rotation(doc: &Document, page_id: ObjectId) -> i32 {
             return 0; // cyclic /Parent chain
         }
         seen.push(node);
-        let dict = match doc.get_object(node).ok().and_then(|o| o.as_dict().ok()) {
-            Some(d) => d,
-            None => return 0,
+        let Some((rotation, parent)) = access.page(node).ok().and_then(|handle| {
+            handle
+                .read(|dict| {
+                    let rotation = dict.get(b"Rotate").ok().map(|value| num_resolved(access, value));
+                    let parent = dict.get(b"Parent").ok().and_then(|value| value.as_reference().ok());
+                    (rotation, parent)
+                })
+                .ok()
+        }) else {
+            return 0;
         };
-        if let Ok(o) = dict.get(b"Rotate") {
-            // A dictionary value may legally be indirect, so `num_deref`, not `num`.
-            let deg = num_deref(doc, o).round() as i32;
+        if let Some(rotation) = rotation {
+            // A dictionary value may legally be indirect, so `num_resolved`, not `num`.
+            let deg = rotation.round() as i32;
             return if deg % 90 == 0 { deg.rem_euclid(360) } else { 0 };
         }
-        node = match dict.get(b"Parent") {
-            Ok(Object::Reference(r)) => *r,
-            _ => return 0,
+        node = match parent {
+            Some(id) => id,
+            None => return 0,
         };
     }
     0
@@ -345,8 +366,12 @@ pub(crate) fn flate_incomplete(stream: &lopdf::Stream) -> Option<usize> {
 /// Deterministic (lopdf stores objects in a `BTreeMap`) and total: a document with no
 /// damaged stream returns an empty list. See [`StreamIssue::kind`] for what is reported and
 /// [`flate_incomplete`] for why the truncation case needs an independent decode.
-pub(crate) fn stream_issues(doc: &Document) -> Vec<StreamIssue> {
-    doc.objects.iter().filter_map(|(id, obj)| stream_issue(*id, obj.as_stream().ok()?)).collect()
+pub(crate) fn stream_issues(access: &dyn DocumentAccess) -> Vec<StreamIssue> {
+    access
+        .object_ids()
+        .into_iter()
+        .filter_map(|id| access.stream(id).ok()?.read(|stream| stream_issue(id, stream)).flatten())
+        .collect()
 }
 
 /// [`stream_issues`] for a single stream: `None` when its bytes decode cleanly (or it carries
@@ -375,6 +400,9 @@ fn stream_issue(id: ObjectId, s: &lopdf::Stream) -> Option<StreamIssue> {
     probe.dict.set("Filter", Object::Array(lead));
     probe.dict.remove(b"DecodeParms"); // a codec's parms do not apply to the generic layers
     probe.dict.remove(b"DP");
+    if has_legacy_unsupported_filter(&probe.dict) {
+        return Some(StreamIssue { object: id, kind: "filter-unapplied", filter, recovered: s.content.len() });
+    }
     match probe.decompressed_content() {
         // `Err` IS the honest signal here: it is what makes `content_bytes` and
         // `codec_payload` fall back to the ENCODED bytes, so whatever consumes them is
@@ -394,18 +422,30 @@ fn stream_issue(id: ObjectId, s: &lopdf::Stream) -> Option<StreamIssue> {
 /// `/Contents` is either one stream or an array of them (a writer may split a page's content
 /// at any byte boundary), and either form may be indirect — so both are followed here rather
 /// than at the two call sites.
-pub(crate) fn page_stream_issues(doc: &Document, page_id: ObjectId) -> Vec<StreamIssue> {
-    let Ok(dict) = doc.get_object(page_id).and_then(|o| o.as_dict()) else {
-        return Vec::new();
-    };
-    let mut ids: Vec<ObjectId> = Vec::new();
-    match dict.get(b"Contents") {
-        Ok(Object::Reference(r)) => ids.push(*r),
-        Ok(Object::Array(a)) => ids.extend(a.iter().filter_map(|o| o.as_reference().ok())),
-        _ => {}
-    }
+pub(crate) fn page_stream_issues(access: &dyn DocumentAccess, page_id: ObjectId) -> Vec<StreamIssue> {
+    let ids = access
+        .object(page_id)
+        .ok()
+        .and_then(|handle| {
+            handle
+                .read(|object| {
+                    let dict = object.as_dict().ok()?;
+                    let mut ids: Vec<ObjectId> = Vec::new();
+                    match dict.get(b"Contents") {
+                        Ok(Object::Reference(id)) => ids.push(*id),
+                        Ok(Object::Array(values)) => {
+                            ids.extend(values.iter().filter_map(|value| value.as_reference().ok()));
+                        }
+                        _ => {}
+                    }
+                    Some(ids)
+                })
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_default();
     ids.into_iter()
-        .filter_map(|id| stream_issue(id, doc.get_object(id).ok()?.as_stream().ok()?))
+        .filter_map(|id| access.stream(id).ok()?.read(|stream| stream_issue(id, stream)).flatten())
         .collect()
 }
 
@@ -413,14 +453,23 @@ pub(crate) fn page_stream_issues(doc: &Document, page_id: ObjectId) -> Vec<Strea
 ///
 /// Every `/Resources` child (`/XObject`, `/Font`, `/ColorSpace`, `/ExtGState`, …) may be
 /// either, so reading one with `as_dict()` alone silently misses the indirect half.
-pub(crate) fn sub_dict<'a>(doc: &'a Document, d: &'a Dictionary, key: &[u8]) -> Option<&'a Dictionary> {
-    d.get(key).ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::test_adapter;
     use lopdf::{dictionary, Stream};
+
+    fn page_box(doc: &Document, page_id: ObjectId) -> Option<[f32; 4]> {
+        super::page_box(&test_adapter(doc), page_id)
+    }
+
+    fn page_rotation(doc: &Document, page_id: ObjectId) -> i32 {
+        super::page_rotation(&test_adapter(doc), page_id)
+    }
+
+    fn stream_issues(doc: &Document) -> Vec<StreamIssue> {
+        super::stream_issues(&test_adapter(doc))
+    }
 
     /// A document holding the given objects at ids `(1,0), (2,0), …` in order.
     fn doc_with(objs: Vec<Object>) -> (Document, Vec<lopdf::ObjectId>) {
@@ -430,59 +479,30 @@ mod tests {
     }
 
     #[test]
-    fn deref_passes_direct_objects_through_and_follows_one_reference() {
-        let (doc, ids) = doc_with(vec![Object::Integer(42)]);
-        let direct = Object::Real(1.5);
-        assert_eq!(deref(&doc, &direct), Some(&Object::Real(1.5)));
-        assert_eq!(deref(&doc, &Object::Reference(ids[0])), Some(&Object::Integer(42)));
-    }
-
-    #[test]
-    fn deref_of_a_dangling_reference_is_none_not_a_panic() {
-        // A truncated / hand-edited file routinely points at an object that isn't there.
-        let (doc, _) = doc_with(vec![Object::Null]);
-        assert_eq!(deref(&doc, &Object::Reference((9999, 0))), None);
-    }
-
-    #[test]
-    fn deref_terminates_on_a_reference_cycle_and_never_returns_a_reference() {
-        // 1 0 obj -> 2 0 R, 2 0 obj -> 1 0 R. lopdf's own DEREF_LIMIT breaks the loop, so
-        // callers may treat `deref` as one-shot; if this ever hangs, that assumption died.
-        let mut doc = Document::with_version("1.5");
-        let a = doc.add_object(Object::Null);
-        let b = doc.add_object(Object::Reference(a));
-        doc.set_object(a, Object::Reference(b));
-        let start = Object::Reference(a);
-        let got = deref(&doc, &start);
-        assert!(
-            !matches!(got, Some(Object::Reference(_))),
-            "deref must never hand back a reference — callers do not loop"
-        );
-    }
-
-    #[test]
-    fn num_is_direct_only_and_num_deref_follows_the_reference() {
+    fn num_is_direct_only_and_num_resolved_follows_the_reference() {
         // The pin for the split: an indirect number is 0.0 to `num` (content-stream
-        // operands may not be indirect) and its real value to `num_deref` (dict/array
+        // operands may not be indirect) and its real value to `num_resolved` (dict/array
         // values may). Reading a dict value with `num` is how an indirect /MediaBox
         // element silently becomes 0.0.
         let (doc, ids) = doc_with(vec![Object::Real(612.0)]);
+        let access = test_adapter(&doc);
         let r = Object::Reference(ids[0]);
         assert_eq!(num(&r), 0.0);
-        assert_eq!(num_deref(&doc, &r), 612.0);
+        assert_eq!(num_resolved(&access, &r), 612.0);
         for direct in [Object::Integer(-7), Object::Real(2.5)] {
-            assert_eq!(num(&direct), num_deref(&doc, &direct));
+            assert_eq!(num(&direct), num_resolved(&access, &direct));
         }
     }
 
     #[test]
     fn num_degrades_non_numeric_and_dangling_input_to_zero() {
         let (doc, _) = doc_with(vec![Object::Null]);
+        let access = test_adapter(&doc);
         for o in [Object::Null, Object::Boolean(true), Object::Name(b"Foo".to_vec()), Object::Array(vec![])] {
             assert_eq!(num(&o), 0.0);
-            assert_eq!(num_deref(&doc, &o), 0.0);
+            assert_eq!(num_resolved(&access, &o), 0.0);
         }
-        assert_eq!(num_deref(&doc, &Object::Reference((9999, 0))), 0.0);
+        assert_eq!(num_resolved(&access, &Object::Reference((9999, 0))), 0.0);
     }
 
     #[test]
@@ -502,7 +522,7 @@ mod tests {
             Some(&raw[..]),
             "the premise, lopdf 0.44: an unfiltered stream decodes to its raw content",
         );
-        assert_eq!(content_bytes(&s).as_ref(), &raw[..]);
+        assert_eq!(content_bytes(&s).as_slice(), &raw[..]);
     }
 
     #[test]
@@ -511,7 +531,7 @@ mod tests {
         let mut s = Stream::new(dictionary! {}, raw.clone());
         s.compress().expect("flate compress");
         assert_ne!(s.content, raw, "the fixture must really be compressed");
-        assert_eq!(content_bytes(&s).as_ref(), &raw[..]);
+        assert_eq!(content_bytes(&s).as_slice(), &raw[..]);
     }
 
     #[test]
@@ -520,7 +540,7 @@ mod tests {
         // `Unimplemented`, and the caller gets the bytes on disk — garbage it can reject,
         // never a silent empty page.
         let unknown = Stream::new(dictionary! { "Filter" => "JBIG2Decode" }, b"\x00\x01\x02".to_vec());
-        assert_eq!(content_bytes(&unknown).as_ref(), b"\x00\x01\x02");
+        assert_eq!(content_bytes(&unknown).as_slice(), b"\x00\x01\x02");
     }
 
     #[test]
@@ -534,7 +554,7 @@ mod tests {
         let truncated = Stream::new(s.dict.clone(), s.content[..s.content.len() / 2].to_vec());
         assert!(truncated.decompressed_content().is_ok(), "lopdf swallows the zlib error");
         let got = content_bytes(&truncated);
-        assert_ne!(got.as_ref(), &truncated.content[..], "not the raw bytes");
+        assert_ne!(got.as_slice(), &truncated.content[..], "not the raw bytes");
         assert!(got.len() < raw.len(), "a truncated stream decodes short, got {} of {}", got.len(), raw.len());
     }
 
@@ -615,9 +635,11 @@ mod tests {
         assert!(whole.starts_with(&short[..]), "what survives a cut is a PREFIX of the page");
         // And the per-page diagnostic names it, so the one page-level entry point in the
         // crate does not report `ops=N` as though N were all there was.
-        let dbg = crate::text::debug_page(&doc, pages[&1], &std::fs::read(path).expect("fixture readable"));
+        let raw = std::fs::read(path).expect("fixture readable");
+        let access = crate::access::test_adapter_with_source(&doc, &raw);
+        let dbg = crate::text::debug_page(&access, pages[&1]).unwrap();
         assert!(dbg.contains("flate-truncated"), "debug_page must surface it: {dbg}");
-        let clean = crate::text::debug_page(&doc, pages[&3], &std::fs::read(path).expect("fixture readable"));
+        let clean = crate::text::debug_page(&access, pages[&3]).unwrap();
         assert!(!clean.contains("truncated"), "the intact page reports nothing: {clean}");
     }
 
@@ -688,7 +710,7 @@ mod tests {
 
     #[test]
     fn page_box_resolves_indirect_extents() {
-        // THE reason this is `num_deref` and not `num`: an array element may legally be an
+        // THE reason this is `num_resolved` and not `num`: an array element may legally be an
         // indirect reference, and reading it directly makes the whole page measure zero.
         let mut doc = Document::with_version("1.5");
         let w = doc.add_object(Object::Integer(1008));

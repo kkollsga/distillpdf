@@ -18,17 +18,23 @@ pub mod doctags;
 pub mod engine;
 pub mod pdf;
 pub mod render;
+pub(crate) mod searchable;
 pub(crate) mod tess_synth;
 #[cfg(feature = "tesseract")]
 pub mod tesseract;
 
-use lopdf::{Document, ObjectId};
+use lopdf::ObjectId;
+#[cfg(test)]
+use lopdf::Document;
 
 /// The page's main raster (largest placed image): standard image bytes (PNG/JPEG) plus
 /// the decoded image. Reuses `img::positioned_images`, which handles every PDF image
 /// encoding by emitting a data URI. Used to feed the OCR engine and crop figure regions.
-pub(crate) fn page_main_image(doc: &Document, page_id: ObjectId) -> Option<(Vec<u8>, image::DynamicImage)> {
-    let placed = crate::img::positioned_images(doc, page_id, true);
+pub(crate) fn page_main_image(
+    access: &dyn crate::access::DocumentAccess,
+    page_id: ObjectId,
+) -> Option<(Vec<u8>, image::DynamicImage)> {
+    let placed = crate::img::positioned_images(access, page_id, true);
     let best = placed
         .into_iter()
         .filter(|p| !p.uri.is_empty())
@@ -49,8 +55,8 @@ fn data_uri_bytes(uri: &str) -> Option<Vec<u8>> {
 /// Page size in PDF points, from the one page-box walker ([`crate::pdfobj::page_box`]):
 /// `/MediaBox` then `/CropBox`, inherited up `/Parent`, indirect extents resolved. Defaults
 /// to [`crate::pdfobj::DEFAULT_PAGE_PTS`] only when the document states no box at all.
-pub(crate) fn page_size_pts(doc: &Document, page_id: ObjectId) -> (f32, f32) {
-    match crate::pdfobj::page_box(doc, page_id) {
+pub(crate) fn page_size_pts(access: &dyn crate::access::DocumentAccess, page_id: ObjectId) -> (f32, f32) {
+    match crate::pdfobj::page_box(access, page_id) {
         Some([x0, y0, x1, y1]) => ((x1 - x0).abs().max(1.0), (y1 - y0).abs().max(1.0)),
         None => crate::pdfobj::DEFAULT_PAGE_PTS,
     }
@@ -79,6 +85,11 @@ pub fn detect_language(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::test_adapter;
+
+    fn page_size_pts(doc: &Document, page_id: ObjectId) -> (f32, f32) {
+        super::page_size_pts(&test_adapter(doc), page_id)
+    }
 
     /// The owned page-box fixture (`tests/gen_fixtures.py::gen_indirect_mediabox`).
     fn box_fixture() -> Document {

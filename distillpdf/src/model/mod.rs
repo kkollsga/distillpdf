@@ -351,6 +351,10 @@ pub struct Block {
     /// `None` preserves the legacy model interpretation during deserialization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_header_rows: Option<usize>,
+    /// True only when exact ruled geometry and independent aligned ownership proved a detached
+    /// leading tier. This preserves its representation-scoped Markdown projection on re-render.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_proven_leading_tier: Option<bool>,
     /// A `kind = table`'s data grid (without the detached header rows), for faithful re-emit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_grid: Option<Vec<Vec<String>>>,
@@ -358,11 +362,14 @@ pub struct Block {
     /// `<caption>` parts (separate from the plain-text `caption` query field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_caption: Option<(String, String, bool)>,
-    /// The EXACT emitted HTML fragment for constructs not faithfully reconstructible from the
+    /// The exact element HTML fragment for constructs not faithfully reconstructible from the
     /// structured fields alone — `figure`/`caption` (SVG, overlays, composite, captions) and the
-    /// page-chrome `header`/`dest_anchors` carriers. SVG subtrees are pulled out to `\0svg:ID\0`
-    /// sentinels (the bytes live in a `kind = svg` asset); render splices them back. `None` for
-    /// the structured kinds (heading/para/list_item/code/table/footnote).
+    /// page-chrome `header`/`dest_anchors` carriers, plus tables whose semantic spans cannot be
+    /// reconstructed from the structured table fields. SVG subtrees are pulled out to `\0svg:ID\0`
+    /// sentinels (the bytes live in a `kind = svg` asset); render splices them back. Destination
+    /// anchor IDs remain pre-dedup so Page and Section rendering can apply their mode-specific
+    /// global namespace. `None` for the structured kinds
+    /// (heading/para/list_item/code/ordinary table/footnote).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub el_html: Option<String>,
 }
@@ -719,6 +726,7 @@ mod tests {
             el_group: None,
             table_header: None,
             table_header_rows: None,
+            table_proven_leading_tier: None,
             table_grid: None,
             table_caption: None,
             el_html: None,

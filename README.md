@@ -64,7 +64,7 @@ distillpdf scan.pdf --ocr             # OCR a scan → scan.searchable.pdf (bund
 - **Rendering modes & image handling** — section-first or page-first HTML/Markdown, an optional
   table of contents, and `embed` / `external` (an `img/` folder) / `drop` image modes.
   [Rendering »](https://distillpdf.readthedocs.io/en/latest/guide/rendering/)
-- **Raw extraction** — `extract_tables()`, `extract_images()`, `extract_links()`,
+- **Raw extraction** — `extract_tables()`, rich `analyze_tables()`, `extract_images()`, `extract_links()`,
   `extract_fonts()` give you the structured pieces, not rendered output.
   [Extraction »](https://distillpdf.readthedocs.io/en/latest/guide/extraction/)
 - **The `.dpdf` document model** — `distill()` once to a durable file, then re-render and query

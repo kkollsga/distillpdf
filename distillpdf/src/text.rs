@@ -5,11 +5,14 @@
 //! ourselves, decode show-text operators through each font's ToUnicode CMap, and
 //! recover real Unicode — including 2-byte CID codes and diacritics.
 
+use crate::access::{AccessError, AccessKind, DictionaryHandle, DocumentAccess, ObjectHandle, read_resolved};
 use crate::geom::Mat;
-use crate::pdfobj::{deref, num};
+use crate::pdfobj::num;
 use crate::walker::{descend_form, xobject_at, Descend, ScopePolicy, XMap};
-use lopdf::{Dictionary, Document, Object, ObjectId};
-use std::collections::HashMap;
+#[cfg(test)]
+use lopdf::Document;
+use lopdf::{Dictionary, Object, ObjectId, OwnedEncoding};
+use std::collections::{BTreeMap, HashMap};
 
 struct FontInfo {
     two_byte: bool,
@@ -88,71 +91,51 @@ fn obj_i64(o: &Object) -> Option<i64> {
     }
 }
 
-/// Find the first occurrence of `needle` in `hay` starting at `from`.
-fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.is_empty() || from > hay.len() {
-        return None;
-    }
-    hay[from..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|p| p + from)
-}
-
-/// Lenient recovery of a stream's bytes straight from the raw PDF, for malformed
-/// streams that omit `/Length` (e.g. oxidize-pdf's ToUnicode CMaps), which lopdf
-/// reads as empty. Mirrors what PyMuPDF does: scan `N 0 obj ... stream..endstream`.
-fn recover_stream(raw: &[u8], obj_num: u32) -> Option<Vec<u8>> {
-    let marker = format!("{obj_num} 0 obj");
-    let obj_pos = find_from(raw, marker.as_bytes(), 0)?;
-    let s = find_from(raw, b"stream", obj_pos)? + b"stream".len();
-    let mut start = s;
-    if raw.get(start) == Some(&b'\r') {
-        start += 1;
-    }
-    if raw.get(start) == Some(&b'\n') {
-        start += 1;
-    }
-    let end = find_from(raw, b"endstream", start)?;
-    let mut e = end;
-    if e > start && raw[e - 1] == b'\n' {
-        e -= 1;
-    }
-    if e > start && raw[e - 1] == b'\r' {
-        e -= 1;
-    }
-    if e > start {
-        Some(raw[start..e].to_vec())
-    } else {
-        None
-    }
-}
-
 /// Build per-page font table: resource name -> FontInfo.
-fn build_fonts(doc: &Document, page_id: ObjectId, raw: &[u8]) -> HashMap<Vec<u8>, FontInfo> {
+fn build_fonts(
+    access: &dyn DocumentAccess,
+    page_id: ObjectId,
+) -> Result<HashMap<Vec<u8>, FontInfo>, AccessError> {
     let mut out = HashMap::new();
-    let fonts = match doc.get_page_fonts(page_id) {
-        Ok(f) => f,
-        Err(_) => return out,
-    };
-    for (name, dict) in fonts {
-        out.insert(name, font_info(doc, dict, raw));
+    // The access chain is outermost-to-page. Later overlays therefore reproduce
+    // `get_page_fonts`' nearest-resource-wins behavior without borrowing its map.
+    for resources in access.page_resource_chain_or_empty(page_id) {
+        out.extend(build_fonts_from_resources(access, &resources)?);
     }
-    out
+    Ok(out)
 }
 
 /// Build a font table from a resources dictionary's `/Font` subdict (used for
 /// Form XObjects, whose fonts live in their own /Resources rather than the page's).
-fn build_fonts_from_resources(doc: &Document, resources: &Dictionary, raw: &[u8]) -> HashMap<Vec<u8>, FontInfo> {
+fn build_fonts_from_resources(
+    access: &dyn DocumentAccess,
+    resources: &DictionaryHandle,
+) -> Result<HashMap<Vec<u8>, FontInfo>, AccessError> {
     let mut out = HashMap::new();
-    if let Some(fd) = resources.get(b"Font").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_dict().ok()) {
-        for (name, val) in fd.iter() {
-            if let Some(dict) = deref(doc, val).and_then(|o| o.as_dict().ok()) {
-                out.insert(name.clone(), font_info(doc, dict, raw));
-            }
+    let Ok(fonts) = resources.entry(access, b"Font") else {
+        return Ok(out);
+    };
+    let names = fonts
+        .read(|value| {
+            value.as_dict().ok().map(|fonts| {
+                fonts
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    for name in names {
+        let Ok(font) = fonts.dictionary_entry(access, &name) else {
+            continue;
+        };
+        if let Some(info) = font_info(access, &font)? {
+            out.insert(name, info);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Parse a Type1 FontFile's built-in `/Encoding` (cleartext `dup N /glyph put`
@@ -160,18 +143,27 @@ fn build_fonts_from_resources(doc: &Document, resources: &Dictionary, raw: &[u8]
 /// Modern fonts re-pack glyphs to compact codes here and carry no PDF-level
 /// Encoding/Differences/ToUnicode, so without this their punctuation (notably the
 /// decimal point, often moved off 0x2E) mis-decodes via the raw byte fallback.
-fn type1_encoding(doc: &Document, descriptor: Option<&Dictionary>) -> Option<HashMap<u32, String>> {
-    let r = descriptor?.get(b"FontFile").ok().and_then(|o| o.as_reference().ok())?;
-    let stream = doc.get_object(r).ok().and_then(|o| o.as_stream().ok())?;
-    let bytes = crate::pdfobj::content_bytes(stream);
-    let end = bytes.windows(5).position(|w| w == b"eexec").unwrap_or(bytes.len());
+fn type1_encoding(
+    access: &dyn DocumentAccess,
+    font_file: Option<ObjectId>,
+) -> Option<HashMap<u32, String>> {
+    let bytes = access
+        .stream(font_file?)
+        .ok()?
+        .read(crate::pdfobj::content_bytes)?;
+    let end = bytes
+        .windows(5)
+        .position(|w| w == b"eexec")
+        .unwrap_or(bytes.len());
     let text = String::from_utf8_lossy(&bytes[..end]);
     let toks: Vec<&str> = text.split_whitespace().collect();
     let mut m = HashMap::new();
     let mut i = 0;
     while i + 3 < toks.len() {
         if toks[i] == "dup" {
-            if let (Ok(code), Some(name)) = (toks[i + 1].parse::<u32>(), toks[i + 2].strip_prefix('/')) {
+            if let (Ok(code), Some(name)) =
+                (toks[i + 1].parse::<u32>(), toks[i + 2].strip_prefix('/'))
+            {
                 if toks[i + 3] == "put" {
                     if let Some(t) = glyph_to_str(name) {
                         m.insert(code, t);
@@ -186,95 +178,190 @@ fn type1_encoding(doc: &Document, descriptor: Option<&Dictionary>) -> Option<Has
     (!m.is_empty()).then_some(m)
 }
 
-/// Construct a [`FontInfo`] from a font dictionary.
-fn font_info(doc: &Document, dict: &Dictionary, raw: &[u8]) -> FontInfo {
+#[derive(Default)]
+struct DescriptorInfo {
+    flags: i64,
+    missing_width: Option<i64>,
+    font_file: Option<ObjectId>,
+}
+
+fn descriptor_info(access: &dyn DocumentAccess, dict: &Dictionary) -> DescriptorInfo {
+    fn read_descriptor(
+        access: &dyn DocumentAccess,
+        value: &Object,
+    ) -> Option<Option<DescriptorInfo>> {
+        read_resolved(access, value, |value| {
+            let descriptor = value.as_dict().ok()?;
+            Some(DescriptorInfo {
+                flags: descriptor.get(b"Flags").ok().and_then(obj_i64).unwrap_or(0),
+                missing_width: descriptor.get(b"MissingWidth").ok().and_then(obj_i64),
+                font_file: descriptor
+                    .get(b"FontFile")
+                    .ok()
+                    .and_then(|value| value.as_reference().ok()),
+            })
+        })
+        .ok()
+    }
+
+    if let Some(info) = dict
+        .get(b"FontDescriptor")
+        .ok()
+        .and_then(|value| read_descriptor(access, value))
     {
-        let subtype = dict.get(b"Subtype").and_then(|o| o.as_name()).unwrap_or(b"");
+        // A resolved but non-dictionary direct descriptor suppresses the descendant
+        // fallback in the eager path; only a failed reference lookup falls through.
+        return info.unwrap_or_default();
+    }
+    dict.get(b"DescendantFonts")
+        .ok()
+        .and_then(|value| {
+            read_resolved(access, value, |value| {
+                let first = value.as_array().ok()?.first()?;
+                read_resolved(access, first, |first| {
+                    let descendant = first.as_dict().ok()?;
+                    descendant
+                        .get(b"FontDescriptor")
+                        .ok()
+                        .and_then(|value| read_descriptor(access, value))
+                        .flatten()
+                })
+                .ok()
+                .flatten()
+            })
+            .ok()
+            .flatten()
+        })
+        .unwrap_or_default()
+}
+
+fn differences_map(access: &dyn DocumentAccess, dict: &Dictionary) -> Option<HashMap<u32, String>> {
+    let encoding = dict.get(b"Encoding").ok()?;
+    read_resolved(access, encoding, |encoding| {
+        let encoding = encoding.as_dict().ok()?;
+        let differences = encoding.get(b"Differences").ok()?;
+        read_resolved(access, differences, |differences| {
+            let array = differences.as_array().ok()?;
+            let mut map = HashMap::new();
+            let mut code = 0u32;
+            for item in array {
+                match item {
+                    Object::Integer(value) => code = *value as u32,
+                    Object::Real(value) => code = *value as u32,
+                    Object::Name(name) => {
+                        if let Some(text) = glyph_to_str(&String::from_utf8_lossy(name)) {
+                            map.insert(code, text);
+                        }
+                        code += 1;
+                    }
+                    _ => {}
+                }
+            }
+            (!map.is_empty()).then_some(map)
+        })
+        .ok()
+        .flatten()
+    })
+    .ok()
+    .flatten()
+}
+
+fn descendant_metrics(
+    access: &dyn DocumentAccess,
+    dict: &Dictionary,
+) -> Option<(f32, HashMap<u32, f32>)> {
+    let descendants = dict.get(b"DescendantFonts").ok()?;
+    read_resolved(access, descendants, |descendants| {
+        let first = descendants.as_array().ok()?.first()?;
+        read_resolved(access, first, |first| {
+            let descendant = first.as_dict().ok()?;
+            let default_width = descendant.get(b"DW").ok().and_then(obj_i64).unwrap_or(1000) as f32;
+            let mut widths = HashMap::new();
+            if let Ok(value) = descendant.get(b"W") {
+                let _ = read_resolved(access, value, |value| {
+                    if let Ok(array) = value.as_array() {
+                        parse_cid_widths(array, &mut widths);
+                    }
+                });
+            }
+            Some((default_width, widths))
+        })
+        .ok()
+        .flatten()
+    })
+    .ok()
+    .flatten()
+}
+
+/// Construct a [`FontInfo`] from an owner-pinned font dictionary.
+fn font_info(
+    access: &dyn DocumentAccess,
+    font: &ObjectHandle,
+) -> Result<Option<FontInfo>, AccessError> {
+    font.read(|value| -> Result<Option<FontInfo>, AccessError> {
+        let Ok(dict) = value.as_dict() else {
+            return Ok(None);
+        };
+        let subtype = dict
+            .get(b"Subtype")
+            .and_then(|o| o.as_name())
+            .unwrap_or(b"");
         let two_byte = subtype == b"Type0";
-        let to_unicode = dict
+        let to_unicode_ref = dict
             .get(b"ToUnicode")
             .ok()
-            .and_then(|o| o.as_reference().ok())
-            .and_then(|r| {
-                // Prefer lopdf's loaded content; fall back to raw recovery when the
-                // stream is missing /Length (lopdf yields empty bytes).
-                let from_lopdf = doc
-                    .get_object(r)
-                    .ok()
-                    .and_then(|o| o.as_stream().ok())
-                    .map(|s| crate::pdfobj::content_bytes(s).into_owned())
-                    .filter(|b| !b.is_empty());
-                let bytes = from_lopdf.or_else(|| recover_stream(raw, r.0))?;
+            .and_then(|object| object.as_reference().ok());
+        let to_unicode = if let Some(reference) = to_unicode_ref {
+            // Prefer lopdf's loaded content; fall back to bounded source recovery when the
+            // stream is missing /Length (lopdf yields empty bytes). Recovery failures are
+            // not missing mappings: they remain typed errors through this checked path.
+            let from_lopdf = access
+                .stream(reference)
+                .ok()
+                .and_then(|stream| stream.read(crate::pdfobj::content_bytes))
+                .filter(|bytes| !bytes.is_empty());
+            if let Some(bytes) = from_lopdf {
                 Some(parse_tounicode(&bytes))
-            });
+            } else {
+                access
+                    .recover_source_stream(reference.0)?
+                    .map(|bytes| parse_tounicode(&bytes))
+            }
+        } else {
+            None
+        };
 
         let identity_unicode = two_byte && to_unicode.as_ref().is_some_and(is_identity_cmap);
 
         // /Encoding /Differences: code -> glyph name -> text. Only kept for simple
         // (non-Type0) fonts; resolves f-ligatures and named punctuation that have
         // no ToUnicode mapping.
-        let mut differences = (!two_byte)
-            .then(|| {
-                dict.get(b"Encoding")
-                    .ok()
-                    .and_then(|o| deref(doc, o))
-                    .and_then(|o| o.as_dict().ok())
-                    .and_then(|enc| enc.get(b"Differences").ok())
-                    .and_then(|o| deref(doc, o))
-                    .and_then(|o| o.as_array().ok())
-                    .map(|arr| {
-                        let mut m = HashMap::new();
-                        let mut code = 0u32;
-                        for it in arr {
-                            match it {
-                                Object::Integer(i) => code = *i as u32,
-                                Object::Real(r) => code = *r as u32,
-                                Object::Name(n) => {
-                                    if let Some(t) = glyph_to_str(&String::from_utf8_lossy(n)) {
-                                        m.insert(code, t);
-                                    }
-                                    code += 1;
-                                }
-                                _ => {}
-                            }
-                        }
-                        m
-                    })
-            })
-            .flatten()
-            .filter(|m: &HashMap<u32, String>| !m.is_empty());
+        let mut differences = (!two_byte).then(|| differences_map(access, dict)).flatten();
 
         // Glyph widths.
         let mut widths = HashMap::new();
         let mut default_width = if two_byte { 1000.0 } else { 500.0 };
         if two_byte {
             // Type0: widths live on the descendant CIDFont (/DW default, /W array).
-            if let Some(desc) = dict
-                .get(b"DescendantFonts")
-                .ok()
-                .and_then(|o| deref(doc, o))
-                .and_then(|o| o.as_array().ok())
-                .and_then(|a| a.first())
-                .and_then(|o| deref(doc, o))
-                .and_then(|o| o.as_dict().ok())
-            {
-                if let Some(dw) = desc.get(b"DW").ok().and_then(obj_i64) {
-                    default_width = dw as f32;
-                }
-                if let Some(w) = desc.get(b"W").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_array().ok()) {
-                    parse_cid_widths(w, &mut widths);
-                }
+            if let Some((dw, parsed)) = descendant_metrics(access, dict) {
+                default_width = dw;
+                widths = parsed;
             }
-        } else if let (Some(first), Some(ws)) = (
-            dict.get(b"FirstChar").ok().and_then(obj_i64),
-            dict.get(b"Widths").ok().and_then(|o| deref(doc, o)).and_then(|o| o.as_array().ok()),
-        ) {
-            for (i, w) in ws.iter().enumerate() {
-                if let Some(wd) = obj_i64(w) {
-                    widths.insert(first as u32 + i as u32, wd as f32);
-                }
+        } else if let Some(first) = dict.get(b"FirstChar").ok().and_then(obj_i64) {
+            if let Ok(value) = dict.get(b"Widths") {
+                let _ = read_resolved(access, value, |value| {
+                    if let Ok(array) = value.as_array() {
+                        for (index, width) in array.iter().enumerate() {
+                            if let Some(width) = obj_i64(width) {
+                                widths.insert(first as u32 + index as u32, width as f32);
+                            }
+                        }
+                    }
+                });
             }
         }
+
+        let descriptor = descriptor_info(access, dict);
 
         // Style flags from BaseFont name + FontDescriptor /Flags.
         let basefont = dict
@@ -282,35 +369,21 @@ fn font_info(doc: &Document, dict: &Dictionary, raw: &[u8]) -> FontInfo {
             .and_then(|o| o.as_name())
             .map(|n| String::from_utf8_lossy(n).to_lowercase())
             .unwrap_or_default();
-        let descriptor = dict
-            .get(b"FontDescriptor")
-            .ok()
-            .and_then(|o| deref(doc, o))
-            .or_else(|| {
-                dict.get(b"DescendantFonts")
-                    .ok()
-                    .and_then(|o| deref(doc, o))
-                    .and_then(|o| o.as_array().ok())
-                    .and_then(|a| a.first())
-                    .and_then(|o| deref(doc, o))
-                    .and_then(|o| o.as_dict().ok())
-                    .and_then(|dd| dd.get(b"FontDescriptor").ok())
-                    .and_then(|o| deref(doc, o))
-            })
-            .and_then(|o| o.as_dict().ok());
         // Subset Type1 fonts (notably Computer Modern) carry NO PDF Encoding/
         // Differences/ToUnicode but re-pack their glyphs to compact codes in the
         // embedded FontFile's built-in /Encoding. Read it so their punctuation
         // (e.g. a decimal point reassigned away from 0x2E) decodes correctly.
         if differences.is_none() && !two_byte {
-            differences = type1_encoding(doc, descriptor);
+            differences = type1_encoding(access, descriptor.font_file);
         }
-        let flags = descriptor.and_then(|d| d.get(b"Flags").ok()).and_then(obj_i64).unwrap_or(0);
+        let flags = descriptor.flags;
         // Bold incl. heading weights (LaTeX/Nimbus heading faces are "Medi"/semibold,
         // not literally "Bold", and often don't set the ForceBold descriptor flag).
-        let bold = ["bold", "black", "heavy", "semibold", "demibold", "-medi", "medium", "cmbx"]
-            .iter()
-            .any(|w| basefont.contains(w))
+        let bold = [
+            "bold", "black", "heavy", "semibold", "demibold", "-medi", "medium", "cmbx",
+        ]
+        .iter()
+        .any(|w| basefont.contains(w))
             || (flags & 0x40000) != 0;
         let italic =
             basefont.contains("italic") || basefont.contains("oblique") || (flags & 0x40) != 0;
@@ -331,7 +404,7 @@ fn font_info(doc: &Document, dict: &Dictionary, raw: &[u8]) -> FontInfo {
                         widths.insert(code as u32, w as f32);
                     }
                 }
-            } else if let Some(mw) = descriptor.and_then(|d| d.get(b"MissingWidth").ok()).and_then(obj_i64) {
+            } else if let Some(mw) = descriptor.missing_width {
                 // Non-standard font without /Widths: the FontDescriptor's /MissingWidth is a
                 // better default than the flat 0.5-em fallback.
                 default_width = mw as f32;
@@ -341,23 +414,33 @@ fn font_info(doc: &Document, dict: &Dictionary, raw: &[u8]) -> FontInfo {
         // CM *text* family (not the CMMI/CMSY/CMEX math fonts, which use a
         // different built-in encoding). Only used when there's no ToUnicode and
         // the code isn't covered by /Differences.
-        let is_cm_math = ["cmmi", "cmsy", "cmex", "cmbsy", "cmmib", "msam", "msbm", "eufm", "eufb"]
-            .iter()
-            .any(|w| basefont.contains(w));
+        let is_cm_math = [
+            "cmmi", "cmsy", "cmex", "cmbsy", "cmmib", "msam", "msbm", "eufm", "eufb",
+        ]
+        .iter()
+        .any(|w| basefont.contains(w));
         let ot1_text = !two_byte
             && to_unicode.is_none()
             && !is_cm_math
-            && ["cmr", "cmbx", "cmss", "cmsl", "cmti", "cmtt", "cmcsc", "cmdunh",
-                "cmvtt", "cmtex", "cmff", "cmfib", "sfrm", "sfbx", "sfss", "sftt", "sfsl", "sfti"]
-                .iter()
-                .any(|w| basefont.contains(w));
+            && [
+                "cmr", "cmbx", "cmss", "cmsl", "cmti", "cmtt", "cmcsc", "cmdunh", "cmvtt", "cmtex",
+                "cmff", "cmfib", "sfrm", "sfbx", "sfss", "sftt", "sfsl", "sfti",
+            ]
+            .iter()
+            .any(|w| basefont.contains(w));
 
         // CM math font whose low codes carry Greek / operators via the built-in TeX
         // encoding (no ToUnicode) — decode them rather than dropping as control chars.
         let cm_math: u8 = if !two_byte && to_unicode.is_none() {
-            if ["cmmi", "cmmib", "eufm", "eufb", "eurm", "eurb"].iter().any(|w| basefont.contains(w)) {
+            if ["cmmi", "cmmib", "eufm", "eufb", "eurm", "eurb"]
+                .iter()
+                .any(|w| basefont.contains(w))
+            {
                 1
-            } else if ["cmsy", "cmbsy", "msam", "msbm"].iter().any(|w| basefont.contains(w)) {
+            } else if ["cmsy", "cmbsy", "msam", "msbm"]
+                .iter()
+                .any(|w| basefont.contains(w))
+            {
                 2
             } else {
                 0
@@ -378,21 +461,41 @@ fn font_info(doc: &Document, dict: &Dictionary, raw: &[u8]) -> FontInfo {
         let symbolic = (flags & 0x4) != 0 && (flags & 0x20) == 0;
         let base_encoding = (!two_byte && !symbolic && !ot1_text && cm_math == 0)
             .then(|| {
-                let enc = dict.get(b"Encoding").ok().and_then(|o| deref(doc, o))?;
-                let name: &[u8] = match enc {
-                    Object::Name(n) => n,
-                    Object::Dictionary(d) => d.get(b"BaseEncoding").ok().and_then(|o| o.as_name().ok())?,
-                    _ => return None,
-                };
-                crate::encoding::base_encoding_table(name)
+                let encoding = dict.get(b"Encoding").ok()?;
+                read_resolved(access, encoding, |encoding| {
+                    let name: &[u8] = match encoding {
+                        Object::Name(name) => name,
+                        Object::Dictionary(dictionary) => dictionary
+                            .get(b"BaseEncoding")
+                            .ok()
+                            .and_then(|value| value.as_name().ok())?,
+                        _ => return None,
+                    };
+                    crate::encoding::base_encoding_table(name)
+                })
+                .ok()
+                .flatten()
             })
             .flatten();
 
         let font_id = font_id_of(&basefont);
-        FontInfo { two_byte, to_unicode, identity_unicode, differences, base_encoding, ot1_text, cm_math, widths, default_width, bold, italic, mono, font_id }
-    }
+        Ok(Some(FontInfo {
+            two_byte,
+            to_unicode,
+            identity_unicode,
+            differences,
+            base_encoding,
+            ot1_text,
+            cm_math,
+            widths,
+            default_width,
+            bold,
+            italic,
+            mono,
+            font_id,
+        }))
+    })?
 }
-
 
 /// Parse a Type0 /W array: `[ c [w...] ]` and `[ c1 c2 w ]` forms.
 fn parse_cid_widths(w: &[Object], widths: &mut HashMap<u32, f32>) {
@@ -1008,6 +1111,91 @@ fn decode_words(elems: &[Show], font: Option<&FontInfo>, size: f32, tc: f32, tw:
 
 /// 2x3 affine matrix (PDF row-vector convention): [a b c d e f].
 /// A positioned run of text (origin in PDF user space, y increases upward).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct SourceId(u32);
+
+impl SourceId {
+    const UNASSIGNED: Self = Self(u32::MAX);
+
+    pub(crate) const fn ordinal(self) -> u32 {
+        self.0
+    }
+}
+
+/// The exact character interval contributed by one painted text occurrence.
+///
+/// Occurrence ids are assigned only after coincident-paint de-duplication, so two uses of the
+/// same Form XObject at different page positions remain distinct while faux-bold overpainting
+/// at one position remains one visible source. Character offsets, rather than byte offsets,
+/// let a ruled-cell cut preserve Unicode text without exposing this bookkeeping publicly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct SourceSlice {
+    source: SourceId,
+    char_start: u32,
+    char_end: u32,
+}
+
+impl SourceSlice {
+    fn unassigned() -> Self {
+        Self {
+            source: SourceId::UNASSIGNED,
+            char_start: 0,
+            char_end: 0,
+        }
+    }
+
+    fn whole(source: SourceId, char_len: usize) -> Self {
+        Self {
+            source,
+            char_start: 0,
+            char_end: u32::try_from(char_len).expect("one text span cannot exceed u32 characters"),
+        }
+    }
+
+    pub(crate) fn source(self) -> SourceId {
+        self.source
+    }
+
+    pub(crate) const fn char_start(self) -> u32 {
+        self.char_start
+    }
+
+    pub(crate) const fn char_end(self) -> u32 {
+        self.char_end
+    }
+
+    pub(crate) const fn char_len(self) -> u32 {
+        self.char_end - self.char_start
+    }
+
+    pub(crate) fn merge_if_touching(self, other: Self) -> Option<Self> {
+        if self.source != other.source || other.char_start > self.char_end || other.char_end < self.char_start {
+            return None;
+        }
+        Some(Self {
+            source: self.source,
+            char_start: self.char_start.min(other.char_start),
+            char_end: self.char_end.max(other.char_end),
+        })
+    }
+
+    pub(crate) fn sub_slice(self, relative_start: usize, relative_end: usize) -> Self {
+        let start = u32::try_from(relative_start).expect("span split offset must fit u32");
+        let end = u32::try_from(relative_end).expect("span split offset must fit u32");
+        debug_assert!(start <= end && end <= self.char_len());
+        Self {
+            source: self.source,
+            char_start: self.char_start + start,
+            char_end: self.char_start + end,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_occurrence(ordinal: u32, char_len: usize) -> Self {
+        Self::whole(SourceId(ordinal), char_len)
+    }
+}
+
 #[derive(Clone)]
 pub struct Span {
     pub x: f32,
@@ -1035,6 +1223,9 @@ pub struct Span {
     /// associate a cell with unrelated text; those spans stay `None` and resolve by geometry
     /// or not at all.
     pub mcid: Option<u32>,
+    /// Private painted-occurrence provenance. Assigned after coincident de-duplication and
+    /// preserved by every geometry-only clone/turn; never projected into a public result.
+    pub(crate) source: SourceSlice,
 }
 
 /// Extract positioned text spans for one page via content-stream interpretation,
@@ -1043,36 +1234,72 @@ pub struct Span {
 /// iText-assembled PDFs) where each appended document is a full-page Form XObject —
 /// would otherwise be invisible to the page-direct walk. Page-direct and
 /// form-internal text land in the same page user space.
-pub fn extract_spans(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Vec<Span> {
-    let content = match doc.get_and_decode_page_content(page_id) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
+pub fn extract_spans(
+    access: &dyn crate::access::DocumentAccess,
+    page_id: ObjectId,
+) -> Result<Vec<Span>, AccessError> {
+    let content = match access
+        .page_content(page_id)
+        .ok()
+        .and_then(|bytes| lopdf::content::Content::decode(&bytes).ok())
+    {
+        Some(content) => content,
+        None => return Ok(Vec::new()),
     };
-    let fonts = build_fonts(doc, page_id, raw);
-    let xmap = crate::walker::page_xobjects(doc, page_id);
+    let fonts = build_fonts(access, page_id)?;
+    let xmap = crate::walker::page_xobjects(access, page_id);
     let mut spans = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
-    let props = marked_properties(doc, page_id);
-    decode_spans(doc, &content.operations, &fonts, &xmap, Mat::ID, raw, 0, &mut spans, &mut budget, Some(&props));
+    let props = marked_properties(access, page_id);
+    decode_spans(
+        access,
+        &content.operations,
+        &fonts,
+        &xmap,
+        Mat::ID,
+        0,
+        &mut spans,
+        &mut budget,
+        Some(&props),
+    )?;
     // §12.5.5: an annotation's appearance stream is page content — a filled form field's
     // value, a stamp's caption — reachable from neither the content stream nor the page's
     // `/Resources`. `walker::placed_appearances` carries the `/BBox`→`/Rect` mapping that
     // puts it where a viewer puts it; its fonts are its own, exactly as a form's are.
-    for (_, ap, actm) in crate::walker::placed_appearances(doc, page_id) {
-        let f = match descend_form(doc, ap, &XMap::new(), ScopePolicy::OwnOnly, 0, &mut budget, fonts.len()) {
+    for (_, ap, actm) in crate::walker::placed_appearances(access, page_id) {
+        let f = match descend_form(
+            access,
+            &ap,
+            &XMap::new(),
+            ScopePolicy::OwnOnly,
+            0,
+            &mut budget,
+            fonts.len(),
+        ) {
             Descend::Into(f) => f,
             Descend::Skip => continue,
             Descend::Halt => break,
         };
-        let Some(fr) = &f.scope.resources else { continue };
-        let ff = build_fonts_from_resources(doc, fr, raw);
-        decode_spans(doc, &f.ops, &ff, &f.scope.xobjects, f.matrix.mul(actm), raw, 1, &mut spans, &mut budget, None);
+        let Some(fr) = &f.scope.resources else {
+            continue;
+        };
+        let ff = build_fonts_from_resources(access, fr)?;
+        decode_spans(
+            access,
+            &f.ops,
+            &ff,
+            &f.scope.xobjects,
+            f.matrix.mul(actm),
+            1,
+            &mut spans,
+            &mut budget,
+            None,
+        )?;
     }
     dedup_coincident(&mut spans);
-    spans
+    assign_occurrence_provenance(&mut spans);
+    Ok(spans)
 }
-
-
 
 /// Emit one positioned text span from a decoded word, resolving its device position
 /// from the text matrix and the graphics CTM (pure-translate / Y-flip / rotation
@@ -1142,6 +1369,7 @@ fn push_positioned_span(spans: &mut Vec<Span>, wtm: &Mat, ctm: &Mat, base_size: 
                 angle,
                 font: style.3,
                 mcid: None, // stamped by the caller's marked-content stack (see `decode_spans`)
+                source: SourceSlice::unassigned(),
             });
         }
 }
@@ -1156,7 +1384,17 @@ fn push_positioned_span(spans: &mut Vec<Span>, wtm: &Mat, ctm: &Mat, base_size: 
 /// [`Span::mcid`] for why a form's or an annotation's marked-content ids must not be stamped
 /// with the page's numbering.
 #[allow(clippy::too_many_arguments)]
-fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashMap<Vec<u8>, FontInfo>, xmap: &XMap, base: Mat, raw: &[u8], depth: u32, spans: &mut Vec<Span>, budget: &mut crate::WalkBudget, props: Option<&HashMap<Vec<u8>, u32>>) {
+fn decode_spans(
+    access: &dyn crate::access::DocumentAccess,
+    ops: &[lopdf::content::Operation],
+    fonts: &HashMap<Vec<u8>, FontInfo>,
+    xmap: &XMap,
+    base: Mat,
+    depth: u32,
+    spans: &mut Vec<Span>,
+    budget: &mut crate::WalkBudget,
+    props: Option<&HashMap<Vec<u8>, u32>>,
+) -> Result<(), AccessError> {
     let mut tm = Mat::ID;
     let mut tlm = Mat::ID;
     let mut leading = 0.0f32;
@@ -1198,7 +1436,7 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
         // self-referential form branch 2x per level. Out of budget → return the spans
         // decoded so far; a page degrades, it never comes back looking blank.
         if !budget.spend(1) {
-            return;
+            return Ok(());
         }
         let o = &op.operands;
         // Spans this operator paints directly. A `Do` recursion's spans are excluded
@@ -1207,7 +1445,7 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
         match op.operator.as_str() {
             "BDC" | "BMC" if props.is_some() => {
                 let id = (op.operator == "BDC")
-                    .then(|| o.get(1).and_then(|p| mcid_of(doc, p, props.unwrap_or(&HashMap::new()))))
+                    .then(|| o.get(1).and_then(|p| mcid_of(access, p, props.unwrap_or(&HashMap::new()))))
                     .flatten();
                 if mcstack.len() < crate::MAX_MARKED_NESTING {
                     mcstack.push(id);
@@ -1333,7 +1571,7 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
             // /Matrix and the CTM in effect at the `Do`). Inline images / non-Form
             // XObjects carry no text and are skipped.
             "Do" => {
-                let Some((_, stream)) = xobject_at(doc, xmap, o) else {
+                let Some((_, stream)) = xobject_at(access, xmap, o) else {
                     continue;
                 };
                 // `OwnOnly`: a form's fonts and XObjects live in its OWN /Resources (PDF
@@ -1341,24 +1579,39 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
                 // a form without one is skipped rather than decoded through some other
                 // scope's encoding. That is a deliberate policy difference from the raster
                 // and vector walks, which overlay the parent scope; see `walker::ScopePolicy`.
-                let f = match descend_form(doc, stream, xmap, ScopePolicy::OwnOnly, depth, budget, fonts.len()) {
+                let f = match descend_form(
+                    access,
+                    &stream,
+                    xmap,
+                    ScopePolicy::OwnOnly,
+                    depth,
+                    budget,
+                    fonts.len(),
+                ) {
                     Descend::Into(f) => f,
                     Descend::Skip => continue,
-                    Descend::Halt => return,
+                    Descend::Halt => return Ok(()),
                 };
-                let ff = match &f.scope.resources {
-                    Some(fr) => build_fonts_from_resources(doc, fr, raw),
-                    None => continue, // unreachable under OwnOnly, which refuses a form without /Resources
+                let Some(fr) = &f.scope.resources else {
+                    continue;
                 };
+                let ff = build_fonts_from_resources(access, fr)?;
                 let sub = f.matrix.mul(ctm);
-                // §8.10.2: the form's `/BBox` clips its content, glyphs included. The raster
-                // and vector walks already read the key (`walker::form_bbox_clip`); this walk
-                // did not, so a producer that reuses ONE oversized form body and selects a
-                // band of it per placement got every glyph of the whole body, once per
-                // placement. See `clip_spans_to`.
-                let clip = crate::walker::form_bbox_clip(doc, stream, sub);
+                let clip = stream
+                    .read(|stream| crate::walker::form_bbox_clip(access, stream, sub))
+                    .flatten();
                 let mark = spans.len();
-                decode_spans(doc, &f.ops, &ff, &f.scope.xobjects, sub, raw, depth + 1, spans, budget, None);
+                decode_spans(
+                    access,
+                    &f.ops,
+                    &ff,
+                    &f.scope.xobjects,
+                    sub,
+                    depth + 1,
+                    spans,
+                    budget,
+                    None,
+                )?;
                 if let Some(bb) = clip {
                     clip_spans_to(spans, mark, bb);
                 }
@@ -1370,39 +1623,71 @@ fn decode_spans(doc: &Document, ops: &[lopdf::content::Operation], fonts: &HashM
             spans[mark..].iter_mut().for_each(|s| s.mcid = Some(m));
         }
     }
+    Ok(())
 }
 
 /// The `/MCID` a `BDC`'s property operand names — written inline as a dictionary, or as a
 /// name into the stream's `/Resources /Properties`.
-fn mcid_of(doc: &Document, prop: &Object, props: &HashMap<Vec<u8>, u32>) -> Option<u32> {
+fn mcid_of(
+    access: &dyn DocumentAccess,
+    prop: &Object,
+    props: &HashMap<Vec<u8>, u32>,
+) -> Option<u32> {
     match prop {
         Object::Name(n) => props.get(n.as_slice()).copied(),
-        _ => {
-            let d = crate::pdfobj::deref(doc, prop)?.as_dict().ok()?;
-            u32::try_from(crate::pdfobj::deref(doc, d.get(b"MCID").ok()?)?.as_i64().ok()?).ok()
-        }
+        _ => read_resolved(access, prop, |prop| {
+            let dictionary = prop.as_dict().ok()?;
+            let mcid = dictionary.get(b"MCID").ok()?;
+            read_resolved(access, mcid, |mcid| mcid.as_i64().ok())
+                .ok()
+                .flatten()
+                .and_then(|mcid| u32::try_from(mcid).ok())
+        })
+        .ok()
+        .flatten(),
     }
 }
 
 /// The page's own `/Resources /Properties` as name → `/MCID`, for the `/Tag /P0 BDC`
 /// spelling. Page-level only, and deliberately so: a form's `/Properties` names a sequence in
 /// the form's numbering, which this walk does not stamp.
-fn marked_properties(doc: &Document, page_id: ObjectId) -> HashMap<Vec<u8>, u32> {
+fn marked_properties(access: &dyn DocumentAccess, page_id: ObjectId) -> HashMap<Vec<u8>, u32> {
     let mut m = HashMap::new();
-    let Ok((own, inherited)) = doc.get_page_resources(page_id) else { return m };
-    for res in own.into_iter().chain(inherited.into_iter().filter_map(|id| doc.get_dictionary(id).ok())) {
-        let Some(props) = crate::pdfobj::sub_dict(doc, res, b"Properties") else { continue };
-        for (k, v) in props.iter() {
-            if let Some(id) = crate::pdfobj::deref(doc, v)
-                .and_then(|o| o.as_dict().ok())
-                .and_then(|d| d.get(b"MCID").ok())
-                .and_then(|o| crate::pdfobj::deref(doc, o))
-                .and_then(|o| o.as_i64().ok())
-                .and_then(|v| u32::try_from(v).ok())
-            {
-                m.insert(k.to_vec(), id);
-            }
-        }
+    let Ok(resources) = access.page_resource_chain(page_id) else {
+        return m;
+    };
+    // The eager implementation visited page-to-root and overwrote duplicates, so retain
+    // that exact (outermost-wins) behavior here by reversing the access chain.
+    for resources in resources.iter().rev() {
+        let Ok(properties) = resources.entry(access, b"Properties") else {
+            continue;
+        };
+        let entries = properties
+            .read(|properties| {
+                let properties = properties.as_dict().ok()?;
+                Some(
+                    properties
+                        .iter()
+                        .filter_map(|(name, value)| {
+                            let id = read_resolved(access, value, |value| {
+                                let dictionary = value.as_dict().ok()?;
+                                let mcid = dictionary.get(b"MCID").ok()?;
+                                read_resolved(access, mcid, |mcid| mcid.as_i64().ok())
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|mcid| u32::try_from(mcid).ok())
+                            })
+                            .ok()
+                            .flatten()?;
+                            Some((name.clone(), id))
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        m.extend(entries);
     }
     m
 }
@@ -1448,6 +1733,18 @@ fn clip_spans_to(spans: &mut Vec<Span>, from: usize, bb: crate::geom::Rect) {
 fn dedup_coincident(spans: &mut Vec<Span>) {
     let mut seen = std::collections::HashSet::new();
     spans.retain(|s| seen.insert((s.x.round() as i32, s.y.round() as i32, s.text.clone())));
+}
+
+/// Number the visible paint occurrences in retained content-walk order.
+///
+/// This deliberately runs after [`dedup_coincident`]. Form invocations are decoded once per
+/// placement and therefore receive different ids; only occurrences that a viewer overprints
+/// at the same rounded position have already collapsed to one.
+fn assign_occurrence_provenance(spans: &mut [Span]) {
+    for (i, span) in spans.iter_mut().enumerate() {
+        let source = SourceId(u32::try_from(i).expect("one page cannot contain more than u32 spans"));
+        span.source = SourceSlice::whole(source, span.text.chars().count());
+    }
 }
 
 /// Effective span width (fall back to a char estimate if widths were absent).
@@ -1792,8 +2089,8 @@ fn text_from_spans(mut spans: Vec<Span>) -> String {
 }
 
 /// Diagnostic: report font table + content status for one page.
-pub fn debug_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> String {
-    let fonts = build_fonts(doc, page_id, raw);
+pub fn debug_page(access: &dyn DocumentAccess, page_id: ObjectId) -> Result<String, AccessError> {
+    let fonts = build_fonts(access, page_id)?;
     let mut s = format!("fonts={}\n", fonts.len());
     for (k, fi) in &fonts {
         s += &format!(
@@ -1804,40 +2101,90 @@ pub fn debug_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> String {
         );
     }
     // ToUnicode raw diagnostics per font.
-    if let Ok(fonts) = doc.get_page_fonts(page_id) {
-        for (name, dict) in fonts {
-            if let Some(r) = dict.get(b"ToUnicode").ok().and_then(|o| o.as_reference().ok()) {
-                if let Ok(st) = doc.get_object(r).and_then(|o| o.as_stream().cloned()) {
-                    let dec = st.decompressed_content();
-                    let raw_len = st.content.len();
-                    let dec_len = dec.as_ref().map(|d| d.len() as i64).unwrap_or(-1);
-                    let used = crate::pdfobj::content_bytes(&st);
-                    let parsed = parse_tounicode(&used).len();
-                    let sample: String = String::from_utf8_lossy(&used).chars().take(50).collect();
-                    s += &format!(
-                        "  TU '{}': ref={:?} raw={} dec={} parsed={} dict={:?} sample={:?}\n",
-                        String::from_utf8_lossy(&name),
-                        r,
-                        raw_len,
-                        dec_len,
-                        parsed,
-                        st.dict,
-                        sample
-                    );
-                }
+    let mut font_handles = std::collections::BTreeMap::new();
+    for resources in access.page_resource_chain_or_empty(page_id) {
+        let Ok(fonts) = resources.entry(access, b"Font") else {
+            continue;
+        };
+        let names = fonts
+            .read(|fonts| {
+                fonts.as_dict().ok().map(|fonts| {
+                    fonts
+                        .iter()
+                        .map(|(name, _)| name.clone())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        for name in names {
+            if let Ok(font) = fonts.dictionary_entry(access, &name) {
+                font_handles.insert(name, font);
+            }
+        }
+    }
+    for (name, font) in font_handles {
+        let reference = font
+            .read(|font| {
+                font.as_dict()
+                    .ok()?
+                    .get(b"ToUnicode")
+                    .ok()?
+                    .as_reference()
+                    .ok()
+            })
+            .ok()
+            .flatten();
+        let Some(reference) = reference else {
+            continue;
+        };
+        if let Ok(stream) = access.stream(reference) {
+            if let Some((raw_len, dec_len, used, dictionary)) = stream.read(|stream| {
+                let decompressed = stream.decompressed_content();
+                (
+                    stream.content.len(),
+                    decompressed
+                        .as_ref()
+                        .map(|bytes| bytes.len() as i64)
+                        .unwrap_or(-1),
+                    crate::pdfobj::content_bytes(stream),
+                    format!("{:?}", stream.dict),
+                )
+            }) {
+                let parsed = parse_tounicode(&used).len();
+                let sample: String = String::from_utf8_lossy(&used).chars().take(50).collect();
+                s += &format!(
+                    "  TU '{}': ref={:?} raw={} dec={} parsed={} dict={} sample={:?}\n",
+                    String::from_utf8_lossy(&name),
+                    reference,
+                    raw_len,
+                    dec_len,
+                    parsed,
+                    dictionary,
+                    sample
+                );
             }
         }
     }
     // Stream integrity for this page's OWN content streams. A truncated Flate stream is
     // reported `Ok` by lopdf and renders short with no error at all, so the one page-level
     // diagnostic in the crate is where "the ops below are all there were" has to be said.
-    for issue in crate::pdfobj::page_stream_issues(doc, page_id) {
-        s += &format!("stream {:?}: {} ({}), {} bytes recovered\n", issue.object, issue.kind, issue.filter, issue.recovered);
+    for issue in crate::pdfobj::page_stream_issues(access, page_id) {
+        s += &format!(
+            "stream {:?}: {} ({}), {} bytes recovered\n",
+            issue.object, issue.kind, issue.filter, issue.recovered
+        );
     }
-    match doc.get_and_decode_page_content(page_id) {
-        Ok(c) => {
-            s += &format!("ops={}\n", c.operations.len());
-            let tfs: Vec<String> = c
+    match access
+        .page_content(page_id)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| {
+            lopdf::content::Content::decode(&bytes).map_err(|error| error.to_string())
+        }) {
+        Ok(content) => {
+            s += &format!("ops={}\n", content.operations.len());
+            let tfs: Vec<String> = content
                 .operations
                 .iter()
                 .filter(|o| o.operator == "Tf")
@@ -1851,19 +2198,343 @@ pub fn debug_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> String {
         }
         Err(e) => s += &format!("content ERR: {e}\n"),
     }
-    s
+    Ok(s)
 }
 
 /// Extract text for one page via positioned spans + reading-order reconstruction.
 /// Returns None if the page content cannot be decoded.
-pub fn extract_page(doc: &Document, page_id: ObjectId, raw: &[u8]) -> Option<String> {
-    let spans = extract_spans(doc, page_id, raw);
-    Some(text_from_spans(spans))
+struct FallbackEncoding {
+    owned: OwnedEncoding,
+    object: ObjectId,
+}
+
+fn fallback_fatal(error: &AccessError) -> bool {
+    matches!(
+        error.kind,
+        AccessKind::ResourceLimit
+            | AccessKind::SourceChanged
+            | AccessKind::SourceIo
+            | AccessKind::Bounds
+            | AccessKind::PasswordRequired
+            | AccessKind::InvalidPassword
+            | AccessKind::Encryption
+            | AccessKind::InvalidEncryptDictionary
+            | AccessKind::ObjectDecryption
+    )
+}
+
+fn record_fallback_error(slot: &mut Option<AccessError>, error: AccessError) {
+    if slot.is_none()
+        || (fallback_fatal(&error) && !slot.as_ref().is_some_and(fallback_fatal))
+    {
+        *slot = Some(error);
+    }
+}
+
+fn fallback_error(object: ObjectId, error: impl std::fmt::Display) -> AccessError {
+    AccessError::object(object, error)
+}
+
+fn fallback_to_unicode(
+    access: &dyn DocumentAccess,
+    font: &ObjectHandle,
+) -> Result<FallbackEncoding, AccessError> {
+    let stream = font.dictionary_entry(access, b"ToUnicode")?;
+    let object = stream.root_id();
+    let bytes = stream.decoded_stream_bytes(64 * 1024 * 1024)?;
+    let owned = OwnedEncoding::from_to_unicode_for_extraction(bytes)
+        .map_err(|error| fallback_error(object, error))?;
+    Ok(FallbackEncoding { owned, object: font.root_id() })
+}
+
+fn fallback_named_encoding(
+    access: &dyn DocumentAccess,
+    font: &ObjectHandle,
+    name: &[u8],
+) -> Result<FallbackEncoding, AccessError> {
+    if matches!(name, b"Identity-H" | b"Identity-V") {
+        return fallback_to_unicode(access, font);
+    }
+    let owned = OwnedEncoding::from_named(name, None)
+        .map_err(|error| fallback_error(font.root_id(), error))?;
+    Ok(FallbackEncoding { owned, object: font.root_id() })
+}
+
+fn fallback_encoding_value(
+    access: &dyn DocumentAccess,
+    font: &ObjectHandle,
+    encoding: &ObjectHandle,
+) -> Result<FallbackEncoding, AccessError> {
+    enum Shape {
+        Name(Vec<u8>),
+        Dictionary { valid_type: bool, base: Option<Vec<u8>> },
+        Invalid,
+    }
+    let shape = encoding.read(|object| match object {
+        Object::Name(name) => Shape::Name(name.to_vec()),
+        Object::Dictionary(dictionary) => Shape::Dictionary {
+            valid_type: dictionary.get_type().ok() == Some(b"Encoding"),
+            base: dictionary.get(b"BaseEncoding").ok().and_then(|value| value.as_name().ok()).map(Vec::from),
+        },
+        _ => Shape::Invalid,
+    })?;
+    match shape {
+        Shape::Name(name) => fallback_named_encoding(access, font, &name),
+        Shape::Dictionary { valid_type: false, .. } | Shape::Invalid => {
+            Err(fallback_error(encoding.root_id(), "invalid fallback Encoding value"))
+        }
+        Shape::Dictionary { base, .. } => {
+            let base = match base {
+                Some(name) => fallback_named_encoding(access, font, &name)?,
+                None => FallbackEncoding {
+                    owned: OwnedEncoding::standard(),
+                    object: font.root_id(),
+                },
+            };
+            let FallbackEncoding { owned: base_owned, .. } = base;
+            let encoding_id = encoding.root_id();
+            let owned = encoding.read(|object| {
+                let differences = object
+                    .as_dict()
+                    .ok()
+                    .and_then(|dictionary| dictionary.get(b"Differences").ok())
+                    .and_then(|value| value.as_array().ok())
+                    .ok_or_else(|| {
+                        fallback_error(encoding_id, "missing required dictionary key Differences")
+                    })?;
+                base_owned
+                    .with_differences(differences)
+                    .map_err(|error| fallback_error(encoding_id, error))
+            })??;
+            Ok(FallbackEncoding {
+                owned,
+                object: font.root_id(),
+            })
+        }
+    }
+}
+
+fn fallback_font_encoding(
+    access: &dyn DocumentAccess,
+    font: &ObjectHandle,
+) -> Result<FallbackEncoding, AccessError> {
+    let is_font = font.read(|object| {
+        object.as_dict().map(|dictionary| dictionary.has_type(b"Font")).unwrap_or(false)
+    })?;
+    if !is_font {
+        return Err(fallback_error(font.root_id(), "fallback font dictionary has wrong Type"));
+    }
+    let result = (|| {
+        let (has_encoding, has_to_unicode) = font.read(|object| {
+            let dictionary = object.as_dict().ok();
+            (
+                dictionary.is_some_and(|dictionary| dictionary.has(b"Encoding")),
+                dictionary.is_some_and(|dictionary| dictionary.has(b"ToUnicode")),
+            )
+        })?;
+        if has_encoding {
+            let encoding = font.dictionary_entry(access, b"Encoding")?;
+            return fallback_encoding_value(access, font, &encoding);
+        }
+        if has_to_unicode {
+            return fallback_to_unicode(access, font);
+        }
+        Ok(FallbackEncoding {
+            owned: OwnedEncoding::standard(),
+            object: font.root_id(),
+        })
+    })();
+    match result {
+        Err(error) if fallback_fatal(&error) => Err(error),
+        Err(_) => Ok(FallbackEncoding {
+            owned: OwnedEncoding::standard(),
+            object: font.root_id(),
+        }),
+        result => result,
+    }
+}
+
+fn fallback_font_handles(
+    access: &dyn DocumentAccess,
+    page: ObjectId,
+) -> Result<BTreeMap<Vec<u8>, ObjectHandle>, AccessError> {
+    let mut output: BTreeMap<Vec<u8>, ObjectHandle> = BTreeMap::new();
+    for resources in access.page_resource_chain(page)? {
+        let fonts = match resources.entry(access, b"Font") {
+            Ok(fonts) => fonts,
+            Err(error) if fallback_fatal(&error) => return Err(error),
+            Err(_) => continue,
+        };
+        let names: Vec<Vec<u8>> = fonts.read(|object| {
+            object.as_dict().map(|dictionary| {
+                dictionary.iter().map(|(name, _)| name.to_vec()).collect()
+            })
+        })?.unwrap_or_default();
+        for name in names {
+            match fonts.dictionary_entry(access, &name) {
+                Ok(font) => { output.insert(name, font); }
+                Err(error) if fallback_fatal(&error) => return Err(error),
+                Err(_) => {}
+            }
+        }
+    }
+    Ok(output)
+}
+
+pub(crate) fn fallback_page_text(
+    access: &dyn DocumentAccess,
+    page: ObjectId,
+) -> Result<String, AccessError> {
+    fn collect_text(
+        output: &mut String,
+        encoding: &FallbackEncoding,
+        operands: &[Object],
+    ) -> Result<(), AccessError> {
+        for operand in operands {
+            match operand {
+                Object::String(bytes, _) => encoding.owned.write_to_string(bytes, output)
+                    .map_err(|error| fallback_error(encoding.object, error))?,
+                Object::Array(array) => {
+                    collect_text(output, encoding, array)?;
+                    output.push(' ');
+                }
+                Object::Integer(value) if *value < -100 => output.push(' '),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    let fonts = fallback_font_handles(access, page)?;
+    let mut first_error = None;
+    let mut encodings = BTreeMap::new();
+    for (name, font) in fonts {
+        match fallback_font_encoding(access, &font) {
+            Ok(encoding) => { encodings.insert(name, encoding); }
+            Err(error) => record_fallback_error(&mut first_error, error),
+        }
+    }
+    let bytes = access.page_content(page)?;
+    let content = lopdf::content::Content::decode(&bytes).map_err(|error| fallback_error(page, error))?;
+    let mut chunks = Vec::new();
+    let mut current_encoding = None;
+    let mut current_text = String::new();
+    for operation in content.operations {
+        match operation.operator.as_str() {
+            "Tf" => {
+                let operand = operation.operands.first()
+                    .ok_or_else(|| fallback_error(page, "missing font operand"))?;
+                current_encoding = match operand.as_name() {
+                    Ok(name) => encodings.get(name),
+                    Err(error) => {
+                        record_fallback_error(&mut first_error, fallback_error(page, error));
+                        None
+                    }
+                };
+                if !current_text.is_empty() {
+                    chunks.push(std::mem::take(&mut current_text));
+                }
+            }
+            "Tj" | "TJ" => {
+                if let Some(encoding) = current_encoding {
+                    if let Err(error) = collect_text(&mut current_text, encoding, &operation.operands) {
+                        record_fallback_error(&mut first_error, error);
+                    }
+                }
+            }
+            "'" => {
+                if let Some(encoding) = current_encoding {
+                    if !current_text.ends_with('\n') { current_text.push('\n'); }
+                    if let Err(error) = collect_text(&mut current_text, encoding, &operation.operands) {
+                        record_fallback_error(&mut first_error, error);
+                    }
+                }
+            }
+            "\"" => {
+                if let Some(encoding) = current_encoding {
+                    if !current_text.ends_with('\n') { current_text.push('\n'); }
+                    if let Some(value) = operation.operands.get(2) {
+                        if let Err(error) = collect_text(&mut current_text, encoding, std::slice::from_ref(value)) {
+                            record_fallback_error(&mut first_error, error);
+                        }
+                    }
+                }
+            }
+            "T*" | "ET" if !current_text.ends_with('\n') => current_text.push('\n'),
+            _ => {}
+        }
+    }
+    if !current_text.is_empty() { chunks.push(current_text); }
+    if let Some(error) = first_error { return Err(error); }
+    Ok(chunks.concat())
+}
+
+pub fn extract_page(
+    access: &dyn crate::access::DocumentAccess,
+    page_id: ObjectId,
+) -> Result<String, AccessError> {
+    let spans = extract_spans(access, page_id)?;
+    Ok(text_from_spans(spans))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::test_adapter;
+
+    #[test]
+    fn malformed_tounicode_stream_recovers_through_source_boundary() {
+        let _test_lock = crate::access::indexed_test_lock();
+        let cmap = b"1 beginbfchar\n<41> <0041>\nendbfchar\n";
+        let mut raw = b"%PDF-1.7\n9 0 obj\n<<>>\nstream\n".to_vec();
+        raw.extend_from_slice(cmap);
+        raw.extend_from_slice(b"endstream\nendobj\n");
+
+        let mut document = Document::with_version("1.7");
+        document.objects.insert(
+            (9, 0),
+            Object::Stream(lopdf::Stream::new(lopdf::Dictionary::new(), Vec::new())),
+        );
+        let mut font = lopdf::Dictionary::new();
+        font.set("Subtype", Object::Name(b"Type0".to_vec()));
+        font.set("ToUnicode", Object::Reference((9, 0)));
+        document.objects.insert((10, 0), Object::Dictionary(font));
+        let access = crate::access::test_adapter_with_source(&document, &raw);
+        let font = access.object((10, 0)).unwrap();
+        let info = font_info(&access, &font).unwrap().expect("font info");
+        assert_eq!(info.to_unicode.unwrap().get(&0x41).map(String::as_str), Some("A"));
+    }
+
+    #[test]
+    fn malformed_tounicode_recovery_propagates_typed_source_failure() {
+        struct ChangedSource;
+        impl lopdf::RandomAccessSource for ChangedSource {
+            fn len(&self) -> lopdf::SourceResult<u64> {
+                Ok(1)
+            }
+
+            fn read_at(&self, _offset: u64, _out: &mut [u8]) -> lopdf::SourceResult<usize> {
+                Err(lopdf::SourceError::SourceChanged)
+            }
+        }
+
+        let mut document = Document::with_version("1.7");
+        document.objects.insert(
+            (9, 0),
+            Object::Stream(lopdf::Stream::new(lopdf::Dictionary::new(), Vec::new())),
+        );
+        let mut font = lopdf::Dictionary::new();
+        font.set("Subtype", Object::Name(b"Type0".to_vec()));
+        font.set("ToUnicode", Object::Reference((9, 0)));
+        document.objects.insert((10, 0), Object::Dictionary(font));
+        let access = crate::access::test_adapter_with_random_source(
+            &document,
+            std::sync::Arc::new(ChangedSource),
+        );
+        let font = access.object((10, 0)).unwrap();
+        let error = font_info(&access, &font).err().expect("source change must propagate");
+        assert_eq!(error.kind, crate::access::AccessKind::SourceChanged);
+    }
 
     /// An adversarial fixture (`tests/gen_fixtures.py::gen_form_bomb`), its bytes and page.
     fn adversarial(name: &str) -> (Vec<u8>, Document, ObjectId) {
@@ -1880,7 +2551,7 @@ mod tests {
         // `MAX_FORM_DEPTH` alone allowed ~2^40 descents. This call never returned.
         let (raw, doc, page_id) = adversarial("form_bomb.pdf");
         let t = std::time::Instant::now();
-        let spans = extract_spans(&doc, page_id, &raw);
+        let spans = extract_spans(&crate::access::test_adapter_with_source(&doc, &raw), page_id).unwrap();
         assert!(t.elapsed().as_secs() < 10, "form bomb ran for {:?} — the budget is not bounding it", t.elapsed());
         assert!(spans.is_empty(), "the bomb shows no text, so none may be invented for it");
     }
@@ -1891,7 +2562,7 @@ mod tests {
         // showing one word, invoked at three offsets, is three real runs on the page. An
         // `ObjectId` dedupe would return 1 and silently drop two thirds of the text.
         let (raw, doc, page_id) = adversarial("form_repeat.pdf");
-        let spans = extract_spans(&doc, page_id, &raw);
+        let spans = extract_spans(&crate::access::test_adapter_with_source(&doc, &raw), page_id).unwrap();
         let hits: Vec<&Span> = spans.iter().filter(|s| s.text.contains("REPEAT")).collect();
         let seen: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(hits.len(), 3, "a repeated form must show its text once per invocation, got {seen:?}");
@@ -1899,6 +2570,44 @@ mod tests {
         ys.sort_unstable();
         ys.dedup();
         assert_eq!(ys.len(), 3, "the three occurrences must land at three offsets, got {ys:?}");
+        let mut source_ids: Vec<u32> = hits.iter().map(|s| s.source.source().ordinal()).collect();
+        source_ids.sort_unstable();
+        source_ids.dedup();
+        assert_eq!(source_ids.len(), 3, "each painted form invocation needs its own source id");
+        assert!(hits.iter().all(|s| {
+            s.source.char_start() == 0
+                && s.source.char_end() as usize == s.text.chars().count()
+        }));
+    }
+
+    #[test]
+    fn occurrence_ids_are_assigned_after_visible_coincident_deduplication() {
+        let span = |x: f32| Span {
+            x,
+            y: 20.0,
+            size: 10.0,
+            width: 20.0,
+            text: "same".into(),
+            bold: false,
+            italic: false,
+            mono: false,
+            angle: 0.0,
+            font: 0,
+            mcid: None,
+            source: SourceSlice::unassigned(),
+        };
+        let mut spans = vec![span(10.0), span(10.0), span(40.0)];
+
+        dedup_coincident(&mut spans);
+        assign_occurrence_provenance(&mut spans);
+
+        assert_eq!(spans.len(), 2, "coincident overpaint is one visible occurrence");
+        assert_eq!(
+            spans.iter().map(|s| s.source.source().ordinal()).collect::<Vec<_>>(),
+            vec![0, 1],
+            "surviving paint sites are numbered in retained content order"
+        );
+        assert!(spans.iter().all(|s| (s.source.char_start(), s.source.char_end()) == (0, 4)));
     }
 
     #[test]
@@ -1906,11 +2615,12 @@ mod tests {
         // Degrade, don't vanish: a walk that runs out mid-page keeps the spans it decoded.
         let (raw, doc, page_id) = adversarial("form_repeat.pdf");
         let content = doc.get_and_decode_page_content(page_id).expect("fixture page has content");
-        let fonts = build_fonts(&doc, page_id, &raw);
-        let xmap = crate::walker::page_xobjects(&doc, page_id);
+        let access = crate::access::test_adapter_with_source(&doc, &raw);
+        let fonts = build_fonts(&access, page_id).unwrap();
+        let xmap = crate::walker::page_xobjects(&access, page_id);
         let mut spans = Vec::new();
         let mut budget = crate::WalkBudget::new(700);
-        decode_spans(&doc, &content.operations, &fonts, &xmap, Mat::ID, &raw, 0, &mut spans, &mut budget, None);
+        decode_spans(&access, &content.operations, &fonts, &xmap, Mat::ID, 0, &mut spans, &mut budget, None).unwrap();
         assert!(!spans.is_empty(), "a tripped budget must not empty the page");
         assert!(spans.len() < 3, "the budget must really bite, got {} spans", spans.len());
     }
@@ -1925,7 +2635,7 @@ mod tests {
         let raw = std::fs::read(path).unwrap();
         let doc = Document::load_mem(&raw).unwrap();
         let pid = *doc.get_pages().get(&1).unwrap();
-        let out = extract_page(&doc, pid, &raw).unwrap();
+        let out = extract_page(&crate::access::test_adapter_with_source(&doc, &raw), pid).unwrap();
         // The six the table omits (this is the defect) …
         for sym in ["\u{2B1F}", "\u{2B22}", "\u{2B21}", "\u{27F6}", "\u{27F5}", "\u{27F7}"] {
             assert!(out.contains(sym), "uncovered symbol {sym:?} lost from {out:?}");
@@ -1950,7 +2660,7 @@ mod tests {
         let raw = std::fs::read(path).unwrap();
         let doc = Document::load_mem(&raw).unwrap();
         let pid = *doc.get_pages().get(&1).unwrap();
-        let out = extract_page(&doc, pid, &raw).unwrap();
+        let out = extract_page(&crate::access::test_adapter_with_source(&doc, &raw), pid).unwrap();
         assert!(out.contains("Hello"), "subset font text lost: {out:?}");
         assert!(!out.contains("HelloA"), "unmapped CID 0x41 invented an 'A': {out:?}");
         assert!(!out.contains('A'), "no 'A' is drawn anywhere on this page: {out:?}");
@@ -1962,7 +2672,7 @@ mod tests {
         let raw = std::fs::read(path).unwrap();
         let doc = Document::load_mem(&raw).unwrap();
         let pid = *doc.get_pages().get(&n).unwrap();
-        extract_page(&doc, pid, &raw).unwrap()
+        extract_page(&crate::access::test_adapter_with_source(&doc, &raw), pid).unwrap()
     }
 
     /// An *incomplete* ToUnicode (the common case — one `bfchar` per subsetted glyph) left
@@ -2013,7 +2723,7 @@ mod tests {
         let raw = std::fs::read(path).expect("form_inherit.pdf fixture must exist");
         let doc = Document::load_mem(&raw).expect("form_inherit.pdf fixture must load");
         let pid = *doc.get_pages().get(&1).expect("fixture has page 1");
-        let spans = extract_spans(&doc, pid, &raw);
+        let spans = extract_spans(&crate::access::test_adapter_with_source(&doc, &raw), pid).unwrap();
         let s = spans.iter().find(|s| s.text.contains("INHERIT")).expect("the form's label");
         assert!((s.x - 172.0).abs() < 1.0, "x {} (72 means the indirect /Matrix was lost)", s.x);
     }
@@ -2031,7 +2741,7 @@ mod tests {
         let raw = std::fs::read(path).expect("form_bbox_text.pdf fixture must exist");
         let doc = Document::load_mem(&raw).expect("form_bbox_text.pdf fixture must load");
         let pid = *doc.get_pages().get(&1).expect("fixture has page 1");
-        let spans = extract_spans(&doc, pid, &raw);
+        let spans = extract_spans(&crate::access::test_adapter_with_source(&doc, &raw), pid).unwrap();
         let hits = |w: &str| spans.iter().filter(|s| s.text.contains(w)).count();
         assert_eq!(hits("TOPBAND"), 1, "the top band paints once, not once per placement");
         assert_eq!(hits("BOTBAND"), 1, "the bottom band paints once, not once per placement");
@@ -2042,7 +2752,7 @@ mod tests {
         let bot = spans.iter().find(|s| s.text.contains("BOTBAND")).unwrap();
         assert!((bot.x - 95.0).abs() < 1.0 && (bot.y - 371.6).abs() < 1.0, "BOTBAND at ({}, {})", bot.x, bot.y);
         // The guard: the clip must not eat the page's own text, which no `/BBox` governs.
-        let out = extract_page(&doc, pid, &raw).expect("page text");
+        let out = extract_page(&crate::access::test_adapter_with_source(&doc, &raw), pid).expect("page text");
         assert!(out.contains("One body, two bands"), "page-level text lost to a form clip: {out:?}");
     }
 
@@ -2059,7 +2769,7 @@ mod tests {
         let doc = Document::load_mem(&raw).expect("unfiltered_form.pdf fixture must load");
         let pid = *doc.get_pages().get(&1).expect("fixture has page 1");
         // The premise, asserted rather than assumed: the form really is unfiltered.
-        let form_id = crate::walker::page_xobjects(&doc, pid).get(b"UF".as_slice()).copied().expect("/UF form");
+        let form_id = crate::walker::page_xobjects(&test_adapter(&doc), pid).get(b"UF".as_slice()).copied().expect("/UF form");
         let form = doc.get_object(form_id).unwrap().as_stream().unwrap();
         assert!(form.dict.get(b"Filter").is_err(), "the fixture's form must carry no /Filter");
         assert_eq!(
@@ -2068,7 +2778,7 @@ mod tests {
             "the premise, lopdf 0.44: an unfiltered stream decodes to its raw content",
         );
 
-        let out = extract_page(&doc, pid, &raw).expect("page text");
+        let out = extract_page(&crate::access::test_adapter_with_source(&doc, &raw), pid).expect("page text");
         assert!(out.contains("Unfiltered form ink"), "the form's own label is lost: {out:?}");
         // The page-level text was never at risk — its presence proves the page decoded and
         // only the form descent was dropping content.
@@ -2151,7 +2861,7 @@ mod tests {
         let doc = Document::load(path).expect("textstate_q.pdf fixture must load");
         let raw = std::fs::read(path).expect("fixture readable");
         let page_id = *doc.get_pages().get(&1).expect("fixture has page 1");
-        let spans = extract_spans(&doc, page_id, &raw);
+        let spans = extract_spans(&crate::access::test_adapter_with_source(&doc, &raw), page_id).unwrap();
         let mut by_line: std::collections::BTreeMap<i32, Vec<&Span>> = std::collections::BTreeMap::new();
         for s in &spans {
             by_line.entry(-(s.y.round() as i32)).or_default().push(s);
@@ -2162,5 +2872,18 @@ mod tests {
             let word: String = line.iter().map(|s| s.text.as_str()).collect();
             assert_eq!(word, "Cloverdale", "leaked char spacing transposed the last two glyphs");
         }
+    }
+
+
+    #[test]
+    fn fallback_error_selection_promotes_later_fatal_errors() {
+        let mut selected = None;
+        record_fallback_error(&mut selected, AccessError::object((1, 0), "ordinary"));
+        let fatal = AccessError::typed((2, 0), AccessKind::Bounds, "fatal bounds");
+        record_fallback_error(&mut selected, fatal.clone());
+        assert_eq!(selected, Some(fatal.clone()));
+
+        record_fallback_error(&mut selected, AccessError::object((3, 0), "later ordinary"));
+        assert_eq!(selected, Some(fatal));
     }
 }
