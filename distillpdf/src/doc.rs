@@ -2073,6 +2073,72 @@ pub(crate) mod tests {
         assert_eq!(renders[0], eager, "indexed render differs from eager");
     }
 
+    /// Both engines read the *newest* structure tree of a hybrid-reference file whose
+    /// re-tagging revision is reachable only through an inner section's `/XRefStm`.
+    ///
+    /// `hybrid_xref_revision.pdf` is three revisions deep (see `tests/gen_fixtures.py`): the
+    /// base tags `Quarterly Totals` as an `/H2` in a `/Sect` and the table's first row as
+    /// `/TD`; revision 2 supersedes those structure elements out of a *second* `/ObjStm`,
+    /// making the heading a spanning `/TH` inside the table; revision 3 appends only an
+    /// `/Info` dictionary and carries no `/XRefStm` of its own.
+    ///
+    /// Both engines used to get this wrong, differently, which is how it was found — the one
+    /// eager/indexed disagreement in a 196-document corpus sweep, on the re-tagged
+    /// `gov_usgs_usgs70277647`. lopdf's eager bootstrap read `/XRefStm` off the newest
+    /// trailer only, so a chain whose newest section has none never merged a supplement at
+    /// all: it kept no xref entry for the compressed structure elements, and the duplicate
+    /// member guard then resolved them from whichever `/ObjStm` came first — the stale one.
+    /// The indexed reader had the mirror defect *within* a revision, letting the classic
+    /// section's mandatory free mask outrank the supplement that lifts it, so it lost the
+    /// declaration entirely and fell back to inference. ISO 32000-1 7.5.8.4 settles both:
+    /// a section's supplement supersedes that section, and the section supersedes everything
+    /// older.
+    ///
+    /// The assertions are the two symptoms the corpus document showed, in one file: the
+    /// declared `/TH` cells must be present, and the heading must NOT survive as a heading.
+    #[test]
+    fn hybrid_xref_revision_reads_the_newest_structure_tree_on_both_engines() {
+        let _test_lock = crate::access::indexed_test_lock();
+        let path = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures_pdf/hybrid_xref_revision.pdf"
+        ));
+        let raw = std::fs::read(&path).expect("committed hybrid-reference fixture");
+
+        let eager = PdfDocument::from_bytes(&raw)
+            .expect("eager open")
+            .render(crate::Mode::Section, false, false);
+        let control = open_indexed_file_internal(&path, None).expect("indexed open");
+        let indexed = PdfDocument::finish_indexed_open(control, Some(path.clone()))
+            .render(crate::Mode::Section, false, false);
+
+        for (engine, html) in [("eager", &eager), ("indexed", &indexed)] {
+            // Revision 2 promoted the header row to `/TH` and pulled the heading in as a
+            // spanning `/TH`; reading revision 1 emits `<td>` and a separate heading.
+            assert!(
+                html.contains(r#"<th scope="colgroup" colspan="3">Quarterly Totals</th>"#),
+                "{engine} lost the newest revision's spanning header cell:\n{html}"
+            );
+            assert!(
+                html.contains(r#"<th scope="col">Region</th>"#),
+                "{engine} lost the newest revision's declared /TH cells:\n{html}"
+            );
+            assert!(
+                !html.contains("<h2>"),
+                "{engine} kept the superseded revision's heading:\n{html}"
+            );
+            assert!(
+                !html.contains("sec-quarterly-totals"),
+                "{engine} kept the superseded revision's section anchor:\n{html}"
+            );
+            assert!(
+                html.contains("Figures are provisional until the annual restatement."),
+                "{engine} dropped the paragraph both revisions keep:\n{html}"
+            );
+        }
+        assert_eq!(indexed, eager, "engines disagree on the hybrid-reference fixture");
+    }
+
     /// The public constructors carry honest route provenance for whichever engine the internal
     /// `DISTILLPDF_ENGINE` selector picked.
     ///
@@ -2993,3 +3059,4 @@ pub(crate) mod tests {
         assert_eq!(DistillOptions::from_assets("none").unwrap().profile, AssetProfile::None);
     }
 }
+
