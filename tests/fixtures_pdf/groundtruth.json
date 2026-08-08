@@ -556,6 +556,67 @@
     ],
     "title": "Structural Heading Showcase"
   },
+  "hybrid_xref_revision.pdf": {
+    "declared_grid": [
+      [
+        "Quarterly Totals",
+        "",
+        ""
+      ],
+      [
+        "Region",
+        "Units",
+        "Revenue"
+      ],
+      [
+        "North",
+        "120",
+        "1,450"
+      ],
+      [
+        "South",
+        "98",
+        "1,180"
+      ],
+      [
+        "West",
+        "143",
+        "1,905"
+      ]
+    ],
+    "declared_header_rows": 2,
+    "newest_only": [
+      [
+        20,
+        32
+      ]
+    ],
+    "object_streams": 2,
+    "revisions": 3,
+    "stale_heading": "Quarterly Totals",
+    "superseded": [
+      [
+        9,
+        30,
+        32
+      ],
+      [
+        11,
+        30,
+        32
+      ],
+      [
+        12,
+        30,
+        32
+      ]
+    ],
+    "text_contains": [
+      "Regional Revenue Report",
+      "Quarterly Totals",
+      "Figures are provisional until the annual restatement."
+    ]
+  },
   "identity_cid_font.pdf": {
     "lines": [
       "Geometry: \u2220 \u221f \u22a5 \u2225 \u25b3 \u25a1 \u25cb \u2b1f \u2b22 \u2b21",

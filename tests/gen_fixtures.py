@@ -4036,6 +4036,212 @@ def gen_objstm_pages():
     }
 
 
+def gen_hybrid_xref_revision():
+    """A **hybrid-reference** file, re-tagged by an incremental update, whose newest
+    revision is reachable only through a `/XRefStm` two sections down the `/Prev` chain.
+
+    This is the shape a government PDF takes after it is re-tagged for accessibility: the
+    original is linearized with its structure tree in an object stream, a first update
+    rewrites some of those structure elements into a *second* object stream, and a later
+    update touches only the trailer. Three revisions, and the one that matters is in the
+    middle.
+
+    ISO 32000-1 7.5.8.4 governs both halves of how that has to be read:
+
+      * a section's `/XRefStm` supplement belongs to **that section's** revision, so it must
+        be applied before the chain descends to that section's `/Prev` — reading only the
+        newest trailer's supplement loses every object stream member in a file whose newest
+        revision has no supplement of its own;
+      * the supplement lists the compressed objects the classic section is *required* to mask
+        as free, so within the revision the supplement supersedes its own section.
+
+    Getting either wrong silently yields the older revision of the structure tree, and this
+    file is built so that showing up as a rendering difference, not an error:
+
+      * revision 1 tags `Quarterly Totals` as an `/H2` inside a `/Sect`, and the table's
+        first row as three `/TD` cells;
+      * revision 2 supersedes the `/Sect` (dropping the heading), the `/Table` (gaining a
+        title row) and the header `/TR` (its cells promoted to `/TH`), so the same words are
+        now a spanning `/TH` **inside** the table;
+      * revision 3 appends only an `/Info` dictionary and carries no `/XRefStm` at all.
+
+    A reader stuck on revision 1 emits a heading plus a `<td>` header row; a reader that
+    honours revision 2 emits neither, and the declared table absorbs the title. Both engines
+    must agree, on revision 2.
+
+    Object streams and hybrid cross-references are both beyond reportlab, so this is
+    assembled byte by byte."""
+    path = os.path.join(OUT, "hybrid_xref_revision.pdf")
+
+    # --- page content: one MCID per tagged run ----------------------------------------
+    HEAD_MCID = 0
+    ROWS = [["Region", "Units", "Revenue"], ["North", "120", "1,450"],
+            ["South", "98", "1,180"], ["West", "143", "1,905"]]
+    NOTE_MCID = 13
+    COL_X = (72.0, 220.0, 360.0)
+    ROW_Y = (670.0, 652.0, 634.0, 616.0)
+
+    def marked(mcid, x, y, s, font=b"F1", size=10):
+        return (b"/P << /MCID %d >> BDC BT /%s %d Tf %.1f %.1f Td (%s) Tj ET EMC"
+                % (mcid, font, size, x, y, s.encode()))
+
+    body = [b"BT /F2 19 Tf 72 740 Td (Regional Revenue Report) Tj ET",
+            marked(HEAD_MCID, 72.0, 700.0, "Quarterly Totals", b"F2", 14)]
+    mcid = 1
+    for ri, row in enumerate(ROWS):
+        for ci, text in enumerate(row):
+            body.append(marked(mcid, COL_X[ci], ROW_Y[ri], text,
+                               b"F2" if ri == 0 else b"F1"))
+            mcid += 1
+    body.append(marked(NOTE_MCID, 72.0, 580.0,
+                       "Figures are provisional until the annual restatement."))
+    content = b"\n".join(body)
+
+    # --- structure elements ------------------------------------------------------------
+    def elem(tag, kids, extra=b""):
+        return b"<< /Type /StructElem /S /%s /Pg 3 0 R %s/K [%s] >>" % (tag, extra, kids)
+
+    def cell(tag, mcid, span=b""):
+        attr = b"/A << /O /Table %s >> " % span if span else b""
+        return b"<< /Type /StructElem /S /%s %s/K [%d] >>" % (tag, attr, mcid)
+
+    def row_elem(tag, mcids, parent):
+        return elem(b"TR", b" ".join(cell(tag, m) for m in mcids), b"/P %d 0 R " % parent)
+
+    # Revision 1 — the heading lives in the /Sect, the header row is plain /TD cells.
+    BASE = {
+        8: elem(b"Document", b"9 0 R 11 0 R"),
+        9: elem(b"Sect", b"10 0 R 16 0 R", b"/P 8 0 R "),
+        10: elem(b"H2", b"%d" % HEAD_MCID, b"/P 9 0 R "),
+        11: elem(b"Table", b"12 0 R 13 0 R 14 0 R 15 0 R", b"/P 8 0 R "),
+        12: row_elem(b"TD", [1, 2, 3], 11),
+        13: row_elem(b"TD", [4, 5, 6], 11),
+        14: row_elem(b"TD", [7, 8, 9], 11),
+        15: row_elem(b"TD", [10, 11, 12], 11),
+        16: elem(b"P", b"%d" % NOTE_MCID, b"/P 9 0 R "),
+    }
+    # Revision 2 — the same words, re-tagged as a spanning /TH at the top of the table.
+    UPDATE = {
+        9: elem(b"Sect", b"16 0 R", b"/P 8 0 R "),
+        11: elem(b"Table", b"20 0 R 12 0 R 13 0 R 14 0 R 15 0 R", b"/P 8 0 R "),
+        12: row_elem(b"TH", [1, 2, 3], 11),
+        20: elem(b"TR", cell(b"TH", HEAD_MCID, b"/ColSpan 3"), b"/P 11 0 R "),
+    }
+
+    BASE_STM, BASE_SUP = 30, 31
+    UPDATE_STM, UPDATE_SUP = 32, 33
+    INFO = 34
+    SIZE = INFO + 1
+
+    def object_stream(container, members):
+        """Pack ``members`` ({num: bytes}) into one Flate ``/ObjStm``; return (body, index)."""
+        pairs, payload, index = [], bytearray(), {}
+        for position, num in enumerate(sorted(members)):
+            pairs.append(b"%d %d" % (num, len(payload)))
+            payload += members[num] + b" "
+            index[num] = position
+        header = b" ".join(pairs) + b"\n"
+        packed = zlib.compress(bytes(header) + bytes(payload), 9)
+        return (b"<< /Type /ObjStm /N %d /First %d /Length %d /Filter /FlateDecode >>\n"
+                b"stream\n" % (len(members), len(header), len(packed))
+                + packed + b"\nendstream"), index
+
+    def supplement(num, container, index):
+        """A `/XRef` stream naming ``index`` ({objnum: position}) inside ``container``.
+
+        `/Index` is written as one range per member so the supplement describes exactly the
+        compressed objects of its revision and nothing else."""
+        ranges, rows = bytearray(), bytearray()
+        for objnum in sorted(index):
+            ranges += b" %d 1" % objnum
+            rows += b"\x02" + container.to_bytes(4, "big") + index[objnum].to_bytes(2, "big")
+        packed = zlib.compress(bytes(rows), 9)
+        return (b"<< /Type /XRef /Size %d /Index [%s ] /W [1 4 2] /Length %d "
+                b"/Filter /FlateDecode >>\nstream\n"
+                % (SIZE, bytes(ranges).strip(), len(packed)) + packed + b"\nendstream")
+
+    def free_range(start, count):
+        return (start, [None] * count)
+
+    body_bytes = bytearray(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n")
+    offsets = {}
+
+    def append(num, payload):
+        offsets[num] = len(body_bytes)
+        body_bytes.extend(b"%d 0 obj\n" % num + payload + b"\nendobj\n")
+
+    def append_section(sections, trailer):
+        """One classic cross-reference section; ``sections`` is [(start, [offset|None])]."""
+        start = len(body_bytes)
+        body_bytes.extend(b"xref\n")
+        for first, entries in sections:
+            body_bytes.extend(b"%d %d\n" % (first, len(entries)))
+            for entry in entries:
+                body_bytes.extend(b"%010d 00000 n \n" % entry if entry is not None
+                                  else b"0000000000 65535 f \n")
+        body_bytes.extend(b"trailer\n" + trailer(start)
+                          + b"\nstartxref\n%d\n%%%%EOF\n" % start)
+        return start
+
+    # --- revision 1: the linearized-style base, structure tree in an object stream -----
+    append(1, b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 7 0 R "
+              b"/MarkInfo << /Marked true >> >>")
+    append(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+    append(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /StructParents 0 "
+              b"/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>")
+    append(4, b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content))
+    append(5, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+              b"/Encoding /WinAnsiEncoding >>")
+    append(6, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold "
+              b"/Encoding /WinAnsiEncoding >>")
+    append(7, b"<< /Type /StructTreeRoot /K [8 0 R] >>")
+    base_stream, base_index = object_stream(BASE_STM, BASE)
+    append(BASE_STM, base_stream)
+    append(BASE_SUP, supplement(BASE_SUP, BASE_STM, base_index))
+    base_xref = append_section(
+        [(0, [None] + [offsets[n] for n in range(1, 8)]),
+         # The hybrid mask: objects 8-16 are invisible to a reader that stops at the
+         # classic table, and described only by this section's own /XRefStm.
+         free_range(8, 9),
+         (BASE_STM, [offsets[BASE_STM], offsets[BASE_SUP]])],
+        lambda start: b"<< /Size %d /Root 1 0 R /XRefStm %d >>" % (SIZE, offsets[BASE_SUP]))
+
+    # --- revision 2: the re-tagging, in a second object stream ------------------------
+    update_stream, update_index = object_stream(UPDATE_STM, UPDATE)
+    append(UPDATE_STM, update_stream)
+    append(UPDATE_SUP, supplement(UPDATE_SUP, UPDATE_STM, update_index))
+    update_xref = append_section(
+        [(0, [None]), free_range(9, 1), free_range(11, 2), free_range(20, 1),
+         (UPDATE_STM, [offsets[UPDATE_STM], offsets[UPDATE_SUP]])],
+        lambda start: b"<< /Size %d /Root 1 0 R /Prev %d /XRefStm %d >>"
+                      % (SIZE, base_xref, offsets[UPDATE_SUP]))
+
+    # --- revision 3: trailer-only, and deliberately carries NO /XRefStm ----------------
+    append(INFO, b"<< /Title (Regional Revenue Report) >>")
+    append_section(
+        [(0, [None]), (INFO, [offsets[INFO]])],
+        lambda start: b"<< /Size %d /Root 1 0 R /Info %d 0 R /Prev %d >>"
+                      % (SIZE, INFO, update_xref))
+
+    with open(path, "wb") as f:
+        f.write(bytes(body_bytes))
+
+    GT["hybrid_xref_revision.pdf"] = {
+        "revisions": 3,
+        "object_streams": 2,
+        # (object, stale container, newest container) — the supersession the /XRefStm of
+        # revision 2 declares and a naive /Prev walk misses.
+        "superseded": [[9, BASE_STM, UPDATE_STM], [11, BASE_STM, UPDATE_STM],
+                       [12, BASE_STM, UPDATE_STM]],
+        "newest_only": [[20, UPDATE_STM]],
+        "declared_grid": [["Quarterly Totals", "", ""]] + ROWS,
+        "declared_header_rows": 2,
+        "stale_heading": "Quarterly Totals",
+        "text_contains": ["Regional Revenue Report", "Quarterly Totals",
+                          "Figures are provisional until the annual restatement."],
+    }
+
+
 # ------------------------------------------------------------------------------ links
 def _assemble_pdf(objs, path, info=None):
     """Write a minimal PDF from {objnum: bytes} (numbers contiguous from 1).
@@ -5013,6 +5219,7 @@ def main():
     gen_form_bomb()
     gen_deep_page_tree()
     gen_objstm_pages()
+    gen_hybrid_xref_revision()
     with open(os.path.join(OUT, "groundtruth.json"), "w") as f:
         # sort_keys: the dict's insertion order is main()'s call order, so adding or
         # reordering one generator reshuffled the whole file and buried the real change
