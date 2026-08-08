@@ -30,7 +30,7 @@ tesseract = ["dep:cmake", "dep:whatlang"]
 # — not a bare `path` — so CI and any fresh clone resolve the exact same lopdf. To iterate against a local checkout, TEMPORARILY
 # swap in `path = "../../lopdf-lazy-engine"` (do not commit it), or add an UNCOMMITTED
 # `[patch."https://github.com/kkollsga/lopdf.git"] lopdf = { path = ... }` to the workspace root.
-lopdf = { git = "https://github.com/kkollsga/lopdf.git", rev = "b9a6d56e5c906c0144af162d15d519fd0129c89e" }
+lopdf = { git = "https://github.com/kkollsga/lopdf.git", rev = "d1b2d0b8387c4b06d8f88628b7328ba9549393fc" }
 # Independent Flate validation (`pdfobj::flate_incomplete`). lopdf swallows its own zlib
 # error and returns the partial output, so a TRUNCATED stream reports Ok and renders short
 # with no signal; inflating the bytes ourselves is the only way to tell. Already linked twice

@@ -2446,6 +2446,178 @@ pub(crate) mod tests {
         assert!(document.extract_text().contains("deep page tree"));
     }
 
+    /// A page tree that is deep **and** broad: `depth` nested `/Pages` nodes, each holding the
+    /// next node *and* a page of its own, so descending always leaves a sibling behind.
+    ///
+    /// Leaf order is the tree's left-to-right leaf order, which runs deepest-first here: the
+    /// first page is `broad level depth-1` and the last is `broad level 0`.
+    fn deep_broad_page_tree_pdf(depth: usize) -> Vec<u8> {
+        let font = 2;
+        let node = |level: usize| 3 + 3 * level;
+        let mut objects = vec![
+            format!("<< /Type /Catalog /Pages {} 0 R >>", node(0)),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ];
+        for level in 0..depth {
+            let (page, stream) = (node(level) + 1, node(level) + 2);
+            let kids = if level + 1 < depth {
+                format!("[{} 0 R {page} 0 R]", node(level + 1))
+            } else {
+                format!("[{page} 0 R]")
+            };
+            let parent = if level > 0 {
+                format!(" /Parent {} 0 R", node(level - 1))
+            } else {
+                String::new()
+            };
+            objects.push(format!(
+                "<< /Type /Pages /Kids {kids} /Count {}{parent} >>",
+                depth - level
+            ));
+            objects.push(format!(
+                "<< /Type /Page /Parent {} 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 {font} 0 R >> >> /Contents {stream} 0 R >>",
+                node(level)
+            ));
+            let content = format!("BT /F1 12 Tf 72 700 Td (broad level {level}) Tj ET");
+            objects.push(format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ));
+        }
+
+        let mut body = b"%PDF-1.5\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(body.len());
+            body.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref = body.len();
+        let size = objects.len() + 1;
+        body.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+        for offset in &offsets {
+            body.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        body.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                .as_bytes(),
+        );
+        body
+    }
+
+    /// The eager half of the depth question: a tree deep *and* broad enough to retain a frame
+    /// per level used to lose every page below the 256th, silently.
+    ///
+    /// The single-kid chain above never retained a sibling, so it walked to any depth and the
+    /// lazy refusal could fall back to a correct eager read. This shape retains one at every
+    /// level, and eager dropped 43 of its 300 pages with no error — which made eager an unsafe
+    /// floor under exactly the fallback the lazy cap depends on, and a liar as the parity
+    /// oracle. Both routes must now report the same 300 pages and the same text, including the
+    /// levels that used to vanish.
+    #[test]
+    fn a_deep_and_broad_page_tree_keeps_every_page_on_both_routes() {
+        // Past the indexed cap, so the lazy route must take the counted fallback.
+        const DEPTH: usize = 300;
+        const _: () = assert!(DEPTH > crate::access::INDEXED_PAGE_TREE_DEPTH);
+        let raw = deep_broad_page_tree_pdf(DEPTH);
+
+        let eager = PdfDocument::from_bytes_with_engine(&raw, Engine::Eager).unwrap();
+        assert_eq!(eager.engine(), EngineRoute::Eager);
+        assert_eq!(eager.page_count(), DEPTH);
+        let text = eager.extract_text();
+        for level in [0, 1, 255, 256, 257, DEPTH - 1] {
+            assert!(
+                text.contains(&format!("broad level {level}")),
+                "level {level} is missing from the eager text"
+            );
+        }
+
+        // Past the cap, so the index refuses and the counted fallback runs — onto an eager
+        // walk that is now trustworthy.
+        let document = PdfDocument::from_bytes_with_engine(&raw, Engine::Lazy).unwrap();
+        assert_eq!(document.engine(), EngineRoute::LazyEagerFallback);
+        assert_eq!(document.page_count(), eager.page_count());
+        assert_eq!(document.extract_text(), text);
+    }
+
+    /// An incremental revision that **frees** an object the base revision defines, leaving the
+    /// page's `/Contents` array still naming it.
+    ///
+    /// A reference to a freed object is a reference to null (ISO 32000-1, 7.3.10), so the
+    /// second content stream is gone by the rules of the format even though its bytes are
+    /// still in the file. Eager used to discard free entries entirely, so the base section's
+    /// definition won the merge and the deleted sentence came back — a redaction undone by the
+    /// reader, on the default engine.
+    #[test]
+    fn a_freed_object_is_not_resurrected_by_either_route() {
+        let kept = "Public summary paragraph.";
+        let redacted = "Case officer home address on file.";
+        let stream = |y: u32, text: &str| {
+            let content = format!("BT /F1 12 Tf 72 {y} Td ({text}) Tj ET");
+            format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            )
+        };
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents [5 0 R 6 0 R] >>".to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+            stream(700, kept),
+            stream(660, redacted),
+        ];
+
+        let mut body = b"%PDF-1.5\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(body.len());
+            body.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let base_xref = body.len();
+        body.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+        for offset in &offsets {
+            body.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        body.extend_from_slice(
+            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{base_xref}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        // Revision 2 deletes object 6 and touches nothing else: the free-list head points at
+        // it, and its own entry points back at the head carrying the generation a reuse would
+        // take. The page still says `/Contents [5 0 R 6 0 R]`.
+        let redact_xref = body.len();
+        body.extend_from_slice(
+            b"xref\n0 1\n0000000006 65535 f \n6 1\n0000000000 00001 f \n",
+        );
+        body.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 7 /Root 1 0 R /Prev {base_xref} >>\nstartxref\n{redact_xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+
+        for engine in [Engine::Eager, Engine::Lazy] {
+            let document = PdfDocument::from_bytes_with_engine(&body, engine).unwrap();
+            let text = document.extract_text();
+            assert!(text.contains(kept), "{engine:?} lost the surviving paragraph");
+            assert!(
+                !text.contains(redacted),
+                "{engine:?} resurrected the freed object"
+            );
+            assert_eq!(document.page_count(), 1);
+        }
+
+        // Same bytes, same rendering, whichever engine reads them.
+        let eager = PdfDocument::from_bytes_with_engine(&body, Engine::Eager).unwrap();
+        let lazy = PdfDocument::from_bytes_with_engine(&body, Engine::Lazy).unwrap();
+        assert_eq!(lazy.engine(), EngineRoute::Lazy);
+        assert_eq!(
+            lazy.render(html::Mode::Section, false, false),
+            eager.render(html::Mode::Section, false, false)
+        );
+    }
+
     /// Belt and braces behind the typed limit above: the index never *serves* a zero-page
     /// document, whatever produced the empty page map.
     ///
