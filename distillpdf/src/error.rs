@@ -32,6 +32,10 @@ pub enum Error {
     InvalidMode(String),
     /// An unknown `image_mode` string (carries the offending value).
     InvalidImageMode(String),
+    /// An unknown `engine` string (carries the offending value). The message lists the two
+    /// values the PUBLIC grammar accepts; the diagnostic `LazyStrict` engine is Rust-only and
+    /// deliberately unnameable here.
+    InvalidEngine(String),
     /// A directory output path was given but there is no source filename to derive a name.
     NoSourceDir,
     /// An output path was needed but the document was opened from bytes (no source path).
@@ -72,6 +76,7 @@ impl fmt::Display for Error {
             Error::InvalidImageMode(m) => {
                 write!(f, "invalid image_mode {m:?}: expected \"embed\", \"external\", or \"drop\"")
             }
+            Error::InvalidEngine(e) => write!(f, "invalid engine {e:?}: expected \"eager\" or \"lazy\""),
             Error::NoSourceDir => write!(
                 f,
                 "a directory path needs a source filename to derive the name; pass a full file path"
@@ -106,6 +111,12 @@ mod tests {
         assert_eq!(
             Error::InvalidImageMode("x".into()).to_string(),
             "invalid image_mode \"x\": expected \"embed\", \"external\", or \"drop\""
+        );
+        // The engine message must name every value the public grammar takes — it is the whole
+        // help a caller who mistyped `engine=` gets.
+        assert_eq!(
+            Error::InvalidEngine("indexed".into()).to_string(),
+            "invalid engine \"indexed\": expected \"eager\" or \"lazy\""
         );
         assert_eq!(Error::NoPage(None).to_string(), "no page");
         assert_eq!(Error::NoPage(Some(7)).to_string(), "no page 7");

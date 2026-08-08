@@ -107,9 +107,8 @@ pub struct PdfDocument {
     /// Runtime-selectable immutable access route. L2 uses the eager oracle adapter; L3 adds
     /// the bounded indexed implementation without reopening consumer signatures.
     pub(crate) access: Arc<dyn DocumentAccess>,
-    /// Route provenance for this handle. The write side is live (both engines populate it);
-    /// the read side is crate-internal and has test/measurement callers only.
-    #[allow(dead_code)]
+    /// Route provenance for this handle. Both engines populate it on the write side; the read
+    /// side is public as [`PdfDocument::engine`] and crate-internal as `route_diagnostics`.
     diagnostics: Arc<RouteDiagnostics>,
     /// Source path (`open`); `None` when constructed from bytes.
     pub(crate) source: Option<PathBuf>,
@@ -245,7 +244,6 @@ impl RouteDiagnostics {
         })
     }
 
-    #[allow(dead_code)] // diagnostics read side: tests and the internal measurement harness
     pub(crate) fn snapshot(&self) -> RouteDiagnosticsSnapshot {
         let indexed = self.indexed.get();
         RouteDiagnosticsSnapshot {
@@ -682,49 +680,103 @@ fn ensure_decrypted(raw: &[u8], doc: &mut Document) -> Result<(), Error> {
     Ok(())
 }
 
-/// Which access engine the public constructors build — **internal and unstable**.
+/// Which access engine a [`PdfDocument`] constructor builds.
 ///
-/// Selected once per process by the `DISTILLPDF_ENGINE` environment variable. This is not
-/// public API: it exists so Phase B can run the existing suites and the corpus measurement
-/// harness over the bounded indexed route without changing what a released build does. The
-/// default — and the value for every unset/unrecognised string — is [`EngineSelection::Eager`],
-/// so published behaviour is untouched.
+/// The default is [`Engine::Eager`] — the long-standing `lopdf::Document` route — and it stays
+/// the default until an owner decision flips it. Pick another one explicitly with
+/// [`PdfDocument::open_with_engine`] / [`PdfDocument::from_bytes_with_engine`].
 ///
-/// * unset / anything else — [`EngineSelection::Eager`], the eager `lopdf::Document` route.
-/// * `indexed` — the bounded indexed route, with an **explicit, counted** eager fallback when
-///   the indexed open itself fails (xref recovery, an encryption shape the index cannot take,
-///   a bounded-decode envelope refusal). The fallback is recorded in the resulting document's
-///   [`RouteDiagnostics::fallback_opens`]; it is never silent.
-/// * `indexed-strict` — the same route with the fallback *disabled*, so an indexed open failure
-///   surfaces as [`Error::Open`]. Measurement uses this to tell a true-indexed run from a run
-///   that quietly ended up on the eager engine.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EngineSelection {
+/// * [`Engine::Eager`] — parse the whole container up front. Lowest latency on small files.
+/// * [`Engine::Lazy`] — the bounded indexed route: build an index and pull objects on demand,
+///   so a large file never has to be resident in full. Output is identical to eager. When the
+///   indexed open itself refuses a document (xref recovery, an encryption shape the index
+///   cannot take, a bounded-decode envelope refusal) the constructor falls back to the eager
+///   engine and **counts** it — see [`PdfDocument::engine`], which reports
+///   [`EngineRoute::LazyEagerFallback`] for exactly that case. The fallback is never silent.
+/// * [`Engine::LazyStrict`] — the same route with the fallback *disabled*, so an indexed open
+///   failure surfaces as [`Error::Open`]. This is the measurement/diagnostic variant: it tells
+///   a true-lazy run from one that quietly ended up on the eager engine. Not exposed by the
+///   Python binding.
+///
+/// When a caller does not name an engine, the internal `DISTILLPDF_ENGINE` environment variable
+/// decides — see [`engine_selection`]. An explicit [`Engine`] always wins over it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Engine {
+    #[default]
     Eager,
-    Indexed,
-    IndexedStrict,
+    Lazy,
+    LazyStrict,
 }
 
-impl EngineSelection {
+impl Engine {
+    /// Parse the **public** engine grammar: `"eager"` or `"lazy"`. This is the grammar the
+    /// Python binding's `engine=` keyword speaks, so the error message here is the one a
+    /// Python caller sees; `LazyStrict` is deliberately unreachable through it.
+    pub fn parse(value: &str) -> Result<Self, Error> {
+        match value {
+            "eager" => Ok(Engine::Eager),
+            "lazy" => Ok(Engine::Lazy),
+            other => Err(Error::InvalidEngine(other.to_string())),
+        }
+    }
+
     fn prefers_indexed(self) -> bool {
-        !matches!(self, EngineSelection::Eager)
+        !matches!(self, Engine::Eager)
+    }
+}
+
+/// Which engine actually served an open — the honest answer, after any fallback.
+///
+/// Derived from the route counters the constructors write, so it cannot drift from what really
+/// happened. Returned by [`PdfDocument::engine`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EngineRoute {
+    /// The eager engine, because that is what was asked for (or defaulted to).
+    Eager,
+    /// The bounded indexed engine.
+    Lazy,
+    /// [`Engine::Lazy`] was asked for, the indexed open refused the document, and the counted
+    /// eager fallback served it instead.
+    LazyEagerFallback,
+}
+
+impl EngineRoute {
+    /// The stable string form — also exactly what the Python `Pdf.engine` property returns.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EngineRoute::Eager => "eager",
+            EngineRoute::Lazy => "lazy",
+            EngineRoute::LazyEagerFallback => "lazy (eager fallback)",
+        }
+    }
+}
+
+impl std::fmt::Display for EngineRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
 /// The `DISTILLPDF_ENGINE` grammar, as a pure function so it is testable without the process
 /// environment. Unset and every unrecognised value mean eager — the selector can only ever be
-/// turned on deliberately.
-fn parse_engine_selection(value: Option<&str>) -> EngineSelection {
+/// turned on deliberately. Deliberately NOT the public [`Engine::parse`] grammar: these spellings
+/// are internal and may change or disappear.
+fn parse_engine_selection(value: Option<&str>) -> Engine {
     match value {
-        Some("indexed") => EngineSelection::Indexed,
-        Some("indexed-strict") => EngineSelection::IndexedStrict,
-        _ => EngineSelection::Eager,
+        Some("indexed") => Engine::Lazy,
+        Some("indexed-strict") => Engine::LazyStrict,
+        _ => Engine::Eager,
     }
 }
 
-/// Read `DISTILLPDF_ENGINE` once per process. Internal/unstable — see [`EngineSelection`].
-fn engine_selection() -> EngineSelection {
-    static SELECTION: OnceLock<EngineSelection> = OnceLock::new();
+/// The engine to use when the caller named none: read `DISTILLPDF_ENGINE` once per process.
+///
+/// **Internal and unstable** — it exists so the whole test suite and the corpus measurement
+/// harness can be run over the indexed route without changing what a released build does, and
+/// it carries no compatibility promise. An explicit [`Engine`] passed to
+/// [`PdfDocument::open_with_engine`] / [`PdfDocument::from_bytes_with_engine`] always wins.
+fn engine_selection() -> Engine {
+    static SELECTION: OnceLock<Engine> = OnceLock::new();
     *SELECTION.get_or_init(|| {
         parse_engine_selection(std::env::var("DISTILLPDF_ENGINE").ok().as_deref())
     })
@@ -864,11 +916,11 @@ impl PdfDocument {
     }
 
     /// Decide what an indexed open failure means for the selected engine: `Err` under
-    /// `indexed-strict`, `Ok(())` ("fall back, and count it") under `indexed`.
-    fn indexed_failure_disposition(error: RouteOpenError) -> Result<(), Error> {
-        if engine_selection() == EngineSelection::IndexedStrict {
+    /// [`Engine::LazyStrict`], `Ok(())` ("fall back, and count it") under [`Engine::Lazy`].
+    fn indexed_failure_disposition(error: RouteOpenError, engine: Engine) -> Result<(), Error> {
+        if engine == Engine::LazyStrict {
             return Err(Error::Open(format!(
-                "DISTILLPDF_ENGINE=indexed-strict: indexed open failed: {:?}",
+                "engine=lazy-strict: indexed open failed: {:?}",
                 error.failure
             )));
         }
@@ -912,17 +964,30 @@ impl PdfDocument {
 
     /// Open a PDF from a filesystem path. Only loads/parses the container.
     ///
-    /// Eager by default; `DISTILLPDF_ENGINE=indexed` routes through the bounded indexed engine
-    /// with a counted eager fallback (internal/unstable — see [`EngineSelection`]).
+    /// Uses [`Engine::Eager`] unless the internal `DISTILLPDF_ENGINE` selector says otherwise
+    /// (see [`engine_selection`]). To choose deliberately, call [`PdfDocument::open_with_engine`].
     pub fn open(path: &str) -> Result<Self, Error> {
+        Self::open_with_selection(path, engine_selection())
+    }
+
+    /// Open a PDF from a filesystem path on a named [`Engine`].
+    ///
+    /// The explicit choice wins outright: the internal `DISTILLPDF_ENGINE` selector is not
+    /// consulted. [`PdfDocument::engine`] on the returned handle reports which engine actually
+    /// served the open, including a counted [`EngineRoute::LazyEagerFallback`].
+    pub fn open_with_engine(path: &str, engine: Engine) -> Result<Self, Error> {
+        Self::open_with_selection(path, engine)
+    }
+
+    fn open_with_selection(path: &str, engine: Engine) -> Result<Self, Error> {
         let mut after_indexed_failure = false;
-        if engine_selection().prefers_indexed() {
+        if engine.prefers_indexed() {
             match open_indexed_file_internal(Path::new(path), None) {
                 Ok(control) => {
                     return Ok(Self::finish_indexed_open(control, Some(PathBuf::from(path))));
                 }
                 Err(error) => {
-                    Self::indexed_failure_disposition(error)?;
+                    Self::indexed_failure_disposition(error, engine)?;
                     after_indexed_failure = true;
                 }
             }
@@ -950,14 +1015,24 @@ impl PdfDocument {
 
     /// Open a PDF from raw bytes. There is no source path.
     ///
-    /// Honours the same internal [`EngineSelection`] as [`PdfDocument::open`].
+    /// Selects the engine exactly like [`PdfDocument::open`].
     pub fn from_bytes(data: &[u8]) -> Result<Self, Error> {
+        Self::from_bytes_with_selection(data, engine_selection())
+    }
+
+    /// Open a PDF from raw bytes on a named [`Engine`] — the `from_bytes` counterpart to
+    /// [`PdfDocument::open_with_engine`], with the same precedence rule.
+    pub fn from_bytes_with_engine(data: &[u8], engine: Engine) -> Result<Self, Error> {
+        Self::from_bytes_with_selection(data, engine)
+    }
+
+    fn from_bytes_with_selection(data: &[u8], engine: Engine) -> Result<Self, Error> {
         let mut after_indexed_failure = false;
-        if engine_selection().prefers_indexed() {
+        if engine.prefers_indexed() {
             match open_indexed_bytes_internal(Arc::from(data), None) {
                 Ok(control) => return Ok(Self::finish_indexed_open(control, None)),
                 Err(error) => {
-                    Self::indexed_failure_disposition(error)?;
+                    Self::indexed_failure_disposition(error, engine)?;
                     after_indexed_failure = true;
                 }
             }
@@ -969,9 +1044,24 @@ impl PdfDocument {
         )
     }
 
+    /// Which engine actually served the open that produced this handle.
+    ///
+    /// Read straight off the route counters both engines write, so it reports a counted eager
+    /// fallback as [`EngineRoute::LazyEagerFallback`] rather than claiming the lazy engine ran.
+    pub fn engine(&self) -> EngineRoute {
+        let snapshot = self.diagnostics.snapshot();
+        if snapshot.fallback_opens > 0 {
+            EngineRoute::LazyEagerFallback
+        } else if snapshot.indexed_opens > 0 {
+            EngineRoute::Lazy
+        } else {
+            EngineRoute::Eager
+        }
+    }
+
     /// Route provenance for the open that produced this handle — crate-internal, no public
     /// surface. The `fallback_opens` counter is how a counted eager fallback from the indexed
-    /// selector is observed.
+    /// selector is observed; [`PdfDocument::engine`] is the public read of the same counters.
     #[allow(dead_code)] // diagnostics read side: tests and the internal measurement harness
     pub(crate) fn route_diagnostics(&self) -> RouteDiagnosticsSnapshot {
         self.diagnostics.snapshot()
@@ -2054,26 +2144,154 @@ pub(crate) mod tests {
         ] {
             assert_eq!(
                 parse_engine_selection(value),
-                EngineSelection::Eager,
+                Engine::Eager,
                 "{value:?} must stay eager"
             );
         }
-        assert_eq!(
-            parse_engine_selection(Some("indexed")),
-            EngineSelection::Indexed
-        );
+        assert_eq!(parse_engine_selection(Some("indexed")), Engine::Lazy);
         assert_eq!(
             parse_engine_selection(Some("indexed-strict")),
-            EngineSelection::IndexedStrict
+            Engine::LazyStrict
         );
-        assert!(!EngineSelection::Eager.prefers_indexed());
-        assert!(EngineSelection::Indexed.prefers_indexed());
-        assert!(EngineSelection::IndexedStrict.prefers_indexed());
+        assert!(!Engine::Eager.prefers_indexed());
+        assert!(Engine::Lazy.prefers_indexed());
+        assert!(Engine::LazyStrict.prefers_indexed());
         // The process-wide selection agrees with the grammar for this process's environment.
         assert_eq!(
             engine_selection(),
             parse_engine_selection(std::env::var("DISTILLPDF_ENGINE").ok().as_deref())
         );
+    }
+
+    /// The two grammars are separate on purpose: `DISTILLPDF_ENGINE` is internal and spells the
+    /// lazy route `indexed`, while the public `engine=` keyword spells it `lazy` and cannot name
+    /// the strict diagnostic variant at all. Neither may start accepting the other's spellings —
+    /// that is how the env var stays unstable and the public grammar stays small.
+    #[test]
+    fn the_public_engine_grammar_is_two_values_and_is_not_the_env_grammar() {
+        assert_eq!(Engine::parse("eager").unwrap(), Engine::Eager);
+        assert_eq!(Engine::parse("lazy").unwrap(), Engine::Lazy);
+        for rejected in ["indexed", "indexed-strict", "lazy-strict", "LAZY", "lazy ", ""] {
+            let message = Engine::parse(rejected).unwrap_err().to_string();
+            assert!(
+                message.contains("expected \"eager\" or \"lazy\""),
+                "{rejected:?} must be rejected with the allowed values listed, got {message}"
+            );
+        }
+        // …and the env grammar does NOT answer to the public spellings (checked as `Eager` in
+        // `engine_selector_defaults_to_eager_for_unset_and_unknown_values`).
+        assert_eq!(parse_engine_selection(Some("lazy")), Engine::Eager);
+    }
+
+    /// An explicit engine wins over `DISTILLPDF_ENGINE`, in **both** directions.
+    ///
+    /// This is the property that lets the whole suite be re-run under
+    /// `DISTILLPDF_ENGINE=indexed` while a caller that asked for `Engine::Eager` still gets the
+    /// eager engine — and the reason the env var can stay internal: it only ever decides what an
+    /// *unspecified* open does. Both assertions run in either mode, so this test proves the
+    /// override in whichever direction the process environment is not already pointing.
+    #[test]
+    fn an_explicit_engine_overrides_the_environment_selector() {
+        let (fixture, raw) = route_fixture();
+        let path = fixture.to_str().unwrap();
+
+        for document in [
+            PdfDocument::open_with_engine(path, Engine::Eager).unwrap(),
+            PdfDocument::from_bytes_with_engine(&raw, Engine::Eager).unwrap(),
+        ] {
+            assert_eq!(document.engine(), EngineRoute::Eager);
+            assert_eq!(document.route_diagnostics().indexed_opens, 0);
+        }
+
+        for document in [
+            PdfDocument::open_with_engine(path, Engine::Lazy).unwrap(),
+            PdfDocument::from_bytes_with_engine(&raw, Engine::Lazy).unwrap(),
+        ] {
+            // This fixture opens indexed, so `Lazy` really is served lazily rather than falling
+            // back — anything else would make the assertion vacuous.
+            assert_eq!(document.engine(), EngineRoute::Lazy);
+            assert_eq!(document.route_diagnostics().eager_opens, 0);
+        }
+
+        // The env-driven constructors keep answering to the environment, not to the last
+        // explicit choice: nothing above is sticky.
+        assert_eq!(
+            PdfDocument::open(path).unwrap().engine(),
+            if engine_selection().prefers_indexed() { EngineRoute::Lazy } else { EngineRoute::Eager }
+        );
+    }
+
+    /// A valid PDF whose catalog object is larger than the indexed reader's per-object decode
+    /// envelope (`INDEXED_OBJECT_BYTES`, 4 MiB): the index refuses it at open, the eager engine
+    /// reads it without complaint. Written by hand rather than taken from `tests/fixtures_pdf/`
+    /// because every committed fixture opens *indexed* — the refusal has to be constructed.
+    fn oversized_catalog_pdf() -> Vec<u8> {
+        let pad = "x".repeat(5 * 1024 * 1024);
+        let content = "BT /F1 12 Tf 72 700 Td (fallback) Tj ET";
+        let objects = [
+            format!("<< /Type /Catalog /Pages 2 0 R /Pad ({pad}) >>"),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_string(),
+            format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ];
+        let mut body = b"%PDF-1.5\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(body.len());
+            body.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref = body.len();
+        let size = objects.len() + 1;
+        body.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+        for offset in &offsets {
+            body.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        body.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        body
+    }
+
+    /// `engine()` reports the route that actually ran — a refused lazy open says
+    /// `lazy (eager fallback)`, never `lazy` — and [`Engine::LazyStrict`] refuses instead of
+    /// falling back, which is the whole point of having it.
+    #[test]
+    fn a_refused_lazy_open_falls_back_and_says_so_unless_it_is_strict() {
+        let raw = oversized_catalog_pdf();
+
+        let document = PdfDocument::from_bytes_with_engine(&raw, Engine::Lazy).unwrap();
+        assert_eq!(document.engine(), EngineRoute::LazyEagerFallback);
+        let snapshot = document.route_diagnostics();
+        assert_eq!(snapshot.fallback_opens, 1);
+        assert_eq!(snapshot.eager_opens, 1);
+        assert_eq!(snapshot.indexed_opens, 0);
+        // The fallback is a route change, not a content change: the document reads normally.
+        assert_eq!(document.page_count(), 1);
+        assert!(document.extract_text().contains("fallback"));
+
+        // Eager on the same bytes is the same document — and does NOT claim a fallback, because
+        // nothing was refused.
+        let eager = PdfDocument::from_bytes_with_engine(&raw, Engine::Eager).unwrap();
+        assert_eq!(eager.engine(), EngineRoute::Eager);
+        assert_eq!(eager.extract_text(), document.extract_text());
+
+        let strict = PdfDocument::from_bytes_with_engine(&raw, Engine::LazyStrict);
+        assert!(
+            matches!(strict, Err(Error::Open(ref message)) if message.contains("indexed open failed")),
+            "strict must surface the refusal, got {strict:?}",
+            strict = strict.map(|document| document.engine())
+        );
+    }
+
+    /// The three route strings are the Python `Pdf.engine` property's values — behaviour-locked
+    /// here so a rename in Rust cannot silently change what Python returns.
+    #[test]
+    fn engine_route_strings_are_locked() {
+        assert_eq!(EngineRoute::Eager.as_str(), "eager");
+        assert_eq!(EngineRoute::Lazy.as_str(), "lazy");
+        assert_eq!(EngineRoute::LazyEagerFallback.as_str(), "lazy (eager fallback)");
+        assert_eq!(EngineRoute::LazyEagerFallback.to_string(), "lazy (eager fallback)");
     }
 
     #[test]

@@ -47,6 +47,7 @@ mod tests {
             Error::Encrypted => "Encrypted",
             Error::InvalidMode(_) => "InvalidMode",
             Error::InvalidImageMode(_) => "InvalidImageMode",
+            Error::InvalidEngine(_) => "InvalidEngine",
             Error::NoSourceDir => "NoSourceDir",
             Error::NoSourcePath => "NoSourcePath",
             Error::OcrPoisoned => "OcrPoisoned",
