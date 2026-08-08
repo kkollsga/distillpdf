@@ -1210,12 +1210,18 @@ impl IndexedDocumentAdapter {
     }
 
     /// Follow an indirect-reference chain to its terminal value, as eager `get_object` does.
+    ///
+    /// The cycle set is built lazily. Virtually every call terminates on the first object — a
+    /// reference *to* a reference is rare — and this is the hottest path in the adapter, so
+    /// allocating a `HashSet` (and hashing into it) per resolve was pure overhead on the
+    /// common case. `seen` therefore stays empty until a second hop actually happens, at which
+    /// point it is seeded with every id already walked; the cycle verdict is identical.
     fn resolve_terminal(&self, id: ObjectId) -> Result<ObjectHandle, AccessError> {
         let mut current = id;
-        let mut seen = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
         let mut hops = 0;
         loop {
-            if !seen.insert(current) {
+            if hops > 0 && !seen.insert(current) {
                 return Err(AccessError::typed(
                     current,
                     AccessKind::Backend,
@@ -1235,6 +1241,9 @@ impl IndexedDocumentAdapter {
                     AccessKind::ResourceLimit,
                     format!("reference depth exceeds {INDEXED_REFERENCE_DEPTH}"),
                 ));
+            }
+            if hops == 0 {
+                seen.insert(id);
             }
             drop(handle);
             current = next;
@@ -2193,6 +2202,73 @@ pub(crate) mod tests {
         assert_eq!(first.kind, SourceFailureKind::SourceChanged);
         assert_eq!(second, first, "single-flight failure publication is stable");
         assert_eq!(AccessError::source(first).kind, AccessKind::SourceChanged);
+    }
+
+    /// A classic-xref PDF whose objects 4..=8 are `body[n]`, so a test can lay out an
+    /// arbitrary reference topology without an `lopdf::Document` in the way.
+    fn indexed_reference_fixture(bodies: &[(usize, &[u8])]) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let size = bodies.iter().map(|(number, _)| *number).max().unwrap_or(3) + 1;
+        let mut offsets = vec![0usize; size];
+        let fixed: Vec<(usize, &[u8])> = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice()),
+            (3, b"<< /Type /Page /Parent 2 0 R >>".as_slice()),
+        ];
+        for (number, body) in fixed.iter().chain(bodies.iter()) {
+            offsets[*number] = pdf.len();
+            pdf.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+        for offset in offsets.iter().skip(1) {
+            if *offset == 0 {
+                pdf.extend_from_slice(b"0000000000 65535 f \n");
+            } else {
+                pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+            }
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn indexed_reference_chains_resolve_and_cycles_stay_backend_errors() {
+        let _test_lock = indexed_test_lock();
+        // 4 -> 5 -> 6 = 42 (two hops), 7 -> 7 (self cycle), 8 -> 9 -> 8 (two-object cycle).
+        let raw = indexed_reference_fixture(&[
+            (4, b"5 0 R".as_slice()),
+            (5, b"6 0 R".as_slice()),
+            (6, b"42".as_slice()),
+            (7, b"7 0 R".as_slice()),
+            (8, b"9 0 R".as_slice()),
+            (9, b"8 0 R".as_slice()),
+        ]);
+        let adapter = indexed(&raw, None);
+        // The zero-hop and multi-hop paths agree with eager `get_object`.
+        assert_eq!(
+            adapter.object((6, 0)).unwrap().read(|o| o.as_i64().unwrap()).unwrap(),
+            42
+        );
+        assert_eq!(
+            adapter.object((4, 0)).unwrap().read(|o| o.as_i64().unwrap()).unwrap(),
+            42
+        );
+        // The lazily seeded cycle set still names the object it caught and its class.
+        for id in [(7u32, 0u16), (8, 0), (9, 0)] {
+            let Err(error) = adapter.object(id) else {
+                panic!("{id:?} resolved instead of reporting a cycle");
+            };
+            assert_eq!(error.kind, AccessKind::Backend, "{id:?}");
+            assert!(
+                error.to_string().contains("indirect reference cycle"),
+                "{id:?}: {error}"
+            );
+        }
     }
 
     fn indexed_metadata_fixture() -> Vec<u8> {
