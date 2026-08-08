@@ -1318,6 +1318,19 @@ def test_phase7_crosspage_fixture_truth_and_provenance_are_exact():
     ]
 
 
+# The `<table ...>` open tags each negative emits, in document order. A table whose caption is
+# anchored to it carries that caption's `id="tab-N"`; a table with no anchored caption is a bare
+# `<table>`. Locked as a list rather than counted, because WHICH of them anchors is exactly the
+# accepted behaviour this test exists to pin: before the heading rules stopped publishing a
+# prominent caption as the page's document `<h1>`, "Table 7."/"Table 11." were consumed as a
+# title and their tables carried no anchor at all.
+CROSSPAGE_NEGATIVE_TABLE_TAGS = {
+    "t3_crosspage_independent_geometry.pdf": ["<table>", "<table>"],
+    "t3_crosspage_independent_caption.pdf": ['<table id="tab-7">', "<table>"],
+    "t3_crosspage_aligned_prose.pdf": ['<table id="tab-11">'],
+}
+
+
 @pytest.mark.parametrize(
     "fname,expected_shapes",
     [
@@ -1346,15 +1359,21 @@ def test_phase7_crosspage_negatives_lock_accepted_parent_behavior(fname, expecte
 
     html = pdf.to_html(return_string=True, image_mode="drop")
     markdown = pdf.to_markdown(return_string=True, image_mode="drop")
-    assert html.count("<table>") == len(expected)
+    assert re.findall(r"<table[^>]*>", html) == CROSSPAGE_NEGATIVE_TABLE_TAGS[fname]
+    assert html.count("<table") == len(expected)
     assert markdown.count("| --- | --- | --- | --- |") == len(expected)
 
     if fname == "t3_crosspage_independent_caption.pdf":
         captions = ["Table 7. Permit register", "Table 8. Audit outcomes"]
         assert [table["caption"] for table in analyzed] == [None, None]
-        for caption, count in zip(captions, (2, 1)):
-            assert html.count(caption) == count
-            assert markdown.count(caption) == count
+        # Once each. "Table 7." used to appear TWICE: the page's most prominent line was its
+        # caption, so `find_document_title` published it as the document `<h1>` as well — the
+        # same words emitted as a title and as the table's caption. It is now only the
+        # table's `<caption>`, which is also why table 7 carries the `tab-7` anchor above.
+        for caption in captions:
+            assert html.count(caption) == 1
+            assert markdown.count(caption) == 1
+        assert '<caption style="caption-side:bottom">Table 7. Permit register</caption>' in html
         spans = [pdf._dbg_spans_xy(page) for page in (1, 2)]
         assert [
             hashlib.sha256(json.dumps(page, sort_keys=True, separators=(",", ":")).encode())

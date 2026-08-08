@@ -3571,6 +3571,83 @@ def gen_three_column_prose():
     GT["three_column_prose.pdf"] = {"tables": 1}
 
 
+def gen_form_grid_prose():
+    """A form/grid page whose NON-heading lines all wear a heading's face.
+
+    Every trap below is bold and short — the style signature `detect_header` reads as a
+    section — yet none of them is a section heading, and two of them are not a document title:
+
+      * a **URL sentence** (topmost, so it is the first title candidate). `find_document_title`
+        only rejects a long candidate that ENDS a sentence, so a body sentence cut mid-clause —
+        by a column break, or by a table claiming its tail — cleared the prose guard and was
+        published as the document `<h1>`;
+      * a **caption** ("Table 3: District totals …"), the next candidate down. It is the
+        caption of a grid, so it is neither the document title nor an `<hN>`;
+      * a **grid label** in the band just above the table's top rule — the sub-header of the
+        ruled area below it. Removing the geometric table filter from the prose flow (so that
+        prose beside a table survives) let every such label surface as a section;
+      * a **dot-leader form line** ("11 Educator expenses …… 11"), whose leading number is a
+        form line number and reads exactly like a numbered section;
+      * a **bulleted line**: the heading branch runs before the list branch, so a bullet in a
+        heading face was emitted as a section instead of a list item.
+
+    Two REAL headings ("Program Notes" — which is what the title should fall through to — and
+    "Data Sources") are set in the same bold face, so a rule that fixes the five traps by
+    suppressing the face fails here.
+
+    Assert: one table; `<h1>` is "Program Notes"; "Data Sources" is still a heading; no trap
+    carries a heading tag and no trap's text is lost."""
+    pdf = os.path.join(OUT, "form_grid_prose.pdf")
+    url_line = ("Registry Entries Have Been Published At https://www.example.org/registry/entries "
+                "With The Revised Procedure Per Section")
+    caption = "Table 3: District totals for the reporting year"
+    leader = "11 Educator expenses ........................... 11"
+    bullet = "Mineral and energy resources of the district"
+    grid_label = "Section B Adjustments"
+    body = [
+        b"BT /F2 10 Tf 60 752 Td (%s) Tj ET" % url_line.encode(),
+        b"BT /F2 11 Tf 60 730 Td (%s) Tj ET" % caption.encode(),
+        b"BT /F2 12 Tf 60 706 Td (Program Notes) Tj ET",
+    ]
+    # The ruled grid: 4 vertical x 5 horizontal rules, the shape `gen_three_column_prose` uses.
+    TX = [60.0, 190.0, 320.0, 450.0]
+    TY = [600.0, 616.0, 632.0, 648.0, 664.0]
+    CELLS = [["District", "Filed", "Adjusted"],
+             ["North", "18.2", "77"],
+             ["South", "31.0", "96"],
+             ["Coastal", "42.5", "128"]]
+    for ri, row in enumerate(CELLS):
+        y = TY[len(TY) - 2 - ri] + 4.0
+        for ci, cell in enumerate(row):
+            body.append(b"BT /F1 9 Tf %.1f %.1f Td (%s) Tj ET" % (TX[ci] + 3.0, y, cell.encode()))
+    for y in TY:
+        body.append(b"0.5 w %.1f %.1f m %.1f %.1f l S" % (TX[0], y, TX[-1], y))
+    for x in TX:
+        body.append(b"0.5 w %.1f %.1f m %.1f %.1f l S" % (x, TY[0], x, TY[-1]))
+    # 4pt above the grid's top rule — inside the one-body-height band the table owns.
+    body.append(b"BT /F2 10 Tf 60 668 Td (%s) Tj ET" % grid_label.encode())
+    body.append(b"BT /F2 10 Tf 60 578 Td (%s) Tj ET" % leader.encode())
+    body.append(b"BT /F2 10 Tf 60 560 Td (\\225 %s) Tj ET" % bullet.encode())
+    PROSE = [
+        "The district office reviewed every filing received during the reporting",
+        "year and compared the adjusted totals against the figures published in",
+        "the previous summary, which are reproduced in the table above for ease",
+        "of reference by the reader of this report and by the reviewing office.",
+    ]
+    for i, t in enumerate(PROSE):
+        body.append(b"BT /F1 10 Tf 60 %.1f Td (%s) Tj ET" % (536.0 - i * 13.0, t.encode()))
+    body.append(b"BT /F2 12 Tf 60 460 Td (Data Sources) Tj ET")
+    for i, t in enumerate(PROSE[:3]):
+        body.append(b"BT /F1 10 Tf 60 %.1f Td (%s) Tj ET" % (442.0 - i * 13.0, t.encode()))
+    _assemble_pdf(_one_page(b"\n".join(body)), pdf)
+    GT["form_grid_prose.pdf"] = {
+        "tables": 1,
+        "title": "Program Notes",
+        "headings": ["Data Sources"],
+        "not_headings": [caption, url_line, leader, bullet, grid_label],
+    }
+
+
 def gen_two_column_tables():
     """A two-column page whose BOTH columns carry a table — and no prose anywhere.
 
@@ -5711,6 +5788,7 @@ def main():
     gen_ruled_blank_cells()
     gen_booktabs_wrapped()
     gen_three_column_prose()
+    gen_form_grid_prose()
     gen_two_column_tables()
     gen_two_column_tables_prose()
     gen_stacked_tables()

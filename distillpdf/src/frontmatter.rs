@@ -400,6 +400,13 @@ pub(crate) fn emit_header_block(fm: &FrontMatter, out: &mut String) {
 /// the line indices it spans (a multi-line title is one `<h1>`). Titles are often
 /// bold-but-not-larger, so prominence — not size alone — is the signal. None if no line
 /// qualifies (callers fall back to [`find_title_sized`]).
+/// A URL anywhere in the text. A document title never carries one; a body sentence, a
+/// registry reference or a footer often does.
+fn contains_url(t: &str) -> bool {
+    let lo = t.to_lowercase();
+    lo.contains("http://") || lo.contains("https://") || lo.contains("www.")
+}
+
 pub(crate) fn find_document_title(lines: &[Line], body: f32) -> Option<(String, HashSet<usize>)> {
     let allcaps = |t: &str| {
         let a = t.chars().filter(|c| c.is_alphabetic());
@@ -423,6 +430,17 @@ pub(crate) fn find_document_title(lines: &[Line], body: f32) -> Option<(String, 
             && roman_section(tt).is_none()
             && !looks_like_reference(tt)
             && !tt.to_lowercase().starts_with("abstract")
+            // A figure/table caption is never the document title, however prominent it is.
+            // A caption is routinely the largest bold run on a page that carries no real
+            // title, so without this "Table 27: Trilinos AMG iterations …" is emitted as the
+            // document `<h1>` — a title that is really the caption of the grid beside it.
+            && crate::captions::caption_label(tt).is_none()
+            // Nor does a title carry a URL. `is_prose` only rejects a long candidate that
+            // ENDS a sentence, so a body sentence cut mid-clause (a table claiming its tail,
+            // a column break) slips through: "IANA has updated the "…Cache Directive
+            // Registry" at <https://www.iana.org/assignments/http-cache-directives> with the
+            // registration procedure per Section" was emitted as an RFC page's `<h1>`.
+            && !contains_url(tt)
     };
     let prominent = |l: &Line| {
         let tt = l.text();

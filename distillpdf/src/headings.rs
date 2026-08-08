@@ -194,6 +194,28 @@ pub(crate) fn detect_header(line: &Line, body: f32, profile: Option<&DocProfile>
         return None;
     }
 
+    // A 4+ leader-dot run is a CONTENTS or FORM LINE-ITEM shape, never a section heading:
+    // "11 Educator expenses ........................... 11", "9 Total other income. Add
+    // lines 8a through 8z ................... 9". The numbering these carry is a form line
+    // number, and it is exactly what the numbered-section rule below reads as "N. Title" —
+    // which is how a tax form's every line promoted to an <h2>. The same run already
+    // disqualifies a caption (`dotleader_tail`, `is_dotleader_toc`); a real heading is
+    // never typeset with a leader to a page/line number.
+    if crate::captions::dotleader_tail(trimmed) {
+        return None;
+    }
+
+    // A BULLET-marked line is a list item, not a section heading. The heading branch runs
+    // BEFORE the list branch in `emit_lines` (so "3.1 Method" beats "3." as a list), which
+    // means a bulleted line set in a heading-ish face — a legend/explanation panel's
+    // "• Mineral and energy resources", "• Geologic mapping" — reached the heading rules
+    // first and was emitted as a section. No typographic convention marks a section title
+    // with a bullet. Only UNORDERED markers are excluded: an ordered "1." lead is exactly
+    // the numbered-section shape the rules below are built to read.
+    if crate::html::list_kind(trimmed) == Some(false) {
+        return None;
+    }
+
     // Mis-extracted display MATH promoted to a heading. A heading is real words; an
     // equation fragment is symbols, single letters and digits. `real_words` = tokens
     // with ≥2 ASCII letters.

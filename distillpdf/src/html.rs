@@ -781,7 +781,34 @@ fn box_of_lines(lines: &[&Line]) -> Option<Bbox> {
 /// [`PageElement`] per emitted construct (a heading, a paragraph, a list, a code block, a
 /// footnote aside). Headings carry NO id here — ids are minted later by the `assemble` tail,
 /// matching the legacy bare-`<hN>` emit.
-fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[(String, u8)], profile: &DocProfile, plan: &HeadingPlan, out: &mut Vec<PageElement>) {
+/// Everything `emit_lines` needs about the PAGE it is emitting, gathered so the emitter keeps
+/// a three-argument signature as the prose rules grow: the body size and title size the
+/// heading tiers are read against, the PDF-outline titles targeting this page, the document
+/// typography profile and heading plan, and the accepted tables' rects (widened by one body
+/// height, the same band `in_table` uses) for the grid-residue heading guard.
+#[derive(Clone, Copy)]
+struct ProseCtx<'a> {
+    body: f32,
+    title_sz: f32,
+    promote: &'a [(String, u8)],
+    profile: &'a DocProfile,
+    plan: &'a HeadingPlan,
+    table_interiors: &'a [(f32, f32, f32, f32)],
+}
+
+fn emit_lines(lines: &[&Line], ctx: ProseCtx<'_>, out: &mut Vec<PageElement>) {
+    let ProseCtx { body, title_sz, promote, profile, plan, table_interiors } = ctx;
+    // A line lying WHOLLY inside an accepted table's rect is grid residue — text the table
+    // detector saw inside its own ruled area but placed in no cell. It is emitted (deleting it
+    // was the text loss `fix(tables): enforce exclusive prose ownership` set out to end), but it
+    // is never a SECTION HEADING: a section title does not live inside a grid. Containment is
+    // strict on both axes, so prose beside or below a table — the case that commit exists for —
+    // is untouched.
+    let residue_of_table = |l: &Line| {
+        table_interiors
+            .iter()
+            .any(|&(x0, x1, y0, y1)| l.y >= y0 && l.y <= y1 && l.x1 > x0 && l.x0 < x1)
+    };
     let mut i = 0;
     // The currently-open paragraph. It is NOT flushed at a column-wrap block
     // boundary — a paragraph that wraps from the bottom of one column to the top
@@ -861,7 +888,13 @@ fn emit_lines(lines: &[&Line], body: f32, title_sz: f32, promote: &[(String, u8)
             promote.iter().find(|(k, _)| *k == key).map(|(_, d)| d.saturating_add(1).min(5))
         };
         if !in_enumerated_run(lines, i) && !colon_introduced_list(lines, i) {
-        if let Some((lvl, k)) = if let Some(flvl) = forced { Some((flvl, ln.runs.len())) } else { header_at(lines, i, body, profile, plan) } {
+        if let Some((lvl, k)) = if let Some(flvl) = forced {
+            Some((flvl, ln.runs.len()))
+        } else if residue_of_table(ln) {
+            None
+        } else {
+            header_at(lines, i, body, profile, plan)
+        } {
             // HTML heading tag: reserve <h1> for the document title (the largest
             // text). Sections (logical level 1) become <h2>, subsections <h3>,
             // etc., so the outline nests under a single <h1>.
@@ -2306,10 +2339,14 @@ pub(crate) fn render_doc_elements(
         // PDF-outline titles whose target page is this one, so body-size section titles
         // still become headings.
         let page_promote: &[(String, u8)] = promote_by_page.get(pno).map(|v| v.as_slice()).unwrap_or(&[]);
+        // The accepted tables' rects, for the grid-residue heading guard in `emit_lines`.
+        let table_interiors: Vec<(f32, f32, f32, f32)> =
+            tables.iter().map(|t| (t.bbox.x0, t.bbox.x1, t.bbox.y0 - body, t.bbox.y1 + body)).collect();
+        let prose_ctx = ProseCtx { body, title_sz, promote: page_promote, profile: &profile, plan: &head_plan, table_interiors: &table_interiors };
         let mut run: Vec<&Line> = Vec::new();
         let flush = |run: &mut Vec<&Line>, out: &mut Vec<PageElement>| {
             if !run.is_empty() {
-                emit_lines(run, body, title_sz, page_promote, &profile, &head_plan, out);
+                emit_lines(run, prose_ctx, out);
                 run.clear();
             }
         };
@@ -2794,13 +2831,75 @@ mod tests {
         }
     }
 
+    /// `tests/fixtures_pdf/form_grid_prose.pdf` (see `gen_form_grid_prose`): five bold, short,
+    /// heading-faced lines that are NOT headings — a mid-clause URL sentence, a table caption,
+    /// a grid sub-label in the band above a table's top rule, a dot-leader form line and a
+    /// bullet — beside two REAL headings in the same face. Before this, the URL line was the
+    /// document `<h1>` and the other four were `<h2>`/`<h4>` sections. Every trap must keep
+    /// its text: these rules change classification, never emission.
+    #[test]
+    fn heading_faced_form_and_grid_lines_are_not_headings() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/form_grid_prose.pdf");
+        let raw = std::fs::read(path).expect("fixture bytes");
+        let doc = Document::load(path).expect("fixture loads");
+        let html = to_html(
+            &crate::access::test_adapter_with_source(&doc, &raw),
+            Mode::Page,
+            false,
+            false,
+        );
+        let headings: Vec<&str> = html
+            .match_indices("<h")
+            .filter(|(i, _)| html[i + 2..].starts_with(|c: char| c.is_ascii_digit()))
+            .filter_map(|(i, _)| {
+                let open = i + html[i..].find('>')?;
+                let close = open + html[open..].find("</h")?;
+                Some(&html[open + 1..close])
+            })
+            .collect();
+        assert!(
+            headings.iter().any(|h| h.contains("Program Notes")),
+            "the real title is gone: {headings:?}"
+        );
+        assert!(
+            headings.iter().any(|h| h.contains("Data Sources")),
+            "the real heading in the same bold face is gone: {headings:?}"
+        );
+        let h1 = html.find("<h1").map(|i| {
+            let open = i + html[i..].find('>').unwrap_or(0);
+            let close = open + html[open..].find("</h1>").unwrap_or(0);
+            html[open + 1..close].to_string()
+        });
+        assert_eq!(
+            h1.as_deref().map(str::trim),
+            Some("Program Notes"),
+            "the document <h1> must fall through the URL line and the caption to the first \
+             real heading"
+        );
+        for trap in [
+            "Registry Entries Have Been Published At",
+            "Table 3: District totals",
+            "Section B Adjustments",
+            "11 Educator expenses",
+            "Mineral and energy resources",
+        ] {
+            assert!(
+                !headings.iter().any(|h| h.contains(trap)),
+                "{trap:?} promoted to a heading: {headings:?}"
+            );
+            assert!(html.contains(trap), "{trap:?} lost from the output entirely");
+        }
+        assert_eq!(html.matches("<table").count(), 1, "the real grid is unchanged");
+    }
+
     /// Emit `texts` as one run of body-size lines with `promote` as the page's outline
     /// entries, and report the `<hN>` tag of every heading emitted.
     fn heading_tags(promote: &[(String, u8)], texts: &[&str]) -> Vec<u8> {
         let lines: Vec<Line> = texts.iter().enumerate().map(|(i, t)| line(t, 700.0 - 20.0 * i as f32)).collect();
         let refs: Vec<&Line> = lines.iter().collect();
         let mut out: Vec<PageElement> = Vec::new();
-        emit_lines(&refs, 10.0, 10.0, promote, &DocProfile::default(), &HeadingPlan::default(), &mut out);
+        let (profile, plan) = (DocProfile::default(), HeadingPlan::default());
+        emit_lines(&refs, ProseCtx { body: 10.0, title_sz: 10.0, promote, profile: &profile, plan: &plan, table_interiors: &[] }, &mut out);
         out.iter()
             .filter_map(|e| match &e.kind {
                 ElKind::Heading { level, .. } => Some(*level),
