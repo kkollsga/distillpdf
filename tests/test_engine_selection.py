@@ -12,10 +12,11 @@
   ``DISTILLPDF_ENGINE=indexed`` too;
 * a misspelled engine is a ``ValueError`` that names the values that would have worked.
 
-The fallback fixture is generated here rather than committed: every fixture under
-``tests/fixtures_pdf/`` opens indexed, so a refusal has to be constructed. A catalog object
-padded past the indexed reader's 4 MiB per-object decode envelope is the smallest honest one —
-a perfectly valid PDF that the eager engine reads without complaint.
+The oversized-catalog fallback fixture is generated here rather than committed because a 5 MiB
+pad is not worth carrying in the tree: a catalog object padded past the indexed reader's 4 MiB
+per-object decode envelope is the smallest honest refusal — a perfectly valid PDF that the eager
+engine reads without complaint. The second refusal, a page tree nested past the 256-level cap, is
+small enough to commit and lives at ``fixtures_pdf/adversarial/deep_page_tree.pdf``.
 """
 import os
 
@@ -26,6 +27,7 @@ from _fixtures import FIX
 from _rawpdf import HELV, assemble_pdf, stream, text_op
 
 HEADINGS = os.path.join(FIX, "headings.pdf")
+DEEP_PAGE_TREE = os.path.join(FIX, "adversarial", "deep_page_tree.pdf")
 
 #: What an open that names no engine must route to, given this process's environment. The
 #: public default is eager; the internal selector is the only thing that can move it.
@@ -89,6 +91,22 @@ def test_a_refused_lazy_open_falls_back_to_eager_and_says_so(oversized_catalog):
     eager = distillpdf.Pdf.open(oversized_catalog, engine="eager")
     assert eager.engine == "eager"
     assert doc.extract_text() == eager.extract_text()
+
+
+def test_a_page_tree_past_the_depth_cap_falls_back_instead_of_rendering_blank():
+    """The silent-blank shape this fixture exists for: a valid one-page PDF whose ``/Pages``
+    tree nests past the indexed reader's 256-level cap. The cap used to stop the walk without
+    reporting anything, so the lazy open "succeeded" with zero pages — a blank document that
+    still called itself ``"lazy"``. It must be a counted fallback with eager's output."""
+    doc = distillpdf.Pdf.open(DEEP_PAGE_TREE, engine="lazy")
+    eager = distillpdf.Pdf.open(DEEP_PAGE_TREE, engine="eager")
+    assert doc.engine == "lazy (eager fallback)"
+    assert eager.engine == "eager"
+    # Never zero pages and never empty text, whatever the route.
+    assert doc.page_count() == eager.page_count() == 1
+    assert "deep page tree" in doc.extract_text()
+    assert doc.extract_text() == eager.extract_text()
+    assert doc.to_html(return_string=True) == eager.to_html(return_string=True)
 
 
 def test_a_refused_lazy_open_from_bytes_also_falls_back(oversized_catalog):

@@ -3345,7 +3345,49 @@ def gen_form_bomb():
         "control": "form_repeat.pdf",
         "control_repeats": 3,
         "control_word": "REPEAT",
+        "deep_page_tree": "deep_page_tree.pdf",
+        "deep_page_tree_depth": DEEP_PAGE_TREE_DEPTH,
+        "deep_page_tree_word": "deep page tree",
     }
+
+
+# Comfortably past the indexed reader's 256-level page-tree cap (`INDEXED_PAGE_TREE_DEPTH`
+# in `distillpdf/src/access.rs`) so the fixture keeps its meaning if the cap is nudged, and
+# still only ~25 KB.
+DEEP_PAGE_TREE_DEPTH = 300
+
+
+def gen_deep_page_tree():
+    """One ordinary page reached through 300 nested single-kid ``/Pages`` nodes.
+
+    Nothing here is malformed — every node is ``/Type /Pages`` with a one-element ``/Kids``,
+    a matching ``/Count`` and a ``/Parent`` backlink — but the *nesting* is past the depth
+    the indexed (lazy) engine will walk. That limit used to stop the walk silently, so the
+    lazy route opened the file "successfully" with zero pages and rendered blank while still
+    reporting ``engine == "lazy"``; the eager route read the same file correctly. The limit
+    now reports itself, which routes the file through the counted eager fallback.
+
+    Deep single-kid chains are what a page tree built by repeated one-page appends looks
+    like, so this is a real shape and not only a hardening probe. It lives in
+    ``adversarial/`` because it exercises a structural limit, not layout fidelity.
+    """
+    os.makedirs(ADV_OUT, exist_ok=True)
+    depth = DEEP_PAGE_TREE_DEPTH
+    last = 2 + depth - 1          # deepest /Pages node
+    page, content, font = last + 1, last + 2, last + 3
+
+    objs = {1: b"<< /Type /Catalog /Pages 2 0 R >>"}
+    for i in range(depth):
+        n = 2 + i
+        parent = b" /Parent %d 0 R" % (n - 1) if i else b""
+        objs[n] = b"<< /Type /Pages /Kids [%d 0 R] /Count 1%s >>" % (n + 1, parent)
+    objs[page] = (b"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 612 792] "
+                  b"/Resources << /Font << /F1 %d 0 R >> >> /Contents %d 0 R >>"
+                  % (last, font, content))
+    body = b"BT /F1 12 Tf 72 700 Td (deep page tree) Tj ET"
+    objs[content] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(body), body)
+    objs[font] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+    _assemble_pdf(objs, os.path.join(ADV_OUT, "deep_page_tree.pdf"))
 
 
 # ------------------------------------------------------------------- table evidence
@@ -4969,6 +5011,7 @@ def main():
     gen_profile_heads()
     gen_encrypted()
     gen_form_bomb()
+    gen_deep_page_tree()
     gen_objstm_pages()
     with open(os.path.join(OUT, "groundtruth.json"), "w") as f:
         # sort_keys: the dict's insertion order is main()'s call order, so adding or

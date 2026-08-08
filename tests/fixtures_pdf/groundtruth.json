@@ -3,7 +3,10 @@
     "bomb": "form_bomb.pdf",
     "control": "form_repeat.pdf",
     "control_repeats": 3,
-    "control_word": "REPEAT"
+    "control_word": "REPEAT",
+    "deep_page_tree": "deep_page_tree.pdf",
+    "deep_page_tree_depth": 300,
+    "deep_page_tree_word": "deep page tree"
   },
   "alpha_groups.pdf": {
     "group_opacities": [

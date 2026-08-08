@@ -2284,6 +2284,145 @@ pub(crate) mod tests {
         );
     }
 
+    /// A valid one-page PDF reached through a chain of `depth` single-kid `/Pages` nodes.
+    ///
+    /// Nothing here is malformed: every node carries `/Type /Pages`, a one-element `/Kids`,
+    /// `/Count 1` and a `/Parent` backlink, and the leaf is an ordinary page. Only the *nesting*
+    /// is unusual, which is exactly the axis the indexed reader caps (`INDEXED_PAGE_TREE_DEPTH`).
+    fn deep_page_tree_pdf(depth: usize) -> Vec<u8> {
+        let content = "BT /F1 12 Tf 72 700 Td (deep page tree) Tj ET";
+        let last = 2 + depth - 1;
+        let (stream, font) = (last + 2, last + 3);
+        let mut objects = vec!["<< /Type /Catalog /Pages 2 0 R >>".to_string()];
+        for index in 0..depth {
+            let node = 2 + index;
+            let parent = if index > 0 {
+                format!(" /Parent {} 0 R", node - 1)
+            } else {
+                String::new()
+            };
+            objects.push(format!(
+                "<< /Type /Pages /Kids [{} 0 R] /Count 1{parent} >>",
+                node + 1
+            ));
+        }
+        objects.push(format!(
+            "<< /Type /Page /Parent {last} 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 {font} 0 R >> >> /Contents {stream} 0 R >>"
+        ));
+        objects.push(format!(
+            "<< /Length {} >>\nstream\n{content}\nendstream",
+            content.len()
+        ));
+        objects.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string());
+        assert_eq!(objects.len(), font, "object numbering must stay contiguous");
+
+        let mut body = b"%PDF-1.5\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(body.len());
+            body.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref = body.len();
+        let size = objects.len() + 1;
+        body.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+        for offset in &offsets {
+            body.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        body.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        body
+    }
+
+    /// A `/Pages` tree nested past the indexed reader's depth cap must be a *refusal*, not a
+    /// silently empty document.
+    ///
+    /// Before the fix the reader stopped walking at the cap and handed back an empty page map
+    /// with no error, so the open "succeeded", the counted eager fallback never fired, and the
+    /// caller got a zero-page, zero-text document that still reported `engine == "lazy"`. The
+    /// cap now raises a typed structural error, which routes through the existing fallback.
+    #[test]
+    fn a_page_tree_deeper_than_the_cap_falls_back_instead_of_rendering_blank() {
+        let raw = deep_page_tree_pdf(300);
+
+        let eager = PdfDocument::from_bytes_with_engine(&raw, Engine::Eager).unwrap();
+        assert_eq!(eager.engine(), EngineRoute::Eager);
+        assert_eq!(eager.page_count(), 1);
+        assert!(eager.extract_text().contains("deep page tree"));
+
+        let document = PdfDocument::from_bytes_with_engine(&raw, Engine::Lazy).unwrap();
+        assert_eq!(document.engine(), EngineRoute::LazyEagerFallback);
+        let snapshot = document.route_diagnostics();
+        assert_eq!(snapshot.fallback_opens, 1);
+        assert_eq!(snapshot.eager_opens, 1);
+        assert_eq!(snapshot.indexed_opens, 0);
+        // The silent-blank shape is what this locks out: a non-zero page count and the eager
+        // text, never an empty document that claims the lazy engine ran.
+        assert_eq!(document.page_count(), eager.page_count());
+        assert_eq!(document.extract_text(), eager.extract_text());
+
+        let strict = PdfDocument::from_bytes_with_engine(&raw, Engine::LazyStrict);
+        assert!(
+            matches!(strict, Err(Error::Open(ref message)) if message.contains("indexed open failed")),
+            "strict must surface the refusal, got {strict:?}",
+            strict = strict.map(|document| document.engine())
+        );
+    }
+
+    /// The cap is inclusive: a tree that sits exactly at `INDEXED_PAGE_TREE_DEPTH` is still a
+    /// lazy open, so the refusal above is a cap boundary and not a general deep-tree failure.
+    #[test]
+    fn a_page_tree_at_the_cap_still_opens_lazily() {
+        let raw = deep_page_tree_pdf(crate::access::INDEXED_PAGE_TREE_DEPTH);
+        let document = PdfDocument::from_bytes_with_engine(&raw, Engine::Lazy).unwrap();
+        assert_eq!(document.engine(), EngineRoute::Lazy);
+        assert_eq!(document.page_count(), 1);
+        assert!(document.extract_text().contains("deep page tree"));
+    }
+
+    /// Belt and braces behind the typed limit above: the index never *serves* a zero-page
+    /// document, whatever produced the empty page map.
+    ///
+    /// Every structural limit is supposed to report itself, but a limit that ever truncates
+    /// again would land here — an empty page map, a successful open, a blank render labelled
+    /// `lazy`. Refusing the shape means the worst case is a counted fallback to eager, which is
+    /// the reference for what "no pages" means. Here eager also finds no pages, and the routes
+    /// still agree.
+    #[test]
+    fn an_empty_page_map_is_refused_rather_than_served() {
+        let raw = {
+            let objects = [
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [] /Count 0 >>",
+            ];
+            let mut body = b"%PDF-1.5\n".to_vec();
+            let mut offsets = Vec::new();
+            for (index, object) in objects.iter().enumerate() {
+                offsets.push(body.len());
+                body.extend_from_slice(
+                    format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes(),
+                );
+            }
+            let xref = body.len();
+            let size = objects.len() + 1;
+            body.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+            for offset in &offsets {
+                body.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+            }
+            body.extend_from_slice(
+                format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                    .as_bytes(),
+            );
+            body
+        };
+
+        let document = PdfDocument::from_bytes_with_engine(&raw, Engine::Lazy).unwrap();
+        assert_eq!(document.engine(), EngineRoute::LazyEagerFallback);
+        assert_eq!(document.route_diagnostics().fallback_opens, 1);
+        let eager = PdfDocument::from_bytes_with_engine(&raw, Engine::Eager).unwrap();
+        assert_eq!(document.page_count(), eager.page_count());
+    }
+
     /// The three route strings are the Python `Pdf.engine` property's values — behaviour-locked
     /// here so a rename in Rust cannot silently change what Python returns.
     #[test]
