@@ -446,6 +446,20 @@
     "subtype": "Type1",
     "text": "Text drawn inside a form XObject."
   },
+  "form_grid_prose.pdf": {
+    "headings": [
+      "Data Sources"
+    ],
+    "not_headings": [
+      "Table 3: District totals for the reporting year",
+      "Registry Entries Have Been Published At https://www.example.org/registry/entries With The Revised Procedure Per Section",
+      "11 Educator expenses ........................... 11",
+      "Mineral and energy resources of the district",
+      "Section B Adjustments"
+    ],
+    "tables": 1,
+    "title": "Program Notes"
+  },
   "form_image.pdf": {
     "caption": "Figure 1: A raster bar chart drawn inside a form XObject.",
     "page1_images": [
