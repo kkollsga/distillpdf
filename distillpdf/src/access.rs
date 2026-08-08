@@ -36,7 +36,7 @@ const INDEXED_CACHE_MAX_ENTRIES: usize = 65_536;
 const INDEXED_CACHE_ENTRY_BYTES: u64 = 4_096;
 // Frozen by `tests/lazy_engine_fixtures.py`: 128 reference hops are admitted and 129 fail.
 const INDEXED_REFERENCE_DEPTH: usize = 128;
-const INDEXED_PAGE_TREE_DEPTH: usize = 256;
+pub(crate) const INDEXED_PAGE_TREE_DEPTH: usize = 256;
 const INDEXED_MAX_PAGES: usize = 1_000_000;
 const EAGER_RESOURCE_DEPTH: usize = 100;
 const INDEX_FIXED_BYTES: u64 = 33_554_432;
@@ -549,7 +549,8 @@ fn indexed_error(object: ObjectId, error: &IndexedReaderError) -> AccessError {
         | IndexedReaderError::StreamLimitExceeded { .. }
         | IndexedReaderError::ResolutionDepthExceeded { .. }
         | IndexedReaderError::ObjectStreamCacheBypass { .. }
-        | IndexedReaderError::PageCountLimitExceeded { .. } => AccessKind::ResourceLimit,
+        | IndexedReaderError::PageCountLimitExceeded { .. }
+        | IndexedReaderError::PageTreeDepthLimitExceeded { .. } => AccessKind::ResourceLimit,
         IndexedReaderError::StartXrefOutOfBounds { .. }
         | IndexedReaderError::NegativeStreamLength { .. } => AccessKind::Bounds,
         IndexedReaderError::NotScalarObject { .. }
@@ -1155,6 +1156,23 @@ impl IndexedDocumentAdapter {
                     stats.estimated_retained_bytes()
                 ),
             ));
+        }
+        // A zero-page index is never worth serving. Every structural limit the walk can hit is
+        // supposed to report itself — but a limit that ever *truncates* instead produces this
+        // exact shape, and a document with no pages renders blank while still claiming the lazy
+        // engine ran. Refusing here turns any such regression into a counted eager fallback,
+        // where eager decides what "no pages" means for the file. It costs one wasted index on
+        // the genuinely page-less documents, which are malformed anyway.
+        if stats.page_count() == 0 && stats.object_count() > 0 {
+            return Err(AccessError::typed(
+                (0, 0),
+                AccessKind::ResourceLimit,
+                format!(
+                    "indexed page map is empty across {} indexed objects",
+                    stats.object_count()
+                ),
+            )
+            .at(AccessPhase::Pages, None));
         }
         let map = Arc::new(map);
         let counters = Arc::new(IndexedAdapterCounters::default());
@@ -3183,8 +3201,13 @@ pub(crate) mod tests {
     fn indexed_adapter_resolves_compressed_trailer_reference_with_bounded_owner() {
         let _test_lock = indexed_test_lock();
         let mut document = Document::with_version("1.7");
+        // One real page: the adapter refuses to serve a zero-page index (it is the shape a
+        // truncating structural limit produces), and this test is about the trailer, not that.
+        let page = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Page", "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        }));
         let pages = document.add_object(Object::Dictionary(dictionary! {
-            "Type" => "Pages", "Kids" => Vec::<Object>::new(), "Count" => 0,
+            "Type" => "Pages", "Kids" => vec![Object::Reference(page)], "Count" => 1,
         }));
         let catalog = document.add_object(Object::Dictionary(dictionary! {
             "Type" => "Catalog", "Pages" => Object::Reference(pages),
