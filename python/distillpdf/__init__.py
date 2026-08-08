@@ -1,4 +1,6 @@
 """distillpdf — pure-Rust PDF extraction on lopdf."""
+from typing import Optional
+
 from ._distillpdf import (
     EncryptedPdfError,
     Pdf,
@@ -19,15 +21,22 @@ from .dpdf import DpdfError, FindResult
 from .ocr import OcrBackend, OcrConfig, OcrDependencyError, available_backends, get_backend
 
 
-def open(path: str) -> Document:
+def open(path: str, *, engine: Optional[str] = None) -> Document:
     """Open a PDF from a path. Returns a :class:`Document` (the Rust core plus the OCR
-    workflow); all core extraction methods work as before."""
-    return Document.open(path)
+    workflow); all core extraction methods work as before.
+
+    ``engine`` picks how the PDF container is read: ``"eager"`` (the default) parses it all up
+    front, ``"lazy"`` (experimental) indexes it and pulls objects on demand, which keeps peak
+    memory well below the file size on large documents. The output is identical either way, and
+    a file the lazy engine refuses falls back to eager — read ``doc.engine`` for what actually
+    ran. Any other value raises :class:`ValueError`."""
+    return Document.open(path, engine=engine)
 
 
-def from_bytes(data: bytes) -> Document:
-    """Open a PDF from raw bytes. Returns a :class:`Document`."""
-    return Document.from_bytes(data)
+def from_bytes(data: bytes, *, engine: Optional[str] = None) -> Document:
+    """Open a PDF from raw bytes. Returns a :class:`Document`. Takes the same ``engine``
+    keyword as :func:`open`."""
+    return Document.from_bytes(data, engine=engine)
 
 
 def load(path: str) -> Doc:
