@@ -513,7 +513,6 @@ pub(crate) fn find_title_sized(lines: &[Line], body: f32) -> Option<(String, Has
             || lo.contains("copyright")
             || t.contains('©')
             || lo.starts_with("printed in")
-            || contains_url(t)
     };
     let in_top = |i: usize| lines[i].y >= ymax - 0.45 * yrange;
     // An author/affiliation list (mostly capitalised tokens joined by `,`/`and`/`&`) can
@@ -535,13 +534,7 @@ pub(crate) fn find_title_sized(lines: &[Line], body: f32) -> Option<(String, Has
     // No numbered/roman-section guard here: the font-size gate already discriminates the
     // title, and that guard would reject common titles read as an appendix label — e.g.
     // "A Study of …" / "I Introduction" (a leading "A "/"I " trips numbered_level).
-    // A FIGURE/TABLE CAPTION is never the document title, however prominent it is. On a page
-    // whose only oversized run is a caption ("Table 27: Trilinos AMG iterations while
-    // increasing refinements …", "Table 8: MLS Wire Formats Registry") the size anchor picks
-    // it and emits it as the document `<h1>` — a caption promoted to a title, and one that
-    // then also duplicates the caption the table itself carries.
-    let is_caption = |i: usize| crate::captions::caption_label(&norm(i)).is_some();
-    let ok = |i: usize| in_top(i) && !is_pub_ref(&norm(i)) && !looks_like_names(i) && !is_caption(i);
+    let ok = |i: usize| in_top(i) && !is_pub_ref(&norm(i)) && !looks_like_names(i);
     let anchor_max = order
         .iter()
         .cloned()
