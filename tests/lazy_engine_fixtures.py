@@ -16,6 +16,7 @@ import argparse
 import base64
 import hashlib
 import json
+import shutil
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -219,6 +220,349 @@ def _object_stream_pdf() -> RenderedPdf:
     payload = header + first_member + b" " + second_member
     writer.add(6, _stream(payload, b"/Type /ObjStm /N 2 /First %d" % len(header)))
     return writer.render_xref_stream({7: (6, 0), 8: (6, 1)}, xref_number=9)
+
+
+OBJSTM_CONTAINER_CASES = (
+    "objstm-plain.pdf",
+    "objstm-flate.pdf",
+    "objstm-two-containers.pdf",
+    "objstm-container-nonstream.pdf",
+    "objstm-first-missing.pdf",
+    "objstm-first-negative.pdf",
+    "objstm-first-past-end.pdf",
+    "objstm-n-missing.pdf",
+    "objstm-n-negative.pdf",
+    "objstm-n-over-131072.pdf",
+    "objstm-filter-chain.pdf",
+    "objstm-predictor.pdf",
+    "objstm-flate-corrupt.pdf",
+    "objstm-length-missing.pdf",
+    "objstm-length-negative.pdf",
+    "objstm-length-indirect-missing.pdf",
+    "objstm-endstream-missing.pdf",
+    "objstm-endstream-truncated.pdf",
+    "objstm-container-generation.pdf",
+    "objstm-xref-authority.pdf",
+)
+
+OBJSTM_ENCRYPTED_NAME = "objstm-r4-rc4.pdf"
+OBJSTM_ENCRYPTED_OWNER_PASSWORD = "owner"
+OBJSTM_ENCRYPTED_USER_PASSWORD = ""
+OBJSTM_BOUNDARY_CASES = (
+    "encoded-over-64m",
+    "encoded-within-cap-truncated",
+    "flate-growth",
+    "plain-cache-below",
+    "plain-cache-above",
+    "plain-cap-edge",
+)
+
+
+def _objstm_logical_payload() -> tuple[bytes, int]:
+    first_member = b"(compressed-value)"
+    second_member = b"<< /Kind /Compressed >>"
+    header = b"7 0 8 %d " % (len(first_member) + 1)
+    return header + first_member + b" " + second_member, len(header)
+
+
+def _raw_stream(
+    payload: bytes,
+    dictionary: bytes,
+    *,
+    length: bytes | None = None,
+    suffix: bytes = b"\nendstream",
+) -> bytes:
+    length_entry = b"" if length is None else b"/Length " + length + b" "
+    return b"<< " + length_entry + dictionary.strip() + b" >>\nstream\n" + payload + suffix
+
+
+def _objstm_writer() -> PdfWriter:
+    return _base_writer(b"7 0 R", "object stream container")
+
+
+def _objstm_facts(
+    *,
+    containers: list[int],
+    encoding: str,
+    encoded_lengths: list[int],
+    decoded_lengths: list[int],
+    declarations: dict[int, tuple[int, int]],
+    expected: str,
+) -> dict:
+    return {
+        "containers": containers,
+        "encoding": encoding,
+        "encoded_lengths": encoded_lengths,
+        "decoded_lengths": decoded_lengths,
+        "xref_declarations": [
+            {"object": object_id, "container": container, "index": index}
+            for object_id, (container, index) in sorted(declarations.items())
+        ],
+        "expected_preparation": expected,
+        "storage": "generated-small",
+    }
+
+
+def _render_one_objstm(
+    body: bytes,
+    *,
+    declarations: dict[int, tuple[int, int]] | None = None,
+    generation: int = 0,
+) -> RenderedPdf:
+    declarations = declarations or {7: (6, 0), 8: (6, 1)}
+    writer = _objstm_writer()
+    writer.add(6, body, generation=generation)
+    return writer.render_xref_stream(declarations, xref_number=9)
+
+
+def _objstm_container_fixtures() -> Iterable[tuple[str, RenderedPdf, dict]]:
+    decoded, first = _objstm_logical_payload()
+    declarations = {7: (6, 0), 8: (6, 1)}
+    plain_dictionary = b"/Type /ObjStm /N 2 /First %d" % first
+
+    plain_body = _stream(decoded, plain_dictionary)
+    yield "objstm-plain.pdf", _render_one_objstm(plain_body), _objstm_facts(
+        containers=[6],
+        encoding="plain",
+        encoded_lengths=[len(decoded)],
+        decoded_lengths=[len(decoded)],
+        declarations=declarations,
+        expected="ready",
+    )
+
+    encoded = zlib.compress(decoded, level=9)
+    flate_body = _stream(
+        encoded,
+        plain_dictionary + b" /Filter /FlateDecode",
+    )
+    yield "objstm-flate.pdf", _render_one_objstm(flate_body), _objstm_facts(
+        containers=[6],
+        encoding="flate",
+        encoded_lengths=[len(encoded)],
+        decoded_lengths=[len(decoded)],
+        declarations=declarations,
+        expected="ready",
+    )
+
+    writer = _base_writer(b"7 0 R", "two object stream containers")
+    writer.add(6, plain_body)
+    second_payload = b"10 0 << /Container /Second >>"
+    writer.add(9, _stream(second_payload, b"/Type /ObjStm /N 1 /First 5"))
+    two_declarations = {7: (6, 0), 8: (6, 1), 10: (9, 0)}
+    yield "objstm-two-containers.pdf", writer.render_xref_stream(two_declarations, xref_number=11), _objstm_facts(
+        containers=[6, 9],
+        encoding="plain",
+        encoded_lengths=[len(decoded), len(second_payload)],
+        decoded_lengths=[len(decoded), len(second_payload)],
+        declarations=two_declarations,
+        expected="ready-both",
+    )
+
+    yield "objstm-container-nonstream.pdf", _render_one_objstm(b"<< /Type /ObjStm /N 2 /First 9 >>"), _objstm_facts(
+        containers=[6],
+        encoding="none",
+        encoded_lengths=[0],
+        decoded_lengths=[0],
+        declarations=declarations,
+        expected="container-not-stream",
+    )
+
+    malformed_headers = (
+        ("objstm-first-missing.pdf", b"/Type /ObjStm /N 2", "first-missing"),
+        ("objstm-first-negative.pdf", b"/Type /ObjStm /N 2 /First -1", "first-negative"),
+        (
+            "objstm-first-past-end.pdf",
+            b"/Type /ObjStm /N 2 /First %d" % (len(decoded) + 1),
+            "first-past-end",
+        ),
+        ("objstm-n-missing.pdf", b"/Type /ObjStm /First %d" % first, "n-missing"),
+        ("objstm-n-negative.pdf", b"/Type /ObjStm /N -1 /First %d" % first, "n-negative"),
+        (
+            "objstm-n-over-131072.pdf",
+            b"/Type /ObjStm /N 131073 /First %d" % first,
+            "n-over-131072",
+        ),
+    )
+    for name, dictionary, expected in malformed_headers:
+        yield name, _render_one_objstm(_stream(decoded, dictionary)), _objstm_facts(
+            containers=[6],
+            encoding="plain",
+            encoded_lengths=[len(decoded)],
+            decoded_lengths=[len(decoded)],
+            declarations=declarations,
+            expected=expected,
+        )
+
+    filter_chain = _stream(
+        encoded,
+        plain_dictionary + b" /Filter [/FlateDecode /ASCIIHexDecode]",
+    )
+    yield "objstm-filter-chain.pdf", _render_one_objstm(filter_chain), _objstm_facts(
+        containers=[6],
+        encoding="filter-chain",
+        encoded_lengths=[len(encoded)],
+        decoded_lengths=[len(decoded)],
+        declarations=declarations,
+        expected="unsupported-filter",
+    )
+
+    predictor = _stream(
+        encoded,
+        plain_dictionary + b" /Filter /FlateDecode /DecodeParms << /Predictor 12 >>",
+    )
+    yield "objstm-predictor.pdf", _render_one_objstm(predictor), _objstm_facts(
+        containers=[6],
+        encoding="flate-predictor-12",
+        encoded_lengths=[len(encoded)],
+        decoded_lengths=[len(decoded)],
+        declarations=declarations,
+        expected="unsupported-filter",
+    )
+
+    corrupt = b"deterministic-corrupt-flate"
+    yield "objstm-flate-corrupt.pdf", _render_one_objstm(
+        _stream(corrupt, plain_dictionary + b" /Filter /FlateDecode")
+    ), _objstm_facts(
+        containers=[6],
+        encoding="flate-corrupt",
+        encoded_lengths=[len(corrupt)],
+        decoded_lengths=[0],
+        declarations=declarations,
+        expected="selected-member-absent-after-corrupt-flate",
+    )
+
+    length_cases = (
+        ("objstm-length-missing.pdf", None, "unsupported-length"),
+        ("objstm-length-negative.pdf", b"-1", "unsupported-length"),
+        ("objstm-length-indirect-missing.pdf", b"99 0 R", "unsupported-length"),
+    )
+    for name, length, expected in length_cases:
+        body = _raw_stream(decoded, plain_dictionary, length=length)
+        yield name, _render_one_objstm(body), _objstm_facts(
+            containers=[6],
+            encoding="plain",
+            encoded_lengths=[len(decoded)],
+            decoded_lengths=[len(decoded)],
+            declarations=declarations,
+            expected=expected,
+        )
+
+    missing_endstream = _raw_stream(
+        decoded,
+        plain_dictionary,
+        length=str(len(decoded)).encode("ascii"),
+        suffix=b"",
+    )
+    yield "objstm-endstream-missing.pdf", _render_one_objstm(missing_endstream), _objstm_facts(
+        containers=[6],
+        encoding="plain",
+        encoded_lengths=[len(decoded)],
+        decoded_lengths=[len(decoded)],
+        declarations=declarations,
+        expected="missing-endstream",
+    )
+
+    truncated_endstream = _raw_stream(
+        decoded,
+        plain_dictionary,
+        length=str(len(decoded)).encode("ascii"),
+        suffix=b"\nendst",
+    )
+    yield "objstm-endstream-truncated.pdf", _render_one_objstm(truncated_endstream), _objstm_facts(
+        containers=[6],
+        encoding="plain",
+        encoded_lengths=[len(decoded)],
+        decoded_lengths=[len(decoded)],
+        declarations=declarations,
+        expected="missing-endstream",
+    )
+
+    yield "objstm-container-generation.pdf", _render_one_objstm(plain_body), _objstm_facts(
+        containers=[6],
+        encoding="plain",
+        encoded_lengths=[len(decoded)],
+        decoded_lengths=[len(decoded)],
+        declarations=declarations,
+        expected="generation-mismatch-on-6-1",
+    )
+
+    writer = _objstm_writer()
+    duplicate_payload = b"7 0 8 22 (undeclared-duplicate) << /Kind /Wrong >>"
+    writer.add(6, _stream(duplicate_payload, b"/Type /ObjStm /N 2 /First 9"))
+    # Keep every bounded parser/tail request inside the declared container's
+    # physical range so the xref-authority oracle can reject any recovery scan
+    # of the earlier duplicate or a later object. This padding is outside the
+    # stream payload and therefore does not alter its logical facts.
+    writer.add(10, plain_body + b"\n% declared-container-range " + b"x" * 8192)
+    authoritative_declarations = {7: (10, 0), 8: (10, 1)}
+    yield "objstm-xref-authority.pdf", writer.render_xref_stream(authoritative_declarations, xref_number=11), _objstm_facts(
+        containers=[6, 10],
+        encoding="plain",
+        encoded_lengths=[len(duplicate_payload), len(decoded)],
+        decoded_lengths=[len(duplicate_payload), len(decoded)],
+        declarations=authoritative_declarations,
+        expected="declared-container-10-only",
+    )
+
+
+def _deflate_prefixed_repeated(prefix: bytes, value: int, total_length: int) -> bytes:
+    if total_length < len(prefix):
+        raise ValueError("logical Flate length is shorter than its ObjStm header")
+    compressor = zlib.compressobj(level=6)
+    parts = [compressor.compress(prefix)]
+    remaining = total_length - len(prefix)
+    chunk = bytes([value]) * min(max(remaining, 1), 1024 * 1024)
+    while remaining:
+        take = min(remaining, len(chunk))
+        parts.append(compressor.compress(chunk[:take]))
+        remaining -= take
+    parts.append(compressor.flush())
+    return b"".join(parts)
+
+
+def _write_single_objstm_streaming(path: Path, payload_length: int) -> int:
+    """Write one large plain ObjStm without retaining its payload or final PDF."""
+    if payload_length < 4:
+        raise ValueError("ObjStm payload must contain the four-byte member header")
+    writer = _base_writer(b"7 0 R", "large object stream boundary")
+    offsets: dict[int, int] = {}
+    with path.open("wb") as output:
+        output.write(HEADER)
+        for number, (generation, body) in sorted(writer._objects.items()):
+            offsets[number] = output.tell()
+            output.write(f"{number} {generation} obj\n".encode("ascii"))
+            output.write(body)
+            output.write(b"\nendobj\n")
+        offsets[6] = output.tell()
+        output.write(b"6 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length %d >>\nstream\n" % payload_length)
+        output.write(b"7 0 ")
+        remaining = payload_length - 4
+        chunk = b"A" * min(max(remaining, 1), 1024 * 1024)
+        while remaining:
+            take = min(remaining, len(chunk))
+            output.write(chunk[:take])
+            remaining -= take
+        output.write(b"\nendstream\nendobj\n")
+        startxref = output.tell()
+        entries = bytearray()
+        for number in range(9):
+            if number == 0:
+                kind, field1, field2 = 0, 0, 65_535
+            elif number == 7:
+                kind, field1, field2 = 2, 6, 0
+            elif number == 8:
+                kind, field1, field2 = 1, startxref, 0
+            else:
+                kind, field1, field2 = 1, offsets[number], 0
+            entries += bytes([kind]) + field1.to_bytes(8, "big") + field2.to_bytes(2, "big")
+        xref = _stream(
+            bytes(entries),
+            b"/Type /XRef /Size 9 /Root 1 0 R /W [1 8 2] /Index [0 9]",
+        )
+        output.write(b"8 0 obj\n")
+        output.write(xref)
+        output.write(b"\nendobj\nstartxref\n%d\n%%%%EOF\n" % startxref)
+    return startxref
 
 
 def _malformed_stream_pdf(kind: str) -> RenderedPdf:
@@ -622,6 +966,192 @@ def generate_small(output: Path) -> dict:
     return manifest
 
 
+def _manifest_row(name: str, rendered: RenderedPdf, facts: dict) -> dict:
+    return {
+        "name": name,
+        "bytes": len(rendered.data),
+        "sha256": hashlib.sha256(rendered.data).hexdigest(),
+        "startxref": rendered.startxref,
+        "facts": facts,
+    }
+
+
+def _committed_objstm_dir() -> Path:
+    return Path(__file__).resolve().parent / "fixtures_pdf" / "objstm"
+
+
+def generate_objstm_container(output: Path) -> dict:
+    """Generate the dependency-free Gate 1 fixture set into caller-owned storage.
+
+    Malformed and boundary inputs intentionally stay outside the broad fidelity corpus.
+    The one encrypted artifact is copied from committed, hash-pinned bytes; regeneration
+    is a separate maintainer action so normal tests never import pikepdf or skip.
+    """
+    output.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for name, rendered, facts in _objstm_container_fixtures():
+        (output / name).write_bytes(rendered.data)
+        rows.append(_manifest_row(name, rendered, facts))
+
+    committed = _committed_objstm_dir()
+    encrypted_manifest = json.loads((committed / "manifest.json").read_text(encoding="utf-8"))
+    encrypted_row = encrypted_manifest["fixtures"][0]
+    if encrypted_row["name"] != OBJSTM_ENCRYPTED_NAME:
+        raise ValueError("committed ObjStm encrypted manifest has the wrong fixture name")
+    shutil.copyfile(committed / OBJSTM_ENCRYPTED_NAME, output / OBJSTM_ENCRYPTED_NAME)
+    rows.append(encrypted_row)
+
+    manifest = {"schema": 1, "profile": "objstm-container", "fixtures": rows}
+    (output / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return manifest
+
+
+def regenerate_objstm_encrypted(output: Path) -> dict:
+    """Maintainer-only deterministic R4/RC4 authority (pikepdf 10.7.3/qpdf 12.3.2).
+
+    Runtime Rust/Python authorities consume only the committed bytes and manifest.
+    """
+    try:
+        import pikepdf
+    except ImportError as error:
+        raise RuntimeError("encrypted ObjStm regeneration requires pinned pikepdf 10.7.3") from error
+    if pikepdf.__version__ != "10.7.3" or pikepdf.__libqpdf_version__ != "12.3.2":
+        raise RuntimeError(
+            "encrypted ObjStm regeneration requires pikepdf 10.7.3 with qpdf 12.3.2"
+        )
+
+    output.mkdir(parents=True, exist_ok=True)
+    plain = output / ".objstm-r4-rc4-plain.pdf"
+    target = output / OBJSTM_ENCRYPTED_NAME
+    rendered = _object_stream_pdf()
+    plain.write_bytes(rendered.data)
+    with pikepdf.open(plain) as pdf:
+        pdf.save(
+            target,
+            static_id=True,
+            object_stream_mode=pikepdf.ObjectStreamMode.generate,
+            encryption=pikepdf.Encryption(
+                owner=OBJSTM_ENCRYPTED_OWNER_PASSWORD,
+                user=OBJSTM_ENCRYPTED_USER_PASSWORD,
+                R=4,
+                aes=False,
+                metadata=False,
+            ),
+        )
+    plain.unlink()
+    raw = target.read_bytes()
+    marker = raw.rfind(b"startxref\n")
+    if marker < 0:
+        raise ValueError("encrypted ObjStm output has no startxref")
+    startxref = int(raw[marker + len(b"startxref\n"):].splitlines()[0])
+    row = {
+        "name": OBJSTM_ENCRYPTED_NAME,
+        "bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "startxref": startxref,
+        "facts": {
+            "containers": [2],
+            "encoding": "flate-encrypted-r4-rc4",
+            "encoded_lengths": [182],
+            "decoded_lengths": [252],
+            "encrypted": True,
+            "encryption_revision": 4,
+            "cipher": "RC4-128",
+            "encrypt_metadata": False,
+            "user_password": OBJSTM_ENCRYPTED_USER_PASSWORD,
+            "owner_password": OBJSTM_ENCRYPTED_OWNER_PASSWORD,
+            "xref_declarations": [
+                {"object": 3, "container": 2, "index": 0},
+                {"object": 4, "container": 2, "index": 1},
+                {"object": 5, "container": 2, "index": 2},
+                {"object": 6, "container": 2, "index": 3},
+            ],
+            "expected_preparation": "ready",
+            "storage": "committed-small",
+            "generator": "pikepdf-10.7.3/libqpdf-12.3.2",
+        },
+    }
+    manifest = {"schema": 1, "profile": "objstm-encrypted", "fixtures": [row]}
+    (output / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return manifest
+
+
+def generate_objstm_boundary(output: Path, variant: str) -> dict:
+    if variant not in OBJSTM_BOUNDARY_CASES:
+        raise ValueError(f"unknown ObjStm boundary variant: {variant}")
+    output.mkdir(parents=True, exist_ok=True)
+    declarations = {7: (6, 0)}
+    name = f"objstm-{variant}.pdf"
+    path = output / name
+
+    if variant in {"encoded-over-64m", "encoded-within-cap-truncated"}:
+        declared = 64 * 1024 * 1024 + 1 if variant == "encoded-over-64m" else 64 * 1024 * 1024
+        payload = b"7 0 (truncated-boundary)"
+        body = _raw_stream(
+            payload,
+            b"/Type /ObjStm /N 1 /First 4",
+            length=str(declared).encode("ascii"),
+            suffix=b"",
+        )
+        rendered = _render_one_objstm(body, declarations=declarations)
+        path.write_bytes(rendered.data)
+        startxref = rendered.startxref
+        encoded_length = declared
+        decoded_length = 0
+        expected = "stream-limit-above-64m" if variant == "encoded-over-64m" else "truncated-within-cap"
+    elif variant == "flate-growth":
+        decoded_length = 64 * 1024 * 1024 + 1
+        encoded = _deflate_prefixed_repeated(b"7 0 ", ord("A"), decoded_length)
+        rendered = _render_one_objstm(
+            _stream(encoded, b"/Type /ObjStm /N 1 /First 4 /Filter /FlateDecode"),
+            declarations=declarations,
+        )
+        path.write_bytes(rendered.data)
+        startxref = rendered.startxref
+        encoded_length = len(encoded)
+        expected = "decompressed-growth-above-64m"
+    else:
+        payload_lengths = {
+            "plain-cache-below": 32 * 1024 * 1024 - 128 * 1024,
+            "plain-cache-above": 32 * 1024 * 1024 + 128 * 1024,
+            "plain-cap-edge": 48 * 1024 * 1024,
+        }
+        decoded_length = payload_lengths[variant]
+        encoded_length = decoded_length
+        startxref = _write_single_objstm_streaming(path, decoded_length)
+        expected = {
+            "plain-cache-below": "retained-below-32m-candidate",
+            "plain-cache-above": "retained-above-32m-candidate",
+            "plain-cap-edge": "observed-peak-boundary",
+        }[variant]
+
+    row = {
+        "name": name,
+        "bytes": path.stat().st_size,
+        "sha256": _sha256_file(path),
+        "startxref": startxref,
+        "facts": {
+            "containers": [6],
+            "encoding": "flate" if variant == "flate-growth" else "plain",
+            "encoded_lengths": [encoded_length],
+            "decoded_lengths": [decoded_length],
+            "xref_declarations": [{"object": 7, "container": 6, "index": 0}],
+            "expected_preparation": expected,
+            "storage": "on-demand-large",
+            "output_retained_by_generator": False,
+        },
+    }
+    manifest = {"schema": 1, "profile": "objstm-boundary", "fixtures": [row]}
+    (output / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return manifest
+
+
 def generate_scale(output: Path, axis: str, count: int) -> dict:
     if axis not in SCALE_AXES:
         raise ValueError(f"unknown scale axis: {axis}")
@@ -774,19 +1304,22 @@ def verify(output: Path) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("generate", "verify"))
+    parser.add_argument("command", choices=("generate", "verify", "regenerate-encrypted"))
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument(
-        "--profile", choices=("small", "scale", "image", "semantic"), default="small"
+        "--profile", choices=("small", "scale", "image", "semantic", "objstm-container", "objstm-boundary"), default="small"
     )
     parser.add_argument("--axis", choices=SCALE_AXES)
     parser.add_argument("--count", type=int)
     parser.add_argument("--variant", choices=IMAGE_VARIANTS)
     parser.add_argument("--semantic", choices=SEMANTIC_VARIANTS)
+    parser.add_argument("--objstm-boundary", choices=OBJSTM_BOUNDARY_CASES)
     parser.add_argument("--dimension", type=int, default=4096)
     args = parser.parse_args()
     if args.command == "verify":
         manifest = verify(args.out)
+    elif args.command == "regenerate-encrypted":
+        manifest = regenerate_objstm_encrypted(args.out)
     elif args.profile == "small":
         manifest = generate_small(args.out)
     elif args.profile == "scale":
@@ -797,10 +1330,16 @@ def main() -> None:
         if args.variant is None or args.count is None:
             parser.error("image generation requires --variant and --count")
         manifest = generate_image(args.out, args.variant, args.count, args.dimension)
-    else:
+    elif args.profile == "semantic":
         if args.semantic is None or args.count is None:
             parser.error("semantic generation requires --semantic and --count")
         manifest = generate_semantic(args.out, args.semantic, args.count)
+    elif args.profile == "objstm-container":
+        manifest = generate_objstm_container(args.out)
+    else:
+        if args.objstm_boundary is None:
+            parser.error("ObjStm boundary generation requires --objstm-boundary")
+        manifest = generate_objstm_boundary(args.out, args.objstm_boundary)
     print(json.dumps({"profile": manifest["profile"], "fixtures": len(manifest["fixtures"])}, sort_keys=True))
 
 

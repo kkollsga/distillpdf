@@ -275,11 +275,10 @@
     "clone-call|0afc43439fabe5066c531e7ffeaa5d204052fb4c4515b1f9cb4e2822731da585|Arc :: clone (& self . inner)",
     "clone-call|10445af3c33f0f2f1135d6ec360e2aa64e5f89bcc1a6b77df777a5284053333b|permit . clone ()",
     "clone-call|124a25063462f14277dbad12ac9a1da9d2dfba550eb748ee4e014a88fad83357|Arc :: clone (error)",
-    "clone-call|124a25063462f14277dbad12ac9a1da9d2dfba550eb748ee4e014a88fad83357|Arc :: clone (error)",
     "clone-call|2423f463d068a96ebef612de60368a2db7b356e8c00b946826341e9646c2978f|broker_cancellation . clone ()",
-    "clone-call|2f35cde4118699a3e4c32d625c9c3ba3709aad5aaa164804bb4d911db56e51ba|error . as_ref () . clone ()",
     "clone-call|477a923d6a35e7ffe8477aa5e2f562cab04148b6232df786613dc2a844d25303|lock (& self . domain . close_hooks) . clone ()",
-    "clone-call|4af9d597e3738d8605d9a76d5247de47f9b714372713e249f19d56b5bb6996f2|error . error . clone ()",
+    "clone-call|5212232d9eddd8c10c00096a876ff41ce4d1d8f22e0ef2933e0fa9d7eb53c046|error . clone ()",
+    "clone-call|5212232d9eddd8c10c00096a876ff41ce4d1d8f22e0ef2933e0fa9d7eb53c046|error . clone ()",
     "clone-call|6ba20bffa417198d9f18e1b9e2a3a1b63e140b64cdf6fe9da5271fada2e8fd95|domain . cells . get (& key) . cloned ()",
     "clone-call|6dae916db431aa687fc615ef22ce0950d78b23d9ae8f913648ce3d18dadbff78|lock (& self . wait_hooks) . clone ()",
     "clone-call|82a04b1da320c1103fc14fc05914403825fbcffcd73d1bb154c1a6f0ba70f118|Arc :: clone (owner)",
@@ -291,10 +290,12 @@
     "clone-call|a22a9619fb782192aeae868709426e0cf00211167f5d74a80068565e5a2f8079|Arc :: clone (& cell)",
     "clone-call|bc39bd0a8ff20187244278c4fdc89784ce6fb5fb15fbac6573bbd6beb88a1e4a|Arc :: clone (self)",
     "clone-call|bc39bd0a8ff20187244278c4fdc89784ce6fb5fb15fbac6573bbd6beb88a1e4a|Arc :: clone (self)",
+    "clone-call|bd3b3842532b48b19599171d6561c3ed509da99849d9c529c2e73c7fbe3e4de0|control . clone ()",
+    "clone-call|bd3b3842532b48b19599171d6561c3ed509da99849d9c529c2e73c7fbe3e4de0|control . clone ()",
+    "clone-call|c386b95de0b722a606b62dff22bc0999f907c05dab5c97265f94449d5e649727|lock (& self . leader_phase_hooks) . clone ()",
     "clone-call|debf76422aac53af28c130721ae0373350faefa8f5224c60ea693e6c3fcf448b|BudgetBroker :: production () . clone ()",
     "clone-call|e007a17925a47c2e6e43e96d87fbe7d6fcae7d82cbe3537a14529806669702f8|Arc :: clone (& owner)",
-    "clone-call|e007a17925a47c2e6e43e96d87fbe7d6fcae7d82cbe3537a14529806669702f8|Arc :: clone (& owner)",
-    "clone-call|ebfa0b8c68a29c1b6197aefa209c18b0677d243b99eef1aa4e8f08c113a1cf51|failure . clone ()"
+    "clone-call|e007a17925a47c2e6e43e96d87fbe7d6fcae7d82cbe3537a14529806669702f8|Arc :: clone (& owner)"
   ],
   "ocr/doctags.rs": [
     "clone-call|1b328262b779300ca6b82ac4de0be39372984529ad9b979980367c9268878af6|name . clone ()",

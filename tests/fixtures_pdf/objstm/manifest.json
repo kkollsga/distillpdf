@@ -1,0 +1,55 @@
+{
+  "fixtures": [
+    {
+      "bytes": 1128,
+      "facts": {
+        "cipher": "RC4-128",
+        "containers": [
+          2
+        ],
+        "decoded_lengths": [
+          252
+        ],
+        "encoded_lengths": [
+          182
+        ],
+        "encoding": "flate-encrypted-r4-rc4",
+        "encrypt_metadata": false,
+        "encrypted": true,
+        "encryption_revision": 4,
+        "expected_preparation": "ready",
+        "generator": "pikepdf-10.7.3/libqpdf-12.3.2",
+        "owner_password": "owner",
+        "storage": "committed-small",
+        "user_password": "",
+        "xref_declarations": [
+          {
+            "container": 2,
+            "index": 0,
+            "object": 3
+          },
+          {
+            "container": 2,
+            "index": 1,
+            "object": 4
+          },
+          {
+            "container": 2,
+            "index": 2,
+            "object": 5
+          },
+          {
+            "container": 2,
+            "index": 3,
+            "object": 6
+          }
+        ]
+      },
+      "name": "objstm-r4-rc4.pdf",
+      "sha256": "afadac4e544281ce0abf12f459f1927da983469a2cc40c2a0c1f7d26f2894694",
+      "startxref": 817
+    }
+  ],
+  "profile": "objstm-encrypted",
+  "schema": 1
+}

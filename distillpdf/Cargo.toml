@@ -26,7 +26,7 @@ tesseract = ["dep:cmake", "dep:whatlang"]
 # eager adapter remains the active route through L2, while L3 consumes the indexed
 # reader behind distillPDF's owned DocumentAccess boundary.
 # Temporary local owner-required pin to independently reviewed lopdf commit
-# ecd4458ddae931198430b9e28ac800702b6b55d6; replace with its public SHA only after approval.
+# 6abf008; replace with its public SHA only after approval.
 lopdf = { path = "../../lopdf-lazy-engine" }
 # Independent Flate validation (`pdfobj::flate_incomplete`). lopdf swallows its own zlib
 # error and returns the partial output, so a TRUNCATED stream reports Ok and renders short

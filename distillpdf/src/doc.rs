@@ -1176,7 +1176,10 @@ pub(crate) mod tests {
     use super::*;
     use crate::access::tests::{AccessCounts, FaultAccess, FaultPoint};
     use crate::access::AccessKind;
-    use lopdf::{dictionary, Object};
+    use lopdf::{
+        dictionary, IndexedObjectLocation, IndexedReader, IndexedReaderError, IndexedReaderOptions,
+        Object, ScalarResolutionPermit,
+    };
     use std::io::{Seek, Write};
     use std::process::Command;
     use std::sync::atomic::Ordering;
@@ -1248,6 +1251,319 @@ pub(crate) mod tests {
             .status()
             .expect("run deterministic lazy fixture generator");
         assert!(status.success(), "lazy fixture generation failed");
+    }
+
+    fn objstm_reader(path: &Path) -> IndexedReader {
+        let raw = std::fs::read(path).unwrap();
+        IndexedReader::open(BytesSource::from(raw)).unwrap()
+    }
+
+    fn prepare_objstm(
+        reader: &IndexedReader,
+        container: lopdf::ObjectId,
+    ) -> Result<(u64, u64), IndexedReaderError> {
+        let permit = ScalarResolutionPermit::new(64 * 1024 * 1024);
+        match reader.prepare_object_stream_with_permit(container, &permit) {
+            Ok(owner) => {
+                let retained = owner.retained_bytes();
+                let stats = permit.stats();
+                assert_eq!(owner.container_id(), container);
+                assert_eq!(stats.current_bytes, retained);
+                assert!(stats.peak_bytes <= 64 * 1024 * 1024);
+                drop(owner);
+                assert_eq!(permit.close().unwrap().current_bytes, 0);
+                Ok((retained, stats.peak_bytes))
+            }
+            Err(error) => {
+                assert_eq!(permit.close().unwrap().current_bytes, 0);
+                Err(error)
+            }
+        }
+    }
+
+    fn assert_objstm_reader_cache_neutral(reader: &IndexedReader, case: &str) {
+        assert_eq!(reader.cache_stats(), Default::default(), "{case}");
+        assert_eq!(reader.object_cache_stats(), Default::default(), "{case}");
+        assert_eq!(
+            reader.object_stream_cache_stats(),
+            Default::default(),
+            "{case}"
+        );
+    }
+
+    struct ObjStmTracingSource {
+        bytes: Arc<[u8]>,
+        requests: Mutex<Vec<(u64, usize)>>,
+    }
+
+    impl RandomAccessSource for ObjStmTracingSource {
+        fn len(&self) -> SourceResult<u64> {
+            u64::try_from(self.bytes.len()).map_err(|_| SourceError::RangeOverflow {
+                offset: 0,
+                length: u64::MAX,
+            })
+        }
+
+        fn read_at(&self, offset: u64, output: &mut [u8]) -> SourceResult<usize> {
+            let offset =
+                usize::try_from(offset).map_err(|_| SourceError::PlatformLimitExceeded {
+                    requested: offset,
+                    limit: usize::MAX as u64,
+                })?;
+            let length = output.len().min(self.bytes.len().saturating_sub(offset));
+            output[..length].copy_from_slice(&self.bytes[offset..offset + length]);
+            self.requests
+                .lock()
+                .unwrap()
+                .push((u64::try_from(offset).unwrap(), length));
+            Ok(length)
+        }
+    }
+
+    #[test]
+    fn l3b_gate1_objstm_fixture_manifest_and_direct_fork_oracles() {
+        let generated = GeneratedDir::new("objstm-gate1");
+        generate_lazy_fixtures(generated.path(), &["--profile", "objstm-container"]);
+        let actual_manifest =
+            std::fs::read_to_string(generated.path().join("manifest.json")).unwrap();
+        let frozen_manifest = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/oracles/l3b-objstm-container.json"
+        ))
+        .unwrap();
+        assert_eq!(actual_manifest, frozen_manifest);
+
+        let plain = objstm_reader(&generated.path().join("objstm-plain.pdf"));
+        let flate = objstm_reader(&generated.path().join("objstm-flate.pdf"));
+        for reader in [&plain, &flate] {
+            assert_eq!(
+                reader.object_location((7, 0)).unwrap(),
+                IndexedObjectLocation::Compressed {
+                    container: (6, 0),
+                    index: 0,
+                }
+            );
+            assert_objstm_reader_cache_neutral(reader, "plain/Flate before preparation");
+        }
+        let plain_facts = prepare_objstm(&plain, (6, 0)).unwrap();
+        let flate_facts = prepare_objstm(&flate, (6, 0)).unwrap();
+        assert!(plain_facts.0 > 0);
+        assert!(flate_facts.0 > 0);
+        assert_objstm_reader_cache_neutral(&plain, "plain after preparation");
+        assert_objstm_reader_cache_neutral(&flate, "Flate after preparation");
+
+        let two = objstm_reader(&generated.path().join("objstm-two-containers.pdf"));
+        assert!(prepare_objstm(&two, (6, 0)).is_ok());
+        assert!(prepare_objstm(&two, (9, 0)).is_ok());
+        assert_objstm_reader_cache_neutral(&two, "two independent containers");
+
+        let encrypted = objstm_reader(&generated.path().join("objstm-r4-rc4.pdf"));
+        let encrypted_compressed: Vec<_> = encrypted
+            .object_ids()
+            .into_iter()
+            .filter_map(|id| match encrypted.object_location(id).unwrap() {
+                IndexedObjectLocation::Compressed { container, index } => {
+                    Some((id, container, index))
+                }
+                IndexedObjectLocation::Normal => None,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            encrypted_compressed,
+            vec![
+                ((3, 0), (2, 0), 0),
+                ((4, 0), (2, 0), 1),
+                ((5, 0), (2, 0), 2),
+                ((6, 0), (2, 0), 3),
+            ]
+        );
+        assert!(prepare_objstm(&encrypted, (2, 0)).is_ok());
+        assert_objstm_reader_cache_neutral(&encrypted, "encrypted preparation");
+
+        let cases = [
+            "objstm-container-nonstream.pdf",
+            "objstm-first-missing.pdf",
+            "objstm-first-negative.pdf",
+            "objstm-first-past-end.pdf",
+            "objstm-n-missing.pdf",
+            "objstm-n-negative.pdf",
+            "objstm-n-over-131072.pdf",
+            "objstm-filter-chain.pdf",
+            "objstm-predictor.pdf",
+            "objstm-flate-corrupt.pdf",
+            "objstm-length-missing.pdf",
+            "objstm-length-negative.pdf",
+            "objstm-length-indirect-missing.pdf",
+            "objstm-endstream-missing.pdf",
+            "objstm-endstream-truncated.pdf",
+        ];
+        for name in cases {
+            let reader = objstm_reader(&generated.path().join(name));
+            let error = prepare_objstm(&reader, (6, 0)).unwrap_err();
+            match name {
+                "objstm-container-nonstream.pdf" => assert!(matches!(
+                    error,
+                    IndexedReaderError::ObjectStreamContainerNotStream {
+                        id: (6, 0),
+                        container: (6, 0),
+                    }
+                )),
+                "objstm-first-missing.pdf" | "objstm-first-negative.pdf" => match error {
+                    IndexedReaderError::ObjectStreamMember {
+                        id: (6, 0),
+                        container: (6, 0),
+                        index: 0,
+                        source: lopdf::Error::InvalidObjectStream(detail),
+                    } => assert_eq!(detail, "invalid object stream /First"),
+                    other => panic!("{name}: {other:?}"),
+                },
+                "objstm-first-past-end.pdf" => assert!(matches!(
+                    error,
+                    IndexedReaderError::ObjectStreamMember {
+                        id: (6, 0),
+                        container: (6, 0),
+                        index: 0,
+                        source: lopdf::Error::InvalidOffset(52),
+                    }
+                )),
+                "objstm-n-missing.pdf" | "objstm-n-negative.pdf" | "objstm-n-over-131072.pdf" => {
+                    match error {
+                        IndexedReaderError::ObjectStreamMember {
+                            id: (6, 0),
+                            container: (6, 0),
+                            index: 0,
+                            source: lopdf::Error::InvalidObjectStream(detail),
+                        } => assert_eq!(detail, "invalid object stream /N"),
+                        other => panic!("{name}: {other:?}"),
+                    }
+                }
+                "objstm-filter-chain.pdf" | "objstm-predictor.pdf" => assert!(matches!(
+                    error,
+                    IndexedReaderError::UnsupportedBoundedScalar {
+                        id: (6, 0),
+                        reason:
+                            "object-stream filter chains or predictors outside plain/FlateDecode",
+                    }
+                )),
+                "objstm-flate-corrupt.pdf" => match error {
+                    IndexedReaderError::ObjectStreamMember {
+                        id: (6, 0),
+                        container: (6, 0),
+                        index: 0,
+                        source: lopdf::Error::InvalidObjectStream(detail),
+                    } => assert_eq!(detail, "selected object stream member is not present"),
+                    other => panic!("{name}: {other:?}"),
+                },
+                "objstm-length-missing.pdf"
+                | "objstm-length-negative.pdf"
+                | "objstm-length-indirect-missing.pdf" => assert!(matches!(
+                    error,
+                    IndexedReaderError::UnsupportedBoundedScalar {
+                        id: (6, 0),
+                        reason: "object streams without a bounded nonnegative /Length",
+                    }
+                )),
+                "objstm-endstream-missing.pdf" | "objstm-endstream-truncated.pdf" => {
+                    assert!(matches!(
+                        error,
+                        IndexedReaderError::MissingEndstream { id: (6, 0) }
+                    ))
+                }
+                _ => unreachable!(),
+            }
+            assert_objstm_reader_cache_neutral(&reader, name);
+        }
+
+        let generation = objstm_reader(&generated.path().join("objstm-container-generation.pdf"));
+        assert!(matches!(
+            prepare_objstm(&generation, (6, 1)),
+            Err(IndexedReaderError::GenerationMismatch {
+                id: (6, 1),
+                indexed: 0,
+            })
+        ));
+        assert_objstm_reader_cache_neutral(&generation, "container generation mismatch");
+
+        let authority_raw: Arc<[u8]> =
+            std::fs::read(generated.path().join("objstm-xref-authority.pdf"))
+                .unwrap()
+                .into();
+        let duplicate_start = authority_raw
+            .windows(b"6 0 obj\n".len())
+            .position(|window| window == b"6 0 obj\n")
+            .unwrap();
+        let selected_start = authority_raw
+            .windows(b"10 0 obj\n".len())
+            .position(|window| window == b"10 0 obj\n")
+            .unwrap();
+        let selected_end = authority_raw
+            .windows(b"11 0 obj\n".len())
+            .position(|window| window == b"11 0 obj\n")
+            .unwrap();
+        assert!(duplicate_start < selected_start && selected_start < selected_end);
+        let duplicate_interval = duplicate_start as u64..selected_start as u64;
+        let selected_interval = selected_start as u64..selected_end as u64;
+        let source = Arc::new(ObjStmTracingSource {
+            bytes: Arc::clone(&authority_raw),
+            requests: Mutex::new(Vec::new()),
+        });
+        let erased: Arc<dyn RandomAccessSource> = source.clone();
+        let authority =
+            IndexedReader::open_shared(erased, IndexedReaderOptions::default()).unwrap();
+        assert_eq!(
+            authority.object_location((7, 0)).unwrap(),
+            IndexedObjectLocation::Compressed {
+                container: (10, 0),
+                index: 0,
+            }
+        );
+        source.requests.lock().unwrap().clear();
+        let permit = ScalarResolutionPermit::new(64 * 1024 * 1024);
+        let prepared = authority
+            .prepare_object_stream_with_permit((10, 0), &permit)
+            .unwrap();
+        assert_eq!(prepared.container_id(), (10, 0));
+        assert_eq!(permit.stats().current_bytes, prepared.retained_bytes());
+        let reads_after_prepare = source.requests.lock().unwrap().len();
+        let selected = prepared.resolve_member((7, 0), 0).unwrap();
+        assert_eq!(selected.as_object().as_str().unwrap(), b"compressed-value");
+        assert_eq!(source.requests.lock().unwrap().len(), reads_after_prepare);
+        let requests = source.requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        assert!(
+            requests.iter().all(|(offset, returned)| {
+                let end = offset
+                    .checked_add(u64::try_from(*returned).unwrap())
+                    .expect("traced returned interval must not overflow");
+                end <= duplicate_interval.start || *offset >= duplicate_interval.end
+            }),
+            "declared container preparation returned bytes from the undeclared duplicate interval \
+             {duplicate_interval:?}: {requests:?}"
+        );
+        assert!(
+            requests.iter().all(|(offset, returned)| {
+                let end = offset
+                    .checked_add(u64::try_from(*returned).unwrap())
+                    .expect("traced returned interval must not overflow");
+                *offset >= selected_interval.start && end <= selected_interval.end
+            }),
+            "declared container preparation returned bytes outside the selected container interval \
+             {selected_interval:?}: {requests:?}"
+        );
+        assert!(
+            requests.iter().any(|(offset, returned)| {
+                let end = offset.saturating_add(u64::try_from(*returned).unwrap());
+                *offset < selected_interval.end && end > selected_interval.start
+            }),
+            "selected container interval {selected_interval:?} was never returned: {requests:?}"
+        );
+        drop(requests);
+        drop(selected);
+        assert_eq!(permit.stats().current_bytes, prepared.retained_bytes());
+        drop(prepared);
+        assert_eq!(permit.close().unwrap().current_bytes, 0);
+        assert_objstm_reader_cache_neutral(&authority, "xref-authoritative selected container");
     }
 
     fn indexed_outcome(

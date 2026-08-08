@@ -6,7 +6,8 @@
 //! explicitly owned.  The eager implementation remains the compatibility oracle through L9.
 
 use crate::object_cells::{
-    CellLoadError, NegativeDisposition, ObjectCellArena, ObjectCellDomain, ResolvedObjectPin,
+    CellLoadError, ContainerCellError, NegativeDisposition, ObjectCellArena, ObjectCellDomain,
+    ResolvedObjectPin, ResolvedObjectStreamPin,
 };
 use lopdf::{
     BoundedObject, BytesSource, DecompressError, Dictionary, Document, IndexedObjectLocation,
@@ -96,6 +97,8 @@ struct RecoveryBudget {
     limit: u64,
     used: Mutex<u64>,
     available: Condvar,
+    #[cfg(test)]
+    wait_entered: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
 }
 
 impl RecoveryBudget {
@@ -104,7 +107,14 @@ impl RecoveryBudget {
             limit,
             used: Mutex::new(0),
             available: Condvar::new(),
+            #[cfg(test)]
+            wait_entered: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    fn set_wait_entered(&self, sender: std::sync::mpsc::SyncSender<()>) {
+        *self.wait_entered.lock().unwrap() = Some(sender);
     }
 
     fn acquire(&'static self, bytes: u64) -> Result<RecoveryCharge, SourceFailure> {
@@ -118,6 +128,10 @@ impl RecoveryBudget {
             SourceFailure::new(SourceFailureKind::Backend, "recovery budget lock poisoned")
         })?;
         while used.saturating_add(bytes) > self.limit {
+            #[cfg(test)]
+            if let Some(sender) = self.wait_entered.lock().unwrap().take() {
+                sender.send(()).unwrap();
+            }
             used = self.available.wait(used).map_err(|_| {
                 SourceFailure::new(SourceFailureKind::Backend, "recovery budget lock poisoned")
             })?;
@@ -800,6 +814,18 @@ pub(crate) struct IndexedAdapterCounters {
     pub(crate) object_failures: AtomicU64,
     pub(crate) active_resolutions: AtomicU64,
     pub(crate) peak_active_resolutions: AtomicU64,
+    pub(crate) container_preparations: AtomicU64,
+    pub(crate) container_preparation_successes: AtomicU64,
+    pub(crate) container_preparation_failures: AtomicU64,
+    pub(crate) container_persistent_native_failures: AtomicU64,
+    pub(crate) container_persistent_above_cap_failures: AtomicU64,
+    pub(crate) container_flight_only_failures: AtomicU64,
+    pub(crate) container_exact_key_invariant_failures: AtomicU64,
+    pub(crate) active_container_preparations: AtomicU64,
+    pub(crate) peak_active_container_preparations: AtomicU64,
+    pub(crate) initial_container_permit_current_bytes: AtomicU64,
+    pub(crate) initial_container_permit_peak_bytes: AtomicU64,
+    pub(crate) peak_container_permit_bytes: AtomicU64,
     pub(crate) retained_object_estimated_bytes: AtomicU64,
     pub(crate) peak_retained_object_estimated_bytes: AtomicU64,
     pub(crate) retained_object_admitted_bytes: AtomicU64,
@@ -810,6 +836,67 @@ pub(crate) struct IndexedAdapterCounters {
     pub(crate) index_estimated_bytes: AtomicU64,
     pub(crate) index_objects: AtomicU64,
     pub(crate) index_pages: AtomicU64,
+}
+
+struct IndexedContainerAttempt<'a> {
+    counters: &'a IndexedAdapterCounters,
+}
+
+impl<'a> IndexedContainerAttempt<'a> {
+    fn start(counters: &'a IndexedAdapterCounters) -> Self {
+        counters
+            .container_preparations
+            .fetch_add(1, Ordering::Relaxed);
+        let active = counters
+            .active_container_preparations
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        counters
+            .peak_active_container_preparations
+            .fetch_max(active, Ordering::Relaxed);
+        Self { counters }
+    }
+
+    fn record_peak(&self, peak_bytes: u64) {
+        self.counters
+            .peak_container_permit_bytes
+            .fetch_max(peak_bytes, Ordering::Relaxed);
+    }
+
+    fn record_success(&self) {
+        self.counters
+            .container_preparation_successes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_failure(&self, class: crate::objstm_failures::ObjStmFailureClass) {
+        use crate::objstm_failures::ObjStmFailureClass;
+
+        self.counters
+            .container_preparation_failures
+            .fetch_add(1, Ordering::Relaxed);
+        let counter = match class {
+            ObjStmFailureClass::PersistentNative => {
+                &self.counters.container_persistent_native_failures
+            }
+            ObjStmFailureClass::PersistentAboveCap => {
+                &self.counters.container_persistent_above_cap_failures
+            }
+            ObjStmFailureClass::FlightOnly => &self.counters.container_flight_only_failures,
+            ObjStmFailureClass::ExactKeyInvariant => {
+                &self.counters.container_exact_key_invariant_failures
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for IndexedContainerAttempt<'_> {
+    fn drop(&mut self) {
+        self.counters
+            .active_container_preparations
+            .fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 fn indexed_object_exclusive() -> &'static Mutex<()> {
@@ -1624,6 +1711,39 @@ impl IndexedDocumentAdapter {
         Arc::clone(&self.counters)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn prepare_declared_object_stream(
+        &self,
+        container: ObjectId,
+    ) -> Result<ResolvedObjectStreamPin, ContainerCellError> {
+        self.object_cells
+            .resolve_object_stream(container, |permit| {
+                let initial = permit.stats();
+                self.counters
+                    .initial_container_permit_current_bytes
+                    .store(initial.current_bytes, Ordering::Relaxed);
+                self.counters
+                    .initial_container_permit_peak_bytes
+                    .store(initial.peak_bytes, Ordering::Relaxed);
+                let attempt = IndexedContainerAttempt::start(&self.counters);
+                let result = self
+                    .reader
+                    .prepare_object_stream_with_permit(container, permit);
+                attempt.record_peak(permit.stats().peak_bytes);
+                match result {
+                    Ok(owner) => {
+                        attempt.record_success();
+                        Ok(owner)
+                    }
+                    Err(error) => {
+                        let failure = crate::objstm_failures::classify(container, error);
+                        attempt.record_failure(failure.class());
+                        Err(CellLoadError::objstm(failure))
+                    }
+                }
+            })
+    }
+
     fn cached_page_map(&self) -> Result<Arc<PageMap>, AccessError> {
         self.page_map
             .get_or_init(|| {
@@ -2121,7 +2241,9 @@ pub(crate) mod tests {
     use super::*;
     use lopdf::dictionary;
     use lopdf::SourceError;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
     #[derive(Default)]
     pub(crate) struct AccessCounts {
@@ -2140,6 +2262,224 @@ pub(crate) mod tests {
         inner: Arc<dyn RandomAccessSource>,
         counts: Arc<AccessCounts>,
         fail_reads: bool,
+    }
+
+    #[derive(Default)]
+    struct ObjStmBlockState {
+        armed: bool,
+        blocked: bool,
+        released: bool,
+    }
+
+    struct ObjStmBlockControl {
+        state: Arc<(Mutex<ObjStmBlockState>, Condvar)>,
+        reads: Arc<AtomicU64>,
+        failure: Arc<AtomicU8>,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[repr(u8)]
+    enum ObjStmSourceFailure {
+        None = 0,
+        Changed = 1,
+        Io = 2,
+    }
+
+    impl ObjStmBlockControl {
+        fn arm(&self, failure: ObjStmSourceFailure) {
+            self.failure.store(failure as u8, Ordering::Release);
+            let (state, _) = &*self.state;
+            let mut state = state.lock().unwrap();
+            state.armed = true;
+            state.blocked = false;
+            state.released = false;
+        }
+
+        fn wait_until_blocked(&self) {
+            let (state, wake) = &*self.state;
+            let mut state = state.lock().unwrap();
+            while !state.blocked {
+                state = wake.wait(state).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            let (state, wake) = &*self.state;
+            let mut state = state.lock().unwrap();
+            state.released = true;
+            wake.notify_all();
+        }
+
+        fn reads(&self) -> u64 {
+            self.reads.load(Ordering::Relaxed)
+        }
+
+        fn clear_failure(&self) {
+            self.failure
+                .store(ObjStmSourceFailure::None as u8, Ordering::Release);
+        }
+    }
+
+    struct ObjStmBlockingSource {
+        bytes: Arc<[u8]>,
+        control: Arc<ObjStmBlockControl>,
+    }
+
+    impl RandomAccessSource for ObjStmBlockingSource {
+        fn len(&self) -> SourceResult<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+
+        fn read_at(&self, offset: u64, out: &mut [u8]) -> SourceResult<usize> {
+            self.control.reads.fetch_add(1, Ordering::Relaxed);
+            let (state, wake) = &*self.control.state;
+            let mut state = state.lock().unwrap();
+            if state.armed && !state.blocked {
+                state.blocked = true;
+                wake.notify_all();
+                while !state.released {
+                    state = wake.wait(state).unwrap();
+                }
+            }
+            drop(state);
+            match self.control.failure.load(Ordering::Acquire) {
+                value if value == ObjStmSourceFailure::Changed as u8 => {
+                    return Err(SourceError::SourceChanged);
+                }
+                value if value == ObjStmSourceFailure::Io as u8 => {
+                    return Err(SourceError::Io(std::io::Error::other(
+                        "injected object-stream positioned I/O failure",
+                    )));
+                }
+                _ => {}
+            }
+            let start =
+                usize::try_from(offset).map_err(|_| SourceError::PlatformLimitExceeded {
+                    requested: offset,
+                    limit: usize::MAX as u64,
+                })?;
+            let take = out.len().min(self.bytes.len().saturating_sub(start));
+            out[..take].copy_from_slice(&self.bytes[start..start + take]);
+            Ok(take)
+        }
+
+        fn validate_unchanged(&self) -> SourceResult<()> {
+            match self.control.failure.load(Ordering::Acquire) {
+                value if value == ObjStmSourceFailure::Changed as u8 => {
+                    Err(SourceError::SourceChanged)
+                }
+                value if value == ObjStmSourceFailure::Io as u8 => Err(SourceError::Io(
+                    std::io::Error::other("injected object-stream validation I/O failure"),
+                )),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    fn blocking_objstm_source(
+        bytes: Arc<[u8]>,
+    ) -> (Arc<dyn RandomAccessSource>, Arc<ObjStmBlockControl>) {
+        let control = Arc::new(ObjStmBlockControl {
+            state: Arc::new((Mutex::new(ObjStmBlockState::default()), Condvar::new())),
+            reads: Arc::new(AtomicU64::new(0)),
+            failure: Arc::new(AtomicU8::new(ObjStmSourceFailure::None as u8)),
+        });
+        let source: Arc<dyn RandomAccessSource> = Arc::new(ObjStmBlockingSource {
+            bytes,
+            control: Arc::clone(&control),
+        });
+        (source, control)
+    }
+
+    struct ObjStmWaitBarrier {
+        id: ObjectId,
+        target: usize,
+        attached: Mutex<usize>,
+        removed: AtomicU64,
+        wake: Condvar,
+    }
+
+    impl ObjStmWaitBarrier {
+        fn new(id: ObjectId, target: usize) -> Arc<Self> {
+            Arc::new(Self {
+                id,
+                target,
+                attached: Mutex::new(0),
+                removed: AtomicU64::new(0),
+                wake: Condvar::new(),
+            })
+        }
+
+        fn wait_until_attached(&self) {
+            let mut attached = self.attached.lock().unwrap();
+            while *attached < self.target {
+                attached = self.wake.wait(attached).unwrap();
+            }
+            assert_eq!(*attached, self.target);
+        }
+
+        fn assert_balanced(&self) {
+            assert_eq!(self.removed.load(Ordering::Relaxed), self.target as u64);
+        }
+    }
+
+    impl crate::object_cells::WaitEdgeHooks for ObjStmWaitBarrier {
+        fn add(&self, _epoch: u64, id: ObjectId, _generation: u64, _ordinal: u64) {
+            if id != self.id {
+                return;
+            }
+            let mut attached = self.attached.lock().unwrap();
+            *attached += 1;
+            assert!(*attached <= self.target);
+            self.wake.notify_all();
+        }
+
+        fn remove(&self, _epoch: u64, id: ObjectId, _generation: u64, _ordinal: u64) {
+            if id == self.id {
+                self.removed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    struct AccessGeneratedDir(PathBuf);
+
+    impl AccessGeneratedDir {
+        fn new(label: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "distillpdf-gate3-access-{}-{label}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for AccessGeneratedDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn generate_objstm_fixtures(output: &Path, arguments: &[&str]) {
+        let generator = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/lazy_engine_fixtures.py"
+        );
+        let status = Command::new("python3")
+            .arg(generator)
+            .arg("generate")
+            .arg("--out")
+            .arg(output)
+            .args(arguments)
+            .status()
+            .expect("run deterministic ObjStm fixture generator");
+        assert!(status.success(), "ObjStm fixture generation failed");
     }
 
     impl RandomAccessSource for CountingSource {
@@ -2767,24 +3107,19 @@ pub(crate) mod tests {
 
         let budget: &'static RecoveryBudget = Box::leak(Box::new(RecoveryBudget::new(10)));
         let first = budget.acquire(7).unwrap();
-        let started = Arc::new(std::sync::Barrier::new(2));
-        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (wait_tx, wait_rx) = std::sync::mpsc::sync_channel(0);
+        budget.set_wait_entered(wait_tx);
         let child = {
             let child_budget = budget;
-            let started = Arc::clone(&started);
-            let finished = Arc::clone(&finished);
             std::thread::spawn(move || {
-                started.wait();
                 let _second = child_budget.acquire(6).unwrap();
-                finished.store(true, Ordering::Release);
             })
         };
-        started.wait();
-        std::thread::yield_now();
-        assert!(!finished.load(Ordering::Acquire));
+        wait_rx.recv().unwrap();
+        assert_eq!(*budget.used.lock().unwrap(), 7);
         drop(first);
         child.join().unwrap();
-        assert!(finished.load(Ordering::Acquire));
+        assert_eq!(*budget.used.lock().unwrap(), 0);
     }
 
     #[test]
@@ -2856,6 +3191,233 @@ pub(crate) mod tests {
         let bytes: Arc<[u8]> = Arc::from(raw);
         let source: Arc<dyn RandomAccessSource> = Arc::new(BytesSource::new(bytes));
         IndexedDocumentAdapter::open(source, password.map(Vec::from)).unwrap()
+    }
+
+    fn indexed_object_stream_fixture() -> Vec<u8> {
+        let mut document = Document::with_version("1.7");
+        let pages = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => Vec::<Object>::new(), "Count" => 0,
+        }));
+        let catalog = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Catalog", "Pages" => Object::Reference(pages),
+        }));
+        document.add_object(Object::Dictionary(dictionary! {
+            "Producer" => "declared-container-adapter",
+        }));
+        document.trailer.set("Root", Object::Reference(catalog));
+        let options = lopdf::SaveOptions::builder()
+            .use_object_streams(true)
+            .use_xref_streams(true)
+            .build();
+        let mut raw = Vec::new();
+        document.save_with_options(&mut raw, options).unwrap();
+        raw
+    }
+
+    fn first_declared_container(adapter: &IndexedDocumentAdapter) -> ObjectId {
+        adapter
+            .reader
+            .object_ids()
+            .into_iter()
+            .find_map(|id| match adapter.reader.object_location(id) {
+                Some(IndexedObjectLocation::Compressed { container, .. }) => Some(container),
+                _ => None,
+            })
+            .expect("fixture must declare a compressed object")
+    }
+
+    fn assert_representation_counter_sums(snapshot: &crate::object_cells::ObjectCellSnapshot) {
+        macro_rules! assert_sum {
+            ($field:ident) => {
+                assert_eq!(
+                    snapshot.$field,
+                    snapshot.raw.$field + snapshot.containers.$field + snapshot.members.$field,
+                    concat!("aggregate ", stringify!($field))
+                );
+            };
+        }
+        assert_sum!(calls);
+        assert_sum!(loads);
+        assert_sum!(hits);
+        assert_sum!(waits);
+        assert_sum!(negative_hits);
+        assert_sum!(transient_shares);
+        assert_sum!(bypasses);
+        assert_sum!(evictions);
+        assert_sum!(cancellations);
+    }
+
+    fn assert_member_counters_zero(snapshot: &crate::object_cells::ObjectCellSnapshot) {
+        assert_eq!(snapshot.members.calls, 0);
+        assert_eq!(snapshot.members.loads, 0);
+        assert_eq!(snapshot.members.hits, 0);
+        assert_eq!(snapshot.members.waits, 0);
+        assert_eq!(snapshot.members.negative_hits, 0);
+        assert_eq!(snapshot.members.transient_shares, 0);
+        assert_eq!(snapshot.members.bypasses, 0);
+        assert_eq!(snapshot.members.evictions, 0);
+        assert_eq!(snapshot.members.cancellations, 0);
+    }
+
+    fn assert_container_delta(
+        baseline: &crate::object_cells::ObjectCellSnapshot,
+        snapshot: &crate::object_cells::ObjectCellSnapshot,
+        expected: crate::object_cells::RepresentationSnapshot,
+    ) {
+        let actual = crate::object_cells::RepresentationSnapshot {
+            calls: snapshot.containers.calls - baseline.containers.calls,
+            loads: snapshot.containers.loads - baseline.containers.loads,
+            hits: snapshot.containers.hits - baseline.containers.hits,
+            waits: snapshot.containers.waits - baseline.containers.waits,
+            negative_hits: snapshot.containers.negative_hits - baseline.containers.negative_hits,
+            transient_shares: snapshot.containers.transient_shares
+                - baseline.containers.transient_shares,
+            bypasses: snapshot.containers.bypasses - baseline.containers.bypasses,
+            evictions: snapshot.containers.evictions - baseline.containers.evictions,
+            cancellations: snapshot.containers.cancellations - baseline.containers.cancellations,
+        };
+        assert_eq!(actual, expected);
+        assert_eq!(snapshot.raw, baseline.raw);
+        assert_eq!(snapshot.members, baseline.members);
+        assert_representation_counter_sums(snapshot);
+    }
+
+    fn assert_declared_container_route_neutral(adapter: &IndexedDocumentAdapter) {
+        assert_eq!(adapter.reader.cache_stats(), Default::default());
+        assert_eq!(adapter.reader.object_cache_stats(), Default::default());
+        assert_eq!(
+            adapter.reader.object_stream_cache_stats(),
+            Default::default()
+        );
+        let counters = adapter.counters();
+        assert_eq!(counters.object_resolutions.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.object_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.active_resolutions.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.peak_active_resolutions.load(Ordering::Relaxed), 0);
+        assert_eq!(*provisional_o_budget().used.lock().unwrap(), 0);
+    }
+
+    fn assert_one_successful_container_preparation(
+        adapter: &IndexedDocumentAdapter,
+        expected_peak_permit_bytes: u64,
+    ) {
+        let counters = adapter.counters();
+        assert_eq!(counters.container_preparations.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            counters
+                .container_preparation_successes
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters
+                .container_preparation_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .container_persistent_native_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .container_persistent_above_cap_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .container_flight_only_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .container_exact_key_invariant_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .active_container_preparations
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .peak_active_container_preparations
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters
+                .initial_container_permit_current_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .initial_container_permit_peak_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters.peak_container_permit_bytes.load(Ordering::Relaxed),
+            expected_peak_permit_bytes
+        );
+    }
+
+    fn assert_no_o_or_completion_change(
+        baseline: &crate::broker::BrokerSnapshot,
+        snapshot: &crate::broker::BrokerSnapshot,
+    ) {
+        assert_eq!(snapshot.oversize_bytes, baseline.oversize_bytes);
+        assert_eq!(snapshot.peak_oversize_bytes, baseline.peak_oversize_bytes);
+        assert_eq!(
+            snapshot.completion_reserve_bytes,
+            baseline.completion_reserve_bytes
+        );
+        assert_eq!(
+            snapshot.peak_completion_reserve_bytes,
+            baseline.peak_completion_reserve_bytes
+        );
+        assert_eq!(snapshot.oversize_owners, baseline.oversize_owners);
+    }
+
+    fn assert_broker_current_equal(
+        baseline: &crate::broker::BrokerSnapshot,
+        snapshot: &crate::broker::BrokerSnapshot,
+    ) {
+        assert_eq!(snapshot.normal_limit_bytes, baseline.normal_limit_bytes);
+        assert_eq!(snapshot.normal_payload_bytes, baseline.normal_payload_bytes);
+        assert_eq!(
+            snapshot.normal_in_flight_estimate_bytes,
+            baseline.normal_in_flight_estimate_bytes
+        );
+        assert_eq!(snapshot.metadata_bytes, baseline.metadata_bytes);
+        assert_eq!(
+            snapshot.completion_reserve_bytes,
+            baseline.completion_reserve_bytes
+        );
+        assert_eq!(snapshot.oversize_bytes, baseline.oversize_bytes);
+        assert_eq!(snapshot.aggregate_bytes, baseline.aggregate_bytes);
+        assert_eq!(snapshot.queued, baseline.queued);
+        assert_eq!(snapshot.in_flight, baseline.in_flight);
+        assert_eq!(snapshot.live_request_records, baseline.live_request_records);
+        assert_eq!(snapshot.error_metadata_bytes, baseline.error_metadata_bytes);
+        assert_eq!(
+            snapshot.reservation_metadata_bytes,
+            baseline.reservation_metadata_bytes
+        );
+        assert_eq!(snapshot.oversize_owners, baseline.oversize_owners);
+        assert_eq!(snapshot.cache_bytes, baseline.cache_bytes);
+        assert_eq!(snapshot.pin_bytes, baseline.pin_bytes);
+        assert_eq!(snapshot.bypass_bytes, baseline.bypass_bytes);
+        assert_eq!(snapshot.active_operations, baseline.active_operations);
+        assert_eq!(snapshot.invariant_failed, baseline.invariant_failed);
+        assert_eq!(snapshot.closed, baseline.closed);
     }
 
     fn differential_document() -> (Document, Vec<u8>, ObjectId) {
@@ -3224,8 +3786,2190 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn indexed_declared_container_preparation_is_cache_neutral_and_raw_isolated() {
+        let _test_lock = indexed_test_lock();
+        let raw = indexed_object_stream_fixture();
+        let adapter = indexed(&raw, None);
+        let container = first_declared_container(&adapter);
+        assert_eq!(adapter.reader.cache_stats(), Default::default());
+        assert_eq!(adapter.reader.object_cache_stats(), Default::default());
+        assert_eq!(
+            adapter.reader.object_stream_cache_stats(),
+            Default::default()
+        );
+
+        let first = match adapter.prepare_declared_object_stream(container) {
+            Ok(pin) => pin,
+            Err(_) => panic!("declared container preparation must succeed"),
+        };
+        assert_eq!(first.as_object_stream().container_id(), container);
+        let second = match adapter.prepare_declared_object_stream(container) {
+            Ok(pin) => pin,
+            Err(_) => panic!("declared container hit must succeed"),
+        };
+        assert!(std::ptr::eq(
+            first.as_object_stream(),
+            second.as_object_stream()
+        ));
+
+        let counters = adapter.counters();
+        assert_eq!(counters.container_preparations.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            counters
+                .container_preparation_successes
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters
+                .container_preparation_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .active_container_preparations
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .peak_active_container_preparations
+                .load(Ordering::Relaxed),
+            1
+        );
+        let peak = counters.peak_container_permit_bytes.load(Ordering::Relaxed);
+        assert!(peak > 0);
+        assert!(peak <= INDEXED_STREAM_BYTES);
+        assert_eq!(counters.object_resolutions.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.object_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.active_resolutions.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.peak_active_resolutions.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            counters
+                .retained_object_admitted_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(adapter.reader.cache_stats(), Default::default());
+        assert_eq!(adapter.reader.object_cache_stats(), Default::default());
+        assert_eq!(
+            adapter.reader.object_stream_cache_stats(),
+            Default::default()
+        );
+    }
+
+    #[test]
+    fn indexed_declared_container_single_flight_diagnostics_are_exact() {
+        let _test_lock = indexed_test_lock();
+        let generated = AccessGeneratedDir::new("positive");
+        generate_objstm_fixtures(generated.path(), &["--profile", "objstm-container"]);
+        let committed_r4 = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures_pdf/objstm/objstm-r4-rc4.pdf"
+        );
+        let cases = [
+            ("plain", generated.path().join("objstm-plain.pdf")),
+            ("Flate", generated.path().join("objstm-flate.pdf")),
+            ("R4 RC4", PathBuf::from(committed_r4)),
+        ];
+        for (case, path) in cases {
+            let raw: Arc<[u8]> = Arc::from(std::fs::read(path).unwrap());
+            for callers in [2_usize, 4, 16] {
+                let broker_baseline = crate::broker::BudgetBroker::production().snapshot();
+                let (source, control) = blocking_objstm_source(Arc::clone(&raw));
+                let adapter = Arc::new(IndexedDocumentAdapter::open(source, None).unwrap());
+                let container = first_declared_container(&adapter);
+                let waiters = ObjStmWaitBarrier::new(container, callers - 1);
+                adapter.object_cells.set_wait_hooks(waiters.clone());
+                let baseline = adapter.object_cells.snapshot();
+                let broker_open = crate::broker::BudgetBroker::production().snapshot();
+                assert_eq!(
+                    broker_open.active_operations,
+                    broker_baseline.active_operations + 1
+                );
+                assert_no_o_or_completion_change(&broker_baseline, &broker_open);
+                assert_eq!(*provisional_o_budget().used.lock().unwrap(), 0);
+                control.arm(ObjStmSourceFailure::None);
+
+                let leader_adapter = Arc::clone(&adapter);
+                let leader = std::thread::spawn(move || {
+                    leader_adapter.prepare_declared_object_stream(container)
+                });
+                control.wait_until_blocked();
+                let broker_blocked = crate::broker::BudgetBroker::production().snapshot();
+                let blocked_cells = adapter.object_cells.snapshot();
+                let loading_metadata = blocked_cells.cache_bytes - baseline.cache_bytes;
+                assert_eq!(
+                    broker_blocked.normal_in_flight_estimate_bytes,
+                    broker_open.normal_in_flight_estimate_bytes + INDEXED_STREAM_BYTES,
+                    "{case}, {callers} callers"
+                );
+                assert_eq!(
+                    broker_blocked.normal_payload_bytes,
+                    broker_open.normal_payload_bytes + loading_metadata + INDEXED_STREAM_BYTES,
+                    "{case}, {callers} callers"
+                );
+                assert_eq!(
+                    broker_blocked.metadata_bytes,
+                    broker_open.metadata_bytes + crate::broker::QUEUE_METADATA_WEIGHT
+                );
+                assert_eq!(
+                    broker_blocked.completion_reserve_bytes,
+                    broker_open.completion_reserve_bytes
+                );
+                assert_eq!(broker_blocked.oversize_bytes, broker_open.oversize_bytes);
+                assert_eq!(
+                    broker_blocked.aggregate_bytes,
+                    broker_open.aggregate_bytes
+                        + loading_metadata
+                        + INDEXED_STREAM_BYTES
+                        + crate::broker::QUEUE_METADATA_WEIGHT
+                );
+                assert_eq!(
+                    broker_blocked.cache_bytes,
+                    broker_open.cache_bytes + loading_metadata
+                );
+                assert_eq!(broker_blocked.pin_bytes, broker_open.pin_bytes);
+                assert_eq!(broker_blocked.bypass_bytes, broker_open.bypass_bytes);
+                assert_eq!(
+                    broker_blocked.peak_normal_bytes,
+                    broker_open
+                        .peak_normal_bytes
+                        .max(broker_blocked.normal_payload_bytes + broker_blocked.metadata_bytes)
+                );
+                assert_eq!(
+                    broker_blocked.peak_aggregate_bytes,
+                    broker_open
+                        .peak_aggregate_bytes
+                        .max(broker_blocked.aggregate_bytes)
+                );
+                assert_eq!(
+                    broker_blocked.peak_cache_bytes,
+                    broker_open.peak_cache_bytes.max(broker_blocked.cache_bytes)
+                );
+                assert_eq!(broker_blocked.peak_pin_bytes, broker_open.peak_pin_bytes);
+                assert_eq!(
+                    broker_blocked.peak_bypass_bytes,
+                    broker_open
+                        .peak_bypass_bytes
+                        .max(broker_open.bypass_bytes + loading_metadata)
+                );
+                let fresh_permit = adapter
+                    .object_cells
+                    .active_container_permit_stats(container)
+                    .expect("blocked leader owns a fresh container permit");
+                assert_eq!(
+                    adapter
+                        .counters()
+                        .initial_container_permit_current_bytes
+                        .load(Ordering::Relaxed),
+                    0
+                );
+                assert_eq!(
+                    adapter
+                        .counters()
+                        .initial_container_permit_peak_bytes
+                        .load(Ordering::Relaxed),
+                    0
+                );
+                assert_eq!(fresh_permit.limit_bytes, INDEXED_STREAM_BYTES);
+                assert_eq!(fresh_permit.current_bytes, 256);
+                assert_eq!(fresh_permit.peak_bytes, 256);
+                assert_eq!(fresh_permit.reservations, 1);
+                assert!(!fresh_permit.cancelled);
+                assert!(!fresh_permit.closed);
+                assert_no_o_or_completion_change(&broker_open, &broker_blocked);
+                assert_eq!(*provisional_o_budget().used.lock().unwrap(), 0);
+
+                let mut followers = Vec::new();
+                for _ in 1..callers {
+                    let adapter = Arc::clone(&adapter);
+                    followers.push(std::thread::spawn(move || {
+                        adapter.prepare_declared_object_stream(container)
+                    }));
+                }
+                waiters.wait_until_attached();
+                control.release();
+
+                let mut pins = Vec::new();
+                pins.push(match leader.join().unwrap() {
+                    Ok(pin) => pin,
+                    Err(_) => panic!("elected preparation must succeed"),
+                });
+                for follower in followers {
+                    pins.push(match follower.join().unwrap() {
+                        Ok(pin) => pin,
+                        Err(_) => panic!("attached container waiter must succeed"),
+                    });
+                }
+                let owner = pins[0].as_object_stream() as *const _;
+                assert!(pins
+                    .iter()
+                    .all(|pin| std::ptr::eq(owner, pin.as_object_stream())));
+
+                let after_flight = adapter.object_cells.snapshot();
+                assert_eq!(
+                    after_flight.containers.calls - baseline.containers.calls,
+                    callers as u64,
+                    "{case}, {callers} callers"
+                );
+                assert_eq!(after_flight.containers.loads - baseline.containers.loads, 1);
+                assert_eq!(after_flight.containers.hits - baseline.containers.hits, 0);
+                assert_eq!(
+                    after_flight.containers.waits - baseline.containers.waits,
+                    (callers - 1) as u64
+                );
+                assert_eq!(
+                    after_flight.containers.negative_hits - baseline.containers.negative_hits,
+                    0
+                );
+                assert_eq!(
+                    after_flight.containers.transient_shares - baseline.containers.transient_shares,
+                    0
+                );
+                assert_eq!(
+                    after_flight.containers.bypasses - baseline.containers.bypasses,
+                    0
+                );
+                assert_eq!(
+                    after_flight.containers.evictions - baseline.containers.evictions,
+                    0
+                );
+                assert_eq!(
+                    after_flight.containers.cancellations - baseline.containers.cancellations,
+                    0
+                );
+                assert_member_counters_zero(&after_flight);
+                assert_representation_counter_sums(&after_flight);
+                let broker_published = crate::broker::BudgetBroker::production().snapshot();
+                let (retained, retained_permit, broker_charge) = adapter
+                    .object_cells
+                    .container_retained_evidence(container)
+                    .expect("published container retains its exact permit and charge");
+                let retained_stats = retained_permit.stats();
+                assert_eq!(retained_stats.current_bytes, retained);
+                assert_eq!(broker_charge, retained);
+                assert_eq!(
+                    broker_published.normal_in_flight_estimate_bytes,
+                    broker_open.normal_in_flight_estimate_bytes
+                );
+                let published_weight = after_flight.cache_bytes - baseline.cache_bytes;
+                assert_eq!(
+                    broker_published.normal_payload_bytes,
+                    broker_open.normal_payload_bytes + published_weight
+                );
+                assert_eq!(broker_published.metadata_bytes, broker_open.metadata_bytes);
+                assert_eq!(
+                    broker_published.completion_reserve_bytes,
+                    broker_open.completion_reserve_bytes
+                );
+                assert_eq!(broker_published.oversize_bytes, broker_open.oversize_bytes);
+                assert_eq!(
+                    broker_published.aggregate_bytes,
+                    broker_open.aggregate_bytes + published_weight
+                );
+                assert_eq!(
+                    broker_published.cache_bytes,
+                    broker_open.cache_bytes + published_weight - broker_charge
+                );
+                assert_eq!(
+                    broker_published.pin_bytes,
+                    broker_open.pin_bytes + broker_charge
+                );
+                assert_eq!(broker_published.bypass_bytes, broker_open.bypass_bytes);
+                assert_eq!(
+                    broker_published.peak_normal_bytes,
+                    broker_blocked.peak_normal_bytes
+                );
+                assert_eq!(
+                    broker_published.peak_aggregate_bytes,
+                    broker_blocked.peak_aggregate_bytes
+                );
+                assert_eq!(
+                    broker_published.peak_cache_bytes,
+                    broker_blocked
+                        .peak_cache_bytes
+                        .max(broker_open.cache_bytes + published_weight)
+                );
+                assert_eq!(
+                    broker_published.peak_pin_bytes,
+                    broker_open.peak_pin_bytes.max(broker_published.pin_bytes)
+                );
+                assert_eq!(
+                    broker_published.peak_bypass_bytes,
+                    broker_blocked.peak_bypass_bytes
+                );
+                assert_no_o_or_completion_change(&broker_open, &broker_published);
+                let reads_after_flight = control.reads();
+                let hit = match adapter.prepare_declared_object_stream(container) {
+                    Ok(pin) => pin,
+                    Err(_) => panic!("sequential container hit must succeed"),
+                };
+                assert!(std::ptr::eq(owner, hit.as_object_stream()));
+                assert_eq!(control.reads(), reads_after_flight);
+
+                let final_snapshot = adapter.object_cells.snapshot();
+                assert_eq!(
+                    final_snapshot.containers.calls - baseline.containers.calls,
+                    callers as u64 + 1
+                );
+                assert_eq!(
+                    final_snapshot.containers.loads - baseline.containers.loads,
+                    1
+                );
+                assert_eq!(final_snapshot.containers.hits - baseline.containers.hits, 1);
+                assert_eq!(
+                    final_snapshot.containers.waits - baseline.containers.waits,
+                    (callers - 1) as u64
+                );
+                assert_eq!(
+                    final_snapshot.containers.negative_hits - baseline.containers.negative_hits,
+                    0
+                );
+                assert_eq!(
+                    final_snapshot.containers.transient_shares
+                        - baseline.containers.transient_shares,
+                    0
+                );
+                assert_eq!(
+                    final_snapshot.containers.bypasses - baseline.containers.bypasses,
+                    0
+                );
+                assert_eq!(
+                    final_snapshot.containers.evictions - baseline.containers.evictions,
+                    0
+                );
+                assert_eq!(
+                    final_snapshot.containers.cancellations - baseline.containers.cancellations,
+                    0
+                );
+                assert_member_counters_zero(&final_snapshot);
+                assert_representation_counter_sums(&final_snapshot);
+                let counters = adapter.counters();
+                assert_eq!(counters.container_preparations.load(Ordering::Relaxed), 1);
+                assert_eq!(
+                    counters
+                        .container_preparation_successes
+                        .load(Ordering::Relaxed),
+                    1
+                );
+                assert_eq!(
+                    counters
+                        .container_preparation_failures
+                        .load(Ordering::Relaxed),
+                    0
+                );
+                assert_eq!(
+                    counters
+                        .active_container_preparations
+                        .load(Ordering::Relaxed),
+                    0
+                );
+                assert_eq!(
+                    counters
+                        .peak_active_container_preparations
+                        .load(Ordering::Relaxed),
+                    1
+                );
+                assert_eq!(counters.object_resolutions.load(Ordering::Relaxed), 0);
+                assert_eq!(counters.object_failures.load(Ordering::Relaxed), 0);
+                assert_eq!(adapter.reader.cache_stats(), Default::default());
+                assert_eq!(adapter.reader.object_cache_stats(), Default::default());
+                assert_eq!(
+                    adapter.reader.object_stream_cache_stats(),
+                    Default::default()
+                );
+                assert_eq!(*provisional_o_budget().used.lock().unwrap(), 0);
+                drop(hit);
+                drop(pins);
+                drop(adapter);
+                assert_eq!(retained_permit.stats().current_bytes, 0);
+                assert_eq!(
+                    retained_permit.stats().peak_bytes,
+                    retained_stats.peak_bytes
+                );
+                let broker_drained = crate::broker::BudgetBroker::production().snapshot();
+                assert_broker_current_equal(&broker_baseline, &broker_drained);
+                assert_eq!(
+                    broker_drained.aggregate_bytes,
+                    broker_baseline.aggregate_bytes
+                );
+                assert_eq!(
+                    broker_drained.normal_payload_bytes,
+                    broker_baseline.normal_payload_bytes
+                );
+                assert_eq!(
+                    broker_drained.normal_in_flight_estimate_bytes,
+                    broker_baseline.normal_in_flight_estimate_bytes
+                );
+                assert_eq!(
+                    broker_drained.metadata_bytes,
+                    broker_baseline.metadata_bytes
+                );
+                assert_eq!(broker_drained.cache_bytes, broker_baseline.cache_bytes);
+                assert_eq!(broker_drained.pin_bytes, broker_baseline.pin_bytes);
+                assert_eq!(broker_drained.bypass_bytes, broker_baseline.bypass_bytes);
+                assert_eq!(
+                    broker_drained.active_operations,
+                    broker_baseline.active_operations
+                );
+                assert_eq!(broker_drained.queued, broker_baseline.queued);
+                assert_eq!(broker_drained.in_flight, broker_baseline.in_flight);
+                assert_no_o_or_completion_change(&broker_baseline, &broker_drained);
+                assert_eq!(*provisional_o_budget().used.lock().unwrap(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_declared_container_prepares_committed_r4_rc4_fixture() {
+        let _test_lock = indexed_test_lock();
+        let raw = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures_pdf/objstm/objstm-r4-rc4.pdf"
+        ))
+        .unwrap();
+        let adapter = indexed(&raw, None);
+        assert_eq!(
+            adapter.reader.object_location((3, 0)),
+            Some(IndexedObjectLocation::Compressed {
+                container: (2, 0),
+                index: 0,
+            })
+        );
+        let pin = match adapter.prepare_declared_object_stream((2, 0)) {
+            Ok(pin) => pin,
+            Err(_) => panic!("committed encrypted container must prepare"),
+        };
+        assert_eq!(pin.as_object_stream().container_id(), (2, 0));
+
+        let counters = adapter.counters();
+        assert_eq!(counters.container_preparations.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            counters
+                .container_preparation_successes
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters
+                .container_preparation_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(counters.object_resolutions.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.object_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(adapter.reader.cache_stats(), Default::default());
+        assert_eq!(adapter.reader.object_cache_stats(), Default::default());
+        assert_eq!(
+            adapter.reader.object_stream_cache_stats(),
+            Default::default()
+        );
+    }
+
+    #[test]
+    fn real_container_cache_boundary_is_cache_below_and_bypass_above() {
+        const CACHE_TARGET_BYTES: u64 = 32 * 1024 * 1024;
+        const BELOW_BYTES: usize = 33_424_113;
+        const BELOW_SHA256: &str =
+            "c3f723fdae1022e20240309f01d1de77460debc3f2d8cd15aee576cfb2e82d6c";
+        const BELOW_RETAINED: u64 = 33_423_376;
+        const BELOW_PEAK: u64 = 33_424_552;
+        const ABOVE_BYTES: usize = 33_686_257;
+        const ABOVE_SHA256: &str =
+            "aa4206ba1fba2505b81798098980921344dd407018f469639cda8d22132a99b7";
+        const ABOVE_RETAINED: u64 = 33_685_520;
+        const ABOVE_PEAK: u64 = 33_686_696;
+
+        let _test_lock = indexed_test_lock();
+        for (variant, expected_bytes, expected_sha, expected_retained, expected_peak) in [
+            (
+                "plain-cache-below",
+                BELOW_BYTES,
+                BELOW_SHA256,
+                BELOW_RETAINED,
+                BELOW_PEAK,
+            ),
+            (
+                "plain-cache-above",
+                ABOVE_BYTES,
+                ABOVE_SHA256,
+                ABOVE_RETAINED,
+                ABOVE_PEAK,
+            ),
+        ] {
+            let generated = AccessGeneratedDir::new(variant);
+            generate_objstm_fixtures(
+                generated.path(),
+                &["--profile", "objstm-boundary", "--objstm-boundary", variant],
+            );
+            let raw =
+                std::fs::read(generated.path().join(format!("objstm-{variant}.pdf"))).unwrap();
+            assert_eq!(raw.len(), expected_bytes);
+            assert_eq!(format!("{:x}", Sha256::digest(&raw)), expected_sha);
+
+            let raw: Arc<[u8]> = Arc::from(raw);
+            let broker_baseline = crate::broker::BudgetBroker::production().snapshot();
+            let (source, control) = blocking_objstm_source(Arc::clone(&raw));
+            let adapter = Arc::new(IndexedDocumentAdapter::open(source, None).unwrap());
+            let container = (6, 0);
+            assert_eq!(first_declared_container(&adapter), container);
+            let epoch = adapter.object_cells.epoch();
+            let cell_baseline = adapter.object_cells.snapshot();
+            let broker_open = crate::broker::BudgetBroker::production().snapshot();
+            assert_eq!(
+                broker_open.active_operations,
+                broker_baseline.active_operations + 1
+            );
+            assert!(broker_open.operations.contains_key(&epoch));
+            assert_no_o_or_completion_change(&broker_baseline, &broker_open);
+
+            if variant == "plain-cache-below" {
+                let first = adapter.prepare_declared_object_stream(container).unwrap();
+                let first_pointer = first.as_object_stream() as *const _;
+                let (retained, retained_permit, charge) = first.retained_evidence();
+                let retained_stats = retained_permit.stats();
+                assert_eq!(retained, expected_retained);
+                assert_eq!(charge, expected_retained);
+                assert_eq!(retained_stats.current_bytes, expected_retained);
+                assert_eq!(retained_stats.peak_bytes, expected_peak);
+                assert_eq!(retained_stats.limit_bytes, INDEXED_STREAM_BYTES);
+                assert!(expected_peak < INDEXED_STREAM_BYTES);
+
+                let published = adapter.object_cells.snapshot();
+                let complete_weight = published.cache_bytes - cell_baseline.cache_bytes;
+                assert!(complete_weight > expected_retained);
+                assert!(complete_weight <= CACHE_TARGET_BYTES);
+                assert_eq!(published.cells, cell_baseline.cells + 1);
+                assert_eq!(published.ready, cell_baseline.ready + 1);
+                assert_container_delta(
+                    &cell_baseline,
+                    &published,
+                    crate::object_cells::RepresentationSnapshot {
+                        calls: 1,
+                        loads: 1,
+                        ..Default::default()
+                    },
+                );
+                let published_broker = crate::broker::BudgetBroker::production().snapshot();
+                let open_operation = &broker_open.operations[&epoch];
+                let published_operation = &published_broker.operations[&epoch];
+                assert_eq!(published_operation.pin_bytes, expected_retained);
+                assert_eq!(published_operation.bypass_bytes, 0);
+                assert_eq!(published_operation.self_pinned_bytes, expected_retained);
+                assert_eq!(
+                    published_operation.cache_bytes,
+                    open_operation.cache_bytes + complete_weight - expected_retained
+                );
+                assert_eq!(
+                    published_broker.normal_payload_bytes,
+                    broker_open.normal_payload_bytes + complete_weight
+                );
+                assert_eq!(
+                    published_broker.cache_bytes,
+                    broker_open.cache_bytes + complete_weight - expected_retained
+                );
+                assert_eq!(
+                    published_broker.pin_bytes,
+                    broker_open.pin_bytes + expected_retained
+                );
+                assert_eq!(published_broker.bypass_bytes, broker_open.bypass_bytes);
+                assert_no_o_or_completion_change(&broker_open, &published_broker);
+                assert_declared_container_route_neutral(&adapter);
+
+                drop(first);
+                assert_eq!(retained_permit.stats().current_bytes, expected_retained);
+                let reads_before_hit = control.reads();
+                let hit = adapter.prepare_declared_object_stream(container).unwrap();
+                assert!(std::ptr::eq(first_pointer, hit.as_object_stream()));
+                assert_eq!(control.reads(), reads_before_hit);
+                let hit_snapshot = adapter.object_cells.snapshot();
+                assert_container_delta(
+                    &cell_baseline,
+                    &hit_snapshot,
+                    crate::object_cells::RepresentationSnapshot {
+                        calls: 2,
+                        loads: 1,
+                        hits: 1,
+                        ..Default::default()
+                    },
+                );
+                assert_eq!(
+                    adapter
+                        .counters()
+                        .peak_container_permit_bytes
+                        .load(Ordering::Relaxed),
+                    expected_peak
+                );
+                assert_declared_container_route_neutral(&adapter);
+                drop(hit);
+                drop(adapter);
+                assert_eq!(retained_permit.stats().current_bytes, 0);
+            } else {
+                assert!(expected_retained > CACHE_TARGET_BYTES);
+                assert!(expected_retained < INDEXED_STREAM_BYTES);
+                let waiters = ObjStmWaitBarrier::new(container, 1);
+                adapter.object_cells.set_wait_hooks(waiters.clone());
+                control.arm(ObjStmSourceFailure::None);
+                let leader_adapter = Arc::clone(&adapter);
+                let leader = std::thread::spawn(move || {
+                    leader_adapter.prepare_declared_object_stream(container)
+                });
+                control.wait_until_blocked();
+                let follower_adapter = Arc::clone(&adapter);
+                let follower = std::thread::spawn(move || {
+                    follower_adapter.prepare_declared_object_stream(container)
+                });
+                waiters.wait_until_attached();
+                control.release();
+                let leader_pin = leader.join().unwrap().unwrap();
+                let follower_pin = follower.join().unwrap().unwrap();
+                waiters.assert_balanced();
+                assert!(std::ptr::eq(
+                    leader_pin.as_object_stream(),
+                    follower_pin.as_object_stream()
+                ));
+                let (retained, retained_permit, charge) = leader_pin.retained_evidence();
+                assert_eq!(retained, expected_retained);
+                assert_eq!(charge, expected_retained);
+                assert_eq!(retained_permit.stats().current_bytes, expected_retained);
+                assert_eq!(retained_permit.stats().peak_bytes, expected_peak);
+                assert_eq!(retained_permit.stats().limit_bytes, INDEXED_STREAM_BYTES);
+
+                let first_flight = adapter.object_cells.snapshot();
+                assert!(!adapter.object_cells.has_container_cell(container));
+                assert_eq!(first_flight.cells, cell_baseline.cells);
+                assert_eq!(first_flight.cache_bytes, cell_baseline.cache_bytes);
+                assert_container_delta(
+                    &cell_baseline,
+                    &first_flight,
+                    crate::object_cells::RepresentationSnapshot {
+                        calls: 2,
+                        loads: 1,
+                        waits: 1,
+                        bypasses: 1,
+                        ..Default::default()
+                    },
+                );
+                let bypassed = crate::broker::BudgetBroker::production().snapshot();
+                let bypass_operation = &bypassed.operations[&epoch];
+                assert_eq!(
+                    bypass_operation.cache_bytes,
+                    broker_open.operations[&epoch].cache_bytes
+                );
+                assert_eq!(bypass_operation.pin_bytes, 0);
+                assert_eq!(bypass_operation.bypass_bytes, expected_retained);
+                assert_eq!(bypass_operation.self_pinned_bytes, expected_retained);
+                assert_eq!(bypassed.cache_bytes, broker_open.cache_bytes);
+                assert_eq!(bypassed.pin_bytes, broker_open.pin_bytes);
+                assert_eq!(
+                    bypassed.bypass_bytes,
+                    broker_open.bypass_bytes + expected_retained
+                );
+                assert_eq!(
+                    bypassed.normal_payload_bytes,
+                    broker_open.normal_payload_bytes + expected_retained
+                );
+                assert_no_o_or_completion_change(&broker_open, &bypassed);
+                assert_declared_container_route_neutral(&adapter);
+
+                drop(follower_pin);
+                drop(leader_pin);
+                assert_eq!(retained_permit.stats().current_bytes, 0);
+                let released = crate::broker::BudgetBroker::production().snapshot();
+                assert_broker_current_equal(&broker_open, &released);
+                assert!(!adapter.object_cells.has_container_cell(container));
+
+                let reload = adapter.prepare_declared_object_stream(container).unwrap();
+                let (_, reload_permit, reload_charge) = reload.retained_evidence();
+                assert_eq!(retained_permit.stats().current_bytes, 0);
+                assert_eq!(reload_charge, expected_retained);
+                assert_eq!(reload_permit.stats().current_bytes, expected_retained);
+                assert_eq!(reload_permit.stats().peak_bytes, expected_peak);
+                let reloaded = adapter.object_cells.snapshot();
+                assert!(!adapter.object_cells.has_container_cell(container));
+                assert_container_delta(
+                    &cell_baseline,
+                    &reloaded,
+                    crate::object_cells::RepresentationSnapshot {
+                        calls: 3,
+                        loads: 2,
+                        waits: 1,
+                        bypasses: 2,
+                        ..Default::default()
+                    },
+                );
+                assert_eq!(
+                    adapter
+                        .counters()
+                        .peak_container_permit_bytes
+                        .load(Ordering::Relaxed),
+                    expected_peak
+                );
+                assert_eq!(
+                    adapter
+                        .counters()
+                        .container_preparations
+                        .load(Ordering::Relaxed),
+                    2
+                );
+                assert_eq!(
+                    adapter
+                        .counters()
+                        .container_preparation_successes
+                        .load(Ordering::Relaxed),
+                    2
+                );
+                assert_declared_container_route_neutral(&adapter);
+                drop(reload);
+                assert_eq!(reload_permit.stats().current_bytes, 0);
+                assert_broker_current_equal(
+                    &broker_open,
+                    &crate::broker::BudgetBroker::production().snapshot(),
+                );
+                drop(adapter);
+            }
+
+            assert_eq!(*provisional_o_budget().used.lock().unwrap(), 0);
+            let drained = crate::broker::BudgetBroker::production().snapshot();
+            assert_broker_current_equal(&broker_baseline, &drained);
+            assert_no_o_or_completion_change(&broker_baseline, &drained);
+        }
+    }
+
+    #[test]
+    fn committed_r4_container_owners_are_epoch_and_close_isolated() {
+        const R4_RETAINED: u64 = 428;
+        const R4_PEAK: u64 = 64 * 1024 * 1024;
+
+        let _test_lock = indexed_test_lock();
+        let raw: Arc<[u8]> = Arc::from(
+            std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../tests/fixtures_pdf/objstm/objstm-r4-rc4.pdf"
+            ))
+            .unwrap(),
+        );
+        let broker_baseline = crate::broker::BudgetBroker::production().snapshot();
+        let first_source: Arc<dyn RandomAccessSource> =
+            Arc::new(BytesSource::new(Arc::clone(&raw)));
+        let second_source: Arc<dyn RandomAccessSource> =
+            Arc::new(BytesSource::new(Arc::clone(&raw)));
+        let first = IndexedDocumentAdapter::open(first_source, None).unwrap();
+        let second = IndexedDocumentAdapter::open(second_source, None).unwrap();
+        let first_epoch = first.object_cells.epoch();
+        let second_epoch = second.object_cells.epoch();
+        assert_ne!(first_epoch, second_epoch);
+        let cell_baseline = first.object_cells.snapshot();
+
+        let first_pin = first.prepare_declared_object_stream((2, 0)).unwrap();
+        let second_pin = second.prepare_declared_object_stream((2, 0)).unwrap();
+        assert_eq!(first_pin.as_object_stream().container_id(), (2, 0));
+        assert_eq!(second_pin.as_object_stream().container_id(), (2, 0));
+        assert!(!std::ptr::eq(
+            first_pin.as_object_stream(),
+            second_pin.as_object_stream()
+        ));
+        let first_member = first_pin
+            .as_object_stream()
+            .resolve_member((3, 0), 0)
+            .unwrap();
+        let second_member = second_pin
+            .as_object_stream()
+            .resolve_member((3, 0), 0)
+            .unwrap();
+        let expected_member = Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference((4, 0))],
+            "Count" => 1,
+        });
+        assert_eq!(first_member.as_object(), &expected_member);
+        assert_eq!(second_member.as_object(), &expected_member);
+        drop(first_member);
+        drop(second_member);
+
+        let (first_retained, first_permit, first_charge) = first_pin.retained_evidence();
+        let (second_retained, second_permit, second_charge) = second_pin.retained_evidence();
+        assert_eq!((first_retained, first_charge), (R4_RETAINED, R4_RETAINED));
+        assert_eq!((second_retained, second_charge), (R4_RETAINED, R4_RETAINED));
+        assert_eq!(first_permit.stats().current_bytes, R4_RETAINED);
+        assert_eq!(second_permit.stats().current_bytes, R4_RETAINED);
+        assert_eq!(first_permit.stats().peak_bytes, R4_PEAK);
+        assert_eq!(second_permit.stats().peak_bytes, R4_PEAK);
+
+        let published = crate::broker::BudgetBroker::production().snapshot();
+        assert_eq!(
+            published.active_operations,
+            broker_baseline.active_operations + 2
+        );
+        let first_operation = published.operations[&first_epoch].clone();
+        let second_operation = published.operations[&second_epoch].clone();
+        assert_eq!(first_operation.pin_bytes, R4_RETAINED);
+        assert_eq!(second_operation.pin_bytes, R4_RETAINED);
+        assert_eq!(first_operation.bypass_bytes, 0);
+        assert_eq!(second_operation.bypass_bytes, 0);
+        assert_eq!(first_operation.self_pinned_bytes, R4_RETAINED);
+        assert_eq!(second_operation.self_pinned_bytes, R4_RETAINED);
+        assert_eq!(first_operation, second_operation);
+        assert_no_o_or_completion_change(&broker_baseline, &published);
+        assert_one_successful_container_preparation(&first, R4_PEAK);
+        assert_one_successful_container_preparation(&second, R4_PEAK);
+        assert_declared_container_route_neutral(&first);
+        assert_declared_container_route_neutral(&second);
+
+        drop(first);
+        assert_eq!(first_pin.as_object_stream().container_id(), (2, 0));
+        assert_eq!(second_pin.as_object_stream().container_id(), (2, 0));
+        let after_first_close = crate::broker::BudgetBroker::production().snapshot();
+        assert_eq!(
+            after_first_close.operations[&first_epoch].pin_bytes,
+            R4_RETAINED
+        );
+        assert_eq!(after_first_close.operations[&first_epoch].cache_bytes, 0);
+        assert_eq!(
+            after_first_close.operations[&second_epoch],
+            second_operation
+        );
+        assert_eq!(second_permit.stats().current_bytes, R4_RETAINED);
+
+        drop(first_pin);
+        assert_eq!(first_permit.stats().current_bytes, 0);
+        let after_first_owner = crate::broker::BudgetBroker::production().snapshot();
+        assert!(!after_first_owner.operations.contains_key(&first_epoch));
+        assert_eq!(
+            after_first_owner.operations[&second_epoch],
+            second_operation
+        );
+        assert_eq!(
+            after_first_owner.active_operations,
+            broker_baseline.active_operations + 1
+        );
+
+        let second_pointer = second_pin.as_object_stream() as *const _;
+        let second_hit = second.prepare_declared_object_stream((2, 0)).unwrap();
+        assert!(std::ptr::eq(second_pointer, second_hit.as_object_stream()));
+        let final_cells = second.object_cells.snapshot();
+        assert_container_delta(
+            &cell_baseline,
+            &final_cells,
+            crate::object_cells::RepresentationSnapshot {
+                calls: 3,
+                loads: 2,
+                hits: 1,
+                ..Default::default()
+            },
+        );
+        assert_one_successful_container_preparation(&second, R4_PEAK);
+        assert_declared_container_route_neutral(&second);
+
+        drop(second_hit);
+        drop(second_pin);
+        assert_eq!(second_permit.stats().current_bytes, R4_RETAINED);
+        drop(second);
+        assert_eq!(second_permit.stats().current_bytes, 0);
+        let drained = crate::broker::BudgetBroker::production().snapshot();
+        assert_broker_current_equal(&broker_baseline, &drained);
+        assert_no_o_or_completion_change(&broker_baseline, &drained);
+        assert_eq!(*provisional_o_budget().used.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn declared_container_source_read_close_rejects_stale_publication_exactly() {
+        let _test_lock = indexed_test_lock();
+        let raw: Arc<[u8]> = Arc::from(indexed_object_stream_fixture());
+        let broker_baseline = crate::broker::BudgetBroker::production().snapshot();
+        let (source, control) = blocking_objstm_source(raw);
+        let adapter = Arc::new(IndexedDocumentAdapter::open(source, None).unwrap());
+        let container = first_declared_container(&adapter);
+        let baseline = adapter.object_cells.snapshot();
+        let broker_open = crate::broker::BudgetBroker::production().snapshot();
+        control.arm(ObjStmSourceFailure::None);
+
+        let leader_adapter = Arc::clone(&adapter);
+        let leader =
+            std::thread::spawn(move || leader_adapter.prepare_declared_object_stream(container));
+        control.wait_until_blocked();
+        let blocked_cells = adapter.object_cells.snapshot();
+        let blocked_broker = crate::broker::BudgetBroker::production().snapshot();
+        let blocked_permit = adapter
+            .object_cells
+            .active_container_permit_stats(container)
+            .expect("source-read leader owns its container permit");
+        let blocked_counters = adapter.counters();
+        let blocked_counter_values = (
+            blocked_counters
+                .container_preparations
+                .load(Ordering::Relaxed),
+            blocked_counters
+                .container_preparation_successes
+                .load(Ordering::Relaxed),
+            blocked_counters
+                .container_preparation_failures
+                .load(Ordering::Relaxed),
+            blocked_counters
+                .active_container_preparations
+                .load(Ordering::Relaxed),
+            blocked_counters
+                .peak_active_container_preparations
+                .load(Ordering::Relaxed),
+        );
+
+        adapter.object_cells.close();
+        let closed_cells = adapter.object_cells.snapshot();
+        let broker_closed = crate::broker::BudgetBroker::production().snapshot();
+        control.release();
+        let result = leader.join().unwrap();
+        let error = result.unwrap_err().into_access_for_test();
+        let terminal = adapter.object_cells.snapshot();
+
+        assert_container_delta(
+            &baseline,
+            &blocked_cells,
+            crate::object_cells::RepresentationSnapshot {
+                calls: 1,
+                loads: 1,
+                hits: 0,
+                waits: 0,
+                negative_hits: 0,
+                transient_shares: 0,
+                bypasses: 0,
+                evictions: 0,
+                cancellations: 0,
+            },
+        );
+        assert_eq!(blocked_cells.loading, baseline.loading + 1);
+        assert_eq!(blocked_cells.cells, baseline.cells + 1);
+        assert_eq!(blocked_cells.live_interests, baseline.live_interests + 1);
+        assert_eq!(blocked_counter_values, (1, 0, 0, 1, 1));
+        assert_eq!(blocked_permit.limit_bytes, INDEXED_STREAM_BYTES);
+        assert_eq!(blocked_permit.current_bytes, 256);
+        assert_eq!(blocked_permit.peak_bytes, 256);
+        assert_eq!(blocked_permit.reservations, 1);
+        assert!(!blocked_permit.cancelled);
+        assert!(!blocked_permit.closed);
+        assert_eq!(
+            blocked_broker.normal_in_flight_estimate_bytes,
+            broker_open.normal_in_flight_estimate_bytes + INDEXED_STREAM_BYTES
+        );
+
+        assert_eq!(closed_cells.cells, baseline.cells);
+        assert_eq!(closed_cells.loading, baseline.loading);
+        assert_eq!(closed_cells.ready, baseline.ready);
+        assert_eq!(closed_cells.negative, baseline.negative);
+        assert_eq!(closed_cells.live_interests, baseline.live_interests + 1);
+        assert_eq!(closed_cells.cache_bytes, baseline.cache_bytes);
+        assert_eq!(closed_cells.raw, baseline.raw);
+        assert_eq!(closed_cells.containers, blocked_cells.containers);
+        assert_eq!(closed_cells.members, baseline.members);
+        assert_eq!(closed_cells.closes, baseline.closes + 1);
+        assert_eq!(closed_cells.arenas + 1, baseline.arenas);
+        assert_representation_counter_sums(&closed_cells);
+        assert_eq!(
+            broker_closed.normal_payload_bytes,
+            broker_baseline.normal_payload_bytes + INDEXED_STREAM_BYTES
+        );
+        assert_eq!(
+            broker_closed.normal_in_flight_estimate_bytes,
+            broker_baseline.normal_in_flight_estimate_bytes + INDEXED_STREAM_BYTES
+        );
+        assert_eq!(broker_closed.cache_bytes, broker_baseline.cache_bytes);
+        assert_no_o_or_completion_change(&broker_baseline, &broker_closed);
+
+        assert_eq!(error.kind, AccessKind::Backend);
+        assert_eq!(error.detail, "object cell arena is closed");
+        assert_eq!(terminal.cells, baseline.cells);
+        assert_eq!(terminal.loading, baseline.loading);
+        assert_eq!(terminal.ready, baseline.ready);
+        assert_eq!(terminal.negative, baseline.negative);
+        assert_eq!(terminal.live_interests, baseline.live_interests);
+        assert_eq!(terminal.cache_bytes, baseline.cache_bytes);
+        assert_eq!(terminal.raw, baseline.raw);
+        assert_eq!(terminal.containers, blocked_cells.containers);
+        assert_eq!(terminal.members, baseline.members);
+        assert_eq!(terminal.closes, baseline.closes + 1);
+        assert_representation_counter_sums(&terminal);
+
+        let counters = adapter.counters();
+        assert_eq!(counters.container_preparations.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            counters
+                .container_preparation_successes
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .container_preparation_failures
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters
+                .container_persistent_native_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .container_persistent_above_cap_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .container_flight_only_failures
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters
+                .container_exact_key_invariant_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .active_container_preparations
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .peak_active_container_preparations
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters
+                .initial_container_permit_current_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .initial_container_permit_peak_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters.peak_container_permit_bytes.load(Ordering::Relaxed),
+            256
+        );
+        assert_declared_container_route_neutral(&adapter);
+        assert!(adapter
+            .object_cells
+            .active_container_permit_stats(container)
+            .is_none());
+        let drained = crate::broker::BudgetBroker::production().snapshot();
+        assert_broker_current_equal(&broker_baseline, &drained);
+        assert_no_o_or_completion_change(&broker_baseline, &drained);
+        drop(adapter);
+        assert_broker_current_equal(
+            &broker_baseline,
+            &crate::broker::BudgetBroker::production().snapshot(),
+        );
+    }
+
+    #[test]
+    fn indexed_declared_containers_keep_two_keys_and_xref_authority_distinct() {
+        let _test_lock = indexed_test_lock();
+        let generated = AccessGeneratedDir::new("authority");
+        generate_objstm_fixtures(generated.path(), &["--profile", "objstm-container"]);
+
+        let two_raw = std::fs::read(generated.path().join("objstm-two-containers.pdf")).unwrap();
+        let two = indexed(&two_raw, None);
+        let first = two.prepare_declared_object_stream((6, 0)).unwrap();
+        let second = two.prepare_declared_object_stream((9, 0)).unwrap();
+        assert_eq!(first.as_object_stream().container_id(), (6, 0));
+        assert_eq!(second.as_object_stream().container_id(), (9, 0));
+        assert!(!std::ptr::eq(
+            first.as_object_stream(),
+            second.as_object_stream()
+        ));
+        assert_eq!(
+            two.counters()
+                .container_preparations
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            two.counters()
+                .container_preparation_successes
+                .load(Ordering::Relaxed),
+            2
+        );
+        let two_snapshot = two.object_cells.snapshot();
+        assert_member_counters_zero(&two_snapshot);
+        assert_representation_counter_sums(&two_snapshot);
+        assert_eq!(*provisional_o_budget().used.lock().unwrap(), 0);
+
+        let authority_raw =
+            std::fs::read(generated.path().join("objstm-xref-authority.pdf")).unwrap();
+        let authority = indexed(&authority_raw, None);
+        assert_eq!(
+            authority.reader.object_location((7, 0)),
+            Some(IndexedObjectLocation::Compressed {
+                container: (10, 0),
+                index: 0,
+            })
+        );
+        let selected = authority.prepare_declared_object_stream((10, 0)).unwrap();
+        assert_eq!(selected.as_object_stream().container_id(), (10, 0));
+        assert_eq!(
+            authority
+                .counters()
+                .container_preparations
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            authority
+                .counters()
+                .object_resolutions
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            authority.counters().object_failures.load(Ordering::Relaxed),
+            0
+        );
+        let authority_snapshot = authority.object_cells.snapshot();
+        assert_member_counters_zero(&authority_snapshot);
+        assert_representation_counter_sums(&authority_snapshot);
+        assert_eq!(authority.reader.cache_stats(), Default::default());
+        assert_eq!(authority.reader.object_cache_stats(), Default::default());
+        assert_eq!(
+            authority.reader.object_stream_cache_stats(),
+            Default::default()
+        );
+        assert_eq!(*provisional_o_budget().used.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn indexed_declared_container_persistent_failure_is_arc_shared_and_classed_once() {
+        let _test_lock = indexed_test_lock();
+        let raw = indexed_metadata_fixture();
+        let adapter = indexed(&raw, None);
+        let first = match adapter.prepare_declared_object_stream((5, 2)) {
+            Err(ContainerCellError::Shared(owner)) => owner,
+            Err(ContainerCellError::Control(_)) => {
+                panic!("normal non-stream container must be a shared failure")
+            }
+            Ok(_) => panic!("normal non-stream object must not prepare as an object stream"),
+        };
+        let second = match adapter.prepare_declared_object_stream((5, 2)) {
+            Err(ContainerCellError::Shared(owner)) => owner,
+            Err(ContainerCellError::Control(_)) => {
+                panic!("persistent hit must remain a shared failure")
+            }
+            Ok(_) => panic!("persistent non-stream hit must not succeed"),
+        };
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let counters = adapter.counters();
+        assert_eq!(counters.container_preparations.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            counters
+                .container_preparation_successes
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .container_preparation_failures
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters
+                .container_persistent_native_failures
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters
+                .container_persistent_above_cap_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .container_flight_only_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .container_exact_key_invariant_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(counters.object_resolutions.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.object_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(adapter.reader.cache_stats(), Default::default());
+        assert_eq!(adapter.reader.object_cache_stats(), Default::default());
+        assert_eq!(
+            adapter.reader.object_stream_cache_stats(),
+            Default::default()
+        );
+    }
+
+    #[test]
+    fn indexed_declared_container_persistent_fixture_matrix_is_exact() {
+        use crate::objstm_failures::{FailurePayload, ObjStmFailureClass};
+
+        #[derive(Clone, Copy)]
+        enum DynamicExpectation {
+            Any,
+            None,
+            Present,
+        }
+
+        let _test_lock = indexed_test_lock();
+        let generated = AccessGeneratedDir::new("persistent");
+        generate_objstm_fixtures(generated.path(), &["--profile", "objstm-container"]);
+        let mut runs = Vec::new();
+        for name in [
+            "objstm-container-nonstream.pdf",
+            "objstm-first-missing.pdf",
+            "objstm-first-negative.pdf",
+            "objstm-first-past-end.pdf",
+            "objstm-n-missing.pdf",
+            "objstm-n-negative.pdf",
+            "objstm-n-over-131072.pdf",
+            "objstm-filter-chain.pdf",
+            "objstm-predictor.pdf",
+            "objstm-flate-corrupt.pdf",
+            "objstm-endstream-missing.pdf",
+            "objstm-endstream-truncated.pdf",
+        ] {
+            let dynamic = match name {
+                "objstm-filter-chain.pdf" => DynamicExpectation::None,
+                "objstm-flate-corrupt.pdf" => DynamicExpectation::Present,
+                _ => DynamicExpectation::Any,
+            };
+            runs.push((
+                generated.path().join(name),
+                (6, 0),
+                2_usize,
+                ObjStmFailureClass::PersistentNative,
+                dynamic,
+                true,
+            ));
+        }
+        runs.push((
+            generated.path().join("objstm-container-generation.pdf"),
+            (6, 1),
+            2,
+            ObjStmFailureClass::PersistentNative,
+            DynamicExpectation::Any,
+            false,
+        ));
+        for callers in [4_usize, 16] {
+            runs.push((
+                generated.path().join("objstm-filter-chain.pdf"),
+                (6, 0),
+                callers,
+                ObjStmFailureClass::PersistentNative,
+                DynamicExpectation::None,
+                true,
+            ));
+            runs.push((
+                generated.path().join("objstm-flate-corrupt.pdf"),
+                (6, 0),
+                callers,
+                ObjStmFailureClass::PersistentNative,
+                DynamicExpectation::Present,
+                true,
+            ));
+        }
+
+        let above_cap = AccessGeneratedDir::new("above-cap");
+        generate_objstm_fixtures(
+            above_cap.path(),
+            &[
+                "--profile",
+                "objstm-boundary",
+                "--objstm-boundary",
+                "encoded-over-64m",
+            ],
+        );
+        runs.push((
+            above_cap.path().join("objstm-encoded-over-64m.pdf"),
+            (6, 0),
+            1,
+            ObjStmFailureClass::PersistentAboveCap,
+            DynamicExpectation::None,
+            false,
+        ));
+
+        for (path, container, callers, expected_class, dynamic, block_in_source) in runs {
+            let raw: Arc<[u8]> = Arc::from(std::fs::read(&path).unwrap());
+            let broker_baseline = crate::broker::BudgetBroker::production().snapshot();
+            let (source, control) = blocking_objstm_source(raw);
+            let adapter = Arc::new(IndexedDocumentAdapter::open(source, None).unwrap());
+            let baseline = adapter.object_cells.snapshot();
+            let broker_open = crate::broker::BudgetBroker::production().snapshot();
+            let waiters = ObjStmWaitBarrier::new(container, callers.saturating_sub(1));
+            adapter.object_cells.set_wait_hooks(waiters.clone());
+            if block_in_source {
+                control.arm(ObjStmSourceFailure::None);
+            }
+
+            let leader_adapter = Arc::clone(&adapter);
+            let leader = std::thread::spawn(move || {
+                leader_adapter.prepare_declared_object_stream(container)
+            });
+            let mut followers = Vec::new();
+            if block_in_source {
+                control.wait_until_blocked();
+                let broker_blocked = crate::broker::BudgetBroker::production().snapshot();
+                let blocked_cells = adapter.object_cells.snapshot();
+                let loading_metadata = blocked_cells.cache_bytes - baseline.cache_bytes;
+                assert_eq!(
+                    broker_blocked.normal_payload_bytes,
+                    broker_open.normal_payload_bytes + loading_metadata + INDEXED_STREAM_BYTES,
+                    "{}",
+                    path.display()
+                );
+                assert_eq!(
+                    broker_blocked.normal_in_flight_estimate_bytes,
+                    broker_open.normal_in_flight_estimate_bytes + INDEXED_STREAM_BYTES,
+                    "{}",
+                    path.display()
+                );
+                assert_eq!(
+                    broker_blocked.metadata_bytes,
+                    broker_open.metadata_bytes + crate::broker::QUEUE_METADATA_WEIGHT
+                );
+                assert_eq!(
+                    broker_blocked.completion_reserve_bytes,
+                    broker_open.completion_reserve_bytes
+                );
+                assert_eq!(broker_blocked.oversize_bytes, broker_open.oversize_bytes);
+                assert_eq!(
+                    broker_blocked.aggregate_bytes,
+                    broker_open.aggregate_bytes
+                        + loading_metadata
+                        + INDEXED_STREAM_BYTES
+                        + crate::broker::QUEUE_METADATA_WEIGHT
+                );
+                assert_eq!(
+                    broker_blocked.cache_bytes,
+                    broker_open.cache_bytes + loading_metadata
+                );
+                assert_eq!(broker_blocked.pin_bytes, broker_open.pin_bytes);
+                assert_eq!(broker_blocked.bypass_bytes, broker_open.bypass_bytes);
+                assert_eq!(
+                    broker_blocked.peak_normal_bytes,
+                    broker_open
+                        .peak_normal_bytes
+                        .max(broker_blocked.normal_payload_bytes + broker_blocked.metadata_bytes)
+                );
+                assert_eq!(
+                    broker_blocked.peak_aggregate_bytes,
+                    broker_open
+                        .peak_aggregate_bytes
+                        .max(broker_blocked.aggregate_bytes)
+                );
+                assert_eq!(
+                    broker_blocked.peak_cache_bytes,
+                    broker_open.peak_cache_bytes.max(broker_blocked.cache_bytes)
+                );
+                assert_eq!(broker_blocked.peak_pin_bytes, broker_open.peak_pin_bytes);
+                assert_eq!(
+                    broker_blocked.peak_bypass_bytes,
+                    broker_open
+                        .peak_bypass_bytes
+                        .max(broker_open.bypass_bytes + loading_metadata)
+                );
+                let fresh_permit = adapter
+                    .object_cells
+                    .active_container_permit_stats(container)
+                    .expect("blocked persistent leader owns a fresh permit");
+                assert_eq!(
+                    adapter
+                        .counters()
+                        .initial_container_permit_current_bytes
+                        .load(Ordering::Relaxed),
+                    0
+                );
+                assert_eq!(
+                    adapter
+                        .counters()
+                        .initial_container_permit_peak_bytes
+                        .load(Ordering::Relaxed),
+                    0
+                );
+                assert_eq!(fresh_permit.limit_bytes, INDEXED_STREAM_BYTES);
+                assert_eq!(fresh_permit.current_bytes, 256);
+                assert_eq!(fresh_permit.peak_bytes, 256);
+                assert_eq!(fresh_permit.reservations, 1);
+                assert!(!fresh_permit.cancelled);
+                assert!(!fresh_permit.closed);
+                for _ in 1..callers {
+                    let adapter = Arc::clone(&adapter);
+                    followers.push(std::thread::spawn(move || {
+                        adapter.prepare_declared_object_stream(container)
+                    }));
+                }
+                waiters.wait_until_attached();
+                control.release();
+            }
+
+            let mut owners = Vec::new();
+            let result = leader.join().unwrap();
+            owners.push(match result {
+                Err(ContainerCellError::Shared(owner)) => owner,
+                Err(ContainerCellError::Control(_)) => {
+                    panic!("{}: persistent failure became control", path.display())
+                }
+                Ok(_) => panic!("{}: persistent fixture succeeded", path.display()),
+            });
+            for follower in followers {
+                owners.push(match follower.join().unwrap() {
+                    Err(ContainerCellError::Shared(owner)) => owner,
+                    Err(ContainerCellError::Control(_)) => {
+                        panic!("{}: persistent waiter became control", path.display())
+                    }
+                    Ok(_) => panic!("{}: persistent waiter succeeded", path.display()),
+                });
+            }
+            if !block_in_source {
+                for _ in 1..callers {
+                    owners.push(match adapter.prepare_declared_object_stream(container) {
+                        Err(ContainerCellError::Shared(owner)) => owner,
+                        Err(ContainerCellError::Control(_)) => {
+                            panic!("{}: persistent hit became control", path.display())
+                        }
+                        Ok(_) => panic!("{}: persistent fixture succeeded", path.display()),
+                    });
+                }
+            }
+            assert_eq!(
+                adapter
+                    .counters()
+                    .initial_container_permit_current_bytes
+                    .load(Ordering::Relaxed),
+                0,
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                adapter
+                    .counters()
+                    .initial_container_permit_peak_bytes
+                    .load(Ordering::Relaxed),
+                0,
+                "{}",
+                path.display()
+            );
+            assert!(owners.iter().all(|owner| Arc::ptr_eq(owner, &owners[0])));
+            let FailurePayload::ObjStm(template) = owners[0].payload() else {
+                panic!("{}: persistent owner lost ObjStm payload", path.display())
+            };
+            let retained_weight = owners[0].retained_weight();
+            assert_eq!(
+                retained_weight,
+                owners[0].payload().retained_weight().unwrap(),
+                "{}",
+                path.display()
+            );
+            let dynamic_allocation = owners[0].objstm_dynamic_allocation();
+            assert_eq!(template.class(), expected_class, "{}", path.display());
+            match dynamic {
+                DynamicExpectation::Any => {}
+                DynamicExpectation::None => {
+                    assert_eq!(template.dynamic_capacity(), Some(0), "{}", path.display());
+                    assert_eq!(dynamic_allocation, None, "{}", path.display());
+                }
+                DynamicExpectation::Present => {
+                    assert!(
+                        template.dynamic_capacity().is_some_and(|bytes| bytes > 0),
+                        "{}",
+                        path.display()
+                    );
+                    assert!(
+                        dynamic_allocation.is_some_and(|(pointer, capacity)| {
+                            pointer != 0 && capacity == template.dynamic_capacity().unwrap()
+                        }),
+                        "{}",
+                        path.display()
+                    );
+                }
+            }
+
+            let reads_after_error = control.reads();
+            let peak_after_error = adapter
+                .counters()
+                .peak_container_permit_bytes
+                .load(Ordering::Relaxed);
+            assert!(peak_after_error <= INDEXED_STREAM_BYTES);
+            if block_in_source {
+                assert!(peak_after_error > 0, "{}", path.display());
+            }
+            let hit = match adapter.prepare_declared_object_stream(container) {
+                Err(ContainerCellError::Shared(owner)) => owner,
+                Err(ContainerCellError::Control(_)) => {
+                    panic!("{}: persistent hit became control", path.display())
+                }
+                Ok(_) => panic!("{}: persistent hit succeeded", path.display()),
+            };
+            assert!(Arc::ptr_eq(&hit, &owners[0]));
+            let FailurePayload::ObjStm(_) = hit.payload() else {
+                panic!("{}: persistent hit lost ObjStm payload", path.display())
+            };
+            assert_eq!(hit.retained_weight(), retained_weight, "{}", path.display());
+            assert_eq!(
+                hit.objstm_dynamic_allocation(),
+                dynamic_allocation,
+                "{}",
+                path.display()
+            );
+            assert_eq!(control.reads(), reads_after_error);
+            assert_eq!(
+                adapter
+                    .counters()
+                    .peak_container_permit_bytes
+                    .load(Ordering::Relaxed),
+                peak_after_error
+            );
+
+            let snapshot = adapter.object_cells.snapshot();
+            assert_container_delta(
+                &baseline,
+                &snapshot,
+                crate::object_cells::RepresentationSnapshot {
+                    calls: callers as u64 + 1,
+                    loads: 1,
+                    waits: if block_in_source {
+                        (callers - 1) as u64
+                    } else {
+                        0
+                    },
+                    negative_hits: if block_in_source { 1 } else { callers as u64 },
+                    hits: 0,
+                    transient_shares: 0,
+                    bypasses: 0,
+                    evictions: 0,
+                    cancellations: 0,
+                },
+            );
+            if container == (6, 1) {
+                assert_eq!(snapshot.raw, baseline.raw);
+                assert_eq!(snapshot.members, baseline.members);
+                assert_declared_container_route_neutral(&adapter);
+            }
+            let published_weight = snapshot.cache_bytes - baseline.cache_bytes;
+            let loading_metadata = published_weight
+                .checked_sub(retained_weight)
+                .expect("persistent retained weight fits the exact cell charge");
+            let broker_published = crate::broker::BudgetBroker::production().snapshot();
+            assert_eq!(
+                broker_published.normal_payload_bytes,
+                broker_open.normal_payload_bytes + published_weight,
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                broker_published.normal_in_flight_estimate_bytes,
+                broker_open.normal_in_flight_estimate_bytes
+            );
+            assert_eq!(broker_published.metadata_bytes, broker_open.metadata_bytes);
+            assert_eq!(
+                broker_published.completion_reserve_bytes,
+                broker_open.completion_reserve_bytes
+            );
+            assert_eq!(broker_published.oversize_bytes, broker_open.oversize_bytes);
+            assert_eq!(
+                broker_published.aggregate_bytes,
+                broker_open.aggregate_bytes + published_weight
+            );
+            assert_eq!(
+                broker_published.cache_bytes,
+                broker_open.cache_bytes + published_weight
+            );
+            assert_eq!(broker_published.pin_bytes, broker_open.pin_bytes);
+            assert_eq!(broker_published.bypass_bytes, broker_open.bypass_bytes);
+            let loader_peak = broker_open
+                .normal_payload_bytes
+                .checked_add(loading_metadata + INDEXED_STREAM_BYTES)
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        broker_open.metadata_bytes + crate::broker::QUEUE_METADATA_WEIGHT,
+                    )
+                })
+                .unwrap();
+            assert_eq!(
+                broker_published.peak_normal_bytes,
+                broker_open.peak_normal_bytes.max(loader_peak)
+            );
+            assert_eq!(
+                broker_published.peak_aggregate_bytes,
+                broker_open.peak_aggregate_bytes.max(
+                    loader_peak + broker_open.completion_reserve_bytes + broker_open.oversize_bytes
+                )
+            );
+            assert_eq!(
+                broker_published.peak_cache_bytes,
+                broker_open
+                    .peak_cache_bytes
+                    .max(broker_open.cache_bytes + published_weight)
+            );
+            assert_eq!(broker_published.peak_pin_bytes, broker_open.peak_pin_bytes);
+            assert_eq!(
+                broker_published.peak_bypass_bytes,
+                broker_open
+                    .peak_bypass_bytes
+                    .max(broker_open.bypass_bytes + loading_metadata)
+            );
+            let counters = adapter.counters();
+            assert_eq!(counters.container_preparations.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                counters
+                    .container_preparation_failures
+                    .load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(
+                counters
+                    .container_preparation_successes
+                    .load(Ordering::Relaxed),
+                0
+            );
+            match expected_class {
+                ObjStmFailureClass::PersistentNative => assert_eq!(
+                    counters
+                        .container_persistent_native_failures
+                        .load(Ordering::Relaxed),
+                    1
+                ),
+                ObjStmFailureClass::PersistentAboveCap => assert_eq!(
+                    counters
+                        .container_persistent_above_cap_failures
+                        .load(Ordering::Relaxed),
+                    1
+                ),
+                _ => unreachable!(),
+            }
+            assert_eq!(*provisional_o_budget().used.lock().unwrap(), 0);
+            assert_no_o_or_completion_change(
+                &broker_baseline,
+                &crate::broker::BudgetBroker::production().snapshot(),
+            );
+            drop(hit);
+            drop(owners);
+            drop(adapter);
+            let drained = crate::broker::BudgetBroker::production().snapshot();
+            assert_broker_current_equal(&broker_baseline, &drained);
+            assert_eq!(drained.aggregate_bytes, broker_baseline.aggregate_bytes);
+            assert_eq!(
+                drained.normal_payload_bytes,
+                broker_baseline.normal_payload_bytes
+            );
+            assert_eq!(drained.cache_bytes, broker_baseline.cache_bytes);
+            assert_eq!(drained.pin_bytes, broker_baseline.pin_bytes);
+            assert_eq!(drained.bypass_bytes, broker_baseline.bypass_bytes);
+            assert_eq!(drained.active_operations, broker_baseline.active_operations);
+            assert_no_o_or_completion_change(&broker_baseline, &drained);
+        }
+    }
+
+    #[test]
+    fn indexed_declared_container_flight_failure_retries_without_raw_fallback() {
+        let _test_lock = indexed_test_lock();
+        let raw: Arc<[u8]> = Arc::from(indexed_object_stream_fixture());
+        for (label, failure, expected_kind) in [
+            (
+                "source-changed",
+                ObjStmSourceFailure::Changed,
+                AccessKind::SourceChanged,
+            ),
+            ("source-io", ObjStmSourceFailure::Io, AccessKind::SourceIo),
+        ] {
+            for callers in [2_usize, 4, 16] {
+                let broker_baseline = crate::broker::BudgetBroker::production().snapshot();
+                let (source, control) = blocking_objstm_source(Arc::clone(&raw));
+                let adapter = Arc::new(IndexedDocumentAdapter::open(source, None).unwrap());
+                let container = first_declared_container(&adapter);
+                let waiters = ObjStmWaitBarrier::new(container, callers - 1);
+                adapter.object_cells.set_wait_hooks(waiters.clone());
+                let baseline = adapter.object_cells.snapshot();
+                let broker_open = crate::broker::BudgetBroker::production().snapshot();
+                control.arm(failure);
+
+                let leader_adapter = Arc::clone(&adapter);
+                let leader = std::thread::spawn(move || {
+                    leader_adapter.prepare_declared_object_stream(container)
+                });
+                control.wait_until_blocked();
+                let broker_blocked = crate::broker::BudgetBroker::production().snapshot();
+                let blocked_cells = adapter.object_cells.snapshot();
+                let loading_metadata = blocked_cells.cache_bytes - baseline.cache_bytes;
+                assert_eq!(
+                    broker_blocked.normal_in_flight_estimate_bytes,
+                    broker_open.normal_in_flight_estimate_bytes + INDEXED_STREAM_BYTES,
+                    "{label}, {callers} callers"
+                );
+                assert_eq!(
+                    broker_blocked.normal_payload_bytes,
+                    broker_open.normal_payload_bytes + loading_metadata + INDEXED_STREAM_BYTES,
+                    "{label}, {callers} callers"
+                );
+                assert_eq!(
+                    broker_blocked.metadata_bytes,
+                    broker_open.metadata_bytes + crate::broker::QUEUE_METADATA_WEIGHT
+                );
+                assert_eq!(
+                    broker_blocked.completion_reserve_bytes,
+                    broker_open.completion_reserve_bytes
+                );
+                assert_eq!(broker_blocked.oversize_bytes, broker_open.oversize_bytes);
+                assert_eq!(
+                    broker_blocked.aggregate_bytes,
+                    broker_open.aggregate_bytes
+                        + loading_metadata
+                        + INDEXED_STREAM_BYTES
+                        + crate::broker::QUEUE_METADATA_WEIGHT
+                );
+                assert_eq!(
+                    broker_blocked.cache_bytes,
+                    broker_open.cache_bytes + loading_metadata
+                );
+                assert_eq!(broker_blocked.pin_bytes, broker_open.pin_bytes);
+                assert_eq!(broker_blocked.bypass_bytes, broker_open.bypass_bytes);
+                assert_eq!(
+                    broker_blocked.peak_normal_bytes,
+                    broker_open
+                        .peak_normal_bytes
+                        .max(broker_blocked.normal_payload_bytes + broker_blocked.metadata_bytes)
+                );
+                assert_eq!(
+                    broker_blocked.peak_aggregate_bytes,
+                    broker_open
+                        .peak_aggregate_bytes
+                        .max(broker_blocked.aggregate_bytes)
+                );
+                assert_eq!(
+                    broker_blocked.peak_cache_bytes,
+                    broker_open.peak_cache_bytes.max(broker_blocked.cache_bytes)
+                );
+                assert_eq!(broker_blocked.peak_pin_bytes, broker_open.peak_pin_bytes);
+                assert_eq!(
+                    broker_blocked.peak_bypass_bytes,
+                    broker_open
+                        .peak_bypass_bytes
+                        .max(broker_open.bypass_bytes + loading_metadata)
+                );
+                let fresh_permit = adapter
+                    .object_cells
+                    .active_container_permit_stats(container)
+                    .expect("blocked flight leader owns a fresh permit");
+                assert_eq!(
+                    adapter
+                        .counters()
+                        .initial_container_permit_current_bytes
+                        .load(Ordering::Relaxed),
+                    0
+                );
+                assert_eq!(
+                    adapter
+                        .counters()
+                        .initial_container_permit_peak_bytes
+                        .load(Ordering::Relaxed),
+                    0
+                );
+                assert_eq!(fresh_permit.limit_bytes, INDEXED_STREAM_BYTES);
+                assert_eq!(fresh_permit.current_bytes, 256);
+                assert_eq!(fresh_permit.peak_bytes, 256);
+                assert_eq!(fresh_permit.reservations, 1);
+                assert!(!fresh_permit.cancelled);
+                assert!(!fresh_permit.closed);
+                assert_no_o_or_completion_change(&broker_open, &broker_blocked);
+                assert_eq!(*provisional_o_budget().used.lock().unwrap(), 0);
+
+                let mut followers = Vec::new();
+                for _ in 1..callers {
+                    let adapter = Arc::clone(&adapter);
+                    followers.push(std::thread::spawn(move || {
+                        adapter.prepare_declared_object_stream(container)
+                    }));
+                }
+                waiters.wait_until_attached();
+                control.release();
+
+                let mut owners = Vec::new();
+                owners.push(match leader.join().unwrap() {
+                    Err(ContainerCellError::Shared(owner)) => owner,
+                    Err(ContainerCellError::Control(_)) => {
+                        panic!("{label} must be a shared flight failure")
+                    }
+                    Ok(_) => panic!("{label} preparation must not succeed"),
+                });
+                for follower in followers {
+                    owners.push(match follower.join().unwrap() {
+                        Err(ContainerCellError::Shared(owner)) => owner,
+                        Err(ContainerCellError::Control(_)) => {
+                            panic!("attached {label} waiter became control")
+                        }
+                        Ok(_) => panic!("attached {label} waiter succeeded"),
+                    });
+                }
+                assert!(owners.iter().all(|owner| Arc::ptr_eq(owner, &owners[0])));
+                let crate::objstm_failures::FailurePayload::ObjStm(template) = owners[0].payload()
+                else {
+                    panic!("{label}: flight owner lost ObjStm payload")
+                };
+                let crate::objstm_failures::ObjStmFact::FlightAccess { kind, .. } = template.fact()
+                else {
+                    panic!("{label}: flight owner lost typed source fact")
+                };
+                assert_eq!(*kind, expected_kind, "{label}");
+                let flight_snapshot = adapter.object_cells.snapshot();
+                assert_eq!(
+                    flight_snapshot.containers.calls - baseline.containers.calls,
+                    callers as u64
+                );
+                assert_eq!(
+                    flight_snapshot.containers.loads - baseline.containers.loads,
+                    1
+                );
+                assert_eq!(
+                    flight_snapshot.containers.hits - baseline.containers.hits,
+                    0
+                );
+                assert_eq!(
+                    flight_snapshot.containers.waits - baseline.containers.waits,
+                    (callers - 1) as u64
+                );
+                assert_eq!(
+                    flight_snapshot.containers.negative_hits - baseline.containers.negative_hits,
+                    0
+                );
+                assert_eq!(
+                    flight_snapshot.containers.transient_shares
+                        - baseline.containers.transient_shares,
+                    (callers - 1) as u64
+                );
+                assert_eq!(
+                    flight_snapshot.containers.bypasses - baseline.containers.bypasses,
+                    0
+                );
+                assert_eq!(
+                    flight_snapshot.containers.evictions - baseline.containers.evictions,
+                    0
+                );
+                assert_eq!(
+                    flight_snapshot.containers.cancellations - baseline.containers.cancellations,
+                    0
+                );
+                assert_member_counters_zero(&flight_snapshot);
+                assert_representation_counter_sums(&flight_snapshot);
+                let error_peak = adapter
+                    .counters()
+                    .peak_container_permit_bytes
+                    .load(Ordering::Relaxed);
+                assert_eq!(error_peak, 256, "{label}");
+                assert_eq!(
+                    adapter
+                        .counters()
+                        .container_preparation_failures
+                        .load(Ordering::Relaxed),
+                    1
+                );
+                assert_eq!(
+                    adapter
+                        .counters()
+                        .container_flight_only_failures
+                        .load(Ordering::Relaxed),
+                    1
+                );
+
+                drop(owners);
+                let handed_off = adapter.object_cells.snapshot();
+                assert_eq!(handed_off.cells, 0, "{label}");
+                assert_eq!(handed_off.loading, 0, "{label}");
+                assert_eq!(handed_off.ready, 0, "{label}");
+                assert_eq!(handed_off.negative, 0, "{label}");
+                assert_eq!(handed_off.live_interests, 0, "{label}");
+                assert_eq!(handed_off.external_pins, 0, "{label}");
+                assert_eq!(handed_off.cache_bytes, 0, "{label}");
+                assert!(!adapter.object_cells.has_container_cell(container));
+                assert_eq!(
+                    adapter
+                        .object_cells
+                        .active_container_permit_stats(container),
+                    None
+                );
+                let broker_handed_off = crate::broker::BudgetBroker::production().snapshot();
+                assert_broker_current_equal(&broker_open, &broker_handed_off);
+                assert_eq!(
+                    broker_handed_off.normal_payload_bytes, broker_open.normal_payload_bytes,
+                    "{label}"
+                );
+                assert_eq!(
+                    broker_handed_off.normal_in_flight_estimate_bytes,
+                    broker_open.normal_in_flight_estimate_bytes,
+                    "{label}"
+                );
+                assert_eq!(
+                    broker_handed_off.metadata_bytes, broker_open.metadata_bytes,
+                    "{label}"
+                );
+                assert_eq!(
+                    broker_handed_off.completion_reserve_bytes,
+                    broker_open.completion_reserve_bytes,
+                    "{label}"
+                );
+                assert_eq!(
+                    broker_handed_off.oversize_bytes, broker_open.oversize_bytes,
+                    "{label}"
+                );
+                assert_eq!(
+                    broker_handed_off.aggregate_bytes, broker_open.aggregate_bytes,
+                    "{label}"
+                );
+                assert_eq!(
+                    broker_handed_off.cache_bytes, broker_open.cache_bytes,
+                    "{label}"
+                );
+                assert_eq!(
+                    broker_handed_off.pin_bytes, broker_open.pin_bytes,
+                    "{label}"
+                );
+                assert_eq!(
+                    broker_handed_off.bypass_bytes, broker_open.bypass_bytes,
+                    "{label}"
+                );
+                control.clear_failure();
+                let pin = match adapter.prepare_declared_object_stream(container) {
+                    Ok(pin) => pin,
+                    Err(_) => panic!("successor generation must retry after flight failure"),
+                };
+                assert_eq!(pin.as_object_stream().container_id(), container);
+                let (success_retained, success_permit, success_charge) = adapter
+                    .object_cells
+                    .container_retained_evidence(container)
+                    .expect("successor retains its exact permit and broker charge");
+                assert_eq!(success_permit.stats().current_bytes, success_retained);
+                assert_eq!(success_charge, success_retained);
+                let counters = adapter.counters();
+                assert_eq!(counters.container_preparations.load(Ordering::Relaxed), 2);
+                assert_eq!(
+                    counters
+                        .container_preparation_successes
+                        .load(Ordering::Relaxed),
+                    1
+                );
+                assert_eq!(
+                    counters
+                        .container_preparation_failures
+                        .load(Ordering::Relaxed),
+                    1
+                );
+                assert_eq!(
+                    counters.peak_container_permit_bytes.load(Ordering::Relaxed),
+                    success_permit.stats().peak_bytes
+                );
+                assert_eq!(
+                    counters
+                        .active_container_preparations
+                        .load(Ordering::Relaxed),
+                    0
+                );
+                assert_eq!(
+                    counters
+                        .peak_active_container_preparations
+                        .load(Ordering::Relaxed),
+                    1
+                );
+                assert_eq!(counters.object_resolutions.load(Ordering::Relaxed), 0);
+                assert_eq!(counters.object_failures.load(Ordering::Relaxed), 0);
+                let final_snapshot = adapter.object_cells.snapshot();
+                assert_eq!(
+                    final_snapshot.containers.calls - baseline.containers.calls,
+                    callers as u64 + 1
+                );
+                assert_eq!(
+                    final_snapshot.containers.loads - baseline.containers.loads,
+                    2
+                );
+                assert_eq!(final_snapshot.containers.hits - baseline.containers.hits, 0);
+                assert_eq!(
+                    final_snapshot.containers.waits - baseline.containers.waits,
+                    (callers - 1) as u64
+                );
+                assert_eq!(
+                    final_snapshot.containers.negative_hits - baseline.containers.negative_hits,
+                    0
+                );
+                assert_eq!(
+                    final_snapshot.containers.transient_shares
+                        - baseline.containers.transient_shares,
+                    (callers - 1) as u64
+                );
+                assert_eq!(
+                    final_snapshot.containers.bypasses - baseline.containers.bypasses,
+                    0
+                );
+                assert_eq!(
+                    final_snapshot.containers.evictions - baseline.containers.evictions,
+                    0
+                );
+                assert_eq!(
+                    final_snapshot.containers.cancellations - baseline.containers.cancellations,
+                    0
+                );
+                assert_member_counters_zero(&final_snapshot);
+                assert_representation_counter_sums(&final_snapshot);
+                assert_eq!(adapter.reader.cache_stats(), Default::default());
+                assert_eq!(adapter.reader.object_cache_stats(), Default::default());
+                assert_eq!(
+                    adapter.reader.object_stream_cache_stats(),
+                    Default::default()
+                );
+                assert_eq!(*provisional_o_budget().used.lock().unwrap(), 0);
+                assert_no_o_or_completion_change(
+                    &broker_baseline,
+                    &crate::broker::BudgetBroker::production().snapshot(),
+                );
+                drop(pin);
+                drop(adapter);
+                assert_eq!(success_permit.stats().current_bytes, 0);
+                let drained = crate::broker::BudgetBroker::production().snapshot();
+                assert_broker_current_equal(&broker_baseline, &drained);
+                assert_eq!(drained.aggregate_bytes, broker_baseline.aggregate_bytes);
+                assert_eq!(
+                    drained.normal_payload_bytes,
+                    broker_baseline.normal_payload_bytes
+                );
+                assert_eq!(
+                    drained.normal_in_flight_estimate_bytes,
+                    broker_baseline.normal_in_flight_estimate_bytes
+                );
+                assert_eq!(drained.cache_bytes, broker_baseline.cache_bytes);
+                assert_eq!(drained.pin_bytes, broker_baseline.pin_bytes);
+                assert_eq!(drained.bypass_bytes, broker_baseline.bypass_bytes);
+                assert_eq!(drained.active_operations, broker_baseline.active_operations);
+                assert_no_o_or_completion_change(&broker_baseline, &drained);
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_declared_container_unsupported_length_is_flight_only_and_retryable() {
+        let _test_lock = indexed_test_lock();
+        let generated = AccessGeneratedDir::new("unsupported-length");
+        generate_objstm_fixtures(generated.path(), &["--profile", "objstm-container"]);
+        for name in [
+            "objstm-length-missing.pdf",
+            "objstm-length-negative.pdf",
+            "objstm-length-indirect-missing.pdf",
+        ] {
+            let raw = std::fs::read(generated.path().join(name)).unwrap();
+            let adapter = indexed(&raw, None);
+            let baseline = adapter.object_cells.snapshot();
+            let first = match adapter.prepare_declared_object_stream((6, 0)) {
+                Err(ContainerCellError::Shared(owner)) => owner,
+                Err(ContainerCellError::Control(_)) => {
+                    panic!("{name}: unsupported length became control")
+                }
+                Ok(_) => panic!("{name}: unsupported length succeeded"),
+            };
+            let peak_after_first_error = adapter
+                .counters()
+                .peak_container_permit_bytes
+                .load(Ordering::Relaxed);
+            drop(first);
+            let second = match adapter.prepare_declared_object_stream((6, 0)) {
+                Err(ContainerCellError::Shared(owner)) => owner,
+                Err(ContainerCellError::Control(_)) => {
+                    panic!("{name}: unsupported-length retry became control")
+                }
+                Ok(_) => panic!("{name}: unsupported-length retry succeeded"),
+            };
+            drop(second);
+            let counters = adapter.counters();
+            assert_eq!(counters.container_preparations.load(Ordering::Relaxed), 2);
+            assert_eq!(
+                counters
+                    .container_preparation_failures
+                    .load(Ordering::Relaxed),
+                2
+            );
+            assert_eq!(
+                counters
+                    .container_flight_only_failures
+                    .load(Ordering::Relaxed),
+                2
+            );
+            assert_eq!(
+                counters.peak_container_permit_bytes.load(Ordering::Relaxed),
+                peak_after_first_error,
+                "{name}"
+            );
+            let snapshot = adapter.object_cells.snapshot();
+            assert_eq!(snapshot.containers.calls - baseline.containers.calls, 2);
+            assert_eq!(snapshot.containers.loads - baseline.containers.loads, 2);
+            assert_eq!(
+                snapshot.containers.negative_hits - baseline.containers.negative_hits,
+                0
+            );
+            assert_eq!(
+                snapshot.containers.transient_shares - baseline.containers.transient_shares,
+                0
+            );
+            assert_member_counters_zero(&snapshot);
+            assert_representation_counter_sums(&snapshot);
+            assert_eq!(adapter.reader.cache_stats(), Default::default());
+            assert_eq!(adapter.reader.object_cache_stats(), Default::default());
+            assert_eq!(
+                adapter.reader.object_stream_cache_stats(),
+                Default::default()
+            );
+            assert_eq!(*provisional_o_budget().used.lock().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn indexed_container_attempt_guard_clears_active_on_unwind() {
+        let counters = IndexedAdapterCounters::default();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _attempt = IndexedContainerAttempt::start(&counters);
+            panic!("injected preparation panic");
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(counters.container_preparations.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            counters
+                .active_container_preparations
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .peak_active_container_preparations
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters
+                .container_preparation_successes
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters
+                .container_preparation_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
     fn indexed_negative_classifier_covers_every_current_fork_variant() {
-        use lopdf::MissingNormalObjectReason;
+        use lopdf::{MissingNormalObjectReason, ObjectLimitProvenance};
 
         let id = (7, 3);
         let persistent = vec![
@@ -3244,7 +5988,11 @@ pub(crate) mod tests {
             },
             IndexedReaderError::InvalidIndirectObject { id, offset: 4 },
             IndexedReaderError::IncompleteObject { id, offset: 4 },
-            IndexedReaderError::ObjectLimitExceeded { id, limit: 8 },
+            IndexedReaderError::ObjectLimitExceeded {
+                id,
+                limit: 8,
+                provenance: ObjectLimitProvenance::FrameNeedMoreAtMaximum,
+            },
             IndexedReaderError::NotScalarObject { id },
             IndexedReaderError::NotStreamObject { id },
             IndexedReaderError::UnsupportedBoundedScalar { id, reason: "test" },
@@ -3784,10 +6532,9 @@ pub(crate) mod tests {
                     1 => return Ok(0),
                     2 => return Ok(out.len().saturating_add(1)),
                     3 => {
-                        return Err(SourceError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Err(SourceError::Io(std::io::Error::other(
                             "injected positioned read failure",
-                        )))
+                        )));
                     }
                     _ => {}
                 }
@@ -3890,8 +6637,7 @@ pub(crate) mod tests {
         let (raw, page) = page_pdf(b"FlateDecode", flate_zeros(64 * 1024 * 1024));
         let error = indexed(&raw, None)
             .page_content(page)
-            .err()
-            .expect("decoded content bomb must exceed aggregate O");
+            .expect_err("decoded content bomb must exceed aggregate O");
         assert_eq!(error.phase, AccessPhase::PageContent);
         assert_eq!(error.kind, AccessKind::ResourceLimit);
         assert_eq!(*provisional_o_budget().used.lock().unwrap(), 0);

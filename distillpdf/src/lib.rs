@@ -36,6 +36,7 @@ mod layout;
 mod links;
 mod nav;
 mod object_cells;
+mod objstm_failures;
 mod pdfobj;
 mod postprocess;
 mod profile;
