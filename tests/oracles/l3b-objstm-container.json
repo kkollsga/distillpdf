@@ -361,7 +361,7 @@
       "startxref": 603
     },
     {
-      "bytes": 857,
+      "bytes": 868,
       "facts": {
         "containers": [
           6
@@ -372,7 +372,7 @@
         "encoded_lengths": [
           52
         ],
-        "encoding": "flate-predictor-12",
+        "encoding": "flate-predictor-12-colors-64",
         "expected_preparation": "unsupported-filter",
         "storage": "generated-small",
         "xref_declarations": [
@@ -389,8 +389,8 @@
         ]
       },
       "name": "objstm-predictor.pdf",
-      "sha256": "529e0ad03599d1ba40aa958e8199f4929f7017dd3c12d8144fbddb144fe5e45d",
-      "startxref": 618
+      "sha256": "c57d3af1a4a429242935267008375d9731c6836a65fd3063c6f7defb44e9fddb",
+      "startxref": 629
     },
     {
       "bytes": 799,

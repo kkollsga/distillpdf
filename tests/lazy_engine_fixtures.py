@@ -406,13 +406,17 @@ def _objstm_container_fixtures() -> Iterable[tuple[str, RenderedPdf, dict]]:
         expected="unsupported-filter",
     )
 
+    # A PNG predictor is inside the bounded envelope, but only with operands the decoder's
+    # row arithmetic is defined and budgeted for. `/Colors 64` is past the cap, so this stays
+    # the "declared an encoding the bounded path will not run" case.
     predictor = _stream(
         encoded,
-        plain_dictionary + b" /Filter /FlateDecode /DecodeParms << /Predictor 12 >>",
+        plain_dictionary
+        + b" /Filter /FlateDecode /DecodeParms << /Predictor 12 /Colors 64 >>",
     )
     yield "objstm-predictor.pdf", _render_one_objstm(predictor), _objstm_facts(
         containers=[6],
-        encoding="flate-predictor-12",
+        encoding="flate-predictor-12-colors-64",
         encoded_lengths=[len(encoded)],
         decoded_lengths=[len(decoded)],
         declarations=declarations,

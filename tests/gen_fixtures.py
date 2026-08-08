@@ -4392,6 +4392,280 @@ def gen_freed_object_revision():
     }
 
 
+def _classic_body(marker):
+    """A two-page classic-xref PDF body plus its object offsets, ready for a trailer.
+
+    Returned without the ``xref``/``trailer``/``startxref`` tail so a caller can append a
+    good one and a broken one to otherwise identical bytes."""
+    body = bytearray(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n")
+    offsets = {}
+
+    def append(num, payload):
+        offsets[num] = len(body)
+        body.extend(b"%d 0 obj\n" % num + payload + b"\nendobj\n")
+
+    def content(page):
+        lines = [b"BT /F1 15 Tf 72 %d Td (%s page %d heading) Tj ET"
+                 % (int(PAGE_H) - 72, marker.encode(), page)]
+        for line in range(20):
+            y = int(PAGE_H) - 100 - line * LEAD
+            lines.append(b"BT /F1 10.5 Tf 72 %d Td (%s page %d line %02d carries a marker "
+                         b"so a lost object changes the bytes.) Tj ET"
+                         % (y, marker.encode(), page, line + 1))
+        payload = b"\n".join(lines)
+        return b"<< /Length %d >>\nstream\n%s\nendstream" % (len(payload), payload)
+
+    append(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+    append(2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>")
+    append(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] "
+              b"/Resources << /Font << /F1 7 0 R >> >> /Contents 5 0 R >>"
+              % (int(PAGE_W), int(PAGE_H)))
+    append(4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] "
+              b"/Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>"
+              % (int(PAGE_W), int(PAGE_H)))
+    append(5, content(1))
+    append(6, content(2))
+    append(7, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+              b"/Encoding /WinAnsiEncoding >>")
+    return body, offsets
+
+
+def gen_damaged_startxref():
+    """A file whose **cross-reference machinery is destroyed** and whose body is not.
+
+    This is what a truncated download, a botched incremental append or a byte-range fetch
+    that dropped its tail leaves behind: every object is still there, at the offset the
+    table used to name, but `startxref` points somewhere that is not a cross-reference
+    section. Both of lopdf's readers used to fail closed on it — the eager one still does —
+    so the document did not open at all.
+
+    The indexed reader now rebuilds its index by scanning the body for ``N G obj`` headers,
+    one forward pass of bounded chunks, and opens the file lazily. The pair written here is
+    byte-identical apart from the `startxref` operand, so "the recovered index is the index
+    the intact table describes" is checkable as *identical rendered output* rather than as
+    an assertion about offsets.
+
+    It lives in ``adversarial/`` because the eager engine cannot open it, and the top-level
+    fixture sweeps open every file there on the default engine.
+
+    Cross-reference damage is beyond reportlab, so this is assembled byte by byte."""
+    os.makedirs(ADV_OUT, exist_ok=True)
+    intact_path = os.path.join(ADV_OUT, "damaged_startxref_intact.pdf")
+    damaged_path = os.path.join(ADV_OUT, "damaged_startxref.pdf")
+    MARKER = "Rescan"
+
+    body, offsets = _classic_body(MARKER)
+    xref_offset = len(body)
+    body.extend(b"xref\n0 8\n0000000000 65535 f \n")
+    for num in range(1, 8):
+        body.extend(b"%010d 00000 n \n" % offsets[num])
+    body.extend(b"trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n")
+    digits_at = len(body)
+    body.extend(b"%010d\n%%%%EOF\n" % xref_offset)
+
+    intact = bytes(body)
+    # The same file with the operand pointed into the middle of page 1's content stream:
+    # a `startxref` that parses and is in bounds, and names something that is not a
+    # cross-reference section. Same length, so every object offset stays valid.
+    damaged = bytearray(intact)
+    damaged[digits_at:digits_at + 10] = b"%010d" % (offsets[5] + 40)
+    assert len(damaged) == len(intact)
+
+    with open(intact_path, "wb") as f:
+        f.write(intact)
+    with open(damaged_path, "wb") as f:
+        f.write(bytes(damaged))
+
+    GT["adversarial/damaged_startxref.pdf"] = {
+        "pages": 2,
+        "objects": 7,
+        # The byte range the two files differ in — the `startxref` operand, nothing else.
+        "startxref_digits_offset": digits_at,
+        "intact_startxref": xref_offset,
+        "intact_twin": "adversarial/damaged_startxref_intact.pdf",
+        "text_contains": ["%s page 1 heading" % MARKER,
+                          "%s page 2 heading" % MARKER,
+                          "%s page 2 line 20" % MARKER],
+    }
+
+
+def _ascii85(data):
+    """ASCII85 with the PDF `~>` EOD and no `z` abbreviation."""
+    out = bytearray()
+    for start in range(0, len(data), 4):
+        group = data[start:start + 4]
+        value = int.from_bytes(group + b"\x00" * (4 - len(group)), "big")
+        digits = bytearray()
+        for _ in range(5):
+            digits.insert(0, 33 + value % 85)
+            value //= 85
+        out += digits[:len(group) + 1]
+    return bytes(out + b"~>")
+
+
+def _asciihex(data):
+    return data.hex().upper().encode() + b">"
+
+
+def _png_up_predict(data, row_bytes):
+    """PNG `Up` (filter type 2) on every row — what a `/Predictor 12` stream carries."""
+    assert len(data) % row_bytes == 0
+    out = bytearray()
+    previous = bytes(row_bytes)
+    for start in range(0, len(data), row_bytes):
+        row = data[start:start + row_bytes]
+        out.append(2)
+        out += bytes((row[i] - previous[i]) & 0xFF for i in range(row_bytes))
+        previous = row
+    return bytes(out)
+
+
+def _tiff_predict2(data, row_bytes):
+    """TIFF Predictor 2 (horizontal differencing) at 8 bits, one colour."""
+    assert len(data) % row_bytes == 0
+    out = bytearray()
+    for start in range(0, len(data), row_bytes):
+        row = data[start:start + row_bytes]
+        out.append(row[0])
+        out += bytes((row[i] - row[i - 1]) & 0xFF for i in range(1, row_bytes))
+    return bytes(out)
+
+
+# One entry per encoding the indexed reader's bounded object-stream envelope admits:
+# the `/Filter` and `/DecodeParms` the container declares, and how to produce its payload.
+_OBJSTM_FORMS = [
+    (b"/Filter /FlateDecode", lambda raw: zlib.compress(raw, 9)),
+    (b"/Filter [/FlateDecode]", lambda raw: zlib.compress(raw, 9)),
+    (b"/Filter /FlateDecode /DecodeParms "
+     b"<< /Predictor 12 /Columns 8 /Colors 1 /BitsPerComponent 8 >>",
+     lambda raw: zlib.compress(_png_up_predict(raw, 8), 9)),
+    (b"/Filter /FlateDecode /DecodeParms "
+     b"<< /Predictor 2 /Columns 8 /Colors 1 /BitsPerComponent 8 >>",
+     lambda raw: zlib.compress(_tiff_predict2(raw, 8), 9)),
+    (b"/Filter [/ASCII85Decode /FlateDecode]",
+     lambda raw: _ascii85(zlib.compress(raw, 9))),
+    (b"/Filter [/ASCIIHexDecode /FlateDecode]",
+     lambda raw: _asciihex(zlib.compress(raw, 9))),
+]
+
+
+def gen_objstm_filter_forms():
+    """One document whose object streams are each encoded a **different admitted way**.
+
+    The indexed reader decodes an object-stream container under a charged allowance, so it
+    accepts only the encodings it can reproduce inside that budget; everything else refuses
+    with a typed error and costs the whole document its lazy route. The envelope used to be
+    "no filter, or a bare ``/FlateDecode``" — a one-element ``/Filter [/FlateDecode]`` array
+    was already outside it.
+
+    Every container here holds the same *kind* of payload (page dictionaries, resources and
+    an indirect ``/MediaBox``) and differs only in how it is encoded: bare Flate, Flate in a
+    one-element array, Flate under a PNG predictor, Flate under TIFF Predictor 2, and Flate
+    behind an ASCII85 or ASCIIHex prefix. A single container outside the envelope drops the
+    whole file to the eager engine, so "all six forms are admitted" is checkable as the
+    route the document takes, and their correctness as byte-identical output against eager.
+
+    The predictor payloads are padded to a whole number of predictor rows with spaces, which
+    land past the last member body where the container's own index never reads.
+
+    Object streams are beyond reportlab, so this is assembled by hand."""
+    path = os.path.join(OUT, "objstm_filter_forms.pdf")
+    forms = _OBJSTM_FORMS
+    pages = len(forms)
+
+    catalog, tree = 1, 2
+    page_num = {i: 3 + i * 3 for i in range(pages)}
+    res_num = {i: 4 + i * 3 for i in range(pages)}
+    box_num = {i: 5 + i * 3 for i in range(pages)}
+    font = 3 + pages * 3
+    content_num = {i: font + 1 + i for i in range(pages)}
+    first_container = font + 1 + pages
+    containers = [first_container + i for i in range(pages)]
+    xref_num = first_container + pages
+
+    regular = {}
+    for i in range(pages):
+        body = [b"BT /F1 15 Tf 72 %d Td (Container %d: encoding form) Tj ET"
+                % (int(PAGE_H) - 72, i + 1)]
+        for line in range(18):
+            y = int(PAGE_H) - 100 - line * LEAD
+            body.append(b"BT /F1 10.5 Tf 72 %d Td (Form %d line %02d carries the marker "
+                        b"%02d-%02d so a lost member changes the bytes.) Tj ET"
+                        % (y, i + 1, line + 1, i + 1, line + 1))
+        content = b"\n".join(body)
+        regular[content_num[i]] = (b"<< /Length %d >>\nstream\n" % len(content)
+                                   + content + b"\nendstream")
+
+    # Container i carries page i's dictionary trio; the shared catalog, page tree and font
+    # ride along in the first one.
+    members = {i: [page_num[i], res_num[i], box_num[i]] for i in range(pages)}
+    members[0] = [catalog, tree, font] + members[0]
+    compressed = {
+        catalog: b"<< /Type /Catalog /Pages %d 0 R >>" % tree,
+        tree: (b"<< /Type /Pages /Count %d /Kids [%s] >>"
+               % (pages, b" ".join(b"%d 0 R" % page_num[i] for i in range(pages)))),
+        font: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+              b"/Encoding /WinAnsiEncoding >>",
+    }
+    for i in range(pages):
+        compressed[page_num[i]] = (
+            b"<< /Type /Page /Parent %d 0 R /MediaBox %d 0 R /Resources %d 0 R "
+            b"/Contents %d 0 R >>" % (tree, box_num[i], res_num[i], content_num[i]))
+        compressed[res_num[i]] = b"<< /Font << /F1 %d 0 R >> >>" % font
+        compressed[box_num[i]] = b"[0 0 %d %d]" % (int(PAGE_W), int(PAGE_H))
+
+    location = {}
+    for i, (container, (declaration, encode)) in enumerate(zip(containers, forms)):
+        pairs, payload = [], bytearray()
+        for index, num in enumerate(sorted(members[i])):
+            pairs.append(b"%d %d" % (num, len(payload)))
+            payload += compressed[num] + b" "
+            location[num] = (container, index)
+        header = b" ".join(pairs) + b"\n"
+        raw = bytes(header) + bytes(payload)
+        # The predictor forms are row-framed; pad past the last member body.
+        if b"/Predictor" in declaration:
+            raw += b" " * (-len(raw) % 8)
+        packed = encode(raw)
+        regular[container] = (
+            b"<< /Type /ObjStm /N %d /First %d /Length %d %s >>\nstream\n"
+            % (len(members[i]), len(header), len(packed), declaration)
+            + packed + b"\nendstream")
+
+    body = bytearray(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n")
+    offsets = {}
+    for num in sorted(regular):
+        offsets[num] = len(body)
+        body += b"%d 0 obj\n" % num + regular[num] + b"\nendobj\n"
+    xref_offset = len(body)
+    size = xref_num + 1
+    rows = bytearray(b"\x00" + (0).to_bytes(4, "big") + (65535).to_bytes(2, "big"))
+    for num in range(1, size):
+        if num in location:
+            container, index = location[num]
+            rows += b"\x02" + container.to_bytes(4, "big") + index.to_bytes(2, "big")
+        elif num == xref_num:
+            rows += b"\x01" + xref_offset.to_bytes(4, "big") + (0).to_bytes(2, "big")
+        else:
+            rows += b"\x01" + offsets[num].to_bytes(4, "big") + (0).to_bytes(2, "big")
+    packed = zlib.compress(bytes(rows), 9)
+    body += (b"%d 0 obj\n<< /Type /XRef /Size %d /W [1 4 2] /Root %d 0 R /Length %d "
+             b"/Filter /FlateDecode >>\nstream\n" % (xref_num, size, catalog, len(packed))
+             + packed + b"\nendstream\nendobj\n")
+    body += b"startxref\n%d\n%%%%EOF\n" % xref_offset
+    with open(path, "wb") as f:
+        f.write(bytes(body))
+
+    GT["objstm_filter_forms.pdf"] = {
+        "pages": pages,
+        "object_streams": len(containers),
+        "filters": [declaration.decode() for declaration, _ in forms],
+        "text_contains": ["Container 1: encoding form",
+                          "Container %d: encoding form" % pages,
+                          "marker %02d-18" % pages],
+    }
+
+
 def gen_damaged_streams():
     """The two ways a stream can fail to decode **without anyone being told** on lopdf 0.40.
 
@@ -5349,6 +5623,8 @@ def main():
     gen_objstm_pages()
     gen_hybrid_xref_revision()
     gen_freed_object_revision()
+    gen_damaged_startxref()
+    gen_objstm_filter_forms()
     with open(os.path.join(OUT, "groundtruth.json"), "w") as f:
         # sort_keys: the dict's insertion order is main()'s call order, so adding or
         # reordering one generator reshuffled the whole file and buried the real change

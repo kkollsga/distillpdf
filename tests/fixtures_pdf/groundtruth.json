@@ -12,6 +12,18 @@
     "deep_page_tree_depth": 300,
     "deep_page_tree_word": "deep page tree"
   },
+  "adversarial/damaged_startxref.pdf": {
+    "intact_startxref": 5004,
+    "intact_twin": "adversarial/damaged_startxref_intact.pdf",
+    "objects": 7,
+    "pages": 2,
+    "startxref_digits_offset": 5217,
+    "text_contains": [
+      "Rescan page 1 heading",
+      "Rescan page 2 heading",
+      "Rescan page 2 line 20"
+    ]
+  },
   "alpha_groups.pdf": {
     "group_opacities": [
       "0.0039",
@@ -830,6 +842,23 @@
         "91.8",
         "0.12"
       ]
+    ]
+  },
+  "objstm_filter_forms.pdf": {
+    "filters": [
+      "/Filter /FlateDecode",
+      "/Filter [/FlateDecode]",
+      "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 8 /Colors 1 /BitsPerComponent 8 >>",
+      "/Filter /FlateDecode /DecodeParms << /Predictor 2 /Columns 8 /Colors 1 /BitsPerComponent 8 >>",
+      "/Filter [/ASCII85Decode /FlateDecode]",
+      "/Filter [/ASCIIHexDecode /FlateDecode]"
+    ],
+    "object_streams": 6,
+    "pages": 6,
+    "text_contains": [
+      "Container 1: encoding form",
+      "Container 6: encoding form",
+      "marker 06-18"
     ]
   },
   "objstm_pages.pdf": {
