@@ -93,9 +93,11 @@ doc.engine          # "lazy"
 ```
 
 The output is **identical** to the default `engine="eager"` — it is a memory strategy, not a
-fidelity choice, and it is regression-tested against the eager route as the oracle. A damaged
-or unusually-encrypted file the index refuses falls back to the eager engine automatically, so
-`engine="lazy"` never turns a readable PDF into an error; `doc.engine` then reports
+fidelity choice, and it is regression-tested against the eager route as the oracle. Damaged
+cross-reference data is rebuilt in place by a bounded forward scan, so a broken file stays
+lazy; only the rare shapes the index refuses — an oversized object, an unusually deep page
+tree, an unusual encryption — fall back to the eager engine, so `engine="lazy"` never turns a
+readable PDF into an error. The fallback is never silent: `doc.engine` then reports
 `"lazy (eager fallback)"`. Experimental in that the *default* engine may change in a future
 release — the keyword and its two values are stable.
 [Lazy engine »](https://distillpdf.readthedocs.io/en/latest/reference/python/#lazy-engine-experimental)

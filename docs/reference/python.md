@@ -42,8 +42,11 @@ doc.to_html("out.html")
   changes your HTML, Markdown, text or `.dpdf`.
 - **Lower memory on large files.** The win grows with file size; on small documents the eager
   engine is usually the faster of the two, which is why it stays the default.
-- **Automatic eager fallback.** A damaged or unusually-encrypted file the index refuses is
-  opened eagerly instead, so `engine="lazy"` never turns a readable PDF into an error. The
+- **Damage does not cost you the index.** Broken cross-reference data is rebuilt in place by a
+  bounded forward scan over the file body, so a damaged PDF stays on the lazy route.
+- **Automatic eager fallback.** The few shapes the index genuinely refuses — an object past the
+  4 MiB per-object decode envelope, a page tree deeper than 256 levels, an unusual encryption —
+  are opened eagerly instead, so `engine="lazy"` never turns a readable PDF into an error. The
   fallback is never silent: [`Pdf.engine`](#pdfengine) reports `"lazy (eager fallback)"`.
 - **Experimental.** The keyword and its two values are stable; which engine is the *default*
   may change in a future release. Anything other than `"eager"`/`"lazy"` raises `ValueError`.
