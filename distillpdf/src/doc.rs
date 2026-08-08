@@ -1648,12 +1648,15 @@ pub(crate) mod tests {
                         other => panic!("{name}: {other:?}"),
                     }
                 }
+                // A chain whose *terminal* filter is not Flate/LZW, and a predictor whose
+                // operands are past the bounded decode's caps: both outside the envelope,
+                // both refused by name rather than decoded to the wrong bytes.
                 "objstm-filter-chain.pdf" | "objstm-predictor.pdf" => assert!(matches!(
                     error,
                     IndexedReaderError::UnsupportedBoundedScalar {
                         id: (6, 0),
                         reason:
-                            "object-stream filter chains or predictors outside plain/FlateDecode",
+                            "object-stream filter chains or decode parameters outside the bounded decode envelope",
                     }
                 )),
                 "objstm-flate-corrupt.pdf" => match error {
@@ -2071,6 +2074,121 @@ pub(crate) mod tests {
         }
         assert_eq!(renders[0], renders[1], "two indexed renders at 4 threads differ");
         assert_eq!(renders[0], eager, "indexed render differs from eager");
+    }
+
+    /// A file whose cross-reference machinery is destroyed still opens *lazily*, by rescan.
+    ///
+    /// `damaged_startxref.pdf` and `damaged_startxref_intact.pdf` (see `tests/gen_fixtures.py`)
+    /// are the same seven objects, the same classic table, and the same trailer; they differ in
+    /// the ten digits of the `startxref` operand, which the damaged one points into the middle
+    /// of a content stream. Both of lopdf's readers used to fail closed on that — the eager one
+    /// still does, so before this the document did not open on any engine, and the lazy route's
+    /// counted eager fallback had nothing to fall back *to*.
+    ///
+    /// The indexed reader now rebuilds its index from a single forward scan of the body for
+    /// `N G obj` headers. Because the twin is byte-identical apart from those ten digits, the
+    /// recovered index being the index the intact table describes is checkable as identical
+    /// rendered output — against the intact file on *both* engines, not just against itself.
+    #[test]
+    fn damaged_startxref_recovers_on_the_indexed_route_and_matches_the_intact_twin() {
+        let _test_lock = crate::access::indexed_test_lock();
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/adversarial");
+        let damaged_path = PathBuf::from(format!("{dir}/damaged_startxref.pdf"));
+        let intact_path = PathBuf::from(format!("{dir}/damaged_startxref_intact.pdf"));
+        let damaged = std::fs::read(&damaged_path).expect("committed damaged fixture");
+        let intact = std::fs::read(&intact_path).expect("committed intact twin");
+        assert_eq!(damaged.len(), intact.len(), "the twins must differ only in the operand");
+        let differing: Vec<usize> = damaged
+            .iter()
+            .zip(&intact)
+            .enumerate()
+            .filter(|(_, (left, right))| left != right)
+            .map(|(index, _)| index)
+            .collect();
+        let operand = intact
+            .windows(b"startxref\n".len())
+            .position(|window| window == b"startxref\n")
+            .expect("the intact twin declares a startxref")
+            + b"startxref\n".len();
+        assert!(
+            !differing.is_empty() && differing.iter().all(|index| (operand..operand + 10).contains(index)),
+            "the twins must differ only inside the ten startxref digits: {differing:?}"
+        );
+
+        // The eager engine has no rescan, so it still cannot open the damaged file at all.
+        assert!(
+            PdfDocument::from_bytes_with_engine(&damaged, Engine::Eager).is_err(),
+            "eager must still fail closed"
+        );
+
+        let eager = PdfDocument::from_bytes_with_engine(&intact, Engine::Eager)
+            .expect("eager opens the intact twin")
+            .render(crate::Mode::Page, false, false);
+        assert!(eager.contains("Rescan page 2 line 20"), "fixture text");
+
+        for (name, path) in [("damaged", &damaged_path), ("intact", &intact_path)] {
+            let control = open_indexed_file_internal(path, None).expect("indexed open");
+            let document = PdfDocument::finish_indexed_open(control, Some(path.to_path_buf()));
+            // A recovered open is still an indexed open: nothing was counted as a fallback,
+            // so the route the caller is told about is the route that ran.
+            let diagnostics = document.route_diagnostics();
+            assert_eq!(diagnostics.indexed_opens, 1, "{name}");
+            assert_eq!(diagnostics.fallback_opens, 0, "{name}");
+            assert_eq!(document.engine(), EngineRoute::Lazy, "{name}");
+            assert_eq!(document.page_count(), 2, "{name}");
+            assert_eq!(document.render(crate::Mode::Page, false, false), eager, "{name}");
+        }
+    }
+
+    /// Every object-stream encoding inside the bounded decode envelope keeps its document
+    /// on the lazy route, and decodes to what eager decodes.
+    ///
+    /// `objstm_filter_forms.pdf` (see `tests/gen_fixtures.py`) carries one `/ObjStm` container
+    /// per admitted encoding — bare `/FlateDecode`, Flate in a one-element `/Filter` array,
+    /// Flate under a PNG predictor, Flate under TIFF Predictor 2, and Flate behind an ASCII85
+    /// or ASCIIHex prefix — each holding the page dictionary, resources and indirect
+    /// `/MediaBox` of one page. The indexed reader decodes a container under a charged
+    /// allowance and so admits only what it can reproduce inside that budget; before this,
+    /// the envelope was "no filter or a bare `/FlateDecode`" and *five* of these six
+    /// containers refused, dropping the whole document to the eager engine.
+    #[test]
+    fn every_admitted_object_stream_encoding_stays_lazy_and_matches_eager() {
+        let _test_lock = crate::access::indexed_test_lock();
+        let path = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures_pdf/objstm_filter_forms.pdf"
+        ));
+        let raw = std::fs::read(&path).expect("committed filter-form fixture");
+        let eager = PdfDocument::from_bytes_with_engine(&raw, Engine::Eager)
+            .expect("eager open")
+            .render(crate::Mode::Page, false, false);
+        assert!(eager.contains("Container 6: encoding form"), "fixture text");
+
+        let control = open_indexed_file_internal(&path, None).expect("indexed open");
+        let document = PdfDocument::finish_indexed_open(control, Some(path.clone()));
+        assert_eq!(document.engine(), EngineRoute::Lazy);
+        assert_eq!(document.route_diagnostics().fallback_opens, 0);
+        assert_eq!(document.page_count(), 6);
+        assert_eq!(document.render(crate::Mode::Page, false, false), eager);
+
+        // The route above resolves containers through the shared resolver, which is not the
+        // surface the envelope gates. Drive the *bounded* preparation the envelope guards —
+        // the one a memory-budgeted consumer uses — once per container, so each admitted
+        // encoding is proved individually rather than inferred from the render.
+        let reader = IndexedReader::open(BytesSource::from(raw)).expect("indexed reader");
+        let containers: std::collections::BTreeSet<lopdf::ObjectId> = reader
+            .object_ids()
+            .into_iter()
+            .filter_map(|id| match reader.object_location(id) {
+                Some(IndexedObjectLocation::Compressed { container, .. }) => Some(container),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(containers.len(), 6, "one container per encoding form");
+        for container in containers {
+            prepare_objstm(&reader, container)
+                .unwrap_or_else(|error| panic!("container {container:?} refused: {error:?}"));
+        }
     }
 
     /// Both engines read the *newest* structure tree of a hybrid-reference file whose
