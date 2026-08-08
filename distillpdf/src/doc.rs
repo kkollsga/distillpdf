@@ -107,7 +107,9 @@ pub struct PdfDocument {
     /// Runtime-selectable immutable access route. L2 uses the eager oracle adapter; L3 adds
     /// the bounded indexed implementation without reopening consumer signatures.
     pub(crate) access: Arc<dyn DocumentAccess>,
-    #[allow(dead_code)] // internal route provenance becomes public only after API approval
+    /// Route provenance for this handle. The write side is live (both engines populate it);
+    /// the read side is crate-internal and has test/measurement callers only.
+    #[allow(dead_code)]
     diagnostics: Arc<RouteDiagnostics>,
     /// Source path (`open`); `None` when constructed from bytes.
     pub(crate) source: Option<PathBuf>,
@@ -115,7 +117,6 @@ pub struct PdfDocument {
     pub(crate) ocr_cache: Mutex<HashMap<u32, String>>,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OpenRoute {
     EagerFile,
@@ -125,7 +126,6 @@ pub(crate) enum OpenRoute {
     IndexedSnapshot,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OpenReason {
     PublicCompatibility,
@@ -133,7 +133,6 @@ pub(crate) enum OpenReason {
     ExplicitSnapshot,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SourceMode {
     FileDescriptor,
@@ -199,10 +198,11 @@ impl RandomAccessSource for ObservedSource {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) struct RouteDiagnostics {
     pub(crate) route: OpenRoute,
+    #[allow(dead_code)] // reported through `snapshot`, which only tests/measurement read
     pub(crate) reason: OpenReason,
+    #[allow(dead_code)] // reported through `snapshot`, which only tests/measurement read
     pub(crate) source_mode: SourceMode,
     eager_opens: AtomicU64,
     indexed_opens: AtomicU64,
@@ -211,6 +211,8 @@ pub(crate) struct RouteDiagnostics {
     indexed: OnceLock<Arc<IndexedAdapterCounters>>,
 }
 
+/// Read-side view of [`RouteDiagnostics`]. Populated by live code; consumed only by tests and
+/// the internal measurement harness, so it reads as dead in a plain build.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RouteDiagnosticsSnapshot {
@@ -230,7 +232,6 @@ pub(crate) struct RouteDiagnosticsSnapshot {
     pub(crate) document_object_o_admitted_bytes: u64,
 }
 
-#[allow(dead_code)]
 impl RouteDiagnostics {
     fn new(route: OpenRoute, reason: OpenReason, source_mode: SourceMode) -> Arc<Self> {
         Arc::new(Self {
@@ -245,6 +246,7 @@ impl RouteDiagnostics {
         })
     }
 
+    #[allow(dead_code)] // diagnostics read side: tests and the internal measurement harness
     pub(crate) fn snapshot(&self) -> RouteDiagnosticsSnapshot {
         let indexed = self.indexed.get();
         RouteDiagnosticsSnapshot {
@@ -276,14 +278,13 @@ impl RouteDiagnostics {
     }
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // payloads exist for the `Debug` report the strict selector surfaces
 #[derive(Debug)]
 pub(crate) enum RouteFailure {
     Source(SourceError),
     Access(AccessError),
 }
 
-#[allow(dead_code)]
 pub(crate) struct RouteOpenError {
     pub(crate) failure: RouteFailure,
     pub(crate) diagnostics: Arc<RouteDiagnostics>,
@@ -299,14 +300,13 @@ impl std::fmt::Debug for RouteOpenError {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) struct IndexedOpenControl {
     access: Arc<IndexedDocumentAdapter>,
     diagnostics: Arc<RouteDiagnostics>,
     source_owner: Option<Arc<[u8]>>,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // pre-adoption inspection helpers; used by tests and measurement
 impl IndexedOpenControl {
     pub(crate) fn diagnostics(&self) -> RouteDiagnosticsSnapshot {
         self.diagnostics.snapshot()
@@ -688,6 +688,54 @@ fn ensure_decrypted(raw: &[u8], doc: &mut Document) -> Result<(), Error> {
     Ok(())
 }
 
+/// Which access engine the public constructors build — **internal and unstable**.
+///
+/// Selected once per process by the `DISTILLPDF_ENGINE` environment variable. This is not
+/// public API: it exists so Phase B can run the existing suites and the corpus measurement
+/// harness over the bounded indexed route without changing what a released build does. The
+/// default — and the value for every unset/unrecognised string — is [`EngineSelection::Eager`],
+/// so published behaviour is untouched.
+///
+/// * unset / anything else — [`EngineSelection::Eager`], the eager `lopdf::Document` route.
+/// * `indexed` — the bounded indexed route, with an **explicit, counted** eager fallback when
+///   the indexed open itself fails (xref recovery, an encryption shape the index cannot take,
+///   a bounded-decode envelope refusal). The fallback is recorded in the resulting document's
+///   [`RouteDiagnostics::fallback_opens`]; it is never silent.
+/// * `indexed-strict` — the same route with the fallback *disabled*, so an indexed open failure
+///   surfaces as [`Error::Open`]. Measurement uses this to tell a true-indexed run from a run
+///   that quietly ended up on the eager engine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EngineSelection {
+    Eager,
+    Indexed,
+    IndexedStrict,
+}
+
+impl EngineSelection {
+    fn prefers_indexed(self) -> bool {
+        !matches!(self, EngineSelection::Eager)
+    }
+}
+
+/// The `DISTILLPDF_ENGINE` grammar, as a pure function so it is testable without the process
+/// environment. Unset and every unrecognised value mean eager — the selector can only ever be
+/// turned on deliberately.
+fn parse_engine_selection(value: Option<&str>) -> EngineSelection {
+    match value {
+        Some("indexed") => EngineSelection::Indexed,
+        Some("indexed-strict") => EngineSelection::IndexedStrict,
+        _ => EngineSelection::Eager,
+    }
+}
+
+/// Read `DISTILLPDF_ENGINE` once per process. Internal/unstable — see [`EngineSelection`].
+fn engine_selection() -> EngineSelection {
+    static SELECTION: OnceLock<EngineSelection> = OnceLock::new();
+    *SELECTION.get_or_init(|| {
+        parse_engine_selection(std::env::var("DISTILLPDF_ENGINE").ok().as_deref())
+    })
+}
+
 fn open_indexed_source(
     source: Arc<dyn RandomAccessSource>,
     source_owner: Option<Arc<[u8]>>,
@@ -717,7 +765,6 @@ fn open_indexed_source(
     })
 }
 
-#[allow(dead_code)] // internal L3 route authority; public constructors remain eager
 pub(crate) fn open_indexed_file_internal(
     path: &Path,
     password: Option<Vec<u8>>,
@@ -741,7 +788,6 @@ pub(crate) fn open_indexed_file_internal(
     )
 }
 
-#[allow(dead_code)] // internal L3 route authority; public constructors remain eager
 pub(crate) fn open_indexed_bytes_internal(
     bytes: Arc<[u8]>,
     password: Option<Vec<u8>>,
@@ -812,9 +858,41 @@ impl PdfDocument {
         Self::finish_open(access, diagnostics, source)
     }
 
+    /// Adopt a successful indexed open as the document's access route.
+    ///
+    /// The control's `source_owner` is only the *second* handle on the shared bytes — the
+    /// `BytesSource` inside the adapter holds its own — so the handle is dropped here rather
+    /// than adding a byte-retaining field to [`PdfDocument`].
+    fn finish_indexed_open(control: IndexedOpenControl, source: Option<PathBuf>) -> Self {
+        let IndexedOpenControl { access, diagnostics, source_owner } = control;
+        drop(source_owner);
+        Self::finish_open(access, diagnostics, source)
+    }
+
+    /// Decide what an indexed open failure means for the selected engine: `Err` under
+    /// `indexed-strict`, `Ok(())` ("fall back, and count it") under `indexed`.
+    fn indexed_failure_disposition(error: RouteOpenError) -> Result<(), Error> {
+        if engine_selection() == EngineSelection::IndexedStrict {
+            return Err(Error::Open(format!(
+                "DISTILLPDF_ENGINE=indexed-strict: indexed open failed: {:?}",
+                error.failure
+            )));
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)] // access-injection seam for tests; production uses `from_bytes`
     fn from_bytes_with_access_factory(
         data: &[u8],
         make_access: impl FnOnce(Arc<Document>, Arc<[u8]>) -> Arc<dyn DocumentAccess>,
+    ) -> Result<Self, Error> {
+        Self::from_bytes_eager(data, make_access, false)
+    }
+
+    fn from_bytes_eager(
+        data: &[u8],
+        make_access: impl FnOnce(Arc<Document>, Arc<[u8]>) -> Arc<dyn DocumentAccess>,
+        after_indexed_failure: bool,
     ) -> Result<Self, Error> {
         let diagnostics = RouteDiagnostics::new(
             OpenRoute::EagerBytes,
@@ -822,6 +900,9 @@ impl PdfDocument {
             SourceMode::SharedBytes,
         );
         diagnostics.eager_opens.store(1, Ordering::Relaxed);
+        if after_indexed_failure {
+            diagnostics.fallback_opens.store(1, Ordering::Relaxed);
+        }
         let raw: Arc<[u8]> = Arc::from(data);
         let mut doc = load_mem_deterministic(&raw)
             .map_err(|error| Error::Parse(eager_error_message(&error)))?;
@@ -836,13 +917,31 @@ impl PdfDocument {
     }
 
     /// Open a PDF from a filesystem path. Only loads/parses the container.
+    ///
+    /// Eager by default; `DISTILLPDF_ENGINE=indexed` routes through the bounded indexed engine
+    /// with a counted eager fallback (internal/unstable — see [`EngineSelection`]).
     pub fn open(path: &str) -> Result<Self, Error> {
+        let mut after_indexed_failure = false;
+        if engine_selection().prefers_indexed() {
+            match open_indexed_file_internal(Path::new(path), None) {
+                Ok(control) => {
+                    return Ok(Self::finish_indexed_open(control, Some(PathBuf::from(path))));
+                }
+                Err(error) => {
+                    Self::indexed_failure_disposition(error)?;
+                    after_indexed_failure = true;
+                }
+            }
+        }
         let diagnostics = RouteDiagnostics::new(
             OpenRoute::EagerFile,
             OpenReason::PublicCompatibility,
             SourceMode::EagerMaterializedFile,
         );
         diagnostics.eager_opens.store(1, Ordering::Relaxed);
+        if after_indexed_failure {
+            diagnostics.fallback_opens.store(1, Ordering::Relaxed);
+        }
         let raw: Arc<[u8]> = std::fs::read(path).map_err(Error::Read)?.into();
         let mut doc = load_mem_deterministic(&raw).map_err(|e| Error::Open(eager_error_message(&e)))?;
         ensure_decrypted(&raw, &mut doc)?;
@@ -856,14 +955,31 @@ impl PdfDocument {
     }
 
     /// Open a PDF from raw bytes. There is no source path.
+    ///
+    /// Honours the same internal [`EngineSelection`] as [`PdfDocument::open`].
     pub fn from_bytes(data: &[u8]) -> Result<Self, Error> {
-        Self::from_bytes_with_access_factory(data, |document, source| {
-            Arc::new(EagerDocumentAdapter::new(document, source))
-        })
+        let mut after_indexed_failure = false;
+        if engine_selection().prefers_indexed() {
+            match open_indexed_bytes_internal(Arc::from(data), None) {
+                Ok(control) => return Ok(Self::finish_indexed_open(control, None)),
+                Err(error) => {
+                    Self::indexed_failure_disposition(error)?;
+                    after_indexed_failure = true;
+                }
+            }
+        }
+        Self::from_bytes_eager(
+            data,
+            |document, source| Arc::new(EagerDocumentAdapter::new(document, source)),
+            after_indexed_failure,
+        )
     }
 
-    #[cfg(test)]
-    fn route_diagnostics(&self) -> RouteDiagnosticsSnapshot {
+    /// Route provenance for the open that produced this handle — crate-internal, no public
+    /// surface. The `fallback_opens` counter is how a counted eager fallback from the indexed
+    /// selector is observed.
+    #[allow(dead_code)] // diagnostics read side: tests and the internal measurement harness
+    pub(crate) fn route_diagnostics(&self) -> RouteDiagnosticsSnapshot {
         self.diagnostics.snapshot()
     }
 
