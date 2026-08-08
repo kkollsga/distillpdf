@@ -33,13 +33,15 @@ class Document:
         self._scanned = None  # cached page numbers needing OCR (set by run_processing)
 
     # -- constructors --------------------------------------------------------
+    # `engine=` here is the PDF *access* engine ("eager"/"lazy"), not the OCR engine
+    # `run_ocr(engine=...)` takes — different method, different lifecycle stage.
     @classmethod
-    def open(cls, path: str) -> "Document":
-        return cls(_open(path))
+    def open(cls, path: str, *, engine: Optional[str] = None) -> "Document":
+        return cls(_open(path, engine=engine))
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "Document":
-        return cls(_from_bytes(data))
+    def from_bytes(cls, data: bytes, *, engine: Optional[str] = None) -> "Document":
+        return cls(_from_bytes(data, engine=engine))
 
     # -- delegate everything else to the Rust core ---------------------------
     def __getattr__(self, name: str):

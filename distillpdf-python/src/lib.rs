@@ -23,7 +23,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use distillpdf::{doc, markdown, model, ocr, Error, PdfDocument, DEFAULT_PAGE_PTS};
+use distillpdf::{doc, markdown, model, ocr, Engine, Error, PdfDocument, DEFAULT_PAGE_PTS};
 
 pyo3::create_exception!(
     _distillpdf,
@@ -58,6 +58,16 @@ fn page_arg(page: i64) -> PyResult<u32> {
     u32::try_from(page).map_err(|_| PyValueError::new_err(format!("no page {page}")))
 }
 
+/// Normalize the `engine=` keyword taken from Python.
+///
+/// The grammar and its error message both live in the core ([`Engine::parse`] →
+/// [`Error::InvalidEngine`]), for the same reason every other exception here does: an error
+/// minted at the binding could never become a subclass, and a Rust embedder would get a
+/// different message than a Python caller for the same mistake.
+fn engine_arg(engine: &str) -> PyResult<Engine> {
+    Engine::parse(engine).map_err(to_py)
+}
+
 /// The success sentinel returned by the file-writing methods: Python `int` 1.
 fn ok_one(py: Python<'_>) -> PyResult<Py<PyAny>> {
     use pyo3::IntoPyObject;
@@ -75,16 +85,43 @@ impl Pdf {
     /// Open a PDF from a filesystem path. This only loads and parses the PDF container;
     /// the actual extraction/render happens in `to_html()` / `to_markdown()`, which is
     /// where the rendering options (`mode`/`images`/`toc`) live.
+    ///
+    /// `engine=` picks the access engine: `"eager"` (the default) parses the whole container up
+    /// front, `"lazy"` (experimental) indexes it and pulls objects on demand, which keeps peak
+    /// memory far below the file size on large documents. Output is identical either way; a
+    /// document the lazy engine refuses is opened eagerly instead, and `Pdf.engine` says so.
+    /// Anything else is a `ValueError`.
     #[staticmethod]
-    fn open(path: &str) -> PyResult<Self> {
-        Ok(Pdf { inner: PdfDocument::open(path).map_err(to_py)? })
+    #[pyo3(signature = (path, *, engine=None))]
+    fn open(path: &str, engine: Option<&str>) -> PyResult<Self> {
+        let inner = match engine {
+            Some(name) => PdfDocument::open_with_engine(path, engine_arg(name)?),
+            None => PdfDocument::open(path),
+        };
+        Ok(Pdf { inner: inner.map_err(to_py)? })
     }
 
     /// Open a PDF from raw bytes. There is no source path, so writing output with
     /// `outputfile=True` (no `path`) is an error — pass an explicit `path` instead.
+    ///
+    /// Takes the same `engine=` keyword as `Pdf.open`.
     #[staticmethod]
-    fn from_bytes(data: &[u8]) -> PyResult<Self> {
-        Ok(Pdf { inner: PdfDocument::from_bytes(data).map_err(to_py)? })
+    #[pyo3(signature = (data, *, engine=None))]
+    fn from_bytes(data: &[u8], engine: Option<&str>) -> PyResult<Self> {
+        let inner = match engine {
+            Some(name) => PdfDocument::from_bytes_with_engine(data, engine_arg(name)?),
+            None => PdfDocument::from_bytes(data),
+        };
+        Ok(Pdf { inner: inner.map_err(to_py)? })
+    }
+
+    /// Which engine actually opened this document: `"eager"`, `"lazy"`, or
+    /// `"lazy (eager fallback)"` — the last meaning `engine="lazy"` was asked for and the file
+    /// (damaged, or an encryption shape the index cannot take) was served eagerly instead. Read
+    /// off the route counters the open wrote, so it reports what happened, not what was asked.
+    #[getter]
+    fn engine(&self) -> &'static str {
+        self.inner.engine().as_str()
     }
 
     /// Number of pages.
@@ -514,17 +551,20 @@ impl Pdf {
 }
 
 /// Open a PDF from a filesystem path — `distillpdf.open("file.pdf")`. A module-level
-/// shorthand for `Pdf.open(...)`. Rendering options live on `to_html()`/`to_markdown()`.
+/// shorthand for `Pdf.open(...)`, `engine=` included. Rendering options live on
+/// `to_html()`/`to_markdown()`.
 #[pyfunction]
-fn open(path: &str) -> PyResult<Pdf> {
-    Pdf::open(path)
+#[pyo3(signature = (path, *, engine=None))]
+fn open(path: &str, engine: Option<&str>) -> PyResult<Pdf> {
+    Pdf::open(path, engine)
 }
 
 /// Open a PDF from raw bytes — `distillpdf.from_bytes(data)`. Shorthand for
 /// `Pdf.from_bytes(...)`.
 #[pyfunction]
-fn from_bytes(data: &[u8]) -> PyResult<Pdf> {
-    Pdf::from_bytes(data)
+#[pyo3(signature = (data, *, engine=None))]
+fn from_bytes(data: &[u8], engine: Option<&str>) -> PyResult<Pdf> {
+    Pdf::from_bytes(data, engine)
 }
 
 /// Load a `.dpdf` container and return its `model.json` as a JSON string — the minimal

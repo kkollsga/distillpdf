@@ -19,17 +19,56 @@ Python workflow layer (`Document`, `Doc`, the `ocr` module). Source of truth: th
 
 ---
 
+## Lazy engine (experimental)
+
+Every function that opens a PDF takes an `engine=` keyword choosing **how the container is
+read**. It is a memory strategy, not a fidelity choice.
+
+| `engine=` | What it does |
+| --- | --- |
+| `"eager"` *(default)* | Parses the whole container up front. Lowest latency on ordinary files. |
+| `"lazy"` | Builds an index and pulls objects on demand, so peak memory stays far below the file size on large documents. |
+
+```python
+import distillpdf
+
+doc = distillpdf.open("10000-pages.pdf", engine="lazy")
+doc.engine          # "lazy"
+doc.to_html("out.html")
+```
+
+- **Identical output.** The lazy engine renders byte-for-byte what the eager engine renders;
+  it is regression-tested against the eager route as the oracle. Switching engines never
+  changes your HTML, Markdown, text or `.dpdf`.
+- **Lower memory on large files.** The win grows with file size; on small documents the eager
+  engine is usually the faster of the two, which is why it stays the default.
+- **Automatic eager fallback.** A damaged or unusually-encrypted file the index refuses is
+  opened eagerly instead, so `engine="lazy"` never turns a readable PDF into an error. The
+  fallback is never silent: [`Pdf.engine`](#pdfengine) reports `"lazy (eager fallback)"`.
+- **Experimental.** The keyword and its two values are stable; which engine is the *default*
+  may change in a future release. Anything other than `"eager"`/`"lazy"` raises `ValueError`.
+
+!!! warning "`DISTILLPDF_ENGINE` is not the public switch"
+    The `DISTILLPDF_ENGINE` environment variable is an internal, unstable test/measurement hook
+    with a different spelling, no compatibility promise, and no place in application code. It
+    only affects opens that named no engine — an explicit `engine=` always wins.
+
+---
+
 ## Module functions
 
 ### open
 
 ```python
-distillpdf.open(path: str) -> Document
+distillpdf.open(path: str, *, engine: str | None = None) -> Document
 ```
 
 Open a PDF from a filesystem path and return a [`Document`](#document). Equivalent to
 `Document.open(path)`. Raises `ValueError` (`open failed: …`) when the file cannot be read or
 parsed, and [`EncryptedPdfError`](#encryptedpdferror) when it is password-protected.
+
+`engine` selects the access engine — `"eager"` (the default) or `"lazy"`; see
+[Lazy engine](#lazy-engine-experimental).
 
 ```python
 import distillpdf
@@ -40,12 +79,13 @@ doc.to_html("paper.html")
 ### from_bytes
 
 ```python
-distillpdf.from_bytes(data: bytes) -> Document
+distillpdf.from_bytes(data: bytes, *, engine: str | None = None) -> Document
 ```
 
 Open a PDF from raw bytes and return a [`Document`](#document). There is no source path, so
 writing output without an explicit `path` is an error — pass a `path` to the render methods.
-Raises `ValueError` (`parse failed: …`) on a malformed PDF.
+Raises `ValueError` (`parse failed: …`) on a malformed PDF. Takes the same `engine` keyword as
+[`open`](#open).
 
 ### load
 
@@ -152,21 +192,37 @@ work). The methods are documented here once, on `Pdf`; `Document` overrides only
 ### Pdf.open
 
 ```python
-Pdf.open(path: str) -> Pdf          # staticmethod
+Pdf.open(path: str, *, engine: str | None = None) -> Pdf          # staticmethod
 ```
 
 Load and parse a PDF container from a path. Rendering/extraction happens lazily in the output
 methods. Raises `ValueError` on a read/parse failure, or
 [`EncryptedPdfError`](#encryptedpdferror) when the PDF needs a password.
 
+`engine` is `"eager"` (the default) or `"lazy"` — see
+[Lazy engine](#lazy-engine-experimental). It is keyword-only, and any other value raises
+`ValueError`.
+
 ### Pdf.from_bytes
 
 ```python
-Pdf.from_bytes(data: bytes) -> Pdf  # staticmethod
+Pdf.from_bytes(data: bytes, *, engine: str | None = None) -> Pdf  # staticmethod
 ```
 
 Load and parse a PDF from raw bytes. With no source path, the output methods require an
-explicit `path` (writing the default `<source>.ext` has nowhere to go).
+explicit `path` (writing the default `<source>.ext` has nowhere to go). Takes the same
+`engine` keyword as [`Pdf.open`](#pdfopen).
+
+### Pdf.engine
+
+```python
+Pdf.engine -> str                   # read-only property
+```
+
+Which engine actually opened this document: `"eager"`, `"lazy"`, or `"lazy (eager fallback)"`.
+The last value means `engine="lazy"` was asked for and the index refused the file, so it was
+opened eagerly instead — read off the route counters the open wrote, so it reports what
+happened rather than what was requested.
 
 ### Pdf.page_count
 
@@ -463,15 +519,17 @@ state, e.g. `<distillpdf.Document pages=12 ocr=no>`.
 ### Document.open
 
 ```python
-Document.open(path: str) -> Document   # classmethod
+Document.open(path: str, *, engine: str | None = None) -> Document   # classmethod
 ```
 
-Construct from a path (what [`distillpdf.open`](#open) calls).
+Construct from a path (what [`distillpdf.open`](#open) calls). `engine` is the PDF **access**
+engine ([Lazy engine](#lazy-engine-experimental)) — not the OCR engine
+[`run_ocr`](#documentrun_ocr) takes.
 
 ### Document.from_bytes
 
 ```python
-Document.from_bytes(data: bytes) -> Document   # classmethod
+Document.from_bytes(data: bytes, *, engine: str | None = None) -> Document   # classmethod
 ```
 
 Construct from raw bytes (what [`distillpdf.from_bytes`](#from_bytes) calls).

@@ -82,6 +82,24 @@ distillpdf scan.pdf --ocr             # OCR a scan → scan.searchable.pdf (bund
   read / find / search` against a distilled model, no SDK or server.
   [CLI »](https://distillpdf.readthedocs.io/en/latest/guide/cli/)
 
+## Lazy engine (experimental)
+
+Opt in with `engine="lazy"` to read the PDF container through an on-demand index instead of
+parsing it whole, keeping peak memory far below the file size on large documents:
+
+```python
+doc = distillpdf.open("10000-pages.pdf", engine="lazy")
+doc.engine          # "lazy"
+```
+
+The output is **identical** to the default `engine="eager"` — it is a memory strategy, not a
+fidelity choice, and it is regression-tested against the eager route as the oracle. A damaged
+or unusually-encrypted file the index refuses falls back to the eager engine automatically, so
+`engine="lazy"` never turns a readable PDF into an error; `doc.engine` then reports
+`"lazy (eager fallback)"`. Experimental in that the *default* engine may change in a future
+release — the keyword and its two values are stable.
+[Lazy engine »](https://distillpdf.readthedocs.io/en/latest/reference/python/#lazy-engine-experimental)
+
 ## Comparison
 
 | | distillPDF | PyMuPDF | pdfminer.six | Unstructured |

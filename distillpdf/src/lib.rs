@@ -156,7 +156,7 @@ impl WalkBudget {
 // ---- root re-exports: the KGLite consumer contract's small surface ----
 // Document handle, options, error, the typed model, the asset profile, and the `.dpdf`
 // load convenience. Wire structs (`Block`, `Section`, `Page`, …) stay under `model`.
-pub use doc::{load_dpdf, DistillOptions, PdfDocument};
+pub use doc::{load_dpdf, DistillOptions, Engine, EngineRoute, PdfDocument};
 pub use error::Error;
 pub use model::{AssetProfile, DocModel};
 
