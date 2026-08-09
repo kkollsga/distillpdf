@@ -492,6 +492,21 @@
     "word": "INHERIT",
     "x": 172
   },
+  "freed_compressed_link.pdf": {
+    "container_object": 9,
+    "freed_object": 7,
+    "freed_uri": "https://internal.example/leaked-case-file",
+    "kept_object": 8,
+    "kept_uri": "https://example.com/programme-overview",
+    "revisions": 2,
+    "text_contains": [
+      "Public briefing: see the programme overview.",
+      "Case file: contact the case officer directly."
+    ],
+    "uri_excludes": [
+      "https://internal.example/leaked-case-file"
+    ]
+  },
   "freed_object_revision.pdf": {
     "freed_object": 6,
     "kept_object": 5,

@@ -4469,6 +4469,127 @@ def gen_freed_object_revision():
     }
 
 
+def gen_freed_compressed_link():
+    """The **compressed** half of the redaction shape: revision 2 frees a `/Link` annotation
+    that lives inside an `/ObjStm`, and the page's `/Annots` array still names it.
+
+    ``freed_object_revision.pdf`` covers the plain case, where the deleted object sits at its
+    own file offset. This one covers the case an incremental redaction of an object-stream
+    file actually produces: annotations, outline items and form fields are exactly the small
+    dictionaries a writer packs into containers, so a redaction writes a type-0 row for the
+    member and leaves the container it lived in untouched — its bytes, and the URI in them,
+    stay in the file verbatim.
+
+    That makes the container a second, contradicting source of truth. A loader that expands
+    every readable `/ObjStm` and keeps whatever the merged table does not explicitly place
+    elsewhere resurrects the freed member, because a free entry names no container to
+    disagree with. The eager engine did precisely that while the indexed one, which resolves
+    through the table, returned null — so the default engine reported a hyperlink the file had
+    deleted and the two engines disagreed on the same bytes.
+
+    Two links are compressed side by side in one container so the assertion cannot pass
+    vacuously: the kept one must still be reported, the freed one must not, on both engines.
+    The container is written **uncompressed** so the fixture test can show the leaked URI is
+    still physically present in the file.
+
+    Object streams, cross-reference streams and free entries are all beyond reportlab, so this
+    is assembled byte by byte."""
+    path = os.path.join(OUT, "freed_compressed_link.pdf")
+    KEPT_URI = "https://example.com/programme-overview"
+    FREED_URI = "https://internal.example/leaked-case-file"
+    KEPT_TEXT = "Public briefing: see the programme overview."
+    FREED_TEXT = "Case file: contact the case officer directly."
+
+    catalog, tree, page, contents, resources, font = 1, 2, 3, 4, 5, 6
+    freed, kept, container, base_xref_num, redact_xref_num = 7, 8, 9, 10, 11
+
+    content = (b"BT /F1 12 Tf 72 700 Td (%s) Tj ET\n"
+               b"BT /F1 12 Tf 72 660 Td (%s) Tj ET"
+               % (KEPT_TEXT.encode(), FREED_TEXT.encode()))
+    # The freed annotation is listed FIRST, so a loader that resurrects it also shifts the
+    # order of what survives — the failure is visible in the link list, not only in its length.
+    regular = {
+        catalog: b"<< /Type /Catalog /Pages %d 0 R >>" % tree,
+        tree: b"<< /Type /Pages /Kids [%d 0 R] /Count 1 >>" % page,
+        page: (b"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 612 792] /Resources %d 0 R "
+               b"/Contents %d 0 R /Annots [%d 0 R %d 0 R] >>"
+               % (tree, resources, contents, freed, kept)),
+        contents: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        resources: b"<< /Font << /F1 %d 0 R >> >>" % font,
+        font: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+              b"/Encoding /WinAnsiEncoding >>",
+    }
+    compressed = {
+        freed: (b"<< /Type /Annot /Subtype /Link /Rect [72 656 500 674] /Border [0 0 0] "
+                b"/A << /S /URI /URI (%s) >> >>" % FREED_URI.encode()),
+        kept: (b"<< /Type /Annot /Subtype /Link /Rect [72 696 500 714] /Border [0 0 0] "
+               b"/A << /S /URI /URI (%s) >> >>" % KEPT_URI.encode()),
+    }
+
+    # --- the container, uncompressed so the leaked bytes stay legible ---------------------
+    pairs, payload, location = [], bytearray(), {}
+    for index, num in enumerate(sorted(compressed)):
+        pairs.append(b"%d %d" % (num, len(payload)))
+        payload += compressed[num] + b" "
+        location[num] = (container, index)
+    header = b" ".join(pairs) + b"\n"
+    raw_stream = bytes(header) + bytes(payload)
+    regular[container] = (b"<< /Type /ObjStm /N %d /First %d /Length %d >>\nstream\n"
+                          % (len(compressed), len(header), len(raw_stream))
+                          + raw_stream + b"\nendstream")
+
+    body = bytearray(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n")
+    offsets = {}
+    for num in sorted(regular):
+        offsets[num] = len(body)
+        body += b"%d 0 obj\n" % num + regular[num] + b"\nendobj\n"
+
+    def xref_row(kind, second, third):
+        return bytes([kind]) + second.to_bytes(4, "big") + third.to_bytes(2, "big")
+
+    # --- revision 1: everything live, object 7 compressed in the container ---------------
+    base_xref = len(body)
+    size = base_xref_num + 1
+    rows = bytearray(xref_row(0, 0, 65535))
+    for num in range(1, size):
+        if num in location:
+            rows += xref_row(2, *location[num])
+        elif num == base_xref_num:
+            rows += xref_row(1, base_xref, 0)
+        else:
+            rows += xref_row(1, offsets[num], 0)
+    body += (b"%d 0 obj\n<< /Type /XRef /Size %d /W [1 4 2] /Root %d 0 R /Length %d >>\n"
+             b"stream\n" % (base_xref_num, size, catalog, len(rows))
+             + bytes(rows) + b"\nendstream\nendobj\n")
+    body += b"startxref\n%d\n%%%%EOF\n" % base_xref
+
+    # --- revision 2: object 7 is freed, and nothing else changes -------------------------
+    # The container is NOT rewritten: object 7's dictionary, URI and all, is still in it.
+    redact_xref = len(body)
+    rows = xref_row(0, 0, 1) + xref_row(1, redact_xref, 0)
+    body += (b"%d 0 obj\n<< /Type /XRef /Size %d /W [1 4 2] /Root %d 0 R "
+             b"/Index [%d 1 %d 1] /Prev %d /Length %d >>\nstream\n"
+             % (redact_xref_num, redact_xref_num + 1, catalog, freed, redact_xref_num,
+                base_xref, len(rows))
+             + rows + b"\nendstream\nendobj\n")
+    body += b"startxref\n%d\n%%%%EOF\n" % redact_xref
+
+    with open(path, "wb") as f:
+        f.write(bytes(body))
+
+    GT["freed_compressed_link.pdf"] = {
+        "revisions": 2,
+        "freed_object": freed,
+        "kept_object": kept,
+        "container_object": container,
+        "kept_uri": KEPT_URI,
+        "freed_uri": FREED_URI,
+        "text_contains": [KEPT_TEXT, FREED_TEXT],
+        # The link the newest revision deletes. Nothing may report it.
+        "uri_excludes": [FREED_URI],
+    }
+
+
 def _classic_body(marker):
     """A two-page classic-xref PDF body plus its object offsets, ready for a trailer.
 
@@ -5827,6 +5948,7 @@ def main():
     gen_objstm_pages()
     gen_hybrid_xref_revision()
     gen_freed_object_revision()
+    gen_freed_compressed_link()
     gen_damaged_startxref()
     gen_objstm_filter_forms()
     gen_array_decode_parms()

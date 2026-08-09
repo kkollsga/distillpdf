@@ -3147,12 +3147,22 @@ pub(crate) mod tests {
         out
     }
 
-    /// Build a PDF that makes lopdf's object-stream merge race observable: object 5 is defined
-    /// **twice**, in two different `/Type /ObjStm` containers with different values, and the
-    /// xref does not list it as a compressed object — so lopdf's container filter keeps both
-    /// copies and the winner is decided by rayon thread-completion order. The filler objects
-    /// exist only to give the parallel loader enough entries to actually split the work.
+    /// Build a PDF that drives the parallel loader through lopdf's object-stream merge: object
+    /// 5 is defined **twice**, in two different `/Type /ObjStm` containers with different values,
+    /// and the cross-reference stream places it in container 10. Both containers are `Normal`
+    /// entries, so both are read — on separate rayon workers — but only container 10's copy is
+    /// the one the table names, so the merge has a decision to make on every load. The filler
+    /// objects exist only to give the parallel loader enough entries to actually split the work.
+    ///
+    /// The fixture originally left object 5 out of the table entirely, which made lopdf keep
+    /// *both* copies and settle the winner by thread-completion order. The fork now refuses a
+    /// member the table places nowhere (`objstm_member_xref_authority_test`), so that shape no
+    /// longer reaches the merge at all — hence the cross-reference **stream**, which unlike the
+    /// classic table this fixture used before can actually express a compressed entry.
     fn racing_objstm_pdf() -> Vec<u8> {
+        const MAX_ID: u32 = 401;
+        const XREF_ID: u32 = 401;
+
         let mut out: Vec<u8> = Vec::new();
         let mut offs: Vec<(u32, usize)> = Vec::new();
         out.extend_from_slice(b"%PDF-1.5\n");
@@ -3178,30 +3188,57 @@ pub(crate) mod tests {
                 .as_bytes(),
             );
         }
+
+        // A cross-reference stream, /W [1 4 2]: one type byte, a four-byte offset-or-container,
+        // a two-byte generation-or-index. It describes itself at `startxref`.
         let startxref = out.len();
-        let maxid = 400u32;
-        out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", maxid + 1).as_bytes());
-        for id in 1..=maxid {
-            match offs.iter().find(|(n, _)| *n == id) {
-                Some((_, o)) => out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes()),
-                None => out.extend_from_slice(b"0000000000 65535 f \n"),
+        let mut rows: Vec<u8> = Vec::new();
+        let mut row = |kind: u8, second: u32, third: u16, rows: &mut Vec<u8>| {
+            rows.push(kind);
+            rows.extend_from_slice(&second.to_be_bytes());
+            rows.extend_from_slice(&third.to_be_bytes());
+        };
+        for id in 0..=MAX_ID {
+            match id {
+                0 => row(0, 0, 65535, &mut rows),
+                5 => row(2, 10, 0, &mut rows), // the table places object 5 in container 10
+                XREF_ID => row(1, startxref as u32, 0, &mut rows),
+                _ => match offs.iter().find(|(n, _)| *n == id) {
+                    Some((_, o)) => row(1, *o as u32, 0, &mut rows),
+                    None => row(0, 0, 65535, &mut rows),
+                },
             }
         }
         out.extend_from_slice(
-            format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF", maxid + 1).as_bytes(),
+            format!(
+                "{XREF_ID} 0 obj\n<< /Type /XRef /Size {} /Root 1 0 R /Index [0 {}] /W [1 4 2] \
+                 /Length {} >>\nstream\n",
+                MAX_ID + 1,
+                MAX_ID + 1,
+                rows.len()
+            )
+            .as_bytes(),
         );
+        out.extend_from_slice(&rows);
+        out.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{startxref}\n%%EOF").as_bytes());
         out
     }
 
     /// The same bytes must always load to the same object map.
     ///
-    /// lopdf resolves an object number defined in two object streams by *thread-completion
-    /// order*, so on stock `Document::load_mem` this fixture loads two different ways at
-    /// roughly 50/50 (measured: 30/30 over 60 loads, and 3 distinct maps over 40 loads of a
-    /// real USGS file, which flipped a table header in and out of `to_html`). Everything in
-    /// this crate loads through [`load_mem_deterministic`], which confines that race to a
-    /// private one-thread pool. A regression here means a call site went back to
-    /// `Document::load_mem` — or that our pool stopped covering lopdf's `par_iter`.
+    /// Object-stream members reach the object map through a rayon `par_iter` whose workers
+    /// finish in whatever order the scheduler gives them, and this fixture defines object 5 in
+    /// two containers so that ordering has something to decide. Historically lopdf settled it by
+    /// *thread-completion order* and the same bytes loaded two different ways at roughly 50/50
+    /// (measured: 30/30 over 60 loads, and 3 distinct maps over 40 loads of a real USGS file,
+    /// which flipped a table header in and out of `to_html`). Everything in this crate loads
+    /// through [`load_mem_deterministic`], which confines that race to a private one-thread pool.
+    /// A regression here means a call site went back to `Document::load_mem` — or that our pool
+    /// stopped covering lopdf's `par_iter`.
+    ///
+    /// The answer is pinned as well as its stability: the cross-reference table places object 5
+    /// in container 10, so `/Figure` must win every time and container 20's `/Artifact` must
+    /// never appear. A deterministic-but-wrong winner is still a defect.
     #[test]
     fn the_same_bytes_always_load_to_the_same_object_map() {
         let raw = racing_objstm_pdf();
@@ -3213,9 +3250,11 @@ pub(crate) mod tests {
             let got = fingerprint(&load_mem_deterministic(&raw).expect("fixture loads"));
             assert_eq!(got, first, "object map changed on load {i} of the same bytes");
         }
-        // Guard the fixture itself: if lopdf ever stops keeping both copies, this test would
-        // pass vacuously and stop protecting anything.
+        // Guard the fixture itself: if the member ever stopped being expanded at all, this test
+        // would pass vacuously and stop protecting anything.
         assert!(first.contains("/S"), "fixture no longer exercises the object-stream merge");
+        assert!(first.contains("/Figure"), "the container the xref names must be the one that wins");
+        assert!(!first.contains("/Artifact"), "the copy the xref does not name must not be loaded");
     }
 
     #[test]
