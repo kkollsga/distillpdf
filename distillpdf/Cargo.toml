@@ -26,14 +26,15 @@ tesseract = ["dep:cmake", "dep:whatlang"]
 # eager adapter remains the active route through L2, while L3 consumes the indexed
 # reader behind distillPDF's owned DocumentAccess boundary.
 # Pinned to the owned fork's published commit on branch `distillpdf/indexed-reader-v7`
-# (`perf(indexed): reuse decoded object streams across the page-tree walk` — the page-tree
-# container-reuse work, which drops a 102 MB doc's page_map open from ~30.1 ms to ~7.3 ms —
-# plus the upstream xref-stream entry-count bound and the indexed_reader module docs).
+# (`fix: load object-stream members only where the xref says they live` — the merged xref table
+# is now the sole authority on where an object lives, so a compressed object a later revision
+# freed stays deleted on the eager route too, instead of being resurrected out of the `/ObjStm`
+# that still carries it while the indexed reader answered Null).
 # A git rev — not a bare `path` — so CI and any fresh clone resolve the exact same lopdf.
 # To iterate against a local checkout, TEMPORARILY swap in
 # `path = "../../lopdf-lazy-engine"` (do not commit it), or add an UNCOMMITTED
 # `[patch."https://github.com/kkollsga/lopdf.git"] lopdf = { path = ... }` to the workspace root.
-lopdf = { git = "https://github.com/kkollsga/lopdf.git", rev = "b790334dad78875c617c1e0e9cdda6415899dee7" }
+lopdf = { git = "https://github.com/kkollsga/lopdf.git", rev = "30f8f3173cf4faba37e7d38212773ebb186fb6f8" }
 # Independent Flate validation (`pdfobj::flate_incomplete`). lopdf swallows its own zlib
 # error and returns the partial output, so a TRUNCATED stream reports Ok and renders short
 # with no signal; inflating the bytes ourselves is the only way to tell. Already linked twice
