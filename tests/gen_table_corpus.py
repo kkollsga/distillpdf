@@ -2,7 +2,7 @@
 """Generate the **table torture corpus**: PDFs whose every cell's text, position and span
 are KNOWN, emitted together with `truth.json` from the same in-memory objects.
 
-Spec: ``dev-docs/plans/table-torture-corpus.md`` (rev 2). This file implements it; it does
+Spec: the table torture corpus spec (rev 2). This file implements it; it does
 not redesign it. Read §4 (source fidelity — the acceptance criterion) before changing a
 case, and §13 for the build order this file follows.
 
@@ -73,8 +73,8 @@ TRUTH: dict = {}
 # ---------------------------------------------------------------------------- provenance
 #
 # Frozen at build step 0 by the §4.1 median rule — "the page of that family whose bench100
-# table score is nearest the family MEDIAN, never the best or worst" — run by
-# dev-docs/bench/out/g5/step0_sources.py against dev-docs/bench/results/bench100_accuracy.json.
+# table score is nearest the family MEDIAN, never the best or worst" — evaluated against the
+# frozen bench100 accuracy baseline.
 # Frozen as literals on purpose: benchmarking/ is licence-encumbered and absent in CI, and
 # truth.json must be reproducible without it.
 #

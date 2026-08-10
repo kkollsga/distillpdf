@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Minimal hand-authored PDF writer shared by the table torture corpus.
 
-Everything here exists because reportlab cannot emit it (see
-``dev-docs/plans/table-torture-corpus.md`` §9), and every construct has an in-repo
+Everything here exists because reportlab cannot emit it (see the table torture corpus
+spec, §9), and every construct has an in-repo
 precedent in ``tests/gen_fixtures.py`` — this module is a *port* of those idioms into a
 parameterised form, not new research:
 

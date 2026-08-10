@@ -500,8 +500,8 @@ fn rows_of(mut spans: Vec<Span>) -> Vec<Vec<Span>> {
 /// How wide a fully clear vertical lane must be, in ems of the run's mean type size, to be a
 /// COLUMN separator rather than the space between two words of one cell.
 ///
-/// Swept on the 100-document `pdf-parse-bench` tables corpus — see the sweep table in
-/// `dev-docs/plans/fidelity-fix-sweep.md`.
+/// Swept on the 100-document `pdf-parse-bench` tables corpus; this value was the sweep's
+/// argmax on the micro GriTS-Doc_Con markdown surface.
 /// A merged cell: text, its left x-edge, and current right edge.
 struct Cell {
     x: f32,
@@ -933,7 +933,7 @@ const GUTTER_MIN_ROWS: usize = 4;
 ///
 /// **Swept on our own corpus; nothing here is adopted from anywhere.** Four candidate boundary
 /// signals were scored at every internal row boundary of all 250 joinable runs, against the
-/// true cut point of the 52 fusions that join to a run (`dev-docs/bench/out/g2/`):
+/// true cut point of the 52 fusions that join to a run:
 ///
 /// | signal | argmax lands on the true cut | true-cut score p50 | clean-run max p95 |
 /// |---|---|---|---|
@@ -949,7 +949,7 @@ const GUTTER_MIN_ROWS: usize = 4;
 /// carries no information here and is not used.
 ///
 /// The threshold was then swept ON THE CORPUS, end to end, one clean-worktree wheel each
-/// (`dev-docs/bench/out/g2/corpus_sweep.md`) — micro GriTS-Doc_Con, md surface:
+/// — micro GriTS-Doc_Con, md surface:
 ///
 /// | x median gap | 1.6 | 1.8 | 2.0 | **2.5** | 3.0 |
 /// |---|---|---|---|---|---|

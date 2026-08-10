@@ -461,7 +461,7 @@ fn checked_access_fingerprint(access: &dyn DocumentAccess) -> Result<String, Acc
 /// the xref's `/Type /ObjStm` container map does not disambiguate them, the loaded document
 /// differs between runs.
 ///
-/// Measured (`dev-docs/bench/out/g8/`): 40 loads of one USGS file produce **3 distinct object
+/// Measured: 40 loads of one USGS file produce **3 distinct object
 /// maps**, flipping a struct-tree element between `/S /Figure` and `/S /Artifact`, which in
 /// turn made a table header row appear and disappear across `to_html()` renders of the same
 /// bytes. This is not table-specific: any document with that shape can parse differently on

@@ -3987,8 +3987,7 @@ def gen_section_heading_table():
     Measured on the 100-document `pdf-parse-bench` tables corpus this was the whole
     contained-duplicate class: 17 emissions in 22 containment pairs across 12 documents, 21 of
     the 22 a strict row-prefix, and 16 of the 17 pure phantoms the matcher never used. Doc 033
-    published one 27-row table five times over, at 7, 12, 17, 23 and 27 rows. The trace is
-    `dev-docs/bench/out/g3/trace/033.flush`.
+    published one 27-row table five times over, at 7, 12, 17, 23 and 27 rows.
 
     The headings here sit at the body's own 15pt pitch (1.0x, well inside the swept 1.6x); the
     negative twin `gen_heading_ends_table` puts the same line at 2.7x and must still end the

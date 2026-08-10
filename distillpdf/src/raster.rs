@@ -64,7 +64,7 @@ pub(crate) fn filter_to_format(filters: &Option<Vec<String>>) -> &'static str {
 ///
 /// JPEG 2000 decoding is **parked by decision**, not oversight — there is no mature
 /// pure-Rust decoder and OpenJPEG's CVE record is not worth carrying in the automatic path
-/// for untrusted files (`dev-docs/plans/composited-figure-raster-gaps.md` §D). Making the
+/// for untrusted files. Making the
 /// gap visible is the part that does not need a codec.
 ///
 /// `ASCIIHexDecode` is deliberately absent: lopdf cannot apply it either, but it is a
