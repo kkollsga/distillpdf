@@ -31,6 +31,14 @@ Report what was purged (path list, or "nothing aged out"). Only `bench/out/`
 is purged from `bench/` — the small csv/json regression record in
 `bench/results/` is kept indefinitely.
 
+**Pre-purge guard (learned 2026-08-10):** before the `bench/out` delete, check
+whether any durable doc still points into it:
+`grep -rl "bench/out" dev-docs/todos.md dev-docs/plans/ dev-docs/designs/`.
+If a referenced file is about to age out, **promote it to
+`bench/results/`** (and fix the reference) instead of letting the purge break
+the link — unique evidence never belongs in a purged tier (see the
+"Offload, don't print" rule and `dev-docs/README.md`).
+
 ## 2. Read `todos.md` — the only file read by default
 `todos.md` is the index of open threads; its backlinks point to the durable
 docs under `plans/`. **Read only `todos.md` to start.** Do NOT read through

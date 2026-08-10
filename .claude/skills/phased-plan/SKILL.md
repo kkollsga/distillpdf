@@ -25,6 +25,26 @@ subset:**
   **`bench/results/results.csv`**, heavy generated dumps → **`bench/out/`**
   (>14-day purge; never write artifacts next to the script).
 
+## Phase −2 — Doctrine sync (first action, always)
+Before anything else, read `../doctrine/VERSION` and compare it to
+`dev-docs/.doctrine-synced` (one line, a `YYYY.MM.DD` date serial). **If they
+match, stop here** — that is one file read, which is why this step is never
+worth skipping. If doctrine is ahead, read `../doctrine/CHANGELOG.md` forward
+from the marker and act on every entry newer than it, by class:
+
+- `[skills-update]` — merge into the **declared authority** (`CLAUDE.md` /
+  `.agents/skills/`, per the declaration at the top of `CLAUDE.md`), then
+  regenerate the `.claude/` adapters from it. Never hand-port into an adapter.
+  Adjudicate any existing divergence per R14 as *local improvement* or
+  *staleness* before touching either side; blind sync deletes improvements.
+- `[local-sweep]` — the entry states a concrete check command. Run it. A failure
+  becomes scoped, visible work in the current plan, never a silent side-task.
+- `[info]` — no action.
+
+**Write the new version into `dev-docs/.doctrine-synced` only after those
+actions have completed.** Marking first permanently hides the entry it skipped:
+the next sync compares against the marker and sees nothing.
+
 ## Phase −1 — Start fresh (recommend cleanup first)
 Before investigating, **recommend the user run the `dev-docs-cleanup` skill**
 so we start from a tidy `dev-docs/` and a current `todos.md`. Relevant

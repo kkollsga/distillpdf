@@ -1,5 +1,14 @@
 # distillPDF — working agreements
 
+> **Authority declaration (R7).** `AGENTS.md` and `.agents/skills/` are the
+> **authority** for this repo's conventions and skills. `CLAUDE.md` and
+> `.claude/skills/` are **generated adapters**: copies with `AGENTS.md`
+> substituted to `CLAUDE.md`. Edit the authority and regenerate; never hand-edit
+> an adapter. **This declaration block is exempt from that substitution** — it
+> names the same authority in both copies, and substituting it would invert its
+> meaning. Divergences are adjudicated per R14 (improvement vs staleness) before
+> either side is touched, never blind-synced.
+
 ## Releases: the user decides when to bump and push
 
 Do NOT bump the version (`Cargo.toml` / `pyproject.toml`) or push on your own.
