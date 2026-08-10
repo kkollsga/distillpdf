@@ -8,8 +8,9 @@ description: Cut a distillpdf release — goal-check against the phased-plan, ru
 distillpdf publishes to **PyPI only** (no crates.io), from **two version fields
 that must stay identical**:
 
-- `Cargo.toml` line 3 (`version = "x.y.z"`) — the field the publish workflow
-  reads and gates on.
+- `Cargo.toml` — the **first `^version` line** in the workspace root (it lives
+  under `[workspace.package]`; `publish.yml` greps `-m 1 '^version'`, which is
+  why it must stay first). The field the publish workflow reads and gates on.
 - `pyproject.toml` line 7 (`version = "x.y.z"`) — the version the wheel is
   built from.
 
@@ -22,9 +23,10 @@ Tesseract) and uploads via **PyPI Trusted Publishing (OIDC — no secret)**. You
 never run `maturin publish` by hand — the two-file bump + the `main` push are
 the whole trigger.
 
-`Cargo.lock` is gitignored (not tracked) — never stage it. There is no
-crates.io publish and no CHANGELOG; the release commit + git history are the
-record.
+`Cargo.lock` is **tracked** (committed since PR #6, 2026-08-08) and the
+workspace version bump changes it — refresh it (`cargo check -p distillpdf`)
+and **stage it with the two version files**. There is no crates.io publish and
+no CHANGELOG; the release commit + git history are the record.
 
 ## Preconditions
 - Check no release is already staged: `git log origin/main..HEAD --oneline | grep -iE "release"`.
@@ -66,8 +68,8 @@ record.
    **minor/major** bump (new feature, breaking change), STOP and ask one quick
    clarification question first; otherwise proceed with the patch bump.
 4. **Commit** as the final step: `release(x.y.z): ...` (both version fields in
-   one commit). Stage by path (`git add Cargo.toml pyproject.toml`), never `-A`.
-   Do not stage `Cargo.lock` (gitignored).
+   one commit). Stage by path (`git add Cargo.toml pyproject.toml Cargo.lock`),
+   never `-A`.
 5. **Push — invoking `/release` is the authorization.** Running this skill
    authorizes the `main` push it produces (the publish-triggering one) — no
    separate in-the-moment "push" prompt. Authorization is scoped to this one
@@ -112,9 +114,9 @@ record.
 
 ## Notes
 - Keep responses under 400 tokens; write long diffs/logs to a file and report the path.
-- Version source of truth: `Cargo.toml` line 3 — but `pyproject.toml` line 7
-  must match it exactly, or `publish.yml` fails the build. Two fields, one
-  number; bump them together.
+- Version source of truth: the first `^version` line in the root `Cargo.toml`
+  — but `pyproject.toml` line 7 must match it exactly, or `publish.yml` fails
+  the build. Two fields, one number; bump them together.
 - Publish is push-triggered and idempotent (version-gated): a re-push at the
   same version is a safe no-op, not a double-publish.
 - **Never build the wheel with `--all-features`** — `extension-module` can't
