@@ -28,7 +28,10 @@ user's call, not yours.
 - **Offload, don't print.** Write long output (diffs, logs, rendered HTML/PDF
   dumps, profiles) to `dev-docs/temp/` (ephemeral, >1-day purge) or
   `dev-docs/bench/out/` (>14-day purge) and **report the path**. Keep responses
-  under ~400 tokens.
+  under ~400 tokens. Both are *purged* tiers, so route by value as well as
+  weight: **unique evidence** a plan or todo will reference — findings, audits,
+  patches, parity/aggregate summaries — goes to `dev-docs/bench/results/`
+  (durable) or into the `plans/` doc itself, never to a purged tier.
 - **Separate coverage for the two layers.** The pure-Rust core (`cargo test
   --lib`) and the PyO3 layer + Python API (`pytest tests/`) are tested
   independently — after a Rust behaviour change, run **both**. `extension-module`
