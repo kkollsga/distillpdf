@@ -427,6 +427,29 @@ def test_analyze_tables_only_claims_exact_ruled_cell_boundaries():
     )
 
 
+def test_hscale_grid_honours_tz_and_keeps_the_cut_guard():
+    """The Tz (horizontal scaling) fixture: page 1's 60%-scaled grid and page 2's
+    naturally fitting twin both yield the full 12x8 ruled lattice with exact cell text,
+    while page 3's genuinely overrunning grid must NOT be admitted as one — so the fix
+    is pinned to the Th advance term, not to a loosened LATTICE_CUT_PCT."""
+    gt = GT["hscale_grid.pdf"]
+    tables = distillpdf.Pdf.open(os.path.join(FIX, "hscale_grid.pdf")).analyze_tables()
+    by_page = {}
+    for t in tables:
+        by_page.setdefault(t["page"], []).append(t)
+    for page in (1, 2):
+        full = [t for t in by_page.get(page, [])
+                if (t["n_rows"], t["n_cols"]) == (gt["rows"], gt["cols"])]
+        assert full, f"page {page}: full {gt['rows']}x{gt['cols']} grid not recovered"
+        assert "ruled" in full[0]["evidence"]
+        cells = {(c["row"], c["col"]): c["text"] for c in full[0]["cells"]}
+        if page == 1:
+            assert cells[(0, 0)] == gt["cell_0_0"]
+            assert cells[(0, 1)] == gt["cell_0_1"], "neighbour values fused"
+    assert not any((t["n_rows"], t["n_cols"]) == (gt["rows"], gt["cols"])
+                   for t in by_page.get(3, [])), "overrunning grid wrongly admitted"
+
+
 def test_analyze_tables_recovers_aligned_group_header_topology_only(tmp_path):
     path = os.path.join(TABLE_CORPUS, "t2_merged_colspan_over_booktabs.pdf")
     pdf = distillpdf.Pdf.open(path)

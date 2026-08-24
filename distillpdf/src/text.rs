@@ -952,8 +952,10 @@ enum Show<'a> {
 /// Decode a show operator (Tj = one `Str`; TJ = strings interleaved with kerns)
 /// into word spans, splitting at space glyphs and large kern gaps so each word
 /// carries its own position — the substrate for column/table detection. Returns
-/// the words and the total horizontal advance.
-fn decode_words(elems: &[Show], font: Option<&FontInfo>, size: f32, tc: f32, tw: f32) -> (Vec<Word>, f32) {
+/// the words and the total horizontal advance. `th` is the Tz horizontal scale
+/// (Tz/100): per §9.4.4 it multiplies the whole per-glyph displacement —
+/// glyph width, `Tc`, `Tw`, and TJ kerns alike.
+fn decode_words(elems: &[Show], font: Option<&FontInfo>, size: f32, tc: f32, tw: f32, th: f32) -> (Vec<Word>, f32) {
     let mut words: Vec<Word> = Vec::new();
     let mut x = 0.0f32; // running advance from the operator start
     let mut cur = String::new();
@@ -978,7 +980,7 @@ fn decode_words(elems: &[Show], font: Option<&FontInfo>, size: f32, tc: f32, tw:
             // A glyph that decodes to nothing but still advances a space-sized gap
             // is a space whose ToUnicode is missing (common in CID fonts) — keep
             // the word boundary so words don't merge ("of the" not "ofthe").
-            if w > size * 0.15 {
+            if w > size * 0.15 * th {
                 cur.push(' ');
                 *pending_break = true;
             }
@@ -1003,7 +1005,7 @@ fn decode_words(elems: &[Show], font: Option<&FontInfo>, size: f32, tc: f32, tw:
             Show::Kern(k) => {
                 // TJ number: advance is -k/1000*size; a large positive gap (k<-150)
                 // is a visible space → word break.
-                x += -k / 1000.0 * size;
+                x += -k / 1000.0 * size * th;
                 if *k < -150.0 {
                     cur.push(' ');
                     pending_break = true;
@@ -1088,6 +1090,7 @@ fn decode_words(elems: &[Show], font: Option<&FontInfo>, size: f32, tc: f32, tw:
                         if !fi.two_byte && code == 32 {
                             w += tw;
                         }
+                        w *= th;
                         push_code(&s, w, x, &mut cur, &mut cur_start, &mut cur_end, &mut pending_break, &mut words);
                         x += w;
                         i += step;
@@ -1097,7 +1100,7 @@ fn decode_words(elems: &[Show], font: Option<&FontInfo>, size: f32, tc: f32, tw:
                     for &b in *bytes {
                         let mut s = String::new();
                         push_norm(&mut s, b as char);
-                        let w = 0.5 * size + tc + if b == 32 { tw } else { 0.0 };
+                        let w = (0.5 * size + tc + if b == 32 { tw } else { 0.0 }) * th;
                         push_code(&s, w, x, &mut cur, &mut cur_start, &mut cur_end, &mut pending_break, &mut words);
                         x += w;
                     }
@@ -1402,6 +1405,7 @@ fn decode_spans(
     let mut tc = 0.0f32; // char spacing
     let mut tw = 0.0f32; // word spacing
     let mut ts = 0.0f32; // text rise (Ts): baseline shift in text space — sub/superscripts
+    let mut th = 1.0f32; // horizontal scaling (Tz/100): multiplies every advance (§9.4.4)
     let mut cur: Option<&FontInfo> = None;
     let mut ctm = base; // graphics CTM (q/Q/cm) — needed for rotated/transformed text
     // `q`/`Q` save and restore the WHOLE graphics state, and PDF 32000-1 §9.3 puts the text
@@ -1418,6 +1422,7 @@ fn decode_spans(
         tc: f32,
         tw: f32,
         ts: f32,
+        th: f32,
         leading: f32,
         font: Option<&'a FontInfo>,
     }
@@ -1462,7 +1467,7 @@ fn decode_spans(
                 }
                 mcid = mcstack.iter().rev().find_map(|m| *m);
             }
-            "q" => cstack.push(Saved { ctm, size, tc, tw, ts, leading, font: cur }),
+            "q" => cstack.push(Saved { ctm, size, tc, tw, ts, th, leading, font: cur }),
             "Q" => {
                 if let Some(g) = cstack.pop() {
                     ctm = g.ctm;
@@ -1470,6 +1475,7 @@ fn decode_spans(
                     tc = g.tc;
                     tw = g.tw;
                     ts = g.ts;
+                    th = g.th;
                     leading = g.leading;
                     cur = g.font;
                 }
@@ -1518,6 +1524,17 @@ fn decode_spans(
             // each word matrix above as a y-offset, so a raised/lowered glyph lands off
             // the line baseline where the HTML layer recognises it as <sup>/<sub>.
             "Ts" if !o.is_empty() => ts = num(&o[0]),
+            // Horizontal scaling (Tz): percent of normal glyph width. PDFlib-style
+            // micro-justification sets it per show op (observed 32–100%); ignoring it
+            // inflates every advance by 1/Th, which is enough to make the lattice
+            // word-cut guard refuse a correctly detected ruled table. Non-finite
+            // values are ignored (DoS hygiene, same posture as the other params).
+            "Tz" if !o.is_empty() => {
+                let v = num(&o[0]);
+                if v.is_finite() {
+                    th = v / 100.0;
+                }
+            }
             "T*" => {
                 tlm = Mat::translate(0.0, -leading).mul(tlm);
                 tm = tlm;
@@ -1525,7 +1542,7 @@ fn decode_spans(
             "Tj" => {
                 if let Some(Object::String(s, _)) = o.first() {
                     let style = cur.map(|f| (f.bold, f.italic, f.mono, f.font_id)).unwrap_or((false, false, false, 0));
-                    let (words, total) = decode_words(&[Show::Str(s)], cur, size, tc, tw);
+                    let (words, total) = decode_words(&[Show::Str(s)], cur, size, tc, tw, th);
                     for wd in words {
                         let wtm = Mat::translate(wd.x_off, ts).mul(tm);
                         push_positioned_span(spans, &wtm, &ctm, size, wd.width, style, wd.text);
@@ -1538,7 +1555,7 @@ fn decode_spans(
                 tm = tlm;
                 if let Some(Object::String(s, _)) = o.last() {
                     let style = cur.map(|f| (f.bold, f.italic, f.mono, f.font_id)).unwrap_or((false, false, false, 0));
-                    let (words, total) = decode_words(&[Show::Str(s)], cur, size, tc, tw);
+                    let (words, total) = decode_words(&[Show::Str(s)], cur, size, tc, tw, th);
                     for wd in words {
                         let wtm = Mat::translate(wd.x_off, ts).mul(tm);
                         push_positioned_span(spans, &wtm, &ctm, size, wd.width, style, wd.text);
@@ -1558,7 +1575,7 @@ fn decode_spans(
                         })
                         .collect();
                     let style = cur.map(|f| (f.bold, f.italic, f.mono, f.font_id)).unwrap_or((false, false, false, 0));
-                    let (words, total) = decode_words(&elems, cur, size, tc, tw);
+                    let (words, total) = decode_words(&elems, cur, size, tc, tw, th);
                     for wd in words {
                         let wtm = Mat::translate(wd.x_off, ts).mul(tm);
                         push_positioned_span(spans, &wtm, &ctm, size, wd.width, style, wd.text);

@@ -637,6 +637,12 @@
     ],
     "title": "Structural Heading Showcase"
   },
+  "hscale_grid.pdf": {
+    "cell_0_0": "1000000",
+    "cell_0_1": "1009173",
+    "cols": 8,
+    "rows": 12
+  },
   "hybrid_xref_revision.pdf": {
     "declared_grid": [
       [

@@ -3485,6 +3485,59 @@ def gen_ruled_blank_cells():
     GT["ruled_blank_cells.pdf"] = {"rows": len(YS) - 1, "cols": len(XS) - 1}
 
 
+def gen_hscale_grid():
+    """Three fully ruled 12x8 numeric grids that differ only in how their text FITS.
+
+    Page 1 shows 7-digit values at ``60 Tz`` (horizontal scaling 60%): the scaled
+    advance (7 x 0.556 x 9pt x 0.6 = 21pt) fits the 26pt column pitch, but a reader that
+    ignores ``Tz`` computes 35pt and sees every run crossing a vertical rule — which is
+    exactly how the lattice word-cut guard (LATTICE_CUT_PCT) came to refuse *correctly
+    detected* ruled tables on PDFlib-style micro-justified documents, collapsing their
+    columns through the alignment fallback.
+
+    Page 2 is the pin that the fix is the Th term and not a loosened threshold: the same
+    grid with 4-digit values (20pt natural advance) and NO ``Tz`` must extract identically.
+    Page 3 is the negative that keeps the guard honest: 7-digit values, NO ``Tz`` —
+    genuinely overrunning text whose full 8-column lattice must STILL be refused.
+
+    Hand-assembled: reportlab's high-level flow never emits ``Tz``."""
+    pdf = os.path.join(OUT, "hscale_grid.pdf")
+    XS = [72.0 + 26.0 * i for i in range(9)]    # 8 columns, 26pt pitch
+    YS = [520.0 + 18.0 * j for j in range(13)]  # 12 rows, 18pt pitch, bottom-up
+
+    def page(title, digits, tz):
+        body = [b"BT /F2 13 Tf 72 762 Td (%s) Tj ET" % title]
+        for r in range(12):
+            for c in range(8):
+                val = 1000000 + r * 81001 + c * 9173 if digits == 7 else 1000 + r * 83 + c * 17
+                tzop = b"60 Tz " if tz else b""
+                body.append(b"BT /F1 9 Tf %s%.1f %.1f Td (%d) Tj ET"
+                            % (tzop, XS[c] + 3.0, YS[11 - r] + 5.0, val))
+        for y in YS:
+            body.append(b"0.6 w %.1f %.1f m %.1f %.1f l S" % (XS[0], y, XS[-1], y))
+        for x in XS:
+            body.append(b"0.6 w %.1f %.1f m %.1f %.1f l S" % (x, YS[0], x, YS[-1]))
+        return b"\n".join(body)
+
+    streams = [
+        page(b"A Horizontally Scaled Grid", 7, True),
+        page(b"A Naturally Fitting Grid", 4, False),
+        page(b"An Overrunning Grid", 7, False),
+    ]
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R] /Count 3 >>",
+        9: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        10: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
+    }
+    for i, s in enumerate(streams):
+        objs[3 + 2 * i] = (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+                           b"/Font << /F1 9 0 R /F2 10 0 R >> >> /Contents %d 0 R >>" % (4 + 2 * i))
+        objs[4 + 2 * i] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(s), s)
+    _assemble_pdf(objs, pdf)
+    GT["hscale_grid.pdf"] = {"rows": 12, "cols": 8, "cell_0_0": "1000000", "cell_0_1": "1009173"}
+
+
 def gen_booktabs_wrapped():
     """A borderless **booktabs** table — three horizontal rules, no verticals — with a
     wrapped cell in the middle of its body.
@@ -5906,6 +5959,7 @@ def main():
     gen_annot_render()
     gen_glyph_table()
     gen_ruled_blank_cells()
+    gen_hscale_grid()
     gen_booktabs_wrapped()
     gen_three_column_prose()
     gen_form_grid_prose()
