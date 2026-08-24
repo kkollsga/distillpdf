@@ -1445,9 +1445,19 @@ pub(crate) fn render_doc_elements(
         let turned: Option<Vec<Span>> = (!turn.is_identity()).then(|| spans.iter().map(|s| turn_span(turn, s)).collect());
         let dspans: &[Span] = turned.as_deref().unwrap_or(spans.as_slice());
         // Chrome rows (running headers/footers/page numbers) removed before ANY consumer
-        // reads the spans; a chrome-free page keeps its borrow, allocation-free.
-        let dechromed: Option<Vec<Span>> = chrome.filter(dspans, turn.rect(pbox[0], pbox[2], pbox[1], pbox[3]));
-        let dspans: &[Span] = dechromed.as_deref().unwrap_or(dspans);
+        // reads the spans; a chrome-free page keeps its borrows, allocation-free. The SAME
+        // mask filters both space representations — `spans` (page space, what the SVG
+        // emitters are handed) and `dspans` (display space) correspond POSITIONALLY, and
+        // the figure-label pass zips them, so filtering only one would misalign every
+        // pairing after the first dropped span.
+        let chrome_mask = chrome.drop_mask(dspans, turn.rect(pbox[0], pbox[2], pbox[1], pbox[3]));
+        let keep = |src: &[Span], mask: &[bool]| -> Vec<Span> {
+            src.iter().zip(mask).filter(|(_, d)| !**d).map(|(s, _)| clone_span(s)).collect()
+        };
+        let dechromed_p: Option<Vec<Span>> = chrome_mask.as_ref().map(|m| keep(spans, m));
+        let dechromed_d: Option<Vec<Span>> = chrome_mask.as_ref().map(|m| keep(dspans, m));
+        let spans: &[Span] = dechromed_p.as_deref().unwrap_or(spans.as_slice());
+        let dspans: &[Span] = dechromed_d.as_deref().unwrap_or(dspans);
         // A vector figure's / raster's box in display space. Every layout comparison below
         // goes through these; `v.x_left`/`im.x_left` stay page-space for the SVG emitters.
         let dvbox = |v: &vector::PlacedSvg| turn.rect(v.x_left, v.x_right, v.y_bottom, v.y_top);

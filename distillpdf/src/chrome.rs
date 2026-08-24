@@ -59,10 +59,14 @@ impl ChromePlan {
         self.rows.is_empty()
     }
 
-    /// The spans of `dspans` (display space) with this plan's chrome rows removed, or
-    /// `None` when nothing on this page matched (the caller then keeps its borrow — no
-    /// allocation on chrome-free pages, mirroring the `turned`/`dspans` idiom).
-    pub(crate) fn filter(&self, dspans: &[Span], dbox: (f32, f32, f32, f32)) -> Option<Vec<Span>> {
+    /// Which of `dspans` (display space) are this plan's chrome rows: `Some(mask)` with
+    /// `true` at every span to drop, or `None` when nothing on this page matched (the
+    /// caller then keeps its borrows — no allocation on chrome-free pages).
+    ///
+    /// A MASK rather than a filtered copy because the caller holds the same spans in TWO
+    /// positionally-corresponding representations (page space and display space) and must
+    /// filter both with the same indices — the figure-label pass zips them.
+    pub(crate) fn drop_mask(&self, dspans: &[Span], dbox: (f32, f32, f32, f32)) -> Option<Vec<bool>> {
         if self.rows.is_empty() {
             return None;
         }
@@ -79,14 +83,7 @@ impl ChromePlan {
                 }
             }
         }
-        drop.iter().any(|d| *d).then(|| {
-            dspans
-                .iter()
-                .zip(&drop)
-                .filter(|(_, d)| !**d)
-                .map(|(s, _)| s.clone())
-                .collect()
-        })
+        drop.iter().any(|d| *d).then_some(drop)
     }
 }
 
