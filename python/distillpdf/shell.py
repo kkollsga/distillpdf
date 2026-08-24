@@ -72,6 +72,7 @@ def _asset_profile(model: Model) -> dict[str, int]:
 
 
 def verb_info(model: Model, args: argparse.Namespace) -> int:
+    """``info``: the document roll-up (source, pages, sections, OCR state) as text or JSON."""
     # One source of truth for the info roll-up: Doc.info() shapes it, the CLI prints it.
     from .doc import Doc
 
@@ -114,6 +115,7 @@ def verb_info(model: Model, args: argparse.Namespace) -> int:
 # ---- toc --------------------------------------------------------------------
 
 def verb_toc(model: Model, args: argparse.Namespace) -> int:
+    """``toc``: the section tree — id, level, title and page range per section."""
     rows = [
         {
             "id": s["id"],
@@ -161,10 +163,12 @@ def _kind_listing(model: Model, kind: str, args: argparse.Namespace) -> int:
 
 
 def verb_tables(model: Model, args: argparse.Namespace) -> int:
+    """``tables``: list every table block (id, section, caption/shape summary)."""
     return _kind_listing(model, "table", args)
 
 
 def verb_figures(model: Model, args: argparse.Namespace) -> int:
+    """``figures``: list every figure block (id, section, caption summary)."""
     return _kind_listing(model, "figure", args)
 
 
@@ -204,6 +208,8 @@ def _read_target(model: Model, target: str) -> tuple[str, list[dict[str, Any]], 
 
 
 def verb_read(model: Model, args: argparse.Namespace) -> int:
+    """``read``: print a section/block target — or ``--pages X-Y`` — as markdown, bounded
+    by ``--max-chars`` with a resume token for the remainder."""
     # `read --pages X-Y` reads a physical/label page range; otherwise `read <id>` reads a
     # section or a single block.
     if args.pages is not None:
@@ -279,6 +285,8 @@ def _coverage_line(res: FindResult) -> str:
 
 
 def verb_find(model: Model, args: argparse.Namespace) -> int:
+    """``find``: lexical search over block text (scopeable by section/pages/kind);
+    ``--semantic`` routes to the vector ``search`` verb."""
     # `find --semantic` is an alias for `search` (one implementation): the lexical scope flags
     # don't apply to a vector query, so route straight through with the query + k + space.
     if getattr(args, "semantic", False):
@@ -432,6 +440,7 @@ def verb_search(model: Model, args: argparse.Namespace) -> int:
 # ---- ocr-status -------------------------------------------------------------
 
 def verb_ocr_status(model: Model, args: argparse.Namespace) -> int:
+    """``ocr-status``: per-page OCR decisions and per-pass results recorded in the model."""
     page_rows = [
         {"page": p.get("n"), "decision": p.get("ocr_decision"), "active_pass": p.get("active_ocr_pass")}
         for p in model.pages

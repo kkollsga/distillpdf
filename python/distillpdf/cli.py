@@ -74,6 +74,9 @@ def _is_shell_invocation(argv):
 
 
 def main(argv=None):
+    """The ``distillpdf`` CLI entry point: model-shell verbs (``info``/``toc``/``read``/…)
+    when invoked on a ``.dpdf``, otherwise the extraction argument parser.
+    Returns the process exit code."""
     if argv is None:
         argv = sys.argv[1:]
     if _is_shell_invocation(argv):

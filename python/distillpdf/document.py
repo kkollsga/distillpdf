@@ -37,10 +37,15 @@ class Document:
     # `run_ocr(engine=...)` takes — different method, different lifecycle stage.
     @classmethod
     def open(cls, path: str, *, engine: Optional[str] = None) -> "Document":
+        """Open the PDF at ``path`` as a Document — the Rust core plus the OCR workflow.
+
+        ``engine`` selects the page-loading engine (e.g. ``"eager"`` or ``"lazy"``);
+        omitted, the library default applies."""
         return cls(_open(path, engine=engine))
 
     @classmethod
     def from_bytes(cls, data: bytes, *, engine: Optional[str] = None) -> "Document":
+        """Open a PDF from in-memory ``data`` as a Document; see :meth:`open` for ``engine``."""
         return cls(_from_bytes(data, engine=engine))
 
     # -- delegate everything else to the Rust core ---------------------------

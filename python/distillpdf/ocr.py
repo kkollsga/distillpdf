@@ -287,6 +287,8 @@ class OcrBackend:
 
     @classmethod
     def descriptor(cls) -> "OcrCapabilities":
+        """This backend's :class:`OcrCapabilities` snapshot — class attributes plus a live
+        ``is_available()`` probe; never instantiates the backend."""
         return OcrCapabilities(
             name=cls.name, tier=cls.tier, structure_aware=cls.structure_aware,
             bundled=cls.bundled, offline=cls.offline, languages=tuple(cls.languages),
@@ -336,6 +338,7 @@ def register_backend(name: str, factory: Callable[..., OcrBackend],
 
 
 def available_backends() -> list[str]:
+    """The registered OCR backend names, sorted."""
     return sorted(_BACKENDS)
 
 

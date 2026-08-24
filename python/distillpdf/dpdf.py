@@ -147,6 +147,9 @@ class Model:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Model":
+        """Build a Model from an already-parsed model dict, validating the distillPDF
+        shape (``source``/``pages``/``sections``/``blocks``/``indexes``) — raises
+        :class:`DpdfError` for anything else."""
         for key in ("source", "pages", "sections", "blocks", "indexes"):
             if key not in data:
                 raise DpdfError(f"not a distillPDF model: missing {key!r}")
@@ -239,6 +242,7 @@ class Model:
         return "\n\n".join(parts)
 
     def space_by_id(self, space_id: str) -> Optional[dict[str, Any]]:
+        """The embedding space whose ``id`` equals ``space_id``, or ``None``."""
         for sp in self.embedding_spaces:
             if sp.get("id") == space_id:
                 return sp
@@ -246,15 +250,19 @@ class Model:
 
     # -- id lookups ----------------------------------------------------------
     def section_by_id(self, sid: str) -> Optional[dict[str, Any]]:
+        """The section dict with id ``sid``, or ``None``."""
         return self._section_by_id.get(sid)
 
     def block_by_id(self, bid: str) -> Optional[dict[str, Any]]:
+        """The block dict with id ``bid``, or ``None``."""
         return self._block_by_id.get(bid)
 
     def section_ids(self) -> list[str]:
+        """Every section id, in document order."""
         return [s["id"] for s in self.sections]
 
     def block_ids(self) -> list[str]:
+        """Every block id, in document order."""
         return [b["id"] for b in self.blocks]
 
     # -- block selection -----------------------------------------------------
@@ -430,6 +438,7 @@ class Model:
         return "\n\n".join(_block_md(b) for b in blocks).strip()
 
     def section_markdown(self, sid: str) -> str:
+        """One section's blocks rendered as markdown (via :meth:`blocks_markdown`)."""
         return self.blocks_markdown(self.blocks_for_section(sid))
 
     def closest_section_ids(self, sid: str, n: int = 3) -> list[str]:
