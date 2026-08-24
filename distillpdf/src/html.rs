@@ -2645,8 +2645,12 @@ pub(crate) fn assemble(
 /// The HTML document shell `to_html` (and the model re-render) wrap the page bodies in.
 /// Exposed so the model path reconstructs the byte-identical `<head>`/`<style>` prelude.
 pub(crate) const DOC_SHELL_HEAD: &str = "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
-     <style>\nbody{max-width:48rem;margin:auto;padding:1rem}\n\
-     img,svg{max-width:100%;height:auto}\n</style>\n</head>\n<body>\n";
+     <style>\nbody{max-width:48rem;margin:auto;padding:1rem;\
+font-family:system-ui,-apple-system,\"Segoe UI\",Roboto,\"Helvetica Neue\",Arial,sans-serif;\
+line-height:1.55}\n\
+     img,svg{max-width:100%;height:auto}\n\
+     table{border-collapse:collapse;margin:1rem 0}\n\
+     th,td{border:1px solid #9994;padding:.3rem .6rem;text-align:left}\n</style>\n</head>\n<body>\n";
 
 /// A page-space span in DISPLAY space — the same run of text, where a viewer sees it.
 ///

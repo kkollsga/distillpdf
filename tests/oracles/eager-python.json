@@ -222,14 +222,14 @@
     },
     "html.page_embed_no_toc": {
       "kind": "bytes",
-      "length": 3333,
-      "sha256": "b620576261a37e81955ed31858b2898ad9cfae69a7a7381a5d7e6c63f68a19b0",
+      "length": 3550,
+      "sha256": "4f4868dd607573db4f331b0923b0ac3dd4fd70612013961545fb82ccf688fc2a",
       "stage": "render"
     },
     "html.section_drop_toc": {
       "kind": "bytes",
-      "length": 3716,
-      "sha256": "0a26b4aa8f05a403bdefd75960c2e9f60ffea27f83b4888062e1ff3232711e00",
+      "length": 3933,
+      "sha256": "90a19c1f1d7557c04308630cdc29e174abcad4112acc8cd5ab2462936727050a",
       "stage": "render"
     },
     "images.all": {
@@ -331,8 +331,8 @@
     },
     "model.render_html": {
       "kind": "bytes",
-      "length": 3716,
-      "sha256": "0a26b4aa8f05a403bdefd75960c2e9f60ffea27f83b4888062e1ff3232711e00",
+      "length": 3933,
+      "sha256": "90a19c1f1d7557c04308630cdc29e174abcad4112acc8cd5ab2462936727050a",
       "stage": "model_render"
     },
     "model.render_markdown": {

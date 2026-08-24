@@ -8,8 +8,8 @@
         "stage": "html_render",
         "value": {
           "kind": "bytes",
-          "length": 232,
-          "sha256": "9b8e5f8932426bc52583490287e4441f79a7f08d08cf422ed72658ac066d941b"
+          "length": 449,
+          "sha256": "aa760d2368394f11c63c4511d4b98b7180d1887ebf3a5203a0ad8d5279af9fa4"
         }
       },
       "integrity": {
@@ -70,8 +70,8 @@
         "stage": "html_render",
         "value": {
           "kind": "bytes",
-          "length": 232,
-          "sha256": "9b8e5f8932426bc52583490287e4441f79a7f08d08cf422ed72658ac066d941b"
+          "length": 449,
+          "sha256": "aa760d2368394f11c63c4511d4b98b7180d1887ebf3a5203a0ad8d5279af9fa4"
         }
       },
       "integrity": {
