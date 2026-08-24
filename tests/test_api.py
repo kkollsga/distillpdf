@@ -427,6 +427,21 @@ def test_analyze_tables_only_claims_exact_ruled_cell_boundaries():
     )
 
 
+def test_medium_weight_face_is_not_bold():
+    """A spelled-out 'Medium' BaseFont (CSS weight 500, a body weight) must render as
+    regular text, while a genuinely bold face and the Nimbus '-Medi' heading
+    abbreviation keep their weight — the classification is by NAME only here, since
+    none of the fixture's faces are embedded."""
+    gt = GT["medium_weight.pdf"]
+    html = distillpdf.Pdf.open(os.path.join(FIX, "medium_weight.pdf")).to_html(
+        image_mode="drop", return_string=True)
+    assert gt["regular"] in html
+    assert f"<b>{gt['regular']}" not in html and not re.search(
+        r"<b>[^<]*" + re.escape(gt["regular"]), html), "Medium body face rendered bold"
+    assert re.search(r"<b>[^<]*" + re.escape(gt["bold"]), html)
+    assert re.search(r"<(b|h\d)>(<b>)?[^<]*" + re.escape(gt["medi_heading"]), html)
+
+
 def test_hscale_grid_honours_tz_and_keeps_the_cut_guard():
     """The Tz (horizontal scaling) fixture: page 1's 60%-scaled grid and page 2's
     naturally fitting twin both yield the full 12x8 ruled lattice with exact cell text,

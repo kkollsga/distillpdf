@@ -3485,6 +3485,44 @@ def gen_ruled_blank_cells():
     GT["ruled_blank_cells.pdf"] = {"rows": len(YS) - 1, "cols": len(XS) - 1}
 
 
+def gen_medium_weight():
+    """A body set in a spelled-out *Medium* face beside a Nimbus *Medi* heading face.
+
+    "Medium" is CSS weight 500 — the BODY weight of Montserrat/Roboto/SF Pro-class
+    families. Classifying the substring as bold wrapped entire documents in ``<b>`` and
+    erased the style signal ruled-table header inference reads. The LaTeX/Nimbus
+    abbreviation "…-Medi" (NimbusRomNo9L-Medi and its -MediItal companion) IS a heading
+    weight and must stay bold. Both faces here are unembedded with explicit widths, so
+    only the BaseFont NAME drives the classification under test."""
+    pdf = os.path.join(OUT, "medium_weight.pdf")
+    widths = b"[" + b" ".join(b"500" for _ in range(95)) + b"]"
+    font = (b"<< /Type /Font /Subtype /Type1 /BaseFont /%s /FirstChar 32 /LastChar 126 "
+            b"/Widths %s /Encoding /WinAnsiEncoding >>")
+    stream = (
+        b"BT /F3 14 Tf 72 740 Td (A Heading In The Abbreviated Medi Face) Tj ET\n"
+        b"BT /F1 10 Tf 72 710 Td (The body paragraph is set in a medium weight face "
+        b"and reads as regular text.) Tj ET\n"
+        b"BT /F1 10 Tf 72 696 Td (Only the genuinely heavy words below carry emphasis.) Tj ET\n"
+        b"BT /F2 10 Tf 72 672 Td (This line is truly bold.) Tj ET"
+    )
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 5 0 R /F2 6 0 R /F3 7 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+        5: font % (b"Montserrat-Medium", widths),
+        6: font % (b"Montserrat-Bold", widths),
+        7: font % (b"NimbusRomNo9L-Medi", widths),
+    }
+    _assemble_pdf(objs, pdf)
+    GT["medium_weight.pdf"] = {
+        "regular": "reads as regular text",
+        "bold": "This line is truly bold.",
+        "medi_heading": "A Heading In The Abbreviated Medi Face",
+    }
+
+
 def gen_hscale_grid():
     """Three fully ruled 12x8 numeric grids that differ only in how their text FITS.
 
@@ -5959,6 +5997,7 @@ def main():
     gen_annot_render()
     gen_glyph_table()
     gen_ruled_blank_cells()
+    gen_medium_weight()
     gen_hscale_grid()
     gen_booktabs_wrapped()
     gen_three_column_prose()

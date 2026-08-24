@@ -849,6 +849,11 @@
     "cmsy": "\u2264\u2265\u2192\u2208",
     "diff_names": "\u2211\u222b\u03b1\u2264"
   },
+  "medium_weight.pdf": {
+    "bold": "This line is truly bold.",
+    "medi_heading": "A Heading In The Abbreviated Medi Face",
+    "regular": "reads as regular text"
+  },
   "multitier_header_table.pdf": {
     "header_rows": 2,
     "tables": 1

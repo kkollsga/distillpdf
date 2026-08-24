@@ -379,11 +379,14 @@ fn font_info(
         let flags = descriptor.flags;
         // Bold incl. heading weights (LaTeX/Nimbus heading faces are "Medi"/semibold,
         // not literally "Bold", and often don't set the ForceBold descriptor flag).
-        let bold = [
-            "bold", "black", "heavy", "semibold", "demibold", "-medi", "medium", "cmbx",
-        ]
-        .iter()
-        .any(|w| basefont.contains(w))
+        // A spelled-out "Medium" is NOT bold: it is CSS weight 500, shipped as the
+        // BODY face of Montserrat/Roboto/SF Pro-class families — matching it wrapped
+        // whole documents in <b> and erased the ruled-table header-tier style signal.
+        // Only the Nimbus/URW abbreviation "…-Medi"/"…-MediItal" stays a heading weight.
+        let bold = ["bold", "black", "heavy", "semibold", "demibold", "cmbx"]
+            .iter()
+            .any(|w| basefont.contains(w))
+            || (basefont.contains("-medi") && !basefont.contains("-medium"))
             || (flags & 0x40000) != 0;
         let italic =
             basefont.contains("italic") || basefont.contains("oblique") || (flags & 0x40) != 0;
