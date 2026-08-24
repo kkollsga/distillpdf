@@ -73,7 +73,11 @@ Worst docs: Spanish unicode 0.04 · Moderna 10-K 0.20 · NVIDIA 10-K 0.28 · Spa
   - **Tightly-packed right-aligned numeric tables** (Transformer Table 3): adjacent
     columns whose values occasionally bridge the gutter still merge under lane detection;
     needs alignment-aware (right-edge) sub-splitting + the deferred superscript work (its
-    subscripts land on a 2nd line). No regression vs baseline.
+    subscripts land on a 2nd line). No regression vs baseline. NOTE 2026-08-24: one major
+    driver of this symptom on PDFlib/XaitPorter-class producers was the unimplemented `Tz`
+    horizontal-scaling operator inflating run widths (up to ~3×) until the lattice word-cut
+    guard refused correct ruled frames — fixed in `src/text.rs` (lock: `hscale_grid.pdf`);
+    the residual is the genuine alignment-model half.
   - **Inline multi-tier-header colspan** (group label over sub-columns *within* the data
     run): the data columns are correct, but the group row isn't lifted into `<thead>`
     with colspans yet — needs coordinated `table_html` th/td changes. Stranded group
@@ -217,15 +221,18 @@ Worst docs: Spanish unicode 0.04 · Moderna 10-K 0.20 · NVIDIA 10-K 0.28 · Spa
     are never resurrected. arxiv_math ellipse diagrams recovered; corpus empty figures
     ~100 → 0 spurious (genuine graphic-less captions stay as honest `<figure><figcaption>`).
   - **Decision:** pure-Rust, no native PDF-renderer dependency (would break "no system deps" +
-    the abi3 single-wheel build). Page-raster fallback, shadings (`sh`), inline images
-    (`BI/ID/EI`) DEFERRED (low/zero corpus incidence); the deferred items are reimplementable
-    clean-room from the PDF spec (ISO 32000).
+    the abi3 single-wheel build). Page-raster fallback and shadings (`sh`) DEFERRED; inline
+    images (`BI/ID/EI`) SHIPPED 2026-08-24 (clean-room from ISO 32000 §8.9.7, incl. a
+    labelled placeholder for filtered inline images the parser cannot take — the deferral's
+    "low/zero corpus incidence" premise failed for seismic/geoscience exports, which put
+    whole figure sets into inline images; lock: `gen_fixtures.py` `inline_image.pdf`).
   - **Locks:** `tests/test_figure_recovery.py` (LoF-not-figure incl. wrapped; small-vector
     recovered; precision: no promotion without a caption + positive control) on 3 new
     `gen_fixtures.py` fixtures; `empty_figures` count added to the corpus regression gate.
 - **Still OPEN / deferred:** real graphics still missing where the figure is cross-page from its
-  caption, or its content lives in a Form/shading we don't rasterize (cond-mat Fig 3, cs_LG
-  Fig 5, attention Fig 5) — these need cross-page anchoring and/or `sh`/inline-image support.
+  caption, or its content lives in a shading we don't rasterize (cond-mat Fig 3, cs_LG
+  Fig 5, attention Fig 5) — these need cross-page anchoring and/or `sh` support (the
+  inline-image half shipped 2026-08-24).
 - **Test:** figure-heavy doc emits non-empty <svg>/<img> per source XObject; no empty <figure>.
 - **Affected (14):** ai_attention_transformer_arxiv, chem_arxiv, geology_seismology_arxiv, geology_usgs_bogoslof_volcano, geology_usgs_volcanic_hazards_california, med_covid_bnt162b2_medrxiv, med_mrna_vaccine_immunology_pmc, nonenglish_spanish_astrofisica_arxiv, physics_gravitational_waves_arxiv, physics_higgs_atlas_discovery …
 
@@ -279,9 +286,19 @@ Worst docs: Spanish unicode 0.04 · Moderna 10-K 0.20 · NVIDIA 10-K 0.28 · Spa
 - **Affected (11):** ai_attention_transformer_arxiv, bio_protein_design_global_context_arxiv, chem_arxiv, economics_finance_arxiv, geology_seismology_arxiv, med_covid_bnt162b2_medrxiv, med_crispr_clinical_trials_pmc, med_crispr_sicklecell_pmc, med_mrna_vaccine_immunology_pmc, physics_higgs_atlas_discovery …
 
 ### 10. Running headers/footers, page numbers, and line numbers leak into body content
-`medium` · freq 10 · effort medium · area `reading_order` · **status: OPEN**
+`medium` · freq 10 · effort medium · area `reading_order` · **status: SHIPPED 2026-08-24 (core); line numbers OPEN**
 
-- **Fix:** Detect recurring header/footer content by matching text that repeats at a consistent y-position near the page top/bottom across consecutive pages (allowing only a trailing page number to vary) and suppress it or move it to a <header>/<aside> outside the content flow. Strip isolated incrementing integer tokens in the left margin (manuscript line numbers) and at page top/bottom (page numbers). After suppression, merge the flanking paragraph fragments that were split by the removed header.
+- **Shipped:** `src/chrome.rs` — per-document detection over the whole document's spans:
+  top/bottom-band rows clustered by (y-bucket, digit-masked text), accepted as chrome on
+  repetition (≥4 pages, ≥50% coverage, ≤0.35 text diversity) with heading-size and
+  line-spacing-isolation guards; filtered at the SPAN level before table detection, the
+  footnote mask and paragraph assembly (removing at the span stage makes the old
+  "move to `<aside>`" and "merge flanking fragments" steps unnecessary — routing chrome to
+  `<aside>` was itself the failure mode on footers). Lock: `gen_fixtures.py`
+  `page_chrome.pdf` (header/footer removed; divider-page reuse, bottom-band footnote and
+  in-band body lines survive).
+- **Still open:** left-margin manuscript line numbers (a column, not a band row) are not
+  covered by the band clustering.
 - **Test:** known doc: emitted marker words monotonic in (-y, x); no dropped section.
 - **Affected (10):** geology_seismology_arxiv, geology_usgs_bogoslof_volcano, med_covid_bnt162b2_medrxiv, med_crispr_clinical_trials_pmc, med_crispr_sicklecell_pmc, med_mrna_vaccine_immunology_pmc, physics_gravitational_waves_arxiv, sec_nvidia_10k, space_moon_lunar_arxiv, space_moon_lunar_surface_databook_nasa
 
