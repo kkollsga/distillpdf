@@ -7,7 +7,7 @@ resolver = "2"
 [workspace.package]
 # Keep `version` the FIRST key here: publish.yml greps `^version` off this file to gate the
 # PyPI release, and both member crates inherit it via `version.workspace = true`.
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
