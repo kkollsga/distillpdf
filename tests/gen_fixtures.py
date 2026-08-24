@@ -3485,6 +3485,71 @@ def gen_ruled_blank_cells():
     GT["ruled_blank_cells.pdf"] = {"rows": len(YS) - 1, "cols": len(XS) - 1}
 
 
+def gen_page_chrome():
+    """Six pages of running chrome around distinct body text — the repetition shape the
+    per-document chrome detector (src/chrome.rs) exists for.
+
+    Every page carries the same header line at y=770 and a "Page N of 6" footer at y=50
+    (digit runs mask to one key, so the counter does not fragment the cluster). The traps
+    are the survivors: page 4 repeats the header STRING mid-page as a divider title
+    (position must save it), page 3 has a one-off footnote inside the bottom band (text
+    recurrence must save it), and the body paragraphs sit at a constant y INSIDE the top
+    band with different text on every page (the diversity guard must save them)."""
+    pdf = os.path.join(OUT, "page_chrome.pdf")
+    HEADER = b"Confidential Report Alpha"
+    # Body sentences differ by WORDS, as real body text does — lines that differ only in
+    # their digits would mask to one key and legitimately read as chrome.
+    FIRST = [
+        b"Geology governs everything the opening chapter claims.",
+        b"Reservoir pressure behaves quite differently at depth.",
+        b"Seismic interpretation drives the structural model.",
+        b"Interlude,",
+        b"Drilling engineering constrains the well trajectories.",
+        b"Economics ultimately decides the development concept.",
+    ]
+    SECOND = [
+        b"Its argument builds slowly from regional observations.",
+        b"Laboratory measurements anchor the uncertainty ranges.",
+        b"Velocity models were rebuilt after the reprocessing.",
+        b"a divider page interrupts the running argument.",
+        b"Casing design follows the measured pressure windows.",
+        b"Sensitivity cases bracket the base case comfortably.",
+    ]
+    n = 6
+    contents = []
+    for i in range(1, n + 1):
+        body = [
+            b"BT /F1 8 Tf 72 770 Td (%s) Tj ET" % HEADER,
+            b"BT /F1 8 Tf 270 50 Td (Page %d of %d) Tj ET" % (i, n),
+            b"BT /F1 10 Tf 72 720 Td (%s) Tj ET" % FIRST[i - 1],
+            b"BT /F1 10 Tf 72 700 Td (%s) Tj ET" % SECOND[i - 1],
+        ]
+        if i == 1:
+            body.insert(2, b"BT /F2 16 Tf 72 740 Td (Chrome Detection Fixture) Tj ET")
+        if i == 3:
+            body.append(b"BT /F1 8 Tf 72 62 Td (1. A footnote that must survive the bottom band.) Tj ET")
+        if i == 4:
+            body.append(b"BT /F2 14 Tf 180 500 Td (%s) Tj ET" % HEADER)
+        contents.append(b"\n".join(body))
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [%s] /Count %d >>" % (b" ".join(b"%d 0 R" % (3 + 2 * i) for i in range(n)), n),
+        15: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        16: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
+    }
+    for i, c in enumerate(contents):
+        objs[3 + 2 * i] = (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+                           b"/Font << /F1 15 0 R /F2 16 0 R >> >> /Contents %d 0 R >>" % (4 + 2 * i))
+        objs[4 + 2 * i] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c), c)
+    _assemble_pdf(objs, pdf)
+    GT["page_chrome.pdf"] = {
+        "header": "Confidential Report Alpha",
+        "footer_sample": "Page 3 of 6",
+        "footnote": "A footnote that must survive the bottom band.",
+        "body_sample": "Drilling engineering constrains the well trajectories.",
+    }
+
+
 def gen_inline_image():
     """Inline images (``BI…ID…EI``, ISO 32000 §8.9.7) in the exact shape that lost eight
     figures of a real geoscience report: the raster lives INSIDE a Form XObject as an
@@ -6061,6 +6126,7 @@ def main():
     gen_annot_render()
     gen_glyph_table()
     gen_ruled_blank_cells()
+    gen_page_chrome()
     gen_inline_image()
     gen_medium_weight()
     gen_hscale_grid()

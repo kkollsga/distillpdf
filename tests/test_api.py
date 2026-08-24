@@ -427,6 +427,22 @@ def test_analyze_tables_only_claims_exact_ruled_cell_boundaries():
     )
 
 
+def test_page_chrome_is_filtered_and_survivors_stay():
+    """Running chrome (header line + digit-masked 'Page N of M' footer) is removed from
+    the rendered flow, while everything that merely LOOKS nearby survives: the divider
+    page reusing the header string mid-page (position saves it), the one-off footnote in
+    the bottom band (text recurrence saves it), and the word-distinct body lines whose y
+    sits inside the top band (the diversity guard saves them)."""
+    gt = GT["page_chrome.pdf"]
+    html = distillpdf.Pdf.open(os.path.join(FIX, "page_chrome.pdf")).to_html(
+        image_mode="drop", return_string=True)
+    # The 6 running-header instances are gone; the divider title (and its nav entry) stay.
+    assert 1 <= html.count(gt["header"]) <= 2, html.count(gt["header"])
+    assert gt["footer_sample"] not in html and "of 6" not in html
+    assert gt["footnote"] in html
+    assert gt["body_sample"] in html
+
+
 def test_inline_images_are_extracted_and_rendered():
     """Inline images (BI…ID…EI, §8.9.7) inside a Form XObject: the abbreviated-key RGB
     image and the 1-bpc stencil both extract as PNG rows and render as raster data URIs,

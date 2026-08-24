@@ -949,6 +949,12 @@
       "marker 0040-26"
     ]
   },
+  "page_chrome.pdf": {
+    "body_sample": "Drilling engineering constrains the well trajectories.",
+    "footer_sample": "Page 3 of 6",
+    "footnote": "A footnote that must survive the bottom band.",
+    "header": "Confidential Report Alpha"
+  },
   "pagelabels.pdf": {
     "arabic_pages": [
       "1",

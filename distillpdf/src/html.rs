@@ -1375,7 +1375,13 @@ pub(crate) fn render_doc_elements(
 
     // Document-wide style profile: the body/heading size·weight·font tiers, numbering,
     // outline presence and column layout — drives heading classification per-document.
-    let profile = build_doc_profile(&page_spans, body, title_sz, !outline.is_empty());
+    let mut profile = build_doc_profile(&page_spans, body, title_sz, !outline.is_empty());
+    // Document-wide page chrome (running headers / footers / page numbers): detected once
+    // over the same materialized spans, then filtered out per page at the SPAN level below —
+    // before table detection, the footnote mask and paragraph assembly, the stages that
+    // were previously absorbing chrome into `<td>`s, `<aside>`s and glued paragraphs.
+    let chrome = crate::chrome::plan_chrome(access, &page_spans, body);
+    profile.running_heads = chrome.running_heads.clone();
     // L0 evidence: the tables the document DECLARES (`/StructTreeRoot`), keyed by page. Read
     // once for the whole document — the tree is document-wide and a table may straddle a page
     // break — and empty for the untagged majority.
@@ -1432,14 +1438,16 @@ pub(crate) fn render_doc_elements(
         // spaces meet. Hence: one turn, applied to every page-space quantity this closure
         // touches, and the page-space originals kept only for the SVG emitters (which do
         // their own turn from page space — see `PlacedSvg::rot`).
-        let turn = geom::PageTurn::new(
-            crate::pdfobj::page_rotation(access, *_pid),
-            crate::pdfobj::page_box(access, *_pid).unwrap_or([0.0, 0.0, crate::pdfobj::DEFAULT_PAGE_PTS.0, crate::pdfobj::DEFAULT_PAGE_PTS.1]),
-        );
+        let pbox = crate::pdfobj::page_box(access, *_pid).unwrap_or([0.0, 0.0, crate::pdfobj::DEFAULT_PAGE_PTS.0, crate::pdfobj::DEFAULT_PAGE_PTS.1]);
+        let turn = geom::PageTurn::new(crate::pdfobj::page_rotation(access, *_pid), pbox);
         // Display-space spans. `turned` owns them only on a turned page; upright, `dspans` IS
         // `spans`, so no page in any upright document allocates or copies anything here.
         let turned: Option<Vec<Span>> = (!turn.is_identity()).then(|| spans.iter().map(|s| turn_span(turn, s)).collect());
         let dspans: &[Span] = turned.as_deref().unwrap_or(spans.as_slice());
+        // Chrome rows (running headers/footers/page numbers) removed before ANY consumer
+        // reads the spans; a chrome-free page keeps its borrow, allocation-free.
+        let dechromed: Option<Vec<Span>> = chrome.filter(dspans, turn.rect(pbox[0], pbox[2], pbox[1], pbox[3]));
+        let dspans: &[Span] = dechromed.as_deref().unwrap_or(dspans);
         // A vector figure's / raster's box in display space. Every layout comparison below
         // goes through these; `v.x_left`/`im.x_left` stay page-space for the SVG emitters.
         let dvbox = |v: &vector::PlacedSvg| turn.rect(v.x_left, v.x_right, v.y_bottom, v.y_top);

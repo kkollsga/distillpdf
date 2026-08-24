@@ -20,6 +20,7 @@ pub mod ocr;
 mod afm;
 mod access;
 mod captions;
+mod chrome;
 mod elem_passes;
 mod encoding;
 mod extract;

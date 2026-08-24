@@ -30,6 +30,10 @@
     "direct-backend-method|ec407b8c82f3d7d61e37ee1ab3a83f3ed3127db63af4d0110dab072a73c82f5b|self . document . get_pages ()",
     "direct-backend-method|f2fff51a7156922e31f1d021c6f3d238b59ad5606f0e51d7b00d5323fa17cc08|self . document . get_page_resources (page)"
   ],
+  "chrome.rs": [
+    "clone-call|037dbdbc23c038e55f3bb84d1d4d46a09860eb3b96b1147fe3af449603abc262|recurring . iter () . cloned ()",
+    "clone-call|2c8a89e629d146cfa56130d49a2598d1a30a1f64b0ad95b749d5ebabd2ce8000|s . clone ()"
+  ],
   "doc.rs": [
     "clone-call|08acfd2955c2da32ae9559bac1af73bbf38189fe2c2f09488857530ba3fa3b1a|Arc :: clone (& diagnostics)",
     "clone-call|08acfd2955c2da32ae9559bac1af73bbf38189fe2c2f09488857530ba3fa3b1a|Arc :: clone (& diagnostics)",
@@ -143,6 +147,7 @@
     "clone-call|b9d3b86fa426f4c96925eb366328e7f012da40d298c2feffe0005b90e7dc1d7e|html . clone ()",
     "clone-call|b9d3b86fa426f4c96925eb366328e7f012da40d298c2feffe0005b90e7dc1d7e|html . clone ()",
     "clone-call|c08285b199d650a1b5018845452a9b162a62889824e2a0a292186c8457695a4c|s . text . clone ()",
+    "clone-call|c1e91943683139aabd30dc9528f2e71600dcf3b1b519e338fb922c30dcf97f4d|chrome . running_heads . clone ()",
     "clone-call|c2346f0396505a086c0accbd5df2da1876191f315fa19f89fe738efd10578b78|text . clone ()",
     "clone-call|e076b6496dd6f68fc52868dc0d263d5d1f24ad52501dd657296451bfae13b109|l . href . clone ()",
     "clone-call|e105933b33981f5352b23e6a69800e3cd097d89f9ce61a458f5301cfa2ca38ef|uris . iter () . cloned ()",
