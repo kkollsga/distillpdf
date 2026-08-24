@@ -33,7 +33,34 @@ user's call, not yours.
   third-party PDF.
 - **No bugs left behind.** A defect you surface while doing something else never
   vanishes: fix it in scope, or file it to `dev-docs/plans/consider-for-future.md`
-  with a `dev-docs/todos.md` backlink (via the `add-todo` skill).
+  with a `dev-docs/todos.md` backlink (via the `add-todo` skill). **Classify
+  first** — a *bug* (wrong result, crash, broken contract, measured regression,
+  dead gate, a claim the code contradicts) is **fixed**, never filed; only a
+  *missing capability* (a route never built, an optimization never attempted)
+  belongs in `consider-for-future.md`.
+- **A comment is a claim, and a false claim is a defect (R17).** A comment its
+  own function contradicts is a bug of the same class as a wrong value — it is
+  what the next reader acts on. Two standing duties: a change that falsifies a
+  nearby comment **corrects it in the same change**, and a change through
+  commented code applies the information test to the comments it touches —
+  delete lines that restate the next line or the signature, compress low-density
+  ones. Deletion has a floor: why-not-what, invariants and safety preconditions,
+  data-format lifecycle, bail reasons, regression rationale in tests, and
+  anything the tooling parses (R18) stay regardless of how worthless they look.
+  A `///` block is attached only by adjacency — after inserting or moving items
+  near one, confirm it still renders on *its* item (`help()`, the built docs),
+  not just in the source. The `clean-comments` skill is for the residue; the
+  same-change duty is the mechanism.
+- **Recipe hygiene in anything another reader will run.** Never invoke bare
+  `python` in a documented recipe or a gate script — a shell alias makes the
+  alias's failure read as the checker's verdict; name the interpreter
+  (`.venv/bin/python`, or the script's documented `BUILD_PY`/`RUN_PY`
+  override). Never verify with `>/dev/null 2>&1; echo $?` — it masks *which*
+  command failed; read the target command's own status and let its output
+  through. A guard must not be skippable by the condition it guards, and a
+  failure message's pointers must resolve for **every** reader who can hit it
+  (a gate whose failure text cites a gitignored path fails exactly when it is
+  read).
 - **Offload, don't print.** Write long output (diffs, logs, rendered HTML/PDF
   dumps, profiles) to `dev-docs/temp/` (ephemeral, >1-day purge) or
   `dev-docs/bench/out/` (>14-day purge) and **report the path**. Keep responses
@@ -70,7 +97,7 @@ moved to `inbox/read/` (auto-purged after 7 days).
 ## Skills — when to reach for each
 
 The gitignored `dev-docs/` working folder (canonical map: `dev-docs/README.md`)
-and `inbox/` are operated by six skills under `.claude/skills/`:
+and `inbox/` are operated by the skills under `.claude/skills/`:
 
 - **`phased-plan`** — *demand this* for any large feature or non-trivial
   refactor: investigate (read-only) → gated phased plan → branch + draft PR
@@ -81,7 +108,15 @@ and `inbox/` are operated by six skills under `.claude/skills/`:
 - **`dev-docs-cleanup`** — tidy `dev-docs/` (auto-purge time-boxed dirs +
   todos-driven soft-delete). Run before a new `phased-plan` and at end of
   `release`.
-- **`read-inbox`** / **`notify`** — receive / send cross-project mail.
+- **`read-inbox`** / **`notify`** — receive / send cross-project mail. `notify`
+  owns the outbound bar ("changes what the recipient does"); `read-inbox` routes
+  through it.
+- **`clean-comments`** — coordinator-run comment cleanup over a *measured*
+  scope: delete zero-information comments, compress low-density ones, fix
+  claims the code contradicts (R17), never touch what the tooling reads (R18).
+  Run it on a subtree after a large program lands, or when review keeps hitting
+  stale comments — it is the residue pass, not a substitute for R17's
+  same-change duty.
 - **`release`** — ship: goal-check, run `scripts/release-check.sh`, bump **both**
   `Cargo.toml` and `pyproject.toml` (kept in lockstep), push `main` (triggers
   the version-gated PyPI publish), verify PyPI, tidy. Only on the user's

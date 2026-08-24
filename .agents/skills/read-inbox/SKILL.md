@@ -46,7 +46,10 @@ footer, and archival (step 5).
 If a message carries an **actionable task for another project**, file a note to
 their inbox via the **`notify`** skill (which resolves the sibling repo under
 `Koding/` and writes `YYYY-MM-DD-from-distillpdf-<topic>.md` into their
-`inbox/unread/`). Only route if there's genuinely something for *them* to do —
+`inbox/unread/`). Routing defers to **`notify`'s "Send discipline"**: the bar is
+"changes what the recipient does", and routed notes are **batched per target** —
+one note per target per triage session, not one per source message. Only route
+if there's genuinely something for *them* to do —
 don't clutter their `unread/`. (e.g. a downstream consumer asked for an
 extraction feature: the work is *ours*, so it stays here; route back to them
 only to close the loop once it ships.)

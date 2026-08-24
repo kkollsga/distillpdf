@@ -27,16 +27,23 @@ subset:**
 
 ## Phase −2 — Doctrine sync (first action, always)
 Before anything else, read `../doctrine/VERSION` and compare it to
-`dev-docs/.doctrine-synced` (one line, a `YYYY.MM.DD` date serial). **If they
-match, stop here** — that is one file read, which is why this step is never
-worth skipping. If doctrine is ahead, read `../doctrine/CHANGELOG.md` forward
-from the marker and act on every entry newer than it, by class:
+`dev-docs/.doctrine-synced` (one line, a `MAJOR.MINOR.PATCH` semver — it was a
+`YYYY.MM.DD` date serial before doctrine 0.1.0 rewrote every estate marker).
+**If they match, stop here** — that is one file read, which is why this step is
+never worth skipping. If doctrine is ahead, read `../doctrine/CHANGELOG.md`
+forward from the marker and act on every entry newer than it, by class:
 
-- `[skills-update]` — merge into the **declared authority** (`CLAUDE.md` /
-  `.agents/skills/`, per the declaration at the top of `CLAUDE.md`), then
-  regenerate the `.claude/` adapters from it. Never hand-port into an adapter.
-  Adjudicate any existing divergence per R14 as *local improvement* or
-  *staleness* before touching either side; blind sync deletes improvements.
+- `[skills-update]` — merge into the **declared authority** (this repo's
+  conventions file + `.agents/skills/`, per the authority declaration at the
+  top of that conventions file), then regenerate the `.claude/` adapters from
+  it. Never hand-port into an adapter. Regeneration is **NAME-only**: substitute
+  the conventions file's own name, never a skill *path* — a substituted path
+  manufactures a diff that nothing can normalise. Adjudicate any existing
+  divergence per R14 as *local improvement* or *staleness* before touching
+  either side; blind sync deletes improvements. (This bullet deliberately names
+  the authority *indirectly*: a literal adapter-name mention inside generated
+  text gets substituted into self-reference, telling the adapter's reader to
+  edit the adapter.)
 - `[local-sweep]` — the entry states a concrete check command. Run it. A failure
   becomes scoped, visible work in the current plan, never a silent side-task.
 - `[info]` — no action.
@@ -94,8 +101,23 @@ go-ahead.** If they decline, proceed without it.
 - For each phase spell out: the change, the tests that prove it, the green gate.
 - No phase touches `Cargo.toml`/`pyproject.toml` version or publish config —
   shipping is the `release` skill's job.
+- **Challenge the plan once, immediately before presenting it.**
+  (a) **List the factual claims the plan rests on** — file paths, call sites,
+  API/PyO3 behaviour, cost attributions ("the `/ObjStm` walk dominates", "only
+  `html.rs` calls this") — and **verify each against the code, recording the
+  evidence in the plan doc**. Phase 0's attributions are hypotheses until
+  re-checked *as written into the plan*, where a stale or misquoted one now
+  reads as settled.
+  (b) **Run one pre-mortem**: "this plan shipped and failed — why?", 2–3
+  concrete scenarios. A scenario that names a real failure **changes a phase,
+  adds a test, or becomes a stop rule**; one that cannot is a design preference
+  — argue it in the approval loop below, unlabelled.
+  **No severity tiers** (Blocking/Significant/Minor): severity labels are how
+  preferences get laundered, and planning needs only the binary *changes the
+  plan* or *argued and settled*.
 - Present the plan, then **invite revision: ask the user to revise or approve,
-  and loop on their feedback until they approve.**
+  and loop on their feedback until they approve.** This is the stage where
+  design critique belongs — raise it here or hold it.
 - **Hard stop — wait for an explicit go-ahead.** Do not create the branch, open
   the PR, or write any code until the user says proceed (e.g. "proceed", "go
   ahead", "approved", "ship it"). A simple proceed is enough — no formal
@@ -155,15 +177,42 @@ For every phase, in order:
 Stop mid-plan only for a genuine blocker (unfixable test, architectural
 surprise invalidating a later phase). Surface it; don't push through.
 
-**Bugs that surface mid-plan — fix them as they surface, don't step over them.**
-When executing a phase reveals a defect:
+**Bugs that surface mid-plan — no bugs left behind. Fixing is the default; the
+backlog is for missing capability, never for a known defect** (CLAUDE.md "No
+bugs left behind"). The first question a surfaced defect asks is *fix it now*,
+and the answer is yes unless fixing it is genuinely blocked inside this plan.
+
+First, **classify — bug or missing capability**, because only one of them may be
+filed:
+- A **bug** is a defect in behaviour that exists: a wrong result, a crash, a
+  broken contract (an HTML/Markdown/`.dpdf` invariant, a `#[pymethods]`
+  signature), a **measured** fidelity or throughput regression, a gate that
+  cannot fail, a claim the code contradicts (R17). A bug is **fixed**, never
+  backlogged. Catching yourself writing a bug into the backlog *is* the rule
+  firing — stop and open its phase.
+- A **missing capability** is something that was never built (an extraction
+  route that does not exist, an optimization not yet attempted). *That* is what
+  `consider-for-future.md` is for.
+
+Then fix, by where the bug lives:
 - **In scope** (same file/subsystem you're touching): reproduce + confirm the
   root cause, then fix it as its **own bisectable phase** — insert a `Phase Nb`
-  with its own test/fixture + commit. Don't fold a behaviour change into a
-  mechanical-refactor commit — keep bisection clean.
-- **Out of scope** (different subsystem): don't silently leave it. Reproduce,
-  confirm, file it to `dev-docs/plans/consider-for-future.md` with a `todos.md`
-  backlink, and add a cheap generated regression fixture if one fits.
+  with its own test/generated fixture + commit. Don't fold a behaviour change
+  into a mechanical-refactor commit — keep bisection clean.
+- **Out of scope** (different subsystem): still the default is fix — insert a
+  `Phase Nb` for it exactly as above. "Out of scope" changes the *commit
+  boundary*, not the decision to fix. File to `consider-for-future.md` only when
+  fixing now is genuinely blocked (it needs its own investigation this plan
+  can't absorb, or it would balloon scope past what the user approved) — and
+  then it goes with a `todos.md` backlink plus a cheap generated regression
+  fixture pinning it, and the report-out must say **why it could not be fixed
+  here** ("out of scope" is a location, not a reason).
+- **Suspected perf bug**: an unmeasured perf change is not a fix, so a suspected
+  performance defect earns a measurement *before* its fix counts — and that
+  measurement runs **in this plan** (fold it into the perf phase, or add one),
+  never deferred to a someday-backlog. A single-comparison signal is a lead;
+  confirm-or-clear it here.
+
 Either way, record it in the **report-out** below — a discovered bug never
 vanishes.
 
@@ -179,9 +228,12 @@ regressions now, not in a follow-up.
 Surface a concise summary so nothing actioned silently — keep it under the
 400-token rule and link the plan doc for detail:
 - **Phases** done (one line each) + the PR link / final commit shas.
-- **Bugs surfaced** during execution and each one's disposition: *fixed in
-  Phase Nb* (name the fix) or *filed to backlog* (`consider-for-future.md` +
-  `todos.md`). This list is mandatory even if empty ("no bugs surfaced").
+- **Bugs surfaced** during execution and each one's disposition — which is
+  *fixed in Phase Nb* (name the fix) by default. *Filed to backlog*
+  (`consider-for-future.md` + `todos.md`) is the exception, allowed only for a
+  bug fixing-now was genuinely blocked, and it must state **why it could not be
+  fixed here** — not "out of scope", which is a location. This list is
+  mandatory even if empty ("no bugs surfaced").
 - **Fidelity/perf gate** result if run (corpus gate verdict: all metrics held /
   regressions; pre/post throughput if measured).
 - **`todos.md` changes**: actions *retired* (entry removed + doc → `bin/`,

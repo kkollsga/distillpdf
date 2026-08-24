@@ -64,8 +64,25 @@ date, kebab-case topic). Body:
 - <links, file paths, commit SHAs, versions — optional>
 ```
 
-Keep it actionable: only file a note if there's something for them to do or
-genuinely useful to know (CLAUDE.md "Route to the party who can act").
+Keep it actionable: only file a note if there's something for them to do
+(CLAUDE.md "Route to the party who can act") — and clear the send bar below
+first.
+
+## Send discipline
+
+The outbound bar is **"changes what the recipient does"**, not "true and
+relevant" — a note that merely informs does not get sent.
+
+- **Batch per target per session.** Collect everything for a given target and
+  send **one** note. An immediate single-purpose note needs a *blocker*, an
+  *explicitly requested reply*, or a *time-sensitive fact* — otherwise it waits
+  for the batch.
+- **No FYI-grade notes.** Acknowledgements live in the archiving side's Status
+  footer (`read-inbox` step 5), never in the target's `unread/`.
+- **At most one ping per stalled thread**, and only when it carries **new
+  evidence**.
+- **Related items piggyback** on the next legitimate note instead of earning
+  their own file.
 
 ## 4. Write + report
 Write the file to `<target>/inbox/unread/<filename>` and report the full path.
