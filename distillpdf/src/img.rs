@@ -189,6 +189,24 @@ fn decode_rgb(
     })?
 }
 
+/// Build a base64 PNG data URI for an inline image's already-parsed samples.
+///
+/// Deliberately narrower than [`data_uri`]: an inline image can carry no `/SMask` and the
+/// parser hands it over unfiltered, so the whole decode is the shared sample path —
+/// stencils (`/IM true`), sub-byte depths and `/Decode` included.
+fn inline_data_uri(
+    access: &dyn crate::access::DocumentAccess,
+    res: &ResourceScope,
+    stream: &lopdf::Stream,
+    window: Option<(f32, f32, f32, f32)>,
+    turn: i32,
+) -> Option<String> {
+    let rgb = turn_pixels(crop_window(decode_samples(access, res, stream)?.into_rgb8(), window), turn);
+    let png = png_bytes(image::DynamicImage::ImageRgb8(rgb))?;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    Some(format!("data:image/png;base64,{}", b64.encode(&png)))
+}
+
 /// Decode the soft mask (`/SMask`) of an image to a grayscale alpha channel.
 fn decode_smask(
     access: &dyn crate::access::DocumentAccess,
@@ -540,11 +558,23 @@ pub struct Placed {
     pub(crate) clip: Option<ClipRect>,
 }
 
-/// One placed image XObject before clustering: its object id, placed bbox (page points),
+/// Where a tile's pixels come from.
+enum TileSrc {
+    /// A named image XObject — resolvable through the document by id.
+    Object(ObjectId),
+    /// An inline image (`BI…ID…EI`, §8.9.7), its samples already parsed out of the content
+    /// stream (dict normalized to full XObject keys — see
+    /// [`crate::raster::normalize_inline_image`]). `None` when the parser could not take
+    /// the samples (a filtered inline image): the placement is still known, so the page
+    /// shows an honest placeholder instead of silently losing the raster.
+    Inline(Option<Rc<lopdf::Stream>>),
+}
+
+/// One placed image before clustering: its source, placed bbox (page points),
 /// and source pixel WIDTH (for the stitch resolution). Collected by `walk`, then grouped
 /// by `finalize`.
 struct RawTile {
-    id: ObjectId,
+    src: TileSrc,
     x0: f32,
     x1: f32,
     y0: f32,
@@ -566,7 +596,79 @@ struct RawTile {
     full: (f32, f32, f32, f32),
 }
 
+/// A resolved image placement: the cropped bbox, the crop that produced it (when one did),
+/// the rotation matrix for a non-axis-aligned CTM, and the uncropped frame. `None` when the
+/// placement is wholly clipped away or below [`MIN_DIM`] (a diagram tile / rule / icon).
+/// Shared by the `Do` and `BI` arms of [`walk`], which place their unit squares identically.
+struct ImgPlacement {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    crop: Option<ClipRect>,
+    ctm: Option<[f32; 6]>,
+    full: (f32, f32, f32, f32),
+}
+
+fn image_placement(ctm: Mat, clip: Option<ClipRect>, smask: Option<ClipRect>) -> Option<ImgPlacement> {
+    // Placed bbox = image unit square [0,1]^2 through the CTM.
+    let corners = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+    let mut bb = Rect::EMPTY;
+    for (u, v) in corners {
+        let (px, py) = ctm.apply(u, v);
+        bb.include(px, py);
+    }
+    let Rect { mut x0, mut y0, mut x1, mut y1 } = bb;
+    // What the page actually shows is the clip AND the soft-mask window; the
+    // two are independent restrictions on the same paint, so they intersect.
+    let visible = match smask {
+        Some(w) => Some(crate::vector::intersect_clip(clip, w)),
+        None => clip,
+    };
+    // Honour the clip in force, on `vector::finish`'s discipline: keep it only
+    // when it actually crops (so the ubiquitous full-page `re W n` costs
+    // nothing), crop the recorded extent to what shows, and drop outright a
+    // raster that lies wholly outside its clip — the page never showed it.
+    let mut crop = None;
+    if let Some((cx0, cy0, cx1, cy1)) = visible {
+        if cx0 > x0 + 0.5 || cy0 > y0 + 0.5 || cx1 < x1 - 0.5 || cy1 < y1 - 0.5 {
+            let n = Rect::new(x0, y0, x1, y1).intersect(Rect::new(cx0, cy0, cx1, cy1));
+            if n.x1 <= n.x0 || n.y1 <= n.y0 {
+                return None;
+            }
+            x0 = n.x0;
+            y0 = n.y0;
+            x1 = n.x1;
+            y1 = n.y1;
+            crop = visible;
+        }
+    }
+    let (w, h) = (x1 - x0, y1 - y0);
+    if w < MIN_DIM || h < MIN_DIM {
+        return None; // diagram tile / rule / icon — not a figure
+    }
+    // A ROTATED placement (non-axis-aligned CTM) would render mangled if we
+    // just stretched the pixels into this axis-aligned bbox — keep the matrix
+    // so the emitter can rotate it. Axis-aligned (the common case) → None.
+    let scale = ctm.a.abs().max(ctm.b.abs()).max(ctm.c.abs()).max(ctm.d.abs()).max(1e-6);
+    let rot_ctm = if ctm.b.abs() > 0.01 * scale || ctm.c.abs() > 0.01 * scale {
+        Some([ctm.a, ctm.b, ctm.c, ctm.d, ctm.e, ctm.f])
+    } else {
+        None
+    };
+    Some(ImgPlacement { x0, y0, x1, y1, crop, ctm: rot_ctm, full: (bb.x0, bb.y0, bb.x1, bb.y1) })
+}
+
 impl RawTile {
+    /// This tile's document object id — `None` for an inline image, whose samples live in
+    /// the content stream rather than behind a resolvable id.
+    fn oid(&self) -> Option<ObjectId> {
+        match self.src {
+            TileSrc::Object(id) => Some(id),
+            TileSrc::Inline(_) => None,
+        }
+    }
+
     /// The sub-rectangle of this tile's PIXELS that its clip leaves visible, as fractions of
     /// the image's unit square `(u0, v0, u1, v1)` — `None` when nothing was cropped.
     ///
@@ -969,55 +1071,13 @@ fn walk(
                 };
                 let action = stream.read(|value| {
                 if has_subtype(value, b"Image") {
-                    // Placed bbox = image unit square [0,1]^2 through the CTM.
-                    let corners = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
-                    let mut bb = Rect::EMPTY;
-                    for (u, v) in corners {
-                        let (px, py) = ctm.apply(u, v);
-                        bb.include(px, py);
-                    }
-                    let Rect { mut x0, mut y0, mut x1, mut y1 } = bb;
-                    // What the page actually shows is the clip AND the soft-mask window; the
-                    // two are independent restrictions on the same paint, so they intersect.
-                    let visible = match smask {
-                        Some(w) => Some(crate::vector::intersect_clip(clip, w)),
-                        None => clip,
-                    };
-                    // Honour the clip in force, on `vector::finish`'s discipline: keep it only
-                    // when it actually crops (so the ubiquitous full-page `re W n` costs
-                    // nothing), crop the recorded extent to what shows, and drop outright a
-                    // raster that lies wholly outside its clip — the page never showed it.
-                    let mut crop = None;
-                    if let Some((cx0, cy0, cx1, cy1)) = visible {
-                        if cx0 > x0 + 0.5 || cy0 > y0 + 0.5 || cx1 < x1 - 0.5 || cy1 < y1 - 0.5 {
-                            let n = Rect::new(x0, y0, x1, y1).intersect(Rect::new(cx0, cy0, cx1, cy1));
-                            if n.x1 <= n.x0 || n.y1 <= n.y0 {
-                                return false;
-                            }
-                            x0 = n.x0;
-                            y0 = n.y0;
-                            x1 = n.x1;
-                            y1 = n.y1;
-                            crop = visible;
-                        }
-                    }
-                    let (w, h) = (x1 - x0, y1 - y0);
-                    if w < MIN_DIM || h < MIN_DIM {
-                        return false; // diagram tile / rule / icon — not a figure
-                    }
-                    // A ROTATED placement (non-axis-aligned CTM) would render mangled if we
-                    // just stretched the pixels into this axis-aligned bbox — keep the matrix
-                    // so the emitter can rotate it. Axis-aligned (the common case) → None.
-                    let scale = ctm.a.abs().max(ctm.b.abs()).max(ctm.c.abs()).max(ctm.d.abs()).max(1e-6);
-                    let rot_ctm = if ctm.b.abs() > 0.01 * scale || ctm.c.abs() > 0.01 * scale {
-                        Some([ctm.a, ctm.b, ctm.c, ctm.d, ctm.e, ctm.f])
-                    } else {
-                        None
+                    let Some(p) = image_placement(ctm, clip, smask) else {
+                        return false;
                     };
                     // Record geometry + pixel dims; uri building / grid stitching happens
                     // in finalize() once the whole page's tiles are known.
                     let pw = value.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0) as u32;
-                    out.push(RawTile { id, x0, x1, y0, y1, pw, ctm: rot_ctm, res: Rc::clone(res), seq: PaintSeq::at(here, opi), clip: crop, full: (bb.x0, bb.y0, bb.x1, bb.y1) });
+                    out.push(RawTile { src: TileSrc::Object(id), x0: p.x0, x1: p.x1, y0: p.y0, y1: p.y1, pw, ctm: p.ctm, res: Rc::clone(res), seq: PaintSeq::at(here, opi), clip: p.crop, full: p.full });
                     false
                 } else {
                     // A form is descended with the page's XObject scope still in force
@@ -1052,6 +1112,24 @@ fn walk(
                 if action == Some(true) {
                     return;
                 }
+            }
+            // Inline image (§8.9.7). The fork's content parser hands the samples over as a
+            // Stream operand — always unfiltered, exact length taken from the header. A
+            // filtered/unparseable inline image arrives with NO operand: the placement is
+            // still real ink, so it becomes an honest placeholder rather than vanishing.
+            "BI" => {
+                let Some(p) = image_placement(ctm, clip, smask) else {
+                    continue;
+                };
+                let inline = match op.operands.first() {
+                    Some(lopdf::Object::Stream(s)) => Some(Rc::new(crate::raster::normalize_inline_image(s))),
+                    _ => None,
+                };
+                let pw = inline
+                    .as_ref()
+                    .and_then(|s| s.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()))
+                    .unwrap_or(0) as u32;
+                out.push(RawTile { src: TileSrc::Inline(inline), x0: p.x0, x1: p.x1, y0: p.y0, y1: p.y1, pw, ctm: p.ctm, res: Rc::clone(res), seq: PaintSeq::at(here, opi), clip: p.crop, full: p.full });
             }
             _ => {}
         }
@@ -1128,7 +1206,9 @@ fn finalize(
         let (x0, x1, y0, y1) = union_bbox(&tiles);
         // A merged mosaic paints where its FIRST tile did (see `Placed::seq`).
         let grid_seq = || tiles.iter().map(|t| &t.seq).min().cloned().unwrap_or_default();
-        if tiles.len() >= MIN_GRID_TILES && is_grid(&tiles) {
+        // Grid stitching reads tiles back through their document ids; an inline tile has
+        // none, so a cluster containing one falls through to per-tile emission.
+        if tiles.len() >= MIN_GRID_TILES && is_grid(&tiles) && tiles.iter().all(|t| t.oid().is_some()) {
             // A stitched grid is composed axis-aligned, so it carries no rotation.
             if want_uris {
                 if let Some(uri) = stitch_grid(access, &tiles, (x0, x1, y0, y1), rot) {
@@ -1138,7 +1218,7 @@ fn finalize(
                 }
                 // stitch failed → fall through to per-tile emission
             } else {
-                if tiles.iter().any(|t| decodable(access, &t.res, t.id)) {
+                if tiles.iter().any(|t| t.oid().is_some_and(|id| decodable(access, &t.res, id))) {
                     out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri: String::new(), ctm: turned_placement(None, (x0, y0, x1, y1), rot), seq: grid_seq(), clip: None });
                 }
                 continue;
@@ -1160,21 +1240,37 @@ fn finalize(
                 // [`placeholder_uri`]. The gate is `data_uri` having already said no, so this
                 // can never fire for an image we can decode: a decodable stream never reaches
                 // it, and `raster::declined_codec` is the same list the four decline points
-                // on this path read.
-                let uri = match data_uri(access, &t.res, t.id, window, rot) {
-                    Some(uri) => Some(uri),
-                    None => access
-                        .stream(t.id)
-                        .ok()
-                        .and_then(|stream| stream.read(|stream| crate::raster::declined_codec(&stream.dict)))
-                        .flatten()
-                        .map(|(filter, human)| placeholder_uri(filter, human, t.x1 - t.x0, t.y1 - t.y0)),
+                // on this path read. An inline image gets the same honesty: samples that
+                // fail to decode — or that the parser could not take at all — leave a
+                // labelled placeholder, never a blank frame.
+                let uri = match &t.src {
+                    TileSrc::Object(id) => match data_uri(access, &t.res, *id, window, rot) {
+                        Some(uri) => Some(uri),
+                        None => access
+                            .stream(*id)
+                            .ok()
+                            .and_then(|stream| stream.read(|stream| crate::raster::declined_codec(&stream.dict)))
+                            .flatten()
+                            .map(|(filter, human)| placeholder_uri(filter, human, t.x1 - t.x0, t.y1 - t.y0)),
+                    },
+                    TileSrc::Inline(stream) => stream
+                        .as_ref()
+                        .and_then(|s| inline_data_uri(access, &t.res, s, window, rot))
+                        .or_else(|| Some(placeholder_uri("inline image", "inline", t.x1 - t.x0, t.y1 - t.y0))),
                 };
                 if let Some(uri) = uri {
                     out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri, ctm, seq: t.seq.clone(), clip: mask });
                 }
-            } else if decodable(access, &t.res, t.id) {
-                out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri: String::new(), ctm, seq: t.seq.clone(), clip: mask });
+            } else {
+                let renderable = match &t.src {
+                    TileSrc::Object(id) => decodable(access, &t.res, *id),
+                    // Inline mode always emits SOMETHING here (pixels or the labelled
+                    // placeholder), so placeholder mode reports the placement too.
+                    TileSrc::Inline(_) => true,
+                };
+                if renderable {
+                    out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri: String::new(), ctm, seq: t.seq.clone(), clip: mask });
+                }
             }
         }
     }
@@ -1339,7 +1435,7 @@ fn stitch_grid(
     let mut canvas = image::RgbaImage::from_pixel(cw, ch, image::Rgba([255, 255, 255, 255]));
     let mut placed_any = false;
     for t in tiles {
-        let tile = match decode_rgba(access, &t.res, t.id).map(|im| crop_window(im, t.window())) {
+        let tile = match t.oid().and_then(|id| decode_rgba(access, &t.res, id)).map(|im| crop_window(im, t.window())) {
             Some(im) => im,
             None => continue,
         };
@@ -1356,7 +1452,7 @@ fn stitch_grid(
     if !placed_any {
         return None;
     }
-    rgba_uri(turn_pixels(canvas, turn), tiles.iter().all(|t| jpeg_source(access, t.id)))
+    rgba_uri(turn_pixels(canvas, turn), tiles.iter().all(|t| t.oid().is_some_and(|id| jpeg_source(access, id))))
 }
 
 #[cfg(test)]

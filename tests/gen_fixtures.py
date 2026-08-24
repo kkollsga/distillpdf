@@ -3485,6 +3485,70 @@ def gen_ruled_blank_cells():
     GT["ruled_blank_cells.pdf"] = {"rows": len(YS) - 1, "cols": len(XS) - 1}
 
 
+def gen_inline_image():
+    """Inline images (``BI…ID…EI``, ISO 32000 §8.9.7) in the exact shape that lost eight
+    figures of a real geoscience report: the raster lives INSIDE a Form XObject as an
+    inline image (so no ``Do`` of an Image XObject ever names it), drawn under vector ink
+    that renders fine — producing a captioned figure of paths over blank space.
+
+    Page 1 carries the decodable pair: an uncompressed 8x6 RGB inline image with
+    abbreviated keys (``/W /H /BPC /CS /RGB``), and an 8x8 1-bpc stencil
+    (``/IM true /D [1 0]``) — Table 93's most easily-mishandled spellings — plus vector
+    strokes in the same form and a ``Figure 1`` caption. Page 2 is the honest-failure
+    case: a ``/F /AHx`` FILTERED inline image, which the content parser cannot take
+    (it hands over a bare ``BI`` with no operand), so the page must show a labelled
+    placeholder rather than nothing.
+
+    reportlab never emits ``BI``, so this is assembled by hand."""
+    pdf = os.path.join(OUT, "inline_image.pdf")
+    # 8x6 RGB samples: rows fade black -> red so the decoded PNG is recognizably not noise.
+    rgb = b"".join(bytes([32 * r + 4 * c, 8 * c, 16 * r]) for r in range(6) for c in range(8))
+    assert len(rgb) == 144
+    stencil = bytes([0xAA, 0x55] * 4)  # 8x8 checkerboard, 1 byte per row
+    form = (
+        b"0 0 0.8 RG 3 w 10 190 m 290 190 l S 10 10 m 290 10 l S\n"
+        b"0.8 0 0 RG 1.5 w 20 20 m 280 180 l S\n"
+        b"q 200 0 0 120 30 40 cm BI /W 8 /H 6 /BPC 8 /CS /RGB ID\n"
+        + rgb + b"\nEI Q\n"
+        b"q 40 0 0 40 245 20 cm BI /W 8 /H 8 /BPC 1 /IM true /D [1 0] ID\n"
+        + stencil + b"\nEI Q"
+    )
+    hexdata = b"00112233445566778899AABBCCDDEEFF"  # 4x4 gray, ASCIIHex-coded
+    c1 = (
+        b"BT /F2 15 Tf 72 740 Td (An Inline Image Under Vector Ink) Tj ET\n"
+        b"q 1 0 0 1 150 420 cm /Fm0 Do Q\n"
+        b"BT /F1 9.5 Tf 150 400 Td "
+        b"(Figure 1: A panel whose raster is an inline image inside a form.) Tj ET"
+    )
+    c2 = (
+        b"BT /F2 15 Tf 72 740 Td (A Filtered Inline Image) Tj ET\n"
+        b"q 100 0 0 100 200 500 cm BI /W 4 /H 4 /BPC 8 /CS /G /F /AHx ID\n"
+        + hexdata + b"\nEI Q\n"
+        b"BT /F1 9.5 Tf 200 480 Td "
+        b"(Figure 2: A filtered inline image the parser cannot take.) Tj ET"
+    )
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 8 0 R /F2 9 0 R >> /XObject << /Fm0 7 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c1), c1),
+        5: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 8 0 R /F2 9 0 R >> >> /Contents 6 0 R >>"),
+        6: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c2), c2),
+        7: (b"<< /Type /XObject /Subtype /Form /BBox [0 0 300 200] /Length %d >>\n"
+            b"stream\n%s\nendstream" % (len(form), form)),
+        8: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        9: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["inline_image.pdf"] = {
+        "rgb": [8, 6],
+        "stencil": [8, 8],
+        "caption": "Figure 1: A panel whose raster is an inline image inside a form.",
+    }
+
+
 def gen_medium_weight():
     """A body set in a spelled-out *Medium* face beside a Nimbus *Medi* heading face.
 
@@ -5997,6 +6061,7 @@ def main():
     gen_annot_render()
     gen_glyph_table()
     gen_ruled_blank_cells()
+    gen_inline_image()
     gen_medium_weight()
     gen_hscale_grid()
     gen_booktabs_wrapped()

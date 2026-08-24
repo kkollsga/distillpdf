@@ -77,6 +77,46 @@ pub(crate) fn declined_codec(dict: &Dictionary) -> Option<(&'static str, &'stati
     })
 }
 
+/// Rewrite an inline image's dictionary (ISO 32000 §8.9.7, Table 93) to the full XObject
+/// key names so the shared sample decoder reads it unchanged: `W`→`Width`, `CS /G`→
+/// `/DeviceGray`, and so on. Full names pass through — both spellings are legal inline.
+///
+/// The fork's content parser only hands over **unfiltered** inline images (it consumes
+/// exactly `ceil(W·comps·BPC/8)·H` bytes, length-first), so `F`/`Filter` is normalized for
+/// completeness but never present in practice; a filtered inline image reaches the caller
+/// as a `BI` operation with no operand at all, which is the honest-placeholder case.
+pub(crate) fn normalize_inline_image(stream: &lopdf::Stream) -> lopdf::Stream {
+    let mut dict = Dictionary::new();
+    for (key, value) in stream.dict.iter() {
+        let full: &[u8] = match key.as_slice() {
+            b"W" => b"Width",
+            b"H" => b"Height",
+            b"BPC" => b"BitsPerComponent",
+            b"CS" => b"ColorSpace",
+            b"D" => b"Decode",
+            b"DP" => b"DecodeParms",
+            b"F" => b"Filter",
+            b"IM" => b"ImageMask",
+            b"I" => b"Interpolate",
+            other => other,
+        };
+        let value = match (full, value) {
+            (b"ColorSpace", Object::Name(n)) => Object::Name(
+                match n.as_slice() {
+                    b"G" => b"DeviceGray".to_vec(),
+                    b"RGB" => b"DeviceRGB".to_vec(),
+                    b"CMYK" => b"DeviceCMYK".to_vec(),
+                    b"I" => b"Indexed".to_vec(),
+                    _ => n.clone(),
+                },
+            ),
+            _ => value.clone(),
+        };
+        dict.set(full.to_vec(), value);
+    }
+    lopdf::Stream::new(dict, stream.content.clone())
+}
+
 /// Cap on colour-space indirection (`/CS0 → [/Indexed [/ICCBased …] …]`, and the cyclic
 /// resource dictionary a hostile file can write).
 pub(crate) const MAX_CS_DEPTH: u32 = 8;

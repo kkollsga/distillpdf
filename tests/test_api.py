@@ -427,6 +427,23 @@ def test_analyze_tables_only_claims_exact_ruled_cell_boundaries():
     )
 
 
+def test_inline_images_are_extracted_and_rendered():
+    """Inline images (BI…ID…EI, §8.9.7) inside a Form XObject: the abbreviated-key RGB
+    image and the 1-bpc stencil both extract as PNG rows and render as raster data URIs,
+    while the FILTERED inline image the parser cannot take leaves a labelled SVG
+    placeholder — an honest failure, never a silently blank figure."""
+    gt = GT["inline_image.pdf"]
+    pdf = distillpdf.Pdf.open(os.path.join(FIX, "inline_image.pdf"))
+    rows = [(i["page"], i["width"], i["height"], i["format"]) for i in pdf.extract_images()]
+    assert (1, gt["rgb"][0], gt["rgb"][1], "png") in rows
+    assert (1, gt["stencil"][0], gt["stencil"][1], "png") in rows
+    assert not any(page == 2 for page, *_ in rows), "the filtered inline image has no samples"
+    html = pdf.to_html(image_mode="embed", return_string=True)
+    assert html.count("data:image/png") >= 2, "inline rasters missing from the render"
+    assert html.count("data:image/svg+xml") == 1, "filtered inline image needs its placeholder"
+    assert gt["caption"] in html
+
+
 def test_medium_weight_face_is_not_bold():
     """A spelled-out 'Medium' BaseFont (CSS weight 500, a body weight) must render as
     regular text, while a genuinely bold face and the Nimbus '-Medi' heading

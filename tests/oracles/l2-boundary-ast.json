@@ -76,6 +76,7 @@
   ],
   "extract.rs": [
     "clone-call|1b328262b779300ca6b82ac4de0be39372984529ad9b979980367c9268878af6|name . clone ()",
+    "clone-call|2c8a89e629d146cfa56130d49a2598d1a30a1f64b0ad95b749d5ebabd2ce8000|s . clone ()",
     "clone-call|456dffc7874879616c15cc0bd6fa1b4e7aef7de51ec2133d909ed6082044251d|x . text . clone ()",
     "clone-call|6ffc618183a9f4651cd40802ccb3b06b3608cec7e39d78b9ae8952aed84b6707|out . iter () . filter (| t | owns (& f . bbox , t)) . max_by (| a , b | { let region = | t : & PositionedTableAnalysis ",
     "clone-call|7244a625441cbfeb80b7a1bb2236bad85482dc5719147457fb138a36d1c05327|gaps . clone ()",
@@ -83,6 +84,7 @@
     "clone-call|80508999649dd3b83064aba32ecbf31138e5aec16c54207fe4029430099c4402|actual . clone ()",
     "clone-call|99787e0d94a737347708386988b195d58b53f6ac162eb229b6987bc8b888484b|c . aligned . clone ()",
     "clone-call|9c0ffb2c04c1984cd04a01bdc398d94c182ad044689c6a11d95faf1582835d5f|headers . clone ()",
+    "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
     "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
     "clone-call|b35362ee6ae3f1ce895a8852eee51178c03eb99669e779754b485c477db3cd59|diagnostics . clone ()",
     "clone-call|b35362ee6ae3f1ce895a8852eee51178c03eb99669e779754b485c477db3cd59|diagnostics . clone ()",
@@ -148,6 +150,7 @@
     "clone-call|fb618d790b688eb2ef9cd31bf3b641989c417ec844fb1a7149d8a219d0f52d61|n . clone ()"
   ],
   "img.rs": [
+    "clone-call|46f4d22f2b043729c34028059be55db2b583e23e42b84987edb5eac7db1d134d|Rc :: clone (res)",
     "clone-call|46f4d22f2b043729c34028059be55db2b583e23e42b84987edb5eac7db1d134d|Rc :: clone (res)",
     "clone-call|46f4d22f2b043729c34028059be55db2b583e23e42b84987edb5eac7db1d134d|Rc :: clone (res)",
     "clone-call|8a28850777355049b2ac8e474be686b978d7db179ea83a797481ff2c9bf93fa9|f . scope . resources . clone ()",
@@ -315,10 +318,13 @@
   "raster.rs": [
     "clone-call|0196e7bdf620d14b5211a06aa677e198b05b8ca295a794bea1cb3e18a1b2cebc|f . clone ()",
     "clone-call|22efae8bc5ab0006db232c54522fc6d6c83b70c3cdf2862234a73bce5576c024|stream . clone ()",
+    "clone-call|287f419e8de155346718a8d730139480cabf650fefccf209772e0354e462409a|value . clone ()",
     "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
     "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
     "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
-    "clone-call|d464785f33c28e362b13fe8a296253bb378b1dcdf9dde5a4c669a2172564eccb|bytes . clone ()"
+    "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
+    "clone-call|d464785f33c28e362b13fe8a296253bb378b1dcdf9dde5a4c669a2172564eccb|bytes . clone ()",
+    "clone-call|fb618d790b688eb2ef9cd31bf3b641989c417ec844fb1a7149d8a219d0f52d61|n . clone ()"
   ],
   "structtree.rs": [
     "clone-call|1940026b4cd992b1aee631e6b2d26751634d69f32fb31cc455cf03fb957456ae|element . clone ()",

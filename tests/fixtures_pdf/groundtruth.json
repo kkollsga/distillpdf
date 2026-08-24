@@ -790,6 +790,17 @@
     "page3_figures": 0,
     "page4_figures": 1
   },
+  "inline_image.pdf": {
+    "caption": "Figure 1: A panel whose raster is an inline image inside a form.",
+    "rgb": [
+      8,
+      6
+    ],
+    "stencil": [
+      8,
+      8
+    ]
+  },
   "links.pdf": {
     "dest_name": "cite.smith2020",
     "dest_page": 2,

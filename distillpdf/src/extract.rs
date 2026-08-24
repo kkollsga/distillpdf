@@ -187,8 +187,18 @@ fn walk_drawn(
     depth: u32,
     seen: &mut HashSet<ObjectId>,
     out: &mut HashSet<ObjectId>,
+    inline: &mut Vec<lopdf::Stream>,
 ) {
     for op in ops {
+        // An inline image (`BI…ID…EI`, §8.9.7) is drawn content with no XObject id: the
+        // fork's parser hands its samples over as a Stream operand (empty when the image
+        // was filtered/unparseable — nothing to extract then).
+        if op.operator == "BI" {
+            if let Some(lopdf::Object::Stream(s)) = op.operands.first() {
+                inline.push(s.clone());
+            }
+            continue;
+        }
         if op.operator != "Do" {
             continue;
         }
@@ -219,7 +229,7 @@ fn walk_drawn(
                 continue;
             };
             if let Some(ops) = stream.read(crate::walker::form_ops).flatten() {
-                walk_drawn(access, &ops, &scope.xobjects, depth + 1, seen, out);
+                walk_drawn(access, &ops, &scope.xobjects, depth + 1, seen, out, inline);
             }
         }
     }
@@ -245,7 +255,8 @@ fn walk_drawn(
 fn drawn_images(
     access: &dyn crate::access::DocumentAccess,
     page_id: ObjectId,
-) -> Option<HashSet<ObjectId>> {
+) -> Option<(HashSet<ObjectId>, Vec<lopdf::Stream>)> {
+    let mut inline: Vec<lopdf::Stream> = Vec::new();
     let mut xmap = crate::walker::XMap::new();
     for resources in crate::walker::page_resource_chain(access, page_id) {
         let _ = resources.read(|dictionary| {
@@ -259,7 +270,7 @@ fn drawn_images(
     let ops = lopdf::content::Content::decode(&content).ok()?;
     let mut out = HashSet::new();
     let mut seen = HashSet::new();
-    walk_drawn(access, &ops.operations, &xmap, 0, &mut seen, &mut out);
+    walk_drawn(access, &ops.operations, &xmap, 0, &mut seen, &mut out, &mut inline);
     for (id, ap) in crate::walker::appearance_streams(access, page_id) {
         if !seen.insert(id) {
             continue; // shared between annotations, or already reached from the content
@@ -273,10 +284,10 @@ fn drawn_images(
             continue;
         };
         if let Some(ops) = ap.read(crate::walker::form_ops).flatten() {
-            walk_drawn(access, &ops, &scope.xobjects, 1, &mut seen, &mut out);
+            walk_drawn(access, &ops, &scope.xobjects, 1, &mut seen, &mut out, &mut inline);
         }
     }
-    Some(out)
+    Some((out, inline))
 }
 
 /// Does any of these resource dictionaries name an **image** XObject?
@@ -316,6 +327,59 @@ fn reaches_image_xobject(
             .ok()
             .flatten()
             .unwrap_or(false)
+    })
+}
+
+/// Does any of these resource dictionaries name a **Form** XObject? A form's content can
+/// draw an inline image (`BI…ID…EI`) that no resource dictionary will ever list, so a page
+/// that reaches a form cannot be short-circuited on dict evidence alone. Dict-only and
+/// decompresses nothing, like [`reaches_image_xobject`].
+fn reaches_form_xobject(
+    access: &dyn crate::access::DocumentAccess,
+    dicts: &[DictionaryHandle],
+) -> bool {
+    dicts.iter().any(|resources| {
+        resources
+            .read(|resources| {
+                let value = resources.get(b"XObject").ok()?;
+                crate::access::read_resolved(access, value, |xobjects| {
+                    let xobjects = xobjects.as_dict().ok()?;
+                    Some(xobjects.iter().any(|(_, value)| {
+                        value
+                            .as_reference()
+                            .ok()
+                            .and_then(|id| access.stream(id).ok())
+                            .and_then(|stream| {
+                                stream.read(|stream| {
+                                    crate::walker::has_subtype(stream, b"Form")
+                                })
+                            })
+                            .unwrap_or(false)
+                    }))
+                })
+                .ok()
+                .flatten()
+            })
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+    })
+}
+
+/// Conservative byte probe for a page-level inline image: a `BI` token on an operator
+/// boundary in the decoded content bytes. False positives only cost the full walk this
+/// probe was about to skip; a page whose content genuinely draws `BI…ID…EI` always hits.
+/// Decompresses the content but lexes nothing — the lexer was the dominant cost the
+/// short-circuit exists to avoid.
+fn content_has_bi_token(access: &dyn crate::access::DocumentAccess, page_id: ObjectId) -> bool {
+    let Ok(content) = access.page_content(page_id) else {
+        return false;
+    };
+    let boundary = |b: u8| b.is_ascii_whitespace() || matches!(b, b'/' | b')' | b']' | b'>' | b'(' | b'[' | b'<' | b'%');
+    content.windows(2).enumerate().any(|(i, w)| {
+        w == b"BI"
+            && (i == 0 || boundary(content[i - 1]))
+            && content.get(i + 2).is_none_or(|&b| boundary(b))
     })
 }
 
@@ -378,11 +442,18 @@ fn extract_images_inner(
         // the operation, in lopdf's lexer) to conclude nothing. Both dict walks above parse
         // no operator and decompress no stream, and the scan is the enumeration loop's own
         // predicate, so skipping is by construction unobservable — not an approximation.
-        if short_circuit && !reaches_image_xobject(access, &dicts) {
+        if short_circuit
+            && !reaches_image_xobject(access, &dicts)
+            && !reaches_form_xobject(access, &dicts)
+            && !content_has_bi_token(access, page_id)
+        {
             continue;
         }
         let mut index = 0usize;
-        let drawn = drawn_images(access, page_id);
+        let (drawn, inline) = match drawn_images(access, page_id) {
+            Some((drawn, inline)) => (Some(drawn), inline),
+            None => (None, Vec::new()),
+        };
         // Dedup is across resource dictionaries only: an image the page's own /XObject
         // already listed is not re-reported when a nested form points at it too. Repeats
         // *within* one dictionary are kept, so the `index` a directly-referenced image had
@@ -464,6 +535,41 @@ fn extract_images_inner(
                     }
                 });
             });
+        }
+        // Inline images (`BI…ID…EI`) this page draws — no resource dictionary lists them,
+        // so they are appended after the XObject rows, indices continuing. Only parsed
+        // (unfiltered) inline images reach here; a filtered one has no extractable samples.
+        if !inline.is_empty() {
+            let scope = ResourceScope::page(access, page_id);
+            for s in &inline {
+                let stream = crate::raster::normalize_inline_image(s);
+                let dict = &stream.dict;
+                let (Ok(width), Ok(height)) = (
+                    dict.get(b"Width").and_then(|object| object.as_i64()),
+                    dict.get(b"Height").and_then(|object| object.as_i64()),
+                ) else {
+                    continue;
+                };
+                let mut format = "raw";
+                let data = match assemble_png(access, &scope, &stream) {
+                    Some(png) => {
+                        format = "png";
+                        png
+                    }
+                    None => stream.content.clone(),
+                };
+                out.push(ImageInfo {
+                    page: pno,
+                    index,
+                    width,
+                    height,
+                    color_space: image_color_space(access, &scope, dict),
+                    bits_per_component: image_bpc(access, dict),
+                    format,
+                    data,
+                });
+                index += 1;
+            }
         }
     }
     out
