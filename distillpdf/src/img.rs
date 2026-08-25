@@ -536,6 +536,10 @@ pub struct Placed {
     pub x_left: f32,
     pub x_right: f32,
     pub uri: String,
+    /// Stable identity of the source raster, available even when `uri` is intentionally empty.
+    /// Repeated placements of the same PDF image therefore share one table-cell asset in both
+    /// embedded and placeholder render modes.
+    pub(crate) asset_key: u64,
     /// The image's full placement matrix `[a,b,c,d,e,f]` (PDF page space, y up) when it is
     /// ROTATED (non-axis-aligned CTM) — e.g. a "Temp (Celsius)" axis label flattened to a
     /// raster and placed sideways. `None` for the common axis-aligned case (then the bbox
@@ -556,6 +560,23 @@ pub struct Placed {
     /// pixels have not moved. (`vector::finish` sets the precedent: crop the stored bbox,
     /// keep the full geometry, mask it at render time.)
     pub(crate) clip: Option<ClipRect>,
+}
+
+fn fnv64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+pub(crate) fn asset_extension(uri: &str) -> &'static str {
+    let mime = uri.strip_prefix("data:").and_then(|rest| rest.split_once(';')).map(|x| x.0);
+    match mime {
+        Some("image/jpeg") | Some("image/jpg") => "jpg",
+        Some("image/gif") => "gif",
+        Some("image/webp") => "webp",
+        Some("image/tiff") => "tiff",
+        _ => "png",
+    }
 }
 
 /// Where a tile's pixels come from.
@@ -666,6 +687,25 @@ impl RawTile {
         match self.src {
             TileSrc::Object(id) => Some(id),
             TileSrc::Inline(_) => None,
+        }
+    }
+
+    fn asset_key(&self) -> u64 {
+        match &self.src {
+            TileSrc::Object((object, generation)) => {
+                let mut identity = Vec::with_capacity(7);
+                identity.push(b'o');
+                identity.extend_from_slice(&object.to_le_bytes());
+                identity.extend_from_slice(&generation.to_le_bytes());
+                fnv64(&identity)
+            }
+            TileSrc::Inline(Some(stream)) => {
+                let mut identity = Vec::with_capacity(stream.content.len() + 1);
+                identity.push(b'i');
+                identity.extend_from_slice(&stream.content);
+                fnv64(&identity)
+            }
+            TileSrc::Inline(None) => fnv64(b"inline-undecoded"),
         }
     }
 
@@ -1203,6 +1243,12 @@ fn finalize(
     let mut out = Vec::new();
     for g in cluster(&raws) {
         let tiles: Vec<&RawTile> = g.iter().map(|&i| &raws[i]).collect();
+        let asset_key = tiles.iter().fold(0xcbf29ce484222325u64, |hash, tile| {
+            tile.asset_key()
+                .to_le_bytes()
+                .iter()
+                .fold(hash, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3))
+        });
         let (x0, x1, y0, y1) = union_bbox(&tiles);
         // A merged mosaic paints where its FIRST tile did (see `Placed::seq`).
         let grid_seq = || tiles.iter().map(|t| &t.seq).min().cloned().unwrap_or_default();
@@ -1213,13 +1259,13 @@ fn finalize(
             if want_uris {
                 if let Some(uri) = stitch_grid(access, &tiles, (x0, x1, y0, y1), rot) {
                     let ctm = turned_placement(None, (x0, y0, x1, y1), rot);
-                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri, ctm, seq: grid_seq(), clip: None });
+                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri, asset_key, ctm, seq: grid_seq(), clip: None });
                     continue;
                 }
                 // stitch failed → fall through to per-tile emission
             } else {
                 if tiles.iter().any(|t| t.oid().is_some_and(|id| decodable(access, &t.res, id))) {
-                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri: String::new(), ctm: turned_placement(None, (x0, y0, x1, y1), rot), seq: grid_seq(), clip: None });
+                    out.push(Placed { y_top: y1, y_bottom: y0, x_left: x0, x_right: x1, uri: String::new(), asset_key, ctm: turned_placement(None, (x0, y0, x1, y1), rot), seq: grid_seq(), clip: None });
                 }
                 continue;
             }
@@ -1259,7 +1305,7 @@ fn finalize(
                         .or_else(|| Some(placeholder_uri("inline image", "inline", t.x1 - t.x0, t.y1 - t.y0))),
                 };
                 if let Some(uri) = uri {
-                    out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri, ctm, seq: t.seq.clone(), clip: mask });
+                    out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri, asset_key: t.asset_key(), ctm, seq: t.seq.clone(), clip: mask });
                 }
             } else {
                 let renderable = match &t.src {
@@ -1269,7 +1315,7 @@ fn finalize(
                     TileSrc::Inline(_) => true,
                 };
                 if renderable {
-                    out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri: String::new(), ctm, seq: t.seq.clone(), clip: mask });
+                    out.push(Placed { y_top: t.y1, y_bottom: t.y0, x_left: t.x0, x_right: t.x1, uri: String::new(), asset_key: t.asset_key(), ctm, seq: t.seq.clone(), clip: mask });
                 }
             }
         }

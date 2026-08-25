@@ -454,6 +454,7 @@ mod tests {
                     text: "Alpha".into(),
                     images: vec![crate::TableCellImage {
                         asset: "img/cell_alpha.png".into(),
+                        source: None,
                         bbox_norm: Some([0.1, 0.2, 0.3, 0.4]),
                         order: 1,
                     }],
@@ -468,7 +469,7 @@ mod tests {
         let model: DocModel = serde_json::from_slice(&encoded).unwrap();
         let html = render_html(&model, Mode::Page, false);
         assert!(html.contains(
-            "<td>Alpha<img src=\"img/cell_alpha.png\" data-dpdf-cell-image /></td>"
+            "<td>Alpha<img src=\"img/cell_alpha.png\" data-dpdf-cell-image data-asset=\"img/cell_alpha.png\" /></td>"
         ));
         assert!(html.contains("<td>Beta</td>"));
         let (markdown, _) = render_markdown(&model, Mode::Page, false, "embed").unwrap();

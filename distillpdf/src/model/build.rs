@@ -348,15 +348,12 @@ fn build_toc(access: &dyn DocumentAccess, sections: &[Section]) -> Vec<TocEntry>
         .collect()
 }
 
-/// Build the asset table + the embedded-bytes map for the figure blocks.
+/// Build the asset table and embedded-bytes map for figures and table-cell images.
 ///
-/// One asset per figure block that carried an image (id `img/fig_{N}.{ext}`). Under a profile
-/// that keeps figures, we re-render the pages with images INLINE once and pull each figure's
-/// actual raster bytes out of its `<figure id="fig-N">` data URI, then fill the verifying hash
-/// and pixel dimensions and embed the bytes. A figure with no recoverable raster (a pure
-/// vector/SVG figure, or one whose graphic the inline render didn't materialise) keeps a
-/// DROPPED stub with a `regen` recipe — a named, reversible hole, never silent. Under
-/// `assets="none"` every figure is a dropped stub.
+/// Under a profile that keeps figures, the pages are rendered inline once. Raster bytes are
+/// captured from figure elements and from explicitly marked images inside table cells. Repeated
+/// cell placements share one durable asset. Any raster that cannot be recovered keeps a dropped
+/// stub with a regeneration recipe, and `assets="none"` makes every asset such a stub.
 fn build_assets(
     access: &dyn crate::access::DocumentAccess,
     blocks: &mut [Block],
@@ -364,60 +361,100 @@ fn build_assets(
 ) -> (Vec<Asset>, AssetBytes) {
     let mut assets = Vec::new();
     let mut bytes_map = AssetBytes::new();
-    // The figure-id → raster bytes map, built only when the profile keeps figures (re-rendering
-    // inline is the cost we pay exactly once, and only when bytes are wanted).
-    let rasters = if profile.keeps_figures() {
-        figure_rasters(access)
+    // Re-rendering inline is paid exactly once, and only when bytes are wanted.
+    let (rasters, cell_rasters) = if profile.keeps_figures() {
+        captured_rasters(access)
     } else {
-        BTreeMap::new()
+        (BTreeMap::new(), BTreeMap::new())
     };
 
+    let mut seen_cell_assets = HashSet::new();
     for b in blocks.iter_mut() {
-        let Some(id) = b.image.clone() else { continue };
-        // The figure number is the `N` in `img/fig_{N}.png` (== the HTML `fig-N`).
-        let fig_n = id.strip_prefix("img/fig_").and_then(|s| s.split('.').next()).unwrap_or("").to_string();
-        match rasters.get(&fig_n) {
-            Some((data, ext, w, h)) => {
-                // Re-key the asset id to the real extension (a JPEG figure stays `.jpg`) and
-                // re-point the block at it so `block.image` always names a real asset entry.
-                let aid = format!("img/fig_{fig_n}.{ext}");
-                b.image = Some(aid.clone());
-                bytes_map.insert(aid.clone(), data.clone());
-                assets.push(Asset {
-                    id: aid,
+        if let Some(id) = b.image.clone() {
+            // The figure number is the `N` in `img/fig_{N}.png` (== the HTML `fig-N`).
+            let fig_n = id.strip_prefix("img/fig_").and_then(|s| s.split('.').next()).unwrap_or("").to_string();
+            match rasters.get(&fig_n) {
+                Some((data, ext, w, h)) => {
+                    // Re-key the asset id to the real extension (a JPEG figure stays `.jpg`) and
+                    // re-point the block at it so `block.image` always names a real asset entry.
+                    let aid = format!("img/fig_{fig_n}.{ext}");
+                    b.image = Some(aid.clone());
+                    bytes_map.insert(aid.clone(), data.clone());
+                    assets.push(Asset {
+                        id: aid,
+                        kind: AssetKind::Figure,
+                        storage: AssetStorage::Embedded,
+                        sha256: Some(sha256_hex(data)),
+                        bytes: Some(data.len() as u64),
+                        width: *w,
+                        height: *h,
+                        regen: Some(Regen { page: b.page, dpi: None }),
+                    });
+                }
+                None => assets.push(Asset {
+                    id: id.clone(),
                     kind: AssetKind::Figure,
-                    storage: AssetStorage::Embedded,
-                    sha256: Some(sha256_hex(data)),
-                    bytes: Some(data.len() as u64),
-                    width: *w,
-                    height: *h,
+                    storage: AssetStorage::Dropped,
+                    sha256: None,
+                    bytes: None,
+                    width: None,
+                    height: None,
                     regen: Some(Regen { page: b.page, dpi: None }),
-                });
+                }),
             }
-            None => assets.push(Asset {
-                id: id.clone(),
-                kind: AssetKind::Figure,
-                storage: AssetStorage::Dropped,
-                sha256: None,
-                bytes: None,
-                width: None,
-                height: None,
-                regen: Some(Regen { page: b.page, dpi: None }),
-            }),
+        }
+
+        let Some(rows) = b.table_cell_content.as_mut() else {
+            continue;
+        };
+        for image in rows
+            .iter_mut()
+            .flatten()
+            .flat_map(|cell| cell.images.iter_mut())
+        {
+            let original = image.asset.clone();
+            let captured = cell_rasters.get(&original);
+            if !seen_cell_assets.insert(image.asset.clone()) {
+                continue;
+            }
+            match captured {
+                Some((data, _, w, h)) => {
+                    bytes_map.insert(image.asset.clone(), data.clone());
+                    assets.push(Asset {
+                        id: image.asset.clone(),
+                        kind: AssetKind::TableCell,
+                        storage: AssetStorage::Embedded,
+                        sha256: Some(sha256_hex(data)),
+                        bytes: Some(data.len() as u64),
+                        width: *w,
+                        height: *h,
+                        regen: Some(Regen { page: b.page, dpi: None }),
+                    });
+                }
+                None => assets.push(Asset {
+                    id: image.asset.clone(),
+                    kind: AssetKind::TableCell,
+                    storage: AssetStorage::Dropped,
+                    sha256: None,
+                    bytes: None,
+                    width: None,
+                    height: None,
+                    regen: Some(Regen { page: b.page, dpi: None }),
+                }),
+            }
         }
     }
     (assets, bytes_map)
 }
 
-/// A captured figure raster: its bytes, file extension, and decoded pixel dimensions.
+/// A captured raster: its bytes, file extension, and decoded pixel dimensions.
 type FigureRaster = (Vec<u8>, String, Option<u32>, Option<u32>);
 
-/// Re-render the document with images INLINE (once) and decode each figure's raster into
-/// `figure_number → `[`FigureRaster`]. Vector-only figures yield no entry (their graphic is
-/// `<svg>`, not a raster). Width/height come from decoding the image header.
-fn figure_rasters(
+/// Re-render once with inline images and capture both figure and table-cell rasters. Vector-only
+/// figures yield no entry. Width and height come from decoding the image header.
+fn captured_rasters(
     access: &dyn crate::access::DocumentAccess,
-) -> BTreeMap<String, FigureRaster> {
+) -> (BTreeMap<String, FigureRaster>, BTreeMap<String, FigureRaster>) {
     let mut out = BTreeMap::new();
     let html = html::to_html(access, html::Mode::Page, true, false);
     // Walk `<figure id="fig-N"> … <img src="data:…"> … </figure>` occurrences. We only need the
@@ -436,7 +473,30 @@ fn figure_rasters(
         }
         rest = &after[fig_end..];
     }
-    out
+    let mut cells = BTreeMap::new();
+    let mut rest = html.as_str();
+    while let Some(pos) = rest.find("<img ") {
+        rest = &rest[pos..];
+        let Some(end) = rest.find('>') else { break };
+        let tag = &rest[..=end];
+        if tag.contains("data-dpdf-cell-image") {
+            if let (Some(asset), Some((data, ext))) =
+                (html_attr(tag, "data-asset"), first_img_data_uri(tag))
+            {
+                let (w, h) = image_dims(&data);
+                cells.entry(asset.to_string()).or_insert((data, ext, w, h));
+            }
+        }
+        rest = &rest[end + 1..];
+    }
+    (out, cells)
+}
+
+fn html_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("{name}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let end = tag[start..].find('"')? + start;
+    Some(&tag[start..end])
 }
 
 /// Decode the first `<img src="data:image/…;base64,…">` inside a fragment into `(bytes, ext)`.
@@ -709,7 +769,9 @@ fn project_blocks(
                     b.table_proven_leading_tier =
                         table.has_proven_leading_tier().then_some(true);
                     b.table_grid = Some(table.grid_parts());
-                    b.table_cell_content = table.has_cell_images().then(|| table.content_parts());
+                    b.table_cell_content = table
+                        .has_cell_images()
+                        .then(|| prepare_table_content(table.content_parts(), &mut global_img));
                     b.table_caption = table.caption.as_ref().map(|caption| {
                         let n = deduped_tab.as_deref().map(strip_tab_prefix).unwrap_or_else(|| caption.number.clone());
                         (n, caption.html.clone(), caption.below)
@@ -802,6 +864,29 @@ fn prepare_fidelity_fragment(
         *global_img += 1;
     });
     (out, ids)
+}
+
+/// Resolve a table cell's page-local deferred raster sources to the same final one-based
+/// placeholder numbers the live drop-mode HTML receives. Durable asset ids remain untouched.
+fn prepare_table_content(
+    mut rows: Vec<Vec<crate::TableCellContent>>,
+    global_img: &mut usize,
+) -> Vec<Vec<crate::TableCellContent>> {
+    for image in rows
+        .iter_mut()
+        .flatten()
+        .flat_map(|cell| cell.images.iter_mut())
+    {
+        let Some(source) = image.source.as_deref() else {
+            continue;
+        };
+        let resolved = postprocess::rewrite_sentinels(source, 4, |_idx, out| {
+            out.push_str(&(*global_img + 1).to_string());
+            *global_img += 1;
+        });
+        image.source = Some(resolved);
+    }
+    rows
 }
 
 /// Make a block carrying the common fields (the kind-specific fields are filled by the caller),

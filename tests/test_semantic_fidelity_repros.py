@@ -1,12 +1,7 @@
-"""Owned reproductions for residual semantic-table, list, and page-chrome defects.
-
-The strict expected failures are Phase 1 evidence, not accepted behavior.  Each is removed
-by the phase that fixes its production decision path.  Precision controls stay ordinary
-tests throughout so a broad suppression/reordering change cannot make an xfail disappear by
-deleting unrelated content.
-"""
+"""Owned regressions for semantic-table, list, and page-chrome fidelity defects."""
 import os
 import re
+import json
 
 import pytest
 import distillpdf
@@ -83,23 +78,66 @@ def test_logo_rule_chain_fixture_keeps_tables_and_body_content():
     assert text(rendered).count(gt["body"]) == gt["pages"]
 
 
-@pytest.mark.xfail(strict=True, reason="raster-bearing table is discarded and cells are text-only")
 def test_mixed_image_text_cells_remain_one_semantic_table():
-    rendered = distillpdf.Pdf.open(os.path.join(FIX, "mixed_cell_table.pdf")).to_html(
-        mode="page", image_mode="inline", return_string=True)
+    pdf = distillpdf.Pdf.open(os.path.join(FIX, "mixed_cell_table.pdf"))
+    rendered = pdf.to_html(mode="page", image_mode="embed", return_string=True)
     gt = GT["mixed_cell_table.pdf"]
     assert rendered.count("<table") == 1
     table = re.search(r"<table\b.*?</table>", rendered, re.DOTALL).group(0)
-    assert len(cells(table, "td")) == gt["rows"] * gt["cols"]
+    assert len(cells(table, "th")) + len(cells(table, "td")) == gt["rows"] * gt["cols"]
     assert table.count("<img ") == gt["images"]
     assert all(label in table for label in gt["labels"])
-    assert f"<caption>{gt['caption']}</caption>" in table
+    assert re.search(rf"<caption\b[^>]*>{re.escape(gt['caption'])}</caption>", table)
+    assert rendered.count("<figure") == 0
+    dropped = pdf.to_html(mode="page", image_mode="drop", return_string=True)
+    assert re.findall(r'data-asset="([^"]+)', dropped) == re.findall(
+        r'data-asset="([^"]+)', rendered)
 
 
-def test_mixed_cell_fixture_retains_all_source_components_before_fix():
+def test_mixed_cell_fixture_retains_all_source_components():
     pdf = distillpdf.Pdf.open(os.path.join(FIX, "mixed_cell_table.pdf"))
     gt = GT["mixed_cell_table.pdf"]
     assert len(pdf.extract_images()) == gt["assets"]
     visible = text(pdf.to_html(mode="page", image_mode="drop", return_string=True))
     assert gt["caption"] in visible
     assert all(label in visible for label in gt["labels"])
+
+
+def test_mixed_image_text_cells_are_structured_in_raw_analysis():
+    pdf = distillpdf.Pdf.open(os.path.join(FIX, "mixed_cell_table.pdf"))
+    gt = GT["mixed_cell_table.pdf"]
+    analyzed = pdf.analyze_tables()
+    assert len(analyzed) == 1
+    table = analyzed[0]
+    assert (table["n_rows"], table["n_cols"]) == (gt["rows"], gt["cols"])
+    anchors = table["cells"]
+    assert len(anchors) == gt["rows"] * gt["cols"]
+    assert all(cell["content"]["text"] == cell["text"] for cell in anchors)
+    images = [image for cell in anchors for image in cell["content"]["images"]]
+    assert len(images) == gt["images"]
+    assert len({image["asset"] for image in images}) == gt["assets"]
+    assert all(len(image["bbox_norm"]) == 4 and image["order"] >= 0 for image in images)
+
+
+def test_mixed_image_text_cells_roundtrip_through_model(tmp_path):
+    pdf = distillpdf.Pdf.open(os.path.join(FIX, "mixed_cell_table.pdf"))
+    gt = GT["mixed_cell_table.pdf"]
+    live = pdf.to_html(mode="page", toc=False, image_mode="drop", return_string=True)
+    dpdf = pdf.distill(str(tmp_path / "mixed-cell.dpdf"))
+    assert distillpdf.render_html(dpdf, mode="page", toc=False) == live
+
+    model = json.loads(distillpdf.load_model(dpdf))
+    blocks = [block for block in model["blocks"] if block["kind"] == "table"]
+    assert len(blocks) == 1
+    content = blocks[0]["table_cell_content"]
+    images = [image for row in content for cell in row for image in cell["images"]]
+    assert len(images) == gt["images"]
+    assert len({image["asset"] for image in images}) == gt["assets"]
+    assert len(model["assets"]) == gt["assets"]
+    assert model["assets"][0]["kind"] == "table_cell"
+    assert model["assets"][0]["storage"] == "embedded"
+
+    markdown = distillpdf.render_markdown(
+        dpdf, mode="page", toc=False, image_mode="drop")
+    assert all(label in markdown for label in gt["labels"])
+    assert markdown.count("![](#fig-") == gt["images"]

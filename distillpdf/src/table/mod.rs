@@ -63,6 +63,10 @@ pub struct AnalyzedCell {
 pub struct TableCellImage {
     /// Durable asset reference (`img/…`) or a renderer-local deferred image sentinel.
     pub asset: String,
+    /// Renderer source (`data:` URI sentinel or final placeholder number). The durable asset
+    /// id remains separate so HTML replay and model lookup do not overload one string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// Placement within the displayed page as `[left, top, right, bottom]`, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bbox_norm: Option<[f32; 4]>,
@@ -710,6 +714,48 @@ impl TableAnalysis {
             .any(|cell| !cell.content.images.is_empty())
     }
 
+    /// Exact ruled-cell owner for a raster, if precisely one observed cell contains it.
+    pub(crate) fn image_owner(&self, image: Rect) -> Option<(usize, usize)> {
+        if !self.evidence.contains(&TableEvidence::Ruled) || image.area() <= 0.0 {
+            return None;
+        }
+        let center = ((image.x0 + image.x1) * 0.5, (image.y0 + image.y1) * 0.5);
+        let mut owners = self
+            .header
+            .iter()
+            .chain(&self.grid)
+            .flatten()
+            .filter(|cell| !cell.covered)
+            .filter_map(|cell| {
+                let bbox = cell.bbox?;
+                (bbox.contains(center.0, center.1)
+                    && bbox.overlap_area(image) >= image.area() * 0.90)
+                    .then_some((cell.row, cell.col))
+            });
+        let owner = owners.next()?;
+        owners.next().is_none().then_some(owner)
+    }
+
+    pub(crate) fn attach_image(
+        &mut self,
+        row: usize,
+        col: usize,
+        image: TableCellImage,
+    ) -> bool {
+        let Some(cell) = self
+            .header
+            .iter_mut()
+            .chain(&mut self.grid)
+            .flatten()
+            .find(|cell| !cell.covered && cell.row == row && cell.col == col)
+        else {
+            return false;
+        };
+        cell.content.images.push(image);
+        cell.content.images.sort_by_key(|image| image.order);
+        true
+    }
+
     /// Restore additive structured content onto a table reconstructed from legacy text parts.
     /// Shape mismatches degrade cell-by-cell and never erase the legacy text projection.
     pub(crate) fn restore_content(&mut self, rows: Vec<Vec<TableCellContent>>) {
@@ -1311,6 +1357,7 @@ mod tests {
                 text: String::new(),
                 images: vec![TableCellImage {
                     asset: "img/alpha.png".into(),
+                    source: None,
                     bbox_norm: Some([0.1, 0.2, 0.3, 0.4]),
                     order: 2,
                 }],
@@ -1331,6 +1378,32 @@ mod tests {
         assert_eq!(public.cells[0].content.text, "Alpha");
         assert_eq!(public.cells[0].content.images[0].asset, "img/alpha.png");
         assert!(public.cells[1].content.images.is_empty());
+    }
+
+    #[test]
+    fn ruled_cell_geometry_owns_only_a_single_contained_raster() {
+        let mut table = TableAnalysis::from_parts(
+            Vec::new(),
+            vec![vec!["Left".into(), "Right".into()]],
+            0,
+            None,
+            vec![TableEvidence::Ruled],
+        );
+        table.grid[0][0].bbox = Some(Rect::new(0.0, 0.0, 50.0, 40.0));
+        table.grid[0][1].bbox = Some(Rect::new(50.0, 0.0, 100.0, 40.0));
+
+        assert_eq!(
+            table.image_owner(Rect::new(5.0, 5.0, 45.0, 35.0)),
+            Some((0, 0))
+        );
+        assert_eq!(
+            table.image_owner(Rect::new(40.0, 5.0, 60.0, 35.0)),
+            None,
+            "a raster crossing the cell rule remains figure content"
+        );
+
+        table.evidence = vec![TableEvidence::Aligned];
+        assert_eq!(table.image_owner(Rect::new(5.0, 5.0, 45.0, 35.0)), None);
     }
 
     #[test]

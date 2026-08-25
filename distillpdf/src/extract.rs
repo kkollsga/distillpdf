@@ -3411,6 +3411,50 @@ pub fn analyze_tables(access: &dyn crate::access::DocumentAccess) -> Vec<Analyze
                 ]),
             );
             let mut detected = detect_tables_pos(&spans, &rules);
+            let images = crate::img::positioned_images(access, page_id, false);
+            for (image_index, image) in images.iter().enumerate() {
+                let page_rect = crate::geom::Rect::new(
+                    image.x_left,
+                    image.y_bottom,
+                    image.x_right,
+                    image.y_top,
+                );
+                let (x0, x1, y0, y1) = turn.rect(
+                    image.x_left,
+                    image.x_right,
+                    image.y_bottom,
+                    image.y_top,
+                );
+                let display_rect = crate::geom::Rect::new(x0, y0, x1, y1);
+                let owners: Vec<(usize, usize, usize)> = detected
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(table_index, table)| {
+                        table
+                            .table
+                            .image_owner(display_rect)
+                            .map(|(row, col)| (table_index, row, col))
+                    })
+                    .collect();
+                let [(table_index, row, col)] = owners.as_slice() else {
+                    continue;
+                };
+                let asset = format!(
+                    "img/table_p{pno}_{:016x}.{}",
+                    image.asset_key,
+                    crate::img::asset_extension(&image.uri),
+                );
+                detected[*table_index].table.attach_image(
+                    *row,
+                    *col,
+                    crate::TableCellImage {
+                        asset,
+                        source: None,
+                        bbox_norm: turn.normalized_rect(page_rect),
+                        order: image_index as u32,
+                    },
+                );
+            }
             crate::table::finalize_continuation_proofs(pno, &spans, &mut detected, turn, false);
             (pno, turn, detected, String::new())
         })

@@ -678,9 +678,11 @@ fn table_html(table: &TableAnalysis) -> String {
             }
             tbl.push_str(&format!("<{tag}{attrs}>{}", esc(cell.content.text.trim())));
             for image in &cell.content.images {
+                let src = image.source.as_deref().unwrap_or(&image.asset);
                 tbl.push_str(&format!(
-                    "<img src=\"{}\" data-dpdf-cell-image />",
-                    crate::textutil::esc_attr(&image.asset)
+                    "<img src=\"{}\" data-dpdf-cell-image data-asset=\"{}\" />",
+                    crate::textutil::esc_attr(src),
+                    crate::textutil::esc_attr(&image.asset),
                 ));
             }
             tbl.push_str(&format!("</{tag}>"));
@@ -1527,7 +1529,9 @@ pub(crate) fn render_doc_elements(
                 let (ixl, ixr, iyb, iyt) = dibox(im);
                 let ir = Rect::new(ixl, iyb, ixr, iyt);
                 let ia = ir.area().max(1.0);
-                ia >= ta * 0.15 && tr.overlap_area(ir) >= ia * 0.5
+                ia >= ta * 0.15
+                    && tr.overlap_area(ir) >= ia * 0.5
+                    && t.table.image_owner(ir).is_none()
             });
             let strip_in_plot = raw_vectors.iter().any(|v| {
                 let (vxl, vxr, vyb, vyt) = dvbox(v);
@@ -1618,6 +1622,61 @@ pub(crate) fn render_doc_elements(
                     !regions.iter().any(|r| r.overlap_area(tr) >= 0.5 * tr.area().min(r.area()).max(1.0))
                 });
                 tables.extend(found.tables);
+            }
+        }
+        // A raster belongs to a table only when exact ruled geometry gives it one and only
+        // one containing cell. Multi-cell plot rasters continue through figure arbitration;
+        // cell-contained assets are attached to the table and removed from standalone figure
+        // emission. The URI stays deferred behind the same page-local sentinel every other
+        // raster uses, while `asset` is a stable model/API reference.
+        let mut table_image_owned = vec![false; images.len()];
+        for (image_index, image) in images.iter_mut().enumerate() {
+            let (ixl, ixr, iyb, iyt) = dibox(image);
+            let rect = Rect::new(ixl, iyb, ixr, iyt);
+            let owners: Vec<(usize, usize, usize)> = tables
+                .iter()
+                .enumerate()
+                .filter_map(|(table_index, table)| {
+                    table
+                        .table
+                        .image_owner(rect)
+                        .map(|(row, col)| (table_index, row, col))
+                })
+                .collect();
+            let [(table_index, row, col)] = owners.as_slice() else {
+                continue;
+            };
+            let asset_key = image.asset_key;
+            let asset_ext = img::asset_extension(&image.uri);
+            let uri_index = img_uris.len();
+            if inline_images {
+                img_uris.push(std::mem::take(&mut image.uri));
+            } else {
+                img_uris.push(String::new());
+            }
+            let source = format!("\u{0}{uri_index}\u{0}");
+            let asset = format!("img/table_p{pno}_{asset_key:016x}.{asset_ext}");
+            let (display_x0, display_x1, display_y0, display_y1) =
+                turn.rect(pbox[0], pbox[2], pbox[1], pbox[3]);
+            let (display_w, display_h) =
+                (display_x1 - display_x0, display_y1 - display_y0);
+            let bbox_norm = (display_w > 0.0 && display_h > 0.0).then_some([
+                (rect.x0 - display_x0) / display_w,
+                1.0 - (rect.y1 - display_y0) / display_h,
+                (rect.x1 - display_x0) / display_w,
+                1.0 - (rect.y0 - display_y0) / display_h,
+            ]);
+            if tables[*table_index].table.attach_image(
+                *row,
+                *col,
+                crate::TableCellImage {
+                    asset,
+                    source: Some(source),
+                    bbox_norm,
+                    order: image_index as u32,
+                },
+            ) {
+                table_image_owned[image_index] = true;
             }
         }
         // Complete ruled continuation evidence against the FINAL accepted owner set. Caption
@@ -2326,7 +2385,10 @@ pub(crate) fn render_doc_elements(
                 let vr = Rect::new(vxl, vyb, vxr, vyt);
                 let varea = vr.area().max(1.0);
                 for (ii, im) in images.iter().enumerate() {
-                    if vec_owner[vi].is_some() || img_owner[ii].is_some() {
+                    if table_image_owned[ii]
+                        || vec_owner[vi].is_some()
+                        || img_owner[ii].is_some()
+                    {
                         continue;
                     }
                     let (ixl, ixr, iyb, iyt) = dibox(im);
@@ -2344,6 +2406,9 @@ pub(crate) fn render_doc_elements(
             }
         }
         for (j, im) in images.iter().enumerate() {
+            if table_image_owned[j] {
+                continue;
+            }
             let (_, _, _, iyt) = dibox(im);
             items.push(Item::Img(j));
             boxes.push((px0, px1, iyt - 1.0, iyt + 1.0)); // full-width separator
