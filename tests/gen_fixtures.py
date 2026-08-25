@@ -3568,6 +3568,14 @@ def gen_logo_rule_chain():
     """
     pdf = os.path.join(OUT, "logo_rule_chain.pdf")
     c = canvas.Canvas(pdf, pagesize=letter)
+    cell_words = [
+        ("Amber", "Birch", "Cedar", "Dahlia"),
+        ("Elm", "Flint", "Grove", "Harbor"),
+        ("Iris", "Jasper", "Kelp", "Linden"),
+        ("Maple", "Nectar", "Olive", "Pebble"),
+        ("Quartz", "Reed", "Sable", "Thyme"),
+        ("Umber", "Violet", "Willow", "Yarrow"),
+    ]
     for page in range(1, 7):
         c.setLineWidth(0.8)
         c.setStrokeColorRGB(0.1, 0.35, 0.65)
@@ -3588,10 +3596,11 @@ def gen_logo_rule_chain():
         for y in ys:
             c.line(xs[0], y, xs[-1], y)
         c.setFont("Helvetica", 8)
-        c.drawString(80, top - 16, f"A{page}")
-        c.drawString(284, top - 16, f"B{page}")
-        c.drawString(80, bottom + 6, f"C{page}")
-        c.drawString(284, bottom + 6, f"D{page}")
+        a, b, d, e = cell_words[page - 1]
+        c.drawString(80, top - 16, a)
+        c.drawString(284, top - 16, b)
+        c.drawString(80, bottom + 6, d)
+        c.drawString(284, bottom + 6, e)
         c.setFont("Helvetica", 10)
         c.drawString(72, 600, f"Body prose on logo-control page {page}.")
         c.showPage()

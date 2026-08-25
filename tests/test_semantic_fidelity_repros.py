@@ -70,7 +70,6 @@ def test_variable_footer_fixture_preserves_body_and_bottom_band_footnote():
     assert "Distinct body prose for synthetic page 12 remains visible." in visible
 
 
-@pytest.mark.xfail(strict=True, reason="logo curves borrow strong-figure extent from nearby rules")
 def test_running_logo_rule_chain_does_not_emit_figures():
     rendered = html("logo_rule_chain.pdf")
     assert rendered.count("<figure") == 0

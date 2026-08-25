@@ -2865,6 +2865,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn running_logo_rules_do_not_consume_neighboring_tables() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/logo_rule_chain.pdf");
+        let raw = std::fs::read(path).expect("fixture bytes");
+        let doc = Document::load(path).expect("fixture loads");
+        let html = to_html(
+            &crate::access::test_adapter_with_source(&doc, &raw),
+            Mode::Page,
+            false,
+            false,
+        );
+        assert_eq!(html.matches("<figure").count(), 0);
+        assert_eq!(html.matches("<table").count(), 6);
+    }
+
     /// `tests/fixtures_pdf/form_grid_prose.pdf` (see `gen_form_grid_prose`): five bold, short,
     /// heading-faced lines that are NOT headings — a mid-clause URL sentence, a table caption,
     /// a grid sub-label in the band above a table's top rule, a dot-leader form line and a

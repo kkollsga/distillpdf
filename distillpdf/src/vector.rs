@@ -1192,7 +1192,6 @@ fn positioned_vectors_capped(
     cap: usize,
 ) -> (Vec<PlacedSvg>, Vec<PlacedSvg>, PageRules) {
     let painted = painted_page(access, page_id, cap);
-    let rules = rules_of(&painted);
     // Paint order is stamped by the walk itself (`PaintSeq`, the operation's address in the
     // content tree) rather than re-derived from this vector's order here. The two are the
     // same ordering, but only the address is comparable with `img::positioned_images`'s
@@ -1208,7 +1207,9 @@ fn positioned_vectors_capped(
     // exactly as it was.
     let rot = crate::pdfobj::page_rotation(access, page_id);
     let page_w = page_width(access, page_id, rot);
-    let (strong, weak) = cluster_figures(painted, rot);
+    let page_box = crate::pdfobj::page_box(access, page_id);
+    let rules = rules_of(&painted);
+    let (strong, weak) = cluster_figures(painted, rot, page_box);
     let strong: Vec<PlacedSvg> = strong.iter().map(|c| build_svg(c, page_w, rot)).collect();
     let weak: Vec<PlacedSvg> = weak
         .iter()
@@ -1714,19 +1715,36 @@ type WeakCluster = (Vec<Painted>, bool);
 /// body pipeline reads a turned page upright (filed separately), the gate stands down on
 /// 90°/270° pages; upright pages, which is every page of every document that motivated the
 /// gate, are unaffected.
-fn cluster_figures(mut paths: Vec<Painted>, rot: i32) -> (Vec<Vec<Painted>>, Vec<WeakCluster>) {
+fn cluster_figures(
+    mut paths: Vec<Painted>,
+    rot: i32,
+    page_box: Option<[f32; 4]>,
+) -> (Vec<Vec<Painted>>, Vec<WeakCluster>) {
     // Drop full-page background fills (a single huge rectangle) up front.
     paths.retain(|p| !(p.x1 - p.x0 > 400.0 && p.y1 - p.y0 > 600.0 && p.segs.len() <= 5));
     if paths.is_empty() {
         return (Vec::new(), Vec::new());
     }
     paths.sort_by(|a, b| b.y1.partial_cmp(&a.y1).unwrap_or(std::cmp::Ordering::Equal));
+    let running_dividers: Vec<bool> = paths
+        .iter()
+        .map(|p| is_running_brand_divider(p, &paths, rot, page_box))
+        .collect();
     let mut clusters: Vec<Vec<Painted>> = Vec::new();
     let mut band_lo = f32::INFINITY; // current cluster's lowest y
-    for p in paths {
+    for (p, running_divider) in paths.into_iter().zip(running_dividers) {
         if let Some(cur) = clusters.last_mut() {
             if p.y1 >= band_lo - BAND_GAP {
-                band_lo = band_lo.min(p.y0);
+                // A running-brand divider is often less than BAND_GAP below a small logo
+                // and less than BAND_GAP above the first table rule. Letting that one thin,
+                // page-wide edge path lower the band joins all three into a figure-sized
+                // graphic-ink cluster. Keep the divider with the upper mark, but do not let
+                // it bridge onward into body content. Caption recovery still sees the
+                // resulting weak upper candidate; only unconditional strong promotion is
+                // prevented.
+                if !running_divider {
+                    band_lo = band_lo.min(p.y0);
+                }
                 cur.push(p);
                 continue;
             }
@@ -1760,6 +1778,53 @@ fn cluster_figures(mut paths: Vec<Painted>, rot: i32) -> (Vec<Vec<Painted>>, Vec
         c.sort_by(|a, b| a.seq.cmp(&b.seq));
     }
     (strong, weak)
+}
+
+/// A thin page-wide horizontal rule in the top or bottom band.
+///
+/// These rules are common companions to running logos and footer brands. They may belong to
+/// the adjacent weak vector candidate, but they must not extend its vertical clustering band
+/// into a nearby ruled table. The restriction to upright edge bands and 60% of page width
+/// avoids changing chart axes or interior separators.
+fn is_running_brand_divider(
+    p: &Painted,
+    painted: &[Painted],
+    rot: i32,
+    page_box: Option<[f32; 4]>,
+) -> bool {
+    if rot % 180 != 0 || has_graphic_ink(std::slice::from_ref(p)) {
+        return false;
+    }
+    let Some([px0, py0, px1, py1]) = page_box else {
+        return false;
+    };
+    let page_w = (px1 - px0).abs();
+    let page_h = (py1 - py0).abs();
+    if page_w <= 1.0 || page_h <= 1.0 {
+        return false;
+    }
+    let w = p.x1 - p.x0;
+    let h = p.y1 - p.y0;
+    let cy = (p.y0 + p.y1) * 0.5;
+    let in_edge_band = cy <= py0.min(py1) + page_h * 0.18
+        || cy >= py0.min(py1) + page_h * 0.82;
+    let divider_shape = w >= page_w * 0.60 && h <= 2.0 && in_edge_band;
+    divider_shape
+        && painted.iter().any(|q| {
+            if q.seq == p.seq || !has_graphic_ink(std::slice::from_ref(q)) {
+                return false;
+            }
+            let gap = if q.y0 >= p.y1 {
+                q.y0 - p.y1
+            } else if p.y0 >= q.y1 {
+                p.y0 - q.y1
+            } else {
+                0.0
+            };
+            let horizontally_related = q.x1 >= p.x0 && q.x0 <= p.x1;
+            let compact_mark = q.x1 - q.x0 < page_w * 0.30;
+            gap <= BAND_GAP && horizontally_related && compact_mark
+        })
 }
 
 fn fmt(v: f32) -> String {
@@ -2290,6 +2355,23 @@ mod tests {
         assert!(!has_graphic_ink(&[rule(0.0)]), "a flat rule is not graphic ink");
         assert!(!has_graphic_ink(&[rule(0.25)]), "a hairline off the grid is not a diagonal");
         assert!(has_graphic_ink(&[rule(6.0)]), "a genuine slant IS graphic ink");
+    }
+
+    #[test]
+    fn a_running_logo_cannot_borrow_figure_extent_through_its_divider() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/logo_rule_chain.pdf");
+        let doc = Document::load(path).expect("logo_rule_chain.pdf fixture must load");
+        for (page, page_id) in doc.get_pages() {
+            let (strong, _) = positioned_vectors(&test_adapter(&doc), page_id);
+            assert!(
+                strong.is_empty(),
+                "page {page} promoted running logo/table furniture as {:?}",
+                strong
+                    .iter()
+                    .map(|v| (v.x_left, v.x_right, v.y_bottom, v.y_top))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
