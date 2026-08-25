@@ -44,11 +44,27 @@ const MIN_GAP_FACTOR: f32 = 1.8;
 /// Row quantization: spans within the same 2 pt y-band are one row.
 const ROW_QUANT: f32 = 2.0;
 
-/// One detected chrome row: a y-bucket in the top or bottom band plus the masked texts
-/// that recur there. A span row is dropped only when BOTH match.
+#[derive(Default)]
+struct ChromeRow {
+    /// Whole joined keys that recur at this row.
+    whole: HashSet<String>,
+    /// Recurring horizontal chunks within an otherwise variable joined key.
+    chunks: HashSet<String>,
+}
+
+impl ChromeRow {
+    fn matches(&self, dspans: &[Span], members: &[usize]) -> bool {
+        self.whole.contains(&row_key(dspans, members))
+            || row_chunks(dspans, members).iter().any(|key| self.chunks.contains(key))
+    }
+}
+
+/// One detected chrome row: a y-bucket in the top or bottom band plus recurring whole
+/// texts or horizontal members. A span row is dropped only when position and one of those
+/// recurrence keys both match.
 #[derive(Default)]
 pub(crate) struct ChromePlan {
-    rows: HashMap<(bool, i32), HashSet<String>>,
+    rows: HashMap<(bool, i32), ChromeRow>,
     /// The masked header texts (top-band rows), for [`crate::profile::DocProfile`]'s
     /// `running_heads` and any consumer that wants the strings rather than the geometry.
     pub(crate) running_heads: HashSet<String>,
@@ -72,11 +88,10 @@ impl ChromePlan {
         }
         let mut drop: Vec<bool> = vec![false; dspans.len()];
         for (top, bucket, members) in band_rows(dspans, dbox) {
-            let key = row_key(dspans, &members);
             // ±1 bucket of jitter tolerance: quantization must not split a row whose
             // baseline drifts across a 2 pt boundary between pages.
             let banned = (bucket - 1..=bucket + 1)
-                .any(|q| self.rows.get(&(top, q)).is_some_and(|texts| texts.contains(&key)));
+                .any(|q| self.rows.get(&(top, q)).is_some_and(|row| row.matches(dspans, &members)));
             if banned {
                 for i in members {
                     drop[i] = true;
@@ -101,8 +116,13 @@ pub(crate) fn plan_chrome(
     if n_pages < MIN_PAGES {
         return ChromePlan::default();
     }
-    // (band, bucket) → masked text → distinct pages seen on.
-    let mut seen: HashMap<(bool, i32), HashMap<String, HashSet<u32>>> = HashMap::new();
+    #[derive(Default)]
+    struct SeenRow {
+        whole: HashMap<String, HashSet<u32>>,
+        chunks: HashMap<String, HashSet<u32>>,
+    }
+    // (band, bucket) → whole/chunk recurrence keys → distinct pages seen on.
+    let mut seen: HashMap<(bool, i32), SeenRow> = HashMap::new();
     for (pno, pid, spans) in page_spans {
         let page_box = crate::pdfobj::page_box(access, *pid).unwrap_or([
             0.0,
@@ -126,37 +146,48 @@ pub(crate) fn plan_chrome(
             if !isolated(dspans, top, &members) {
                 continue; // at line spacing from the body / a table: content, not chrome
             }
-            seen.entry((top, bucket))
-                .or_default()
-                .entry(row_key(dspans, &members))
-                .or_default()
-                .insert(*pno);
+            let row = seen.entry((top, bucket)).or_default();
+            row.whole.entry(row_key(dspans, &members)).or_default().insert(*pno);
+            for chunk in row_chunks(dspans, &members) {
+                row.chunks.entry(chunk).or_default().insert(*pno);
+            }
         }
     }
     let mut plan = ChromePlan::default();
-    for ((top, bucket), texts) in seen {
-        let covered: HashSet<&u32> = texts.values().flatten().collect();
+    for ((top, bucket), seen_row) in seen {
+        let covered: HashSet<&u32> = seen_row.whole.values().flatten().collect();
         let pages = covered.len();
         if pages < MIN_PAGES || (pages as f32) < MIN_COVERAGE * n_pages as f32 {
             continue;
         }
-        if texts.len() as f32 > MAX_DIVERSITY * pages as f32 {
+        if seen_row.whole.len() as f32 > MAX_DIVERSITY * pages as f32 {
             continue; // a busy body row, not chrome: different text every page
         }
-        // Ban only the texts that themselves recur — a one-off line that happens to sit
-        // on a chrome row (a footnote beside the page number's y) survives.
-        let recurring: HashSet<String> = texts
+        // Whole keys keep the original precision rule. A recurring horizontal chunk (for
+        // example "Page # of #") also proves a variable compound row whose section-title
+        // prefix appears only once. Chunk recurrence uses the document chrome floor rather
+        // than the two-page whole-key floor so ordinary repeated words cannot qualify it.
+        let whole: HashSet<String> = seen_row
+            .whole
             .into_iter()
             .filter(|(_, pages)| pages.len() >= 2)
             .map(|(t, _)| t)
             .collect();
-        if recurring.is_empty() {
+        let chunks: HashSet<String> = seen_row
+            .chunks
+            .into_iter()
+            .filter(|(_, pages)| pages.len() >= MIN_PAGES)
+            .map(|(t, _)| t)
+            .collect();
+        if whole.is_empty() && chunks.is_empty() {
             continue;
         }
         if top {
-            plan.running_heads.extend(recurring.iter().cloned());
+            for value in &whole {
+                plan.running_heads.insert(String::from(value.as_str()));
+            }
         }
-        plan.rows.insert((top, bucket), recurring);
+        plan.rows.insert((top, bucket), ChromeRow { whole, chunks });
     }
     plan
 }
@@ -232,8 +263,7 @@ fn band_rows(dspans: &[Span], dbox: (f32, f32, f32, f32)) -> Vec<(bool, i32, Vec
 /// A row's recurrence key: member texts joined in x order, lowercased, whitespace
 /// collapsed, every digit RUN masked to one `#` — so "Page 12 of 340" and
 /// "Page 9 of 340" (and "5 Geology 47 of 172" / "6 Reservoir 58 of 172") coincide.
-fn row_key(dspans: &[Span], members: &[usize]) -> String {
-    let joined = members.iter().map(|&i| dspans[i].text.as_str()).collect::<Vec<_>>().join(" ");
+fn normalized_key(joined: &str) -> String {
     let mut out = String::with_capacity(joined.len());
     let mut in_digits = false;
     let mut in_space = false;
@@ -262,6 +292,47 @@ fn row_key(dspans: &[Span], members: &[usize]) -> String {
         }
     }
     out
+}
+
+fn row_key(dspans: &[Span], members: &[usize]) -> String {
+    let joined = members.iter().map(|&i| dspans[i].text.as_str()).collect::<Vec<_>>().join(" ");
+    normalized_key(&joined)
+}
+
+/// Split one row at authored horizontal gaps, preserving word-level spans inside each
+/// component. This exposes a stable page-number tail without treating generic individual
+/// words or digit glyphs as recurrence evidence.
+fn row_chunks(dspans: &[Span], members: &[usize]) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut previous_end: Option<f32> = None;
+    let mut previous_size = 0.0f32;
+    for &i in members {
+        let span = &dspans[i];
+        let width = if span.width > 0.1 {
+            span.width
+        } else {
+            span.text.chars().count() as f32 * span.size * 0.5
+        };
+        let separated = previous_end.is_some_and(|end| {
+            span.x - end > span.size.max(previous_size).max(1.0) * 1.5
+        });
+        if separated && !current.is_empty() {
+            chunks.push(normalized_key(&current));
+            current.clear();
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(span.text.trim());
+        previous_end = Some(span.x + width);
+        previous_size = span.size;
+    }
+    if !current.is_empty() {
+        chunks.push(normalized_key(&current));
+    }
+    chunks.retain(|key| !key.is_empty());
+    chunks
 }
 
 #[cfg(test)]
@@ -294,5 +365,42 @@ mod tests {
         let b = spans(&["Page", "9", "of", "340"]);
         assert_eq!(row_key(&a, &[0]), "page # of #");
         assert_eq!(row_key(&b, &[0, 1, 2, 3]), "page # of #");
+    }
+
+    #[test]
+    fn recurring_page_tail_matches_a_unique_compound_footer() {
+        let values = [
+            (72.0, 70.0, "Single Page Appendix"),
+            (430.0, 22.0, "Page"),
+            (455.0, 10.0, "12"),
+            (468.0, 8.0, "of"),
+            (479.0, 10.0, "12"),
+        ];
+        let spans: Vec<Span> = values
+            .iter()
+            .enumerate()
+            .map(|(i, (x, width, value))| Span {
+                x: *x,
+                y: 50.0,
+                size: 8.0,
+                width: *width,
+                text: (*value).into(),
+                bold: false,
+                italic: false,
+                mono: false,
+                angle: 0.0,
+                font: 0,
+                mcid: None,
+                source: crate::text::SourceSlice::test_occurrence(i as u32, value.len()),
+            })
+            .collect();
+        let members = [0, 1, 2, 3, 4];
+        assert_eq!(row_chunks(&spans, &members), ["single page appendix", "page # of #"]);
+
+        let row = ChromeRow {
+            whole: HashSet::new(),
+            chunks: HashSet::from(["page # of #".into()]),
+        };
+        assert!(row.matches(&spans, &members));
     }
 }

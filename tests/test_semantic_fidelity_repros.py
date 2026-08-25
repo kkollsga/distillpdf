@@ -53,7 +53,6 @@ def test_detached_marker_fixture_preserves_true_columns_and_following_prose():
     assert positions == sorted(positions)
 
 
-@pytest.mark.xfail(strict=True, reason="whole-row recurrence spares the singleton footer key")
 def test_variable_prefix_footer_is_removed_by_its_recurring_tail():
     rendered = html("variable_footer_chrome.pdf")
     visible = text(rendered)

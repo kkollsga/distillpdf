@@ -30,9 +30,6 @@
     "direct-backend-method|ec407b8c82f3d7d61e37ee1ab3a83f3ed3127db63af4d0110dab072a73c82f5b|self . document . get_pages ()",
     "direct-backend-method|f2fff51a7156922e31f1d021c6f3d238b59ad5606f0e51d7b00d5323fa17cc08|self . document . get_page_resources (page)"
   ],
-  "chrome.rs": [
-    "clone-call|037dbdbc23c038e55f3bb84d1d4d46a09860eb3b96b1147fe3af449603abc262|recurring . iter () . cloned ()"
-  ],
   "doc.rs": [
     "clone-call|08acfd2955c2da32ae9559bac1af73bbf38189fe2c2f09488857530ba3fa3b1a|Arc :: clone (& diagnostics)",
     "clone-call|08acfd2955c2da32ae9559bac1af73bbf38189fe2c2f09488857530ba3fa3b1a|Arc :: clone (& diagnostics)",

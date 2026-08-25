@@ -3549,7 +3549,7 @@ def gen_variable_footer_chrome():
         c.drawString(72, 50, section)
         c.drawRightString(540, 50, f"Page {i} of {len(sections)}")
         if i == 7:
-            c.drawString(72, 64, "One-off bottom-band footnote must survive.")
+            c.drawString(72, 66, "One-off bottom-band footnote must survive.")
         c.showPage()
     c.save()
     GT["variable_footer_chrome.pdf"] = {
