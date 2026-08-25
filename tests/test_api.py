@@ -403,6 +403,7 @@ def test_analyze_tables_surface_and_document_delegation():
         anchors = {(cell["row"], cell["col"]) for cell in table["cells"]}
         for cell in table["cells"]:
             assert set(cell) == cell_keys
+            assert "content" not in cell
             assert cell["rowspan"] >= 1 and cell["colspan"] >= 1
             assert cell["role"] in {"header", "data"}
             assert all(tuple(anchor) in anchors for anchor in cell["header_path"])

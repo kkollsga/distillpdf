@@ -168,7 +168,8 @@ pub use model::{AssetProfile, DocModel};
 // crate-private modules) without exposing the modules' internal helper fns.
 pub use extract::{FontInfo, ImageInfo, TableInfo};
 pub use table::{
-    AnalyzedCaption, AnalyzedCell, AnalyzedTable, TableCellRole, TableEvidence,
+    AnalyzedCaption, AnalyzedCell, AnalyzedTable, TableCellContent, TableCellImage,
+    TableCellRole, TableEvidence,
 };
 pub use frontmatter::{Author, FrontMatter};
 pub use html::Mode;

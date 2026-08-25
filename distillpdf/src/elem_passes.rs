@@ -272,12 +272,12 @@ fn map_inline_html(e: &mut PageElement, f: impl Fn(&str) -> String) {
         Table(table) => {
             for row in table.header.iter_mut() {
                 for cell in row.iter_mut() {
-                    cell.text = f(&cell.text);
+                    cell.content.text = f(&cell.content.text);
                 }
             }
             for row in table.grid.iter_mut() {
                 for cell in row.iter_mut() {
-                    cell.text = f(&cell.text);
+                    cell.content.text = f(&cell.content.text);
                 }
             }
             if let Some(caption) = &mut table.caption {

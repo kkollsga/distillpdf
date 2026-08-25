@@ -323,6 +323,7 @@ mod tests {
             table_header_rows: None,
             table_proven_leading_tier: None,
             table_grid: None,
+            table_cell_content: None,
             table_caption: None,
             el_html: None,
         }];
@@ -439,6 +440,7 @@ mod tests {
             table_header_rows: None,
             table_proven_leading_tier: None,
             table_grid: None,
+            table_cell_content: None,
             table_caption: None,
             el_html: None,
         });

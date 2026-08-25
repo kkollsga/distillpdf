@@ -136,6 +136,9 @@ fn elements_from_blocks(blocks: &[&Block]) -> Vec<PageElement> {
                 if b.table_proven_leading_tier == Some(true) {
                     table.restore_proven_leading_tier();
                 }
+                if let Some(content) = b.table_cell_content.clone() {
+                    table.restore_content(content);
+                }
                 if let Some(fidelity_html) = b.el_html.clone() {
                     table.restore_fidelity_html(fidelity_html);
                 }
@@ -370,6 +373,7 @@ mod tests {
             table_header_rows: None,
             table_proven_leading_tier: None,
             table_grid: None,
+            table_cell_content: None,
             table_caption: None,
             el_html: None,
         }
@@ -431,11 +435,47 @@ mod tests {
         };
         let json = serde_json::to_value(&legacy).unwrap();
         assert!(json.get("table_header_rows").is_none(), "None stays absent for old models");
+        assert!(json.get("table_cell_content").is_none(), "additive cell content stays absent");
         let legacy: Block = serde_json::from_value(json).unwrap();
         assert_eq!(legacy.table_header_rows, None);
         let html = render_html(&model_with_blocks(1, vec![legacy]), Mode::Page, false);
         assert!(html.contains("<th scope=\"colgroup\" colspan=\"2\">Group</th>"));
         assert!(html.contains("<td>A</td><td>B</td>"));
+    }
+
+    #[test]
+    fn structured_table_cell_content_renders_text_and_asset_in_html_and_markdown() {
+        let table = Block {
+            table_header: Some(Vec::new()),
+            table_header_rows: Some(0),
+            table_grid: Some(vec![vec!["Alpha".into(), "Beta".into()]]),
+            table_cell_content: Some(vec![vec![
+                crate::TableCellContent {
+                    text: "Alpha".into(),
+                    images: vec![crate::TableCellImage {
+                        asset: "img/cell_alpha.png".into(),
+                        bbox_norm: Some([0.1, 0.2, 0.3, 0.4]),
+                        order: 1,
+                    }],
+                },
+                crate::TableCellContent { text: "Beta".into(), images: Vec::new() },
+            ]]),
+            ..blk("b0001", BlockKind::Table, 1, "")
+        };
+        let model = model_with_blocks(1, vec![table]);
+        let encoded = serde_json::to_vec(&model).unwrap();
+        assert!(String::from_utf8_lossy(&encoded).contains("table_cell_content"));
+        let model: DocModel = serde_json::from_slice(&encoded).unwrap();
+        let html = render_html(&model, Mode::Page, false);
+        assert!(html.contains(
+            "<td>Alpha<img src=\"img/cell_alpha.png\" data-dpdf-cell-image /></td>"
+        ));
+        assert!(html.contains("<td>Beta</td>"));
+        let (markdown, _) = render_markdown(&model, Mode::Page, false, "embed").unwrap();
+        assert!(
+            markdown.contains("Alpha") && markdown.contains("img/cell_alpha.png"),
+            "{markdown}"
+        );
     }
 
     #[test]

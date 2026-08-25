@@ -358,6 +358,10 @@ pub struct Block {
     /// A `kind = table`'s data grid (without the detached header rows), for faithful re-emit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_grid: Option<Vec<Vec<String>>>,
+    /// Additive text+raster content for table cells. Absent on legacy/text-only models;
+    /// rows follow `table_header + table_grid` without expanding colspans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_cell_content: Option<Vec<Vec<crate::TableCellContent>>>,
     /// A `kind = table`'s caption as `(number, inner-html, below)` — the renderer's
     /// `<caption>` parts (separate from the plain-text `caption` query field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -728,6 +732,7 @@ mod tests {
             table_header_rows: None,
             table_proven_leading_tier: None,
             table_grid: None,
+            table_cell_content: None,
             table_caption: None,
             el_html: None,
         }

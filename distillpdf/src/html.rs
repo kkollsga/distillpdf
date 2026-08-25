@@ -676,7 +676,14 @@ fn table_html(table: &TableAnalysis) -> String {
             if rowspan > 1 {
                 attrs.push_str(&format!(" rowspan=\"{rowspan}\""));
             }
-            tbl.push_str(&format!("<{tag}{attrs}>{}</{tag}>", esc(cell.text.trim())));
+            tbl.push_str(&format!("<{tag}{attrs}>{}", esc(cell.content.text.trim())));
+            for image in &cell.content.images {
+                tbl.push_str(&format!(
+                    "<img src=\"{}\" data-dpdf-cell-image />",
+                    crate::textutil::esc_attr(&image.asset)
+                ));
+            }
+            tbl.push_str(&format!("</{tag}>"));
         }
         tbl.push_str("</tr>");
     };

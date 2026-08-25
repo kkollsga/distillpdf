@@ -709,6 +709,7 @@ fn project_blocks(
                     b.table_proven_leading_tier =
                         table.has_proven_leading_tier().then_some(true);
                     b.table_grid = Some(table.grid_parts());
+                    b.table_cell_content = table.has_cell_images().then(|| table.content_parts());
                     b.table_caption = table.caption.as_ref().map(|caption| {
                         let n = deduped_tab.as_deref().map(strip_tab_prefix).unwrap_or_else(|| caption.number.clone());
                         (n, caption.html.clone(), caption.below)
@@ -827,6 +828,7 @@ fn mk_block(id: String, kind: BlockKind, text: String, page: u32, bbox: Option<B
         table_header_rows: None,
         table_proven_leading_tier: None,
         table_grid: None,
+        table_cell_content: None,
         table_caption: None,
         el_html: None,
     }

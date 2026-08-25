@@ -211,6 +211,20 @@ impl Pdf {
             for cell in table.cells {
                 let c = PyDict::new(py);
                 c.set_item("text", cell.text)?;
+                if !cell.content.images.is_empty() {
+                    let content = PyDict::new(py);
+                    content.set_item("text", &cell.content.text)?;
+                    let content_images = PyList::empty(py);
+                    for image in cell.content.images {
+                        let entry = PyDict::new(py);
+                        entry.set_item("asset", image.asset)?;
+                        entry.set_item("bbox_norm", image.bbox_norm.map(|bbox| bbox.to_vec()))?;
+                        entry.set_item("order", image.order)?;
+                        content_images.append(entry)?;
+                    }
+                    content.set_item("images", content_images)?;
+                    c.set_item("content", content)?;
+                }
                 c.set_item("row", cell.row)?;
                 c.set_item("col", cell.col)?;
                 c.set_item("rowspan", cell.rowspan)?;

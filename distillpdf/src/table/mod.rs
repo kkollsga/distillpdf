@@ -1,13 +1,14 @@
 //! Canonical in-memory table analysis shared by the born-digital detector, render IR and
 //! durable-model projection.
 //!
-//! This is deliberately private and deliberately not a wire type.  The public legacy raw
-//! extraction remains [`crate::TableInfo`], while the `.dpdf` model keeps its existing
-//! `table_header` / `table_grid` fields.  Those surfaces are projections of this analysis,
+//! The analysis itself remains private. Public raw extraction keeps its legacy string grid,
+//! while `.dpdf` retains `table_header` / `table_grid` and adds optional structured cell
+//! content only when a cell owns a raster. Those surfaces are projections of this analysis,
 //! not parallel interpretations of a table.
 
 use crate::geom::{PageTurn, Rect};
 use crate::text::{SourceSlice, Span};
+use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
 /// One table reported by [`crate::PdfDocument::analyze_tables`].
@@ -42,6 +43,8 @@ pub struct AnalyzedTable {
 #[non_exhaustive]
 pub struct AnalyzedCell {
     pub text: String,
+    /// Structured content retained alongside the legacy text projection.
+    pub content: TableCellContent,
     pub row: usize,
     pub col: usize,
     pub rowspan: usize,
@@ -53,6 +56,32 @@ pub struct AnalyzedCell {
     /// Header anchor coordinates `[row, col]`, outermost to innermost, whose spans cover this
     /// data cell's column. Empty for header cells and zero-header tables.
     pub header_path: Vec<[usize; 2]>,
+}
+
+/// One raster owned by a semantic table cell.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TableCellImage {
+    /// Durable asset reference (`img/…`) or a renderer-local deferred image sentinel.
+    pub asset: String,
+    /// Placement within the displayed page as `[left, top, right, bottom]`, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bbox_norm: Option<[f32; 4]>,
+    /// Paint order among the cell's components.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub order: u32,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+/// Text plus zero or more cell-owned rasters, shared by analysis, render IR and `.dpdf`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TableCellContent {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<TableCellImage>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,7 +102,7 @@ pub struct AnalyzedCaption {
 /// promoting it into an invented cell boundary.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CellAnalysis {
-    pub(crate) text: String,
+    pub(crate) content: TableCellContent,
     pub(crate) row: usize,
     pub(crate) col: usize,
     pub(crate) rowspan: usize,
@@ -119,7 +148,7 @@ impl CellAnalysis {
         bbox: Option<Rect>,
     ) -> Self {
         Self {
-            text,
+            content: TableCellContent { text, images: Vec::new() },
             row,
             col,
             rowspan,
@@ -142,7 +171,7 @@ impl CellAnalysis {
         content_bbox: Option<Rect>,
     ) -> Self {
         Self {
-            text,
+            content: TableCellContent { text, images: Vec::new() },
             row,
             col,
             rowspan,
@@ -157,7 +186,7 @@ impl CellAnalysis {
 
     pub(crate) fn covered(row: usize, col: usize) -> Self {
         Self {
-            text: String::new(),
+            content: TableCellContent::default(),
             row,
             col,
             rowspan: 1,
@@ -172,30 +201,30 @@ impl CellAnalysis {
 
     #[cfg(test)]
     pub(crate) fn trim(&self) -> &str {
-        self.text.trim()
+        self.content.text.trim()
     }
 
     #[cfg(test)]
     pub(crate) fn contains(&self, pattern: &str) -> bool {
-        self.text.contains(pattern)
+        self.content.text.contains(pattern)
     }
 }
 
 impl PartialEq<&str> for CellAnalysis {
     fn eq(&self, other: &&str) -> bool {
-        self.text == *other
+        self.content.text == *other
     }
 }
 
 impl PartialEq<String> for CellAnalysis {
     fn eq(&self, other: &String) -> bool {
-        self.text == *other
+        self.content.text == *other
     }
 }
 
 impl PartialEq<(String, usize)> for CellAnalysis {
     fn eq(&self, other: &(String, usize)) -> bool {
-        self.text == other.0 && self.render_colspan == other.1
+        self.content.text == other.0 && self.render_colspan == other.1
     }
 }
 
@@ -416,7 +445,7 @@ impl TableAnalysis {
             || top_anchor_styled.len() != width
             || !is_dense_header_row(top, 0)
             || !is_dense_header_row(leaves, 1)
-            || leaves.iter().any(|cell| cell.text.trim().is_empty())
+            || leaves.iter().any(|cell| cell.content.text.trim().is_empty())
         {
             return;
         }
@@ -424,7 +453,7 @@ impl TableAnalysis {
         let starts: Vec<usize> = top
             .iter()
             .enumerate()
-            .filter_map(|(col, cell)| (!cell.text.trim().is_empty()).then_some(col))
+            .filter_map(|(col, cell)| (!cell.content.text.trim().is_empty()).then_some(col))
             .collect();
         if starts.len() < 2 || starts[0] != 0 {
             return;
@@ -534,7 +563,11 @@ impl TableAnalysis {
                     && cell.render_colspan == 1
                     && !cell.covered
             }))
-        .then(|| row.iter().map(|cell| (cell.text.as_str(), cell.rowspan, cell.colspan)).collect())
+        .then(|| {
+            row.iter()
+                .map(|cell| (cell.content.text.as_str(), cell.rowspan, cell.colspan))
+                .collect()
+        })
     }
 
     /// Merge one already-proven fragment. The proof decides whether the leading row is a
@@ -646,7 +679,7 @@ impl TableAnalysis {
             .iter()
             .map(|row| {
                 row.iter()
-                    .map(|cell| (cell.text.clone(), cell.render_colspan))
+                    .map(|cell| (cell.content.text.clone(), cell.render_colspan))
                     .collect()
             })
             .collect()
@@ -656,8 +689,42 @@ impl TableAnalysis {
     pub(crate) fn grid_parts(&self) -> Vec<Vec<String>> {
         self.grid
             .iter()
-            .map(|row| row.iter().map(|cell| cell.text.clone()).collect())
+            .map(|row| row.iter().map(|cell| cell.content.text.clone()).collect())
             .collect()
+    }
+
+    /// Structured per-cell content in the same detached-header + grid row shape.
+    pub(crate) fn content_parts(&self) -> Vec<Vec<TableCellContent>> {
+        self.header
+            .iter()
+            .chain(&self.grid)
+            .map(|row| row.iter().map(|cell| cell.content.clone()).collect())
+            .collect()
+    }
+
+    pub(crate) fn has_cell_images(&self) -> bool {
+        self.header
+            .iter()
+            .chain(&self.grid)
+            .flatten()
+            .any(|cell| !cell.content.images.is_empty())
+    }
+
+    /// Restore additive structured content onto a table reconstructed from legacy text parts.
+    /// Shape mismatches degrade cell-by-cell and never erase the legacy text projection.
+    pub(crate) fn restore_content(&mut self, rows: Vec<Vec<TableCellContent>>) {
+        for (cell, mut content) in self
+            .header
+            .iter_mut()
+            .chain(&mut self.grid)
+            .zip(rows)
+            .flat_map(|(cells, contents)| cells.iter_mut().zip(contents))
+        {
+            if content.text.is_empty() && !cell.content.text.is_empty() {
+                content.text = std::mem::take(&mut cell.content.text);
+            }
+            cell.content = content;
+        }
     }
 
     pub(crate) fn has_semantic_spans(&self) -> bool {
@@ -676,14 +743,14 @@ impl TableAnalysis {
             let mut row = Vec::with_capacity(width);
             for cell in hrow {
                 for _ in 0..cell.render_colspan.max(1) {
-                    row.push(cell.text.trim().to_string());
+                    row.push(cell.content.text.trim().to_string());
                 }
             }
             rows.push(row);
         }
         rows.extend(self.grid.iter().map(|row| {
             row.iter()
-                .map(|cell| cell.text.trim().to_string())
+                .map(|cell| cell.content.text.trim().to_string())
                 .collect()
         }));
         rows
@@ -700,7 +767,7 @@ impl TableAnalysis {
                 let width = header.iter().map(|cell| cell.render_colspan.max(1)).sum();
                 let mut row = Vec::with_capacity(width);
                 for cell in header {
-                    row.push(cell.text);
+                    row.push(cell.content.text);
                     row.extend(std::iter::repeat_n(
                         String::new(),
                         cell.render_colspan.max(1) - 1,
@@ -711,7 +778,7 @@ impl TableAnalysis {
         }
         rows.extend(self.grid
             .into_iter()
-            .map(|row| row.into_iter().map(|cell| cell.text).collect()));
+            .map(|row| row.into_iter().map(|cell| cell.content.text).collect()));
         rows
     }
 
@@ -905,7 +972,8 @@ impl PositionedTableAnalysis {
             .flatten()
             .filter(|cell| !cell.covered)
             .map(|cell| AnalyzedCell {
-                text: cell.text.clone(),
+                text: cell.content.text.clone(),
+                content: cell.content.clone(),
                 row: cell.row,
                 col: cell.col,
                 rowspan: cell.rowspan.max(1),
@@ -1230,6 +1298,42 @@ mod tests {
     }
 
     #[test]
+    fn additive_cell_content_preserves_legacy_text_and_public_image_metadata() {
+        let mut table = TableAnalysis::from_parts(
+            Vec::new(),
+            vec![vec!["Alpha".into(), "Beta".into()]],
+            0,
+            None,
+            vec![TableEvidence::Ruled],
+        );
+        table.restore_content(vec![vec![
+            TableCellContent {
+                text: String::new(),
+                images: vec![TableCellImage {
+                    asset: "img/alpha.png".into(),
+                    bbox_norm: Some([0.1, 0.2, 0.3, 0.4]),
+                    order: 2,
+                }],
+            },
+            TableCellContent { text: "Beta".into(), images: Vec::new() },
+        ]]);
+        assert_eq!(table.grid_parts(), vec![vec!["Alpha".to_string(), "Beta".to_string()]]);
+        assert!(table.has_cell_images());
+
+        let public = PositionedTableAnalysis {
+            bbox: Rect::new(0.0, 0.0, 10.0, 10.0),
+            table,
+            key: CandidateKey::synthetic(),
+            claim: TableClaim::default(),
+        }
+        .into_public(1, |r| Some([r.x0, r.y1, r.x1, r.y0]));
+        assert_eq!(public.cells[0].text, "Alpha");
+        assert_eq!(public.cells[0].content.text, "Alpha");
+        assert_eq!(public.cells[0].content.images[0].asset, "img/alpha.png");
+        assert!(public.cells[1].content.images.is_empty());
+    }
+
+    #[test]
     fn query_cells_expand_colspans_and_trim_exactly_once() {
         let table = TableAnalysis::from_parts(
             vec![vec![(" Group ".into(), 2), (" Tail ".into(), 0)]],
@@ -1401,7 +1505,7 @@ mod tests {
                 .cells
                 .iter()
                 .filter(|cell| cell.row == 0)
-                .map(|cell| (cell.col, cell.colspan, cell.text.as_str()))
+                .map(|cell| (cell.col, cell.colspan, cell.content.text.as_str()))
                 .collect::<Vec<_>>(),
             vec![(0, 3, "Group A"), (3, 3, "Group B")]
         );

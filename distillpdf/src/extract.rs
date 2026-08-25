@@ -1770,7 +1770,7 @@ fn prove_ruled_leading_tier(
         || aligned_leaves
             .iter()
             .zip(base_grid.first()?)
-            .any(|(cell, text)| cell.text.trim() != text.trim())
+            .any(|(cell, text)| cell.content.text.trim() != text.trim())
     {
         return None;
     }
@@ -1873,10 +1873,10 @@ fn prove_ruled_leading_tier(
         let anchor = &aligned_top[group.start];
         if anchor.covered
             || anchor.colspan != group.end - group.start
-            || anchor.text.trim() != cell.text.trim()
+            || anchor.content.text.trim() != cell.content.text.trim()
             || aligned_top[group.start + 1..group.end]
                 .iter()
-                .any(|slot| !slot.covered || !slot.text.trim().is_empty())
+                .any(|slot| !slot.covered || !slot.content.text.trim().is_empty())
         {
             return None;
         }
@@ -3867,12 +3867,21 @@ mod tests {
             assert_eq!(table.table.header_rows, 1, "{name}");
             assert_eq!((table.table.grid.len(), table.table.grid[0].len()), (5, 4), "{name}");
             assert_eq!(
-                table.table.grid[0].iter().map(|cell| cell.text.as_str()).collect::<Vec<_>>(),
+                table
+                    .table
+                    .grid[0]
+                    .iter()
+                    .map(|cell| cell.content.text.as_str())
+                    .collect::<Vec<_>>(),
                 vec!["Model", "Params", "BLEU", "Notes"],
                 "{name}"
             );
             for (row, expected_note) in ["seed 0", "seed 1", "seed 2", "seed 3"].iter().enumerate() {
-                assert_eq!(table.table.grid[row + 1][3].text, *expected_note, "{name} row {row}");
+                assert_eq!(
+                    table.table.grid[row + 1][3].content.text,
+                    *expected_note,
+                    "{name} row {row}"
+                );
             }
             assert_eq!(table.claim.row_count(), 5, "{name}");
             assert!(
@@ -3939,8 +3948,8 @@ mod tests {
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].table.evidence, vec![TableEvidence::Aligned, TableEvidence::Ruled]);
         assert_eq!((tables[0].table.grid.len(), tables[0].table.grid[0].len()), (2, 3));
-        assert_eq!(tables[0].table.grid[0][2].text, "Rate Note");
-        assert_eq!(tables[0].table.grid[1][2].text, "4.2 seed");
+        assert_eq!(tables[0].table.grid[0][2].content.text, "Rate Note");
+        assert_eq!(tables[0].table.grid[1][2].content.text, "4.2 seed");
         assert_eq!(tables[0].claim.len(), 8);
     }
 
@@ -5033,7 +5042,16 @@ mod tests {
             .chain(&t.grid)
             .flatten()
             .filter(|cell| !cell.covered)
-            .map(|cell| (cell.text.as_str(), cell.row, cell.col, cell.rowspan, cell.colspan, cell.role))
+            .map(|cell| {
+                (
+                    cell.content.text.as_str(),
+                    cell.row,
+                    cell.col,
+                    cell.rowspan,
+                    cell.colspan,
+                    cell.role,
+                )
+            })
             .collect();
         assert_eq!(
             anchors,
@@ -5209,7 +5227,15 @@ mod tests {
         assert_eq!(
             table.table.header[0]
                 .iter()
-                .map(|cell| (cell.text.as_str(), cell.row, cell.col, cell.colspan, cell.role))
+                .map(|cell| {
+                    (
+                        cell.content.text.as_str(),
+                        cell.row,
+                        cell.col,
+                        cell.colspan,
+                        cell.role,
+                    )
+                })
                 .collect::<Vec<_>>(),
             vec![
                 ("Geochemistry", 0, 0, 3, CellRole::Header),
@@ -5226,7 +5252,7 @@ mod tests {
             for (old, new) in prior_row.iter().zip(shifted_row) {
                 assert_eq!(new.row, old.row + 1);
                 assert_eq!(new.col, old.col);
-                assert_eq!(new.text, old.text);
+                assert_eq!(new.content.text, old.content.text);
                 assert_eq!(new.bbox, old.bbox);
                 assert_eq!(new.content_bbox, old.content_bbox);
                 assert_eq!(new.rowspan, old.rowspan);
@@ -5464,7 +5490,7 @@ mod tests {
         assert_no_tier(wrong_leading_mapping, &upright, false, 2);
 
         let mut same_shape_impostor = aligned.clone();
-        same_shape_impostor.table.grid[0][0].text = "Impostor".into();
+        same_shape_impostor.table.grid[0][0].content.text = "Impostor".into();
         assert_no_tier(same_shape_impostor, &upright, false, 2);
 
         let band = frame.abutting_band.as_ref().expect("target band");
