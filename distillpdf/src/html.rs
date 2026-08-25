@@ -1802,6 +1802,14 @@ pub(crate) fn render_doc_elements(
                 y <= t.bbox.y1 + body && y >= t.bbox.y0 - body && x1 > t.bbox.x0 && x0 < t.bbox.x1
             })
         };
+        // Caption recognition must see a label just outside the drawn frame even though the
+        // broader body-sized ownership band consumes ordinary grid residue. A label whose
+        // baseline is actually inside the frame remains table content, never a caption.
+        let inside_table_frame = |x0: f32, x1: f32, y: f32| {
+            tables.iter().any(|t| {
+                y <= t.bbox.y1 && y >= t.bbox.y0 && x1 > t.bbox.x0 && x0 < t.bbox.x1
+            })
+        };
         // A vector figure's bbox — used to attach its labels and to keep that text
         // out of the body flow (it belongs to the figure, not the prose).
         let fig_boxes: Vec<(f32, f32, f32, f32)> = vectors.iter().map(&dvbox).collect();
@@ -2126,14 +2134,18 @@ pub(crate) fn render_doc_elements(
         let cap_lines: Vec<(usize, bool, String)> = lines
             .iter()
             .enumerate()
-            .filter(|(_, l)| !in_table(l.x0, l.x1, l.y))
             .filter_map(|(idx, l)| {
                 let t = l.text();
                 caption_label(&t).and_then(|(f, n)| {
                     // Drop multi-page "Figure N—Continued" markers — re-emitting them would
                     // duplicate the original figure's id and pollute the output with empty
                     // continuation captions.
-                    (!is_ref_continuation(idx) && !is_inline_xref(&t) && !caption_is_continued(&t) && !is_dotleader_toc(&lines, idx)).then_some((idx, f, n))
+                    (!inside_table_frame(l.x0, l.x1, l.y)
+                        && !is_ref_continuation(idx)
+                        && !is_inline_xref(&t)
+                        && !caption_is_continued(&t)
+                        && !is_dotleader_toc(&lines, idx))
+                        .then_some((idx, f, n))
                 })
             })
             .collect();

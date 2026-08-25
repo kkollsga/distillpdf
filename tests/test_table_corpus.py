@@ -1326,7 +1326,7 @@ def test_phase7_crosspage_fixture_truth_and_provenance_are_exact():
 # title and their tables carried no anchor at all.
 CROSSPAGE_NEGATIVE_TABLE_TAGS = {
     "t3_crosspage_independent_geometry.pdf": ["<table>", "<table>"],
-    "t3_crosspage_independent_caption.pdf": ['<table id="tab-7">', "<table>"],
+    "t3_crosspage_independent_caption.pdf": ['<table id="tab-7">', '<table id="tab-8">'],
     "t3_crosspage_aligned_prose.pdf": ['<table id="tab-11">'],
 }
 
@@ -1374,6 +1374,7 @@ def test_phase7_crosspage_negatives_lock_accepted_parent_behavior(fname, expecte
             assert html.count(caption) == 1
             assert markdown.count(caption) == 1
         assert '<caption style="caption-side:bottom">Table 7. Permit register</caption>' in html
+        assert '<caption>Table 8. Audit outcomes</caption>' in html
         spans = [pdf._dbg_spans_xy(page) for page in (1, 2)]
         assert [
             hashlib.sha256(json.dumps(page, sort_keys=True, separators=(",", ":")).encode())

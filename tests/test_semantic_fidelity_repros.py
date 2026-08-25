@@ -17,7 +17,6 @@ from _fixtures import FIX, GT, cells, html, text
 TABLE_CORPUS = os.path.join(os.path.dirname(__file__), "table_corpus")
 
 
-@pytest.mark.xfail(strict=True, reason="close table label is claimed before caption recognition")
 def test_close_table_label_is_its_caption():
     pdf = distillpdf.Pdf.open(
         os.path.join(TABLE_CORPUS, "t3_crosspage_independent_caption.pdf"))
