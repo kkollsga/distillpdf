@@ -138,18 +138,24 @@ step "Accuracy floor gate (per-table-type x per-dimension, bench100)"
 # without the other.
 GATE="dev-docs/bench/scripts/bench100_gate.py"
 FLOORS="dev-docs/bench/results/bench100_floors.json"
+TRUTH_DIR="dev-docs/bench/results/bench100_groundtruth"
 ANCHORS="accuracy/bench100_anchors.json"
 if [ -d benchmarking/bench100 ]; then
   missing=""
   [ -f "$GATE" ]    || missing="$missing\n           - the gate script $GATE"
   [ -f "$FLOORS" ]  || missing="$missing\n           - the frozen floors $FLOORS"
   [ -f "$ANCHORS" ] || missing="$missing\n           - the committed anchors $ANCHORS"
+  for judge in 1 2 3; do
+    truth="$TRUTH_DIR/groundtruth_judge$judge.json"
+    [ -f "$truth" ] || missing="$missing\n           - the durable blind-judge truth $truth"
+  done
   "$RUN_PY" -c "import fitz" 2>/dev/null \
                     || missing="$missing\n           - PyMuPDF (fitz) in $RUN_PY"
   if [ -n "$missing" ]; then
     echo "FAILED — the bench100 corpus is present, so this gate MUST run, but it cannot."
     printf '         missing:%b\n' "$missing"
-    echo "         Restore it — from git ($ANCHORS is committed), an archived predecessor"
+    echo "         Restore the judge files from backup or rerun blind judging; restore other"
+    echo "         state from git ($ANCHORS), an archived predecessor"
     echo "         (dev-docs/bench/results/bench100_floors_*.json), or a signed re-baseline:"
     echo "           $GATE --rescore --rebaseline --owner-note \"<why>\""
     echo "         Deleting the baseline is not a skip. A release must NOT proceed."

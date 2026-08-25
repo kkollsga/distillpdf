@@ -20,6 +20,35 @@ At skill start, hard-delete the three time-boxed locations. **Never touch
 `bench/scripts/` or `bench/results/`** — harnesses and the benchmark result
 history are durable; only `bench/out/` (heavy built artifacts) is disposable.
 
+Before deleting anything, preserve the bench100 blind-judge truth. The three
+`groundtruth_judge{1,2,3}.json` files are unique human evidence required by the
+release gate, not generated output. Their canonical home is
+`dev-docs/bench/results/bench100_groundtruth/`. The scorer's frozen hash still
+uses its historical `bench/out/bench100/gt/` lookup, so that location contains
+only relative symlinks to the durable files. If an older workspace has real
+judge files at the historical path, byte-compare any existing durable copy,
+move the real file into the durable directory, and replace it with the symlink
+before the age-based purge. Refuse on a byte mismatch; never pick one copy.
+
+```bash
+mkdir -p dev-docs/bench/results/bench100_groundtruth dev-docs/bench/out/bench100/gt
+for name in groundtruth_judge1.json groundtruth_judge2.json groundtruth_judge3.json; do
+  old="dev-docs/bench/out/bench100/gt/$name"
+  kept="dev-docs/bench/results/bench100_groundtruth/$name"
+  if [ -f "$old" ] && [ ! -L "$old" ]; then
+    if [ -f "$kept" ]; then
+      cmp "$old" "$kept" || exit 2
+      rm "$old"
+    else
+      mv "$old" "$kept"
+    fi
+  fi
+  if [ ! -e "$old" ] && [ ! -L "$old" ]; then
+    ln -s "../../../results/bench100_groundtruth/$name" "$old"
+  fi
+done
+```
+
 ```bash
 mkdir -p dev-docs/temp dev-docs/bin dev-docs/bench/out
 find dev-docs/temp      -type f -mmin  +1440  -print -delete   # ephemeral handoff, >1 day
