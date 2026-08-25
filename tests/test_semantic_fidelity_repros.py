@@ -48,6 +48,25 @@ def test_detached_marker_fixture_preserves_true_columns_and_following_prose():
     assert positions == sorted(positions)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="numeric-leading marker bodies remain detached and an orphan marker emits empty",
+)
+def test_numeric_and_nested_marker_rails_form_nonempty_items():
+    rendered = html("list_marker_rail.pdf")
+    page = re.search(
+        r'<section data-page="3"[^>]*>.*?</section>', rendered, re.DOTALL
+    ).group(0)
+    gt = GT["list_marker_rail.pdf"]
+    assert cells(page, "li") == gt["numeric"] + gt["nested"]
+    assert "<table" not in page
+
+
+def test_numeric_marker_fixture_preserves_following_prose():
+    rendered = html("list_marker_rail.pdf")
+    assert GT["list_marker_rail.pdf"]["after_numeric"] in text(rendered)
+
+
 def test_variable_prefix_footer_is_removed_by_its_recurring_tail():
     rendered = html("variable_footer_chrome.pdf")
     visible = text(rendered)
@@ -141,3 +160,38 @@ def test_mixed_image_text_cells_roundtrip_through_model(tmp_path):
         dpdf, mode="page", toc=False, image_mode="drop")
     assert all(label in markdown for label in gt["labels"])
     assert markdown.count("![](#fig-") == gt["images"]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="a wide raster/vector sidecar column still wins figure arbitration over its grid",
+)
+def test_mixed_sidecar_column_is_one_semantic_table():
+    pdf = distillpdf.Pdf.open(os.path.join(FIX, "mixed_sidecar_table.pdf"))
+    gt = GT["mixed_sidecar_table.pdf"]
+    rendered = pdf.to_html(mode="page", toc=False, image_mode="drop", return_string=True)
+    assert rendered.count("<table") == 1
+    assert rendered.count("<figure") == 0
+    table = re.search(r"<table\b.*?</table>", rendered, re.DOTALL).group(0)
+    assert len(cells(table, "th")) + len(cells(table, "td")) == gt["rows"] * gt["cols"]
+    assert table.count("<img ") == gt["images"]
+    assert re.search(rf"<caption\b[^>]*>{re.escape(gt['caption'])}</caption>", table)
+
+    analyzed = pdf.analyze_tables()
+    assert len(analyzed) == 1
+    assert (analyzed[0]["n_rows"], analyzed[0]["n_cols"]) == (gt["rows"], gt["cols"])
+    images = [
+        image
+        for cell in analyzed[0]["cells"]
+        for image in cell.get("content", {}).get("images", [])
+    ]
+    assert len(images) == gt["images"]
+
+
+def test_mixed_sidecar_fixture_retains_source_components():
+    pdf = distillpdf.Pdf.open(os.path.join(FIX, "mixed_sidecar_table.pdf"))
+    gt = GT["mixed_sidecar_table.pdf"]
+    assert len(pdf.extract_images()) == gt["assets"]
+    extracted = pdf.extract_text()
+    assert all(value in extracted for value in gt["headers"] + gt["labels"])
+    assert gt["caption"] in extracted

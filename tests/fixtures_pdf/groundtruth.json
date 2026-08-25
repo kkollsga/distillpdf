@@ -816,6 +816,7 @@
   },
   "list_marker_rail.pdf": {
     "after": "Ordinary prose after the list remains a paragraph.",
+    "after_numeric": "Prose after both repaired lists remains visible.",
     "column_order": [
       "LEFTSTART",
       "LEFTEND",
@@ -831,6 +832,20 @@
       "Rail item 6 keeps its marker and body together.",
       "Rail item 7 keeps its marker and body together.",
       "Rail item 8 keeps its marker and body together."
+    ],
+    "nested": [
+      "Nested alpha body one.",
+      "Nested alpha body two.",
+      "Nested alpha body three."
+    ],
+    "numeric": [
+      "2010-2014: Numeric-leading rail item 1 keeps its body.",
+      "2020-2024: Numeric-leading rail item 2 keeps its body.",
+      "2030-2034: Numeric-leading rail item 3 keeps its body.",
+      "2040-2044: Numeric-leading rail item 4 keeps its body.",
+      "2050-2054: Numeric-leading rail item 5 keeps its body.",
+      "2060-2064: Numeric-leading rail item 6 keeps its body.",
+      "2070-2074: Numeric-leading rail item 7 keeps its body."
     ]
   },
   "lists.pdf": {
@@ -902,6 +917,32 @@
       "Delta cell"
     ],
     "rows": 2
+  },
+  "mixed_sidecar_table.pdf": {
+    "assets": 1,
+    "caption": "Figure 22. Generated sidecar image and text components",
+    "cols": 3,
+    "headers": [
+      "Basin type",
+      "Process type",
+      "Location diagram"
+    ],
+    "images": 4,
+    "labels": [
+      "Outer fan",
+      "Inner fan",
+      "Channel belt",
+      "Basin floor",
+      "Confined flow",
+      "Bypass flow",
+      "Ponded flow",
+      "Lobe flow",
+      "Analogue North",
+      "Analogue East",
+      "Analogue South",
+      "Analogue West"
+    ],
+    "rows": 5
   },
   "multitier_header_table.pdf": {
     "header_rows": 2,

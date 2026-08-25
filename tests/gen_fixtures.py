@@ -214,11 +214,39 @@ def gen_list_marker_rail():
     for i, line in enumerate(simpleSplit(right, "Helvetica", 10, 205)):
         c.drawString(330, 690 - i * 14, line)
     c.showPage()
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(72, 735, "Numeric and Nested Marker Rails")
+    c.setFont("Helvetica", 10)
+    numeric = [
+        f"20{i}0-20{i}4: Numeric-leading rail item {i} keeps its body."
+        for i in range(1, 8)
+    ]
+    def winansi_bullet(x, y):
+        c._code.append(f"BT /F1 10 Tf {x:g} {y:g} Td (\\225) Tj ET")
+
+    y = 675.0
+    for item in numeric:
+        winansi_bullet(72, y)
+        c.drawString(89, y, item)
+        y -= 14
+    winansi_bullet(72, 540)
+    nested = ["Nested alpha body one.", "Nested alpha body two.", "Nested alpha body three."]
+    y = 526.0
+    for item in nested:
+        winansi_bullet(89, y)
+        c.drawString(106, y, item)
+        y -= 14
+    c.drawString(72, 455, "Prose after both repaired lists remains visible.")
+    c.showPage()
     c.save()
     GT["list_marker_rail.pdf"] = {
         "items": items,
         "after": "Ordinary prose after the list remains a paragraph.",
         "column_order": ["LEFTSTART", "LEFTEND", "RIGHTSTART", "RIGHTEND"],
+        "numeric": numeric,
+        "nested": nested,
+        "after_numeric": "Prose after both repaired lists remains visible.",
     }
 
 
@@ -3657,6 +3685,69 @@ def gen_mixed_cell_table():
     }
 
 
+def gen_mixed_sidecar_table():
+    """A ruled text grid whose wide image column has no right-hand vertical rule.
+
+    The authored object is a 5x3 table, but line-only detection sees the first two columns.
+    Raster and vector content occupy the wide third column, matching the layout class where a
+    captioned composite figure currently wins arbitration over the semantic grid.
+    """
+    pdf = os.path.join(OUT, "mixed_sidecar_table.pdf")
+    png = os.path.join(OUT, "_mixed_sidecar.png")
+    im = Image.new("RGB", (190, 68), "white")
+    d = ImageDraw.Draw(im)
+    d.rectangle([1, 1, 188, 66], outline=(25, 70, 110), width=2)
+    d.polygon([(12, 55), (54, 15), (92, 44), (130, 10), (178, 53)], fill=(230, 150, 55))
+    im.save(png)
+
+    c = canvas.Canvas(pdf, pagesize=letter)
+    title(c, "Mixed Sidecar Semantic Table")
+    xs = (72.0, 170.0, 268.0)
+    right = 540.0
+    ys = (180.0, 285.0, 390.0, 495.0, 600.0, 635.0)
+    c.setLineWidth(0.8)
+    for x in xs:
+        c.line(x, ys[0], x, ys[-1])
+    for y in ys:
+        c.line(xs[0], y, right, y)
+    headers = ("Basin type", "Process type", "Location diagram")
+    c.setFont("Helvetica-Bold", 9)
+    for x, value in zip(xs, headers):
+        c.drawString(x + 7, 616, value)
+    left = ["Outer fan", "Inner fan", "Channel belt", "Basin floor"]
+    middle = ["Confined flow", "Bypass flow", "Ponded flow", "Lobe flow"]
+    diagram = ["Analogue North", "Analogue East", "Analogue South", "Analogue West"]
+    for row in range(4):
+        yb, yt = ys[3 - row], ys[4 - row]
+        c.setFont("Helvetica", 9)
+        c.drawString(xs[0] + 7, yt - 18, left[row])
+        c.drawString(xs[1] + 7, yt - 18, middle[row])
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(xs[2] + 7, yt - 16, diagram[row])
+        draw_image(c, png, xs[2] + 36, yb + 8, width=190, height=68)
+        c.setStrokeColorRGB(0.2, 0.35, 0.55)
+        p = c.beginPath()
+        p.moveTo(xs[2] + 8, yb + 15)
+        p.curveTo(xs[2] + 70, yb + 82, right - 70, yb + 18, right - 8, yb + 80)
+        c.drawPath(p, stroke=1, fill=0)
+        c.setStrokeColorRGB(0, 0, 0)
+    c.setFont("Helvetica", 9)
+    caption = "Figure 22. Generated sidecar image and text components"
+    c.drawString(xs[0], ys[0] - 18, caption)
+    c.showPage()
+    c.save()
+    os.remove(png)
+    GT["mixed_sidecar_table.pdf"] = {
+        "rows": 5,
+        "cols": 3,
+        "images": 4,
+        "assets": 1,
+        "headers": list(headers),
+        "labels": left + middle + diagram,
+        "caption": caption,
+    }
+
+
 def gen_page_chrome():
     """Six pages of running chrome around distinct body text — the repetition shape the
     per-document chrome detector (src/chrome.rs) exists for.
@@ -6302,6 +6393,7 @@ def main():
     gen_variable_footer_chrome()
     gen_logo_rule_chain()
     gen_mixed_cell_table()
+    gen_mixed_sidecar_table()
     gen_page_chrome()
     gen_inline_image()
     gen_medium_weight()
