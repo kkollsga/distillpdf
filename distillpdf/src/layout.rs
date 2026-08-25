@@ -61,6 +61,78 @@ fn span_width(s: &Span) -> f32 {
     }
 }
 
+fn standalone_list_marker(text: &str) -> bool {
+    let t = text.trim();
+    let mut chars = t.chars();
+    if chars
+        .next()
+        .is_some_and(|c| matches!(c, '•' | '◦' | '▪' | '‣' | '·' | '−' | '–' | '*' | '\u{95}' | '\u{85}'))
+        && chars.next().is_none()
+    {
+        return true;
+    }
+    let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+    (1..=2).contains(&digits) && matches!(&t[digits..], "." | ")")
+}
+
+/// Close the false XY-cut gutter between a repeated marker rail and its same-baseline
+/// bodies. Only the ordering boxes are bridged; the spans and their authored geometry stay
+/// unchanged for line assembly, links, and output boxes.
+fn bridge_list_marker_rails(
+    spans: &[Span],
+    order_y: &[f32],
+    boxes: &mut [text::BBox],
+    band: f32,
+    avg: f32,
+) {
+    let mut pairs: Vec<(usize, usize, f32, f32, f32)> = Vec::new(); // marker, body, mx, bx, y
+    for (i, marker) in spans.iter().enumerate() {
+        if !standalone_list_marker(&marker.text) {
+            continue;
+        }
+        let marker_end = marker.x + span_width(marker);
+        let body = spans
+            .iter()
+            .enumerate()
+            .filter(|(j, candidate)| {
+                *j != i
+                    && !standalone_list_marker(&candidate.text)
+                    && candidate.text.chars().filter(|c| c.is_alphabetic()).take(2).count() >= 2
+                    && (order_y[*j] - order_y[i]).abs() <= band * 0.5
+                    && candidate.x >= marker_end - avg * 0.2
+                    && candidate.x - marker_end <= avg * 2.2
+                    && candidate.size >= marker.size * 0.7
+                    && candidate.size <= marker.size * 1.4
+            })
+            .min_by(|(_, a), (_, b)| {
+                a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        if let Some((j, body)) = body {
+            pairs.push((i, j, marker.x, body.x, order_y[i]));
+        }
+    }
+
+    let valid: Vec<(usize, usize)> = pairs
+        .iter()
+        .filter_map(|&(marker, body, mx, bx, _)| {
+            let rail: Vec<_> = pairs
+                .iter()
+                .filter(|(_, _, omx, obx, _)| {
+                    (*omx - mx).abs() <= avg * 0.6 && (*obx - bx).abs() <= avg
+                })
+                .collect();
+            let (lo, hi) = rail.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), p| {
+                (lo.min(p.4), hi.max(p.4))
+            });
+            (rail.len() >= 3 && hi - lo >= avg * 2.0).then_some((marker, body))
+        })
+        .collect();
+
+    for (marker, body) in valid {
+        boxes[marker].1 = boxes[marker].1.max(boxes[body].1);
+    }
+}
+
 /// Group spans into visual lines, each with style runs (merged by bold/italic).
 /// Explicit whitespace spans are kept (they carry real spaces); plus a gap
 /// heuristic re-derives spaces when they're encoded purely as positioning.
@@ -175,11 +247,12 @@ pub(crate) fn lines_of(mut spans: Vec<Span>, links: &[LinkBox]) -> Vec<Line> {
     // Order spans column-aware (same XY-cut as the text path) so a visual line is
     // never assembled across a column gutter — left and right columns become
     // separate lines, splitting only between words, never within one.
-    let boxes: Vec<text::BBox> = spans
+    let mut boxes: Vec<text::BBox> = spans
         .iter()
         .enumerate()
         .map(|(i, s)| (s.x, s.x + span_width(s), order_y[i], order_y[i] + s.size.max(1.0)))
         .collect();
+    bridge_list_marker_rails(&spans, &order_y, &mut boxes, band, avg);
     // Span-level prose ordering: enable the crossing-tolerant column gutter so a centered
     // page number / running header in a tight two-column gutter doesn't force the columns to
     // interleave line-by-line.
@@ -420,4 +493,62 @@ pub(crate) fn render_runs(runs: &[Run]) -> String {
     }
     close_a!();
     o.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn span(ordinal: u32, x: f32, y: f32, width: f32, value: &str) -> Span {
+        Span {
+            x,
+            y,
+            size: 10.0,
+            width,
+            text: value.into(),
+            bold: false,
+            italic: false,
+            mono: false,
+            angle: 0.0,
+            font: 1,
+            mcid: None,
+            source: text::SourceSlice::test_occurrence(ordinal, value.chars().count()),
+        }
+    }
+
+    #[test]
+    fn a_repeated_marker_rail_rejoins_its_same_baseline_bodies() {
+        let mut spans = Vec::new();
+        for i in 0..4 {
+            spans.push(span(i, 72.0, 650.0 - i as f32 * 14.0, 5.0, "*"));
+        }
+        for i in 0..4 {
+            spans.push(span(10 + i, 89.0, 650.0 - i as f32 * 14.0, 90.0, &format!("Rail item {}", i + 1)));
+        }
+
+        let text: Vec<String> = lines_of(spans, &[]).iter().map(Line::text).collect();
+        assert_eq!(
+            text,
+            ["* Rail item 1", "* Rail item 2", "* Rail item 3", "* Rail item 4"]
+        );
+    }
+
+    #[test]
+    fn one_marker_cannot_bridge_two_real_columns() {
+        let spans = vec![
+            span(0, 72.0, 650.0, 5.0, "*"),
+            span(1, 89.0, 650.0, 80.0, "One body"),
+            span(2, 330.0, 650.0, 80.0, "Right column"),
+        ];
+        let order_y: Vec<f32> = spans.iter().map(|s| s.y).collect();
+        let mut boxes: Vec<text::BBox> = spans
+            .iter()
+            .map(|s| (s.x, s.x + span_width(s), s.y, s.y + s.size))
+            .collect();
+        let marker_before = boxes[0];
+
+        bridge_list_marker_rails(&spans, &order_y, &mut boxes, 6.0, 10.0);
+
+        assert_eq!(boxes[0], marker_before);
+    }
 }

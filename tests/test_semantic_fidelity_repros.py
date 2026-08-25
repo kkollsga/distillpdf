@@ -36,10 +36,10 @@ def test_close_caption_fixture_keeps_both_tables_and_labels_once():
     assert rendered.count("Table 8. Audit outcomes") == 1
 
 
-@pytest.mark.xfail(strict=True, reason="XY-cut separates the marker rail from list bodies")
 def test_detached_marker_rail_forms_nonempty_items():
     rendered = html("list_marker_rail.pdf")
-    items = cells(rendered, "li")
+    page = re.search(r'<section data-page="1".*?</section>', rendered, re.DOTALL).group(0)
+    items = cells(page, "li")
     assert items == GT["list_marker_rail.pdf"]["items"]
     assert all(items)
 
