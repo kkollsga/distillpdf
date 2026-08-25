@@ -177,6 +177,51 @@ def gen_lists():
     }
 
 
+def gen_list_marker_rail():
+    """List markers and bodies painted as separate same-baseline text objects.
+
+    Seven or more repeated marker/body rows create enough vertical extent for the global
+    XY-cut column validator to mistake the narrow marker rail for a real page column.  The
+    second page is a genuine narrow two-column layout: repairing the list must not collapse
+    those independent columns back into line-interleaved prose.
+    """
+    pdf = os.path.join(OUT, "list_marker_rail.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    title(c, "Detached List Marker Rail")
+    items = [f"Rail item {i} keeps its marker and body together." for i in range(1, 9)]
+    y = 650.0
+    c.setFont("Helvetica", 10)
+    for item in items:
+        c.drawString(72, y, "*")
+        c.drawString(89, y, item)
+        y -= 14
+    c.drawString(72, 500, "Ordinary prose after the list remains a paragraph.")
+    c.showPage()
+
+    left = ("LEFTSTART the genuine left column is read completely before the right one. "
+            "Its ordinary prose wraps through a narrow measure for several lines, proving "
+            "that a list-marker repair cannot broadly reconnect neighboring page columns. "
+            "More words extend the vertical overlap and LEFTEND closes this column.")
+    right = ("RIGHTSTART the genuine right column follows the complete left column. Its "
+             "ordinary prose also wraps through a narrow measure for several lines, keeping "
+             "the central gutter open while preserving independent reading order. More words "
+             "extend the vertical overlap and RIGHTEND closes this column.")
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(72, 735, "True Two Column Control")
+    c.setFont("Helvetica", 10)
+    for i, line in enumerate(simpleSplit(left, "Helvetica", 10, 205)):
+        c.drawString(72, 690 - i * 14, line)
+    for i, line in enumerate(simpleSplit(right, "Helvetica", 10, 205)):
+        c.drawString(330, 690 - i * 14, line)
+    c.showPage()
+    c.save()
+    GT["list_marker_rail.pdf"] = {
+        "items": items,
+        "after": "Ordinary prose after the list remains a paragraph.",
+        "column_order": ["LEFTSTART", "LEFTEND", "RIGHTSTART", "RIGHTEND"],
+    }
+
+
 def gen_runin():
     """A bold run-in head inline with the body it introduces, where that body wraps with
     a line-break hyphen. The head must become its own <hN>, and the body must flow as ONE
@@ -3485,6 +3530,124 @@ def gen_ruled_blank_cells():
     GT["ruled_blank_cells.pdf"] = {"rows": len(YS) - 1, "cols": len(XS) - 1}
 
 
+def gen_variable_footer_chrome():
+    """A recurring page tail joined to low-diversity, page-varying section titles.
+
+    Whole-row recurrence removes the 5/3/3 variants but leaks the singleton fourth title.
+    A one-off footnote in the same bottom band lacks the recurring page tail and must survive.
+    """
+    pdf = os.path.join(OUT, "variable_footer_chrome.pdf")
+    sections = (["North Basin"] * 5 + ["South Basin"] * 3
+                + ["West Basin"] * 3 + ["Single Page Appendix"])
+    c = canvas.Canvas(pdf, pagesize=letter)
+    for i, section in enumerate(sections, 1):
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(72, 720, f"Synthetic Section {i}")
+        c.setFont("Helvetica", 10)
+        c.drawString(72, 680, f"Distinct body prose for synthetic page {i} remains visible.")
+        c.setFont("Helvetica", 8)
+        c.drawString(72, 50, section)
+        c.drawRightString(540, 50, f"Page {i} of {len(sections)}")
+        if i == 7:
+            c.drawString(72, 64, "One-off bottom-band footnote must survive.")
+        c.showPage()
+    c.save()
+    GT["variable_footer_chrome.pdf"] = {
+        "sections": sorted(set(sections)),
+        "singleton": "Single Page Appendix",
+        "tail": f"Page {len(sections)} of {len(sections)}",
+        "footnote": "One-off bottom-band footnote must survive.",
+    }
+
+
+def gen_logo_rule_chain():
+    """A small top-band curved logo promoted only when rules bridge it to a table.
+
+    Pages 1-4 put the table's top rule within the vector cluster's 24pt band gap; pages
+    5-6 move the same table farther down.  The logo and divider are identical on every page.
+    """
+    pdf = os.path.join(OUT, "logo_rule_chain.pdf")
+    c = canvas.Canvas(pdf, pagesize=letter)
+    for page in range(1, 7):
+        c.setLineWidth(0.8)
+        c.setStrokeColorRGB(0.1, 0.35, 0.65)
+        for off in (0, 5, 10):
+            p = c.beginPath()
+            p.moveTo(72 + off, 750)
+            p.curveTo(76 + off, 765, 88 + off, 765, 94 + off, 750)
+            c.drawPath(p, stroke=1, fill=0)
+        c.setStrokeColorRGB(0, 0, 0)
+        c.line(72, 735, 540, 735)
+
+        top = 713.0 if page <= 4 else 675.0
+        bottom = top - 44.0
+        xs = (72.0, 276.0, 480.0)
+        ys = (bottom, (bottom + top) / 2, top)
+        for x in xs:
+            c.line(x, bottom, x, top)
+        for y in ys:
+            c.line(xs[0], y, xs[-1], y)
+        c.setFont("Helvetica", 8)
+        c.drawString(80, top - 16, f"A{page}")
+        c.drawString(284, top - 16, f"B{page}")
+        c.drawString(80, bottom + 6, f"C{page}")
+        c.drawString(284, bottom + 6, f"D{page}")
+        c.setFont("Helvetica", 10)
+        c.drawString(72, 600, f"Body prose on logo-control page {page}.")
+        c.showPage()
+    c.save()
+    GT["logo_rule_chain.pdf"] = {
+        "pages": 6,
+        "near_pages": 4,
+        "tables": 6,
+        "body": "Body prose on logo-control page",
+    }
+
+
+def gen_mixed_cell_table():
+    """A ruled 2x2 table with a generated raster and text in every cell.
+
+    Each raster covers more than 15% of the whole table, deliberately engaging the
+    renderer's raster-overlap table rejection even though exact rules prove cell ownership.
+    """
+    pdf = os.path.join(OUT, "mixed_cell_table.pdf")
+    png = os.path.join(OUT, "_mixed_cell.png")
+    im = Image.new("RGB", (145, 90), "white")
+    d = ImageDraw.Draw(im)
+    d.rectangle([1, 1, 143, 88], outline=(20, 60, 120), width=3)
+    d.ellipse([38, 14, 106, 78], fill=(220, 120, 50), outline=(80, 30, 10), width=2)
+    im.save(png)
+
+    c = canvas.Canvas(pdf, pagesize=letter)
+    title(c, "Mixed Cell Semantic Table")
+    x0, x1, x2 = 72.0, 242.0, 412.0
+    y0, y1, y2 = 390.0, 510.0, 630.0
+    c.setLineWidth(0.8)
+    for x in (x0, x1, x2):
+        c.line(x, y0, x, y2)
+    for y in (y0, y1, y2):
+        c.line(x0, y, x2, y)
+    labels = [["Alpha cell", "Beta cell"], ["Gamma cell", "Delta cell"]]
+    for r, (yb, yt) in enumerate(((y1, y2), (y0, y1))):
+        for col, (xl, xr) in enumerate(((x0, x1), (x1, x2))):
+            draw_image(c, png, xl + 12, yb + 8, width=145, height=90)
+            c.setFont("Helvetica-Bold", 9)
+            c.drawString(xl + 12, yt - 14, labels[r][col])
+    c.setFont("Helvetica", 9)
+    c.drawString(x0, y0 - 18, "Table 21. Generated image and text cell components")
+    c.showPage()
+    c.save()
+    os.remove(png)
+    GT["mixed_cell_table.pdf"] = {
+        "rows": 2,
+        "cols": 2,
+        "labels": [v for row in labels for v in row],
+        "images": 4,
+        "assets": 1,
+        "caption": "Table 21. Generated image and text cell components",
+    }
+
+
 def gen_page_chrome():
     """Six pages of running chrome around distinct body text — the repetition shape the
     per-document chrome detector (src/chrome.rs) exists for.
@@ -6078,6 +6241,7 @@ def main():
     gen_heading_traps()
     gen_sec_structure()
     gen_lists()
+    gen_list_marker_rail()
     gen_runin()
     gen_footnotes()
     gen_twolists()
@@ -6126,6 +6290,9 @@ def main():
     gen_annot_render()
     gen_glyph_table()
     gen_ruled_blank_cells()
+    gen_variable_footer_chrome()
+    gen_logo_rule_chain()
+    gen_mixed_cell_table()
     gen_page_chrome()
     gen_inline_image()
     gen_medium_weight()

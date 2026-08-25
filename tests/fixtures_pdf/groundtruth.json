@@ -814,6 +814,25 @@
     "uri": "https://example.com/distillpdf",
     "uri_text": "Visit our project homepage"
   },
+  "list_marker_rail.pdf": {
+    "after": "Ordinary prose after the list remains a paragraph.",
+    "column_order": [
+      "LEFTSTART",
+      "LEFTEND",
+      "RIGHTSTART",
+      "RIGHTEND"
+    ],
+    "items": [
+      "Rail item 1 keeps its marker and body together.",
+      "Rail item 2 keeps its marker and body together.",
+      "Rail item 3 keeps its marker and body together.",
+      "Rail item 4 keeps its marker and body together.",
+      "Rail item 5 keeps its marker and body together.",
+      "Rail item 6 keeps its marker and body together.",
+      "Rail item 7 keeps its marker and body together.",
+      "Rail item 8 keeps its marker and body together."
+    ]
+  },
   "lists.pdf": {
     "colon": [
       "Question one introduced after a colon line.",
@@ -844,6 +863,12 @@
     "n_figures": 0,
     "wrapped_text": "considerably longer descriptive title"
   },
+  "logo_rule_chain.pdf": {
+    "body": "Body prose on logo-control page",
+    "near_pages": 4,
+    "pages": 6,
+    "tables": 6
+  },
   "map_label_grid.pdf": {
     "page1_figures": 1,
     "page2_figures": 0
@@ -864,6 +889,19 @@
     "bold": "This line is truly bold.",
     "medi_heading": "A Heading In The Abbreviated Medi Face",
     "regular": "reads as regular text"
+  },
+  "mixed_cell_table.pdf": {
+    "assets": 1,
+    "caption": "Table 21. Generated image and text cell components",
+    "cols": 2,
+    "images": 4,
+    "labels": [
+      "Alpha cell",
+      "Beta cell",
+      "Gamma cell",
+      "Delta cell"
+    ],
+    "rows": 2
   },
   "multitier_header_table.pdf": {
     "header_rows": 2,
@@ -1438,6 +1476,17 @@
     "form_text": "Unfiltered form ink",
     "n_bars": 5,
     "title": "A Form Stream With No Filter"
+  },
+  "variable_footer_chrome.pdf": {
+    "footnote": "One-off bottom-band footnote must survive.",
+    "sections": [
+      "North Basin",
+      "Single Page Appendix",
+      "South Basin",
+      "West Basin"
+    ],
+    "singleton": "Single Page Appendix",
+    "tail": "Page 12 of 12"
   },
   "xobject_figure.pdf": {
     "body_once": [
