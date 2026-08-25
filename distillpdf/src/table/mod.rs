@@ -280,6 +280,10 @@ pub(crate) struct TableAnalysis {
     /// Final accepted source owner. Unlike `TableClaim`, this remains exact after a table
     /// crosses a page boundary because every slice carries its originating page.
     ownership: Option<ProvenOwnership>,
+    /// Renderer/API-only proof that a ruled text grid was extended by a row-aligned raster
+    /// sidecar column. It prevents the same authored object from being reclassified as a
+    /// captioned figure during live arbitration; durable replay no longer runs that decision.
+    image_sidecar: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -404,6 +408,7 @@ impl TableAnalysis {
             fidelity_html: None,
             continuation: None,
             ownership: None,
+            image_sidecar: false,
         }
     }
 
@@ -502,6 +507,7 @@ impl TableAnalysis {
             fidelity_html: None,
             continuation: None,
             ownership: None,
+            image_sidecar: false,
         }
     }
 
@@ -712,6 +718,10 @@ impl TableAnalysis {
             .chain(&self.grid)
             .flatten()
             .any(|cell| !cell.content.images.is_empty())
+    }
+
+    pub(crate) fn has_image_sidecar(&self) -> bool {
+        self.image_sidecar
     }
 
     /// Exact ruled-cell owner for a raster, if precisely one observed cell contains it.
@@ -998,6 +1008,127 @@ impl PositionedTableAnalysis {
         self.key = key;
         self.claim = claim;
         self
+    }
+
+    /// Extend a ruled text grid with one wide image-bearing column when every data-row band
+    /// has raster content immediately to its right and every row has text in that same band.
+    /// This is deliberately an all-rows proof: a nearby plot or ordinary figure cannot lend a
+    /// column to a table unless it repeats the table's complete row structure.
+    pub(crate) fn extend_image_sidecar(&mut self, spans: &[Span], images: &[(usize, Rect)]) -> bool {
+        if !self.table.evidence.contains(&TableEvidence::Ruled) {
+            return false;
+        }
+        let (nrows, ncols) = self.table.logical_shape();
+        if nrows < 4 || ncols < 2 || self.table.header_rows == 0 || self.table.header_rows >= nrows {
+            return false;
+        }
+        let avg = if spans.is_empty() {
+            10.0
+        } else {
+            spans.iter().map(|span| span.size).sum::<f32>() / spans.len() as f32
+        };
+        let mut row_boxes = vec![Rect::EMPTY; nrows];
+        for cell in self.table.header.iter().chain(&self.table.grid).flatten() {
+            let Some(bbox) = cell.bbox else {
+                return false;
+            };
+            row_boxes[cell.row] = row_boxes[cell.row].union(bbox);
+        }
+        if row_boxes.iter().any(|bbox| !bbox.is_valid()) {
+            return false;
+        }
+
+        let mut image_rows: Vec<Vec<usize>> = vec![Vec::new(); nrows];
+        let mut sidecar_left = f32::INFINITY;
+        let mut sidecar_right = f32::NEG_INFINITY;
+        for &(index, image) in images {
+            if image.x0 < self.bbox.x1 - avg * 0.25 || image.x1 <= self.bbox.x1 {
+                continue;
+            }
+            let owners: Vec<usize> = row_boxes
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.overlap_h(image) >= image.height() * 0.90)
+                .map(|(row, _)| row)
+                .collect();
+            let [row] = owners.as_slice() else {
+                continue;
+            };
+            if *row < self.table.header_rows {
+                continue;
+            }
+            image_rows[*row].push(index);
+            sidecar_left = sidecar_left.min(image.x0);
+            sidecar_right = sidecar_right.max(image.x1);
+        }
+        if image_rows[self.table.header_rows..].iter().any(Vec::is_empty)
+            || sidecar_left - self.bbox.x1 > avg * 5.0
+            || sidecar_right - self.bbox.x1 < self.bbox.width() * 0.50
+        {
+            return false;
+        }
+
+        let mut sidecar_spans: Vec<Vec<Span>> = vec![Vec::new(); nrows];
+        for span in spans {
+            let center_x = span.x + span.width.max(span.size * 0.3) * 0.5;
+            let center_y = span.y + span.size * 0.5;
+            if center_x <= self.bbox.x1 || center_x > sidecar_right + avg * 2.0 {
+                continue;
+            }
+            if let Some((row, _)) = row_boxes
+                .iter()
+                .enumerate()
+                .find(|(_, bbox)| center_y >= bbox.y0 && center_y <= bbox.y1)
+            {
+                sidecar_spans[row].push(crate::html::clone_span(span));
+            }
+        }
+        if sidecar_spans.iter().any(|row| row.is_empty()) {
+            return false;
+        }
+
+        let mut claim_rows: Vec<Vec<SourceSlice>> = (0..nrows)
+            .map(|row| self.claim.row(row).unwrap_or_default().to_vec())
+            .collect();
+        for row in 0..nrows {
+            claim_rows[row].extend(sidecar_spans[row].iter().map(|span| span.source));
+            let text = crate::layout::lines_of(
+                sidecar_spans[row]
+                    .iter()
+                    .map(crate::html::clone_span)
+                    .collect(),
+                &[],
+            )
+            .iter()
+            .map(crate::layout::Line::text)
+            .collect::<Vec<_>>()
+            .join(" ");
+            let mut cell = CellAnalysis::new(
+                text,
+                row,
+                ncols,
+                1,
+                1,
+                Some(Rect::new(self.bbox.x1, row_boxes[row].y0, sidecar_right, row_boxes[row].y1)),
+            );
+            if row < self.table.header_rows {
+                cell.role = TableCellRole::Header;
+            }
+            let Some(target) = self
+                .table
+                .header
+                .iter_mut()
+                .chain(&mut self.table.grid)
+                .find(|cells| cells.first().is_some_and(|first| first.row == row))
+            else {
+                return false;
+            };
+            target.push(cell);
+        }
+        self.claim = TableClaim::from_rows(claim_rows);
+        self.bbox.x1 = sidecar_right;
+        self.table.image_sidecar = true;
+        true
     }
 
     pub(crate) fn merge_proven_fragment(&mut self, next: &PositionedTableAnalysis) -> bool {
@@ -1404,6 +1535,56 @@ mod tests {
 
         table.evidence = vec![TableEvidence::Aligned];
         assert_eq!(table.image_owner(Rect::new(5.0, 5.0, 45.0, 35.0)), None);
+    }
+
+    #[test]
+    fn complete_row_aligned_image_sidecar_extends_the_ruled_grid() {
+        let mut positioned = PositionedTableAnalysis::from_parts(
+            Rect::new(0.0, 0.0, 200.0, 500.0),
+            Vec::new(),
+            (0..5)
+                .map(|row| vec![format!("L{row}"), format!("M{row}")])
+                .collect(),
+            1,
+            vec![TableEvidence::Ruled],
+        );
+        for cell in positioned.table.grid.iter_mut().flatten() {
+            let y1 = 500.0 - cell.row as f32 * 100.0;
+            let y0 = y1 - 100.0;
+            let x0 = cell.col as f32 * 100.0;
+            cell.bbox = Some(Rect::new(x0, y0, x0 + 100.0, y1));
+        }
+        let spans: Vec<Span> = (0..5)
+            .map(|row| Span {
+                x: 220.0,
+                y: 480.0 - row as f32 * 100.0,
+                size: 10.0,
+                width: 60.0,
+                text: format!("Side {row}"),
+                bold: row == 0,
+                italic: false,
+                mono: false,
+                angle: 0.0,
+                font: 1,
+                mcid: None,
+                source: SourceSlice::test_occurrence(row as u32, 6),
+            })
+            .collect();
+        let images: Vec<(usize, Rect)> = (1..5)
+            .map(|row| {
+                let y1 = 500.0 - row as f32 * 100.0;
+                (row, Rect::new(220.0, y1 - 90.0, 390.0, y1 - 10.0))
+            })
+            .collect();
+
+        assert!(positioned.extend_image_sidecar(&spans, &images));
+        assert_eq!(positioned.table.logical_shape(), (5, 3));
+        assert!(positioned.table.has_image_sidecar());
+        assert_eq!(
+            positioned.table.image_owner(Rect::new(220.0, 310.0, 390.0, 390.0)),
+            Some((1, 2))
+        );
+        assert_eq!(positioned.claim.row_count(), 5);
     }
 
     #[test]

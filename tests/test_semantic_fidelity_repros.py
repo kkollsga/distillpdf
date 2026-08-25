@@ -48,10 +48,6 @@ def test_detached_marker_fixture_preserves_true_columns_and_following_prose():
     assert positions == sorted(positions)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="numeric-leading marker bodies remain detached and an orphan marker emits empty",
-)
 def test_numeric_and_nested_marker_rails_form_nonempty_items():
     rendered = html("list_marker_rail.pdf")
     page = re.search(
@@ -162,11 +158,7 @@ def test_mixed_image_text_cells_roundtrip_through_model(tmp_path):
     assert markdown.count("![](#fig-") == gt["images"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a wide raster/vector sidecar column still wins figure arbitration over its grid",
-)
-def test_mixed_sidecar_column_is_one_semantic_table():
+def test_mixed_sidecar_column_is_one_semantic_table(tmp_path):
     pdf = distillpdf.Pdf.open(os.path.join(FIX, "mixed_sidecar_table.pdf"))
     gt = GT["mixed_sidecar_table.pdf"]
     rendered = pdf.to_html(mode="page", toc=False, image_mode="drop", return_string=True)
@@ -186,6 +178,20 @@ def test_mixed_sidecar_column_is_one_semantic_table():
         for image in cell.get("content", {}).get("images", [])
     ]
     assert len(images) == gt["images"]
+
+    dpdf = pdf.distill(str(tmp_path / "mixed-sidecar.dpdf"))
+    assert distillpdf.render_html(dpdf, mode="page", toc=False) == rendered
+    model = json.loads(distillpdf.load_model(dpdf))
+    blocks = [block for block in model["blocks"] if block["kind"] == "table"]
+    assert len(blocks) == 1
+    content = blocks[0]["table_cell_content"]
+    durable_images = [
+        image for row in content for cell in row for image in cell.get("images", [])
+    ]
+    assert len(durable_images) == gt["images"]
+    assert len({image["asset"] for image in durable_images}) == gt["assets"]
+    assert len(model["assets"]) == gt["assets"]
+    assert model["assets"][0]["kind"] == "table_cell"
 
 
 def test_mixed_sidecar_fixture_retains_source_components():

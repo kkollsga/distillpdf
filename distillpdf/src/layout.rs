@@ -61,7 +61,7 @@ fn span_width(s: &Span) -> f32 {
     }
 }
 
-fn standalone_list_marker(text: &str) -> bool {
+pub(crate) fn standalone_list_marker(text: &str) -> bool {
     let t = text.trim();
     let mut chars = t.chars();
     if chars
@@ -97,7 +97,7 @@ fn bridge_list_marker_rails(
             .filter(|(j, candidate)| {
                 *j != i
                     && !standalone_list_marker(&candidate.text)
-                    && candidate.text.chars().filter(|c| c.is_alphabetic()).take(2).count() >= 2
+                    && candidate.text.chars().filter(|c| c.is_alphanumeric()).take(2).count() >= 2
                     && (order_y[*j] - order_y[i]).abs() <= band * 0.5
                     && candidate.x >= marker_end - avg * 0.2
                     && candidate.x - marker_end <= avg * 2.2
@@ -531,6 +531,26 @@ mod tests {
             text,
             ["* Rail item 1", "* Rail item 2", "* Rail item 3", "* Rail item 4"]
         );
+    }
+
+    #[test]
+    fn a_numeric_leading_body_is_still_list_body_evidence() {
+        let mut spans = Vec::new();
+        for i in 0..4 {
+            let y = 650.0 - i as f32 * 14.0;
+            spans.push(span(i, 72.0, y, 5.0, "•"));
+            spans.push(span(
+                10 + i,
+                89.0,
+                y,
+                180.0,
+                &format!("20{i}0-20{i}4: scheduled item"),
+            ));
+        }
+
+        let text: Vec<String> = lines_of(spans, &[]).iter().map(Line::text).collect();
+        assert_eq!(text.len(), 4);
+        assert!(text.iter().all(|line| line.starts_with("• 20")));
     }
 
     #[test]

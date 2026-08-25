@@ -2300,6 +2300,19 @@ pub(crate) fn detect_tables_pos(spans: &[Span], rules: &crate::vector::PageRules
             };
             build_table(TABLE_TYPES, &c, spans)
         })
+        .filter(|table| {
+            if table.table.evidence.as_slice() != [TableEvidence::Aligned] {
+                return true;
+            }
+            let rows: Vec<_> = table.table.header.iter().chain(&table.table.grid).collect();
+            let marker_rail = rows.len() >= 3
+                && rows.iter().all(|row| {
+                    row.len() == 2
+                        && crate::layout::standalone_list_marker(&row[0].content.text)
+                        && !row[1].content.text.trim().is_empty()
+                });
+            !marker_rail
+        })
         .collect();
     out
 }
@@ -3412,6 +3425,22 @@ pub fn analyze_tables(access: &dyn crate::access::DocumentAccess) -> Vec<Analyze
             );
             let mut detected = detect_tables_pos(&spans, &rules);
             let images = crate::img::positioned_images(access, page_id, false);
+            let image_rects: Vec<(usize, crate::geom::Rect)> = images
+                .iter()
+                .enumerate()
+                .map(|(index, image)| {
+                    let (x0, x1, y0, y1) = turn.rect(
+                        image.x_left,
+                        image.x_right,
+                        image.y_bottom,
+                        image.y_top,
+                    );
+                    (index, crate::geom::Rect::new(x0, y0, x1, y1))
+                })
+                .collect();
+            for table in &mut detected {
+                table.extend_image_sidecar(&spans, &image_rects);
+            }
             for (image_index, image) in images.iter().enumerate() {
                 let page_rect = crate::geom::Rect::new(
                     image.x_left,

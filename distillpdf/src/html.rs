@@ -646,10 +646,16 @@ fn table_html(table: &TableAnalysis) -> String {
     // unambiguously associated. `caption-side:bottom` (inline style; no class — the HTML
     // stays thin) preserves a caption that sits below the table in the source.
     if let Some((_, caption, below)) = cap {
+        let figure_anchor = caption_label(&crate::nav::strip_inline(caption))
+            .filter(|(is_figure, _)| *is_figure)
+            .map(|(_, number)| format!(" id=\"fig-{}\"", num_id(&number)))
+            .unwrap_or_default();
         if below {
-            tbl.push_str(&format!("<caption style=\"caption-side:bottom\">{caption}</caption>"));
+            tbl.push_str(&format!(
+                "<caption{figure_anchor} style=\"caption-side:bottom\">{caption}</caption>"
+            ));
         } else {
-            tbl.push_str(&format!("<caption>{caption}</caption>"));
+            tbl.push_str(&format!("<caption{figure_anchor}>{caption}</caption>"));
         }
     }
     // Detached rows render before the regular grid, but ownership and semantics are distinct:
@@ -936,9 +942,12 @@ fn emit_lines(lines: &[&Line], ctx: ProseCtx<'_>, out: &mut Vec<PageElement>) {
         }
         // list — but a numbered "list" of author-initial / year-bearing entries is
         // a bibliography, not a list; let it fall through to a paragraph.
-        if list_kind(&txt).is_some() && !(has_year(&txt) || initials_count(&txt) >= 2) {
+        let list = list_kind(&txt);
+        if list.is_some()
+            && !(list == Some(true) && (has_year(&txt) || initials_count(&txt) >= 2))
+        {
             flush_para!();
-            let ordered = list_kind(&txt).unwrap();
+            let ordered = list.unwrap();
             let mut item_htmls: Vec<String> = Vec::new();
             let mut list_box: Option<Bbox> = None;
             // Each <li> is its marker line PLUS any wrapped continuation lines (no
@@ -971,9 +980,13 @@ fn emit_lines(lines: &[&Line], ctx: ProseCtx<'_>, out: &mut Vec<PageElement>) {
                     prev_y = l.y;
                     i += 1;
                 }
-                item_htmls.push(esc(item.trim()));
+                if !item.trim().is_empty() {
+                    item_htmls.push(esc(item.trim()));
+                }
             }
-            out.push(PageElement::at(ElKind::List { ordered, items: item_htmls }, list_box));
+            if !item_htmls.is_empty() {
+                out.push(PageElement::at(ElKind::List { ordered, items: item_htmls }, list_box));
+            }
             continue;
         }
         // code / monospace block
@@ -1479,6 +1492,17 @@ pub(crate) fn render_doc_elements(
         let (raw_vectors, weak_vectors, page_rules) = vector::positioned_vectors_ruled(access, *_pid);
         let page_rules = turn_rules(turn, page_rules);
         let mut tables = extract::detect_tables_pos(dspans, &page_rules);
+        let image_rects: Vec<(usize, Rect)> = images
+            .iter()
+            .enumerate()
+            .map(|(index, image)| {
+                let (x0, x1, y0, y1) = dibox(image);
+                (index, Rect::new(x0, y0, x1, y1))
+            })
+            .collect();
+        for table in &mut tables {
+            table.extend_image_sidecar(dspans, &image_rects);
+        }
         // Vector figures that carry a "Figure N" caption — their *internal* text (a diagram's
         // node labels: "E[CLS] E1 … EN", "Trm Trm … Trm") now lands in the page span stream
         // (extract_spans recurses into Form XObjects), where detect_tables_pos reads the
@@ -1576,7 +1600,9 @@ pub(crate) fn render_doc_elements(
                 let blankets = xcov >= 0.6 && v_overlap && tr.height() < fr.height() * 1.2;
                 center_in || (x_aligned && v_overlap && ta < va) || blankets
             });
-            !(raster_covered || strip_in_plot || label_grid_in_fig)
+            !(raster_covered
+                || strip_in_plot
+                || (label_grid_in_fig && !t.table.has_image_sidecar()))
         });
         // ── L0: the tables this page DECLARES ──────────────────────────────────────────
         // A tagged PDF states its table structure in `/StructTreeRoot`; where a declaration
@@ -2248,7 +2274,7 @@ pub(crate) fn render_doc_elements(
                 // figure it actually abuts (0 when the caption is inside the figure box).
                 let edge = |yb: f32, yt: f32| if cy < yb { yb - cy } else if cy > yt { cy - yt } else { 0.0 };
                 let img_best = images.iter().enumerate()
-                    .filter(|(j, _)| img_cap[*j].is_none())
+                    .filter(|(j, _)| !table_image_owned[*j] && img_cap[*j].is_none())
                     .map(|(j, im)| {
                         let (_, _, yb, yt) = dibox(im);
                         (j, edge(yb, yt))
@@ -2278,7 +2304,23 @@ pub(crate) fn render_doc_elements(
                         svg_cap[k] = Some((num.clone(), html.clone()));
                         true
                     }
-                    (None, None) => false,
+                    (None, None) => tables
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, table)| {
+                            tab_cap[*j].is_none() && table.table.has_image_sidecar()
+                        })
+                        .map(|(j, table)| (j, edge(table.bbox.y0, table.bbox.y1)))
+                        .filter(|(_, distance)| *distance <= body * 6.0)
+                        .min_by(|a, b| {
+                            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(j, _)| {
+                            let table = &tables[j];
+                            let below = cy < (table.bbox.y1 + table.bbox.y0) * 0.5;
+                            tab_cap[j] = Some((num.clone(), html.clone(), below));
+                        })
+                        .is_some(),
                 }
             } else {
                 tables.iter().enumerate()
