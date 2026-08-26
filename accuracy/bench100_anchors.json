@@ -2,10 +2,10 @@
  "schema": 1,
  "what": "Committed trust anchors for the bench100 accuracy floor gate (dev-docs/bench/scripts/bench100_gate.py). The corpus, the ground truth and the frozen baseline are license-encumbered or local-only and stay gitignored; their HASHES are not, and committing the hashes is what gives the gate an external reference to verify against. Every run compares the live baseline to this file and exits 2 on any mismatch.",
  "how_to_verify": "python dev-docs/bench/scripts/bench100_gate.py --rescore   # exits 2 on any mismatch with this file. If it disagrees, `git diff accuracy/bench100_anchors.json` shows what someone changed; a legitimate move arrives as a reviewed diff to this file in the same commit as the phase that earned it.",
- "ratchet_seq": 11,
- "frozen_utc": "2026-08-25T12:23:12Z",
- "git_commit": "ddb33a5",
- "distillpdf_version": "0.1.3",
+ "ratchet_seq": 12,
+ "frozen_utc": "2026-08-26T14:13:44Z",
+ "git_commit": "6c83b64",
+ "distillpdf_version": "0.1.4",
  "pages": 256,
  "docs": 88,
  "scorer_sha256_16": "cf56a64b5df032d1",
@@ -15,11 +15,11 @@
   "groundtruth_judge3.json": "0e169c08f0360fdf"
  },
  "corpus_sha256_16": "d576d3cc536f67ae",
- "baseline_sha256_16": "ea62cdda11b9aa72",
+ "baseline_sha256_16": "ec9a509f162c4105",
  "floors": {
   "ALL|headings": 0.6616,
   "ALL|images": 0.632,
-  "ALL|lists": 0.4744,
+  "ALL|lists": 0.4793,
   "ALL|paragraphs": 0.6606,
   "ALL|tables": 0.6264,
   "booktabs|headings": 0.6571,
@@ -29,7 +29,7 @@
   "booktabs|tables": 0.5446,
   "borderless|headings": 0.6853,
   "borderless|images": 0.5124,
-  "borderless|lists": 0.4819,
+  "borderless|lists": 0.495,
   "borderless|paragraphs": 0.7084,
   "borderless|tables": 0.4934,
   "full-grid|headings": 0.5805,
@@ -40,8 +40,8 @@
  "fp_ceilings": {
   "ALL|headings": 0.7333,
   "ALL|images": 0.0846,
-  "ALL|lists": 0.0635,
-  "ALL|paragraphs": 0.6103,
+  "ALL|lists": 0.0422,
+  "ALL|paragraphs": 0.5971,
   "ALL|tables": 0.0922,
   "booktabs|headings": 0.7109,
   "booktabs|images": 0.0288,
@@ -50,12 +50,12 @@
   "booktabs|tables": 0.1868,
   "borderless|headings": 0.78,
   "borderless|images": 0.0675,
-  "borderless|lists": 0.1092,
+  "borderless|lists": 0.0675,
   "borderless|paragraphs": 0.7743,
   "borderless|tables": 0.0542,
   "full-grid|headings": 0.8997,
   "full-grid|images": 0.1911,
   "full-grid|lists": 0.0494,
-  "full-grid|paragraphs": 0.5201
+  "full-grid|paragraphs": 0.4898
  }
 }
