@@ -2290,6 +2290,73 @@ def gen_undecodable_codec():
         "kind": "codec-unsupported",
     }
 
+def _tiff_lzw_stream(img):
+    """LZW-compress a PIL image into one PDF-ready ``/LZWDecode`` stream by writing it as
+    a single-strip TIFF (PDF LZW and TIFF LZW share the MSB bit order and the
+    ``EarlyChange=1`` width convention) and slicing the strip back out. Using Pillow's C
+    encoder sidesteps hand-rolling LZW — the strip is a reference-grade stream."""
+    from PIL import TiffImagePlugin
+    saved = TiffImagePlugin.STRIP_SIZE
+    TiffImagePlugin.STRIP_SIZE = 1 << 31  # one strip, whatever the image size
+    try:
+        buf = io.BytesIO()
+        img.save(buf, "TIFF", compression="tiff_lzw")
+    finally:
+        TiffImagePlugin.STRIP_SIZE = saved
+    buf.seek(0)
+    from PIL import Image
+    with Image.open(buf) as t:
+        offsets = t.tag_v2[273]  # StripOffsets
+        counts = t.tag_v2[279]   # StripByteCounts
+    assert len(offsets) == 1, "the fixture stream must be a single strip"
+    return buf.getvalue()[offsets[0]:offsets[0] + counts[0]]
+
+
+def gen_oversized_raster():
+    """Two decodable rasters whose declared pixel counts exceed the 64 Mpx decode cap
+    (``raster::MAX_IMAGE_PIXELS``) — the shape that made a real report's full-page
+    correlation panels (98.8 and 167 Mpx scans) vanish without even a placeholder,
+    leaving their "Figure N" captions as empty ``<figure>`` shells.
+
+    ``/ImFlate`` is 9000x8000 gray FlateDecode; ``/ImLzw`` is 8300x8300 gray LZWDecode
+    (the real report's filter, and the crate's only LZW raster coverage). Both must
+    survive as figures with anchored captions, decoded at a subsampled step (both land at
+    step 2), never dropped. The streams are uniform-gray so 72 Mpx compresses to a few
+    hundred bytes."""
+    from PIL import Image
+    pdf = os.path.join(OUT, "oversized_raster.pdf")
+    flate_w, flate_h = 9000, 8000
+    lzw_w, lzw_h = 8300, 8300
+    flate = zlib.compress(b"\x80" * (flate_w * flate_h), 9)
+    lzw = _tiff_lzw_stream(Image.new("L", (lzw_w, lzw_h), 96))
+    stream = b"\n".join([
+        b"BT /F1 15 Tf 72 750 Td (Oversized Rasters Still Render) Tj ET",
+        b"q 440 0 0 300 86 420 cm /ImFlate Do Q",
+        b"BT /F1 10 Tf 86 400 Td (Figure 1 Regional seismic base map) Tj ET",
+        b"q 440 0 0 300 86 80 cm /ImLzw Do Q",
+        b"BT /F1 10 Tf 86 60 Td (Figure 2 Correlation panel mosaic) Tj ET",
+    ])
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << "
+            b"/Font << /F1 7 0 R >> /XObject << /ImFlate 5 0 R /ImLzw 6 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+        5: (b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceGray "
+            b"/BitsPerComponent 8 /Filter /FlateDecode /Length %d >>\nstream\n%s\nendstream"
+            % (flate_w, flate_h, len(flate), flate)),
+        6: (b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceGray "
+            b"/BitsPerComponent 8 /Filter /LZWDecode /Length %d >>\nstream\n%s\nendstream"
+            % (lzw_w, lzw_h, len(lzw), lzw)),
+        7: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+    }
+    _assemble_pdf(objs, pdf)
+    GT["oversized_raster.pdf"] = {
+        "flate": {"declared": [flate_w, flate_h], "decoded": [flate_w // 2, flate_h // 2]},
+        "lzw": {"declared": [lzw_w, lzw_h], "decoded": [lzw_w // 2, lzw_h // 2]},
+        "captions": ["Figure 1 Regional seismic base map", "Figure 2 Correlation panel mosaic"],
+    }
+
 
 def gen_codec_basemap():
     """The same undecodable image twice: once as a BASEMAP under the ink, once as the figure.
@@ -6493,6 +6560,7 @@ def main():
     gen_panel_table()
     gen_tagged_table()
     gen_undecodable_codec()
+    gen_oversized_raster()
     gen_codec_basemap()
     gen_no_spurious_figs()
     gen_links()

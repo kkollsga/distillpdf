@@ -1115,8 +1115,12 @@ fn walk(
                         return false;
                     };
                     // Record geometry + pixel dims; uri building / grid stitching happens
-                    // in finalize() once the whole page's tiles are known.
-                    let pw = value.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0) as u32;
+                    // in finalize() once the whole page's tiles are known. `pw` is the
+                    // EFFECTIVE width — declared /Width over the decoder's subsample step
+                    // — because grid stitching derives its canvas scale from it, and the
+                    // declared width of an oversized tile names pixels the decode won't have.
+                    let declared = value.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0).max(0) as u32;
+                    let pw = declared / crate::raster::sample_step(access, res, &value.dict).max(1) as u32;
                     out.push(RawTile { src: TileSrc::Object(id), x0: p.x0, x1: p.x1, y0: p.y0, y1: p.y1, pw, ctm: p.ctm, res: Rc::clone(res), seq: PaintSeq::at(here, opi), clip: p.crop, full: p.full });
                     false
                 } else {
@@ -1165,10 +1169,15 @@ fn walk(
                     Some(lopdf::Object::Stream(s)) => Some(Rc::new(crate::raster::normalize_inline_image(s))),
                     _ => None,
                 };
+                // Effective width, as for the XObject arm above — an inline image can in
+                // principle also declare past the subsample cap.
                 let pw = inline
                     .as_ref()
-                    .and_then(|s| s.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()))
-                    .unwrap_or(0) as u32;
+                    .map(|s| {
+                        let declared = s.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0).max(0) as u32;
+                        declared / crate::raster::sample_step(access, res, &s.dict).max(1) as u32
+                    })
+                    .unwrap_or(0);
                 out.push(RawTile { src: TileSrc::Inline(inline), x0: p.x0, x1: p.x1, y0: p.y0, y1: p.y1, pw, ctm: p.ctm, res: Rc::clone(res), seq: PaintSeq::at(here, opi), clip: p.crop, full: p.full });
             }
             _ => {}
@@ -2008,7 +2017,9 @@ mod tests {
         // mode disagreed with inline mode in BOTH directions on the same page:
         // `colorspace_images.pdf` emitted 3 `<image N>` placeholders for 2 embedded images.
         // Rederiving it from `raster::samples_decodable` makes the two agree by construction.
-        for name in ["colorspace_images.pdf", "render_samples.pdf", "undrawn_image.pdf"] {
+        // `oversized_raster.pdf` pins the same agreement for images past the pixel cap:
+        // both modes must now see them (subsampled), where they used to see neither.
+        for name in ["colorspace_images.pdf", "render_samples.pdf", "undrawn_image.pdf", "oversized_raster.pdf"] {
             let path = format!("{}/../tests/fixtures_pdf/{name}", env!("CARGO_MANIFEST_DIR"));
             let doc = Document::load(&path).unwrap_or_else(|e| panic!("{name} must load: {e}"));
             for page_id in doc.get_pages().values() {
@@ -2017,5 +2028,16 @@ mod tests {
                 assert_eq!(placeholders, inline, "{name}: placeholder count must match the embedded count");
             }
         }
+    }
+
+    #[test]
+    fn oversized_rasters_render_as_figures_not_holes() {
+        // The two over-64-Mpx images (Flate and LZW) that used to vanish from every mode:
+        // both must place, and placeholder mode must count them without decoding.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures_pdf/oversized_raster.pdf");
+        let doc = Document::load(path).expect("fixture must load");
+        let page_id = *doc.get_pages().values().next().expect("one page");
+        let placed = positioned_images(&test_adapter(&doc), page_id, false);
+        assert_eq!(placed.len(), 2, "both oversized rasters must place");
     }
 }

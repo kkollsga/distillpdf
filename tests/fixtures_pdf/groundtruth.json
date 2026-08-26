@@ -1038,6 +1038,32 @@
       "marker 0040-26"
     ]
   },
+  "oversized_raster.pdf": {
+    "captions": [
+      "Figure 1 Regional seismic base map",
+      "Figure 2 Correlation panel mosaic"
+    ],
+    "flate": {
+      "declared": [
+        9000,
+        8000
+      ],
+      "decoded": [
+        4500,
+        4000
+      ]
+    },
+    "lzw": {
+      "declared": [
+        8300,
+        8300
+      ],
+      "decoded": [
+        4150,
+        4150
+      ]
+    }
+  },
   "page_chrome.pdf": {
     "body_sample": "Drilling engineering constrains the well trajectories.",
     "footer_sample": "Page 3 of 6",

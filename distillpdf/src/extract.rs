@@ -497,10 +497,17 @@ fn extract_images_inner(
                                 };
                                 let filters = image_filters(dict);
                                 let mut format = filter_to_format(&Some(filters));
+                                let (mut width, mut height) = (width, height);
                                 let mut data = if format == "raw" {
                                     match assemble_png(access, &scope, stream) {
                                         Some(png) => {
                                             format = "png";
+                                            // An oversized image decodes subsampled; the row
+                                            // must state the dims the PNG actually has, not
+                                            // the declared ones it no longer does.
+                                            let step = crate::raster::sample_step(access, &scope, dict).max(1) as i64;
+                                            width = (width + step - 1) / step;
+                                            height = (height + step - 1) / step;
                                             png
                                         }
                                         None => stream.content.clone(),
@@ -551,9 +558,14 @@ fn extract_images_inner(
                     continue;
                 };
                 let mut format = "raw";
+                let (mut width, mut height) = (width, height);
                 let data = match assemble_png(access, &scope, &stream) {
                     Some(png) => {
                         format = "png";
+                        // Subsampled decode: state the PNG's real dims (as above).
+                        let step = crate::raster::sample_step(access, &scope, dict).max(1) as i64;
+                        width = (width + step - 1) / step;
+                        height = (height + step - 1) / step;
                         png
                     }
                     None => stream.content.clone(),

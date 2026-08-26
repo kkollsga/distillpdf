@@ -461,6 +461,23 @@ def test_inline_images_are_extracted_and_rendered():
     assert gt["caption"] in html
 
 
+def test_oversized_rasters_extract_subsampled_and_render_as_captioned_figures():
+    """Images declared past the 64 Mpx decode cap (a 72 Mpx Flate gray and a 68.9 Mpx LZW
+    gray — the filter of the real report's vanished correlation panels) must decode at a
+    subsample step instead of disappearing: extract_images() hands back real PNGs whose
+    rows state the SUBSAMPLED dimensions, and the page renders both as figures with their
+    captions anchored — never as caption-only shells."""
+    gt = GT["oversized_raster.pdf"]
+    pdf = distillpdf.Pdf.open(os.path.join(FIX, "oversized_raster.pdf"))
+    rows = [(i["width"], i["height"], i["format"]) for i in pdf.extract_images()]
+    assert (gt["flate"]["decoded"][0], gt["flate"]["decoded"][1], "png") in rows
+    assert (gt["lzw"]["decoded"][0], gt["lzw"]["decoded"][1], "png") in rows
+    html = pdf.to_html(mode="page", image_mode="drop", return_string=True)
+    assert html.count("<image ") == 2, "both oversized rasters need placeholders"
+    for caption in gt["captions"]:
+        assert re.search(r"<figcaption[^>]*>(?:<b>)?%s" % re.escape(caption), html), caption
+
+
 def test_medium_weight_face_is_not_bold():
     """A spelled-out 'Medium' BaseFont (CSS weight 500, a body weight) must render as
     regular text, while a genuinely bold face and the Nimbus '-Medi' heading

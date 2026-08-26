@@ -406,6 +406,14 @@ pub(crate) fn cs_model(
 /// under two names (`MAX_ASSEMBLE_*` / `MAX_IMAGE_*`) before this.
 pub(crate) const MAX_IMAGE_DIM: i64 = 0x1FFFF; // 131071 px per side
 pub(crate) const MAX_IMAGE_PIXELS: usize = 64 << 20; // 64 M px
+/// Ceiling on the DECLARED decompressed sample bytes (stride × height) the sample decoder
+/// will materialize for an image whose pixel count exceeds [`MAX_IMAGE_PIXELS`]. Such an
+/// image is decoded SUBSAMPLED (see [`SamplePlan::step`]) — the output allocation is
+/// bounded by the pixel cap, but the input buffer is still the full decompressed stream,
+/// and this is the bound that keeps a hostile declaration from turning the subsample
+/// route into a decompression-bomb OOM. 1 GiB admits a ~340 Mpx RGB8 scan (a full-page
+/// 1400-DPI plot is ~167 Mpx) while refusing absurd declarations outright.
+pub(crate) const MAX_SAMPLE_BYTES: usize = 1 << 30; // 1 GiB
 
 /// Are these declared dimensions safe to allocate from? Refusing them before the raw
 /// buffer is reserved is what prevents a decompression-bomb OOM.
@@ -446,6 +454,13 @@ struct SamplePlan {
     bpc: usize,
     w: usize,
     h: usize,
+    /// Decode every `step`-th pixel of every `step`-th row: 1 for an image within
+    /// [`MAX_IMAGE_PIXELS`], else the smallest factor that brings the OUTPUT under the
+    /// cap. A 167 Mpx full-page scan placed on a 500 pt box carries ~1400 DPI — far past
+    /// anything the render path can show — so nearest-neighbour subsampling loses nothing
+    /// visible, and it is what lets an oversized figure render at all instead of
+    /// vanishing without even a placeholder.
+    step: usize,
 }
 
 /// The dictionary-only half of the decode gate — see [`SamplePlan`]. Touches no stream
@@ -465,8 +480,9 @@ fn sample_plan(
         return None;
     }
     let (wu, hu) = (w as usize, h as usize);
-    if wu.checked_mul(hu)? > MAX_IMAGE_PIXELS {
-        return None;
+    let mut step = 1usize;
+    while wu.div_ceil(step).checked_mul(hu.div_ceil(step))? > MAX_IMAGE_PIXELS {
+        step += 1;
     }
     // A stencil mask has no colour space and exactly one 1-bit sample per pixel (§8.9.6.2).
     let is_mask = dict.get(b"ImageMask").and_then(|o| o.as_bool()).unwrap_or(false);
@@ -480,7 +496,18 @@ fn sample_plan(
     if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
         return None;
     }
-    Some(SamplePlan { cs, bpc: bpc as usize, w: wu, h: hu })
+    let (bpc, nc) = (bpc as usize, cs.components());
+    if step > 1 {
+        // The subsample bounds the OUTPUT, but the decoder still materializes the full
+        // decompressed input; refuse declarations past the input ceiling — that bound is
+        // what keeps the over-cap route from becoming a decompression-bomb OOM. In-cap
+        // images (step 1) keep their historical behaviour, ceiling-free.
+        let stride = wu.checked_mul(nc)?.checked_mul(bpc)?.div_ceil(8);
+        if stride.checked_mul(hu)? > MAX_SAMPLE_BYTES {
+            return None;
+        }
+    }
+    Some(SamplePlan { cs, bpc, w: wu, h: hu, step })
 }
 
 /// Can this image's *samples* be decoded, judged from its dictionary alone (no stream
@@ -533,7 +560,9 @@ impl Samples {
 ///
 /// Handles 1/2/4/8/16 bits per component, the `/Decode` array, `/ImageMask` stencils, and
 /// Gray/RGB/CMYK/ICCBased/Indexed colour spaces — including a space *named* in `res`
-/// (`/ColorSpace /CS0`). Returns `None` for anything it cannot reduce faithfully, rather
+/// (`/ColorSpace /CS0`). An image declared past [`MAX_IMAGE_PIXELS`] decodes SUBSAMPLED
+/// per [`SamplePlan::step`] (within the [`MAX_SAMPLE_BYTES`] input ceiling) instead of
+/// being refused. Returns `None` for anything it cannot reduce faithfully, rather
 /// than emitting a confidently wrong picture; a caller then reports the image honestly
 /// (`format:"raw"` on the extract path, no `<img>` on the render path).
 ///
@@ -546,8 +575,10 @@ pub(crate) fn decode_samples(
     stream: &lopdf::Stream,
 ) -> Option<Samples> {
     let dict = &stream.dict;
-    let SamplePlan { cs, bpc, w: wu, h: hu } = sample_plan(access, res, dict)?;
+    let SamplePlan { cs, bpc, w: wu, h: hu, step } = sample_plan(access, res, dict)?;
     let nc = cs.components();
+    // Output dimensions after the subsample (the loop shapes below yield exactly these).
+    let (ow, oh) = (wu.div_ceil(step), hu.div_ceil(step));
 
     let samples = content_bytes(stream);
     // Rows are padded to a byte boundary (§8.9.5.1).
@@ -561,7 +592,7 @@ pub(crate) fn decode_samples(
     let gray_out = cs.is_gray();
     let out_ch = if gray_out { 1 } else { 3 };
     let mut out: Vec<u8> = Vec::new();
-    out.try_reserve_exact(wu.checked_mul(hu)?.checked_mul(out_ch)?).ok()?;
+    out.try_reserve_exact(ow.checked_mul(oh)?.checked_mul(out_ch)?).ok()?;
 
     // A spot space's transform, evaluated once over the tint grid (see [`tint_lut`]) so the
     // per-pixel cost is one indexed read.
@@ -572,8 +603,8 @@ pub(crate) fn decode_samples(
 
     // One pixel's colour-space samples, reused per pixel to avoid a per-pixel allocation.
     let mut comp = vec![0u8; nc.max(4)];
-    for row in samples.chunks_exact(stride).take(hu) {
-        for x in 0..wu {
+    for row in samples.chunks_exact(stride).take(hu).step_by(step) {
+        for x in (0..wu).step_by(step) {
             for (j, slot) in comp.iter_mut().enumerate().take(nc) {
                 let raw = sample_at(row, x * nc + j, bpc);
                 *slot = match &cs {
@@ -629,12 +660,24 @@ pub(crate) fn decode_samples(
         }
     }
 
-    let (w, h) = (wu as u32, hu as u32);
+    let (w, h) = (ow as u32, oh as u32);
     if gray_out {
         Some(Samples::Gray(image::GrayImage::from_raw(w, h, out)?))
     } else {
         Some(Samples::Rgb(image::RgbImage::from_raw(w, h, out)?))
     }
+}
+
+/// The subsample step [`decode_samples`] would apply to this image (1 = full resolution),
+/// judged from its dictionary alone. For callers that record the image's *effective*
+/// pixel width (grid stitching picks its canvas scale from it) — the declared `/Width`
+/// overstates a subsampled tile's resolution by this factor.
+pub(crate) fn sample_step(
+    access: &dyn crate::access::DocumentAccess,
+    res: &ResourceScope,
+    dict: &Dictionary,
+) -> usize {
+    sample_plan(access, res, dict).map_or(1, |plan| plan.step)
 }
 
 /// A real PNG file from an image XObject's samples: [`decode_samples`] plus the encoder.
@@ -1013,6 +1056,68 @@ mod tests {
         assert!(!dims_sane(65536, 65536));
         // The product is computed saturating, so it cannot wrap into a "sane" answer.
         assert!(!dims_sane(u32::MAX, u32::MAX));
+    }
+
+    #[test]
+    fn over_pixel_cap_images_plan_a_subsample_step_instead_of_refusing() {
+        let doc = Document::with_version("1.5");
+        let res = Dictionary::new();
+        let plan_for = |w: i64, h: i64| {
+            let d = dictionary! {
+                "Width" => w, "Height" => h,
+                "ColorSpace" => Object::Name(b"DeviceGray".to_vec()),
+                "BitsPerComponent" => 8i64,
+            };
+            super::sample_plan(&test_adapter(&doc), &ResourceScope::test_owned(&res), &d)
+        };
+        // In-cap: full resolution.
+        assert_eq!(plan_for(8192, 8192).expect("in-cap image must plan").step, 1);
+        // Just over the 64 Mpx cap (the Cerisa 98.8/167 Mpx panels land here too): step 2.
+        let plan = plan_for(9000, 8000).expect("over-cap image must still plan");
+        assert_eq!(plan.step, 2);
+        assert!((9000usize.div_ceil(2)) * (8000usize.div_ceil(2)) <= MAX_IMAGE_PIXELS);
+        // Far over the pixel cap but under the 1 GiB input ceiling (32k × 32k gray =
+        // 1.02 GB): whatever step it takes to land under the output cap.
+        let plan = plan_for(32_000, 32_000).expect("huge but in-ceiling image must plan");
+        assert!(32_000usize.div_ceil(plan.step) * 32_000usize.div_ceil(plan.step) <= MAX_IMAGE_PIXELS);
+        // Past the input ceiling (100k × 100k gray = 10 GB of samples): refused outright —
+        // the subsample route must not become a decompression-bomb OOM.
+        assert!(plan_for(100_000, 100_000).is_none());
+        // The ceiling does NOT bind in-cap images (historical behaviour kept).
+        let d = dictionary! {
+            "Width" => 4096i64, "Height" => 4096i64,
+            "ColorSpace" => Object::Name(b"DeviceRGB".to_vec()),
+            "BitsPerComponent" => 16i64,
+        };
+        assert!(samples_decodable(&doc, &res, &d));
+    }
+
+    #[test]
+    fn oversized_decode_subsamples_to_capped_dims_and_true_pixels() {
+        // 16400×4100 gray = 67.24 Mpx, just past the 64 Mpx (67 108 864) cap → step 2.
+        // Unfiltered samples so the test spends its time in the pixel loop, not a codec.
+        let (w, h) = (16400usize, 4100usize);
+        let mut samples = vec![0u8; w * h];
+        for (i, v) in samples.iter_mut().enumerate() {
+            let (x, y) = (i % w, i / w);
+            *v = ((x * 7 + y * 13) % 251) as u8;
+        }
+        let doc = Document::with_version("1.5");
+        let res = Dictionary::new();
+        let d = dictionary! {
+            "Width" => w as i64, "Height" => h as i64,
+            "ColorSpace" => Object::Name(b"DeviceGray".to_vec()),
+            "BitsPerComponent" => 8i64,
+        };
+        let decoded = decode_samples(&doc, &res, &Stream::new(d, samples.clone()))
+            .expect("over-cap image must decode subsampled");
+        let Samples::Gray(g) = decoded else { panic!("gray in, gray out") };
+        assert_eq!((g.width(), g.height()), (w.div_ceil(2) as u32, h.div_ceil(2) as u32));
+        // Nearest-neighbour: output (ox, oy) is source (2·ox, 2·oy), no averaging.
+        for (ox, oy) in [(0u32, 0u32), (1, 0), (0, 1), (8199, 2049), (137, 1234)] {
+            let src = samples[(2 * oy as usize) * w + 2 * ox as usize];
+            assert_eq!(g.get_pixel(ox, oy).0[0], src, "pixel ({ox},{oy})");
+        }
     }
 
     #[test]
