@@ -70,3 +70,28 @@ def test_inline_fig_ref_not_a_caption():
     probe = GT["figures_nodot.pdf"]["inline_xref"]  # "As shown in Fig 5 the trend"
     assert not any(probe[:20] in c for c in _figcaps(h)), "inline ‘As shown in Fig 5 …’ wrongly captioned"
     assert probe[:20] in text(h), "inline xref text lost from body"
+
+
+# ----- Bare cross-reference labels vs real captions -----
+def test_bare_label_loses_to_descriptive_caption_and_is_suppressed():
+    """A hyperlinked bare "Figure 7" line hovering above the graphic (Word's
+    cross-reference field) must not claim the figure away from the real caption below —
+    and it must not survive as a duplicate fig-7-2 shell or a stray paragraph."""
+    h = html("bare_caption_label.pdf")
+    g = GT["bare_caption_label.pdf"]
+    fig7 = [f for f in _figures(h) if 'id="fig-7"' in f]
+    assert len(fig7) == 1, "exactly one fig-7"
+    assert re.search(r"<img[ >]|<image ", fig7[0]), "fig-7 must keep its graphic"
+    assert g["caption"] in re.sub(r"<[^>]+>", "", fig7[0]), "fig-7 must carry the descriptive caption"
+    assert 'id="fig-7-2"' not in h, "the bare label must not mint a duplicate shell"
+    assert text(h).count("Figure 7") == 1, "the bare label line must be suppressed"
+
+
+def test_lone_bare_caption_still_anchors():
+    """The negative control: a bare "Figure 8" with no descriptive sibling anywhere is a
+    real (if terse) caption and must keep anchoring to its graphic."""
+    h = html("bare_caption_label.pdf")
+    fig8 = [f for f in _figures(h) if 'id="fig-8"' in f]
+    assert len(fig8) == 1, "fig-8 must exist"
+    assert re.search(r"<img[ >]|<image ", fig8[0]), "fig-8 must keep its graphic"
+    assert "Figure 8" in re.sub(r"<[^>]+>", "", fig8[0])

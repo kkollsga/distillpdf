@@ -141,6 +141,11 @@
   "banded_one_table.pdf": {
     "tables": 1
   },
+  "bare_caption_label.pdf": {
+    "bare": "Figure 7",
+    "caption": "Figure 7 Structural cross-section of the northern flank",
+    "lone": "Figure 8"
+  },
   "booktabs_wrapped.pdf": {
     "tables": 1
   },

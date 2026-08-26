@@ -2223,25 +2223,47 @@ pub(crate) fn render_doc_elements(
             let last: String = pt.rsplit(char::is_whitespace).next().unwrap_or("").chars().filter(|c| c.is_alphabetic()).flat_map(char::to_lowercase).collect();
             ref_lead(&last)
         };
-        let cap_lines: Vec<(usize, bool, String)> = lines
+        // (line idx, is_figure, number, tail-is-bare) — bare meaning the line is just the
+        // label ("Figure 5.13") with nothing alphanumeric after the number.
+        let mut cap_lines: Vec<(usize, bool, String, bool)> = lines
             .iter()
             .enumerate()
             .filter_map(|(idx, l)| {
                 let t = l.text();
-                caption_label(&t).and_then(|(f, n)| {
+                caption_parts(&t).and_then(|(f, n, tail)| {
                     // Drop multi-page "Figure N—Continued" markers — re-emitting them would
                     // duplicate the original figure's id and pollute the output with empty
                     // continuation captions.
+                    let bare = !tail.chars().any(|c| c.is_alphanumeric());
                     (!inside_table_frame(l.x0, l.x1, l.y)
                         && !is_ref_continuation(idx)
                         && !is_inline_xref(&t)
                         && !caption_is_continued(&t)
                         && !is_dotleader_toc(&lines, idx))
-                        .then_some((idx, f, n))
+                        .then_some((idx, f, n, bare))
                 })
             })
             .collect();
         let mut consumed_caption = std::collections::HashSet::new();
+        // A bare label that SHARES its number with a descriptive caption on the same page
+        // is a cross-reference artifact (Word writes the field as its own hyperlinked
+        // "Figure 5.13" line hovering at the figure's edge), not a second caption. Left in,
+        // it out-anchors the real caption — it hugs the graphic — and exiles the
+        // descriptive one to a duplicate "fig-N-2" empty shell. Suppress it entirely: its
+        // number survives in the caption that wins, and the in-prose cross-reference keeps
+        // the link. A LONE bare caption (no descriptive twin) still anchors as before.
+        let descriptive: std::collections::HashSet<(bool, &str)> = cap_lines
+            .iter()
+            .filter(|(_, _, _, bare)| !bare)
+            .map(|(_, f, n, _)| (*f, n.as_str()))
+            .collect();
+        let suppressed: Vec<usize> = cap_lines
+            .iter()
+            .filter(|(_, f, n, bare)| *bare && descriptive.contains(&(*f, n.as_str())))
+            .map(|(idx, ..)| *idx)
+            .collect();
+        cap_lines.retain(|(idx, ..)| !suppressed.contains(idx));
+        consumed_caption.extend(suppressed);
         let mut img_cap: Vec<Option<(String, String)>> = vec![None; images.len()]; // (num, html)
         let mut svg_cap: Vec<Option<(String, String)>> = vec![None; vectors.len()]; // (num, html)
         let mut tab_cap: Vec<Option<(String, String, bool)>> = vec![None; tables.len()]; // (num, html, below)
@@ -2254,7 +2276,7 @@ pub(crate) fn render_doc_elements(
         let mut standalone_meta: Vec<(String, String, bool)> = Vec::new();
         // Each caption is gathered as its full (multi-line) block and anchored to the
         // nearest figure (image) / table by y; unanchored captions stand alone.
-        for &(idx, is_fig, ref num) in &cap_lines {
+        for &(idx, is_fig, ref num, _) in &cap_lines {
             if consumed_caption.contains(&idx) {
                 continue; // already swallowed as a previous caption's continuation
             }

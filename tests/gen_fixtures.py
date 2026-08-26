@@ -2357,6 +2357,51 @@ def gen_oversized_raster():
         "captions": ["Figure 1 Regional seismic base map", "Figure 2 Correlation panel mosaic"],
     }
 
+def gen_bare_caption_label():
+    """A bare, hyperlinked "Figure 7" cross-reference line hovering just ABOVE a figure,
+    with the real caption ("Figure 7 " + a descriptive title) BELOW it at a larger gap —
+    the Word cross-reference-field shape that stole a real report's figures from their
+    captions: nearest-edge anchoring bound the bare line to the graphic and exiled the
+    descriptive caption to a duplicate ``fig-N-2`` empty shell.
+
+    The bare line must lose to its same-number descriptive sibling and be suppressed.
+    The negative control is Figure 8 below: a LONE bare caption with no descriptive
+    sibling anywhere — it must keep anchoring as the figure's caption."""
+    pdf = os.path.join(OUT, "bare_caption_label.pdf")
+    img = _flate_image(8, 2, 2, b"/DeviceRGB", 8,
+                       bytes((40, 90, 170, 90, 170, 40, 170, 40, 90, 200, 200, 60)))
+    stream = b"\n".join([
+        b"BT /F2 16 Tf 72 750 Td (Bare Caption Labels) Tj ET",
+        b"BT /F1 10 Tf 150 715 Td (Figure 7) Tj ET",
+        b"q 300 0 0 150 150 560 cm /ImA Do Q",
+        b"BT /F1 10 Tf 150 538 Td (Figure 7 Structural cross-section of the northern flank) Tj ET",
+        b"q 300 0 0 150 150 300 cm /ImB Do Q",
+        b"BT /F1 10 Tf 150 278 Td (Figure 8) Tj ET",
+    ])
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [6 0 R] /Resources << "
+            b"/Font << /F1 5 0 R /F2 7 0 R >> /XObject << /ImA 8 0 R /ImB 9 0 R >> >> /Contents 4 0 R >>"),
+        4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+        5: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        # The bare label is a link, as Word writes its cross-reference fields.
+        6: (b"<< /Type /Annot /Subtype /Link /Rect [150 713 200 725] /Border [0 0 0] "
+            b"/Dest [3 0 R /XYZ 0 792 null] >>"),
+        7: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
+        8: img,
+        9: _flate_image(9, 2, 2, b"/DeviceRGB", 8,
+                        bytes((210, 60, 40, 60, 210, 40, 40, 60, 210, 230, 190, 40))),
+    }
+    _assemble_pdf(objs, pdf)
+    GT["bare_caption_label.pdf"] = {
+        "caption": "Figure 7 Structural cross-section of the northern flank",
+        "bare": "Figure 7",
+        "lone": "Figure 8",
+    }
+
+
+
 
 def gen_codec_basemap():
     """The same undecodable image twice: once as a BASEMAP under the ink, once as the figure.
@@ -6561,6 +6606,7 @@ def main():
     gen_tagged_table()
     gen_undecodable_codec()
     gen_oversized_raster()
+    gen_bare_caption_label()
     gen_codec_basemap()
     gen_no_spurious_figs()
     gen_links()
