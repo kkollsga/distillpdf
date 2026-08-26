@@ -918,6 +918,16 @@
     ],
     "rows": 2
   },
+  "mixed_orientation_chrome.pdf": {
+    "footnote": "A footnote that must survive the bottom band.",
+    "header": "PL999 Fixture - Concept - General",
+    "landscape_body": "A wide correlation panel needs the landscape sheet.",
+    "landscape_pages": [
+      4,
+      7
+    ],
+    "portrait_body": "Regional mapping frames the exploration story."
+  },
   "mixed_sidecar_table.pdf": {
     "assets": 1,
     "caption": "Figure 22. Generated sidecar image and text components",

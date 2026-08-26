@@ -3813,6 +3813,83 @@ def gen_page_chrome():
     }
 
 
+def gen_mixed_orientation_chrome():
+    """A running header at a FIXED DISTANCE FROM THE TOP EDGE across mixed portrait and
+    landscape pages — the shape that leaked a real report's header on exactly its five
+    landscape pages.
+
+    Eight pages: six portrait (612x792) and two landscape (792x612, pages 4 and 7), every
+    one carrying the same 8pt header 80pt below its top edge and a "Page N of 8" footer
+    42pt above the bottom. A per-page fractional band (12% of page height = 73pt on
+    landscape) puts the landscape headers OUT of band, and absolute-y row keys split the
+    two orientations into separate clusters that each miss the coverage floor — so the
+    detector must band and bucket by distance-from-edge with a document-level band size.
+    The survivor traps stay: page 5 repeats the header string mid-page as a divider title
+    (position must save it) and page 2 has a one-off footnote in the bottom band (text
+    recurrence must save it)."""
+    pdf = os.path.join(OUT, "mixed_orientation_chrome.pdf")
+    HEADER = b"PL999 Fixture - Concept - General"
+    BODY = [
+        b"Regional mapping frames the exploration story.",
+        b"Core plugs anchor the porosity transforms firmly.",
+        b"Pressure gradients separate the two aquifer cells.",
+        b"A wide correlation panel needs the landscape sheet.",
+        b"Interlude,",
+        b"Facies belts migrate basinward through the interval.",
+        b"A second panel compares the depth conversion cases.",
+        b"Development phasing follows the drainage strategy.",
+    ]
+    SECOND = [
+        b"Its observations accumulate from three vintage surveys.",
+        b"The uncertainty envelopes tighten with every new well.",
+        b"Interference testing confirmed the compartment model.",
+        b"Sixteen wells hang from the datum on a single spread.",
+        b"a divider page interrupts the running argument here.",
+        b"Their geometries echo the modern shelf analogues well.",
+        b"Both cases keep the crestal wells inside the closure.",
+        b"Early water injection protects the plateau target.",
+    ]
+    n = 8
+    contents = []
+    boxes = []
+    for i in range(1, n + 1):
+        landscape = i in (4, 7)
+        w, h = (792, 612) if landscape else (612, 792)
+        boxes.append((w, h))
+        body = [
+            b"BT /F1 8 Tf 72 %d Td (%s) Tj ET" % (h - 80, HEADER),
+            b"BT /F1 8 Tf %d 42 Td (Page %d of %d) Tj ET" % (w // 2, i, n),
+            b"BT /F1 10 Tf 72 %d Td (%s) Tj ET" % (h // 2 + 20, BODY[i - 1]),
+            b"BT /F1 10 Tf 72 %d Td (%s) Tj ET" % (h // 2, SECOND[i - 1]),
+        ]
+        if i == 1:
+            body.insert(2, b"BT /F2 16 Tf 72 700 Td (Mixed Orientation Chrome Fixture) Tj ET")
+        if i == 2:
+            body.append(b"BT /F1 8 Tf 72 54 Td (1. A footnote that must survive the bottom band.) Tj ET")
+        if i == 5:
+            body.append(b"BT /F2 14 Tf 150 500 Td (%s) Tj ET" % HEADER)
+        contents.append(b"\n".join(body))
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [%s] /Count %d >>" % (b" ".join(b"%d 0 R" % (3 + 2 * i) for i in range(n)), n),
+        19: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        20: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
+    }
+    for i, c in enumerate(contents):
+        w, h = boxes[i]
+        objs[3 + 2 * i] = (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] /Resources << "
+                           b"/Font << /F1 19 0 R /F2 20 0 R >> >> /Contents %d 0 R >>" % (w, h, 4 + 2 * i))
+        objs[4 + 2 * i] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c), c)
+    _assemble_pdf(objs, pdf)
+    GT["mixed_orientation_chrome.pdf"] = {
+        "header": "PL999 Fixture - Concept - General",
+        "landscape_pages": [4, 7],
+        "footnote": "A footnote that must survive the bottom band.",
+        "landscape_body": "A wide correlation panel needs the landscape sheet.",
+        "portrait_body": "Regional mapping frames the exploration story.",
+    }
+
+
 def gen_inline_image():
     """Inline images (``BI…ID…EI``, ISO 32000 §8.9.7) in the exact shape that lost eight
     figures of a real geoscience report: the raster lives INSIDE a Form XObject as an
@@ -6395,6 +6472,7 @@ def main():
     gen_mixed_cell_table()
     gen_mixed_sidecar_table()
     gen_page_chrome()
+    gen_mixed_orientation_chrome()
     gen_inline_image()
     gen_medium_weight()
     gen_hscale_grid()

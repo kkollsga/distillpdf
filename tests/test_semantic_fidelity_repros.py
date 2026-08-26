@@ -80,6 +80,27 @@ def test_variable_footer_fixture_preserves_body_and_bottom_band_footnote():
     assert "Distinct body prose for synthetic page 12 remains visible." in visible
 
 
+def test_mixed_orientation_header_is_removed_on_landscape_pages_too():
+    rendered = html("mixed_orientation_chrome.pdf")
+    gt = GT["mixed_orientation_chrome.pdf"]
+    # The header recurs at a fixed distance from the top edge on all 8 pages; only the
+    # mid-page divider reuse on page 5 may keep the string visible (it is a heading, so
+    # it legitimately echoes once more in the generated TOC nav).
+    for m in re.finditer(r'<section data-page="(\d+)"[^>]*>(.*?)</section>', rendered, re.DOTALL):
+        expected = 1 if m.group(1) == "5" else 0
+        assert m.group(2).count(gt["header"]) == expected, f"page {m.group(1)}"
+    assert "of 8" not in text(rendered)
+
+
+def test_mixed_orientation_fixture_preserves_body_and_bottom_band_footnote():
+    rendered = html("mixed_orientation_chrome.pdf")
+    visible = text(rendered)
+    gt = GT["mixed_orientation_chrome.pdf"]
+    assert gt["footnote"] in visible
+    assert gt["landscape_body"] in visible
+    assert gt["portrait_body"] in visible
+
+
 def test_running_logo_rule_chain_does_not_emit_figures():
     rendered = html("logo_rule_chain.pdf")
     assert rendered.count("<figure") == 0

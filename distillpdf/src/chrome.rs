@@ -1,7 +1,7 @@
 //! Per-document page-chrome detection: running headers, footers and page numbers.
 //!
-//! The signal is **repetition**: chrome sits at the same y-row of the page's top or
-//! bottom band on most pages, with the same text up to its counters ("Page 12 of 340"
+//! The signal is **repetition**: chrome sits at the same distance from the page edge, in
+//! the page's top or bottom band, on most pages, with the same text up to its counters ("Page 12 of 340"
 //! and "Page 13 of 340" are one string once digit runs are masked). Body text never
 //! looks like that — the first body line's y-row is occupied on half the pages of a
 //! dense report, but by a *different* sentence every time, so a text-diversity guard
@@ -26,8 +26,16 @@ use crate::geom::PageTurn;
 use crate::text::Span;
 use lopdf::ObjectId;
 
-/// Fraction of the display page box's height treated as the top and bottom chrome bands.
+/// Fraction of the document's MODAL display page height that sets the chrome band depth.
+/// The band is a document-level absolute size, not a per-page fraction: a word processor
+/// authors its header at a fixed distance from the paper edge, so the same 80 pt header
+/// offset must stay in-band when a minority of pages turn landscape (whose smaller height
+/// would otherwise shrink the band below the offset and leak the header there).
 const BAND_FRAC: f32 = 0.12;
+/// Per-page ceiling on the band: never deeper than this fraction of the page's own
+/// height, so a document whose modal page dwarfs an occasional small page cannot push
+/// the band into that page's body.
+const BAND_PAGE_CAP: f32 = 0.3;
 /// A chrome row must appear on at least this many pages…
 const MIN_PAGES: usize = 4;
 /// …and on at least this fraction of the document's pages…
@@ -65,6 +73,10 @@ impl ChromeRow {
 #[derive(Default)]
 pub(crate) struct ChromePlan {
     rows: HashMap<(bool, i32), ChromeRow>,
+    /// The document-level band depth (pt) detection ran with. Filtering must reuse it:
+    /// re-deriving a band from the filtered page's own box would make detection and
+    /// filtering disagree on mixed-size documents.
+    band: f32,
     /// The masked header texts (top-band rows), for [`crate::profile::DocProfile`]'s
     /// `running_heads` and any consumer that wants the strings rather than the geometry.
     pub(crate) running_heads: HashSet<String>,
@@ -87,7 +99,7 @@ impl ChromePlan {
             return None;
         }
         let mut drop: Vec<bool> = vec![false; dspans.len()];
-        for (top, bucket, members) in band_rows(dspans, dbox) {
+        for (top, bucket, members) in band_rows(dspans, dbox, self.band) {
             // ±1 bucket of jitter tolerance: quantization must not split a row whose
             // baseline drifts across a 2 pt boundary between pages.
             let banned = (bucket - 1..=bucket + 1)
@@ -104,9 +116,12 @@ impl ChromePlan {
 
 /// Detect the document's chrome rows from the materialized per-page spans.
 ///
-/// Bands are fractions of the **display page box** (`/MediaBox` through the page's
-/// `/Rotate`), not of the used text extent — a page whose body stops short must not pull
-/// the band down into it.
+/// The band edges follow the **display page box** (`/MediaBox` through the page's
+/// `/Rotate`), not the used text extent — a page whose body stops short must not pull
+/// the band down into it. The band's *depth* is document-level ([`BAND_FRAC`] of the
+/// modal display height, per-page capped by [`BAND_PAGE_CAP`]), and rows are keyed by
+/// distance from the page edge — both so that chrome authored at a fixed offset from the
+/// paper edge coincides across portrait and landscape pages of one document.
 pub(crate) fn plan_chrome(
     access: &dyn crate::access::DocumentAccess,
     page_spans: &[(u32, ObjectId, Vec<Span>)],
@@ -116,6 +131,29 @@ pub(crate) fn plan_chrome(
     if n_pages < MIN_PAGES {
         return ChromePlan::default();
     }
+    let display_box = |pid: ObjectId| {
+        let page_box = crate::pdfobj::page_box(access, pid).unwrap_or([
+            0.0,
+            0.0,
+            crate::pdfobj::DEFAULT_PAGE_PTS.0,
+            crate::pdfobj::DEFAULT_PAGE_PTS.1,
+        ]);
+        let turn = PageTurn::new(crate::pdfobj::page_rotation(access, pid), page_box);
+        (turn, turn.rect(page_box[0], page_box[2], page_box[1], page_box[3]))
+    };
+    // Modal display height → the document band depth. Whole-pt quantization; ties break
+    // to the larger height so the outcome is deterministic across hash orders.
+    let mut heights: HashMap<i32, usize> = HashMap::new();
+    for (_, pid, _) in page_spans {
+        let (_, (_, _, y0, y1)) = display_box(*pid);
+        *heights.entry((y1 - y0).round() as i32).or_default() += 1;
+    }
+    let modal_h = heights
+        .into_iter()
+        .max_by_key(|&(h, n)| (n, h))
+        .map(|(h, _)| h as f32)
+        .unwrap_or(crate::pdfobj::DEFAULT_PAGE_PTS.1);
+    let band = modal_h.max(1.0) * BAND_FRAC;
     #[derive(Default)]
     struct SeenRow {
         whole: HashMap<String, HashSet<u32>>,
@@ -124,18 +162,11 @@ pub(crate) fn plan_chrome(
     // (band, bucket) → whole/chunk recurrence keys → distinct pages seen on.
     let mut seen: HashMap<(bool, i32), SeenRow> = HashMap::new();
     for (pno, pid, spans) in page_spans {
-        let page_box = crate::pdfobj::page_box(access, *pid).unwrap_or([
-            0.0,
-            0.0,
-            crate::pdfobj::DEFAULT_PAGE_PTS.0,
-            crate::pdfobj::DEFAULT_PAGE_PTS.1,
-        ]);
-        let turn = PageTurn::new(crate::pdfobj::page_rotation(access, *pid), page_box);
-        let dbox = turn.rect(page_box[0], page_box[2], page_box[1], page_box[3]);
+        let (turn, dbox) = display_box(*pid);
         let turned: Option<Vec<Span>> =
             (!turn.is_identity()).then(|| spans.iter().map(|s| crate::html::turn_span(turn, s)).collect());
         let dspans: &[Span] = turned.as_deref().unwrap_or(spans.as_slice());
-        for (top, bucket, members) in band_rows(dspans, dbox) {
+        for (top, bucket, members) in band_rows(dspans, dbox, band) {
             // Chrome is set at (or below) body size; a bigger-than-body row is heading
             // material — the "Section N: …" / "Appendix A-N" page-top titles a document
             // may legitimately repeat, counter and all.
@@ -153,7 +184,7 @@ pub(crate) fn plan_chrome(
             }
         }
     }
-    let mut plan = ChromePlan::default();
+    let mut plan = ChromePlan { band, ..ChromePlan::default() };
     for ((top, bucket), seen_row) in seen {
         let covered: HashSet<&u32> = seen_row.whole.values().flatten().collect();
         let pages = covered.len();
@@ -230,24 +261,28 @@ fn isolated(dspans: &[Span], top: bool, members: &[usize]) -> bool {
 }
 
 /// The rows of `dspans` that sit in the page's top/bottom chrome bands:
-/// `(is_top_band, y_bucket, member span indices)` — upright spans only, bucketed by
-/// [`ROW_QUANT`], members in x order.
-fn band_rows(dspans: &[Span], dbox: (f32, f32, f32, f32)) -> Vec<(bool, i32, Vec<usize>)> {
+/// `(is_top_band, edge_distance_bucket, member span indices)` — upright spans only,
+/// members in x order. The bucket quantizes the span's DISTANCE FROM THE PAGE EDGE by
+/// [`ROW_QUANT`], not its absolute y: a header 80 pt below the top edge gets the same
+/// key on a portrait and a landscape page, which is what lets a minority orientation's
+/// instances join the majority's recurrence counts. `band` is the document-level band
+/// depth (see [`plan_chrome`]), capped here at [`BAND_PAGE_CAP`] of this page's height.
+fn band_rows(dspans: &[Span], dbox: (f32, f32, f32, f32), band: f32) -> Vec<(bool, i32, Vec<usize>)> {
     let (_, _, y0, y1) = dbox;
-    let band = (y1 - y0).max(1.0) * BAND_FRAC;
+    let band = band.min((y1 - y0).max(1.0) * BAND_PAGE_CAP);
     let mut rows: HashMap<(bool, i32), Vec<usize>> = HashMap::new();
     for (i, s) in dspans.iter().enumerate() {
         if s.angle.abs() >= 0.01 || s.text.trim().is_empty() {
             continue;
         }
-        let top = if s.y >= y1 - band {
-            true
+        let (top, edge_dist) = if s.y >= y1 - band {
+            (true, y1 - s.y)
         } else if s.y <= y0 + band {
-            false
+            (false, s.y - y0)
         } else {
             continue;
         };
-        rows.entry((top, (s.y / ROW_QUANT).round() as i32)).or_default().push(i);
+        rows.entry((top, (edge_dist / ROW_QUANT).round() as i32)).or_default().push(i);
     }
     let mut out: Vec<(bool, i32, Vec<usize>)> = rows
         .into_iter()
@@ -402,5 +437,106 @@ mod tests {
             chunks: HashSet::from(["page # of #".into()]),
         };
         assert!(row.matches(&spans, &members));
+    }
+
+    fn span_at(x: f32, y: f32, size: f32, text: &str) -> Span {
+        Span {
+            x,
+            y,
+            size,
+            width: text.chars().count() as f32 * size * 0.5,
+            text: text.to_string(),
+            bold: false,
+            italic: false,
+            mono: false,
+            angle: 0.0,
+            font: 0,
+            mcid: None,
+            source: crate::text::SourceSlice::test_occurrence(0, 0),
+        }
+    }
+
+    #[test]
+    fn band_rows_key_the_same_edge_offset_identically_across_page_heights() {
+        // The Cerisa leak: a header 80 pt below the top edge and a footer 42 pt above the
+        // bottom edge, on an A4 portrait page and an A4 landscape page. One document-level
+        // band (12% of the modal portrait height ≈ 101 pt) must put both instances of each
+        // in the same (band, bucket) key, or the minority orientation can never reach the
+        // coverage floor and its chrome leaks.
+        let band = 841.89 * BAND_FRAC;
+        let portrait = (0.0, 595.28, 0.0, 841.89);
+        let landscape = (0.0, 841.89, 0.0, 595.28);
+        let header_p = [span_at(56.7, 841.89 - 80.0, 8.0, "PL636 Cerisa")];
+        let header_l = [span_at(56.7, 595.28 - 80.0, 8.0, "PL636 Cerisa")];
+        let footer_p = [span_at(500.0, 42.0, 8.0, "24 of 172")];
+        let footer_l = [span_at(750.0, 42.0, 8.0, "25 of 172")];
+        let key = |spans: &[Span], dbox| {
+            let rows = band_rows(spans, dbox, band);
+            assert_eq!(rows.len(), 1, "the row must be in-band: {rows:?}");
+            (rows[0].0, rows[0].1)
+        };
+        assert_eq!(key(&header_p, portrait), key(&header_l, landscape));
+        assert_eq!(key(&footer_p, portrait), key(&footer_l, landscape));
+        // And a genuine body line stays out of the band on both.
+        assert!(band_rows(&[span_at(56.7, 400.0, 10.0, "body prose")], portrait, band).is_empty());
+        assert!(band_rows(&[span_at(56.7, 300.0, 10.0, "body prose")], landscape, band).is_empty());
+    }
+
+    #[test]
+    fn band_page_cap_keeps_a_small_pages_body_out_of_a_big_documents_band() {
+        // A 200 pt-tall insert in a document whose modal page is A4: the raw document band
+        // (~101 pt) would cover half the little page; the per-page cap holds it to 30%.
+        let band = 841.89 * BAND_FRAC;
+        let small = (0.0, 300.0, 0.0, 200.0);
+        let mid_span = [span_at(20.0, 100.0, 10.0, "centre text")];
+        assert!(band_rows(&mid_span, small, band).is_empty());
+        let top_span = [span_at(20.0, 190.0, 8.0, "small page header")];
+        assert_eq!(band_rows(&top_span, small, band).len(), 1);
+    }
+
+    #[test]
+    fn plan_chrome_bans_a_fixed_edge_offset_header_on_the_minority_landscape_pages() {
+        // Six portrait + two landscape pages, one running header 80 pt from the top edge
+        // on every page, varying body text mid-page. Detection must count all eight pages
+        // into one row (coverage 8/8) and drop_mask must ban the header on the landscape
+        // pages too — the exact shape of the Cerisa PL636 leak.
+        use lopdf::{dictionary, Document, Object};
+        let mut doc = Document::with_version("1.5");
+        let mut page_spans: Vec<(u32, ObjectId, Vec<Span>)> = Vec::new();
+        let bodies = [
+            "the reservoir shows strong lateral continuity",
+            "porosity trends follow the depositional axis",
+            "well ties confirm the velocity model update",
+            "the mudstone interval caps the upper zone",
+            "saturation heights match the capillary data",
+            "the aquifer support is weaker than mapped",
+            "seismic amplitudes brighten toward the crest",
+            "the contact is flat across both segments",
+        ];
+        for (i, body_text) in bodies.iter().enumerate() {
+            let landscape = i == 3 || i == 6;
+            let (w, h) = if landscape { (841.89, 595.28) } else { (595.28, 841.89) };
+            let pid = doc.add_object(Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "MediaBox" => vec![0.into(), 0.into(), w.into(), h.into()],
+            }));
+            let spans = vec![
+                span_at(56.7, h - 80.0, 8.0, "PL636 Cerisa - Concept - General"),
+                span_at(56.7, h * 0.5, 10.0, body_text),
+            ];
+            page_spans.push((i as u32 + 1, pid, spans));
+        }
+        let access = crate::access::test_adapter(&doc);
+        let plan = plan_chrome(&access, &page_spans, 10.0);
+        assert!(!plan.is_empty(), "the header row must be detected");
+        for (i, (_, _, spans)) in page_spans.iter().enumerate() {
+            let landscape = i == 3 || i == 6;
+            let (w, h) = if landscape { (841.89, 595.28) } else { (595.28, 841.89) };
+            let mask = plan
+                .drop_mask(spans, (0.0, w, 0.0, h))
+                .unwrap_or_else(|| panic!("page {} must have a chrome match", i + 1));
+            assert!(mask[0], "header must be banned on page {} (landscape={landscape})", i + 1);
+            assert!(!mask[1], "body must survive on page {}", i + 1);
+        }
     }
 }
