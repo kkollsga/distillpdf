@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "distillpdf"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64",
  "cmake",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "distillpdf-python"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "distillpdf",
  "image",
