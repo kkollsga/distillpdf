@@ -26,6 +26,20 @@ user's call, not yours.
 
 ## Working style
 
+- **Doctrine sync records completion.** At planning and release entry, follow
+  `../doctrine/learn-from-us.md` → "Doctrine sync procedure". Compare numeric
+  semver tuples, preserve local improvements, regenerate adapters, and advance
+  `dev-docs/.doctrine-synced` only through contiguous completed entries.
+- **Astra coordinates; Sol does delegated work.** In phased plans, GPT-6 Astra
+  handles scope, sequencing, integration, and synthesis. Select GPT-5.6 Sol
+  explicitly for research, implementation, tests, and review, including nested
+  workers, unless the user later chooses another model.
+- **Bound build storage at working cadence.** Run the repository's size-gated
+  `scripts/prune-target.sh --execute` after each phase commit and before the
+  release gate. It bounds apparent cache size and free space on the configured
+  target volume, is a no-op with headroom, and refuses broad, unmarked, or
+  in-use targets.
+
 - **Root-cause before fixing.** For any bug, reproduce it and confirm the root
   cause *with evidence* before changing code — for an extraction/layout defect,
   capture the failing PDF as a **self-generated, committable** fixture (extend

@@ -16,6 +16,8 @@ benchmarking/
 # Local working notes (not shared)
 CLAUDE.md
 .build-venv/
+/.agents/skills/
+/.claude/skills/
 
 # Local dev working folder + cross-project coordination channel — never committed.
 # See dev-docs/README.md and inbox/README.md for the canonical layouts, and the
