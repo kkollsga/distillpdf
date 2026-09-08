@@ -3,10 +3,9 @@
 Two fixture families, both from ``tests/gen_fixtures.py``:
 
 * ``damaged_startxref.pdf`` — a file whose cross-reference machinery is destroyed and whose
-  body is intact, the shape a truncated download or a botched incremental append leaves. Both
-  of lopdf's readers used to fail closed on it, so it did not open on any engine and the lazy
-  route's counted eager fallback had nothing to fall back *to*. The indexed reader now rebuilds
-  its index from one forward scan of the body for ``N G obj`` headers. Its intact twin is
+  body is intact, the shape a truncated download or a botched incremental append leaves. The
+  eager reader reconstructs the xref and the indexed reader rebuilds its index from one bounded
+  forward scan of the body for ``N G obj`` headers. Its intact twin is
   byte-identical apart from the ten digits of the ``startxref`` operand, so "the recovered
   index is the index the intact table describes" is checkable as identical rendered output.
 
@@ -66,13 +65,8 @@ def test_the_twins_differ_only_in_the_startxref_operand():
     assert int(damaged[start:start + 10]) < len(damaged)
 
 
-def test_eager_still_cannot_open_a_destroyed_cross_reference():
-    """The recovery is the lazy reader's, and only the lazy reader's.
-
-    Kept as an assertion rather than a comment because it is what makes the lazy route's
-    value here concrete: there is no fallback that would have served this document."""
-    with pytest.raises(Exception):
-        distillpdf.Pdf.open(DAMAGED, engine="eager")
+def test_eager_reconstructs_a_destroyed_cross_reference_as_the_intact_twin():
+    assert _sha(_html(DAMAGED, "eager")) == _sha(_html(INTACT, "eager"))
 
 
 def test_a_destroyed_cross_reference_stays_lazy_and_renders_the_intact_output():

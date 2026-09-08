@@ -37,9 +37,8 @@ doc.engine          # "lazy"
 doc.to_html("out.html")
 ```
 
-- **Identical output.** The lazy engine renders byte-for-byte what the eager engine renders;
-  it is regression-tested against the eager route as the oracle. Switching engines never
-  changes your HTML, Markdown, text or `.dpdf`.
+- **Identical output for supported, well-formed PDFs.** Both engines are regression-tested
+  against shared fixtures. Recovery of malformed input can differ between engines.
 - **Lower memory on large files.** The win grows with file size; on small documents the eager
   engine is usually the faster of the two, which is why it stays the default.
 - **Damage does not cost you the index.** Broken cross-reference data is rebuilt in place by a

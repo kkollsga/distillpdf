@@ -5305,8 +5305,7 @@ def gen_damaged_startxref():
     This is what a truncated download, a botched incremental append or a byte-range fetch
     that dropped its tail leaves behind: every object is still there, at the offset the
     table used to name, but `startxref` points somewhere that is not a cross-reference
-    section. Both of lopdf's readers used to fail closed on it — the eager one still does —
-    so the document did not open at all.
+    section. Both readers now reconstruct the damaged cross-reference information.
 
     The indexed reader now rebuilds its index by scanning the body for ``N G obj`` headers,
     one forward pass of bounded chunks, and opens the file lazily. The pair written here is
@@ -5314,8 +5313,8 @@ def gen_damaged_startxref():
     the intact table describes" is checkable as *identical rendered output* rather than as
     an assertion about offsets.
 
-    It lives in ``adversarial/`` because the eager engine cannot open it, and the top-level
-    fixture sweeps open every file there on the default engine.
+    It lives in ``adversarial/`` because it exercises recovery outside the ordinary fixture
+    sweep.
 
     Cross-reference damage is beyond reportlab, so this is assembled byte by byte."""
     os.makedirs(ADV_OUT, exist_ok=True)

@@ -1886,22 +1886,36 @@ pub(crate) mod tests {
                 .map(|control| control.diagnostics())
                 .unwrap_or_else(|error| error.diagnostics.snapshot());
             if matches!(name, "stream-missing-length.pdf" | "stream-short-length.pdf") {
-                // A malformed stream's page content is asserted against the *eager* route
-                // rather than a frozen literal: the contract is parity, and the lazy route
-                // now recovers the same frame eager does.
+                // The indexed contract stays conservative for a malformed stream dictionary:
+                // declared page content is empty, while bounded source recovery can still
+                // return the unambiguous stream frame.
                 let eager = PdfDocument::from_bytes(&raw).unwrap();
                 let eager_content = eager
                     .access
                     .page_content(eager.access.pages().unwrap()[0].id)
                     .unwrap();
                 let recovered = b"BT /F1 12 Tf 72 720 Td (malformed stream) Tj ET";
+                let expected_eager: &[u8] = if name == "stream-short-length.pdf" {
+                    b"BT /F1 12 Tf 72 720 Td (malformed stream) Tj ET\n"
+                } else {
+                    b"\n"
+                };
+                assert_eq!(eager_content.as_ref(), expected_eager, "eager {name}");
+                if name == "stream-short-length.pdf" {
+                    assert_eq!(eager.extract_text(), "malformed stream\n", "eager {name}");
+                }
                 for control in [file.as_ref().unwrap(), bytes.as_ref().unwrap()] {
                     let page = control.pages().unwrap()[0].id;
+                    let expected_indexed: &[u8] = if name == "stream-short-length.pdf" {
+                        b""
+                    } else {
+                        b"\n"
+                    };
                     assert!(
                         control
-                            .checked_page_content_matches(page, eager_content.as_ref())
+                            .checked_page_content_matches(page, expected_indexed)
                             .unwrap(),
-                        "{name}"
+                        "indexed {name}"
                     );
                     assert!(control.checked_recovered_stream_matches(4, recovered).unwrap(), "{name}");
                 }
@@ -2081,9 +2095,8 @@ pub(crate) mod tests {
     /// `damaged_startxref.pdf` and `damaged_startxref_intact.pdf` (see `tests/gen_fixtures.py`)
     /// are the same seven objects, the same classic table, and the same trailer; they differ in
     /// the ten digits of the `startxref` operand, which the damaged one points into the middle
-    /// of a content stream. Both of lopdf's readers used to fail closed on that — the eager one
-    /// still does, so before this the document did not open on any engine, and the lazy route's
-    /// counted eager fallback had nothing to fall back *to*.
+    /// of a content stream. Both readers now reconstruct that damage: eager through lopdf's
+    /// xref recovery and lazy through its bounded forward scan.
     ///
     /// The indexed reader now rebuilds its index from a single forward scan of the body for
     /// `N G obj` headers. Because the twin is byte-identical apart from those ten digits, the
@@ -2115,16 +2128,14 @@ pub(crate) mod tests {
             "the twins must differ only inside the ten startxref digits: {differing:?}"
         );
 
-        // The eager engine has no rescan, so it still cannot open the damaged file at all.
-        assert!(
-            PdfDocument::from_bytes_with_engine(&damaged, Engine::Eager).is_err(),
-            "eager must still fail closed"
-        );
-
         let eager = PdfDocument::from_bytes_with_engine(&intact, Engine::Eager)
             .expect("eager opens the intact twin")
             .render(crate::Mode::Page, false, false);
         assert!(eager.contains("Rescan page 2 line 20"), "fixture text");
+        let damaged_eager = PdfDocument::from_bytes_with_engine(&damaged, Engine::Eager)
+            .expect("eager reconstructs the damaged xref")
+            .render(crate::Mode::Page, false, false);
+        assert_eq!(damaged_eager, eager, "eager reconstructed twin render");
 
         for (name, path) in [("damaged", &damaged_path), ("intact", &intact_path)] {
             let control = open_indexed_file_internal(path, None).expect("indexed open");
@@ -3193,7 +3204,7 @@ pub(crate) mod tests {
         // a two-byte generation-or-index. It describes itself at `startxref`.
         let startxref = out.len();
         let mut rows: Vec<u8> = Vec::new();
-        let mut row = |kind: u8, second: u32, third: u16, rows: &mut Vec<u8>| {
+        let row = |kind: u8, second: u32, third: u16, rows: &mut Vec<u8>| {
             rows.push(kind);
             rows.extend_from_slice(&second.to_be_bytes());
             rows.extend_from_slice(&third.to_be_bytes());
@@ -3441,4 +3452,3 @@ pub(crate) mod tests {
         assert_eq!(DistillOptions::from_assets("none").unwrap().profile, AssetProfile::None);
     }
 }
-

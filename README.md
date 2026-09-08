@@ -92,14 +92,14 @@ doc = distillpdf.open("10000-pages.pdf", engine="lazy")
 doc.engine          # "lazy"
 ```
 
-The output is **identical** to the default `engine="eager"` — it is a memory strategy, not a
-fidelity choice, and it is regression-tested against the eager route as the oracle. Damaged
-cross-reference data is rebuilt in place by a bounded forward scan, so a broken file stays
-lazy; only the rare shapes the index refuses — an oversized object, an unusually deep page
-tree, an unusual encryption — fall back to the eager engine, so `engine="lazy"` never turns a
-readable PDF into an error. The fallback is never silent: `doc.engine` then reports
-`"lazy (eager fallback)"`. Experimental in that the *default* engine may change in a future
-release — the keyword and its two values are stable.
+For supported, well-formed PDFs, the output is **identical** to the default `engine="eager"`.
+Both engines are regression-tested against shared fixtures. Recovery of malformed input can differ
+between engines. Damaged cross-reference data is rebuilt in place by a bounded forward scan, so a broken
+file stays lazy; shapes the index refuses — an oversized object, an unusually deep page tree, an
+unusual encryption — fall back to the eager engine, so `engine="lazy"` never turns a readable PDF
+into an error. The fallback is never silent: `doc.engine` then reports `"lazy (eager fallback)"`.
+Experimental in that the *default* engine may change in a future release — the keyword and its two
+values are stable.
 [Lazy engine »](https://distillpdf.readthedocs.io/en/latest/reference/python/#lazy-engine-experimental)
 
 ## Comparison

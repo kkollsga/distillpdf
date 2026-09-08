@@ -70,8 +70,8 @@
         "stage": "html_render",
         "value": {
           "kind": "bytes",
-          "length": 449,
-          "sha256": "aa760d2368394f11c63c4511d4b98b7180d1887ebf3a5203a0ad8d5279af9fa4"
+          "length": 472,
+          "sha256": "a2eef60bbf805c45eb8d6053a4227ca004b2d4c86f1d80f0e24311fc934c47c8"
         }
       },
       "integrity": {
@@ -84,8 +84,8 @@
         "stage": "markdown_render",
         "value": {
           "kind": "bytes",
-          "length": 1,
-          "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+          "length": 17,
+          "sha256": "29b01894838d8705862680b5daacff16448b345acbc9fa4d6f714d6f76a74a79"
         }
       },
       "model": {
@@ -93,8 +93,8 @@
         "stage": "model_build",
         "value": {
           "kind": "bytes",
-          "length": 605,
-          "sha256": "7f9e2ba42eca0a09ae538caf51d50a1f5b5186a256f20f208d7cfeff1d6c4c09"
+          "length": 931,
+          "sha256": "e6a671382077b5ded55102cb2e11a2416fad47c25e6b4d9e93aec96415da10d7"
         }
       },
       "page_count": {
@@ -107,8 +107,8 @@
         "stage": "page_text_extract",
         "value": {
           "kind": "bytes",
-          "length": 0,
-          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          "length": 16,
+          "sha256": "02ee0fa24d05d4d927625ed1fba4b113ce936325c70bf1cb23446b3d55d4ba72"
         }
       },
       "source": {
@@ -121,8 +121,8 @@
         "stage": "text_extract",
         "value": {
           "kind": "bytes",
-          "length": 1,
-          "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+          "length": 17,
+          "sha256": "29b01894838d8705862680b5daacff16448b345acbc9fa4d6f714d6f76a74a79"
         }
       }
     }
