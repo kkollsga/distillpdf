@@ -785,10 +785,11 @@ def cmd_name(a) -> int:
     if results.get("lost"):
         die(f"this run lost output on {sorted(results['lost'])}. Lost documents cannot be named: fix "
             "them, or re-freeze with an owner note.")
-    if results.get("unnamed_drops") and not a.accept_drops:
-        die(f"this run dropped scores on {sorted(results['unnamed_drops'])}. Naming a drop takes "
-            "--accept-drops: it is a decision to accept a worse number, so it has to be said.")
     keep = set(a.docs.split(",")) if a.docs else None
+    drops = sorted(s for s in results.get("unnamed_drops", {}) if keep is None or s in keep)
+    if drops and not a.accept_drops:
+        die(f"this run dropped scores on {drops}. Naming a drop takes --accept-drops: it is a "
+            "decision to accept a worse number, so it has to be said.")
     entry = {"name": a.name, "reason": a.reason,
              "utc": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
              "commit": results["meta"]["commit"], "changes": {}, "accepted_drops": {}}
