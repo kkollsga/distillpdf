@@ -1145,7 +1145,6 @@ impl IndexedDocumentAdapter {
             page_tree_depth: INDEXED_PAGE_TREE_DEPTH,
             max_pages: INDEXED_MAX_PAGES,
             password,
-            ..IndexedReaderOptions::default()
         };
         let source_len = source.len().map_err(|error| {
             AccessError::source(SourceFailure::from(error)).at(AccessPhase::Object, None)
