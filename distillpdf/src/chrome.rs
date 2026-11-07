@@ -117,7 +117,7 @@ impl ChromePlan {
         for (top, bucket, members) in band_rows(dspans, dbox, self.band) {
             // ±1 bucket of jitter tolerance: quantization must not split a row whose
             // baseline drifts across a 2 pt boundary between pages.
-            let banned = (bucket - 1..=bucket + 1)
+            let banned = (bucket.saturating_sub(1)..=bucket.saturating_add(1))
                 .any(|q| self.row((top, q)).is_some_and(|row| row.matches(dspans, &members)));
             if banned {
                 for i in members {
@@ -200,8 +200,13 @@ impl ChromeScan {
         let turned: Option<Vec<Span>> =
             (!turn.is_identity()).then(|| spans.iter().map(|s| crate::html::turn_span(turn, s)).collect());
         let dspans: &[Span] = turned.as_deref().unwrap_or(spans);
+        let ys = SortedYs::new(dspans);
         for (top, bucket, members) in band_rows(dspans, dbox, self.band) {
-            if !isolated(dspans, top, &members) {
+            // The caller's token: a page can hold tens of thousands of rows.
+            if crate::pages::cancel_requested() {
+                return;
+            }
+            if !isolated(dspans, &ys, top, &members) {
                 continue; // at line spacing from the body / a table: content, not chrome
             }
             let row_size = members.iter().map(|&i| dspans[i].size).fold(0.0f32, f32::max);
@@ -290,42 +295,45 @@ pub(crate) fn plan_chrome(
 /// per-page-instance conditions and gate only DETECTION — filtering drops every matching
 /// (row ∧ text) instance, so a footer still goes on the one page where a footnote sits
 /// close above it.
-fn isolated(dspans: &[Span], top: bool, members: &[usize]) -> bool {
-    let ys: Vec<f32> = members.iter().map(|&i| dspans[i].y).collect();
-    let (row_min, row_max) = ys.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &y| (lo.min(y), hi.max(y)));
+fn isolated(dspans: &[Span], ys: &SortedYs, top: bool, members: &[usize]) -> bool {
+    let (row_min, row_max) = members.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &i| (lo.min(dspans[i].y), hi.max(dspans[i].y)));
     let row_size = members.iter().map(|&i| dspans[i].size).fold(0.0f32, f32::max);
-    let mut nearest_inward: Option<f32> = None;
-    // A mask, not `members.contains`: a page flooding one row with text made this quadratic in
-    // the row's length, and that page was the one thing a cancel could not reach.
-    let mut in_row = vec![false; dspans.len()];
-    for &i in members {
-        in_row[i] = true;
-    }
-    for (i, s) in dspans.iter().enumerate() {
-        if in_row[i] || s.angle.abs() >= 0.01 || s.text.trim().is_empty() {
-            continue;
+    // No member lies beyond `row_max + ROW_QUANT` or `row_min - 0.5` (and the same reflected for a
+    // bottom row), so the page's upright text can be asked directly, with no need to leave the
+    // row's own spans out: this runs for every row, and a page can have tens of thousands.
+    let nearest_inward = if top {
+        if ys.0.last().is_some_and(|&y| y > row_max + ROW_QUANT) {
+            return false; // text above a "header" row: not the outermost row
         }
-        if top {
-            if s.y > row_max + ROW_QUANT {
-                return false; // text above a "header" row: not the outermost row
-            }
-            if s.y < row_min - 0.5 {
-                let gap = row_min - s.y;
-                nearest_inward = Some(nearest_inward.map_or(gap, |g: f32| g.min(gap)));
-            }
-        } else {
-            if s.y < row_min - ROW_QUANT {
-                return false; // text below a "footer" row: not the outermost row
-            }
-            if s.y > row_max + 0.5 {
-                let gap = s.y - row_max;
-                nearest_inward = Some(nearest_inward.map_or(gap, |g: f32| g.min(gap)));
-            }
+        ys.last_below(row_min - 0.5).map(|y| row_min - y)
+    } else {
+        if ys.0.first().is_some_and(|&y| y < row_min - ROW_QUANT) {
+            return false; // text below a "footer" row: not the outermost row
         }
-    }
+        ys.first_above(row_max + 0.5).map(|y| y - row_max)
+    };
     // Chrome DECORATES a page's content; a row that is the page's only text (nothing
     // inward of it) is that page's content, and banning it would empty the page.
     nearest_inward.is_some_and(|gap| gap >= MIN_GAP_FACTOR * row_size.max(6.0))
+}
+
+/// Every upright, non-blank span's baseline on a page, sorted.
+struct SortedYs(Vec<f32>);
+
+impl SortedYs {
+    fn new(dspans: &[Span]) -> Self {
+        let mut ys: Vec<f32> = dspans.iter().filter(|s| s.angle.abs() < 0.01 && !s.text.trim().is_empty()).map(|s| s.y).collect();
+        ys.sort_unstable_by(f32::total_cmp);
+        Self(ys)
+    }
+
+    fn last_below(&self, y: f32) -> Option<f32> {
+        self.0[..self.0.partition_point(|&v| v < y)].last().copied()
+    }
+
+    fn first_above(&self, y: f32) -> Option<f32> {
+        self.0.get(self.0.partition_point(|&v| v <= y)).copied()
+    }
 }
 
 /// The rows of `dspans` that sit in the page's top/bottom chrome bands:
@@ -505,6 +513,85 @@ mod tests {
             chunks: HashSet::from([key_digest("page # of #")]),
         };
         assert!(row.matches(&spans, &members));
+    }
+
+    /// The direct reading of "outermost, with a gutter", which `isolated` answers without walking
+    /// every span. Catches the shortcut deciding differently, which would change which rows every
+    /// document treats as chrome.
+    fn isolated_directly(dspans: &[Span], top: bool, members: &[usize]) -> bool {
+        let ys: Vec<f32> = members.iter().map(|&i| dspans[i].y).collect();
+        let (row_min, row_max) = ys.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &y| (lo.min(y), hi.max(y)));
+        let row_size = members.iter().map(|&i| dspans[i].size).fold(0.0f32, f32::max);
+        let mut nearest_inward: Option<f32> = None;
+        for (i, s) in dspans.iter().enumerate() {
+            if members.contains(&i) || s.angle.abs() >= 0.01 || s.text.trim().is_empty() {
+                continue;
+            }
+            if top {
+                if s.y > row_max + ROW_QUANT {
+                    return false;
+                }
+                if s.y < row_min - 0.5 {
+                    let gap = row_min - s.y;
+                    nearest_inward = Some(nearest_inward.map_or(gap, |g: f32| g.min(gap)));
+                }
+            } else {
+                if s.y < row_min - ROW_QUANT {
+                    return false;
+                }
+                if s.y > row_max + 0.5 {
+                    let gap = s.y - row_max;
+                    nearest_inward = Some(nearest_inward.map_or(gap, |g: f32| g.min(gap)));
+                }
+            }
+        }
+        nearest_inward.is_some_and(|gap| gap >= MIN_GAP_FACTOR * row_size.max(6.0))
+    }
+
+    /// Catches the chrome stage ignoring a cancel: a page of many rows spends its time here, and
+    /// nothing else on the way would notice the token.
+    #[test]
+    fn a_cancelled_scan_stops_counting_rows() {
+        let doc = lopdf::Document::with_version("1.7");
+        let access = crate::access::test_adapter(&doc);
+        let spans: Vec<Span> = (0..50).map(|i| span_at(72.0, 760.0 - i as f32 * 3.0, 9.0, "row")).collect();
+        let pages = (0..4).map(|i| (i as u32 + 1, 0u16));
+        let mut scan = ChromeScan::new(&access, pages.clone());
+        let token = crate::pages::CancelToken::new();
+        token.cancel();
+        let _scope = crate::pages::CancelScope::new(Some(&token));
+        scan.add_page(&access, (1, 0), &spans);
+        assert!(scan.seen.is_empty(), "a cancelled walk counted {} rows", scan.seen.len());
+    }
+
+    #[test]
+    fn isolated_answers_what_a_direct_reading_answers() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |below: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % below
+        };
+        for _ in 0..400 {
+            let count = 2 + next(40) as usize;
+            let spans: Vec<Span> = (0..count)
+                .map(|_| {
+                    let mut span = span_at(next(500) as f32, 700.0 + next(90) as f32 * 0.5, 6.0 + next(8) as f32, "x");
+                    if next(9) == 0 {
+                        span.angle = 1.5;
+                    }
+                    if next(9) == 0 {
+                        span.text = String::from(" ");
+                    }
+                    span
+                })
+                .collect();
+            let ys = SortedYs::new(&spans);
+            for (top, _, members) in band_rows(&spans, (0.0, 612.0, 690.0, 750.0), 40.0) {
+                assert_eq!(isolated(&spans, &ys, top, &members), isolated_directly(&spans, top, &members));
+            }
+        }
     }
 
     fn span_at(x: f32, y: f32, size: f32, text: &str) -> Span {

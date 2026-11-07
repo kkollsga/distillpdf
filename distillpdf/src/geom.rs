@@ -13,6 +13,28 @@
 //! When adopting a call site, keep the receiver on the side its open-coded form had it
 //! (`a.min(b)` and `b.min(a)` differ for signed zero and NaN).
 
+/// A total order over floats, for every sort and every min or max over coordinates.
+///
+/// `partial_cmp(..).unwrap_or(Equal)` is not an order once a NaN is in the list: Rust's sort may
+/// panic on it, and a hostile content stream can make NaNs. This is `partial_cmp` wherever that
+/// answers, so `-0.0 == 0.0` and every finite ordering stays exactly as it was, with all NaNs equal
+/// to each other and after everything else.
+pub(crate) trait TotalOrder {
+    fn total_order(&self, other: &Self) -> std::cmp::Ordering;
+}
+
+macro_rules! impl_total_order {
+    ($float:ty) => {
+        impl TotalOrder for $float {
+            fn total_order(&self, other: &Self) -> std::cmp::Ordering {
+                self.partial_cmp(other).unwrap_or_else(|| self.is_nan().cmp(&other.is_nan()))
+            }
+        }
+    };
+}
+impl_total_order!(f32);
+impl_total_order!(f64);
+
 /// A PDF 2×3 transformation matrix `[a b c d e f]`, i.e.
 /// ```text
 /// | a b 0 |

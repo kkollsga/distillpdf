@@ -45,6 +45,12 @@ jobs:
         # runs only the core's pure-logic unit tests (it carries no pyo3).
         run: cargo test -p distillpdf --lib
 
+      - name: Page API tests
+        # Release profile: `pages_memory` runs tests that are ignored in debug because they push
+        # millions of operators through the parser, and it asserts live heap, which needs its own
+        # binary for its counting allocator.
+        run: cargo test --release -p distillpdf --test pages_api --test pages_memory
+
       - name: Build & install distillpdf (with the bundled Tesseract fast OCR engine)
         # `--features extension-module,tesseract` builds minimal static Leptonica + Tesseract from the vendored
         # submodules (CMake is preinstalled on the runner), exercising the same path the wheels

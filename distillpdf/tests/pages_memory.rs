@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 use distillpdf::{Engine, PdfDocument};
 use lopdf::content::{Content, Operation};
-use lopdf::{dictionary, Document, Object, Stream};
+use lopdf::{dictionary, Document, Object, Stream, StringFormat};
 
 struct Counting;
 
@@ -230,4 +230,180 @@ fn a_kill_loses_nothing_already_taken() {
         assert_eq!(value.parse::<u64>().unwrap(), expected[page - 1], "page {page}");
     }
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The first page of a one-line document, with `tweak` free to add to the catalog.
+fn with_catalog(tweak: impl FnOnce(&mut Document, &mut lopdf::Dictionary, lopdf::ObjectId)) -> Vec<u8> {
+    let mut doc = Document::with_version("1.7");
+    let parent = doc.new_object_id();
+    let content = doc.add_object(Stream::new(dictionary! {}, prose_page(0)));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => parent,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => content,
+    });
+    doc.objects.insert(parent, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }));
+    let mut catalog = dictionary! { "Type" => "Catalog", "Pages" => parent };
+    tweak(&mut doc, &mut catalog, page);
+    let catalog = doc.add_object(catalog);
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// Catches one long label prefix referenced from every `/Nums` entry: a 1 MiB file held 816 MiB of
+/// label strings in the statistics that are documented as small.
+#[test]
+fn page_labels_sharing_a_long_prefix_stay_small() {
+    let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let bytes = with_catalog(|doc, catalog, _| {
+        let dict = doc.add_object(dictionary! { "S" => "D", "P" => Object::String(vec![b'A'; 1 << 20], StringFormat::Literal) });
+        let mut nums: Vec<Object> = Vec::new();
+        for start in 0..800 {
+            nums.push(Object::Integer(start));
+            nums.push(dict.into());
+        }
+        catalog.set("PageLabels", dictionary! { "Nums" => nums });
+    });
+    let doc = open(&bytes);
+    let (peak, stats) = peak_of(|| doc.scan_typography(None, &mut |_| {}).unwrap());
+    assert!(peak < 64 * MIB, "scan peaked at {} MiB", peak / MIB);
+    assert!(stats.approx_bytes() < 2 * MIB as usize, "statistics hold {} bytes", stats.approx_bytes());
+}
+
+/// Catches outline entries sharing one long `/Title`: 1.2 GiB from a small file, on every path that
+/// reads the outline.
+#[test]
+fn outline_entries_sharing_a_long_title_stay_small() {
+    let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let bytes = with_catalog(|doc, catalog, page| {
+        let title = doc.add_object(Object::String(vec![b'A'; 1 << 20], StringFormat::Literal));
+        let root = doc.new_object_id();
+        let ids: Vec<_> = (0..1200).map(|_| doc.new_object_id()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let mut item = dictionary! { "Title" => title, "Parent" => root, "Dest" => vec![page.into(), "Fit".into()] };
+            if i + 1 < ids.len() {
+                item.set("Next", ids[i + 1]);
+            }
+            doc.objects.insert(*id, Object::Dictionary(item));
+        }
+        doc.objects.insert(root, Object::Dictionary(dictionary! { "Type" => "Outlines", "First" => ids[0], "Last" => ids[1199], "Count" => 1200 }));
+        catalog.set("Outlines", root);
+    });
+    let doc = open(&bytes);
+    let (peak, stats) = peak_of(|| doc.scan_typography(None, &mut |_| {}).unwrap());
+    assert!(peak < 64 * MIB, "scan peaked at {} MiB", peak / MIB);
+    assert!(stats.approx_bytes() < 2 * MIB as usize, "statistics hold {} bytes", stats.approx_bytes());
+    let (peak, _) = peak_of(|| doc.outline());
+    assert!(peak < 64 * MIB, "outline peaked at {} MiB", peak / MIB);
+}
+
+/// Catches a page's `/Annots` naming one link with a long URI many times: 831 MiB on the page path.
+#[test]
+fn annotations_sharing_a_long_uri_stay_small() {
+    let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let bytes = {
+        let mut doc = Document::with_version("1.7");
+        let parent = doc.new_object_id();
+        let content = doc.add_object(Stream::new(dictionary! {}, prose_page(0)));
+        let uri = format!("http://{}", "a".repeat(1 << 20));
+        let link = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Link",
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+            "A" => dictionary! { "S" => "URI", "URI" => Object::string_literal(uri) },
+        });
+        let annots: Vec<Object> = (0..800).map(|_| link.into()).collect();
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => parent,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => content, "Annots" => annots,
+        });
+        doc.objects.insert(parent, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }));
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => parent });
+        doc.trailer.set("Root", catalog);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    };
+    let doc = open(&bytes);
+    let stats = doc.scan_typography(None, &mut |_| {}).unwrap();
+    let mut stream = doc.page_stream(stats).unwrap();
+    let (peak, _) = peak_of(|| stream.page(1).unwrap());
+    assert!(peak < 64 * MIB, "page peaked at {} MiB", peak / MIB);
+    let (peak, _) = peak_of(|| doc.extract_links());
+    assert!(peak < 64 * MIB, "links peaked at {} MiB", peak / MIB);
+}
+
+/// A compressed form drawing one long string, invoked `draws` times.
+fn repeated_form_pdf(draws: usize, form: Vec<u8>) -> Vec<u8> {
+    let content = b"/X Do\n".repeat(draws);
+    let mut doc = Document::with_version("1.7");
+    let font = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" });
+    let parent = doc.new_object_id();
+    let mut xobject = Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+        },
+        form,
+    );
+    xobject.compress().unwrap();
+    let xobject = doc.add_object(xobject);
+    let content = doc.add_object(Stream::new(dictionary! {}, content));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => parent,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => content,
+        "Resources" => dictionary! { "XObject" => dictionary! { "X" => xobject }, "Font" => dictionary! { "F1" => font } },
+    });
+    doc.objects.insert(parent, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }));
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => parent });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// Catches the span cap counting spans, not bytes: a 4 KiB file drawing one long string a few
+/// hundred times held 415 MiB of text well under the count.
+#[test]
+fn a_form_repeating_a_long_string_is_capped_by_bytes() {
+    let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut form = b"BT /F1 10 Tf 10 10 Td (".to_vec();
+    form.extend(std::iter::repeat(b'x').take(1 << 20));
+    form.extend_from_slice(b") Tj ET\n");
+    let bytes = repeated_form_pdf(400, form);
+    assert!(bytes.len() < 16 * 1024, "the file is {} bytes", bytes.len());
+    let doc = open(&bytes);
+    let (peak, _) = peak_of(|| doc.scan_typography(None, &mut |_| {}).unwrap());
+    assert!(peak < 200 * MIB, "scan peaked at {} MiB", peak / MIB);
+}
+
+/// Catches a form's content being inflated with no limit, the one stream on the page path without
+/// one: a small file can decode to anything.
+#[cfg_attr(debug_assertions, ignore = "inflates hundreds of MiB: release builds only")]
+#[test]
+fn a_flate_bomb_in_a_form_is_capped() {
+    let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let bytes = repeated_form_pdf(1, vec![b' '; 512 * MIB]);
+    assert!(bytes.len() < 4 * MIB as usize, "the file is {} bytes", bytes.len());
+    let doc = open(&bytes);
+    let (peak, _) = peak_of(|| doc.extract_page_text(1).unwrap());
+    assert!(peak < 200 * MIB, "text peaked at {} MiB", peak / MIB);
+}
+
+/// Catches a parse failure re-reading the rest of a stream as one operator list: 40 MiB of content
+/// held gigabytes. Walked one operator at a time it costs the stream's copies and little more.
+#[cfg_attr(debug_assertions, ignore = "tens of millions of operators through nom: release builds only")]
+#[test]
+fn a_dense_stream_with_a_late_fault_stays_small() {
+    let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut content = b"q\n".repeat(20_000_000);
+    content.extend_from_slice(b"(unterminated Tj\n");
+    let bytes = pdf_with_contents(vec![content]);
+    let doc = open(&bytes);
+    let (peak, _) = peak_of(|| doc.extract_page_text(1).unwrap());
+    assert!(peak < 256 * MIB, "text peaked at {} MiB", peak / MIB);
 }

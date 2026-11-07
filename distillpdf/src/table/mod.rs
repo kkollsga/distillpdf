@@ -527,7 +527,9 @@ impl TableAnalysis {
     /// Could this table run onto the next page? Cheap necessary condition for
     /// [`Self::merge_proven_fragment`], read before a neighbouring page is rendered.
     pub(crate) fn may_continue_below(&self) -> bool {
-        self.proven_continuation().is_some_and(|proof| proof.terminal_owner && proof.leading_styled)
+        // Not `leading_styled`: only a chain's first page has the styled row, and the merge reads
+        // that from the anchor, so a middle page must still count.
+        self.proven_continuation().is_some_and(|proof| proof.terminal_owner)
     }
 
     /// Could this table be the tail of one that began on the previous page? See

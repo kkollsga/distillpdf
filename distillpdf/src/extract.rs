@@ -3,6 +3,7 @@
 //! Pure Rust: these return plain owned structs. The PyO3 layer (`src/lib.rs`) assembles the
 //! Python dicts/lists from them — no pyo3 types appear in this module.
 
+use crate::geom::TotalOrder;
 use crate::pdfobj::filters_of;
 use crate::raster::{assemble_png, codec_payload, filter_to_format, image_bpc, image_color_space, normalized_jpeg_png};
 use crate::table::{
@@ -604,7 +605,7 @@ fn rows_of(mut spans: Vec<Span>) -> Vec<Vec<Span>> {
     // small sub/superscripts (e.g. the "BASE"/"LARGE" in BERT_BASE/BERT_LARGE,
     // ~1pt off the baseline) into their row instead of letting a rounding boundary
     // split them into a 1-cell row that would flush a table run mid-table.
-    spans.sort_by(|p, q| q.y.partial_cmp(&p.y).unwrap_or(std::cmp::Ordering::Equal));
+    spans.sort_by(|p, q| q.y.total_order(&p.y));
     let mut rows: Vec<Vec<Span>> = Vec::new();
     let mut ref_y: Option<f32> = None;
     for s in spans {
@@ -615,7 +616,7 @@ fn rows_of(mut spans: Vec<Span>) -> Vec<Vec<Span>> {
         rows.last_mut().unwrap().push(s);
     }
     for r in &mut rows {
-        r.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+        r.sort_by(|a, b| a.x.total_order(&b.x));
     }
     rows
 }
@@ -705,7 +706,7 @@ fn row_cells(row: &[Span]) -> Vec<Cell> {
 /// deletes for the entire table — see the model-order note in `detect_tables_region`.
 fn columns(rows: &[Vec<Cell>], tol: f32) -> Vec<f32> {
     let mut xs: Vec<f32> = rows.iter().flat_map(|r| r.iter().map(|c| c.x)).collect();
-    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    xs.sort_by(|a, b| a.total_order(b));
     let mut cols: Vec<f32> = Vec::new();
     for x in xs {
         if cols.last().is_none_or(|&c| x - c > tol) {
@@ -719,7 +720,7 @@ fn columns(rows: &[Vec<Cell>], tol: f32) -> Vec<f32> {
 fn nearest_col(cols: &[f32], x: f32) -> Option<usize> {
     cols.iter()
         .enumerate()
-        .min_by(|(_, a), (_, b)| (x - **a).abs().partial_cmp(&(x - **b).abs()).unwrap_or(std::cmp::Ordering::Equal))
+        .min_by(|(_, a), (_, b)| (x - **a).abs().total_order(&(x - **b).abs()))
         .map(|(i, _)| i)
 }
 
@@ -751,7 +752,7 @@ fn column_bands(rows: &[Vec<(f32, f32)>], bridge: usize) -> Vec<(f32, f32)> {
     if ev.is_empty() {
         return Vec::new();
     }
-    ev.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(b.1.cmp(&a.1)));
+    ev.sort_by(|a, b| a.0.total_order(&b.0).then(b.1.cmp(&a.1)));
     let mut bands: Vec<(f32, f32)> = Vec::new();
     let mut cov = 0i32;
     let mut prev_x = ev[0].0;
@@ -1111,7 +1112,7 @@ fn pitch_breaks(ys: &[f32]) -> Vec<usize> {
     }
     let gaps: Vec<f32> = ys.windows(2).map(|w| w[0] - w[1]).collect();
     let mut sorted = gaps.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| a.total_order(b));
     let mid = sorted.len() / 2;
     let base = if sorted.len() % 2 == 0 { (sorted[mid - 1] + sorted[mid]) * 0.5 } else { sorted[mid] };
     if base <= 0.0 {
@@ -1173,7 +1174,12 @@ fn central_split(spans: &[Span]) -> Option<(f32, bool)> {
         if c > best.0 {
             best = (c, x);
         }
-        x += step;
+        // At 2^24 and up, adding this to an f32 can change nothing.
+        let next = x + step;
+        if next <= x {
+            break;
+        }
+        x = next;
     }
     // A two-column LAYOUT has wide wrapping PROSE on both sides: each side's line is
     // a SINGLE wide cell (>=4 words, spanning most of its half-width). A table half
@@ -2452,7 +2458,11 @@ pub(crate) fn column_gutters(spans: &[Span]) -> Vec<f32> {
         } else if let Some(r) = run.take() {
             lanes.push(r);
         }
-        x += step;
+        let next = x + step;
+        if next <= x {
+            break;
+        }
+        x = next;
     }
     if let Some(r) = run.take() {
         lanes.push(r);
@@ -2587,7 +2597,7 @@ fn persistent_internal_gutter(
             if invalid {
                 break;
             }
-            extents.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            extents.sort_by(|a, b| a.0.total_order(&b.0));
             let gaps: Vec<(f32, f32)> = extents
                 .windows(2)
                 .filter_map(|pair| (pair[0].1 < pair[1].0).then_some((pair[0].1, pair[1].0)))
@@ -2599,7 +2609,7 @@ fn persistent_internal_gutter(
             let max_width = gaps
                 .iter()
                 .map(|&(lo, hi)| hi - lo)
-                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|a, b| a.total_order(b))
                 .expect("a nonempty finite gap set has a maximum");
             let mut maximal = gaps
                 .iter()
@@ -2815,9 +2825,8 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
                     // the overflow lands in an existing column, so the column structure
                     // and x-extent are unchanged.
                     row.2.sort_by(|a, b| {
-                        b.y.partial_cmp(&a.y)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+                        b.y.total_order(&a.y)
+                            .then(a.x.total_order(&b.x))
                     });
                     kept.push(row);
                 }
@@ -3189,7 +3198,7 @@ fn detect_tables_region(spans: &[Span], bands: &[(f32, f32, f32)]) -> Vec<Positi
                     _ => {
                         // grazes no column centre — pin to the nearest by left edge
                         let k = (0..ncols)
-                            .min_by(|&i, &j| (kept_x[i] - c.x).abs().partial_cmp(&(kept_x[j] - c.x).abs()).unwrap_or(std::cmp::Ordering::Equal))
+                            .min_by(|&i, &j| (kept_x[i] - c.x).abs().total_order(&(kept_x[j] - c.x).abs()))
                             .unwrap_or(0);
                         (k, 1)
                     }

@@ -5,17 +5,8 @@
 //! 230 MiB of AST to walk 4.7 MiB of content, and a hostile stream of `q\n` costs far more per
 //! input byte. No walker in this crate looks back at an earlier operator, so none needs the list.
 //!
-//! [`OpReader`] hands the same operators over one at a time, holding a bounded chunk. It still
-//! parses with lopdf's parser, so there is one grammar. It only finds where to cut: a position
-//! just after a top-level operator, where the parser starts fresh. Most producers end an operator
-//! with a line break, so it tries the first such line end past the chunk size, and scans the
-//! operands properly only when that does not hold.
-//!
-//! **Why a cut cannot change the result.** The parser is context-free at an operator boundary.
-//! Each chunk is parsed strictly, so a chunk that does not parse to its last byte is never
-//! trusted: the reader then parses the whole remainder leniently, exactly as a whole-stream
-//! decode would from that point, which stops at the same first bad operator. A boundary scanner
-//! that disagrees with the parser therefore costs memory, never a different operator list.
+//! [`OpReader`] hands the same operators over one at a time from `Content::decode_iter`, the fork's
+//! parser run as an iterator, so nothing but the current operator is held.
 //!
 //! **The one difference from `Content::decode`.** An inline image with no `EI` is a hard parser
 //! failure, and the whole-stream decode answers `Err`, losing every operator before it too. Here
@@ -24,20 +15,9 @@
 
 use lopdf::content::{Content, Operation};
 
-/// Bytes of content decoded at a time. A chunk's AST is at most about 40× this on the densest
-/// input (`q\n`), so the walk holds single-digit MiB however long the stream is.
-const CHUNK_BYTES: usize = 32 * 1024;
-
-/// How many `EI` candidates to try for an unfiltered inline image whose samples happen to hold
-/// the bytes ` EI `, and the largest image region worth parsing to check one. Past either, no
-/// cut is made and the remainder is decoded in one piece, which is correct and merely dearer.
-const MAX_EI_CANDIDATES: usize = 8;
-const MAX_INLINE_IMAGE_CHECK_BYTES: usize = 4 * 1024 * 1024;
-
 /// Yields a content stream's operators in order. See the module docs.
 pub(crate) struct OpReader<'a> {
-    data: &'a [u8],
-    pending: std::vec::IntoIter<Operation>,
+    operations: Box<dyn Iterator<Item = lopdf::Result<Operation>> + 'a>,
     /// Operators handed over so far.
     yielded: usize,
     /// The parser refused the rest of the stream outright, the case where a whole-stream decode
@@ -47,7 +27,7 @@ pub(crate) struct OpReader<'a> {
 
 impl<'a> OpReader<'a> {
     pub(crate) fn new(data: &'a [u8]) -> Self {
-        Self { data, pending: Vec::new().into_iter(), yielded: 0, failed: false }
+        Self { operations: Box::new(Content::decode_iter(data)), yielded: 0, failed: false }
     }
 
     /// Operators in the whole stream, consuming the rest of it without keeping any.
@@ -63,238 +43,31 @@ impl<'a> OpReader<'a> {
     pub(crate) fn failed(&self) -> bool {
         self.failed
     }
-
-    fn refill(&mut self) {
-        while self.pending.len() == 0 && !self.data.is_empty() {
-            let mut parsed = None;
-            if self.data.len() > CHUNK_BYTES {
-                // Line ends first: scanning every operand costs 5-10% of the walk on dense pages.
-                // The strict parse is what makes the guess safe, and it refuses a line end that
-                // fell inside a string, an array or a dictionary.
-                let data = self.data;
-                let strict = |cut: usize| Content::decode_strict(&data[..cut]).ok().map(|content| (cut, content));
-                let found = line_end_boundary(data, CHUNK_BYTES)
-                    .and_then(strict)
-                    .or_else(|| op_boundary(data, CHUNK_BYTES).and_then(strict));
-                if let Some((cut, content)) = found {
-                    self.data = &data[cut..];
-                    parsed = Some(content);
-                }
-            }
-            let content = parsed.or_else(|| {
-                let rest = std::mem::take(&mut self.data);
-                Content::decode(rest).ok().or_else(|| {
-                    // Refused outright. What precedes the bad image still stands.
-                    self.failed = true;
-                    Content::decode_strict(&rest[..op_boundary(rest, usize::MAX)?]).ok()
-                })
-            });
-            self.pending = content.map(|content| content.operations).unwrap_or_default().into_iter();
-        }
-    }
 }
 
 impl Iterator for OpReader<'_> {
     type Item = Operation;
 
     fn next(&mut self) -> Option<Operation> {
-        if self.pending.len() == 0 {
-            self.refill();
-        }
-        let op = self.pending.next()?;
-        self.yielded += 1;
-        Some(op)
-    }
-}
-
-fn is_ws(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
-}
-
-fn is_op_char(byte: u8) -> bool {
-    byte.is_ascii_alphabetic() || matches!(byte, b'*' | b'\'' | b'"')
-}
-
-/// A name's body runs until PDF whitespace or a delimiter, as lopdf's `name` parser reads it.
-fn is_name_end(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0C | b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%')
-}
-
-/// Past the end of the literal string opening at `i`, `None` when it never closes.
-fn skip_literal(data: &[u8], mut i: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    while i < data.len() {
-        match data[i] {
-            b'\\' => i += 1,
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i + 1);
-                }
+        match self.operations.next()? {
+            Ok(op) => {
+                self.yielded += 1;
+                Some(op)
             }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-/// One step of the operand lexer shared by the two scans below: at `i` in `data`, either consume
-/// one non-operator token and return where it ends, or return `None` when `data[i]` starts an
-/// operator-shaped word. `depth` tracks arrays and dictionaries. A string that never closes ends
-/// the scan by jumping to the end of the data, so no cut is proposed after it.
-fn skip_operand(data: &[u8], i: usize, depth: &mut usize) -> Option<usize> {
-    let len = data.len();
-    Some(match data[i] {
-        byte if is_ws(byte) => i + 1,
-        b'%' => data[i..].iter().position(|&b| b == b'\r' || b == b'\n').map_or(len, |p| i + p + 1),
-        b'(' => skip_literal(data, i).unwrap_or(len),
-        b'<' if data.get(i + 1) == Some(&b'<') => {
-            *depth += 1;
-            i + 2
-        }
-        b'<' => data[i..].iter().position(|&b| b == b'>').map_or(len, |p| i + p + 1),
-        b'>' if data.get(i + 1) == Some(&b'>') => {
-            *depth = depth.saturating_sub(1);
-            i + 2
-        }
-        b'[' => {
-            *depth += 1;
-            i + 1
-        }
-        b']' => {
-            *depth = depth.saturating_sub(1);
-            i + 1
-        }
-        b'/' => {
-            let mut end = i + 1;
-            while end < len && !is_name_end(data[end]) {
-                end += 1;
-            }
-            end
-        }
-        byte if is_op_char(byte) => return None,
-        _ => i + 1,
-    })
-}
-
-/// How far past the chunk size to look for an operator at a line end.
-const LINE_END_WINDOW: usize = 4096;
-
-/// A guess at a boundary, for the strict parse to confirm: the first line break at least `min_len`
-/// into `data` that follows an operator-shaped character. Only inline image samples could make a
-/// wrong guess parse, as data the parser would read another way, so a window holding `BI` makes
-/// no guess at all and leaves it to [`op_boundary`].
-fn line_end_boundary(data: &[u8], min_len: usize) -> Option<usize> {
-    let limit = data.len().min(min_len + LINE_END_WINDOW);
-    if data[..limit].windows(2).any(|pair| pair == b"BI") {
-        return None;
-    }
-    (min_len..limit).find(|&i| matches!(data[i], b'\n' | b'\r') && is_op_char(data[i - 1])).map(|i| i + 1)
-}
-
-/// The first position at least `min_len` into `data` that sits just after a top-level operator
-/// and the whitespace following it. `None` when no such position exists before the end.
-fn op_boundary(data: &[u8], min_len: usize) -> Option<usize> {
-    let mut i = 0;
-    let mut depth = 0usize;
-    while i < data.len() {
-        if let Some(next) = skip_operand(data, i, &mut depth) {
-            i = next;
-            continue;
-        }
-        let start = i;
-        while i < data.len() && is_op_char(data[i]) {
-            i += 1;
-        }
-        let word = &data[start..i];
-        // The parser reads these three as operands, by prefix.
-        if matches!(word, b"true" | b"false" | b"null") || depth > 0 {
-            continue;
-        }
-        if word == b"BI" {
-            // An image with no end fails the whole parse, so what comes before it must be cut
-            // off from it, however short.
-            match after_inline_image(data, i) {
-                Some(end) => i = end,
-                None => return (start > 0).then_some(start),
-            }
-        }
-        while i < data.len() && is_ws(data[i]) {
-            i += 1;
-        }
-        if i >= min_len {
-            return (i < data.len()).then_some(i);
-        }
-    }
-    None
-}
-
-/// Where the inline image whose `BI` ends at `after_bi` stops, past its `EI`. Mirrors the
-/// parser's two readings: a filtered or otherwise unreadable image ends at the first
-/// whitespace-delimited `EI`, and a raw one at its computed length, which can run past `EI`-like
-/// bytes in its samples. Each raw candidate is therefore confirmed by parsing the region.
-fn after_inline_image(data: &[u8], after_bi: usize) -> Option<usize> {
-    let bi = after_bi - 2;
-    let mut i = after_bi;
-    let mut depth = 0usize;
-    let samples = loop {
-        if i >= data.len() {
-            return None;
-        }
-        if let Some(next) = skip_operand(data, i, &mut depth) {
-            i = next;
-            continue;
-        }
-        let word = i;
-        while i < data.len() && is_op_char(data[i]) {
-            i += 1;
-        }
-        if &data[word..i] == b"ID" && depth == 0 {
-            while i < data.len() && is_ws(data[i]) {
-                i += 1;
-            }
-            break i;
-        }
-    };
-    let dict = &data[after_bi..samples];
-    let filtered = dict.windows(2).enumerate().any(|(p, pair)| {
-        pair == b"/F" && dict.get(p + 2).is_none_or(|&b| is_name_end(b) || dict[p + 2..].starts_with(b"ilter"))
-    });
-    let mut candidates = data[samples..]
-        .windows(4)
-        .enumerate()
-        .filter(|(_, w)| is_ei_window(w))
-        .map(|(p, _)| samples + p + 3);
-    let first = candidates.next()?;
-    if filtered {
-        return Some(first);
-    }
-    for end in std::iter::once(first).chain(candidates).take(MAX_EI_CANDIDATES) {
-        if end - bi > MAX_INLINE_IMAGE_CHECK_BYTES {
-            return None;
-        }
-        // The parser's own reading of the region decides: one `BI` carrying its samples means
-        // the computed length ended exactly here.
-        if let Ok(content) = Content::decode_strict(&data[bi..end]) {
-            if let [op] = content.operations.as_slice() {
-                if matches!(op.operands.first(), Some(lopdf::Object::Stream(_))) {
-                    return Some(end);
-                }
+            Err(_) => {
+                self.failed = true;
+                None
             }
         }
     }
-    Some(first)
-}
-
-fn is_ei_window(window: &[u8]) -> bool {
-    matches!(window[0], b' ' | b'\n' | b'\r') && &window[1..3] == b"EI" && matches!(window[3], b' ' | b'\n' | b'\r')
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Long enough that a reader working in chunks of a page's usual size would have to cut.
+    const CHUNK_BYTES: usize = 32 * 1024;
 
     fn whole(data: &[u8]) -> Vec<Operation> {
         Content::decode(data).map(|content| content.operations).unwrap_or_default()
@@ -393,22 +166,6 @@ mod tests {
         assert!(reader.failed(), "the caller can still tell the stream did not parse");
     }
 
-    /// Catches the reader materialising the stream anyway: a dense stream must never hold more
-    /// than a chunk's worth of operators at once.
-    #[test]
-    fn the_reader_holds_one_chunk_of_operators() {
-        let data = repeated(b"q\n", CHUNK_BYTES * 16);
-        let mut reader = OpReader::new(&data);
-        let mut most = 0;
-        let mut seen = 0;
-        while reader.next().is_some() {
-            seen += 1;
-            most = most.max(reader.pending.len());
-        }
-        assert_eq!(seen, data.len() / 2);
-        assert!(most <= CHUNK_BYTES, "held {most} operators");
-    }
-
     /// Catches `finish_count` disagreeing with the list length the appearance addressing used.
     #[test]
     fn finish_count_is_the_whole_stream_length() {
@@ -418,7 +175,7 @@ mod tests {
         assert_eq!(reader.finish_count(), whole(&data).len());
     }
 
-    /// Catches the scanner panicking or spinning on bytes no producer writes.
+    /// Catches the reader panicking or spinning on bytes no producer writes.
     #[test]
     fn garbage_does_not_panic() {
         let mut seed = 0x2545_f491_4f6c_dd1du64;
@@ -433,8 +190,12 @@ mod tests {
         let _ = streamed(&data[..CHUNK_BYTES + 3]);
         let _ = streamed(b"BI");
         let _ = streamed(b"");
-        let _ = op_boundary(b"BI", 0);
-        let _ = op_boundary(b"BI /W 1 ID", 0);
-        let _ = op_boundary(b"(", 0);
+    }
+
+    /// Catches an operator with a digit in it being cut: `d0` and `d1` are operators, and a scanner
+    /// that reads words as letters only split them from what follows.
+    #[test]
+    fn operators_with_digits_read_the_same() {
+        assert_same(&repeated(b"500 0 d0 q Q\n1 2 3 4 5 6 d1\n", CHUNK_BYTES * 3));
     }
 }

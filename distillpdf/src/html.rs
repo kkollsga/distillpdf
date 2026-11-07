@@ -4,6 +4,7 @@
 //! lists, monospace/code, tables (positioned), inline embedded images. No CSS,
 //! no classes, no script — minimal tags for LLM consumption.
 
+use crate::geom::TotalOrder;
 use crate::captions::*;
 use crate::extract;
 use crate::frontmatter::*;
@@ -1042,7 +1043,7 @@ fn emit_lines(lines: &[&Line], ctx: ProseCtx<'_>, out: &mut Vec<PageElement>) {
         // (paragraph spacing) — catches paragraph breaks that aren't indented, e.g.
         // the two unindented paragraphs of an abstract.
         let mut gaps: Vec<f32> = (1..block.len()).map(|j| block[j - 1].y - block[j].y).filter(|g| *g > 0.0).collect();
-        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        gaps.sort_by(|a, b| a.total_order(b));
         let line_gap = gaps.get(gaps.len() / 2).copied().unwrap_or(0.0); // median
         for (j, l) in block.iter().enumerate() {
             let at_base = l.x0 <= base + thr;
@@ -1884,7 +1885,7 @@ pub(crate) fn render_page_elements(
                         && caption_label(&nxt.text()).is_none()
                         && detect_header(nxt, body, Some(profile)).is_none()
                 })
-                .max_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
+                .max_by(|a, b| a.y.total_order(&b.y));
             match next {
                 Some(n) => {
                     block.push(band_of(n));
@@ -2092,14 +2093,14 @@ pub(crate) fn render_page_elements(
                     let (_, _, yb, yt) = dibox(im);
                     (j, edge(yb, yt))
                 })
-                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                .min_by(|a, b| a.1.total_order(&b.1));
             let svg_best = vectors.iter().enumerate()
                 .filter(|(j, _)| svg_cap[*j].is_none())
                 .map(|(j, v)| {
                     let (_, _, yb, yt) = dvbox(v);
                     (j, edge(yb, yt))
                 })
-                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                .min_by(|a, b| a.1.total_order(&b.1));
             match (img_best, svg_best) {
                 (Some((j, di)), Some((k, ds))) => {
                     if di <= ds {
@@ -2126,7 +2127,7 @@ pub(crate) fn render_page_elements(
                     .map(|(j, table)| (j, edge(table.bbox.y0, table.bbox.y1)))
                     .filter(|(_, distance)| *distance <= body * 6.0)
                     .min_by(|a, b| {
-                        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                        a.1.total_order(&b.1)
                     })
                     .map(|(j, _)| {
                         let table = &tables[j];
@@ -2138,7 +2139,7 @@ pub(crate) fn render_page_elements(
         } else {
             tables.iter().enumerate()
                 .filter(|(j, _)| tab_cap[*j].is_none())
-                .min_by(|(_, a), (_, b)| (a.bbox.y1 - cy).abs().partial_cmp(&(b.bbox.y1 - cy).abs()).unwrap_or(std::cmp::Ordering::Equal))
+                .min_by(|(_, a), (_, b)| (a.bbox.y1 - cy).abs().total_order(&(b.bbox.y1 - cy).abs()))
                 .map(|(j, t)| {
                     let below = cy < (t.bbox.y1 + t.bbox.y0) * 0.5; // caption sits below the table (y up)
                     tab_cap[j] = Some((num.clone(), html.clone(), below));

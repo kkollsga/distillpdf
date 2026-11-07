@@ -51,11 +51,25 @@ impl Link {
     }
 }
 
+/// A bookmark title's source bytes: real ones are a line of text.
+const MAX_OUTLINE_TITLE_BYTES: usize = 4096;
+/// Bookmark text kept per document. A file can reuse one long string for every entry.
+const MAX_OUTLINE_TEXT_BYTES: usize = 16 * 1024 * 1024;
+/// A link's URI, past which the link is not kept. A truncated URI is a wrong one, so it goes whole.
+const MAX_LINK_URI_BYTES: usize = 64 * 1024;
+/// Link text one page keeps. Many annotations can name the same long URI.
+const MAX_PAGE_LINK_BYTES: usize = 4 * 1024 * 1024;
+
 fn pdf_string(o: &Object) -> Option<String> {
     match o {
-        Object::String(b, _) => Some(String::from_utf8_lossy(b).into_owned()),
+        Object::String(b, _) if b.len() <= MAX_LINK_URI_BYTES => Some(String::from_utf8_lossy(b).into_owned()),
         _ => None,
     }
+}
+
+/// The URI, name and file text a link holds, for [`MAX_PAGE_LINK_BYTES`].
+fn link_bytes(link: &Link) -> usize {
+    [&link.uri, &link.dest_name, &link.remote_file].iter().map(|text| text.as_ref().map_or(0, String::len)).sum()
 }
 
 /// Read a PDF file specification (`/GoToR`'s `/F`): either a bare string, or a filespec
@@ -404,7 +418,8 @@ pub fn outline(access: &dyn DocumentAccess) -> Vec<OutlineEntry> {
     };
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    walk_outline(access, first, &page_no, &named, 0, &mut seen, &mut out);
+    let mut text_bytes = 0;
+    walk_outline(access, first, &page_no, &named, 0, &mut seen, &mut out, &mut text_bytes);
     out
 }
 
@@ -451,6 +466,7 @@ fn outline_dest(
 
 /// Walk a sibling chain (`/Next`), recursing into children (`/First`). A visited set
 /// guards against cyclic `/Next` links in malformed outlines; depth is capped.
+#[allow(clippy::too_many_arguments)]
 fn walk_outline(
     access: &dyn DocumentAccess,
     node: ObjectId,
@@ -459,6 +475,7 @@ fn walk_outline(
     depth: u8,
     seen: &mut std::collections::HashSet<ObjectId>,
     out: &mut Vec<OutlineEntry>,
+    text_bytes: &mut usize,
 ) {
     if depth as u32 > crate::MAX_FORM_DEPTH {
         return;
@@ -483,7 +500,8 @@ fn walk_outline(
                     .ok()
                     .and_then(|title| {
                         read_resolved(access, title, |title| match title {
-                            Object::String(bytes, _) => Some(decode_text_string(bytes)),
+                            // Entries can share one long string, so the cap is per entry.
+                            Object::String(bytes, _) => Some(decode_text_string(&bytes[..bytes.len().min(MAX_OUTLINE_TITLE_BYTES)])),
                             _ => None,
                         })
                         .ok()
@@ -506,11 +524,12 @@ fn walk_outline(
         else {
             break;
         };
-        if !title.trim().is_empty() {
+        if !title.trim().is_empty() && *text_bytes < MAX_OUTLINE_TEXT_BYTES {
+            *text_bytes += title.trim().len();
             out.push(OutlineEntry { level: depth, title: title.trim().to_string(), page });
         }
         if let Some(first) = first {
-            walk_outline(access, first, page_no, named, depth + 1, seen, out);
+            walk_outline(access, first, page_no, named, depth + 1, seen, out, text_bytes);
         }
         match next {
             Some(next) => cur = next,
@@ -647,6 +666,7 @@ pub(crate) fn page_links(
 ) -> Vec<Link> {
     let named = HashMap::new();
     let mut out = Vec::new();
+    let mut bytes = 0;
     let Ok(page_handle) = access.page(id) else {
         return out;
     };
@@ -667,6 +687,10 @@ pub(crate) fn page_links(
             .ok()
             .flatten();
         if let Some(link) = link {
+            bytes += link_bytes(&link);
+            if bytes > MAX_PAGE_LINK_BYTES {
+                break;
+            }
             out.push(link);
         }
     }
@@ -695,6 +719,7 @@ pub fn extract_links(access: &dyn DocumentAccess) -> Vec<Link> {
             .ok()
             .flatten()
             .unwrap_or(0);
+        let mut bytes = 0;
         for index in 0..count {
             let Ok(annotation) = annotations.array_entry(access, index) else {
                 continue;
@@ -706,6 +731,10 @@ pub fn extract_links(access: &dyn DocumentAccess) -> Vec<Link> {
                 .ok()
                 .flatten();
             if let Some(link) = link {
+                bytes += link_bytes(&link);
+                if bytes > MAX_PAGE_LINK_BYTES {
+                    break;
+                }
                 out.push(link);
             }
         }

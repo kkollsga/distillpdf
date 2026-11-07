@@ -8,6 +8,7 @@
 //! Declared L0 tables deliberately do not use this contract: their structure tree already is
 //! an exact grid, and converting it back into inferred geometry would discard information.
 
+use crate::geom::TotalOrder;
 use crate::geom::Rect;
 use crate::text::Span;
 
@@ -72,8 +73,7 @@ pub(crate) fn column_band_index(bands: &[(f32, f32)], x: f32) -> Option<usize> {
         .min_by(|(_, &(lo, hi)), (_, &(lo2, hi2))| {
             let d = |l: f32, h: f32| if x < l { l - x } else { x - h };
             d(lo, hi)
-                .partial_cmp(&d(lo2, hi2))
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_order(&d(lo2, hi2))
         })
         .map(|(i, _)| i)
 }

@@ -5,6 +5,7 @@
 //! ourselves, decode show-text operators through each font's ToUnicode CMap, and
 //! recover real Unicode — including 2-byte CID codes and diacritics.
 
+use crate::geom::TotalOrder;
 use crate::access::{AccessError, AccessKind, DictionaryHandle, DocumentAccess, ObjectHandle, read_resolved};
 use crate::geom::Mat;
 use crate::pdfobj::num;
@@ -1357,7 +1358,10 @@ fn push_positioned_span(spans: &mut Vec<Span>, wtm: &Mat, ctm: &Mat, base_size: 
             // to `wtm` when the CTM is identity (dm == wtm), correct when it isn't.
             (dm.e, dm.f, base_size * dm.d.abs(), 0.0, dm.a.abs())
         };
-        if !s.is_empty() && height.abs() >= 2.0 {
+        // A matrix that overflowed reaches here as infinity or NaN. There is no place on a page for
+        // that text, and everything downstream measures and sorts by these numbers.
+        let placeable = x.is_finite() && y.is_finite() && height.is_finite() && (width * sx).is_finite();
+        if !s.is_empty() && height.abs() >= 2.0 && placeable {
             spans.push(Span {
                 x,
                 y,
@@ -1439,7 +1443,7 @@ fn decode_spans(
         // Total-work budget (see `crate::WalkBudget`): the depth cap alone lets a
         // self-referential form branch 2x per level. Out of budget → return the spans
         // decoded so far; a page degrades, it never comes back looking blank.
-        if !budget.spend(1) || spans.len() >= crate::MAX_PAGE_SPANS {
+        if !budget.spend(1) || spans.len() >= crate::MAX_PAGE_SPANS || budget.text_over_cap(spans) {
             return Ok(());
         }
         let o = &op.operands;
@@ -1781,7 +1785,7 @@ fn span_bbox(s: &Span) -> (f32, f32, f32, f32) {
 }
 
 fn fcmp(a: f32, b: f32) -> std::cmp::Ordering {
-    a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+    a.total_order(&b)
 }
 
 /// Median font size across spans (used to scale XY-cut gap thresholds so they
@@ -1842,8 +1846,7 @@ fn tolerant_vgap(intervals: &[(f32, f32)], tol: usize) -> Option<(f32, f32)> {
     let crossings = |x: f32| starts.partition_point(|&lo| lo < x) - ends.partition_point(|&hi| hi <= x);
     // Sweep the interior at 1pt resolution, tracking the widest contiguous run of x whose
     // crossing count stays within tolerance. No real page is wider than 14,400pt. Past
-    // MAX_GUTTER_STEPS the step widens: at 2^24 adding 1.0 to an f32 changes nothing, and a
-    // hostile coordinate there turned this loop into a hang.
+    // MAX_GUTTER_STEPS the step widens, which bounds the work.
     let step = 1.0f32.max((xmax - xmin) / MAX_GUTTER_STEPS);
     let (mut best_w, mut best_c) = (0.0f32, 0.0f32);
     let (mut run_start, mut in_run) = (0.0f32, false);
@@ -1863,7 +1866,12 @@ fn tolerant_vgap(intervals: &[(f32, f32)], tol: usize) -> Option<(f32, f32)> {
             }
             in_run = false;
         }
-        x += step;
+        // At 2^24 and up, adding a point to an f32 changes nothing, whatever the range.
+        let next = x + step;
+        if next <= x {
+            break;
+        }
+        x = next;
     }
     (best_w > 0.0).then_some((best_w, best_c))
 }
@@ -2910,6 +2918,10 @@ mod tests {
     fn tolerant_vgap_ends_on_a_far_coordinate() {
         let intervals = vec![(0.0, 10.0), (1.0e9, 1.0e9 + 10.0), (5.0, 8.0)];
         assert!(tolerant_vgap(&intervals, 0).is_some());
+        // A narrow range out there as well, where the step never gets wider than a point.
+        for x in [16_777_216.0f32, 20_000_000.0, 1.0e9] {
+            let _ = tolerant_vgap(&[(x, x + 400.0), (x + 900.0, x + 1000.0)], 0);
+        }
     }
 
     #[test]
@@ -2966,7 +2978,7 @@ mod tests {
         }
         assert_eq!(by_line.len(), 2, "the fixture draws the word twice");
         for (_, mut line) in by_line {
-            line.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+            line.sort_by(|a, b| a.x.total_order(&b.x));
             let word: String = line.iter().map(|s| s.text.as_str()).collect();
             assert_eq!(word, "Cloverdale", "leaked char spacing transposed the last two glyphs");
         }

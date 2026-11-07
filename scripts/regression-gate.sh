@@ -169,6 +169,7 @@ stage bound bound_check || exit 2
 GT_ARGS=()
 if [ "$SUITES" = 1 ]; then
   stage cargo-lib $WRAP cargo test -p distillpdf --lib
+  stage cargo-pages $WRAP cargo test --release -p distillpdf --test pages_api --test pages_memory
   stage pytest $WRAP "$PY" -m pytest tests/ -q
   stage corpus-goalline corpus_goalline
 fi

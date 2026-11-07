@@ -93,6 +93,11 @@ pub(crate) const MAX_GSTATE_NESTING: usize = 4096;
 /// below it. Past the cap the page degrades like one over its work budget: what was read stays.
 pub(crate) const MAX_PAGE_SPANS: usize = 1_000_000;
 
+/// Text bytes one page keeps in its spans, the same bound by size. A form repeating one long string
+/// reaches it with few spans: a 4 KiB file drew a megabyte 400 times. Real pages stay under a
+/// megabyte; the densest in the corpus is below this by far.
+pub(crate) const MAX_PAGE_TEXT_BYTES: usize = 32 * 1024 * 1024;
+
 /// Maximum nesting depth of a PDF *function* object ([`crate::function`]): a Type 3
 /// stitching function whose sub-functions are themselves Type 3, or an array of arrays.
 ///
@@ -147,11 +152,23 @@ pub(crate) struct WalkBudget {
     left: usize,
     /// Charges since the last look at the caller's cancel token.
     ticks: u32,
+    /// Spans already charged to [`MAX_PAGE_TEXT_BYTES`], and the bytes they came to.
+    spans_seen: usize,
+    text_bytes: usize,
 }
 
 impl WalkBudget {
     pub(crate) fn new(total: usize) -> Self {
-        Self { left: total, ticks: 0 }
+        Self { left: total, ticks: 0, spans_seen: 0, text_bytes: 0 }
+    }
+
+    /// Whether the page's text has outgrown its cap, charging any spans added since the last call.
+    pub(crate) fn text_over_cap(&mut self, spans: &[crate::text::Span]) -> bool {
+        // `get` because the page's span list only grows during a walk; if a caller shrank it, the
+        // charge already made stands and no span is counted twice.
+        self.text_bytes += spans.get(self.spans_seen..).unwrap_or(&[]).iter().map(|span| span.text.len()).sum::<usize>();
+        self.spans_seen = spans.len();
+        self.text_bytes > MAX_PAGE_TEXT_BYTES
     }
 
     /// Charge `n` units of work. Returns `false` once the budget is spent, at which point

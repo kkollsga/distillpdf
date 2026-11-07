@@ -10,6 +10,7 @@
 //! Shadings / patterns / soft masks are out of scope here (skipped); text inside
 //! a figure stays in the normal text flow (it is extracted as spans elsewhere).
 
+use crate::geom::TotalOrder;
 use crate::function::Function;
 use crate::geom::{Mat, Rect};
 use crate::access::read_resolved;
@@ -1380,9 +1381,14 @@ fn coalesce_glyph_runs(spans: &[LabelSpan]) -> Vec<(LabelSpan, usize)> {
         let (sa, sb) = (&spans[a], &spans[b]);
         let (ua, va) = uv(sa);
         let (ub, vb) = uv(sb);
-        (sa.angle, sa.size, sa.bold, sa.italic, va, ua, a)
-            .partial_cmp(&(sb.angle, sb.size, sb.bold, sb.italic, vb, ub, b))
-            .unwrap_or(std::cmp::Ordering::Equal)
+        sa.angle
+            .total_order(&sb.angle)
+            .then(sa.size.total_order(&sb.size))
+            .then(sa.bold.cmp(&sb.bold))
+            .then(sa.italic.cmp(&sb.italic))
+            .then(va.total_order(&vb))
+            .then(ua.total_order(&ub))
+            .then(a.cmp(&b))
     });
     // (first input index, the run built so far, its end along the baseline).
     let mut runs: Vec<(usize, LabelSpan, f32)> = Vec::new();
@@ -1723,7 +1729,7 @@ fn cluster_figures(
     if paths.is_empty() {
         return (Vec::new(), Vec::new());
     }
-    paths.sort_by(|a, b| b.y1.partial_cmp(&a.y1).unwrap_or(std::cmp::Ordering::Equal));
+    paths.sort_by(|a, b| b.y1.total_order(&a.y1));
     let running_dividers: Vec<bool> = paths
         .iter()
         .map(|p| is_running_brand_divider(p, &paths, rot, page_box))
@@ -2092,7 +2098,7 @@ mod tests {
     fn size_bar_figures(doc: &Document, page_id: ObjectId) -> Vec<PlacedSvg> {
         let (strong, weak) = positioned_vectors(&test_adapter(doc), page_id);
         let mut all: Vec<PlacedSvg> = strong.into_iter().chain(weak.into_iter().filter(|v| v.demoted())).collect();
-        all.sort_by(|a, b| b.y_top.partial_cmp(&a.y_top).unwrap_or(std::cmp::Ordering::Equal));
+        all.sort_by(|a, b| b.y_top.total_order(&a.y_top));
         all
     }
 

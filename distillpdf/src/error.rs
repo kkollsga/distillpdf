@@ -12,6 +12,7 @@ use std::fmt;
 /// Everything the core layer can fail with. `Display` is the user-facing message (and the
 /// exact string the Python binding surfaces as `ValueError`).
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Reading the source file failed (`open(path)`).
     Read(std::io::Error),
@@ -63,6 +64,9 @@ pub enum Error {
     /// Saved [`crate::pages::DocStats`] do not belong to this document, or to this version of
     /// the analysis (carries the reason). Scan again.
     StaleStats(String),
+    /// A bug in this library, met on this document. Nothing it returned is affected, and the
+    /// document handle is still usable. Carries the panic's message.
+    Internal(String),
 }
 
 impl fmt::Display for Error {
@@ -95,6 +99,7 @@ impl fmt::Display for Error {
             Error::ParseModelJson(e) => write!(f, "parse model_json: {e}"),
             Error::Cancelled => write!(f, "cancelled"),
             Error::StaleStats(e) => write!(f, "stale document statistics: {e}"),
+            Error::Internal(e) => write!(f, "internal error on this document: {e}"),
         }
     }
 }
@@ -108,9 +113,31 @@ impl std::error::Error for Error {
     }
 }
 
+/// Runs `f`, turning a panic into [`Error::Internal`]. Input here is hostile by assumption, so a
+/// bug met on one file must end that call, not a host. In Python, an escaping panic is a
+/// `PanicException`, which `except Exception` doesn't catch.
+pub fn catch_panics<T>(f: impl FnOnce() -> T) -> Result<T, Error> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("panic");
+        Error::Internal(message.to_string())
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Error;
+    use super::{catch_panics, Error};
+
+    /// Catches a panic escaping to the host, in Python an uncatchable-looking `PanicException`.
+    #[test]
+    fn a_panic_becomes_an_error() {
+        let result: Result<(), Error> = catch_panics(|| panic!("boom {}", 7));
+        assert_eq!(result.unwrap_err().to_string(), "internal error on this document: boom 7");
+        assert_eq!(catch_panics(|| 5).unwrap(), 5);
+    }
 
     #[test]
     fn display_strings_are_locked() {

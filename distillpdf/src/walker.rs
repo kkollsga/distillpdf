@@ -40,7 +40,7 @@
 
 use crate::access::{read_resolved, DictionaryHandle, DocumentAccess, StreamHandle};
 use crate::geom::Mat;
-use crate::pdfobj::{content_bytes, num};
+use crate::pdfobj::{content_bytes_limited, num};
 use lopdf::{Dictionary, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -501,11 +501,11 @@ pub(crate) fn form_scope(
 
 /// A form's decoded content bytes, walked through [`crate::opstream::OpReader`].
 ///
-/// Reads the stream through [`crate::pdfobj::content_bytes`], which keeps an **unfiltered**
+/// Reads the stream through [`crate::pdfobj::content_bytes_limited`], which keeps an **unfiltered**
 /// form's bytes — `decompressed_content()` alone errors on a stream with no `/Filter`, and
 /// two of these walkers used to hand the decoder zero bytes because of it.
 pub(crate) fn form_content(stream: &lopdf::Stream) -> Vec<u8> {
-    content_bytes(stream)
+    content_bytes_limited(stream, crate::access::MAX_PAGE_CONTENT_BYTES)
 }
 
 /// A form's `/Matrix`, identity when absent or malformed.

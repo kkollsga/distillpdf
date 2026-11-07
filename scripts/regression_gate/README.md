@@ -46,7 +46,7 @@ images, `extract_links`.
   noise, (max-min)/median p50/p95: instructions 0.5%/2.9%, footprint 2.4%/14.9%, CPU 8.3%/41.9%,
   wall 18.1%/100%. Treat a footprint move under about 15% on one document as noise.
 
-Existing gates it runs rather than duplicates: `cargo test -p distillpdf --lib`, `pytest tests/`,
+Existing gates it runs rather than duplicates: `cargo test -p distillpdf --lib`, the page API tests (`pages_api`, `pages_memory`), `pytest tests/`,
 `corpus_tests/test_regression.py`, and `bench100_gate.py --rescore` (full mode, in a private copy of
 its state, because the real run overwrites the shared record in `dev-docs/bench/results/`).
 

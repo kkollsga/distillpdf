@@ -58,6 +58,7 @@ mod tests {
             Error::ParseModelJson(_) => "ParseModelJson",
             Error::Cancelled => "Cancelled",
             Error::StaleStats(_) => "StaleStats",
+            Error::Internal(_) => "Internal",
         }
     }
 

@@ -336,6 +336,8 @@
     "clone-call|34de491e33cfb44031ab9496db9e469a12f296669b9dab7cdafb04c438295d79|items . iter () . take (generic_len) . cloned ()",
     "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
     "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
+    "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
+    "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()",
     "clone-call|a9f58684fd657a64c1669755a6df0b8eb01c3ce3082fd43f69288f150227b103|stream . content . clone ()"
   ],
   "postprocess.rs": [

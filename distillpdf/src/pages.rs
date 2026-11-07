@@ -67,10 +67,22 @@
 //!    document-wide running number. A second "Figure 3" keeps `#fig-3`, because `fig-3-2` would
 //!    depend on the pages before it.
 //!
-//! # Stopping, and what a kill loses
+//! # What bounds a hostile file
+//!
+//! A page's own work is capped: operators by the walk budget, text at
+//! 1,000,000 spans and 32 MiB, graphics-state nesting at 4,096, a
+//! form's inflated content at 64 MiB, a page's link text at 4 MiB. Per document, [`DocStats`] holds
+//! at most 1 MiB of bookmark keys and 16,384 label ranges of 256 bytes, which is the outer limit of
+//! what a hostile file can make it hold; [`DocStats::approx_bytes`] says what it holds. Reading the
+//! outline holds at most 16 MiB of titles for the moment it takes. Layout on a page at
+//! those caps is slow rather than unbounded: it stops only at the next stage, so a host still needs
+//! its own deadline, and the process limit is the host's.
+//!
+//! //! # Stopping, and what a kill loses
 //!
 //! A [`CancelToken`] stops the scan and the stream between pages, and inside a heavy page at the
-//! next operator walked. A cancelled page is discarded, never handed over partial. Each
+//! next operator walked. A cancelled page is discarded and never kept, so asking again answers it
+//! whole. Each
 //! [`PageOutput`] is complete and owned when returned, so a killed process loses only the page in
 //! progress. Nothing here starts a thread: the caller's thread does all the work.
 
@@ -93,7 +105,7 @@ use crate::structtree::DeclaredTable;
 use crate::{chrome, docscan, elem_passes, links, markdown, model, nav, postprocess, text};
 
 /// Bumped whenever a saved [`DocStats`] would mean something else to the renderer.
-const STATS_VERSION: u32 = 1;
+const STATS_VERSION: u32 = 2;
 
 /// A ruled table's merge never crosses a multiple of this many pages. It bounds how many pages
 /// one page's answer can need, and it is aligned, so where a table is cut does not depend on
@@ -107,6 +119,9 @@ pub const MAX_CACHED_PAGES: usize = 3;
 /// Headings tracked by the first pass. A document past this is hostile or a heading flood, and an
 /// untracked heading simply stays a heading.
 const MAX_HEADING_KEYS: usize = 64 * 1024;
+
+const MAX_PROMOTE_KEY_BYTES: usize = 512;
+const MAX_PROMOTE_BYTES: usize = 1024 * 1024;
 
 /// The shortest paragraph tail that can be taken to run on: shorter is a label, not a sentence.
 const MIN_RUN_ON_CHARS: usize = 20;
@@ -141,10 +156,10 @@ pub(crate) fn cancel_requested() -> bool {
 }
 
 /// Installs a token for the current thread until dropped, restoring whatever was there.
-struct CancelScope(Option<CancelToken>);
+pub(crate) struct CancelScope(Option<CancelToken>);
 
 impl CancelScope {
-    fn new(token: Option<&CancelToken>) -> Self {
+    pub(crate) fn new(token: Option<&CancelToken>) -> Self {
         Self(ACTIVE_CANCEL.with(|active| active.replace(token.cloned())))
     }
 }
@@ -203,6 +218,8 @@ pub struct DocStats {
     version: u32,
     page_count: u32,
     source_len: u64,
+    /// See `SourceRecovery::fingerprint`: length alone let two files of one size share statistics.
+    fingerprint: String,
     depth: ScanDepth,
     plan: DocPlan,
     running_heads: Vec<RunningHead>,
@@ -259,13 +276,27 @@ impl DocStats {
         progress: &mut dyn FnMut(PageProgress),
     ) -> Result<Self, Error> {
         let _scope = CancelScope::new(cancel);
+        crate::error::catch_panics(|| Self::scan_inner(access, depth, cancel, progress))?
+    }
+
+    fn scan_inner(
+        access: &dyn DocumentAccess,
+        depth: ScanDepth,
+        cancel: Option<&CancelToken>,
+        progress: &mut dyn FnMut(PageProgress),
+    ) -> Result<Self, Error> {
         let pages = access.pages_or_empty();
         let total = pages.len() as u32;
         let outline = links::outline(access);
         let mut promote: BTreeMap<u32, Vec<(String, u8)>> = BTreeMap::new();
+        let mut promote_bytes = 0;
         for entry in &outline {
-            if entry.page > 0 {
-                promote.entry(entry.page).or_default().push((nav::title_key(&entry.title), entry.level));
+            let key = nav::title_key(&entry.title);
+            // What the statistics keep of a bookmark is what they promise to keep small. A title
+            // too long to match a heading of at most twelve words earns no place.
+            if entry.page > 0 && key.len() <= MAX_PROMOTE_KEY_BYTES && promote_bytes < MAX_PROMOTE_BYTES {
+                promote_bytes += key.len();
+                promote.entry(entry.page).or_default().push((key, entry.level));
             }
         }
 
@@ -274,6 +305,7 @@ impl DocStats {
         for (done, page) in pages.iter().enumerate() {
             check(cancel)?;
             let spans = text::extract_spans(access, page.id).unwrap_or_default();
+            source_unchanged(access)?;
             typography.add_page(page.number, &spans);
             chrome_scan.add_page(access, page.id, &spans);
             progress(PageProgress { phase: ScanPhase::Typography, done: done as u32 + 1, total });
@@ -281,11 +313,16 @@ impl DocStats {
         check(cancel)?;
         let (body, title_sz, profile) = typography.finish(pages.len(), !outline.is_empty());
         let chrome = chrome_scan.finish(body);
+        // Spans with infinite positions never get here, but a size past the f32 range rounds to
+        // infinity on its own, and a non-finite number has no JSON form: saved statistics would
+        // never load, and a host would rescan for ever.
+        let (body, title_sz) = (finite_or(body, 10.0), finite_or(title_sz, finite_or(body, 10.0)));
         let mut plan = DocPlan { body, title_sz, profile, chrome, head_plan: HeadingPlan::default() };
         let mut stats = Self {
             version: STATS_VERSION,
             page_count: total,
             source_len: access.source_len().unwrap_or(0),
+            fingerprint: source_fingerprint(access)?,
             depth,
             plan: plan.clone(),
             running_heads: Vec::new(),
@@ -307,6 +344,7 @@ impl DocStats {
             for (done, page) in pages.iter().enumerate() {
                 check(cancel)?;
                 let spans = text::extract_spans(access, page.id).unwrap_or_default();
+                source_unchanged(access)?;
                 style_scan.add_page(&spans, stats.plan.body, &stats.plan.profile);
                 let (els, _) = render_page(access, stats, *page, &page_no, &declared, &spans);
                 for element in &els {
@@ -376,8 +414,33 @@ impl DocStats {
         if self.source_len != source_len {
             return Err(Error::StaleStats(format!("scanned a {}-byte file, this one is {source_len}", self.source_len)));
         }
+        if self.fingerprint != source_fingerprint(access)? {
+            return Err(Error::StaleStats(String::from("scanned another file of the same size")));
+        }
         Ok(())
     }
+}
+
+/// A non-finite number replaced, so it can be saved.
+fn finite_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        fallback
+    }
+}
+
+fn source_fingerprint(access: &dyn DocumentAccess) -> Result<String, Error> {
+    access.source_recovery().fingerprint().map_err(|error| Error::StaleStats(format!("the source can't be read: {error}")))
+}
+
+/// Whether the file is still the one opened. Read after a page's content, because a read that failed
+/// for that reason came back as an empty page, the answer a caller is least able to question.
+fn source_unchanged(access: &dyn DocumentAccess) -> Result<(), Error> {
+    access
+        .source_recovery()
+        .validate_unchanged()
+        .map_err(|error| Error::StaleStats(format!("the source changed: {error}")))
 }
 
 /// One page's element IR, through the same per-page code the whole-document path runs.
@@ -478,6 +541,8 @@ pub struct PageStream<'d> {
     declared: Option<HashMap<ObjectId, Vec<DeclaredTable>>>,
     cache: Vec<CachedPage>,
     next: u32,
+    /// The iterator has handed over an error and ended. [`Self::page`] still answers.
+    failed: bool,
     cancel: Option<CancelToken>,
     on_page: Option<Box<dyn FnMut(u32, u32) + 'd>>,
 }
@@ -488,7 +553,7 @@ impl<'d> PageStream<'d> {
         stats.validate(access, pages.len())?;
         let page_no = pages.iter().map(|page| (page.id, page.number)).collect();
         let running = stats.running_heads.iter().map(|head| (head.key, head.first_h1_page)).collect();
-        Ok(Self { access, stats, running, pages, page_no, declared: None, cache: Vec::new(), next: 1, cancel: None, on_page: None })
+        Ok(Self { access, stats, running, pages, page_no, declared: None, cache: Vec::new(), next: 1, failed: false, cancel: None, on_page: None })
     }
 
     /// Stops this stream between pages and inside a heavy page.
@@ -533,7 +598,12 @@ impl<'d> PageStream<'d> {
         if n == 0 || n as usize > self.pages.len() {
             return Err(Error::NoPage(Some(n)));
         }
-        let output = self.build_output(n)?;
+        let output = crate::error::catch_panics(|| self.build_output(n))?;
+        if output.is_err() {
+            // Whatever the page left half-built, nothing of it may answer the next call.
+            self.cache.clear();
+        }
+        let output = output?;
         // A walk stopped by the token returns what it has, and that partial page must not leave.
         check(cancel.as_ref())?;
         let total = self.page_count();
@@ -555,18 +625,17 @@ impl<'d> PageStream<'d> {
             return Ok(self.cache.len() - 1);
         }
         check(self.cancel.as_ref())?;
-        // A page read after the file changed underneath would come back blank, not wrong, and a
-        // blank page is what a caller is least able to question.
-        self.access
-            .source_recovery()
-            .validate_unchanged()
-            .map_err(|error| Error::StaleStats(format!("the source changed: {error}")))?;
         let page = self.pages[n as usize - 1];
         let spans = text::extract_spans(self.access, page.id).unwrap_or_default();
         let access = self.access;
         let declared = self.declared.get_or_insert_with(|| crate::structtree::declared_tables(access));
         let (els, uris) = render_page(self.access, &self.stats, page, &self.page_no, declared, &spans);
         drop(spans);
+        // Both checks come after the read, because each one's failure looks like a short page. A walk
+        // the token stopped returned what it had, and a file changed underneath reads as blank. A
+        // page like that must not reach the cache, where a retry would find it.
+        check(self.cancel.as_ref())?;
+        source_unchanged(self.access)?;
         self.cache.push(CachedPage { page: n, raw: (n, els, uris), resolved: None });
         if self.cache.len() > MAX_CACHED_PAGES + SEGMENT_PAGES as usize {
             self.cache.remove(0);
@@ -617,21 +686,22 @@ impl<'d> PageStream<'d> {
         let boundary_out = n == segment_end && self.tables_may_join(n)? && self.merges_across_boundary(n)?;
         let boundary_in = n == segment_start && n > 1 && self.tables_may_join(n - 1)? && self.merges_across_boundary(n - 1)?;
 
+        // The page holding the rows `n` lost, however far back the chain began.
+        let table_in = window
+            .iter()
+            .find(|(_, els, _)| els.iter().flat_map(|e| e.spill.iter()).any(|(page, _)| *page == n))
+            .map(|(page, _, _)| *page);
         let position = (n - first) as usize;
         let (_, mut els, uris) = window.swap_remove(position);
-        // Everything `n`'s chain absorbed, and whether `n` itself was absorbed.
+        // Everything `n`'s chain absorbed.
         let table_out = els.iter().flat_map(|e| e.spill.iter()).map(|(page, _)| *page).min();
-        let raw_tables = |ir: &PageIR| ir.1.iter().filter(|e| matches!(e.kind, ElKind::Table(_))).count();
-        let index = self.raw(n)?;
-        let lost_table = raw_tables(&self.cache[index].raw) > els.iter().filter(|e| matches!(e.kind, ElKind::Table(_))).count();
-        let table_in = lost_table.then(|| n - 1);
         self.demote_running(n, &mut els);
         elem_passes::run_page_local_passes(&mut els);
         let resolved = ResolvedPage {
             els,
             uris,
             table_out: table_out.or(boundary_out.then_some(n + 1)),
-            table_in: table_in.or(boundary_in.then(|| n - 1)),
+            table_in: table_in.or(boundary_in.then_some(n - 1)),
         };
         let index = self.raw(n)?;
         self.cache[index].resolved = Some(resolved.clone());
@@ -728,13 +798,15 @@ impl Iterator for PageStream<'_> {
     type Item = Result<PageOutput, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next as usize > self.pages.len() {
+        if self.failed || self.next as usize > self.pages.len() {
             return None;
         }
         let output = self.page(self.next);
-        // A cancelled page has not been handed over, so a retry would answer it afresh.
-        if output.is_ok() {
-            self.next += 1;
+        // It ends here, so a loop that doesn't stop on `Err` cannot spin. A cancelled page has not
+        // been handed over, and [`PageStream::page`] answers it afresh.
+        match &output {
+            Ok(_) => self.next += 1,
+            Err(_) => self.failed = true,
         }
         Some(output)
     }

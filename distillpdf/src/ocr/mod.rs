@@ -23,6 +23,7 @@ pub(crate) mod tess_synth;
 #[cfg(feature = "tesseract")]
 pub mod tesseract;
 
+use crate::geom::TotalOrder;
 use lopdf::ObjectId;
 #[cfg(test)]
 use lopdf::Document;
@@ -40,7 +41,7 @@ pub(crate) fn page_main_image(
         .filter(|p| !p.uri.is_empty())
         .max_by(|a, b| {
             let area = |p: &crate::img::Placed| (p.x_right - p.x_left).abs() * (p.y_top - p.y_bottom).abs();
-            area(a).partial_cmp(&area(b)).unwrap_or(std::cmp::Ordering::Equal)
+            area(a).total_order(&area(b))
         })?;
     let bytes = data_uri_bytes(&best.uri)?;
     let img = image::load_from_memory(&bytes).ok()?;

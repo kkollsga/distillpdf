@@ -350,7 +350,10 @@ fn statistics_from_another_document_are_refused() {
     let two = open(&pdf_of(&[&["A first page."], &["A second page."]]));
     let stats = one.scan_document(None, &mut |_| {}).unwrap();
     assert!(matches!(two.page_stream(stats.clone()), Err(Error::StaleStats(_))));
-    let json = stats.to_json().unwrap().replace("\"version\":1", "\"version\":9999");
+    let json = stats.to_json().unwrap();
+    let start = json.find("\"version\":").unwrap();
+    let end = start + json[start..].find(',').unwrap();
+    let json = format!("{}\"version\":9999{}", &json[..start], &json[end..]);
     assert!(matches!(one.page_stream(DocStats::from_json(&json).unwrap()), Err(Error::StaleStats(_))));
     assert!(matches!(DocStats::from_json("not json"), Err(Error::StaleStats(_))));
 }
@@ -453,4 +456,381 @@ fn hostile_page_labels_are_cheap() {
     let out = dir.join("labels.dpdf");
     opened.distill(out.to_str(), &distillpdf::DistillOptions::text_only()).expect("distill");
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Runs `f` on its own thread and fails the test, rather than hanging the suite, past `seconds`.
+fn within<T: Send + 'static>(seconds: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(f());
+    });
+    finished.recv_timeout(Duration::from_secs(seconds)).expect("hung past its limit")
+}
+
+fn page_with(content: Vec<u8>) -> Vec<u8> {
+    let mut doc = Document::with_version("1.7");
+    let font = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" });
+    let parent = doc.new_object_id();
+    let content = doc.add_object(Stream::new(dictionary! {}, content));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => parent,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => content,
+        "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+    });
+    doc.objects.insert(parent, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }));
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => parent });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// Catches the gutter sweep spinning once `x += step` stops changing `x`, at 2^24 and up with a
+/// narrow range, which no cancel could reach. Every path that lays out a page runs it.
+#[test]
+fn text_far_off_the_page_does_not_hang_any_path() {
+    for x in ["20000000", "1000000000", "16777217"] {
+        let mut content = b"BT /F1 10 Tf ".to_vec();
+        for line in 0..40 {
+            content.extend_from_slice(
+                format!("1 0 0 1 {x} {} Tm (word wide wide wide wide wide wide wide wide wide wide) Tj\n", 700 - line * 12).as_bytes(),
+            );
+        }
+        content.extend_from_slice(b"ET\n");
+        let bytes = page_with(content);
+        within(120, move || {
+            let doc = open(&bytes);
+            doc.extract_page_text(1).unwrap();
+            let _ = doc.extract_text();
+            let _ = doc.render(Mode::Page, false, false);
+            let stats = doc.scan_document(None, &mut |_| {}).unwrap();
+            doc.page_stream(stats).unwrap().page(1).unwrap();
+        });
+    }
+}
+
+/// Catches a NaN coordinate reaching a sort. Rust's sort may panic on an ordering that isn't total,
+/// and `partial_cmp().unwrap_or(Equal)` is not one, so hostile numbers became a `PanicException`.
+/// These two files, the repo's own fixtures with numbers changed by a fuzzer, panicked the render.
+#[test]
+fn files_that_made_nan_coordinates_do_not_panic() {
+    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for name in ["nan_sort_report.pdf", "nan_sort_chrome.pdf"] {
+        let bytes = std::fs::read(data.join(name)).unwrap();
+        let doc = open(&bytes);
+        let _ = doc.extract_text();
+        let _ = doc.render(Mode::Page, false, false);
+        let _ = doc.render(Mode::Section, false, true);
+        let stats = doc.scan_document(None, &mut |_| {}).unwrap();
+        let mut stream = doc.page_stream(stats).unwrap();
+        for page in stream.by_ref() {
+            page.unwrap();
+        }
+    }
+}
+
+/// Catches an overflowed matrix putting text at a NaN position: it must not reach layout, which
+/// measures and sorts by these numbers, and the rest of the page must still read.
+#[test]
+fn nan_coordinates_do_not_panic_any_path() {
+    // Each `cm` overflows the matrix to infinity, and infinity times zero is NaN.
+    let huge = "340282350000000000000000000000000000000.0";
+    let mut content = Vec::new();
+    for line in 0..80 {
+        if line % 2 == 0 {
+            content.extend_from_slice(format!("q {huge} 0 0 {huge} {huge} {huge} cm {huge} 0 0 {huge} 0 0 cm 0 0 0 0 0 0 cm\n").as_bytes());
+        } else {
+            content.extend_from_slice(b"q\n");
+        }
+        content.extend_from_slice(format!("BT /F1 10 Tf 1 0 0 1 {} {} Tm (word {line}) Tj ET Q\n", 40 + line * 3, 700 - line * 7).as_bytes());
+        content.extend_from_slice(format!("q 0 0 m {huge} {huge} l S {} {} 50 10 re S Q\n", 40 + line * 3, 700 - line * 7).as_bytes());
+    }
+    let bytes = page_with(content);
+    let doc = open(&bytes);
+    let text = doc.extract_text();
+    assert!(text.contains("word 1"), "the placed lines still read: {text}");
+    let _ = doc.render(Mode::Page, false, false);
+    let _ = doc.render(Mode::Section, false, true);
+    let stats = doc.scan_document(None, &mut |_| {}).unwrap();
+    assert!(stats.to_json().is_ok());
+    doc.page_stream(stats).unwrap().page(1).unwrap();
+}
+
+/// Catches a raw inline image confusing a chunk boundary: `BI` and ` EI ` in its samples used to
+/// lose every line after it and read the samples as page text, an injection path.
+#[test]
+fn inline_image_samples_never_become_text_or_lose_the_page() {
+    let mut samples = Vec::new();
+    for _ in 0..8 {
+        samples.extend_from_slice(b"Q EI ");
+    }
+    samples.extend_from_slice(b"BT /F1 10 Tf 72 700 Td (INJECTED) Tj ET BI x");
+    let mut content = format!("BI /W {} /H 1 /BPC 8 /CS /G ID ", samples.len()).into_bytes();
+    content.extend_from_slice(&samples);
+    content.extend_from_slice(b" EI\nBT /F1 10 Tf 72 720 Td 13 TL\n");
+    for _ in 0..1800 {
+        content.extend_from_slice(b"(the visible body line) Tj T*\n");
+    }
+    content.extend_from_slice(b"ET\n");
+    let decoded = Content::decode(&content).expect("the whole stream parses");
+    let bytes = page_with(content);
+    let doc = open(&bytes);
+    let text = doc.extract_text();
+    let expected = decoded.operations.iter().filter(|op| op.operator == "Tj").count();
+    assert_eq!(text.matches("visible body").count(), expected, "as many lines as a whole decode finds");
+    let stats = doc.scan_typography(None, &mut |_| {}).unwrap();
+    let page = doc.page_stream(stats).unwrap().page(1).unwrap();
+    assert_eq!(page.markdown.matches("visible body").count(), expected);
+    assert_eq!(text.contains("INJECTED"), decoded.operations.iter().any(|op| matches!(op.operands.first(), Some(Object::String(s, _)) if s == b"INJECTED")));
+}
+
+/// Catches a walk stopped by the token leaving its partial page in the stream's cache, where a
+/// retry returned it as `Ok` without the end of the page. Tried across many stopping points, since
+/// where the token lands varies.
+#[test]
+fn a_retry_after_a_cancel_returns_the_whole_page() {
+    let mut content = b"BT /F1 10 Tf 72 720 Td (BEGINWORD first line of the page text) Tj ET\n".to_vec();
+    content.extend(b"0 0 1 rg\n".repeat(1_500_000));
+    content.extend_from_slice(b"BT /F1 10 Tf 72 300 Td (ENDWORD last line of the page text) Tj ET\n");
+    let bytes = page_with(content);
+    let doc = Arc::new(open(&bytes));
+    let stats = doc.scan_typography(None, &mut |_| {}).unwrap();
+    let saved = stats.to_json().unwrap();
+    let started = Instant::now();
+    let fresh = doc.page_stream(stats).unwrap().page(1).unwrap();
+    let whole = started.elapsed();
+    assert!(fresh.markdown.contains("ENDWORD"));
+    let mut cancelled = 0;
+    for step in 0..24u32 {
+        let token = CancelToken::new();
+        let trigger = token.clone();
+        let delay = whole * step / 24;
+        let timer = std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            trigger.cancel();
+        });
+        let mut stream = doc.page_stream(DocStats::from_json(&saved).unwrap()).unwrap().with_cancel(token);
+        let first = stream.page(1);
+        timer.join().unwrap();
+        match first {
+            Ok(page) => assert_eq!(page.markdown, fresh.markdown, "an uncancelled answer is whole"),
+            Err(Error::Cancelled) => cancelled += 1,
+            Err(other) => panic!("{other}"),
+        }
+        let mut stream = stream.with_cancel(CancelToken::new());
+        assert_eq!(stream.page(1).unwrap().markdown, fresh.markdown, "cancel point {step}");
+    }
+    assert!(cancelled > 0, "no attempt was actually cancelled");
+}
+
+/// Catches `for page in stream` spinning: a loop that doesn't stop on `Err` got the same error
+/// forever from a cancelled stream. `.page(n)` is how to retry.
+#[test]
+fn the_iterator_ends_after_an_error() {
+    let doc = open(&pdf_of(&[&["One."], &["Two."]]));
+    let stats = doc.scan_typography(None, &mut |_| {}).unwrap();
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let results: Vec<_> = doc.page_stream(stats).unwrap().with_cancel(cancel).take(5).collect();
+    assert_eq!(results.len(), 1, "one error, then the end");
+    assert!(matches!(results[0], Err(Error::Cancelled)));
+}
+
+/// Catches a same-sized file being read under another file's statistics, which silently changes
+/// which rows are dropped as running headers.
+#[test]
+fn statistics_of_another_file_of_the_same_size_are_refused() {
+    let make = |head: &str, body: &str| {
+        let pages: Vec<Vec<String>> = (0..8).map(|n| vec![head.to_string(), format!("{body} {n} here.")]).collect();
+        let lines: Vec<Vec<&str>> = pages.iter().map(|page| page.iter().map(String::as_str).collect()).collect();
+        let slices: Vec<&[&str]> = lines.iter().map(Vec::as_slice).collect();
+        pdf_of(&slices)
+    };
+    let a = make("Annual Report Header", "Body text of document A page");
+    let b = make("Secret Findings Line", "Body text of document B page");
+    assert_eq!(a.len(), b.len());
+    let (doc_a, doc_b) = (open(&a), open(&b));
+    let stats = doc_a.scan_typography(None, &mut |_| {}).unwrap();
+    assert!(matches!(doc_b.page_stream(stats.clone()), Err(Error::StaleStats(_))));
+    assert!(doc_a.page_stream(stats).is_ok(), "its own file still fits");
+}
+
+/// Catches a font size overflowing to infinity, which serializes as `null` and can never load, so
+/// a host holding saved statistics rescans for ever.
+#[test]
+fn statistics_of_a_hostile_font_size_can_be_saved_and_loaded() {
+    let big = "9".repeat(45);
+    let mut content = format!("BT /F1 {big}.0 Tf 72 720 Td (Huge text) Tj ET\n").into_bytes();
+    content.extend_from_slice(b"BT /F1 10 Tf 72 700 Td (Body text line one here) Tj ET\n");
+    let doc = open(&page_with(content));
+    let stats = doc.scan_document(None, &mut |_| {}).unwrap();
+    let json = stats.to_json().unwrap();
+    let back = DocStats::from_json(&json).expect("what `to_json` writes, `from_json` reads");
+    doc.page_stream(back).unwrap().page(1).unwrap();
+}
+
+/// Catches a replaced file coming back as blank pages under `Ok`, and a scan over one reporting
+/// success: neither may answer from a file that is no longer the one opened.
+#[test]
+fn a_file_replaced_underneath_is_an_error_not_blank_pages() {
+    let dir = std::env::temp_dir().join(format!("distillpdf-replaced-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("doc.pdf");
+    let lines: Vec<&[&str]> = vec![&["A line of body text that ends here."]; 6];
+    let bytes = pdf_of(&lines);
+    std::fs::write(&path, &bytes).unwrap();
+    let doc = PdfDocument::open_with_engine(path.to_str().unwrap(), Engine::Lazy).unwrap();
+    let stats = doc.scan_document(None, &mut |_| {}).unwrap();
+    let mut stream = doc.page_stream(stats).unwrap();
+    stream.page(1).unwrap();
+    let other: Vec<&[&str]> = vec![&["Entirely different words on this page now."]; 9];
+    std::thread::sleep(Duration::from_millis(1100));
+    std::fs::write(&path, pdf_of(&other)).unwrap();
+    assert!(stream.page(4).is_err(), "a page read after the replace");
+    assert!(doc.scan_typography(None, &mut |_| {}).is_err(), "a scan after the replace");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A ruled grid per page, in one column layout, the first row of the first page set bold. That is
+/// what the proof in `table::finalize_continuation_proofs` accepts as one table.
+fn ruled_chain(pages: usize) -> Vec<u8> {
+    let mut doc = Document::with_version("1.7");
+    let regular = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" });
+    let bold = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica-Bold" });
+    let parent = doc.new_object_id();
+    let mut kids: Vec<Object> = Vec::new();
+    for page in 0..pages {
+        let rows = 5;
+        let columns = [4.0, 94.0, 176.8, 238.0];
+        let mut content = String::from("q\n1 0 0 1 147.6 648.4 cm\nq\n");
+        if page == 0 {
+            content.push_str(".85 .85 .91 rg\nn 0 80 316.8 -16 re f*\n");
+        }
+        content.push_str("0 0 0 rg\n");
+        for row in 0..rows {
+            let font = if page == 0 && row == 0 { "F2" } else { "F1" };
+            content.push_str(&format!("BT /{font} 8.5 Tf 12 TL ET\n"));
+            for (column, x) in columns.iter().enumerate() {
+                let y = 69.5 - row as f32 * 16.0;
+                let cell = if page == 0 && row == 0 { format!("Head{column}") } else { format!("P{page}R{row}C{column}") };
+                content.push_str(&format!("BT 1 0 0 1 {x} {y} Tm ({cell}) Tj T* ET\n"));
+            }
+        }
+        content.push_str("q\n1 J\n1 j\n0 0 0 RG\n.5 w\n");
+        for line in ["0 80 m 316.8 80", "0 0 m 316.8 0", "0 0 m 0 80", "316.8 0 m 316.8 80", "0 64 m 316.8 64", "0 48 m 316.8 48", "0 32 m 316.8 32", "0 16 m 316.8 16", "90 0 m 90 80", "172.8 0 m 172.8 80", "234 0 m 234 80"] {
+            content.push_str(&format!("n {line} l S\n"));
+        }
+        content.push_str("Q\nQ\nQ\n");
+        let content = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => parent,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => content,
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => regular, "F2" => bold } },
+        });
+        kids.push(page.into());
+    }
+    let count = kids.len() as i64;
+    doc.objects.insert(parent, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => count }));
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => parent });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// Catches a table over three pages misreporting where it starts: page 3's rows are on page 1, so
+/// its marker must name page 1, not the empty page 2 between them. The rows must all be there once,
+/// and the answer must not depend on the order pages are asked for.
+#[test]
+fn a_table_over_three_pages_goes_where_it_starts_and_says_so() {
+    let bytes = ruled_chain(4);
+    let doc = open(&bytes);
+    let html = doc.render(Mode::Page, false, false);
+    let (whole, _) = markdown::html_to_markdown(&html, false, ImgMode::Placeholder);
+    let pages = all_pages(&doc);
+    assert!(pages[0].markdown.contains("P3R4C3"), "the chain merged: {}", pages[0].markdown);
+    assert_eq!(pages[0].continues_on, Some(2));
+    for page in &pages[1..] {
+        assert_eq!(page.continued_from, Some(1), "page {}", page.page);
+        assert_eq!(page.continues_on, None, "page {}", page.page);
+        assert!(!page.markdown.contains('|'), "no rows left on page {}", page.page);
+    }
+    let spilled: Vec<u32> = pages[0].continuations.iter().map(|c| c.page).collect();
+    assert_eq!(spilled, vec![2, 3, 4]);
+    let joined: String = pages.iter().map(|page| strip_markers(&page.markdown) + "\n").collect();
+    assert_eq!(sorted_words(&joined), sorted_words(&whole));
+    let stats = doc.scan_document(None, &mut |_| {}).unwrap();
+    let mut stream = doc.page_stream(stats).unwrap();
+    for n in [4u32, 2, 3, 1] {
+        assert_eq!(stream.page(n).unwrap().markdown, pages[n as usize - 1].markdown, "page {n} out of order");
+    }
+}
+
+/// Catches the chrome stage walking every span per row: a page of 80,000 rows held a scan for 13.7 s
+/// with no way to stop it, six such pages over a minute. The stage itself now checks the token, so
+/// this asserts the work, and `chrome.rs` tests the check.
+#[test]
+fn a_page_of_many_rows_scans_quickly() {
+    let mut content = b"BT /F1 10 Tf ".to_vec();
+    let height = 10_000_000.0f32;
+    for row in 0..80_000 {
+        content.extend_from_slice(format!("1 0 0 1 72 {} Tm (x) Tj\n", height - 1.0 - row as f32 * 2.0).as_bytes());
+    }
+    content.extend_from_slice(b"ET\n");
+    let mut doc = Document::with_version("1.7");
+    let font = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" });
+    let parent = doc.new_object_id();
+    let mut kids: Vec<Object> = Vec::new();
+    for _ in 0..6 {
+        let stream = doc.add_object(Stream::new(dictionary! {}, content.clone()));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => parent,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), Object::Real(height)],
+            "Contents" => stream,
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+        });
+        kids.push(page.into());
+    }
+    doc.objects.insert(parent, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 6 }));
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => parent });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    within(60, move || {
+        open(&bytes).scan_typography(None, &mut |_| {}).unwrap();
+    });
+}
+
+/// Catches a span at the far edge of a huge page overflowing the chrome bucket's arithmetic, a
+/// debug-build panic on a number that only needs to compare as far away.
+#[test]
+fn a_row_at_an_extreme_coordinate_does_not_overflow() {
+    let pages: Vec<Vec<u8>> = (0..5)
+        .map(|_| b"BT /F1 10 Tf 1 0 0 1 72 -999999999999 Tm (footer far away) Tj 1 0 0 1 72 700 Tm (body text here) Tj ET\n".to_vec())
+        .collect();
+    let mut doc = Document::with_version("1.7");
+    let font = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" });
+    let parent = doc.new_object_id();
+    let mut kids: Vec<Object> = Vec::new();
+    for content in pages {
+        let stream = doc.add_object(Stream::new(dictionary! {}, content));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => parent,
+            "MediaBox" => vec![0.into(), Object::Real(-1.0e13), 612.into(), Object::Real(1.0e13)],
+            "Contents" => stream,
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+        });
+        kids.push(page.into());
+    }
+    doc.objects.insert(parent, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 5 }));
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => parent });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let doc = open(&bytes);
+    let stats = doc.scan_document(None, &mut |_| {}).unwrap();
+    doc.page_stream(stats).unwrap().page(1).unwrap();
 }

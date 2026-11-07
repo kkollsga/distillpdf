@@ -4,6 +4,7 @@
 //! between html.rs and the feature modules (captions, headings, frontmatter, …).
 //! Extracted from html.rs.
 
+use crate::geom::TotalOrder;
 use crate::geom::Rect;
 use crate::html::esc;
 use crate::text::{self, Span};
@@ -105,7 +106,7 @@ fn bridge_list_marker_rails(
                     && candidate.size <= marker.size * 1.4
             })
             .min_by(|(_, a), (_, b)| {
-                a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal)
+                a.x.total_order(&b.x)
             });
         if let Some((j, body)) = body {
             pairs.push((i, j, marker.x, body.x, order_y[i]));

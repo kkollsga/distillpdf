@@ -10,6 +10,7 @@
 //! `raster` does not model: CCITT fax (lopdf cannot apply the filter) and the `/SMask`
 //! composite.
 
+use crate::geom::TotalOrder;
 use base64::Engine;
 use crate::geom::{Mat, Rect};
 use crate::pdfobj::{filters_of, num};
@@ -1414,7 +1415,7 @@ fn union_bbox(tiles: &[&RawTile]) -> (f32, f32, f32, f32) {
 /// Count distinct cluster positions: sorted centers separated by more than `gap` start a
 /// new column/row. Used to require a real 2-D grid (≥2 columns AND ≥2 rows).
 fn distinct_positions(mut centers: Vec<f32>, gap: f32) -> usize {
-    centers.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    centers.sort_by(|a, b| a.total_order(b));
     let mut n = 0;
     let mut last = f32::NEG_INFINITY;
     for c in centers {
@@ -1431,8 +1432,8 @@ fn distinct_positions(mut centers: Vec<f32>, gap: f32) -> usize {
 fn is_grid(tiles: &[&RawTile]) -> bool {
     let mut ws: Vec<f32> = tiles.iter().map(|t| t.x1 - t.x0).collect();
     let mut hs: Vec<f32> = tiles.iter().map(|t| t.y1 - t.y0).collect();
-    ws.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    hs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    ws.sort_by(|a, b| a.total_order(b));
+    hs.sort_by(|a, b| a.total_order(b));
     let (mw, mh) = (ws[ws.len() / 2], hs[hs.len() / 2]);
     let cols = distinct_positions(tiles.iter().map(|t| (t.x0 + t.x1) * 0.5).collect(), mw * 0.5);
     let rows = distinct_positions(tiles.iter().map(|t| (t.y0 + t.y1) * 0.5).collect(), mh * 0.5);

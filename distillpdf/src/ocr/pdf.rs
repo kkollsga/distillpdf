@@ -6,6 +6,7 @@
 //! Text is sized by role (title/heading/body/small) so the re-extraction path recovers
 //! the same structure — this is what makes `to_html(in) ≈ to_html(to_pdf(in))` hold.
 
+use crate::geom::TotalOrder;
 use image::DynamicImage;
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Object, Stream};
@@ -164,7 +165,7 @@ fn page_body_size(page: &OcrPage, w: f32, h: f32) -> f32 {
         }
     }
     let body = if samples.len() >= 2 {
-        samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        samples.sort_by(|a, b| a.total_order(b));
         samples[samples.len() / 2]
     } else {
         weighted_median(&mut fill).unwrap_or(10.0)
@@ -177,7 +178,7 @@ fn weighted_median(items: &mut [(f32, usize)]) -> Option<f32> {
     if items.is_empty() {
         return None;
     }
-    items.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    items.sort_by(|a, b| a.0.total_order(&b.0));
     let total: usize = items.iter().map(|x| x.1).sum();
     let mut cum = 0usize;
     for (size, weight) in items.iter() {

@@ -24,6 +24,7 @@ pub struct Author {
     pub affiliation: Option<String>,
 }
 
+use crate::geom::TotalOrder;
 use crate::html::{esc, initials_count, looks_like_reference, numbered_level, roman_section, FOOTNOTE_MARKERS};
 use crate::layout::{lines_of, Line};
 use crate::text;
@@ -122,7 +123,7 @@ pub(crate) fn detect_front_matter(lines: &[Line], body: f32) -> (FrontMatter, Ha
     let ymin = lines.iter().map(|l| l.y).fold(f32::MAX, f32::min);
     let yrange = (ymax - ymin).max(1.0);
     let mut order: Vec<usize> = (0..lines.len()).collect();
-    order.sort_by(|&a, &b| lines[b].y.partial_cmp(&lines[a].y).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|&a, &b| lines[b].y.total_order(&lines[a].y));
 
     let abstract_label = |t: &str| t.trim_start().to_lowercase().starts_with("abstract");
     let keywords_label = |t: &str| {
@@ -256,7 +257,7 @@ pub(crate) fn detect_front_matter(lines: &[Line], body: f32) -> (FrontMatter, Ha
     // --- Authors: run-scan into (name, markers); link markers → affiliation. -----------
     if !author_idxs.is_empty() {
         let mut alines = author_idxs.clone();
-        alines.sort_by(|&a, &b| lines[b].y.partial_cmp(&lines[a].y).unwrap_or(std::cmp::Ordering::Equal));
+        alines.sort_by(|&a, &b| lines[b].y.total_order(&lines[a].y));
         let mut parsed: Vec<(String, Vec<String>)> = Vec::new();
         let mut name_buf = String::new();
         let mut markers: Vec<String> = Vec::new();
@@ -448,7 +449,7 @@ pub(crate) fn find_document_title(lines: &[Line], body: f32) -> Option<(String, 
     };
     let title_ok = |l: &Line| title_core(l) && prominent(l);
     let mut order: Vec<usize> = (0..lines.len()).collect();
-    order.sort_by(|&a, &b| lines[b].y.partial_cmp(&lines[a].y).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|&a, &b| lines[b].y.total_order(&lines[a].y));
     let cap_start = |l: &Line| l.text().trim().chars().next().is_some_and(|c| !c.is_lowercase());
     let is_prose = |t: &str| {
         let words: Vec<&str> = t.split_whitespace().collect();
@@ -499,7 +500,7 @@ pub(crate) fn find_title_sized(lines: &[Line], body: f32) -> Option<(String, Has
     let ymin = lines.iter().map(|l| l.y).fold(f32::MAX, f32::min);
     let yrange = (ymax - ymin).max(1.0);
     let mut order: Vec<usize> = (0..lines.len()).collect();
-    order.sort_by(|&a, &b| lines[b].y.partial_cmp(&lines[a].y).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|&a, &b| lines[b].y.total_order(&lines[a].y));
     let norm = |i: usize| lines[i].text().split_whitespace().collect::<Vec<_>>().join(" ");
     let is_pub_ref = |t: &str| {
         let lo = t.to_lowercase();

@@ -80,6 +80,13 @@ struct Pdf {
     inner: PdfDocument,
 }
 
+/// Runs document work with the GIL released, and a panic out of it as a `ValueError`. Left alone, a
+/// panic reaches Python as `PanicException`, a `BaseException` that `except Exception` misses, and
+/// the input here is hostile by assumption.
+fn guarded<T: Send>(py: Python<'_>, work: impl FnOnce() -> T + Send) -> PyResult<T> {
+    py.allow_threads(|| distillpdf::error::catch_panics(work)).map_err(to_py)
+}
+
 #[pymethods]
 impl Pdf {
     /// Open a PDF from a filesystem path. This only loads and parses the PDF container;
@@ -95,10 +102,13 @@ impl Pdf {
     #[pyo3(signature = (path, *, engine=None))]
     fn open(path: &str, engine: Option<&str>) -> PyResult<Self> {
         let inner = match engine {
-            Some(name) => PdfDocument::open_with_engine(path, engine_arg(name)?),
-            None => PdfDocument::open(path),
+            Some(name) => {
+                let engine = engine_arg(name)?;
+                distillpdf::error::catch_panics(|| PdfDocument::open_with_engine(path, engine))
+            }
+            None => distillpdf::error::catch_panics(|| PdfDocument::open(path)),
         };
-        Ok(Pdf { inner: inner.map_err(to_py)? })
+        Ok(Pdf { inner: inner.map_err(to_py)?.map_err(to_py)? })
     }
 
     /// Open a PDF from raw bytes. There is no source path, so writing output with
@@ -109,10 +119,13 @@ impl Pdf {
     #[pyo3(signature = (data, *, engine=None))]
     fn from_bytes(data: &[u8], engine: Option<&str>) -> PyResult<Self> {
         let inner = match engine {
-            Some(name) => PdfDocument::from_bytes_with_engine(data, engine_arg(name)?),
-            None => PdfDocument::from_bytes(data),
+            Some(name) => {
+                let engine = engine_arg(name)?;
+                distillpdf::error::catch_panics(|| PdfDocument::from_bytes_with_engine(data, engine))
+            }
+            None => distillpdf::error::catch_panics(|| PdfDocument::from_bytes(data)),
         };
-        Ok(Pdf { inner: inner.map_err(to_py)? })
+        Ok(Pdf { inner: inner.map_err(to_py)?.map_err(to_py)? })
     }
 
     /// Which engine actually opened this document: `"eager"`, `"lazy"`, or
@@ -134,8 +147,8 @@ impl Pdf {
     /// Hybrid: prefer our ToUnicode-aware content-stream extractor (handles CID
     /// fonts + diacritics); fall back to lopdf's extractor per page when ours
     /// yields little (so simple-encoded PDFs never regress).
-    fn extract_text(&self) -> PyResult<String> {
-        Ok(self.inner.extract_text())
+    fn extract_text(&self, py: Python<'_>) -> PyResult<String> {
+        guarded(py, || self.inner.extract_text())
     }
 
     /// Extract images from all pages (list of dicts incl. the image bytes).
@@ -145,7 +158,7 @@ impl Pdf {
     /// those carry `color_space` + `bits_per_component` so they can be reassembled.
     fn extract_images<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
-        for im in self.inner.extract_images() {
+        for im in guarded(py, || self.inner.extract_images())? {
             let d = PyDict::new(py);
             d.set_item("page", im.page)?;
             d.set_item("index", im.index)?;
@@ -163,7 +176,7 @@ impl Pdf {
     /// Extract per-page font info (list of dicts).
     fn extract_fonts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
-        for fi in self.inner.extract_fonts() {
+        for fi in guarded(py, || self.inner.extract_fonts())? {
             let d = PyDict::new(py);
             d.set_item("page", fi.page)?;
             d.set_item("name", fi.name)?;
@@ -180,7 +193,7 @@ impl Pdf {
     /// Extract tables from all pages (list of dicts with cell grids).
     fn extract_tables<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
-        for t in self.inner.extract_tables() {
+        for t in guarded(py, || self.inner.extract_tables())? {
             let d = PyDict::new(py);
             d.set_item("page", t.page)?;
             d.set_item("n_rows", t.cells.len())?;
@@ -199,7 +212,7 @@ impl Pdf {
     /// structure-tree reconciliation and caption attachment.
     fn analyze_tables<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
-        for table in self.inner.analyze_tables() {
+        for table in guarded(py, || self.inner.analyze_tables())? {
             let d = PyDict::new(py);
             d.set_item("page", table.page)?;
             d.set_item("bbox_norm", table.bbox_norm.map(|bbox| bbox.to_vec()))?;
@@ -271,7 +284,7 @@ impl Pdf {
     /// document and `dest_name` (when set) names a destination INSIDE it, not in this PDF.
     fn extract_links<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
-        for lk in self.inner.extract_links() {
+        for lk in guarded(py, || self.inner.extract_links())? {
             let d = PyDict::new(py);
             d.set_item("page", lk.page)?;
             d.set_item("rect", lk.rect.to_vec())?;
@@ -313,14 +326,14 @@ impl Pdf {
         let mode = doc::parse_mode(mode).map_err(to_py)?;
         // Placeholder renders `<image N>`; embed/external need the real image bytes.
         let images = !matches!(im, markdown::ImgMode::Placeholder);
-        let html = py.allow_threads(|| self.inner.render(mode, images, toc));
+        let html = guarded(py, || self.inner.render(mode, images, toc))?;
         if return_string {
             return Ok(pyo3::types::PyString::new(py, &html).into_any().unbind());
         }
         let dest = self.inner.resolve_out_path(path, "html").map_err(to_py)?;
         if matches!(im, markdown::ImgMode::Files) {
             // Extract figures to img/ next to the file.
-            let (html, files) = py.allow_threads(|| markdown::externalize_images(&html));
+            let (html, files) = guarded(py, || markdown::externalize_images(&html))?;
             self.inner.write_doc(dest, &html, &files).map_err(to_py)?;
         } else {
             self.inner.write_doc(dest, &html, &[]).map_err(to_py)?;
@@ -352,8 +365,8 @@ impl Pdf {
         let im = doc::parse_image_mode(image_mode, !return_string, markdown::ImgMode::Placeholder).map_err(to_py)?;
         let mode = doc::parse_mode(mode).map_err(to_py)?;
         let need_bytes = matches!(im, markdown::ImgMode::Embed | markdown::ImgMode::Files);
-        let html = py.allow_threads(|| self.inner.render(mode, need_bytes, toc));
-        let (md, files) = py.allow_threads(|| markdown::html_to_markdown(&html, toc, im));
+        let html = guarded(py, || self.inner.render(mode, need_bytes, toc))?;
+        let (md, files) = guarded(py, || markdown::html_to_markdown(&html, toc, im))?;
 
         if return_string {
             return Ok(pyo3::types::PyString::new(py, &md).into_any().unbind());
@@ -372,7 +385,7 @@ impl Pdf {
         let mode = doc::parse_mode(mode).map_err(to_py)?;
         // Force the TOC nav on (and skip image encoding — irrelevant to the outline) —
         // `nav::toc` parses the outline back out of that <nav>.
-        Ok(py.allow_threads(|| self.inner.toc(mode)))
+        guarded(py, || self.inner.toc(mode))
     }
 
     /// The PDF's OWN table of contents — the author-supplied `/Outlines` bookmarks —
@@ -382,7 +395,7 @@ impl Pdf {
     /// no outline. This is distinct from `toc()`, which is built from detected headings;
     /// when an outline is present, `to_html()` also uses it for the rendered `<nav>`.
     fn outline(&self, py: Python<'_>) -> PyResult<Vec<(u8, String, u32, String)>> {
-        Ok(py.allow_threads(|| self.inner.outline()))
+        guarded(py, || self.inner.outline())
     }
 
     /// HTML of a single section: the heading matching `name` (its `sec-…` slug, an id
@@ -395,7 +408,7 @@ impl Pdf {
         let mode = doc::parse_mode(mode).map_err(to_py)?;
         let images = !matches!(doc::parse_image_mode(image_mode, false, markdown::ImgMode::Embed).map_err(to_py)?, markdown::ImgMode::Placeholder);
         // `nav::section` resolves via the TOC nav, so build with it present.
-        Ok(py.allow_threads(|| self.inner.section(mode, name, images)))
+        guarded(py, || self.inner.section(mode, name, images))
     }
 
     /// Structured front-matter of an academic paper, parsed from page 1:
@@ -403,7 +416,7 @@ impl Pdf {
     /// keywords:[str]}`. Fields are empty/None when not detected. Authors are linked to
     /// their organisation via the affiliation superscript markers.
     fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let fm = py.allow_threads(|| self.inner.front_matter());
+        let fm = guarded(py, || self.inner.front_matter())?;
         let d = PyDict::new(py);
         d.set_item("title", fm.title)?;
         let authors = PyList::empty(py);
@@ -426,7 +439,7 @@ impl Pdf {
     /// Drives the `distillpdf.ocr` orchestrators (the model runs in the optional [ocr] extra).
     fn ocr_plan<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
-        for e in self.inner.ocr_plan() {
+        for e in guarded(py, || self.inner.ocr_plan())? {
             let d = PyDict::new(py);
             d.set_item("page", e.page)?;
             d.set_item("needs_ocr", e.needs_ocr)?;
@@ -478,7 +491,7 @@ impl Pdf {
             Some(m) => m,
             None => self.inner.get_ocr().map_err(to_py)?,
         };
-        let buf = py.allow_threads(|| self.inner.build_searchable_pdf(&ocr, remove_raster)).map_err(to_py)?;
+        let buf = guarded(py, || self.inner.build_searchable_pdf(&ocr, remove_raster))?.map_err(to_py)?;
         std::fs::write(path, buf).map_err(|e| to_py(Error::Write(e)))?;
         ok_one(py)
     }
@@ -507,7 +520,7 @@ impl Pdf {
     #[pyo3(signature = (path=None, assets="figures"))]
     fn distill(&self, py: Python<'_>, path: Option<&str>, assets: &str) -> PyResult<String> {
         let opts = doc::DistillOptions::from_assets(assets).map_err(to_py)?;
-        py.allow_threads(|| self.inner.distill(path, &opts)).map_err(to_py)
+        guarded(py, || self.inner.distill(path, &opts))?.map_err(to_py)
     }
 
     /// Diagnostic: force our ToUnicode extractor for all pages (eval only).

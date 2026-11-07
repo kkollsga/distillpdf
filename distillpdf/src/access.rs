@@ -24,7 +24,7 @@ const MAX_RECOVERY_INDEX_ENTRIES: usize = 65_536;
 /// Ceiling on one page's concatenated decoded content, and on one decoded stream payload.
 /// A fixed per-document constant: the same document degrades the same way on every run,
 /// whatever else the process is doing.
-const MAX_PAGE_CONTENT_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_PAGE_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CACHED_DICTIONARIES: usize = 512;
 const MAX_CACHED_DICTIONARY_KEYS: usize = 32;
 const FORMS_BEFORE_SKIPPING_DESCRIPTORS: u64 = 64;
@@ -224,6 +224,27 @@ impl SourceRecovery {
 
     fn len(&self) -> SourceResult<u64> {
         self.source.len()
+    }
+
+    /// A digest of the source's length and of evenly spaced samples of its bytes, the whole of a
+    /// small file. It reads a bounded amount however large the file is, so it tells two files
+    /// apart, not one file from a careful edit between samples.
+    pub(crate) fn fingerprint(&self) -> Result<String, SourceFailure> {
+        const SAMPLES: u64 = 64;
+        const SAMPLE_BYTES: u64 = 4096;
+        let len = self.source.len().map_err(SourceFailure::from)?;
+        let mut digest = Sha256::new();
+        digest.update(len.to_le_bytes());
+        let stride = (len / SAMPLES).max(SAMPLE_BYTES);
+        let mut buffer = vec![0u8; SAMPLE_BYTES as usize];
+        let mut offset = 0;
+        while offset < len {
+            let want = SAMPLE_BYTES.min(len - offset) as usize;
+            self.source.read_exact_at(offset, &mut buffer[..want]).map_err(SourceFailure::from)?;
+            digest.update(&buffer[..want]);
+            offset += stride;
+        }
+        Ok(digest.finalize().iter().take(16).map(|byte| format!("{byte:02x}")).collect())
     }
 
     /// Ask the *uncached* source whether it still is what it was at open.

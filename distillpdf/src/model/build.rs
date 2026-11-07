@@ -189,6 +189,10 @@ fn page_labels(
 /// a label is written in digits, which reads worse and costs nothing.
 const MAX_SPELLED_LABEL: i64 = 9_999;
 
+/// What a document's `/PageLabels` may hold: a real one has a handful of ranges and a short prefix.
+const MAX_LABEL_PREFIX_BYTES: usize = 256;
+const MAX_LABEL_RANGES: usize = 16 * 1024;
+
 /// One `/PageLabels` range: `(start index, style, prefix, first counter value)`.
 pub(crate) type LabelRange = (i64, String, String, i64);
 
@@ -236,7 +240,7 @@ pub(crate) fn page_label_ranges(access: &dyn crate::access::DocumentAccess) -> V
                 // only interpreted scalars; no source-owned array or dictionary escapes.
                 let mut ranges: Vec<(i64, String, String, i64)> = Vec::new();
                 let mut i = 0;
-                while i + 1 < nums.len() {
+                while i + 1 < nums.len() && ranges.len() < MAX_LABEL_RANGES {
                     let Object::Integer(start) = &nums[i] else {
                         i += 2;
                         continue;
@@ -264,8 +268,10 @@ pub(crate) fn page_label_ranges(access: &dyn crate::access::DocumentAccess) -> V
                                 .ok()
                                 .and_then(|value| {
                                     crate::access::read_resolved(access, value, |value| {
+                                        // Every range can name the same long prefix, and it is
+                                        // repeated in each page's label.
                                         let bytes = value.as_str().ok()?;
-                                        Some(crate::pdfobj::decode_text_string(bytes))
+                                        Some(crate::pdfobj::decode_text_string(&bytes[..bytes.len().min(MAX_LABEL_PREFIX_BYTES)]))
                                     })
                                     .ok()
                                     .flatten()

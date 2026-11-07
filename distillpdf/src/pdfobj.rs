@@ -93,6 +93,19 @@ pub(crate) fn content_bytes(stream: &lopdf::Stream) -> Vec<u8> {
     }
 }
 
+/// [`content_bytes`] for a stream read as page content, which is hostile input a walker expands
+/// further: inflating past `limit` yields no content at all, never an unbounded buffer.
+pub(crate) fn content_bytes_limited(stream: &lopdf::Stream, limit: usize) -> Vec<u8> {
+    if stream.dict.get(b"Filter").is_err() || has_legacy_unsupported_filter(&stream.dict) {
+        return stream.content.clone();
+    }
+    match stream.decompressed_content_with_limit(limit) {
+        Ok(bytes) => bytes,
+        Err(lopdf::Error::Decompress(_)) => Vec::new(),
+        Err(_) => stream.content.clone(),
+    }
+}
+
 /// Filters newly implemented by the pinned fork but unsupported by the prior eager 0.44 route.
 pub(crate) fn has_legacy_unsupported_filter(dict: &Dictionary) -> bool {
     filters_of(dict)

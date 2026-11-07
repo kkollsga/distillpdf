@@ -4,6 +4,7 @@
 #
 # CI (.github/workflows/ci.yml) runs the parts that work on a fresh clone:
 #   - cargo test -p distillpdf --lib   (pure-logic Rust unit tests, pyo3-free core)
+#   - cargo test --release -p distillpdf --test pages_api --test pages_memory
 #   - pytest tests/               (self-contained, self-generated fixtures)
 # It deliberately does NOT run the corpus regression gate: that gate scores real
 # third-party PDFs that are license-encumbered and cannot be published, so the
@@ -41,6 +42,11 @@ step "Rust unit tests (cargo test -p distillpdf --lib)"
 # Scope to the pyo3-free core; a bare workspace `--lib` would also pull in
 # distillpdf-python's lib tests, which need libpython linked.
 PYO3_PYTHON="$BUILD_PY" cargo test -p distillpdf --lib
+
+step "Page API tests (cargo test --release, pages_api and pages_memory)"
+# Their own binaries, so `--lib` above does not run them, and release because `pages_memory` runs
+# what debug builds ignore.
+PYO3_PYTHON="$BUILD_PY" cargo test --release -p distillpdf --test pages_api --test pages_memory
 
 step "Clippy (core lib, warnings allowed but surfaced)"
 PYO3_PYTHON="$BUILD_PY" cargo clippy -p distillpdf --lib 2>&1 | tail -3 || true
