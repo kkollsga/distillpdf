@@ -224,13 +224,18 @@ fn main() {
         }
         "stream" | "pagemd" => {
             let relief = std::env::var_os("PROBE_RELIEF").is_some();
-            let stats = doc
-                .scan_document(None, &mut |_| {
-                    if relief {
-                        relieve();
-                    }
-                })
-                .expect("scan");
+            let mut on_progress = |_| {
+                if relief {
+                    relieve();
+                }
+            };
+            // `PROBE_QUICK` measures the typography-only scan's trade-off.
+            let stats = if std::env::var_os("PROBE_QUICK").is_some() {
+                doc.scan_typography(None, &mut on_progress)
+            } else {
+                doc.scan_document(None, &mut on_progress)
+            }
+            .expect("scan");
             let scan_ms = start.elapsed().as_secs_f64() * 1e3;
             let mut stream = doc.page_stream(stats).expect("stream");
             let mut bytes = 0;

@@ -30,6 +30,10 @@ def words(markdown):
     return S.norm_words(TARGET.sub("]", MARKER.sub("", markdown)))
 
 
+def windows(pages, size=8):
+    return [[w for page in pages[i : i + size] for w in page] for i in range(0, len(pages), size)]
+
+
 def category(slug):
     head = slug.split("_")[0]
     return "arxiv" if re.search(r"_\d{4}\.\d+$", slug) else head
@@ -58,6 +62,9 @@ def main():
             got = [words(p) for p in both[name]]
             row[f"{name}_recall"] = S.overlap(ref_set, {w for p in got for w in p})[0]
             row[f"{name}_order"] = S.pooled_order(ref_pages, got)
+            # Per-page order counts a tail moved to the page where its paragraph starts as out of
+            # place on both pages. Windows of pages show whether the reading order itself moved.
+            row[f"{name}_order_w"] = S.pooled_order(windows(ref_pages), windows(got))
         rows.append(row)
         print(json.dumps(row), flush=True)
     with open(out_path, "w") as out:
@@ -66,11 +73,11 @@ def main():
     for row in rows:
         groups[row["category"]].append(row)
     mean = lambda items, key: sum(r[key] for r in items if r.get(key) is not None) / max(1, sum(r.get(key) is not None for r in items))
-    print("category docs recall whole/page order whole/page lower-recall lower-order")
+    print("category docs recall whole/page, order per page whole/page, order in 8-page windows whole/page, docs lower on recall, on windowed order")
     for name, items in sorted(groups.items()):
         lower_recall = sum((r.get("pages_recall") or 0) < (r.get("whole_recall") or 0) for r in items)
-        lower_order = sum((r.get("pages_order") or 0) < (r.get("whole_order") or 0) for r in items)
-        print(f"{name} {len(items)} {mean(items, 'whole_recall'):.4f}/{mean(items, 'pages_recall'):.4f} {mean(items, 'whole_order'):.4f}/{mean(items, 'pages_order'):.4f} {lower_recall} {lower_order}")
+        lower_order = sum((r.get("pages_order_w") or 0) < (r.get("whole_order_w") or 0) for r in items)
+        print(f"{name} {len(items)} {mean(items, 'whole_recall'):.4f}/{mean(items, 'pages_recall'):.4f} {mean(items, 'whole_order'):.4f}/{mean(items, 'pages_order'):.4f} {mean(items, 'whole_order_w'):.4f}/{mean(items, 'pages_order_w'):.4f} {lower_recall} {lower_order}")
     return 0
 
 
