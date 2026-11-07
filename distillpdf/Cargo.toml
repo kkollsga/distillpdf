@@ -23,12 +23,12 @@ tesseract = ["dep:cmake", "dep:whatlang"]
 
 [dependencies]
 # Keep this exact fork revision pinned: it preserves the eager default/fallback route and
-# distillPDF's bounded indexed-reader contract on lopdf 0.45.
+# distillPDF's bounded indexed-reader contract on lopdf 0.47.
 # A git rev — not a bare `path` — so CI and any fresh clone resolve the exact same lopdf.
 # To iterate against a local checkout, TEMPORARILY swap in
 # `path = "../../lopdf-lazy-engine"` (do not commit it), or add an UNCOMMITTED
 # `[patch."https://github.com/kkollsga/lopdf.git"] lopdf = { path = ... }` to the workspace root.
-lopdf = { git = "https://github.com/kkollsga/lopdf.git", rev = "909771af05c4210db4c138dc2393e5fb6f77b7c7" }
+lopdf = { git = "https://github.com/kkollsga/lopdf.git", rev = "cacfbc5dd3400e9bb7d39c15fa4a28a45f41f003" }
 # Independent Flate validation (`pdfobj::flate_incomplete`). lopdf swallows its own zlib
 # error and returns the partial output, so a TRUNCATED stream reports Ok and renders short
 # with no signal; inflating the bytes ourselves is the only way to tell. Already linked twice

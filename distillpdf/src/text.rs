@@ -2288,7 +2288,8 @@ fn fallback_encoding_value(
     let shape = encoding.read(|object| match object {
         Object::Name(name) => Shape::Name(name.to_vec()),
         Object::Dictionary(dictionary) => Shape::Dictionary {
-            valid_type: dictionary.get_type().ok() == Some(b"Encoding"),
+            // `/Type` is optional, but must be `/Encoding` when it is a name (ISO 32000-1, Table 114).
+            valid_type: !matches!(dictionary.get(b"Type").and_then(Object::as_name), Ok(name) if name != b"Encoding"),
             base: dictionary.get(b"BaseEncoding").ok().and_then(|value| value.as_name().ok()).map(Vec::from),
         },
         _ => Shape::Invalid,
@@ -2308,19 +2309,26 @@ fn fallback_encoding_value(
             };
             let FallbackEncoding { owned: base_owned, .. } = base;
             let encoding_id = encoding.root_id();
-            let owned = encoding.read(|object| {
-                let differences = object
-                    .as_dict()
-                    .ok()
-                    .and_then(|dictionary| dictionary.get(b"Differences").ok())
-                    .and_then(|value| value.as_array().ok())
-                    .ok_or_else(|| {
-                        fallback_error(encoding_id, "missing required dictionary key Differences")
-                    })?;
+            let has_differences = encoding.read(|object| {
+                object.as_dict().is_ok_and(|dictionary| dictionary.has(b"Differences"))
+            })?;
+            // Without `/Differences` the base encoding stands as it is. The array is optional, and
+            // the eager route has honoured `/BaseEncoding` here since lopdf 0.46 (#591).
+            let owned = if has_differences {
+                encoding.read(|object| {
+                    let differences = object
+                        .as_dict()
+                        .ok()
+                        .and_then(|dictionary| dictionary.get(b"Differences").ok())
+                        .and_then(|value| value.as_array().ok())
+                        .ok_or_else(|| fallback_error(encoding_id, "Differences is not an array"))?;
+                    base_owned
+                        .with_differences(differences)
+                        .map_err(|error| fallback_error(encoding_id, error))
+                })??
+            } else {
                 base_owned
-                    .with_differences(differences)
-                    .map_err(|error| fallback_error(encoding_id, error))
-            })??;
+            };
             Ok(FallbackEncoding {
                 owned,
                 object: font.root_id(),

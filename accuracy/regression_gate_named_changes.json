@@ -1,0 +1,150 @@
+{
+ "what": "Named output changes against accuracy/regression_gate_baseline.json. Matched by exact hash pair; a re-freeze empties this file.",
+ "named_changes": [
+  {
+   "name": "lopdf 0.47: two blank pages recovered",
+   "reason": "Content::decode failed on pages 37 and 113 under 0.45 ('couldn't parse input'), so both pages read as empty. Those streams hold inline images; page 37's declares /CS [/I /RGB ...], the shape upstream #597 accepts, so #597 is the likely fix, not separately bisected. Under 0.47 they parse: 79 and 65 words against PyMuPDF's 78 and 70. Recall 0.9036 -> 0.9067. Read the page and text diffs: new text only.",
+   "utc": "2026-11-07T12:17:24Z",
+   "commit": "dff6be0",
+   "changes": {
+    "gov_nasa_ntrs20240002628": [
+     {
+      "engine": "eager",
+      "op": "html",
+      "from": "530e4987ce9fe07e896f07f5",
+      "to": "8523ac2de1893eb2972c46d8"
+     },
+     {
+      "engine": "eager",
+      "op": "markdown",
+      "from": "5215e10413a18269a33dad94",
+      "to": "891e4e81576464fdb0a1571d"
+     },
+     {
+      "engine": "eager",
+      "op": "pages",
+      "from": "ccc198493e18eb5aa0b9d0f7",
+      "to": "4fcd25a35ac94f1778d7d6f4"
+     },
+     {
+      "engine": "eager",
+      "op": "text",
+      "from": "cfcc4fc2c6504976672d6641",
+      "to": "dba565270de27288d54b9232"
+     },
+     {
+      "engine": "lazy",
+      "op": "html",
+      "from": "530e4987ce9fe07e896f07f5",
+      "to": "8523ac2de1893eb2972c46d8"
+     },
+     {
+      "engine": "lazy",
+      "op": "markdown",
+      "from": "5215e10413a18269a33dad94",
+      "to": "891e4e81576464fdb0a1571d"
+     },
+     {
+      "engine": "lazy",
+      "op": "pages",
+      "from": "ccc198493e18eb5aa0b9d0f7",
+      "to": "4fcd25a35ac94f1778d7d6f4"
+     },
+     {
+      "engine": "lazy",
+      "op": "text",
+      "from": "cfcc4fc2c6504976672d6641",
+      "to": "dba565270de27288d54b9232"
+     }
+    ]
+   },
+   "accepted_drops": {}
+  },
+  {
+   "name": "lopdf 0.47: last 143 operations of a figure panel parsed",
+   "reason": "Form Im5 on page 3 stopped parsing after 2116 of 2259 operations under 0.45. The extra content moves how this figure's text is structured: 10 false h4 headings made from speech-bubble text go away (headings_kept 0.8, an improvement), and a false table of the same text appears (tables_kept 0.7873, a defect). A garbled 14-glyph line also appears: it is 'Issue Reporter' in a font with no ToUnicode and per-glyph /ActualText, which distillPDF does not read. md_recall and html_recall rise; order holds. Accepted because neither version of this figure's structure was right and fuller content is what the move brings.",
+   "utc": "2026-11-07T12:17:24Z",
+   "commit": "dff6be0",
+   "changes": {
+    "cs_SE_2607.28587": [
+     {
+      "engine": "eager",
+      "op": "html",
+      "from": "ec979ef9f5907c00c3d05ef2",
+      "to": "39ab5b27823f42a7723a553c"
+     },
+     {
+      "engine": "eager",
+      "op": "markdown",
+      "from": "cfdfc7e39b681aa143501645",
+      "to": "0c738db7f4bc52809c491cd2"
+     },
+     {
+      "engine": "eager",
+      "op": "pages",
+      "from": "7be2072da2338795c24efb0e",
+      "to": "ec982b221fe59428a48dc8d0"
+     },
+     {
+      "engine": "eager",
+      "op": "text",
+      "from": "309b32361834001f3befc570",
+      "to": "4762b294499c172a6c398478"
+     },
+     {
+      "engine": "lazy",
+      "op": "html",
+      "from": "ec979ef9f5907c00c3d05ef2",
+      "to": "39ab5b27823f42a7723a553c"
+     },
+     {
+      "engine": "lazy",
+      "op": "markdown",
+      "from": "cfdfc7e39b681aa143501645",
+      "to": "0c738db7f4bc52809c491cd2"
+     },
+     {
+      "engine": "lazy",
+      "op": "pages",
+      "from": "7be2072da2338795c24efb0e",
+      "to": "ec982b221fe59428a48dc8d0"
+     },
+     {
+      "engine": "lazy",
+      "op": "text",
+      "from": "309b32361834001f3befc570",
+      "to": "4762b294499c172a6c398478"
+     }
+    ]
+   },
+   "accepted_drops": {
+    "cs_SE_2607.28587": [
+     {
+      "engine": "eager",
+      "metric": "headings_kept",
+      "from": 1.0,
+      "to": 0.8
+     },
+     {
+      "engine": "eager",
+      "metric": "tables_kept",
+      "from": 1.0,
+      "to": 0.7873
+     },
+     {
+      "engine": "lazy",
+      "metric": "headings_kept",
+      "from": 1.0,
+      "to": 0.8
+     },
+     {
+      "engine": "lazy",
+      "metric": "tables_kept",
+      "from": 1.0,
+      "to": 0.7873
+     }
+    ]
+   }
+  }
+ ]
+}
