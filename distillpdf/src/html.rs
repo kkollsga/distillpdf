@@ -2478,67 +2478,6 @@ pub(crate) fn render_page_elements(
     (els, img_uris)
 }
 
-/// One page's heading verdicts as the render would reach them on its prose, without its tables
-/// and figures. This is the first pass's reading of what headings a document has: `on_heading`
-/// gets each heading's level and inner HTML, in the same form [`ElKind::Heading`] carries.
-pub(crate) fn scan_page_headings(
-    access: &dyn crate::access::DocumentAccess,
-    plan: &DocPlan,
-    promote: &[(String, u8)],
-    pidx: usize,
-    pid: ObjectId,
-    spans: &[Span],
-    style_scan: &mut HeadingScan,
-    on_heading: &mut dyn FnMut(u8, &str),
-) {
-    let (body, title_sz) = (plan.body, plan.title_sz);
-    let (turn, dbox) = crate::chrome::display_box(access, pid);
-    let turned: Option<Vec<Span>> = (!turn.is_identity()).then(|| spans.iter().map(|s| turn_span(turn, s)).collect());
-    let dspans: &[Span] = turned.as_deref().unwrap_or(spans);
-    let mask = plan.chrome.drop_mask(dspans, dbox);
-    let kept: Vec<Span> = match &mask {
-        Some(mask) => dspans.iter().zip(mask).filter(|(_, d)| !**d).map(|(s, _)| clone_span(s)).collect(),
-        None => dspans.iter().map(clone_span).collect(),
-    };
-    let mut lines = lines_of(kept, &[]);
-    // The style counts read page-space spans with chrome still in. On an upright page that is
-    // these lines plus the chrome's own, which spares assembling every line twice; a turned page
-    // reads differently in page space, so it gets the real thing.
-    if turned.is_some() {
-        style_scan.add_page(spans, body, &plan.profile);
-    } else {
-        style_scan.add_empty_page();
-        style_scan.add_lines(&lines, body, &plan.profile);
-        if let Some(mask) = &mask {
-            let chrome: Vec<Span> = dspans.iter().zip(mask).filter(|(_, d)| **d).map(|(s, _)| clone_span(s)).collect();
-            style_scan.add_lines(&lines_of(chrome, &[]), body, &plan.profile);
-        }
-    }
-    merge_heading_continuations(&mut lines, &plan.profile);
-    let mut els: Vec<PageElement> = Vec::new();
-    if pidx == 0 && !lines.is_empty() {
-        let (fm, consumed) = detect_front_matter(&lines, body);
-        if is_paper_front_matter(&fm) {
-            let mut i = 0usize;
-            lines.retain(|_| {
-                let keep = !consumed.contains(&i);
-                i += 1;
-                keep
-            });
-        } else {
-            emit_document_title(&mut lines, body, &mut els);
-        }
-    }
-    let refs: Vec<&Line> = lines.iter().collect();
-    let ctx = ProseCtx { body, title_sz, promote, profile: &plan.profile, plan: &plan.head_plan, table_interiors: &[] };
-    emit_lines(&refs, ctx, &mut els);
-    for e in &els {
-        if let ElKind::Heading { level, text, .. } = &e.kind {
-            on_heading(*level, text);
-        }
-    }
-}
-
 /// One page's post-transform element IR: the page number, the typed [`PageElement`] list (after
 /// the cross-page transforms), and the page-LOCAL deferred image-URI list (`\0idx\0`-indexed).
 /// This is the single-stream document IR — `to_html` emits + merges it; `crate::model::build`

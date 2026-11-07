@@ -1111,7 +1111,17 @@ impl PdfDocument {
         cancel: Option<&crate::pages::CancelToken>,
         progress: &mut dyn FnMut(crate::pages::PageProgress),
     ) -> Result<crate::pages::DocStats, Error> {
-        crate::pages::DocStats::scan(self.access.as_ref(), cancel, progress)
+        crate::pages::DocStats::scan(self.access.as_ref(), crate::pages::ScanDepth::Full, cancel, progress)
+    }
+
+    /// [`Self::scan_document`] without its rendering pass: much faster, at the quality trade-off
+    /// [`crate::pages`] states.
+    pub fn scan_typography(
+        &self,
+        cancel: Option<&crate::pages::CancelToken>,
+        progress: &mut dyn FnMut(crate::pages::PageProgress),
+    ) -> Result<crate::pages::DocStats, Error> {
+        crate::pages::DocStats::scan(self.access.as_ref(), crate::pages::ScanDepth::Typography, cancel, progress)
     }
 
     /// Structured output one page at a time, from a document's [`crate::pages::DocStats`].

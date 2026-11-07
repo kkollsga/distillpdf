@@ -549,19 +549,10 @@ pub(crate) struct HeadingScan {
 
 impl HeadingScan {
     pub(crate) fn add_page(&mut self, spans: &[Span], body: f32, profile: &DocProfile) {
+        let debug = std::env::var_os("DPDF_HEAD_PROFILE").is_some();
         self.pages += 1;
         let lines = lines_of(spans.iter().map(clone_span).collect(), &[]);
-        self.add_lines(&lines, body, profile);
-    }
-
-    /// Count one more page without its lines, which the caller feeds through [`Self::add_lines`].
-    pub(crate) fn add_empty_page(&mut self) {
-        self.pages += 1;
-    }
-
-    pub(crate) fn add_lines(&mut self, lines: &[Line], body: f32, profile: &DocProfile) {
-        let debug = std::env::var_os("DPDF_HEAD_PROFILE").is_some();
-        for ln in lines {
+        for ln in &lines {
             self.doc_lines += 1;
             if let Some((_, _, HeadingKind::Style)) = detect_header(ln, body, Some(profile)) {
                 let sig = style_sig(ln);

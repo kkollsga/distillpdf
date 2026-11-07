@@ -325,7 +325,8 @@
     "clone-call|875a138aa96c9cbe60f38ab0a3824e7d422eee15d56ee5d30b8643f56a476168|self . cancel . clone ()",
     "clone-call|ef37ba5c916232b2607839568c125a2d1a9d5932c5096ac96cdafa68611f1a2c|resolved . clone ()",
     "clone-call|ef37ba5c916232b2607839568c125a2d1a9d5932c5096ac96cdafa68611f1a2c|resolved . clone ()",
-    "clone-call|f224ee5f34e43e96ae2bdafcfb82c8e2011c70bf7f7e766afdfddccfc843ea78|next . els [opening] . clone ()"
+    "clone-call|f224ee5f34e43e96ae2bdafcfb82c8e2011c70bf7f7e766afdfddccfc843ea78|next . els [opening] . clone ()",
+    "clone-call|f615000582d6f0cd11ebc945ac5c5c7c40c4f7e22e65e1e6b88cdd30be56995b|plan . clone ()"
   ],
   "pdfobj.rs": [
     "clone-call|0196e7bdf620d14b5211a06aa677e198b05b8ca295a794bea1cb3e18a1b2cebc|f . clone ()",

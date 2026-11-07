@@ -21,11 +21,19 @@
 //!
 //! # What whole-document knowledge costs, and what it buys
 //!
-//! Heading levels, body size and running headers need the whole document. [`DocStats::scan`] is
-//! a bounded first pass: it reads each page's text once, folds it into [`DocStats`] and drops it,
-//! then reads it once more to count which headings recur. No layout, tables, figures or images,
-//! so it costs what `extract_text` costs, twice. With `DocStats` in hand any page renders alone.
-//! Save it with [`DocStats::to_json`] to skip the scan next time.
+//! Heading levels, body size and running headers need the whole document. [`DocStats`] holds what
+//! the page path needs of that, and there are two ways to get it, both holding one page at a time:
+//!
+//! * [`PdfDocument::scan_document`](crate::PdfDocument::scan_document) reads every page's text to
+//!   learn the typography and running chrome, then renders every page once to count which styles
+//!   flood the document and which headings recur. A page rendered from these statistics is the
+//!   whole-document page, apart from the differences below. It costs what `extract_text` costs
+//!   plus a sequential render.
+//! * [`PdfDocument::scan_typography`](crate::PdfDocument::scan_typography) does only the first half,
+//!   at the cost of `extract_text`. Chrome still goes, but a heading style flooding a filing stays
+//!   in and a repeated heading stays a heading: a stated quality trade-off for an answer now.
+//!
+//! Save the result with [`DocStats::to_json`] to skip the scan next time.
 //!
 //! **State and its bounds.** [`DocStats`] holds counts and digests, no document text except the
 //! outline's titles: typically a few KiB, capped by construction ([`DocStats::approx_bytes`]
@@ -43,17 +51,15 @@
 //!    page where it starts, whole, followed by a `[continues on PDF p. N]` line, and page N opens
 //!    with `[continued from PDF p. M]`. The whole-document path leaves paragraphs split at the
 //!    break, so a phrase over the break cannot be found there. Paragraphs join only when the next
-//!    page opens mid-sentence: lowercase, after text that has no closing punctuation.
+//!    page opens mid-sentence: lowercase, after text that has no closing punctuation. The moved
+//!    text goes straight onto the paragraph it continues, so it lands before that page's
+//!    footnotes, where the whole-document order had the footnotes first.
 //! 2. **Ruled tables across a segment boundary.** A proven table continuation is merged within a
 //!    run of [`SEGMENT_PAGES`] pages, not beyond. That bounds what one page must render. Past the
 //!    boundary the rows stay on their own pages, with the markers, and no row is lost.
 //! 3. **Ids that need the whole document.** An unnumbered figure's anchor is `#p12-fig-1`, not a
 //!    document-wide running number. A second "Figure 3" keeps `#fig-3`, because `fig-3-2` would
 //!    depend on the pages before it.
-//!
-//! Running-heading demotion uses the first pass's reading of the document's headings, taken from
-//! prose alone. Where a heading's only other occurrences sit inside a table or figure, the count
-//! can differ from the whole-document path's, which counts finished elements.
 //!
 //! # Stopping, and what a kill loses
 //!
@@ -151,6 +157,15 @@ fn check(cancel: Option<&CancelToken>) -> Result<(), Error> {
     }
 }
 
+/// How much of the document a scan reads. See the module docs for the trade-off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScanDepth {
+    /// Typography and chrome, from text alone.
+    Typography,
+    /// Also renders every page once, so heading decisions match the whole-document path.
+    Full,
+}
+
 /// Which stage a [`PageProgress`] reports. A document may repeat [`ScanPhase::Headings`] once, in
 /// the rare case where its first reading found a heading style to distrust.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,6 +197,7 @@ pub struct DocStats {
     version: u32,
     page_count: u32,
     source_len: u64,
+    depth: ScanDepth,
     plan: DocPlan,
     running_heads: Vec<RunningHead>,
     /// Outline titles by target page, as `(page, [(key, nesting depth)])`, sorted by page.
@@ -232,6 +248,7 @@ impl DocStats {
     /// The bounded first pass. See the module docs for what it does and what it costs.
     pub(crate) fn scan(
         access: &dyn DocumentAccess,
+        depth: ScanDepth,
         cancel: Option<&CancelToken>,
         progress: &mut dyn FnMut(PageProgress),
     ) -> Result<Self, Error> {
@@ -259,49 +276,56 @@ impl DocStats {
         let (body, title_sz, profile) = typography.finish(pages.len(), !outline.is_empty());
         let chrome = chrome_scan.finish(body);
         let mut plan = DocPlan { body, title_sz, profile, chrome, head_plan: HeadingPlan::default() };
-
-        // One reading of the prose gives both the heading styles to distrust and the heading
-        // texts that recur. If a style turns out distrusted, the second answer was read with the
-        // wrong plan, so it is read again: rare, and only ever on a heading-flooded filing.
-        let (head_plan, mut running_heads) = Self::read_headings(access, &plan, &pages, &promote, cancel, progress)?;
-        if !head_plan.is_empty() {
-            plan.head_plan = head_plan;
-            (_, running_heads) = Self::read_headings(access, &plan, &pages, &promote, cancel, progress)?;
-        }
-
-        Ok(Self {
+        let mut stats = Self {
             version: STATS_VERSION,
             page_count: total,
             source_len: access.source_len().unwrap_or(0),
-            plan,
-            running_heads,
+            depth,
+            plan: plan.clone(),
+            running_heads: Vec::new(),
             promote: promote.into_iter().collect(),
             labels: model::build::page_label_ranges(access),
-        })
+        };
+        if depth == ScanDepth::Typography {
+            return Ok(stats);
+        }
+
+        // One rendering gives both the heading styles to distrust and the heading texts that
+        // recur. If a style turns out distrusted, the second answer was read with the wrong plan,
+        // so it is read again: rare, and only ever on a heading-flooded filing.
+        let page_no: HashMap<ObjectId, u32> = pages.iter().map(|page| (page.id, page.number)).collect();
+        let declared = crate::structtree::declared_tables(access);
+        let read_headings = |stats: &DocStats, progress: &mut dyn FnMut(PageProgress)| -> Result<(HeadingPlan, Vec<RunningHead>), Error> {
+            let mut style_scan = HeadingScan::default();
+            let mut key_scan = HeadingKeyScan::default();
+            for (done, page) in pages.iter().enumerate() {
+                check(cancel)?;
+                let spans = text::extract_spans(access, page.id).unwrap_or_default();
+                style_scan.add_page(&spans, stats.plan.body, &stats.plan.profile);
+                let (els, _) = render_page(access, stats, *page, &page_no, &declared, &spans);
+                for element in &els {
+                    if let ElKind::Heading { level, text, .. } = &element.kind {
+                        key_scan.add(page.number, *level, text);
+                    }
+                }
+                progress(PageProgress { phase: ScanPhase::Headings, done: done as u32 + 1, total });
+            }
+            check(cancel)?;
+            Ok((style_scan.finish(), key_scan.finish()))
+        };
+        let (head_plan, running_heads) = read_headings(&stats, progress)?;
+        stats.running_heads = running_heads;
+        if !head_plan.is_empty() {
+            plan.head_plan = head_plan;
+            stats.plan = plan;
+            (_, stats.running_heads) = read_headings(&stats, progress)?;
+        }
+        Ok(stats)
     }
 
-    fn read_headings(
-        access: &dyn DocumentAccess,
-        plan: &DocPlan,
-        pages: &[PageRef],
-        promote: &BTreeMap<u32, Vec<(String, u8)>>,
-        cancel: Option<&CancelToken>,
-        progress: &mut dyn FnMut(PageProgress),
-    ) -> Result<(HeadingPlan, Vec<RunningHead>), Error> {
-        let total = pages.len() as u32;
-        let mut style_scan = HeadingScan::default();
-        let mut key_scan = HeadingKeyScan::default();
-        for (done, page) in pages.iter().enumerate() {
-            check(cancel)?;
-            let spans = text::extract_spans(access, page.id).unwrap_or_default();
-            let page_promote = promote.get(&page.number).map_or(&[][..], Vec::as_slice);
-            html::scan_page_headings(access, plan, page_promote, done, page.id, &spans, &mut style_scan, &mut |level, text| {
-                key_scan.add(page.number, level, text);
-            });
-            progress(PageProgress { phase: ScanPhase::Headings, done: done as u32 + 1, total });
-        }
-        check(cancel)?;
-        Ok((style_scan.finish(), key_scan.finish()))
+    /// How much this scan read.
+    pub fn depth(&self) -> ScanDepth {
+        self.depth
     }
 
     /// The pages this document has.
@@ -348,6 +372,34 @@ impl DocStats {
         }
         Ok(())
     }
+}
+
+/// One page's element IR, through the same per-page code the whole-document path runs.
+fn render_page(
+    access: &dyn DocumentAccess,
+    stats: &DocStats,
+    page: PageRef,
+    page_no: &HashMap<ObjectId, u32>,
+    declared: &HashMap<ObjectId, Vec<DeclaredTable>>,
+    spans: &Vec<text::Span>,
+) -> (Vec<PageElement>, Vec<String>) {
+    let n = page.number;
+    let boxes: Vec<LinkBox> = links::page_links(access, n, page.id, page_no)
+        .iter()
+        .filter_map(|link| html::link_href(link).map(|href| LinkBox { rect: link.rect, href }))
+        .collect();
+    let promote = stats
+        .promote
+        .binary_search_by_key(&n, |(page, _)| *page)
+        .map_or(&[][..], |index| stats.promote[index].1.as_slice());
+    let facts = PageFacts {
+        links: &boxes,
+        dests: None,
+        promote,
+        declared: declared.get(&page.id).map(Vec::as_slice),
+        emit_svg: false,
+    };
+    html::render_page_elements(access, &stats.plan, &facts, n as usize - 1, &n, &page.id, spans, false)
 }
 
 /// Part of a page's Markdown and the blocks it came from.
@@ -505,26 +557,9 @@ impl<'d> PageStream<'d> {
             .map_err(|error| Error::StaleStats(format!("the source changed: {error}")))?;
         let page = self.pages[n as usize - 1];
         let spans = text::extract_spans(self.access, page.id).unwrap_or_default();
-        let boxes: Vec<LinkBox> = links::page_links(self.access, n, page.id, &self.page_no)
-            .iter()
-            .filter_map(|link| html::link_href(link).map(|href| LinkBox { rect: link.rect, href }))
-            .collect();
         let access = self.access;
         let declared = self.declared.get_or_insert_with(|| crate::structtree::declared_tables(access));
-        let promote = self
-            .stats
-            .promote
-            .binary_search_by_key(&n, |(page, _)| *page)
-            .map_or(&[][..], |index| self.stats.promote[index].1.as_slice());
-        let facts = PageFacts {
-            links: &boxes,
-            dests: None,
-            promote,
-            declared: declared.get(&page.id).map(Vec::as_slice),
-            emit_svg: false,
-        };
-        let (els, uris) =
-            html::render_page_elements(self.access, &self.stats.plan, &facts, n as usize - 1, &n, &page.id, &spans, false);
+        let (els, uris) = render_page(self.access, &self.stats, page, &self.page_no, declared, &spans);
         drop(spans);
         self.cache.push(CachedPage { page: n, raw: (n, els, uris), resolved: None });
         if self.cache.len() > MAX_CACHED_PAGES + SEGMENT_PAGES as usize {
@@ -641,10 +676,10 @@ impl<'d> PageStream<'d> {
 
         // Does this page's opening paragraph belong to the page before?
         let mut continued_from = page.table_in;
-        if n > 1 && opening_para(&page.els).is_some_and(|i| starts_mid_sentence(para_text(&page.els[i]))) && body_blocks(&page.els) >= 2 {
+        if n > 1 && movable_opening(&page.els).is_some() {
             let previous = self.resolved(n - 1)?;
-            if closing_para(&previous.els).is_some_and(|i| ends_mid_sentence(para_text(&previous.els[i]))) {
-                if let Some(i) = opening_para(&page.els) {
+            if closing_runs_on(&previous.els).is_some() {
+                if let Some(i) = movable_opening(&page.els) {
                     page.els.remove(i);
                     continued_from = continued_from.or(Some(n - 1));
                 }
@@ -655,12 +690,10 @@ impl<'d> PageStream<'d> {
         let mut continues_on = page.table_out;
         let mut spill_para = None;
         if n < total {
-            if let Some(closing) = closing_para(&page.els).filter(|&i| ends_mid_sentence(para_text(&page.els[i]))) {
+            if let Some(closing) = closing_runs_on(&page.els) {
                 let next = self.resolved(n + 1)?;
-                if body_blocks(&next.els) >= 2 {
-                    if let Some(opening) = opening_para(&next.els).filter(|&i| starts_mid_sentence(para_text(&next.els[i]))) {
-                        spill_para = Some((closing, next.els[opening].clone()));
-                    }
+                if let Some(opening) = movable_opening(&next.els) {
+                    spill_para = Some((closing, next.els[opening].clone()));
                 }
             }
         }
@@ -737,6 +770,28 @@ fn ends_mid_sentence(html: &str) -> bool {
     let text = text.trim_end();
     text.chars().count() >= MIN_RUN_ON_CHARS
         && text.chars().next_back().is_some_and(|c| c.is_alphanumeric() || matches!(c, ',' | '-' | '\u{00AD}' | '\u{2010}' | '\u{2011}'))
+}
+
+/// This page's closing paragraph, when it reads as running on. The page before it may also take
+/// the page's opening paragraph, but never this same one: see [`movable_opening`].
+fn closing_runs_on(els: &[PageElement]) -> Option<usize> {
+    closing_para(els).filter(|&i| {
+        let text = para_text(&els[i]);
+        ends_mid_sentence(text) && !postprocess::is_math_fragment(text)
+    })
+}
+
+/// This page's opening paragraph, when it reads as the tail of one on the page before. Display
+/// math starts lowercase too, so a fragment of it never qualifies. Nor does a page's only block
+/// when that block itself runs on: a paragraph moves one page at most, which keeps a page's answer
+/// a function of its two neighbours.
+fn movable_opening(els: &[PageElement]) -> Option<usize> {
+    opening_para(els).filter(|&i| {
+        let text = para_text(&els[i]);
+        starts_mid_sentence(text)
+            && !postprocess::is_math_fragment(text)
+            && !(body_blocks(els) == 1 && closing_runs_on(els).is_some())
+    })
 }
 
 /// The finished page: blocks, Markdown, and the map between them.
