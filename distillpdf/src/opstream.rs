@@ -7,7 +7,9 @@
 //!
 //! [`OpReader`] hands the same operators over one at a time, holding a bounded chunk. It still
 //! parses with lopdf's parser, so there is one grammar. It only finds where to cut: a position
-//! just after a top-level operator, where the parser starts fresh.
+//! just after a top-level operator, where the parser starts fresh. Most producers end an operator
+//! with a line break, so it tries the first such line end past the chunk size, and scans the
+//! operands properly only when that does not hold.
 //!
 //! **Why a cut cannot change the result.** The parser is context-free at an operator boundary.
 //! Each chunk is parsed strictly, so a chunk that does not parse to its last byte is never
@@ -64,22 +66,28 @@ impl<'a> OpReader<'a> {
 
     fn refill(&mut self) {
         while self.pending.len() == 0 && !self.data.is_empty() {
-            let cut = if self.data.len() > CHUNK_BYTES { op_boundary(self.data, CHUNK_BYTES) } else { None };
-            let parsed = match cut {
-                Some(end) => match Content::decode_strict(&self.data[..end]) {
-                    Ok(content) => {
-                        self.data = &self.data[end..];
-                        Some(content)
-                    }
-                    Err(_) => None,
-                },
-                None => None,
-            };
+            let mut parsed = None;
+            if self.data.len() > CHUNK_BYTES {
+                // Line ends first: scanning every operand costs 5-10% of the walk on dense pages.
+                // The strict parse is what makes the guess safe, and it refuses a line end that
+                // fell inside a string, an array or a dictionary.
+                let data = self.data;
+                let strict = |cut: usize| Content::decode_strict(&data[..cut]).ok().map(|content| (cut, content));
+                let found = line_end_boundary(data, CHUNK_BYTES)
+                    .and_then(strict)
+                    .or_else(|| op_boundary(data, CHUNK_BYTES).and_then(strict));
+                if let Some((cut, content)) = found {
+                    self.data = &data[cut..];
+                    parsed = Some(content);
+                }
+            }
             let content = parsed.or_else(|| {
                 let rest = std::mem::take(&mut self.data);
-                let decoded = Content::decode(rest).ok();
-                self.failed |= decoded.is_none();
-                decoded
+                Content::decode(rest).ok().or_else(|| {
+                    // Refused outright. What precedes the bad image still stands.
+                    self.failed = true;
+                    Content::decode_strict(&rest[..op_boundary(rest, usize::MAX)?]).ok()
+                })
             });
             self.pending = content.map(|content| content.operations).unwrap_or_default().into_iter();
         }
@@ -171,6 +179,21 @@ fn skip_operand(data: &[u8], i: usize, depth: &mut usize) -> Option<usize> {
     })
 }
 
+/// How far past the chunk size to look for an operator at a line end.
+const LINE_END_WINDOW: usize = 4096;
+
+/// A guess at a boundary, for the strict parse to confirm: the first line break at least `min_len`
+/// into `data` that follows an operator-shaped character. Only inline image samples could make a
+/// wrong guess parse, as data the parser would read another way, so a window holding `BI` makes
+/// no guess at all and leaves it to [`op_boundary`].
+fn line_end_boundary(data: &[u8], min_len: usize) -> Option<usize> {
+    let limit = data.len().min(min_len + LINE_END_WINDOW);
+    if data[..limit].windows(2).any(|pair| pair == b"BI") {
+        return None;
+    }
+    (min_len..limit).find(|&i| matches!(data[i], b'\n' | b'\r') && is_op_char(data[i - 1])).map(|i| i + 1)
+}
+
 /// The first position at least `min_len` into `data` that sits just after a top-level operator
 /// and the whitespace following it. `None` when no such position exists before the end.
 fn op_boundary(data: &[u8], min_len: usize) -> Option<usize> {
@@ -181,17 +204,22 @@ fn op_boundary(data: &[u8], min_len: usize) -> Option<usize> {
             i = next;
             continue;
         }
-        let word = i;
+        let start = i;
         while i < data.len() && is_op_char(data[i]) {
             i += 1;
         }
-        let word = &data[word..i];
+        let word = &data[start..i];
         // The parser reads these three as operands, by prefix.
         if matches!(word, b"true" | b"false" | b"null") || depth > 0 {
             continue;
         }
         if word == b"BI" {
-            i = after_inline_image(data, i)?;
+            // An image with no end fails the whole parse, so what comes before it must be cut
+            // off from it, however short.
+            match after_inline_image(data, i) {
+                Some(end) => i = end,
+                None => return (start > 0).then_some(start),
+            }
         }
         while i < data.len() && is_ws(data[i]) {
             i += 1;
@@ -297,6 +325,22 @@ mod tests {
         assert_same(&repeated(unit, CHUNK_BYTES * 5 + 17));
     }
 
+    /// Catches a guessed line end that is not an operator's: inside a string, an array or a
+    /// dictionary a line break after a word looks exactly like one.
+    #[test]
+    fn a_line_end_inside_a_string_is_not_a_boundary() {
+        assert_same(&repeated(b"BT (one word\ntwo words\n) Tj ET\n", CHUNK_BYTES * 3 + 9));
+        assert_same(&repeated(b"[(one\n) -5 (two\n)] TJ\n", CHUNK_BYTES * 3 + 9));
+        assert_same(&repeated(b"/T <</K word\n/L true\n>> BDC\nEMC\n", CHUNK_BYTES * 3 + 9));
+        // A long run with no operator at all at the guessed position.
+        let mut long = repeated(b"q Q\n", CHUNK_BYTES - 8);
+        long.extend_from_slice(b"(");
+        long.extend_from_slice(&repeated(b"words\n", CHUNK_BYTES));
+        long.extend_from_slice(b") Tj\n");
+        long.extend_from_slice(&repeated(b"q Q\n", CHUNK_BYTES));
+        assert_same(&long);
+    }
+
     /// Catches a boundary found inside the samples of an inline image, whether the image is raw
     /// (ended by its length, with false `EI`s inside) or filtered (ended by the first `EI`).
     #[test]
@@ -338,6 +382,15 @@ mod tests {
         data.extend_from_slice(b"BI /W 1 /H 1 ID xx");
         assert!(whole(&data).is_empty(), "the whole-stream decode loses the page");
         assert_eq!(streamed(&data).len(), good);
+
+        // A stream too short to chunk, and one whose image falls just past a chunk boundary.
+        assert_eq!(streamed(b"q Q\nBI /W 1 /H 1 ID xx").len(), 2);
+        let mut near = repeated(b"q Q\n", CHUNK_BYTES + 400);
+        let good = whole(&near).len();
+        near.extend_from_slice(b"BI /W 1 /H 1 ID xx");
+        let mut reader = OpReader::new(&near);
+        assert_eq!(reader.by_ref().count(), good);
+        assert!(reader.failed(), "the caller can still tell the stream did not parse");
     }
 
     /// Catches the reader materialising the stream anyway: a dense stream must never hold more

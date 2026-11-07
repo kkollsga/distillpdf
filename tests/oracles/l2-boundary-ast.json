@@ -1,5 +1,7 @@
 {
   "access.rs": [
+    "clone-call|16e9e350b80f5bd93627523f6cf2f82f9bdccea5382bcdb24ca3d4c32ac36a7b|Arc :: clone (found)",
+    "clone-call|18e6a66a68431231eb57038f76f7f1c6c2e93a3a825a75cd2ae9045a5a487478|Arc :: clone (& dictionary)",
     "clone-call|2220002259b8ab5fbc18c525feba18cb3f5eafed10ce910da5760821e59f91e4|descriptor . dictionary () . clone ()",
     "clone-call|49733a8f34f513daeb3fc60d7a3efa1199c52737e6da5beee62d7e9479a80f6f|step . clone ()",
     "clone-call|747e2a6479d266588a900b69209809686b16348dcc88e34dd04bab6760058c8a|Arc :: clone (& self . counters)",

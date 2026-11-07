@@ -15,7 +15,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const SOURCE_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_RECOVERED_STREAM_BYTES: u64 = 64 * 1024 * 1024;
@@ -24,6 +25,9 @@ const MAX_RECOVERY_INDEX_ENTRIES: usize = 65_536;
 /// A fixed per-document constant: the same document degrades the same way on every run,
 /// whatever else the process is doing.
 const MAX_PAGE_CONTENT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CACHED_DICTIONARIES: usize = 512;
+const MAX_CACHED_DICTIONARY_KEYS: usize = 32;
+const FORMS_BEFORE_SKIPPING_DESCRIPTORS: u64 = 64;
 const INDEXED_OBJECT_BYTES: u64 = 4 * 1024 * 1024;
 const INDEXED_STREAM_BYTES: u64 = 64 * 1024 * 1024;
 /// Per-document bounded resolution cache, sized from the source length alone so two opens of
@@ -935,8 +939,8 @@ pub(crate) trait DocumentAccess: Send + Sync {
     /// Stream `id`'s dictionary, without its payload where the backend can read it that way. A
     /// walk asking only "is this an image or a form?" must not pull a 30 MiB raster into memory
     /// to find out.
-    fn stream_dictionary(&self, id: ObjectId) -> Option<Dictionary> {
-        self.stream(id).ok()?.read(|stream| stream.dict.clone())
+    fn stream_dictionary(&self, id: ObjectId) -> Option<Arc<Dictionary>> {
+        self.stream(id).ok()?.read(|stream| Arc::new(stream.dict.clone()))
     }
     fn stream(&self, id: ObjectId) -> Result<StreamHandle, AccessError> {
         StreamHandle::new(id, self.object(id)?)
@@ -1107,6 +1111,10 @@ pub(crate) struct IndexedDocumentAdapter {
     recovery: Arc<SourceRecovery>,
     page_map: OnceLock<Result<Arc<PageMap>, AccessError>>,
     counters: Arc<IndexedAdapterCounters>,
+    /// See [`IndexedDocumentAdapter::stream_dictionary`]. Empty until a page draws an XObject.
+    stream_dictionaries: Mutex<HashMap<ObjectId, Arc<Dictionary>>>,
+    forms_asked: AtomicU64,
+    others_asked: AtomicU64,
 }
 
 /// Bounded cache budget for one document, derived from its source length alone.
@@ -1197,6 +1205,9 @@ impl IndexedDocumentAdapter {
             recovery: Arc::new(SourceRecovery::new(source)),
             page_map: OnceLock::from(Ok(map)),
             counters,
+            stream_dictionaries: Mutex::new(HashMap::new()),
+            forms_asked: AtomicU64::new(0),
+            others_asked: AtomicU64::new(0),
         })
     }
 
@@ -1292,12 +1303,33 @@ impl IndexedDocumentAdapter {
 }
 
 impl DocumentAccess for IndexedDocumentAdapter {
-    fn stream_dictionary(&self, id: ObjectId) -> Option<Dictionary> {
-        // Object-stream members and reference chains have no descriptor; they take the long way.
-        match self.reader.resolve_stream_descriptor(id) {
-            Ok(descriptor) => Some(descriptor.dictionary().clone()),
-            Err(_) => self.stream(id).ok()?.read(|stream| stream.dict.clone()),
+    fn stream_dictionary(&self, id: ObjectId) -> Option<Arc<Dictionary>> {
+        // A descriptor saves reading an image's samples, and costs framing the object every time.
+        // So the last few are kept, for a page tiling one image thousands of times, and a document
+        // that keeps answering "form" stops asking: a form is read whole straight after anyway,
+        // and one NASA report draws 41,000 of them, 43% more instructions when each paid twice.
+        let cache = || self.stream_dictionaries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(found) = cache().get(&id) {
+            return Some(Arc::clone(found));
         }
+        let (forms, others) = (self.forms_asked.load(Ordering::Relaxed), self.others_asked.load(Ordering::Relaxed));
+        let mostly_forms = forms >= FORMS_BEFORE_SKIPPING_DESCRIPTORS && others * 64 < forms;
+        let descriptor = if mostly_forms { None } else { self.reader.resolve_stream_descriptor(id).ok() };
+        let dictionary = match &descriptor {
+            Some(descriptor) => Arc::new(descriptor.dictionary().clone()),
+            // Object-stream members and reference chains have no descriptor either.
+            None => self.stream(id).ok()?.read(|stream| Arc::new(stream.dict.clone()))?,
+        };
+        let is_form = dictionary.get(b"Subtype").and_then(Object::as_name).is_ok_and(|name| name == b"Form");
+        if is_form { &self.forms_asked } else { &self.others_asked }.fetch_add(1, Ordering::Relaxed);
+        if descriptor.is_some() && dictionary.len() <= MAX_CACHED_DICTIONARY_KEYS {
+            let mut cache = cache();
+            if cache.len() >= MAX_CACHED_DICTIONARIES {
+                cache.clear();
+            }
+            cache.insert(id, Arc::clone(&dictionary));
+        }
+        Some(dictionary)
     }
 
     fn object(&self, id: ObjectId) -> Result<ObjectHandle, AccessError> {
@@ -1765,6 +1797,36 @@ pub(crate) mod tests {
             EagerDocumentAdapter::new(Arc::new(document), Arc::from(raw)),
             ids,
         )
+    }
+
+    /// Catches the payload-free read disagreeing with the full object, on either side of the point
+    /// where a form-heavy document stops using descriptors: every walk decides image or form on it.
+    #[test]
+    fn a_stream_dictionary_is_the_stream_s_dictionary_however_it_is_read() {
+        use lopdf::{dictionary, Document, Stream};
+        let mut doc = Document::with_version("1.7");
+        let mut ids = Vec::new();
+        for form in 0..200 {
+            let dict = dictionary! { "Subtype" => "Form", "Number" => form };
+            ids.push(doc.add_object(Stream::new(dict, vec![b'q'; 16])));
+        }
+        ids.push(doc.add_object(Stream::new(dictionary! { "Subtype" => "Image", "Width" => 1 }, vec![0u8; 4096])));
+        let parent = doc.new_object_id();
+        let page = doc.add_object(dictionary! { "Type" => "Page", "Parent" => parent });
+        doc.objects.insert(parent, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }));
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => parent });
+        doc.trailer.set("Root", catalog);
+        let mut raw = Vec::new();
+        doc.save_to(&mut raw).unwrap();
+        let adapter = IndexedDocumentAdapter::open(Arc::new(lopdf::BytesSource::new(raw.into())), None).unwrap();
+        for _ in 0..2 {
+            for id in &ids {
+                let found = adapter.stream_dictionary(*id).expect("a stream has a dictionary");
+                let whole = adapter.stream(*id).unwrap().read(|stream| stream.dict.clone()).unwrap();
+                assert_eq!(*found, whole);
+            }
+        }
+        assert!(adapter.forms_asked.load(Ordering::Relaxed) >= FORMS_BEFORE_SKIPPING_DESCRIPTORS);
     }
 
     #[test]

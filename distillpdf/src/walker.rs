@@ -279,7 +279,7 @@ pub(crate) fn form_at(
     operands: &[Object],
 ) -> Option<(ObjectId, StreamHandle)> {
     let id = *scope.get(operands.first()?.as_name().ok()?)?;
-    if !dict_has_subtype(&access.stream_dictionary(id)?, b"Form") {
+    if !dict_has_subtype(access.stream_dictionary(id)?.as_ref(), b"Form") {
         return None;
     }
     Some((id, access.stream(id).ok()?))
