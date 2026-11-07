@@ -167,9 +167,57 @@ fn page_labels(
     access: &dyn crate::access::DocumentAccess,
     page_count: u32,
 ) -> BTreeMap<u32, String> {
+    let ranges = page_label_ranges(access);
     let mut out = BTreeMap::new();
+    for (ri, range) in ranges.iter().enumerate() {
+        let end0 = ranges
+            .get(ri + 1)
+            .map(|next| next.0)
+            .unwrap_or(page_count as i64);
+        for p0 in range.0..end0 {
+            if p0 < 0 {
+                continue;
+            }
+            if let Some(label) = label_in_range(range, p0) {
+                out.insert((p0 + 1) as u32, label); // /Nums is 0-based, pages are 1-based
+            }
+        }
+    }
+    out
+}
+
+/// One `/PageLabels` range: `(start index, style, prefix, first counter value)`.
+pub(crate) type LabelRange = (i64, String, String, i64);
+
+/// The label of 0-based page `p0` inside `range`, `None` when it comes out empty.
+fn label_in_range((start0, style, prefix, st): &LabelRange, p0: i64) -> Option<String> {
+    let value = st + (p0 - start0); // the running counter within this range
+    let body = match style.as_str() {
+        "D" => value.to_string(),
+        "r" => roman(value as u32, false),
+        "R" => roman(value as u32, true),
+        "a" => alpha(value as u32, false),
+        "A" => alpha(value as u32, true),
+        _ => String::new(), // style-less range → prefix only (or nothing)
+    };
+    let label = format!("{prefix}{body}");
+    (!label.is_empty()).then_some(label)
+}
+
+/// The label of 1-based `page`, from [`page_label_ranges`], with no per-page table to hold.
+pub(crate) fn page_label(ranges: &[LabelRange], page: u32, page_count: u32) -> Option<String> {
+    if page == 0 || page > page_count {
+        return None;
+    }
+    let p0 = i64::from(page) - 1;
+    let index = ranges.partition_point(|range| range.0 <= p0).checked_sub(1)?;
+    label_in_range(&ranges[index], p0)
+}
+
+/// The document's `/PageLabels` ranges, sorted by start index.
+pub(crate) fn page_label_ranges(access: &dyn crate::access::DocumentAccess) -> Vec<LabelRange> {
     let Ok(catalog) = access.catalog() else {
-        return out;
+        return Vec::new();
     };
     let Ok(Some(mut ranges)) = catalog.read(|catalog| {
         let page_labels = catalog.get(b"PageLabels").ok()?;
@@ -243,34 +291,10 @@ fn page_labels(
         .ok()
         .flatten()
     }) else {
-        return out;
+        return Vec::new();
     };
     ranges.sort_by_key(|(start, _, _, _)| *start);
-    for (ri, (start0, style, prefix, st)) in ranges.iter().enumerate() {
-        let end0 = ranges
-            .get(ri + 1)
-            .map(|(start, _, _, _)| *start)
-            .unwrap_or(page_count as i64);
-        for p0 in *start0..end0 {
-            if p0 < 0 {
-                continue;
-            }
-            let value = st + (p0 - start0); // the running counter within this range
-            let body = match style.as_str() {
-                "D" => value.to_string(),
-                "r" => roman(value as u32, false),
-                "R" => roman(value as u32, true),
-                "a" => alpha(value as u32, false),
-                "A" => alpha(value as u32, true),
-                _ => String::new(), // style-less range → prefix only (or nothing)
-            };
-            let label = format!("{prefix}{body}");
-            if !label.is_empty() {
-                out.insert((p0 + 1) as u32, label); // /Nums is 0-based, pages are 1-based
-            }
-        }
-    }
-    out
+    ranges
 }
 
 /// Lowercase/uppercase roman numeral for a PDF page label (1 → i/I, 4 → iv/IV, …).
@@ -603,6 +627,21 @@ fn project_blocks(
     dedup_map: &BTreeMap<String, Vec<String>>,
     sec_ids: &[Option<String>],
 ) -> (Vec<Block>, Vec<Section>) {
+    project_blocks_marking(pages_ir, dedup_map, sec_ids, &mut |_| {})
+}
+
+/// One page's blocks, with no document-wide ids to honour. `after_element` receives the running
+/// block count after each element, so a caller can tie blocks back to the element they came from.
+pub(crate) fn project_page_blocks(page: &PageIR, after_element: &mut dyn FnMut(usize)) -> Vec<Block> {
+    project_blocks_marking(std::slice::from_ref(page), &BTreeMap::new(), &[], after_element).0
+}
+
+fn project_blocks_marking(
+    pages_ir: &[PageIR],
+    dedup_map: &BTreeMap<String, Vec<String>>,
+    sec_ids: &[Option<String>],
+    after_element: &mut dyn FnMut(usize),
+) -> (Vec<Block>, Vec<Section>) {
     let mut blocks: Vec<Block> = Vec::new();
     let mut sections: Vec<Section> = Vec::new();
     let mut stack: Vec<(String, u8)> = Vec::new();
@@ -818,6 +857,7 @@ fn project_blocks(
                     blocks.push(b);
                 }
             }
+            after_element(blocks.len());
         }
     }
 

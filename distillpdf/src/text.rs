@@ -8,7 +8,7 @@
 use crate::access::{AccessError, AccessKind, DictionaryHandle, DocumentAccess, ObjectHandle, read_resolved};
 use crate::geom::Mat;
 use crate::pdfobj::num;
-use crate::walker::{descend_form, xobject_at, Descend, ScopePolicy, XMap};
+use crate::walker::{descend_form, Descend, ScopePolicy, XMap};
 #[cfg(test)]
 use lopdf::Document;
 use lopdf::{Dictionary, Object, ObjectId, OwnedEncoding};
@@ -1244,13 +1244,8 @@ pub fn extract_spans(
     access: &dyn crate::access::DocumentAccess,
     page_id: ObjectId,
 ) -> Result<Vec<Span>, AccessError> {
-    let content = match access
-        .page_content(page_id)
-        .ok()
-        .and_then(|bytes| lopdf::content::Content::decode(&bytes).ok())
-    {
-        Some(content) => content,
-        None => return Ok(Vec::new()),
+    let Ok(content) = access.page_content(page_id) else {
+        return Ok(Vec::new());
     };
     let fonts = build_fonts(access, page_id)?;
     let xmap = crate::walker::page_xobjects(access, page_id);
@@ -1259,7 +1254,7 @@ pub fn extract_spans(
     let props = marked_properties(access, page_id);
     decode_spans(
         access,
-        &content.operations,
+        &mut crate::opstream::OpReader::new(&content),
         &fonts,
         &xmap,
         Mat::ID,
@@ -1292,7 +1287,7 @@ pub fn extract_spans(
         let ff = build_fonts_from_resources(access, fr)?;
         decode_spans(
             access,
-            &f.ops,
+            &mut f.ops(),
             &ff,
             &f.scope.xobjects,
             f.matrix.mul(actm),
@@ -1392,7 +1387,7 @@ fn push_positioned_span(spans: &mut Vec<Span>, wtm: &Mat, ctm: &Mat, base_size: 
 #[allow(clippy::too_many_arguments)]
 fn decode_spans(
     access: &dyn crate::access::DocumentAccess,
-    ops: &[lopdf::content::Operation],
+    ops: &mut dyn Iterator<Item = lopdf::content::Operation>,
     fonts: &HashMap<Vec<u8>, FontInfo>,
     xmap: &XMap,
     base: Mat,
@@ -1591,7 +1586,7 @@ fn decode_spans(
             // /Matrix and the CTM in effect at the `Do`). Inline images / non-Form
             // XObjects carry no text and are skipped.
             "Do" => {
-                let Some((_, stream)) = xobject_at(access, xmap, o) else {
+                let Some((_, stream)) = crate::walker::form_at(access, xmap, o) else {
                     continue;
                 };
                 // `OwnOnly`: a form's fonts and XObjects live in its OWN /Resources (PDF
@@ -1623,7 +1618,7 @@ fn decode_spans(
                 let mark = spans.len();
                 decode_spans(
                     access,
-                    &f.ops,
+                    &mut f.ops(),
                     &ff,
                     &f.scope.xobjects,
                     sub,
@@ -2435,11 +2430,11 @@ pub(crate) fn fallback_page_text(
         }
     }
     let bytes = access.page_content(page)?;
-    let content = lopdf::content::Content::decode(&bytes).map_err(|error| fallback_error(page, error))?;
+    let mut operations = crate::opstream::OpReader::new(&bytes);
     let mut chunks = Vec::new();
     let mut current_encoding = None;
     let mut current_text = String::new();
-    for operation in content.operations {
+    for operation in operations.by_ref() {
         match operation.operator.as_str() {
             "Tf" => {
                 let operand = operation.operands.first()
@@ -2483,6 +2478,9 @@ pub(crate) fn fallback_page_text(
             "T*" | "ET" if !current_text.ends_with('\n') => current_text.push('\n'),
             _ => {}
         }
+    }
+    if operations.failed() {
+        return Err(fallback_error(page, "invalid content stream"));
     }
     if !current_text.is_empty() { chunks.push(current_text); }
     if let Some(error) = first_error { return Err(error); }
@@ -2640,7 +2638,7 @@ mod tests {
         let xmap = crate::walker::page_xobjects(&access, page_id);
         let mut spans = Vec::new();
         let mut budget = crate::WalkBudget::new(700);
-        decode_spans(&access, &content.operations, &fonts, &xmap, Mat::ID, 0, &mut spans, &mut budget, None).unwrap();
+        decode_spans(&access, &mut content.operations.iter().cloned(), &fonts, &xmap, Mat::ID, 0, &mut spans, &mut budget, None).unwrap();
         assert!(!spans.is_empty(), "a tripped budget must not empty the page");
         assert!(spans.len() < 3, "the budget must really bite, got {} spans", spans.len());
     }

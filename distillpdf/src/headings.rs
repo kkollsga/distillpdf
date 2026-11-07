@@ -511,10 +511,17 @@ pub(crate) fn style_sig(line: &Line) -> (i32, bool, u32) {
 
 /// Document-global heading model (distrusted over-firing style signatures); built once
 /// before the parallel render, read-only and integer-keyed → deterministic.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct HeadingPlan {
     distrusted: std::collections::HashSet<(i32, bool, u32)>,
 }
+
+impl HeadingPlan {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.distrusted.is_empty()
+    }
+}
+
 /// PASS over the whole document's lines: count, per style signature, how many lines yield
 /// a surviving `Style` heading verdict, then distrust a signature whose count is far above
 /// what real section headings plausibly reach. A genuine document spreads headings across
@@ -523,21 +530,44 @@ pub(crate) struct HeadingPlan {
 /// filing's flood is still only a few percent of its lines) raised mildly for very long
 /// docs. arXiv papers (≤~50 headings, mostly numbered=Reliable) never trip it → no-op.
 pub(crate) fn plan_headings(page_spans: &[(u32, ObjectId, Vec<Span>)], body: f32, profile: &DocProfile) -> HeadingPlan {
-    let mut counts: HashMap<(i32, bool, u32), usize> = HashMap::new();
-    let mut samples: HashMap<(i32, bool, u32), Vec<String>> = HashMap::new();
-    let debug = std::env::var("DPDF_HEAD_PROFILE").is_ok();
-    let mut doc_lines = 0usize;
-    let mut pages = 0usize;
+    let mut scan = HeadingScan::default();
     for (_pno, _id, spans) in page_spans {
-        pages += 1;
+        scan.add_page(spans, body, profile);
+    }
+    scan.finish()
+}
+
+/// The fold behind [`plan_headings`]: per style signature, how many lines earned a `Style`
+/// verdict. Keyed by style, so it holds nothing per page.
+#[derive(Default)]
+pub(crate) struct HeadingScan {
+    counts: HashMap<(i32, bool, u32), usize>,
+    samples: HashMap<(i32, bool, u32), Vec<String>>,
+    doc_lines: usize,
+    pages: usize,
+}
+
+impl HeadingScan {
+    pub(crate) fn add_page(&mut self, spans: &[Span], body: f32, profile: &DocProfile) {
+        self.pages += 1;
         let lines = lines_of(spans.iter().map(clone_span).collect(), &[]);
-        for ln in &lines {
-            doc_lines += 1;
+        self.add_lines(&lines, body, profile);
+    }
+
+    /// Count one more page without its lines, which the caller feeds through [`Self::add_lines`].
+    pub(crate) fn add_empty_page(&mut self) {
+        self.pages += 1;
+    }
+
+    pub(crate) fn add_lines(&mut self, lines: &[Line], body: f32, profile: &DocProfile) {
+        let debug = std::env::var_os("DPDF_HEAD_PROFILE").is_some();
+        for ln in lines {
+            self.doc_lines += 1;
             if let Some((_, _, HeadingKind::Style)) = detect_header(ln, body, Some(profile)) {
                 let sig = style_sig(ln);
-                *counts.entry(sig).or_insert(0) += 1;
+                *self.counts.entry(sig).or_insert(0) += 1;
                 if debug {
-                    let s = samples.entry(sig).or_default();
+                    let s = self.samples.entry(sig).or_default();
                     if s.len() < 4 {
                         s.push(ln.text().trim().chars().take(40).collect());
                     }
@@ -545,17 +575,22 @@ pub(crate) fn plan_headings(page_spans: &[(u32, ObjectId, Vec<Span>)], body: f32
             }
         }
     }
-    let thresh = 90usize.max(pages); // absolute floor 90; ~1 per page for very long docs
-    let distrusted: std::collections::HashSet<(i32, bool, u32)> =
-        counts.iter().filter(|(_, &c)| c > thresh).map(|(&k, _)| k).collect();
-    if debug {
-        let mut v: Vec<_> = counts.iter().collect();
-        v.sort_by(|a, b| b.1.cmp(a.1));
-        eprintln!("[head-profile] doc_lines={doc_lines} pages={pages} thresh={thresh} style-sigs:");
-        for (sig, c) in v.iter().take(10) {
-            let dis = if **c > thresh { " DISTRUST" } else { "" };
-            eprintln!("  {:?} x{}{}  e.g. {:?}", sig, c, dis, samples.get(*sig).map(|s| s.as_slice()).unwrap_or(&[]));
+
+    pub(crate) fn finish(self) -> HeadingPlan {
+        let debug = std::env::var_os("DPDF_HEAD_PROFILE").is_some();
+        let Self { counts, samples, doc_lines, pages } = self;
+        let thresh = 90usize.max(pages); // absolute floor 90; ~1 per page for very long docs
+        let distrusted: std::collections::HashSet<(i32, bool, u32)> =
+            counts.iter().filter(|(_, &c)| c > thresh).map(|(&k, _)| k).collect();
+        if debug {
+            let mut v: Vec<_> = counts.iter().collect();
+            v.sort_by(|a, b| b.1.cmp(a.1));
+            eprintln!("[head-profile] doc_lines={doc_lines} pages={pages} thresh={thresh} style-sigs:");
+            for (sig, c) in v.iter().take(10) {
+                let dis = if **c > thresh { " DISTRUST" } else { "" };
+                eprintln!("  {:?} x{}{}  e.g. {:?}", sig, c, dis, samples.get(*sig).map(|s| s.as_slice()).unwrap_or(&[]));
+            }
         }
+        HeadingPlan { distrusted }
     }
-    HeadingPlan { distrusted }
 }

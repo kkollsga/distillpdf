@@ -58,6 +58,11 @@ pub enum Error {
     ModelNotUtf8(String),
     /// Parsing a supplied `model_json` string failed.
     ParseModelJson(String),
+    /// The caller's [`crate::pages::CancelToken`] fired. Pages already handed over are complete.
+    Cancelled,
+    /// Saved [`crate::pages::DocStats`] do not belong to this document, or to this version of
+    /// the analysis (carries the reason). Scan again.
+    StaleStats(String),
 }
 
 impl fmt::Display for Error {
@@ -88,6 +93,8 @@ impl fmt::Display for Error {
             Error::Model(s) | Error::Ocr(s) => write!(f, "{s}"),
             Error::ModelNotUtf8(e) => write!(f, "model json not utf-8: {e}"),
             Error::ParseModelJson(e) => write!(f, "parse model_json: {e}"),
+            Error::Cancelled => write!(f, "cancelled"),
+            Error::StaleStats(e) => write!(f, "stale document statistics: {e}"),
         }
     }
 }

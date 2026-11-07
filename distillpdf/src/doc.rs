@@ -1103,6 +1103,22 @@ impl PdfDocument {
         out
     }
 
+    /// The document's first pass for page-at-a-time output: see [`crate::pages`]. Holds one page
+    /// at a time and a small bounded state. `cancel` stops it between pages and inside a heavy
+    /// page; `progress` hears about every page.
+    pub fn scan_document(
+        &self,
+        cancel: Option<&crate::pages::CancelToken>,
+        progress: &mut dyn FnMut(crate::pages::PageProgress),
+    ) -> Result<crate::pages::DocStats, Error> {
+        crate::pages::DocStats::scan(self.access.as_ref(), cancel, progress)
+    }
+
+    /// Structured output one page at a time, from a document's [`crate::pages::DocStats`].
+    pub fn page_stream(&self, stats: crate::pages::DocStats) -> Result<crate::pages::PageStream<'_>, Error> {
+        crate::pages::PageStream::new(self.access.as_ref(), stats)
+    }
+
     /// Extract text from a single 1-indexed page (hybrid).
     pub fn extract_page_text(&self, page: u32) -> Result<String, Error> {
         let page_id = self.access.pages_or_empty().into_iter()

@@ -19,7 +19,7 @@ use crate::raster::{
 };
 use crate::vector::ClipRect;
 use crate::walker::{
-    descend_form, has_subtype, page_resources, page_xobjects, soft_mask_of,
+    descend_form, page_resources, page_xobjects, soft_mask_of,
     xobject_at, Descend, PaintSeq, ResourceScope,
     ScopePolicy, SoftMask, XMap,
 };
@@ -252,17 +252,17 @@ fn decodable(
     res: &ResourceScope,
     id: ObjectId,
 ) -> bool {
-    access.stream(id).ok().and_then(|stream| stream.read(|stream| {
-        let dict = &stream.dict;
-        let filters = filters_of(dict);
-        if filters.iter().any(|f| f == b"JPXDecode" || f == b"JBIG2Decode") {
-            return false;
-        }
-        if filters.iter().any(|f| f == b"DCTDecode" || f == b"CCITTFaxDecode") {
-            return true; // JPEG / CCITT fax: renderable (fax via decode_ccitt)
-        }
-        samples_decodable(access, res, dict)
-    })).unwrap_or(false)
+    let Some(dict) = access.stream_dictionary(id) else {
+        return false;
+    };
+    let filters = filters_of(&dict);
+    if filters.iter().any(|f| f == b"JPXDecode" || f == b"JBIG2Decode") {
+        return false;
+    }
+    if filters.iter().any(|f| f == b"DCTDecode" || f == b"CCITTFaxDecode") {
+        return true; // JPEG / CCITT fax: renderable (fax via decode_ccitt)
+    }
+    samples_decodable(access, res, &dict)
 }
 
 /// Build a base64 data URI for an image stream, or None if unsupported.
@@ -746,14 +746,10 @@ pub fn positioned_images(
     page_id: ObjectId,
     want_uris: bool,
 ) -> Vec<Placed> {
-    let content = match access
-        .page_content(page_id)
-        .ok()
-        .and_then(|bytes| lopdf::content::Content::decode(&bytes).ok())
-    {
-        Some(content) => content,
-        None => return Vec::new(),
+    let Ok(content) = access.page_content(page_id) else {
+        return Vec::new();
     };
+    let mut ops = crate::opstream::OpReader::new(&content);
     // The page's XObjects over its WHOLE resource chain, not just the nearest dictionary
     // (see `walker::page_resource_chain`) — a raster a producer left on an outer node of
     // the page tree used to resolve to nothing and simply not appear.
@@ -763,7 +759,7 @@ pub fn positioned_images(
     let res = Rc::new(page_resources(access, page_id));
     let mut raws: Vec<RawTile> = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
-    walk(access, &content.operations, &xmap, &res, Mat::ID, None, None, &mut raws, 0, &mut budget, &[]);
+    walk(access, &mut ops, &xmap, &res, Mat::ID, None, None, &mut raws, 0, &mut budget, &[]);
     // §12.5.5: an annotation's appearance stream is page content a viewer paints ON TOP of
     // the content stream — and it is reachable from neither that stream nor the page's
     // `/Resources`. Addressed past the last page operation so paint order puts it there.
@@ -787,8 +783,8 @@ pub fn positioned_images(
                     .map(ResourceScope::own)
                     .unwrap_or_default(),
             );
-            let here = PaintSeq::at(&[], content.operations.len() + k);
-            walk(access, &f.ops, &f.scope.xobjects, &ares, sub_ctm, clip, None, &mut raws, 1, &mut budget, here.as_slice());
+            let here = PaintSeq::at(&[], ops.finish_count() + k);
+            walk(access, &mut f.ops(), &f.scope.xobjects, &ares, sub_ctm, clip, None, &mut raws, 1, &mut budget, here.as_slice());
             false
         });
         if outcome == Some(true) {
@@ -831,7 +827,7 @@ fn add_ink(bb: Rect, clip: Option<ClipRect>, out: &mut Rect) {
 #[allow(clippy::too_many_arguments)]
 fn mask_extent(
     access: &dyn crate::access::DocumentAccess,
-    ops: &[lopdf::content::Operation],
+    ops: &mut dyn Iterator<Item = lopdf::content::Operation>,
     xmap: &XMap,
     base: Mat,
     base_clip: Option<ClipRect>,
@@ -900,18 +896,26 @@ fn mask_extent(
             // A shading or a glyph run is ink this walk cannot bound; see the doc comment.
             "sh" | "Tj" | "TJ" | "'" | "\"" | "BI" => return false,
             "Do" => {
-                let Some((_, stream)) = xobject_at(access, xmap, o) else {
+                let Some(id) = crate::walker::xobject_id(xmap, o) else {
                     continue;
                 };
-                let completed = stream.read(|value| {
-                if has_subtype(value, b"Image") {
+                let Some(dict) = access.stream_dictionary(id) else {
+                    continue;
+                };
+                if crate::walker::dict_has_subtype(&dict, b"Image") {
                     let mut bb = Rect::EMPTY;
                     for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
                         let (px, py) = ctm.apply(u, v);
                         bb.include(px, py);
                     }
                     add_ink(bb, clip, out);
-                } else {
+                    continue;
+                }
+                let Some((_, stream)) = xobject_at(access, xmap, o) else {
+                    continue;
+                };
+                let completed = stream.read(|value| {
+                {
                     match descend_form(access, &stream, xmap, ScopePolicy::OverlayParent, depth, budget, 0) {
                         Descend::Into(f) => {
                             let sub_ctm = f.matrix.mul(ctm);
@@ -919,7 +923,7 @@ fn mask_extent(
                                 Some(bb) => Some(crate::vector::intersect_clip(clip, (bb.x0, bb.y0, bb.x1, bb.y1))),
                                 None => clip,
                             };
-                            if !mask_extent(access, &f.ops, &f.scope.xobjects, sub_ctm, sub_clip, depth + 1, budget, out) {
+                            if !mask_extent(access, &mut f.ops(), &f.scope.xobjects, sub_ctm, sub_clip, depth + 1, budget, out) {
                                 return false;
                             }
                         }
@@ -972,7 +976,7 @@ fn mask_window(
         .flatten()
         .map(|bb| (bb.x0, bb.y0, bb.x1, bb.y1));
     let mut ink = Rect::EMPTY;
-    if !mask_extent(access, &f.ops, &f.scope.xobjects, sub_ctm, sub_clip, depth + 1, budget, &mut ink) {
+    if !mask_extent(access, &mut f.ops(), &f.scope.xobjects, sub_ctm, sub_clip, depth + 1, budget, &mut ink) {
         return None;
     }
     (ink.is_valid() && ink.x1 > ink.x0 && ink.y1 > ink.y0).then_some((ink.x0, ink.y0, ink.x1, ink.y1))
@@ -985,7 +989,7 @@ fn mask_window(
 #[allow(clippy::too_many_arguments)]
 fn walk(
     access: &dyn crate::access::DocumentAccess,
-    ops: &[lopdf::content::Operation],
+    ops: &mut dyn Iterator<Item = lopdf::content::Operation>,
     xmap: &XMap,
     res: &Rc<ResourceScope>,
     base: Mat,
@@ -1021,7 +1025,7 @@ fn walk(
     // would, control points included (which over-estimates a curved clip in exactly the same
     // direction: it can only ever clip less than a conforming reader, never more).
     let mut cur = Rect::EMPTY;
-    for (opi, op) in ops.iter().enumerate() {
+    for (opi, op) in ops.enumerate() {
         // Total-work budget (see `crate::WalkBudget`): the depth cap alone lets a
         // self-referential form branch 2x per level. Out of budget → stop and keep the
         // tiles found so far; a partial page beats a hang and beats an empty one.
@@ -1106,24 +1110,31 @@ fn walk(
                 cur = Rect::EMPTY;
             }
             "Do" => {
-                let Some((id, stream)) = xobject_at(access, xmap, o) else {
+                let Some(id) = crate::walker::xobject_id(xmap, o) else {
                     continue;
                 };
-                let action = stream.read(|value| {
-                if has_subtype(value, b"Image") {
+                let Some(dict) = access.stream_dictionary(id) else {
+                    continue;
+                };
+                if crate::walker::dict_has_subtype(&dict, b"Image") {
                     let Some(p) = image_placement(ctm, clip, smask) else {
-                        return false;
+                        continue;
                     };
                     // Record geometry + pixel dims; uri building / grid stitching happens
                     // in finalize() once the whole page's tiles are known. `pw` is the
                     // EFFECTIVE width — declared /Width over the decoder's subsample step
                     // — because grid stitching derives its canvas scale from it, and the
                     // declared width of an oversized tile names pixels the decode won't have.
-                    let declared = value.dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0).max(0) as u32;
-                    let pw = declared / crate::raster::sample_step(access, res, &value.dict).max(1) as u32;
+                    let declared = dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0).max(0) as u32;
+                    let pw = declared / crate::raster::sample_step(access, res, &dict).max(1) as u32;
                     out.push(RawTile { src: TileSrc::Object(id), x0: p.x0, x1: p.x1, y0: p.y0, y1: p.y1, pw, ctm: p.ctm, res: Rc::clone(res), seq: PaintSeq::at(here, opi), clip: p.crop, full: p.full });
-                    false
-                } else {
+                    continue;
+                }
+                let Some((_, stream)) = xobject_at(access, xmap, o) else {
+                    continue;
+                };
+                let action = stream.read(|value| {
+                {
                     // A form is descended with the page's XObject scope still in force
                     // (`OverlayParent`): a raster the page defines and the form invokes by
                     // an unqualified name must still be found.
@@ -1145,7 +1156,7 @@ fn walk(
                                 Some(bb) => Some(crate::vector::intersect_clip(clip, (bb.x0, bb.y0, bb.x1, bb.y1))),
                                 None => clip,
                             };
-                            walk(access, &f.ops, &f.scope.xobjects, &child, sub_ctm, sub_clip, smask, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice());
+                            walk(access, &mut f.ops(), &f.scope.xobjects, &child, sub_ctm, sub_clip, smask, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice());
                             false
                         }
                         Descend::Skip => false,
@@ -1585,7 +1596,7 @@ mod tests {
         let mut raws = Vec::new();
         let mut budget = crate::WalkBudget::new(700);
         let res = Rc::new(page_resources(&test_adapter(&doc), page_id));
-        walk(&test_adapter(&doc), &content.operations, &xmap, &res, Mat::ID, None, None, &mut raws, 0, &mut budget, &[]);
+        walk(&test_adapter(&doc), &mut content.operations.iter().cloned(), &xmap, &res, Mat::ID, None, None, &mut raws, 0, &mut budget, &[]);
         assert!(!raws.is_empty(), "a tripped budget must not empty the page");
         assert!(raws.len() < 3, "the budget must really bite, got {} tiles", raws.len());
     }

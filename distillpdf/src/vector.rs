@@ -1238,19 +1238,14 @@ fn painted_page(
     // the graphics state starts at the spec defaults (opaque, black) — which is exactly
     // what a page with no `/ExtGState` is entitled to.
     let chain = page_resource_chain(access, page_id);
-    let content = match access
-        .page_content(page_id)
-        .ok()
-        .and_then(|bytes| lopdf::content::Content::decode(&bytes).ok())
-    {
-        Some(content) => content,
-        None => return Vec::new(),
+    let Ok(content) = access.page_content(page_id) else {
+        return Vec::new();
     };
     // Over-budget pages DEGRADE, they do not vanish: interpret the first `cap` operations and
     // keep whatever was painted by then. Returning empty here made a dense page look like a page
     // with no figures at all (a whole cover map disappeared), which is strictly worse than a
-    // partial one — the ops are already parsed by this point, so the cap only bounds the walk.
-    let ops = &content.operations[..content.operations.len().min(cap)];
+    // partial one.
+    let mut ops = crate::opstream::OpReader::new(&content);
     // Both maps are folded over the WHOLE resource chain, outermost first, so the page's
     // own dictionary still shadows an ancestor's entry of the same name while a name only
     // an ancestor defines finally resolves (see `walker::page_resource_chain`).
@@ -1267,7 +1262,7 @@ fn painted_page(
     }
     let mut painted = Vec::new();
     let mut budget = crate::WalkBudget::new(crate::MAX_FORM_WORK);
-    walk(access, ops, &xmap, &egmap, &csmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget, &[]);
+    walk(access, &mut ops.by_ref().take(cap), &xmap, &egmap, &csmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget, &[]);
     // §12.5.5: an annotation's appearance is page content, painted on top of the content
     // stream and reachable from neither it nor the page's `/Resources`. Its ink is this
     // walk's business exactly as a form's is — see `walker::placed_appearances` for the
@@ -1305,8 +1300,8 @@ fn painted_page(
         {
             g.clip = Some(intersect_clip(g.clip, (bb.x0, bb.y0, bb.x1, bb.y1)));
         }
-        let here = PaintSeq::at(&[], content.operations.len() + k);
-        walk(access, &f.ops, &f.scope.xobjects, &aeg, &acs, g, &mut painted, 1, &mut budget, here.as_slice());
+        let here = PaintSeq::at(&[], ops.finish_count() + k);
+        walk(access, &mut f.ops(), &f.scope.xobjects, &aeg, &acs, g, &mut painted, 1, &mut budget, here.as_slice());
     }
     painted
 }
@@ -1440,7 +1435,7 @@ fn clone_label(s: &LabelSpan) -> LabelSpan {
 #[allow(clippy::too_many_arguments)]
 fn walk(
     access: &dyn crate::access::DocumentAccess,
-    ops: &[lopdf::content::Operation],
+    ops: &mut dyn Iterator<Item = lopdf::content::Operation>,
     xmap: &XMap,
     egmap: &HashMap<Vec<u8>, (Option<f32>, Option<f32>)>,
     csmap: &HashMap<Vec<u8>, Rc<PaintCs>>,
@@ -1477,7 +1472,7 @@ fn walk(
         Some(Stroke { color: g.stroke, width: (g.lw * s).max(0.3), dash })
     };
 
-    for (opi, op) in ops.iter().enumerate() {
+    for (opi, op) in ops.enumerate() {
         // Total-work budget (see `crate::WalkBudget`). `MAX_OPS` above truncates only the
         // page's TOP-LEVEL operator list; a self-referential form re-enters `walk` with a
         // fresh, tiny slice each time, so only a budget shared across all levels bounds it.
@@ -1602,7 +1597,7 @@ fn walk(
                 // Images are `crate::img`'s business; only forms carry path ink. The
                 // descent inherits the page's scope (`OverlayParent`) so a form can paint
                 // through an ExtGState or XObject the page defines.
-                let Some((_, stream)) = crate::walker::xobject_at(access, xmap, o) else {
+                let Some((_, stream)) = crate::walker::form_at(access, xmap, o) else {
                     continue;
                 };
                 let f = match descend_form(access, &stream, xmap, ScopePolicy::OverlayParent, depth, budget, egmap.len()) {
@@ -1652,7 +1647,7 @@ fn walk(
                 {
                     sub.clip = Some(intersect_clip(sub.clip, (bb.x0, bb.y0, bb.x1, bb.y1)));
                 }
-                walk(access, &f.ops, &f.scope.xobjects, &child_eg, &child_cs, sub, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice());
+                walk(access, &mut f.ops(), &f.scope.xobjects, &child_eg, &child_cs, sub, out, depth + 1, budget, PaintSeq::at(here, opi).as_slice());
             }
             _ => {}
         }
@@ -2127,7 +2122,7 @@ mod tests {
         }
         let mut painted = Vec::new();
         let mut budget = crate::WalkBudget::new(budget);
-        walk(&access, &content.operations, &xmap, &egmap, &csmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget, &[]);
+        walk(&access, &mut content.operations.iter().cloned(), &xmap, &egmap, &csmap, GState::new(Mat::ID, [0; 3], [0; 3], 1.0, 1.0, 1.0), &mut painted, 0, &mut budget, &[]);
         painted
     }
 
@@ -3003,7 +2998,7 @@ mod tests {
         let csmap: HashMap<Vec<u8>, Rc<PaintCs>> = HashMap::new();
         walk(
             &test_adapter(doc),
-            &content.operations,
+            &mut content.operations.iter().cloned(),
             &XMap::new(),
             &egmap,
             &csmap,

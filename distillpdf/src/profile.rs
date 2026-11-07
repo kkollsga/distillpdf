@@ -1,19 +1,16 @@
 //! Document style profile: a one-pass analysis of the whole document's typography —
 //! the body text size/weight/font, the heading size/weight/font tiers (ranked to levels),
-//! whether sections are numbered, whether a PDF outline exists, and the column layout.
+//! whether sections are numbered, and whether a PDF outline exists.
 //!
-//! Computed once up front (see `build_doc_profile` in `html.rs`) and fed into the heading
+//! Computed once up front (see [`crate::docscan`]) and fed into the heading
 //! decision gates so classification adapts to each document instead of relying on fixed
 //! global thresholds (e.g. a heading face only 1.1× body, set in a distinct font, that the
-//! old `ratio >= 1.18` rule missed). Plain data only — the clustering logic lives in
-//! `html.rs` next to the span model it reads.
-
-use std::collections::HashSet;
+//! old `ratio >= 1.18` rule missed). Plain data only.
 
 /// One detected heading style: a size/weight/font signature and the heading level it maps
 /// to. `level` is the `detect_header` level (1 → `<h2>`, 2 → `<h3>`, …); `<h1>` is reserved
 /// for the document title and handled separately.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct HeadingTier {
     pub size: f32,
     pub bold: bool,
@@ -25,7 +22,7 @@ pub struct HeadingTier {
 // wires only heading classification); they are the foundation for migrating the other
 // decision gates later, so keep them even while unread.
 #[allow(dead_code)]
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DocProfile {
     pub body_size: f32,
     pub body_font: u32,
@@ -37,10 +34,6 @@ pub struct DocProfile {
     pub numbered: bool,
     /// The PDF carries an `/Outlines` bookmark tree (recorded; not consumed yet).
     pub has_outline: bool,
-    /// Dominant column count (1 or 2; recorded; not consumed yet).
-    pub columns: u8,
-    /// Repeated running header/footer lines (recorded; populated by a later pass).
-    pub running_heads: HashSet<String>,
 }
 
 impl DocProfile {

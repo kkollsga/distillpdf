@@ -524,6 +524,18 @@ impl TableAnalysis {
         }));
     }
 
+    /// Could this table run onto the next page? Cheap necessary condition for
+    /// [`Self::merge_proven_fragment`], read before a neighbouring page is rendered.
+    pub(crate) fn may_continue_below(&self) -> bool {
+        self.proven_continuation().is_some_and(|proof| proof.terminal_owner && proof.leading_styled)
+    }
+
+    /// Could this table be the tail of one that began on the previous page? See
+    /// [`Self::may_continue_below`].
+    pub(crate) fn may_continue_above(&self) -> bool {
+        self.proven_continuation().is_some_and(|proof| proof.leading_owner)
+    }
+
     fn proven_continuation(&self) -> Option<&ProvenContinuation> {
         match self.continuation.as_ref()? {
             ContinuationProof::Proven(proof) => Some(proof),

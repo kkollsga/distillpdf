@@ -13,6 +13,7 @@ pub mod error;
 pub mod markdown;
 pub mod model;
 pub mod ocr;
+pub mod pages;
 
 // Crate-internal extraction / layout / render machinery. Their handful of already-`pub`
 // result types are surfaced by the root re-exports below rather than by opening the whole
@@ -21,6 +22,7 @@ mod afm;
 mod access;
 mod captions;
 mod chrome;
+mod docscan;
 mod elem_passes;
 mod encoding;
 mod extract;
@@ -35,6 +37,7 @@ mod lattice;
 mod layout;
 mod links;
 mod nav;
+mod opstream;
 mod pdfobj;
 mod postprocess;
 mod profile;
@@ -131,16 +134,26 @@ pub(crate) const FORM_DESCENT_COST: usize = 512;
 /// not vanish (the precedent `vector::positioned_vectors_capped` set for `MAX_OPS`).
 pub(crate) struct WalkBudget {
     left: usize,
+    /// Charges since the last look at the caller's cancel token.
+    ticks: u32,
 }
 
 impl WalkBudget {
     pub(crate) fn new(total: usize) -> Self {
-        Self { left: total }
+        Self { left: total, ticks: 0 }
     }
 
     /// Charge `n` units of work. Returns `false` once the budget is spent, at which point
     /// the caller must stop walking (and keep whatever it has already collected).
     pub(crate) fn spend(&mut self, n: usize) -> bool {
+        // Every walk over a page's operators charges here, once an operator, so this is the one
+        // place a heavy page can be stopped from inside. A cancelled walk ends like an exhausted
+        // one, and the page API then throws the partial page away.
+        self.ticks = self.ticks.wrapping_add(1);
+        if self.ticks & 0x3ff == 0 && pages::cancel_requested() {
+            self.left = 0;
+            return false;
+        }
         match self.left.checked_sub(n) {
             Some(rest) => {
                 self.left = rest;

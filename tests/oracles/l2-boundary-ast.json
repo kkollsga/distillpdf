@@ -1,5 +1,6 @@
 {
   "access.rs": [
+    "clone-call|2220002259b8ab5fbc18c525feba18cb3f5eafed10ce910da5760821e59f91e4|descriptor . dictionary () . clone ()",
     "clone-call|49733a8f34f513daeb3fc60d7a3efa1199c52737e6da5beee62d7e9479a80f6f|step . clone ()",
     "clone-call|747e2a6479d266588a900b69209809686b16348dcc88e34dd04bab6760058c8a|Arc :: clone (& self . counters)",
     "clone-call|910bcfb4b0c1724ad46e37a537cbed887731cd14f9ad807dd95637c02ab2bd4c|Arc :: clone (& self . document)",
@@ -10,6 +11,8 @@
     "clone-call|b8c80446b736970392cd721afc3f046b0a29115a47005456989858c12518f0ff|Arc :: clone (& self . recovery)",
     "clone-call|be875f50f8e5ce7dc199ab7afe28e4d6b936da24ef158ad3aa90219477212679|self . owner . clone ()",
     "clone-call|be875f50f8e5ce7dc199ab7afe28e4d6b936da24ef158ad3aa90219477212679|self . owner . clone ()",
+    "clone-call|c0be39a6aed071fe0c4ffbbca0666801055293adf5587c73fe92ca4e5806a842|stream . dict . clone ()",
+    "clone-call|c0be39a6aed071fe0c4ffbbca0666801055293adf5587c73fe92ca4e5806a842|stream . dict . clone ()",
     "clone-call|d5aac83cca8f9c047463e5287913bcd157708d0b0d91e465841a1fe83af53678|Arc :: clone (& source)",
     "clone-call|dd2998c047431890f19b567e5eca43e779740be3cfe5a83ba74624e5f3ae9e4c|self . path . clone ()",
     "clone-call|dd2998c047431890f19b567e5eca43e779740be3cfe5a83ba74624e5f3ae9e4c|self . path . clone ()",
@@ -145,7 +148,6 @@
     "clone-call|b9d3b86fa426f4c96925eb366328e7f012da40d298c2feffe0005b90e7dc1d7e|html . clone ()",
     "clone-call|b9d3b86fa426f4c96925eb366328e7f012da40d298c2feffe0005b90e7dc1d7e|html . clone ()",
     "clone-call|c08285b199d650a1b5018845452a9b162a62889824e2a0a292186c8457695a4c|s . text . clone ()",
-    "clone-call|c1e91943683139aabd30dc9528f2e71600dcf3b1b519e338fb922c30dcf97f4d|chrome . running_heads . clone ()",
     "clone-call|c2346f0396505a086c0accbd5df2da1876191f315fa19f89fe738efd10578b78|text . clone ()",
     "clone-call|e076b6496dd6f68fc52868dc0d263d5d1f24ad52501dd657296451bfae13b109|l . href . clone ()",
     "clone-call|e105933b33981f5352b23e6a69800e3cd097d89f9ce61a458f5301cfa2ca38ef|uris . iter () . cloned ()",
@@ -313,6 +315,17 @@
     "unsafe-block|a1cc175afe95113822128a7e2f80c4c4b284acc3be8689e09bcf95c2ea6d58d5|unsafe { setMsgSeverity (6) ; let h = TessBaseAPICreate () ; if h . is_null () { return Err (\"TessBaseAPICreate returned",
     "unsafe-block|a1f05cba5ac3ff04316ecdf463f36005d364686244c7fb24b595ab3c4f907458|unsafe { TessBaseAPIDelete (self . 0) }",
     "unsafe-impl|42b7a8c7371218b69032c236c062b3022836811536ffcf125ab11c176165e9e1|unsafe impl Send for TessApi { }"
+  ],
+  "pages.rs": [
+    "clone-call|07719367ba1a6fb411b1bf92e18ea33ff2fd160a32c2b3adf44bd06bbfcc2630|pieces [index] . clone ()",
+    "clone-call|142d6855c491b575a1dfff0a46220adae6db18d579bcdb94c81980f0c7198db8|token . cloned ()",
+    "clone-call|31e386623deec26bbe53416d338a3e6393c04e259cf91f846d3fdca68fb8b5d7|element . spill . clone ()",
+    "clone-call|4b8294d47e225b516dc44c62a8186aab1a35040a4c6709f7cd0e9843e8cfcae4|self . cache [index] . raw . clone ()",
+    "clone-call|4b8294d47e225b516dc44c62a8186aab1a35040a4c6709f7cd0e9843e8cfcae4|self . cache [index] . raw . clone ()",
+    "clone-call|875a138aa96c9cbe60f38ab0a3824e7d422eee15d56ee5d30b8643f56a476168|self . cancel . clone ()",
+    "clone-call|ef37ba5c916232b2607839568c125a2d1a9d5932c5096ac96cdafa68611f1a2c|resolved . clone ()",
+    "clone-call|ef37ba5c916232b2607839568c125a2d1a9d5932c5096ac96cdafa68611f1a2c|resolved . clone ()",
+    "clone-call|f224ee5f34e43e96ae2bdafcfb82c8e2011c70bf7f7e766afdfddccfc843ea78|next . els [opening] . clone ()"
   ],
   "pdfobj.rs": [
     "clone-call|0196e7bdf620d14b5211a06aa677e198b05b8ca295a794bea1cb3e18a1b2cebc|f . clone ()",

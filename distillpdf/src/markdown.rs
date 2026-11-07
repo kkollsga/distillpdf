@@ -37,12 +37,24 @@ pub struct ImageFile {
 /// files to write (empty unless `img_mode == Files`). `toc` keeps/drops the `<nav>`.
 pub fn html_to_markdown(html: &str, toc: bool, img_mode: ImgMode) -> (String, Vec<ImageFile>) {
     let nodes = parse(html);
-    let mut ctx = Ctx { img_mode, toc, fig_n: 0, files: Vec::new() };
+    let mut ctx = Ctx { img_mode, toc, fig_n: 0, files: Vec::new(), page: None };
     let mut out = String::new();
     block(&nodes, &mut out, &mut ctx);
     // Collapse 3+ blank lines to a single blank line; trim trailing whitespace.
     let md = squeeze_blanks(&out);
     (md, ctx.files)
+}
+
+/// One fragment of page `page` as Markdown with no image bytes. `fig_n` is the page's running
+/// figure counter, carried from fragment to fragment. Same renderer as [`html_to_markdown`];
+/// only an unnumbered figure's anchor differs, being scoped to the page.
+pub(crate) fn fragment_to_markdown(html: &str, page: u32, fig_n: &mut usize) -> String {
+    let nodes = parse(html);
+    let mut ctx = Ctx { img_mode: ImgMode::Placeholder, toc: false, fig_n: *fig_n, files: Vec::new(), page: Some(page) };
+    let mut out = String::new();
+    block(&nodes, &mut out, &mut ctx);
+    *fig_n = ctx.fig_n;
+    squeeze_blanks(&out).trim_end().to_string()
 }
 
 // ---------------------------------------------------------------------------- parsing
@@ -246,6 +258,18 @@ struct Ctx {
     toc: bool,
     fig_n: usize,
     files: Vec<ImageFile>,
+    /// The page an unnumbered figure's anchor is scoped to, when this is one page of a document:
+    /// a page's Markdown must not depend on how many figures came before it.
+    page: Option<u32>,
+}
+
+impl Ctx {
+    fn fallback_anchor(&self) -> String {
+        match self.page {
+            Some(page) => format!("p{page}-fig-{}", self.fig_n),
+            None => format!("fig-{}", self.fig_n),
+        }
+    }
 }
 
 fn attr<'a>(attrs: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -313,7 +337,7 @@ fn render_elem(tag: &str, attrs: &[(String, String)], children: &[Node], svg: Op
         "image" => {
             // Placeholder graphic outside a figure.
             ctx.fig_n += 1;
-            push_block(out, &format!("![](#fig-{})", ctx.fig_n));
+            push_block(out, &format!("![](#{})", ctx.fallback_anchor()));
         }
         "svg" => {
             let g = Graphic::Svg(svg.unwrap_or("").to_string());
@@ -367,7 +391,7 @@ fn inline(nodes: &[Node], ctx: &mut Ctx) -> String {
                 }
                 "image" => {
                     ctx.fig_n += 1;
-                    s.push_str(&format!("![](#fig-{})", ctx.fig_n));
+                    s.push_str(&format!("![](#{})", ctx.fallback_anchor()));
                 }
                 "svg" => {
                     let g = Graphic::Svg(svg.clone().unwrap_or_default());
@@ -632,7 +656,7 @@ fn emit_image(ctx: &mut Ctx, caption: &str, graphic: Graphic, fig_id: Option<&st
     ctx.fig_n += 1;
     let n = ctx.fig_n;
     let alt = caption.trim();
-    let anchor = fig_id.map(|s| s.to_string()).unwrap_or_else(|| format!("fig-{n}"));
+    let anchor = fig_id.map(|s| s.to_string()).unwrap_or_else(|| ctx.fallback_anchor());
 
     // Placeholder mode (or a graphic we can't materialise): caption only.
     if ctx.img_mode == ImgMode::Placeholder || matches!(graphic, Graphic::None | Graphic::Placeholder) {

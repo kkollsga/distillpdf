@@ -31,16 +31,16 @@
 //! - **No dedupe.** A form legitimately drawn three times descends three times. The
 //!   renderers must repaint it (`tests/fixtures_pdf/adversarial/form_repeat.pdf`); only a
 //!   *collector* may keep a visited set, which is why `extract::walk_drawn` composes
-//!   [`form_scope`] + [`form_ops`] itself instead of calling [`descend_form`] — see
+//!   [`form_scope`] + [`form_content`] itself instead of calling [`descend_form`] — see
 //!   [`crate::WalkBudget`].
-//! - **Degrade, never fabricate.** A malformed form (bad subtype, undecodable content, no
-//!   `/Resources` under [`ScopePolicy::OwnOnly`]) yields [`Descend::Skip`]: the walk
-//!   continues with the operators around it. Nothing here panics.
+//! - **Degrade, never fabricate.** A malformed form (bad subtype, no `/Resources` under
+//!   [`ScopePolicy::OwnOnly`]) yields [`Descend::Skip`], and content that stops parsing yields
+//!   the operators before the fault: the walk continues with the operators around it. Nothing
+//!   here panics.
 
 use crate::access::{read_resolved, DictionaryHandle, DocumentAccess, StreamHandle};
 use crate::geom::Mat;
 use crate::pdfobj::{content_bytes, num};
-use lopdf::content::Operation;
 use lopdf::{Dictionary, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -115,13 +115,20 @@ pub(crate) struct FormScope {
 
 /// Everything a walker needs to run a form's content, in one piece.
 pub(crate) struct FormDescent {
-    /// The form's decoded operator list.
-    pub ops: Vec<Operation>,
+    /// The form's decoded content bytes; [`Self::ops`] walks them.
+    pub content: Vec<u8>,
     /// The scope its names resolve in.
     pub scope: FormScope,
     /// Its `/Matrix`, identity when absent or malformed. Compose it with the CTM in force
     /// at the `Do` (`matrix.mul(ctm)`) — this module does not know the caller's state.
     pub matrix: Mat,
+}
+
+impl FormDescent {
+    /// The form's operators, one at a time.
+    pub fn ops(&self) -> crate::opstream::OpReader<'_> {
+        crate::opstream::OpReader::new(&self.content)
+    }
 }
 
 /// A nearest-wins resource overlay that retains only owner-pinned dictionary handles.
@@ -264,13 +271,33 @@ pub(crate) fn xobject_at(
     Some((id, access.stream(id).ok()?))
 }
 
+/// [`xobject_at`] for a walk that only descends forms: an image resolves to nothing, without its
+/// samples ever being read.
+pub(crate) fn form_at(
+    access: &dyn DocumentAccess,
+    scope: &XMap,
+    operands: &[Object],
+) -> Option<(ObjectId, StreamHandle)> {
+    let id = *scope.get(operands.first()?.as_name().ok()?)?;
+    if !dict_has_subtype(&access.stream_dictionary(id)?, b"Form") {
+        return None;
+    }
+    Some((id, access.stream(id).ok()?))
+}
+
+/// The id a `Do`'s operand names in this scope.
+pub(crate) fn xobject_id(scope: &XMap, operands: &[Object]) -> Option<ObjectId> {
+    scope.get(operands.first()?.as_name().ok()?).copied()
+}
+
+/// Whether a stream dictionary has the requested `/Subtype` name.
+pub(crate) fn dict_has_subtype(dict: &Dictionary, expected: &[u8]) -> bool {
+    dict.get(b"Subtype").and_then(|object| object.as_name()).is_ok_and(|name| name == expected)
+}
+
 /// Whether a stream has the requested `/Subtype` name.
 pub(crate) fn has_subtype(stream: &lopdf::Stream, expected: &[u8]) -> bool {
-    stream
-        .dict
-        .get(b"Subtype")
-        .and_then(|object| object.as_name())
-        .is_ok_and(|name| name == expected)
+    dict_has_subtype(&stream.dict, expected)
 }
 
 /// Is this form XObject a **transparency group** (`/Group << /S /Transparency >>`,
@@ -472,13 +499,13 @@ pub(crate) fn form_scope(
     }
 }
 
-/// A form's decoded operator list. `None` when the content stream cannot be parsed.
+/// A form's decoded content bytes, walked through [`crate::opstream::OpReader`].
 ///
 /// Reads the stream through [`crate::pdfobj::content_bytes`], which keeps an **unfiltered**
 /// form's bytes — `decompressed_content()` alone errors on a stream with no `/Filter`, and
 /// two of these walkers used to hand the decoder zero bytes because of it.
-pub(crate) fn form_ops(stream: &lopdf::Stream) -> Option<Vec<Operation>> {
-    lopdf::content::Content::decode(&content_bytes(stream)).ok().map(|c| c.operations)
+pub(crate) fn form_content(stream: &lopdf::Stream) -> Vec<u8> {
+    content_bytes(stream)
 }
 
 /// A form's `/Matrix`, identity when absent or malformed.
@@ -802,8 +829,8 @@ pub(crate) fn descend_form(
         return Descend::Skip;
     };
     let matrix = stream.read(|stream| form_matrix(access, stream)).unwrap_or(Mat::ID);
-    match stream.read(form_ops).flatten() {
-        Some(ops) => Descend::Into(Box::new(FormDescent { ops, scope, matrix })),
+    match stream.read(form_content) {
+        Some(content) => Descend::Into(Box::new(FormDescent { content, scope, matrix })),
         None => Descend::Skip,
     }
 }
@@ -845,8 +872,8 @@ mod tests {
         // The defect two walkers shipped: `decompressed_content()` ERRORS on a stream with
         // no `/Filter`, so `unwrap_or_default()` handed the decoder zero bytes.
         let (doc, id) = doc_with_form(form_dict(Dictionary::new()), b"1 0 0 rg 0 0 10 10 re f");
-        let ops = form_ops(stream_of(&doc, id)).expect("an unfiltered form decodes");
-        assert_eq!(ops.len(), 3, "rg, re, f");
+        let content = form_content(stream_of(&doc, id));
+        assert_eq!(crate::opstream::OpReader::new(&content).count(), 3, "rg, re, f");
     }
 
     #[test]

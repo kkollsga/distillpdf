@@ -53,7 +53,7 @@ enum SourceFailureKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct SourceFailure {
+pub(crate) struct SourceFailure {
     kind: SourceFailureKind,
     detail: Arc<str>,
 }
@@ -223,7 +223,7 @@ impl SourceRecovery {
     }
 
     /// Ask the *uncached* source whether it still is what it was at open.
-    fn validate_unchanged(&self) -> Result<(), SourceFailure> {
+    pub(crate) fn validate_unchanged(&self) -> Result<(), SourceFailure> {
         self.source
             .validate_unchanged()
             .map_err(SourceFailure::from)
@@ -932,6 +932,12 @@ pub(crate) trait DocumentAccess: Send + Sync {
     }
     /// Materialize a page's decoded content with the selected backend's exact fallback policy.
     fn page_content(&self, page: ObjectId) -> Result<PageContent, AccessError>;
+    /// Stream `id`'s dictionary, without its payload where the backend can read it that way. A
+    /// walk asking only "is this an image or a form?" must not pull a 30 MiB raster into memory
+    /// to find out.
+    fn stream_dictionary(&self, id: ObjectId) -> Option<Dictionary> {
+        self.stream(id).ok()?.read(|stream| stream.dict.clone())
+    }
     fn stream(&self, id: ObjectId) -> Result<StreamHandle, AccessError> {
         StreamHandle::new(id, self.object(id)?)
     }
@@ -1286,6 +1292,14 @@ impl IndexedDocumentAdapter {
 }
 
 impl DocumentAccess for IndexedDocumentAdapter {
+    fn stream_dictionary(&self, id: ObjectId) -> Option<Dictionary> {
+        // Object-stream members and reference chains have no descriptor; they take the long way.
+        match self.reader.resolve_stream_descriptor(id) {
+            Ok(descriptor) => Some(descriptor.dictionary().clone()),
+            Err(_) => self.stream(id).ok()?.read(|stream| stream.dict.clone()),
+        }
+    }
+
     fn object(&self, id: ObjectId) -> Result<ObjectHandle, AccessError> {
         self.resolve_terminal(id)
             .map_err(|error| error.at(AccessPhase::Object, None))

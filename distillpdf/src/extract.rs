@@ -182,7 +182,7 @@ fn resource_bfs(
 /// `walker::descend_form`, which is the budgeted composition.
 fn walk_drawn(
     access: &dyn crate::access::DocumentAccess,
-    ops: &[lopdf::content::Operation],
+    ops: &mut dyn Iterator<Item = lopdf::content::Operation>,
     xmap: &crate::walker::XMap,
     depth: u32,
     seen: &mut HashSet<ObjectId>,
@@ -228,8 +228,9 @@ fn walk_drawn(
             ) else {
                 continue;
             };
-            if let Some(ops) = stream.read(crate::walker::form_ops).flatten() {
-                walk_drawn(access, &ops, &scope.xobjects, depth + 1, seen, out, inline);
+            if let Some(content) = stream.read(crate::walker::form_content) {
+                let mut ops = crate::opstream::OpReader::new(&content);
+                walk_drawn(access, &mut ops, &scope.xobjects, depth + 1, seen, out, inline);
             }
         }
     }
@@ -267,10 +268,13 @@ fn drawn_images(
     // page has no/unreadable content). The old `.ok()?` bailed out on Err; an empty
     // vec now decodes to zero operations, which reaches the same empty result.
     let content = access.page_content(page_id).ok()?;
-    let ops = lopdf::content::Content::decode(&content).ok()?;
+    let mut ops = crate::opstream::OpReader::new(&content);
     let mut out = HashSet::new();
     let mut seen = HashSet::new();
-    walk_drawn(access, &ops.operations, &xmap, 0, &mut seen, &mut out, &mut inline);
+    walk_drawn(access, &mut ops, &xmap, 0, &mut seen, &mut out, &mut inline);
+    if ops.failed() {
+        return None;
+    }
     for (id, ap) in crate::walker::appearance_streams(access, page_id) {
         if !seen.insert(id) {
             continue; // shared between annotations, or already reached from the content
@@ -283,8 +287,9 @@ fn drawn_images(
         ) else {
             continue;
         };
-        if let Some(ops) = ap.read(crate::walker::form_ops).flatten() {
-            walk_drawn(access, &ops, &scope.xobjects, 1, &mut seen, &mut out, &mut inline);
+        if let Some(content) = ap.read(crate::walker::form_content) {
+            let mut ops = crate::opstream::OpReader::new(&content);
+            walk_drawn(access, &mut ops, &scope.xobjects, 1, &mut seen, &mut out, &mut inline);
         }
     }
     Some((out, inline))
@@ -1129,6 +1134,7 @@ fn pitch_breaks(ys: &[f32]) -> Vec<usize> {
 /// caller can treat each side completely independently. A page where a wide
 /// element (a spanning figure/table) sits across the centre has no clean gutter,
 /// returns None, and is handled whole.
+#[cfg(test)]
 pub(crate) fn central_gutter(spans: &[Span]) -> Option<f32> {
     central_split(spans).map(|(g, _)| g)
 }

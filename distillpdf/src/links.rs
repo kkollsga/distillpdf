@@ -636,6 +636,43 @@ fn link_from_annotation(
     })
 }
 
+/// One page's Link annotations, for a caller rendering a page at a time. `named` is left empty:
+/// a named destination's target page only fills [`Link::dest_page`], and a link with a name
+/// renders from the name, so this path never walks the document's whole name tree.
+pub(crate) fn page_links(
+    access: &dyn DocumentAccess,
+    page: u32,
+    id: ObjectId,
+    page_no: &HashMap<ObjectId, u32>,
+) -> Vec<Link> {
+    let named = HashMap::new();
+    let mut out = Vec::new();
+    let Ok(page_handle) = access.page(id) else {
+        return out;
+    };
+    let Ok(annotations) = page_handle.entry(access, b"Annots") else {
+        return out;
+    };
+    let count = annotations
+        .read(|annotations| annotations.as_array().ok().map(Vec::len))
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    for index in 0..count {
+        let Ok(annotation) = annotations.array_entry(access, index) else {
+            continue;
+        };
+        let link = annotation
+            .read(|annotation| link_from_annotation(access, page, annotation.as_dict().ok()?, page_no, &named))
+            .ok()
+            .flatten();
+        if let Some(link) = link {
+            out.push(link);
+        }
+    }
+    out
+}
+
 /// Extract every Link annotation across the document.
 pub fn extract_links(access: &dyn DocumentAccess) -> Vec<Link> {
     let pages = access.pages_or_empty();

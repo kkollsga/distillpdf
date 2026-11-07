@@ -15,8 +15,8 @@
 //!   * position alone would eat whatever body line happens to sit at a common y;
 //!   * a margin would swallow title-page front matter and real footnotes wholesale.
 //!
-//! Detection runs once over the whole document's spans (the render pipeline already
-//! materializes them all before any page renders); filtering happens at the **span**
+//! Detection folds the document's pages through [`ChromeScan`], one at a time and keeping only
+//! digests and counts; filtering happens at the **span**
 //! level, before table detection, footnote masking and paragraph assembly — the stages
 //! that were previously absorbing chrome into `<td>`s, `<aside>`s and glued paragraphs.
 
@@ -52,37 +52,52 @@ const MIN_GAP_FACTOR: f32 = 1.8;
 /// Row quantization: spans within the same 2 pt y-band are one row.
 const ROW_QUANT: f32 = 2.0;
 
-#[derive(Default)]
-struct ChromeRow {
+/// Distinct `(row, key, size)` recurrence entries a scan keeps. A real document's chrome bands
+/// hold a few per page, and a hostile one is the only way to reach this. Past it new keys are
+/// not counted, so an unseen row cannot qualify as chrome and its text stays on the page.
+const MAX_SCAN_ENTRIES: usize = 256 * 1024;
+
+/// A stable 64-bit digest of a normalized row key. A plan retains digests rather than header
+/// text, so its size does not grow with how long a document's running heads are. A collision
+/// can only misfile a row an attacker could have repeated anyway.
+fn key_digest(key: &str) -> u64 {
+    key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ChromeRow {
     /// Whole joined keys that recur at this row.
-    whole: HashSet<String>,
+    whole: HashSet<u64>,
     /// Recurring horizontal chunks within an otherwise variable joined key.
-    chunks: HashSet<String>,
+    chunks: HashSet<u64>,
 }
 
 impl ChromeRow {
     fn matches(&self, dspans: &[Span], members: &[usize]) -> bool {
-        self.whole.contains(&row_key(dspans, members))
-            || row_chunks(dspans, members).iter().any(|key| self.chunks.contains(key))
+        self.whole.contains(&key_digest(&row_key(dspans, members)))
+            || row_chunks(dspans, members).iter().any(|key| self.chunks.contains(&key_digest(key)))
     }
 }
 
 /// One detected chrome row: a y-bucket in the top or bottom band plus recurring whole
 /// texts or horizontal members. A span row is dropped only when position and one of those
 /// recurrence keys both match.
-#[derive(Default)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ChromePlan {
-    rows: HashMap<(bool, i32), ChromeRow>,
+    rows: Vec<((bool, i32), ChromeRow)>,
     /// The document-level band depth (pt) detection ran with. Filtering must reuse it:
     /// re-deriving a band from the filtered page's own box would make detection and
     /// filtering disagree on mixed-size documents.
     band: f32,
-    /// The masked header texts (top-band rows), for [`crate::profile::DocProfile`]'s
-    /// `running_heads` and any consumer that wants the strings rather than the geometry.
-    pub(crate) running_heads: HashSet<String>,
 }
 
 impl ChromePlan {
+    /// The row at this band and bucket. Few rows per document, so a scan beats a map.
+    fn row(&self, key: (bool, i32)) -> Option<&ChromeRow> {
+        self.rows.iter().find(|(row, _)| *row == key).map(|(_, row)| row)
+    }
+
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
@@ -103,7 +118,7 @@ impl ChromePlan {
             // ±1 bucket of jitter tolerance: quantization must not split a row whose
             // baseline drifts across a 2 pt boundary between pages.
             let banned = (bucket - 1..=bucket + 1)
-                .any(|q| self.rows.get(&(top, q)).is_some_and(|row| row.matches(dspans, &members)));
+                .any(|q| self.row((top, q)).is_some_and(|row| row.matches(dspans, &members)));
             if banned {
                 for i in members {
                     drop[i] = true;
@@ -112,9 +127,24 @@ impl ChromePlan {
         }
         drop.iter().any(|d| *d).then_some(drop)
     }
+
+    /// Bytes this plan holds, for the page API's stated state size.
+    pub(crate) fn state_bytes(&self) -> usize {
+        self.rows.iter().map(|(_, row)| 64 + (row.whole.len() + row.chunks.len()) * 16).sum()
+    }
 }
 
-/// Detect the document's chrome rows from the materialized per-page spans.
+/// How many times a key was seen at a row, per row size: an instance only counts when its row is
+/// not larger than body text, and the scan meets rows before it knows the body size.
+type KeyCounts = HashMap<(u64, u32), u32>;
+
+#[derive(Default)]
+struct SeenRow {
+    whole: KeyCounts,
+    chunks: KeyCounts,
+}
+
+/// Folds pages into the document's [`ChromePlan`], holding recurrence counts and no text.
 ///
 /// The band edges follow the **display page box** (`/MediaBox` through the page's
 /// `/Rotate`), not the used text extent — a page whose body stops short must not pull
@@ -122,105 +152,137 @@ impl ChromePlan {
 /// modal display height, per-page capped by [`BAND_PAGE_CAP`]), and rows are keyed by
 /// distance from the page edge — both so that chrome authored at a fixed offset from the
 /// paper edge coincides across portrait and landscape pages of one document.
+pub(crate) struct ChromeScan {
+    n_pages: usize,
+    band: f32,
+    /// (band, bucket) → whole/chunk recurrence keys → how many pages each was seen on.
+    seen: HashMap<(bool, i32), SeenRow>,
+    entries: usize,
+}
+
+pub(crate) fn display_box(access: &dyn crate::access::DocumentAccess, pid: ObjectId) -> (PageTurn, (f32, f32, f32, f32)) {
+    let page_box = crate::pdfobj::page_box(access, pid).unwrap_or([
+        0.0,
+        0.0,
+        crate::pdfobj::DEFAULT_PAGE_PTS.0,
+        crate::pdfobj::DEFAULT_PAGE_PTS.1,
+    ]);
+    let turn = PageTurn::new(crate::pdfobj::page_rotation(access, pid), page_box);
+    (turn, turn.rect(page_box[0], page_box[2], page_box[1], page_box[3]))
+}
+
+impl ChromeScan {
+    /// Reads every page's box, so the band depth is known before the first row is counted. Page
+    /// dictionaries only; no content is decoded.
+    pub(crate) fn new(access: &dyn crate::access::DocumentAccess, pages: impl Iterator<Item = ObjectId>) -> Self {
+        // Modal display height → the document band depth. Whole-pt quantization; ties break
+        // to the larger height so the outcome is deterministic across hash orders.
+        let mut heights: HashMap<i32, usize> = HashMap::new();
+        let mut n_pages = 0;
+        for pid in pages {
+            n_pages += 1;
+            let (_, (_, _, y0, y1)) = display_box(access, pid);
+            *heights.entry((y1 - y0).round() as i32).or_default() += 1;
+        }
+        let modal_h = heights
+            .into_iter()
+            .max_by_key(|&(h, n)| (n, h))
+            .map(|(h, _)| h as f32)
+            .unwrap_or(crate::pdfobj::DEFAULT_PAGE_PTS.1);
+        Self { n_pages, band: modal_h.max(1.0) * BAND_FRAC, seen: HashMap::new(), entries: 0 }
+    }
+
+    pub(crate) fn add_page(&mut self, access: &dyn crate::access::DocumentAccess, pid: ObjectId, spans: &[Span]) {
+        if self.n_pages < MIN_PAGES {
+            return;
+        }
+        let (turn, dbox) = display_box(access, pid);
+        let turned: Option<Vec<Span>> =
+            (!turn.is_identity()).then(|| spans.iter().map(|s| crate::html::turn_span(turn, s)).collect());
+        let dspans: &[Span] = turned.as_deref().unwrap_or(spans);
+        for (top, bucket, members) in band_rows(dspans, dbox, self.band) {
+            if !isolated(dspans, top, &members) {
+                continue; // at line spacing from the body / a table: content, not chrome
+            }
+            let row_size = members.iter().map(|&i| dspans[i].size).fold(0.0f32, f32::max);
+            let row = self.seen.entry((top, bucket)).or_default();
+            let room = self.entries < MAX_SCAN_ENTRIES;
+            let bump = |counts: &mut KeyCounts, entries: &mut usize, key: u64| {
+                let slot = (key, row_size.to_bits());
+                if let Some(count) = counts.get_mut(&slot) {
+                    *count += 1;
+                } else if room {
+                    counts.insert(slot, 1);
+                    *entries += 1;
+                }
+            };
+            bump(&mut row.whole, &mut self.entries, key_digest(&row_key(dspans, &members)));
+            // A row repeating a chunk still counts one page for it.
+            let mut chunks: Vec<u64> = row_chunks(dspans, &members).iter().map(|key| key_digest(key)).collect();
+            chunks.sort_unstable();
+            chunks.dedup();
+            for chunk in chunks {
+                bump(&mut row.chunks, &mut self.entries, chunk);
+            }
+        }
+    }
+
+    /// The plan, now that the body size is known. Chrome is set at (or below) body size; a
+    /// bigger-than-body row is heading material — the "Section N: …" / "Appendix A-N" page-top
+    /// titles a document may legitimately repeat, counter and all.
+    pub(crate) fn finish(self, body: f32) -> ChromePlan {
+        let mut plan = ChromePlan { band: self.band, ..ChromePlan::default() };
+        if self.n_pages < MIN_PAGES {
+            return plan;
+        }
+        let tally = |counts: &KeyCounts| {
+            let mut totals: HashMap<u64, u32> = HashMap::new();
+            for (&(key, size), &count) in counts {
+                if f32::from_bits(size) <= body * 1.15 {
+                    *totals.entry(key).or_default() += count;
+                }
+            }
+            totals
+        };
+        for ((top, bucket), seen_row) in self.seen {
+            let whole_counts = tally(&seen_row.whole);
+            let pages = whole_counts.values().map(|&count| count as usize).sum::<usize>();
+            if pages < MIN_PAGES || (pages as f32) < MIN_COVERAGE * self.n_pages as f32 {
+                continue;
+            }
+            if whole_counts.len() as f32 > MAX_DIVERSITY * pages as f32 {
+                continue; // a busy body row, not chrome: different text every page
+            }
+            // Whole keys keep the original precision rule. A recurring horizontal chunk (for
+            // example "Page # of #") also proves a variable compound row whose section-title
+            // prefix appears only once. Chunk recurrence uses the document chrome floor rather
+            // than the two-page whole-key floor so ordinary repeated words cannot qualify it.
+            let whole: HashSet<u64> = whole_counts.into_iter().filter(|&(_, n)| n >= 2).map(|(key, _)| key).collect();
+            let chunks: HashSet<u64> =
+                tally(&seen_row.chunks).into_iter().filter(|&(_, n)| n as usize >= MIN_PAGES).map(|(key, _)| key).collect();
+            if whole.is_empty() && chunks.is_empty() {
+                continue;
+            }
+            plan.rows.push(((top, bucket), ChromeRow { whole, chunks }));
+        }
+        // The plan is persisted and compared, so its order is not left to the hash map's.
+        plan.rows.sort_by_key(|(row, _)| *row);
+        plan
+    }
+}
+
+/// Detect the document's chrome rows from the materialized per-page spans.
+#[cfg(test)]
 pub(crate) fn plan_chrome(
     access: &dyn crate::access::DocumentAccess,
     page_spans: &[(u32, ObjectId, Vec<Span>)],
     body: f32,
 ) -> ChromePlan {
-    let n_pages = page_spans.len();
-    if n_pages < MIN_PAGES {
-        return ChromePlan::default();
+    let mut scan = ChromeScan::new(access, page_spans.iter().map(|(_, pid, _)| *pid));
+    for (_, pid, spans) in page_spans {
+        scan.add_page(access, *pid, spans);
     }
-    let display_box = |pid: ObjectId| {
-        let page_box = crate::pdfobj::page_box(access, pid).unwrap_or([
-            0.0,
-            0.0,
-            crate::pdfobj::DEFAULT_PAGE_PTS.0,
-            crate::pdfobj::DEFAULT_PAGE_PTS.1,
-        ]);
-        let turn = PageTurn::new(crate::pdfobj::page_rotation(access, pid), page_box);
-        (turn, turn.rect(page_box[0], page_box[2], page_box[1], page_box[3]))
-    };
-    // Modal display height → the document band depth. Whole-pt quantization; ties break
-    // to the larger height so the outcome is deterministic across hash orders.
-    let mut heights: HashMap<i32, usize> = HashMap::new();
-    for (_, pid, _) in page_spans {
-        let (_, (_, _, y0, y1)) = display_box(*pid);
-        *heights.entry((y1 - y0).round() as i32).or_default() += 1;
-    }
-    let modal_h = heights
-        .into_iter()
-        .max_by_key(|&(h, n)| (n, h))
-        .map(|(h, _)| h as f32)
-        .unwrap_or(crate::pdfobj::DEFAULT_PAGE_PTS.1);
-    let band = modal_h.max(1.0) * BAND_FRAC;
-    #[derive(Default)]
-    struct SeenRow {
-        whole: HashMap<String, HashSet<u32>>,
-        chunks: HashMap<String, HashSet<u32>>,
-    }
-    // (band, bucket) → whole/chunk recurrence keys → distinct pages seen on.
-    let mut seen: HashMap<(bool, i32), SeenRow> = HashMap::new();
-    for (pno, pid, spans) in page_spans {
-        let (turn, dbox) = display_box(*pid);
-        let turned: Option<Vec<Span>> =
-            (!turn.is_identity()).then(|| spans.iter().map(|s| crate::html::turn_span(turn, s)).collect());
-        let dspans: &[Span] = turned.as_deref().unwrap_or(spans.as_slice());
-        for (top, bucket, members) in band_rows(dspans, dbox, band) {
-            // Chrome is set at (or below) body size; a bigger-than-body row is heading
-            // material — the "Section N: …" / "Appendix A-N" page-top titles a document
-            // may legitimately repeat, counter and all.
-            let row_size = members.iter().map(|&i| dspans[i].size).fold(0.0f32, f32::max);
-            if row_size > body * 1.15 {
-                continue;
-            }
-            if !isolated(dspans, top, &members) {
-                continue; // at line spacing from the body / a table: content, not chrome
-            }
-            let row = seen.entry((top, bucket)).or_default();
-            row.whole.entry(row_key(dspans, &members)).or_default().insert(*pno);
-            for chunk in row_chunks(dspans, &members) {
-                row.chunks.entry(chunk).or_default().insert(*pno);
-            }
-        }
-    }
-    let mut plan = ChromePlan { band, ..ChromePlan::default() };
-    for ((top, bucket), seen_row) in seen {
-        let covered: HashSet<&u32> = seen_row.whole.values().flatten().collect();
-        let pages = covered.len();
-        if pages < MIN_PAGES || (pages as f32) < MIN_COVERAGE * n_pages as f32 {
-            continue;
-        }
-        if seen_row.whole.len() as f32 > MAX_DIVERSITY * pages as f32 {
-            continue; // a busy body row, not chrome: different text every page
-        }
-        // Whole keys keep the original precision rule. A recurring horizontal chunk (for
-        // example "Page # of #") also proves a variable compound row whose section-title
-        // prefix appears only once. Chunk recurrence uses the document chrome floor rather
-        // than the two-page whole-key floor so ordinary repeated words cannot qualify it.
-        let whole: HashSet<String> = seen_row
-            .whole
-            .into_iter()
-            .filter(|(_, pages)| pages.len() >= 2)
-            .map(|(t, _)| t)
-            .collect();
-        let chunks: HashSet<String> = seen_row
-            .chunks
-            .into_iter()
-            .filter(|(_, pages)| pages.len() >= MIN_PAGES)
-            .map(|(t, _)| t)
-            .collect();
-        if whole.is_empty() && chunks.is_empty() {
-            continue;
-        }
-        if top {
-            for value in &whole {
-                plan.running_heads.insert(String::from(value.as_str()));
-            }
-        }
-        plan.rows.insert((top, bucket), ChromeRow { whole, chunks });
-    }
-    plan
+    scan.finish(body)
 }
 
 /// Is this band row the OUTERMOST text row of its page, with a chrome-sized gutter
@@ -233,8 +295,14 @@ fn isolated(dspans: &[Span], top: bool, members: &[usize]) -> bool {
     let (row_min, row_max) = ys.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &y| (lo.min(y), hi.max(y)));
     let row_size = members.iter().map(|&i| dspans[i].size).fold(0.0f32, f32::max);
     let mut nearest_inward: Option<f32> = None;
+    // A mask, not `members.contains`: a page flooding one row with text made this quadratic in
+    // the row's length, and that page was the one thing a cancel could not reach.
+    let mut in_row = vec![false; dspans.len()];
+    for &i in members {
+        in_row[i] = true;
+    }
     for (i, s) in dspans.iter().enumerate() {
-        if members.contains(&i) || s.angle.abs() >= 0.01 || s.text.trim().is_empty() {
+        if in_row[i] || s.angle.abs() >= 0.01 || s.text.trim().is_empty() {
             continue;
         }
         if top {
@@ -266,7 +334,7 @@ fn isolated(dspans: &[Span], top: bool, members: &[usize]) -> bool {
 /// [`ROW_QUANT`], not its absolute y: a header 80 pt below the top edge gets the same
 /// key on a portrait and a landscape page, which is what lets a minority orientation's
 /// instances join the majority's recurrence counts. `band` is the document-level band
-/// depth (see [`plan_chrome`]), capped here at [`BAND_PAGE_CAP`] of this page's height.
+/// depth (see [`ChromeScan`]), capped here at [`BAND_PAGE_CAP`] of this page's height.
 fn band_rows(dspans: &[Span], dbox: (f32, f32, f32, f32), band: f32) -> Vec<(bool, i32, Vec<usize>)> {
     let (_, _, y0, y1) = dbox;
     let band = band.min((y1 - y0).max(1.0) * BAND_PAGE_CAP);
@@ -434,7 +502,7 @@ mod tests {
 
         let row = ChromeRow {
             whole: HashSet::new(),
-            chunks: HashSet::from(["page # of #".into()]),
+            chunks: HashSet::from([key_digest("page # of #")]),
         };
         assert!(row.matches(&spans, &members));
     }

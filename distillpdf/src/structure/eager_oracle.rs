@@ -56,6 +56,8 @@ mod tests {
             Error::Ocr(_) => "Ocr",
             Error::ModelNotUtf8(_) => "ModelNotUtf8",
             Error::ParseModelJson(_) => "ParseModelJson",
+            Error::Cancelled => "Cancelled",
+            Error::StaleStats(_) => "StaleStats",
         }
     }
 

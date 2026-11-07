@@ -37,10 +37,7 @@ pub(crate) fn run_cross_page_passes(pages: &mut [(u32, Vec<PageElement>, Vec<Str
     // where demote preceded the merges).
     demote_running_headings(pages);
     for (_pno, els, _uris) in pages.iter_mut() {
-        merge_adjacent_links(els);
-        merge_fragmented_lists(els);
-        merge_math_fragments(els);
-        merge_adjacent_figures(els);
+        run_page_local_passes(els);
     }
     // In SECTION mode the per-page bodies are concatenated bare (no `<section>` wrapper, no
     // inter-page separator), so a math-fragment paragraph at the end of one page and one at the
@@ -56,10 +53,18 @@ pub(crate) fn run_cross_page_passes(pages: &mut [(u32, Vec<PageElement>, Vec<Str
     }
 }
 
+/// The adjacency passes that never look past their page, in the legacy pipeline's order.
+pub(crate) fn run_page_local_passes(els: &mut Vec<PageElement>) {
+    merge_adjacent_links(els);
+    merge_fragmented_lists(els);
+    merge_math_fragments(els);
+    merge_adjacent_figures(els);
+}
+
 /// Apply the same private proof used by raw/rich projection. The later fragment has already
 /// consumed its exact page-local sources before this pass; removing its element therefore
 /// transfers emission to the anchor without releasing duplicate prose.
-fn group_ruled_table_continuations(pages: &mut [(u32, Vec<PageElement>, Vec<String>)]) {
+pub(crate) fn group_ruled_table_continuations(pages: &mut [(u32, Vec<PageElement>, Vec<String>)]) {
     for current in 1..pages.len() {
         if pages[current - 1].0.checked_add(1) != Some(pages[current].0) {
             continue;
@@ -84,7 +89,10 @@ fn group_ruled_table_continuations(pages: &mut [(u32, Vec<PageElement>, Vec<Stri
         if let Some((anchor_page, anchor_i, next_i, merged)) =
             (matches.len() == 1).then(|| matches.pop().unwrap())
         {
-            pages[anchor_page].1[anchor_i].kind = ElKind::Table(merged);
+            let moved_from = (pages[current].0, pages[current].1[next_i].bbox);
+            let anchor = &mut pages[anchor_page].1[anchor_i];
+            anchor.kind = ElKind::Table(merged);
+            anchor.spill.push(moved_from);
             pages[current].1.remove(next_i);
         }
     }
@@ -146,10 +154,10 @@ fn merge_fragmented_lists_across_pages(pages: &mut [(u32, Vec<PageElement>, Vec<
             // last item, absorb the reopening list's items, and remove the consumed elements
             // (the conts paras + the reopening list) from their pages.
             let (items2, box2) = match &pages[cp].1[ci] {
-                PageElement { kind: ElKind::List { items, .. }, bbox } => (items.clone(), *bbox),
+                PageElement { kind: ElKind::List { items, .. }, bbox, .. } => (items.clone(), *bbox),
                 _ => unreachable!(),
             };
-            if let Some(PageElement { kind: ElKind::List { items, .. }, bbox }) = pages[p].1.last_mut() {
+            if let Some(PageElement { kind: ElKind::List { items, .. }, bbox, .. }) = pages[p].1.last_mut() {
                 if let Some(last) = items.last_mut() {
                     last.push(' ');
                     last.push_str(&conts.join(" "));
@@ -439,7 +447,7 @@ fn merge_fragmented_lists(els: &mut Vec<PageElement>) {
                 }
             }
             match src.get(j) {
-                Some(PageElement { kind: ElKind::List { ordered: o2, items: items2 }, bbox: lbox }) if *o2 == ordered => {
+                Some(PageElement { kind: ElKind::List { ordered: o2, items: items2 }, bbox: lbox, .. }) if *o2 == ordered => {
                     if let Some(last) = items.last_mut() {
                         last.push(' ');
                         last.push_str(&conts.join(" "));
@@ -531,7 +539,7 @@ fn merge_math_fragments(els: &mut Vec<PageElement>) {
         let mut run = vec![first];
         let mut box_acc = e.bbox;
         while matches!(iter.peek(), Some(PageElement { kind: ElKind::Para { text }, .. }) if postprocess::is_math_fragment(text)) {
-            if let Some(PageElement { kind: ElKind::Para { text }, bbox }) = iter.next() {
+            if let Some(PageElement { kind: ElKind::Para { text }, bbox, .. }) = iter.next() {
                 run.push(text);
                 box_acc = bbox_union(box_acc, bbox);
             }

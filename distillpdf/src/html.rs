@@ -14,7 +14,7 @@ use crate::layout::*;
 use crate::links;
 use crate::nav::*;
 use crate::postprocess::*;
-use crate::profile::{DocProfile, HeadingTier};
+use crate::profile::DocProfile;
 use crate::table::TableAnalysis;
 use crate::text::{self, SourceId, SourceSlice, Span};
 use crate::vector;
@@ -22,7 +22,7 @@ use lopdf::ObjectId;
 #[cfg(test)]
 use lopdf::Document;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 /// Canonical per-page lookup from one painted occurrence to its accepted table intervals.
 /// Built once from the final winning table set; prose-span splitting never rescans tables.
@@ -508,16 +508,19 @@ pub(crate) fn bbox_union(a: Option<Bbox>, b: Option<Bbox>) -> Option<Bbox> {
 pub(crate) struct PageElement {
     pub(crate) kind: ElKind,
     pub(crate) bbox: Option<Bbox>,
+    /// Later pages this element's content came from, each with the region it occupied there.
+    /// Filled only by a cross-page merge; [`crate::pages`] reports it.
+    pub(crate) spill: Vec<(u32, Option<Bbox>)>,
 }
 
 impl PageElement {
     /// A page-chrome / unpositioned element (no bbox).
     pub(crate) fn new(kind: ElKind) -> PageElement {
-        PageElement { kind, bbox: None }
+        PageElement { kind, bbox: None, spill: Vec::new() }
     }
     /// A positioned element carrying the page region it was emitted from.
     pub(crate) fn at(kind: ElKind, bbox: Option<Bbox>) -> PageElement {
-        PageElement { kind, bbox }
+        PageElement { kind, bbox, spill: Vec::new() }
     }
 }
 
@@ -1139,139 +1142,6 @@ pub enum Mode {
 }
 
 pub(crate) const FOOTNOTE_MARKERS: &str = "*†‡§¶";
-/// Analyse the whole document's typography once and build a [`DocProfile`]: the body
-/// size/weight/font, the heading size/weight/font tiers ranked to levels, whether sections
-/// are numbered, whether an outline exists, and the column layout. Operates on raw spans
-/// (cheap, single pass) — no `lines_of`.
-fn build_doc_profile(page_spans: &[(u32, ObjectId, Vec<Span>)], body: f32, title_sz: f32, has_outline: bool) -> DocProfile {
-    struct Acc {
-        chars: usize,
-        spans: usize,
-        caption: usize,
-        pages: HashSet<u32>,
-    }
-    let body_i = body.round() as i32;
-    let pages = page_spans.len().max(1);
-    // BTreeMap, not HashMap: three consumers below read this map IN ITERATION ORDER —
-    // `max_by_key` for the body cluster and the title font (both return the LAST maximum),
-    // and the `cands` collect whose later `sort_by` is STABLE, so equal-ranking heading
-    // tiers keep iteration order and `take(4)` picks by it. `HashMap`'s order varies per
-    // map instance (`RandomState`), so any tie made the document's heading tiers — and the
-    // rendered HTML — differ run to run. Ordered by (size, bold, font), ties now resolve to
-    // the largest size / bold / highest font id, deterministically.
-    let mut clusters: BTreeMap<(i32, bool, u32), Acc> = BTreeMap::new();
-    let mut numbered_hits = 0usize;
-    for (pno, _id, spans) in page_spans {
-        for s in spans {
-            if s.angle.abs() >= 0.01 {
-                continue; // ignore rotated labels (matches the body histogram)
-            }
-            let e = clusters.entry((s.size.round() as i32, s.bold, s.font)).or_insert_with(|| Acc {
-                chars: 0,
-                spans: 0,
-                caption: 0,
-                pages: HashSet::new(),
-            });
-            e.chars += s.text.chars().count();
-            e.spans += 1;
-            e.pages.insert(*pno);
-            let lo = s.text.trim_start().to_lowercase();
-            if lo.starts_with("figure") || lo.starts_with("table") || lo.starts_with("fig.") || lo.starts_with("tab.") {
-                e.caption += 1;
-            }
-            // A multi-component number token ("3.2") is a strong numbered-section signal.
-            let t = s.text.trim();
-            if t.len() >= 3 && t.contains('.') && t.bytes().next().is_some_and(|b| b.is_ascii_digit()) && t.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
-                numbered_hits += 1;
-            }
-        }
-    }
-    // Body cluster = most characters.
-    let (body_key, body_chars) = clusters
-        .iter()
-        .max_by_key(|(_, a)| a.chars)
-        .map(|(k, a)| (*k, a.chars.max(1)))
-        .unwrap_or(((body_i, false, 0), 1));
-    let body_font = body_key.2;
-    // The title size, from the CLUSTER histogram — the largest size that carries real
-    // text mass. (Not `title_sz` = max single span: a stray large glyph/symbol inflates
-    // that and would stop the real title from being excluded from the heading tiers,
-    // letting it be merged/mis-promoted.)
-    let title_size = clusters
-        .iter()
-        .filter(|(&(sz, _, _), a)| sz > body_i && a.chars >= 15)
-        .map(|(&(sz, _, _), _)| sz)
-        .max();
-    // Exclude the title (and anything larger) from heading tiers only when it is
-    // distinctly larger than body.
-    let title_excl = title_size.filter(|&ts| (ts as f32) > body * 1.15);
-    // The display/heading font = the font of the title cluster. At an equal heading size
-    // this font outranks others (a section in the title face is a level above a subsection
-    // in a secondary face).
-    let title_font = title_size
-        .and_then(|ts| clusters.iter().filter(|(&(sz, _, _), _)| sz == ts).max_by_key(|(_, a)| a.chars).map(|(&(_, _, f), _)| f))
-        .unwrap_or(body_font);
-    // Heading-candidate clusters: strictly larger than body AND looking like a heading
-    // FACE — a distinct font, or bold, or clearly larger (≥1.18×) — so a stray large body
-    // word or body-size italic/caption text never becomes a heading tier.
-    let mut cands: Vec<(i32, bool, u32, usize)> = clusters
-        .iter()
-        .filter_map(|(&(sz, bold, font), a)| {
-            if (sz, bold, font) == body_key || sz <= body_i {
-                return None;
-            }
-            if font == body_font && !bold && (sz as f32) < body * 1.18 {
-                return None; // a slightly-large body word, not a heading face
-            }
-            if title_excl.is_some_and(|ts| sz >= ts) {
-                return None; // the title (or larger) — handled separately, consumed before emit
-            }
-            // Sparse + not caption-like (the strong guards against a secondary body size,
-            // captions, or running heads becoming a heading tier).
-            if a.chars as f32 >= body_chars as f32 * 0.4 {
-                return None;
-            }
-            if pages >= 4 && a.pages.len() as f32 > pages as f32 * 0.9 {
-                return None; // present on ~every page of a multi-page doc → running head
-            }
-            if a.caption * 2 >= a.spans {
-                return None;
-            }
-            Some((sz, bold, font, a.chars))
-        })
-        .collect();
-    // Rank: size desc, then the title/display font first, then bold first, then density —
-    // so size 10 in the title face (section) outranks size 10 in a secondary face
-    // (subsection). Levels 1=h2, 2=h3, …
-    cands.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then((b.2 == title_font).cmp(&(a.2 == title_font)))
-            .then(b.1.cmp(&a.1))
-            .then(b.3.cmp(&a.3))
-    });
-    let tiers: Vec<HeadingTier> = cands
-        .iter()
-        .take(4)
-        .enumerate()
-        .map(|(i, &(sz, bold, font, _))| HeadingTier { size: sz as f32, bold, font, level: (i as u8 + 1).min(4) })
-        .collect();
-    // Column layout: 2 if at least half the pages carry a central prose gutter.
-    let two_col = page_spans.iter().filter(|(_, _, s)| extract::central_gutter(s).is_some()).count();
-    let columns = if two_col * 2 >= pages { 2 } else { 1 };
-
-    DocProfile {
-        body_size: body_key.0 as f32,
-        body_font,
-        body_bold: body_key.1,
-        title_sz,
-        tiers,
-        numbered: numbered_hits >= 2,
-        has_outline,
-        columns,
-        running_heads: HashSet::new(),
-    }
-}
-
 /// `mode`: see [`Mode`] — `Page` keeps per-page `<section data-page>` wrappers; `Section`
 /// regroups content into nested `<section id="sec-…">` blocks and drops page info.
 ///
@@ -1291,6 +1161,1382 @@ pub fn to_html(
 ) -> String {
     let (body, img_uris, outline) = render_doc(access, mode, inline_images);
     assemble(body, mode, include_toc, &outline, &img_uris, inline_images)
+}
+
+/// The document-wide facts one page's render reads, and nothing else: what the first pass over
+/// the document produces, whichever path ran it ([`render_doc_elements`] over materialized spans,
+/// or [`crate::pages`] page by page keeping only these).
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub(crate) struct DocPlan {
+    pub(crate) body: f32,
+    pub(crate) title_sz: f32,
+    pub(crate) profile: DocProfile,
+    pub(crate) chrome: crate::chrome::ChromePlan,
+    pub(crate) head_plan: HeadingPlan,
+}
+
+/// The per-page slice of the document's annotations, outline and structure tree.
+pub(crate) struct PageFacts<'a> {
+    pub(crate) links: &'a [LinkBox],
+    /// Named-destination anchors landing on this page. `None` in the page-at-a-time path, whose
+    /// Markdown and blocks carry no anchors.
+    pub(crate) dests: Option<&'a [(String, Option<f32>)]>,
+    pub(crate) promote: &'a [(String, u8)],
+    pub(crate) declared: Option<&'a [crate::structtree::DeclaredTable]>,
+    /// Build vector figures' `<svg>` markup. Off when nothing downstream reads it: NASA's report
+    /// is 69.7 MB of HTML because of this markup, and Markdown drops it.
+    pub(crate) emit_svg: bool,
+}
+
+/// The `href` a link annotation carries into the page, or `None` when it has no target here.
+pub(crate) fn link_href(link: &links::Link) -> Option<String> {
+    match (&link.uri, &link.dest_name, link.dest_page) {
+        (Some(u), _, _) => Some(u.clone()),
+        (None, Some(name), _) => Some(format!("#{}", slug(name))),
+        (None, None, Some(p)) => Some(format!("#page-{p}")),
+        _ => None,
+    }
+}
+
+/// One page's element IR, from its spans and the document's [`DocPlan`]. Pure: the result depends
+/// only on the arguments, which is what lets pages render in parallel and in any order.
+#[allow(clippy::too_many_arguments, clippy::ptr_arg)]
+pub(crate) fn render_page_elements(
+    access: &dyn crate::access::DocumentAccess,
+    plan: &DocPlan,
+    facts: &PageFacts<'_>,
+    pidx: usize,
+    pno: &u32,
+    _pid: &ObjectId,
+    spans: &Vec<Span>,
+    inline_images: bool,
+) -> (Vec<PageElement>, Vec<String>) {
+    let (body, title_sz) = (plan.body, plan.title_sz);
+    let (profile, chrome, head_plan) = (&plan.profile, &plan.chrome, &plan.head_plan);
+    let no_links: Vec<LinkBox> = Vec::new();
+    // The page's typed element IR — the single-stream in-memory representation. The walk
+    // below pushes one [`PageElement`] per construct; the page body HTML is then a pure
+    // `emit_page_elements` of this list (byte-identical to the legacy string-building),
+    // and the model build path projects the same list into blocks.
+    let mut els: Vec<PageElement> = Vec::new();
+    // Per-page deferred inline-image data URIs (placeholder mode stores empty strings
+    // to keep the index aligned for `<image N>` numbering). The leading `\0<idx>\0`
+    // sentinel is rewritten to a global index at merge time.
+    let mut img_uris: Vec<String> = Vec::new();
+    // Anchor targets for this page's named destinations, so the semantic links
+    // (#cite.x / #figure.n / #equation.n / #section.x) resolve. Empty <a id> at
+    // the section head land the reader on the correct page + the exact target id.
+    if let Some(ds) = facts.dests {
+        let mut anchors = String::new();
+        for (sl, _y) in ds {
+            anchors.push_str(&format!("<a id=\"{sl}\"></a>"));
+        }
+        anchors.push('\n');
+        els.push(PageElement::new(ElKind::DestAnchors(anchors)));
+    }
+    // The page's `/Rotate`, as the page→display map. EVERYTHING this closure reasons
+    // about geometrically — spans, lines, tables, figure boxes, link rects, the reading
+    // order — is expressed in DISPLAY space from here on, i.e. the way a viewer sees the
+    // page. On an upright page (`is_identity`) that is literally the page space it always
+    // was, unchanged value for value.
+    //
+    // This is the boundary the turn belongs at, and it is not the one `vector.rs` chose
+    // for the figure path. There, the walk and its clustering thresholds stay page-space
+    // and the turn happens at the page→SVG-local emit, because those thresholds are
+    // orientation-sensitive and folding the turn in earlier would change which clusters
+    // become figures. Here the orientation-sensitivity is the POINT: `lines_of` bands by
+    // y and orders by x, so a quarter-turned page's body only groups into lines at all
+    // once it is read in display orientation — and every consumer of a `Line` compares it
+    // against a table/figure/image box, so those must be turned with it or the two
+    // spaces meet. Hence: one turn, applied to every page-space quantity this closure
+    // touches, and the page-space originals kept only for the SVG emitters (which do
+    // their own turn from page space — see `PlacedSvg::rot`).
+    let pbox = crate::pdfobj::page_box(access, *_pid).unwrap_or([0.0, 0.0, crate::pdfobj::DEFAULT_PAGE_PTS.0, crate::pdfobj::DEFAULT_PAGE_PTS.1]);
+    let turn = geom::PageTurn::new(crate::pdfobj::page_rotation(access, *_pid), pbox);
+    // Display-space spans. `turned` owns them only on a turned page; upright, `dspans` IS
+    // `spans`, so no page in any upright document allocates or copies anything here.
+    let turned: Option<Vec<Span>> = (!turn.is_identity()).then(|| spans.iter().map(|s| turn_span(turn, s)).collect());
+    let dspans: &[Span] = turned.as_deref().unwrap_or(spans.as_slice());
+    // Chrome rows (running headers/footers/page numbers) removed before ANY consumer
+    // reads the spans; a chrome-free page keeps its borrows, allocation-free. The SAME
+    // mask filters both space representations — `spans` (page space, what the SVG
+    // emitters are handed) and `dspans` (display space) correspond POSITIONALLY, and
+    // the figure-label pass zips them, so filtering only one would misalign every
+    // pairing after the first dropped span.
+    let chrome_mask = chrome.drop_mask(dspans, turn.rect(pbox[0], pbox[2], pbox[1], pbox[3]));
+    let keep = |src: &[Span], mask: &[bool]| -> Vec<Span> {
+        src.iter().zip(mask).filter(|(_, d)| !**d).map(|(s, _)| clone_span(s)).collect()
+    };
+    let dechromed_p: Option<Vec<Span>> = chrome_mask.as_ref().map(|m| keep(spans, m));
+    let dechromed_d: Option<Vec<Span>> = chrome_mask.as_ref().map(|m| keep(dspans, m));
+    let spans: &[Span] = dechromed_p.as_deref().unwrap_or(spans.as_slice());
+    let dspans: &[Span] = dechromed_d.as_deref().unwrap_or(dspans);
+    // A vector figure's / raster's box in display space. Every layout comparison below
+    // goes through these; `v.x_left`/`im.x_left` stay page-space for the SVG emitters.
+    let dvbox = |v: &vector::PlacedSvg| turn.rect(v.x_left, v.x_right, v.y_bottom, v.y_top);
+    let dibox = |im: &img::Placed| turn.rect(im.x_left, im.x_right, im.y_bottom, im.y_top);
+    let mut images = img::positioned_images(access, *_pid, inline_images);
+    // One vector walk, two answers: the figures, and the page's RULING — L1's second
+    // evidence source for tables (`extract::detect_tables_pos`). The ruling arrives in
+    // page space like every other geometry the walk produces, so it takes the same turn
+    // the spans did, or a rotated page's lattice lands nowhere.
+    let (raw_vectors, weak_vectors, page_rules) = vector::positioned_vectors_ruled(access, *_pid);
+    let page_rules = turn_rules(turn, page_rules);
+    let mut tables = extract::detect_tables_pos(dspans, &page_rules);
+    let image_rects: Vec<(usize, Rect)> = images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| {
+            let (x0, x1, y0, y1) = dibox(image);
+            (index, Rect::new(x0, y0, x1, y1))
+        })
+        .collect();
+    for table in &mut tables {
+        table.extend_image_sidecar(dspans, &image_rects);
+    }
+    // Vector figures that carry a "Figure N" caption — their *internal* text (a diagram's
+    // node labels: "E[CLS] E1 … EN", "Trm Trm … Trm") now lands in the page span stream
+    // (extract_spans recurses into Form XObjects), where detect_tables_pos reads the
+    // regular label grid as a data TABLE. That false table overlaps the figure and the
+    // not_in_table filter below would then drop the diagram, leaving an empty <figure>.
+    // We mark these figure regions so a label grid sitting inside one is dropped as a
+    // false table (below) — letting the diagram render as SVG with its labels intact.
+    // The "Figure N" caption is the discriminator that keeps a real ruled FORM safe: a
+    // form's table cells sit inside a large border vector too, but that vector carries no
+    // figure caption (it's a "Table N"/uncaptioned form region), so its table survives.
+    let captioned_fig_boxes: Vec<(f32, f32, f32, f32)> = {
+        let cap_lines = lines_of(dspans.iter().map(clone_span).collect(), &no_links);
+        raw_vectors
+            .iter()
+            .map(&dvbox)
+            .filter(|&(xl, xr, yb, yt)| {
+                cap_lines.iter().any(|l| {
+                    let cx = (l.x0 + l.x1) * 0.5;
+                    opens_figure_caption(&l.text())
+                        && !caption_is_continued(&l.text())
+                        && (l.y - yb).abs().min((l.y - yt).abs()) < body * 4.0
+                        && cx >= xl - 40.0
+                        && cx <= xr + 40.0
+                })
+            })
+            .collect()
+    };
+    // Drop FALSE tables — a "table" that is really a figure's own structure, not a data
+    // table — BEFORE filtering vectors, so the real plot vector survives the vector
+    // filter below while a genuine ruled form table is preserved:
+    //   (a) a region largely covered by a raster image (a plot's data scatter/heatmap
+    //       reads as a grid), or
+    //   (b) a thin strip mostly inside a MUCH larger COMPOSITE-PLOT vector — a vector
+    //       that itself contains a substantial raster (the plot's data scatter/heatmap),
+    //       so the strip is the plot's axis-number row / legend. Requiring the vector to
+    //       contain a raster is what protects a ruled form (e.g. the IRS W-9): its cell
+    //       borders are a large vector with NO raster, so its real table is never dropped.
+    //   (c) a label grid sitting inside a CAPTIONED vector figure — a diagram's own node
+    //       labels, read as a table now that Form-XObject text reaches the span stream.
+    //       The captioned-figure marker (not a raster) is what tells this from a ruled form.
+    // Left in, such a false table both consumes the figure's labels as cells AND
+    // suppresses the overlapping vector, fragmenting a raster+vector plot (a Vp-depth
+    // crossplot) into a lone raster plus loose axis text.
+    tables.retain(|t| {
+        let tr = t.bbox;
+        let ta = tr.area().max(1.0);
+        let raster_covered = images.iter().any(|im| {
+            let (ixl, ixr, iyb, iyt) = dibox(im);
+            let ir = Rect::new(ixl, iyb, ixr, iyt);
+            let ia = ir.area().max(1.0);
+            ia >= ta * 0.15
+                && tr.overlap_area(ir) >= ia * 0.5
+                && t.table.image_owner(ir).is_none()
+        });
+        let strip_in_plot = raw_vectors.iter().any(|v| {
+            let (vxl, vxr, vyb, vyt) = dvbox(v);
+            let vr = Rect::new(vxl, vyb, vxr, vyt);
+            let va = vr.area().max(1.0);
+            if !(vr.overlap_area(tr) >= ta * 0.6 && ta < va * 0.5) {
+                return false;
+            }
+            // …and the vector is a composite plot: it contains a substantial raster.
+            images.iter().any(|im| {
+                let (ixl, ixr, iyb, iyt) = dibox(im);
+                let ir = Rect::new(ixl, iyb, ixr, iyt);
+                vr.overlap_area(ir) >= ir.area().max(1.0) * 0.5
+            })
+        });
+        // A label grid belonging to a captioned vector figure — a diagram's node labels
+        // / a scatter's point legend — read as a data table now that Form-XObject text
+        // reaches the span stream. It is the figure's own content, so it must NOT block
+        // the figure (the not_in_table filter would otherwise drop the diagram). Two
+        // shapes, both keyed on the figure CARRYING A CAPTION (the discriminator that
+        // keeps a real ruled FORM — no figure caption — safe):
+        //   • the table sits inside the figure's ink box (center within it), or
+        //   • the table is column-aligned with the figure (its x-center within the figure's
+        //     x-span) and vertically OVERLAPS the figure's ink — i.e. label text the
+        //     vector-ink bbox didn't quite cover (a scatter's top-edge legend).
+        // A REAL data table that merely sits near a figure is column-offset or vertically
+        // separated from the ink, so neither shape matches and it survives.
+        let (tcx, tcy) = ((t.bbox.x0 + t.bbox.x1) * 0.5, (t.bbox.y0 + t.bbox.y1) * 0.5);
+        let label_grid_in_fig = captioned_fig_boxes.iter().any(|&(xl, xr, yb, yt)| {
+            let fr = Rect::new(xl, yb, xr, yt);
+            let center_in = fr.contains(tcx, tcy);
+            let v_overlap = yt.min(t.bbox.y1) > yb.max(t.bbox.y0);
+            let x_aligned = tcx >= xl && tcx <= xr;
+            let va = fr.area().max(1.0);
+            // The table blankets the figure horizontally: its x-extent covers most of the
+            // figure's width within the figure's y-band (the figure's labels mis-clustered
+            // into a row wider than the figure, often spanning into the neighbouring column).
+            // Bound the height so a genuine full-column data table that merely crosses the
+            // figure's y-band isn't swallowed.
+            let fw = fr.width().max(1.0);
+            let xcov = fr.overlap_w(tr) / fw;
+            let blankets = xcov >= 0.6 && v_overlap && tr.height() < fr.height() * 1.2;
+            center_in || (x_aligned && v_overlap && ta < va) || blankets
+        });
+        !(raster_covered
+            || strip_in_plot
+            || (label_grid_in_fig && !t.table.has_image_sidecar()))
+    });
+    // ── L0: the tables this page DECLARES ──────────────────────────────────────────
+    // A tagged PDF states its table structure in `/StructTreeRoot`; where a declaration
+    // resolves to content the page actually paints, it is exact evidence and outranks
+    // every heuristic above. It engages only inside its own region: the declared table
+    // replaces whatever inference found there, and the rest of the page is detected
+    // exactly as it was — a page carrying one declared and one undeclared table (IRS
+    // f1040 p1, measured) keeps both. A document with no structure tree reaches an empty
+    // map and nothing below this point runs, which is why L0 cannot move an untagged
+    // document by so much as a byte.
+    //
+    // Placed AFTER the false-table filters above deliberately. Those filters answer "is
+    // this grid of text really a figure's own labels", a question the declaration has
+    // already answered; running them over a declared table would let a heuristic overrule
+    // the file's own statement.
+    if let Some(decl) = facts.declared {
+        let annots: Vec<(ObjectId, Rect)> = crate::walker::annot_rects(access, *_pid)
+            .into_iter()
+            .map(|(id, r)| {
+                let (x0, x1, y0, y1) = turn.rect(r.x0, r.x1, r.y0, r.y1);
+                (id, Rect::new(x0, y0, x1, y1))
+            })
+            .collect();
+        let found = extract::declared_pos_tables(decl, dspans, &annots);
+        // Per-page L0 trace, off unless asked for (`DPDF_L0=1`), same idiom as
+        // `DPDF_PROFILE`: which declarations were accepted and which the trust rule
+        // refused, and why. A refusal that is never visible is a refusal nobody audits.
+        if std::env::var_os("DPDF_L0").is_some() {
+            eprintln!("  L0 page {pno}: declared={} accepted={} refused={:?}", decl.len(), found.tables.len(), found.refused);
+        }
+        if !found.tables.is_empty() {
+            let regions: Vec<Rect> = found.tables.iter().map(|t| t.bbox).collect();
+            // An inferred table that substantially coincides with a declared region is
+            // the same table read worse — the USGS grid inference splits six ways is
+            // declared once — so it goes. "Substantially" is measured against the
+            // SMALLER of the two, which is what makes the rule work in both directions:
+            // inference over-splits a declared table (fragments inside the region) and it
+            // also over-merges one (a declared block plus its neighbours read as a single
+            // wide grid). Either way the declaration owns the structure there. A table
+            // that merely clips a corner of the region is a different table and survives.
+            tables.retain(|t| {
+                let tr = t.bbox;
+                !regions.iter().any(|r| r.overlap_area(tr) >= 0.5 * tr.area().min(r.area()).max(1.0))
+            });
+            tables.extend(found.tables);
+        }
+    }
+    // A raster belongs to a table only when exact ruled geometry gives it one and only
+    // one containing cell. Multi-cell plot rasters continue through figure arbitration;
+    // cell-contained assets are attached to the table and removed from standalone figure
+    // emission. The URI stays deferred behind the same page-local sentinel every other
+    // raster uses, while `asset` is a stable model/API reference.
+    let mut table_image_owned = vec![false; images.len()];
+    for (image_index, image) in images.iter_mut().enumerate() {
+        let (ixl, ixr, iyb, iyt) = dibox(image);
+        let rect = Rect::new(ixl, iyb, ixr, iyt);
+        let owners: Vec<(usize, usize, usize)> = tables
+            .iter()
+            .enumerate()
+            .filter_map(|(table_index, table)| {
+                table
+                    .table
+                    .image_owner(rect)
+                    .map(|(row, col)| (table_index, row, col))
+            })
+            .collect();
+        let [(table_index, row, col)] = owners.as_slice() else {
+            continue;
+        };
+        let asset_key = image.asset_key;
+        let asset_ext = img::asset_extension(&image.uri);
+        let uri_index = img_uris.len();
+        if inline_images {
+            img_uris.push(std::mem::take(&mut image.uri));
+        } else {
+            img_uris.push(String::new());
+        }
+        let source = format!("\u{0}{uri_index}\u{0}");
+        let asset = format!("img/table_p{pno}_{asset_key:016x}.{asset_ext}");
+        let (display_x0, display_x1, display_y0, display_y1) =
+            turn.rect(pbox[0], pbox[2], pbox[1], pbox[3]);
+        let (display_w, display_h) =
+            (display_x1 - display_x0, display_y1 - display_y0);
+        let bbox_norm = (display_w > 0.0 && display_h > 0.0).then_some([
+            (rect.x0 - display_x0) / display_w,
+            1.0 - (rect.y1 - display_y0) / display_h,
+            (rect.x1 - display_x0) / display_w,
+            1.0 - (rect.y0 - display_y0) / display_h,
+        ]);
+        if tables[*table_index].table.attach_image(
+            *row,
+            *col,
+            crate::TableCellImage {
+                asset,
+                source: Some(source),
+                bbox_norm,
+                order: image_index as u32,
+            },
+        ) {
+            table_image_owned[image_index] = true;
+        }
+    }
+    // Complete ruled continuation evidence against the FINAL accepted owner set. Caption
+    // text deliberately remains unclaimed here, so it is an exact boundary barrier shared
+    // by raw, rich and rendered grouping without caption-label interpretation.
+    crate::table::finalize_continuation_proofs(*pno, dspans, &mut tables, turn, true);
+    // Link rectangles are page-space too, and they are hit-tested against the spans in
+    // `lines_of` — so they take the same turn, or a turned page's links land nowhere.
+    let page_links: &[LinkBox] = facts.links;
+    let turned_links: Option<Vec<LinkBox>> = (!turn.is_identity()).then(|| {
+        page_links
+            .iter()
+            .map(|l| {
+                let (x0, x1, y0, y1) = turn.rect(l.rect[0], l.rect[2], l.rect[1], l.rect[3]);
+                LinkBox { rect: [x0, y0, x1, y1], href: l.href.clone() }
+            })
+            .collect()
+    });
+    let plinks: &[LinkBox] = turned_links.as_deref().unwrap_or(page_links);
+    // The final accepted table set owns exact painted source intervals. Remove precisely
+    // that union before prose line assembly: a partial ruled-cell cut keeps its unclaimed
+    // Unicode fragments, while neighbouring prose inside the table bbox/margin survives.
+    // This happens only after declared-table replacement and false-table filtering, so a
+    // rejected/stale candidate can never consume a surface.
+    let table_claims = TableClaimIndex::new(&tables);
+    debug_assert!(
+        tables.iter().all(|table| !table.claim.slices.is_empty()),
+        "every accepted table must carry exact source ownership"
+    );
+    let prose_spans = prose_spans_without_table_claims(dspans, &table_claims);
+    let mut lines = lines_of(prose_spans, plinks);
+    // Drop running page numbers: a line that is just a 1–4 digit number sitting
+    // in the top or bottom margin band of the page (a running footer/header
+    // number). Structural — keyed on position + lone-number shape, not per-doc.
+    if !lines.is_empty() {
+        let ymax = lines.iter().map(|l| l.y).fold(f32::MIN, f32::max);
+        let ymin = lines.iter().map(|l| l.y).fold(f32::MAX, f32::min);
+        let band = (ymax - ymin).max(1.0) * 0.07;
+        lines.retain(|l| {
+            let t = l.text();
+            let t = t.trim();
+            let lone_num = !t.is_empty() && t.len() <= 4 && t.bytes().all(|b| b.is_ascii_digit());
+            !(lone_num && (l.y >= ymax - band || l.y <= ymin + band))
+        });
+    }
+
+    // Fold a heading that wraps onto a second line (same heading tier, adjacent) into
+    // one Line, so a two-line section title — incl. a first line ending ':' — becomes a
+    // single <h2> instead of a heading plus an orphaned body paragraph.
+    merge_heading_continuations(&mut lines, &profile);
+
+    // Document front-matter (first page only): title, authors+organisations,
+    // abstract, keywords. Emitted as a semantic <header>; the lines it consumes are
+    // dropped from the normal page flow so the body intro still renders, and the
+    // title <h1> stays out of the section/TOC machinery (build_* skip <header>).
+    // Front-matter (first page only). A real paper (authors detected) is restructured
+    // into a semantic <header> — title/authors+orgs/abstract/keywords — with those
+    // lines consumed. Anything else keeps the proven title-only heuristic: the topmost
+    // prominent phrase becomes a bare <h1> that flows into the section/TOC machinery.
+    if pidx == 0 && !lines.is_empty() {
+        let (fm, consumed) = detect_front_matter(&lines, body);
+        if is_paper_front_matter(&fm) {
+            let mut hdr = String::new();
+            emit_header_block(&fm, &mut hdr);
+            els.push(PageElement::new(ElKind::Header(hdr)));
+            let mut i = 0usize;
+            lines.retain(|_| {
+                let keep = !consumed.contains(&i);
+                i += 1;
+                keep
+            });
+        } else {
+            emit_document_title(&mut lines, body, &mut els);
+        }
+    }
+
+    // Ordered items by y (top -> bottom). Img/T carry an index so a caption
+    // can be attached opportunistically (see below).
+    enum Item<'a> {
+        L(&'a Line),
+        T(usize),
+        Img(usize),
+        Svg(usize), // vector figure transcoded to inline SVG
+        Cap(usize), // standalone caption (e.g. a vector figure with no raster)
+    }
+    // Vector figures (diagrams/plots drawn as paths). A figure's AREA is the
+    // detected vector-ink cluster; we drop any that overlap a detected table
+    // (tables own their region) so table rules aren't re-emitted as a figure.
+    // A figure overlapping a (remaining, real) table is dropped — a ruled table's
+    // borders read as vector ink and the table owns its region. The false tables that
+    // would wrongly suppress a real plot vector were already removed above, so this
+    // simple any-overlap test no longer fragments raster+vector crossplots.
+    //
+    // …with one proportionality guard. The rule's whole justification is that the ink IS
+    // the table's rules, so it only holds while the table can plausibly ACCOUNT for the
+    // ink. `geology_usgs_fs.pdf` p1 is the counterexample: its cover map draws place
+    // names one glyph at a time, and two of those label grids (5% and 9% of the map's
+    // area) were deleting a 1,574-path map — county boundary, shaded study areas, both
+    // pie charts, every city label. The page still emitted an `<svg>` (the USGS banner),
+    // so no count could see the loss.
+    //
+    // So: a table that covers less than HALF of a figure that carries GRAPHIC INK
+    // (curves or slanted lines — `vector::has_graphic_ink`, which no ruled table, TOC
+    // dot-leader row or filing-chrome card can produce) is a label grid sitting *on* the
+    // figure, not the figure's source. It no longer suppresses it. A real ruled form is
+    // untouched twice over: its vector has no graphic ink, and its table coincides with
+    // that vector rather than covering a corner of it.
+    //
+    // Half, not a quarter: `geology_usgs_volcanic_hazards_california.pdf` p30's Cal OES
+    // county map has a label grid over 38% of it. A quarter was tuned on one document
+    // and a fraction of a large diagram is still not that diagram's ink; the conjunction
+    // with graphic ink is what carries the rule, not the size of the share.
+    let not_in_table = |v: &vector::PlacedSvg| {
+        let (vxl, vxr, vyb, vyt) = dvbox(v);
+        let vr = Rect::new(vxl, vyb, vxr, vyt);
+        let va = vr.area().max(1.0);
+        !tables.iter().any(|t| {
+            if !(vxl < t.bbox.x1 && vxr > t.bbox.x0 && vyb < t.bbox.y1 && vyt > t.bbox.y0) {
+                return false;
+            }
+            let tr = t.bbox;
+            !(v.graphic_ink() && vr.overlap_area(tr) < va * 0.5)
+        })
+    };
+    let mut vectors: Vec<vector::PlacedSvg> = raw_vectors.into_iter().filter(&not_in_table).collect();
+    // Caption-aware recovery: a small vector diagram below the figure filter's strong bar
+    // (a few ellipse curves, a TikZ sketch) is held aside as a WEAK candidate. Promote one
+    // into `vectors` only when a FIGURE CAPTION sits right next to it AND no strong figure
+    // already serves that caption — so a stray mark with no caption is never resurrected,
+    // and a caption with a real graphic isn't given a spurious second figure. Done here,
+    // before fig_boxes/labels/emit are built, so a promoted candidate flows through the
+    // identical machinery as a strong figure.
+    let mut weak: Vec<vector::PlacedSvg> = weak_vectors.into_iter().filter(&not_in_table).collect();
+    if !weak.is_empty() {
+        let gap = body * 6.0; // a caption sits within a few lines of its figure
+        let mut claimed = vec![false; weak.len()];
+        let mut promote: Vec<usize> = Vec::new();
+        for l in &lines {
+            let t = l.text();
+            let is_fig = matches!(caption_label(&t), Some((true, _)));
+            if !is_fig || is_inline_xref(&t) || caption_is_continued(&t) || dotleader_tail(&t) {
+                continue;
+            }
+            let cy = l.y;
+            let edge = |yb: f32, yt: f32| if cy < yb { yb - cy } else if cy > yt { cy - yt } else { 0.0 };
+            let strong_near = images
+                .iter()
+                .map(|im| {
+                    let (_, _, yb, yt) = dibox(im);
+                    edge(yb, yt)
+                })
+                .chain(vectors.iter().map(|v| {
+                    let (_, _, yb, yt) = dvbox(v);
+                    edge(yb, yt)
+                }))
+                .fold(f32::INFINITY, f32::min);
+            if strong_near <= gap {
+                continue; // caption already has a (strong) graphic
+            }
+            let mut best: Option<(usize, f32)> = None;
+            for (j, v) in weak.iter().enumerate() {
+                if claimed[j] {
+                    continue;
+                }
+                let (vxl, vxr, vyb, vyt) = dvbox(v);
+                let e = edge(vyb, vyt);
+                let x_overlap = vxr > l.x0 - body && vxl < l.x1 + body;
+                if e <= gap && x_overlap && best.is_none_or(|(_, be)| e < be) {
+                    best = Some((j, e));
+                }
+            }
+            if let Some((j, _)) = best {
+                claimed[j] = true;
+                promote.push(j);
+            }
+        }
+        promote.sort_unstable();
+        promote.dedup();
+        for &j in promote.iter().rev() {
+            vectors.push(weak.remove(j));
+        }
+    }
+    // Mark lines consumed by a table (within its y-range). A line belongs to a table
+    // only if it overlaps in BOTH axes — the x-overlap is essential on two-column pages
+    // so a table in one column doesn't swallow the other column's prose. Defined after
+    // all table filtering so it sees the final table set.
+    let in_table = |x0: f32, x1: f32, y: f32| {
+        tables.iter().any(|t| {
+            y <= t.bbox.y1 + body && y >= t.bbox.y0 - body && x1 > t.bbox.x0 && x0 < t.bbox.x1
+        })
+    };
+    // Caption recognition must see a label just outside the drawn frame even though the
+    // broader body-sized ownership band consumes ordinary grid residue. A label whose
+    // baseline is actually inside the frame remains table content, never a caption.
+    let inside_table_frame = |x0: f32, x1: f32, y: f32| {
+        tables.iter().any(|t| {
+            y <= t.bbox.y1 && y >= t.bbox.y0 && x1 > t.bbox.x0 && x0 < t.bbox.x1
+        })
+    };
+    // A vector figure's bbox — used to attach its labels and to keep that text
+    // out of the body flow (it belongs to the figure, not the prose).
+    let fig_boxes: Vec<(f32, f32, f32, f32)> = vectors.iter().map(&dvbox).collect();
+    let in_figure = |x: f32, y: f32| fig_boxes.iter().any(|&(xl, xr, yb, yt)| x >= xl - 4.0 && x <= xr + 4.0 && y >= yb - 4.0 && y <= yt + 4.0);
+    // A vector region that is really a FRAMED TEXT BLOCK — a bordered certificate / form
+    // whose frame and rules are vector ink but whose content is a wall of body text — must
+    // not scoop that text into the SVG. Tell it from a real chart/diagram by text density:
+    // a chart carries a handful of short labels, a framed document many lines of multi-word
+    // prose (often in smaller-than-body print). Mark such boxes so all their text stays in
+    // the prose flow regardless of font size (these forms are routinely set below the
+    // document body size, which the body-size prose gate below would otherwise miss).
+    const FRAMED_DOC_MIN_PROSE_LINES: usize = 8;
+    // Precompute, once per line, whether it is a multi-word non-axis "prose line" plus its
+    // center — so the per-box scan below is a cheap point/flag test, not a fresh `l.text()`
+    // build for every (box, line) pair (that nested rebuild dominated render time on a
+    // form-heavy doc with many vector boxes).
+    let line_is_prose: Vec<bool> = lines
+        .iter()
+        .map(|l| l.text().split_whitespace().count() >= 4 && !is_axis_label_text(&l.text()))
+        .collect();
+    let line_centers: Vec<(f32, f32)> = lines.iter().map(|l| ((l.x0 + l.x1) * 0.5, l.y)).collect();
+    let framed_doc_boxes: Vec<(f32, f32, f32, f32)> = fig_boxes
+        .iter()
+        .copied()
+        .filter(|&(xl, xr, yb, yt)| {
+            // A CAPTIONED figure ("Figure N") is a diagram, never a framed certificate —
+            // its many short node labels must NOT make it read as a wall of prose (which
+            // would scoop them into the body and out of the SVG). Only an UNcaptioned
+            // bordered text block qualifies as a framed document.
+            let captioned = captioned_fig_boxes
+                .iter()
+                .any(|&(cxl, cxr, cyb, cyt)| (xl - cxl).abs() < 1.0 && (xr - cxr).abs() < 1.0 && (yb - cyb).abs() < 1.0 && (yt - cyt).abs() < 1.0);
+            !captioned
+                && line_centers
+                    .iter()
+                    .zip(&line_is_prose)
+                    .filter(|&(&(cx, cy), &prose)| prose && cx >= xl && cx <= xr && cy >= yb && cy <= yt)
+                    .count()
+                    >= FRAMED_DOC_MIN_PROSE_LINES
+        })
+        .collect();
+    let in_framed_doc = |x: f32, y: f32| {
+        framed_doc_boxes
+            .iter()
+            .any(|&(xl, xr, yb, yt)| x >= xl - 4.0 && x <= xr + 4.0 && y >= yb - 4.0 && y <= yt + 4.0)
+    };
+    // Axis tick labels and axis titles sit just OUTSIDE the plotted ink (left of the
+    // y-axis, below the x-axis) — beyond `in_figure`'s tight 4pt margin, so without
+    // this they leak into the prose ("84 82 80 78 76", "Pre-training Steps …"). They
+    // are SMALL-FONT (tick/label size, well under body); claim small-font text within
+    // a wider margin of the figure as a figure label too. The font gate keeps body
+    // prose and the body-size "Figure N:" caption (just below the plot) out.
+    let axis_margin = body * 2.2;
+    let near_fig_label = |x: f32, y: f32, size: f32, text: &str| {
+        let near = fig_boxes.iter().any(|&(xl, xr, yb, yt)| {
+            x >= xl - axis_margin && x <= xr + axis_margin && y >= yb - axis_margin && y <= yt + axis_margin
+        });
+        if !near {
+            return false;
+        }
+        // Small-font text just outside the ink is a tick/label (the common case); a
+        // BODY-size run is a label only when it is axis-shaped (a numeric tick row or a
+        // unit-bearing axis title — see `is_axis_label_text`), which excludes the
+        // multi-word "Figure N:" caption and ordinary prose.
+        size < body * 0.82 || is_axis_label_text(text)
+    };
+    // A body-size, multi-word line that merely OVERLAPS a figure's ink box (a
+    // description paragraph the box happens to span — e.g. a location map with a
+    // descriptive blurb beside it) is PROSE, not a figure label: keep it in the body
+    // flow and out of the SVG. Real map/axis labels are short or small-font, so they
+    // are unaffected.
+    let mut prose_rows: Vec<(f32, f32, f32, f32)> = Vec::new();
+    for l in &lines {
+        let cx = (l.x0 + l.x1) * 0.5;
+        let body_prose = l.size >= body * 0.95
+            && l.text().split_whitespace().count() > 5
+            && !is_axis_label_text(&l.text()) // a body-size numeric tick row is a figure label, not prose
+            && detect_header(l, body, Some(profile)).is_none()
+            && in_figure(cx, l.y);
+        // Inside a framed text block, keep ALL multi-word text as prose — including the
+        // small print these forms use, which the body-size gate above would miss.
+        let framed_prose = in_framed_doc(cx, l.y)
+            && l.text().split_whitespace().count() >= 2
+            && !is_axis_label_text(&l.text());
+        if body_prose || framed_prose {
+            prose_rows.push((l.x0, l.x1, l.y - 1.0, l.y + l.size + 1.0));
+        }
+    }
+    // The y-band one line occupies, as the point tests below want it.
+    let band_of = |l: &Line| (l.x0, l.x1, l.y - 1.0, l.y + l.size + 1.0);
+    let in_prose = |x: f32, y: f32| {
+        prose_rows.iter().any(|&(x0, x1, y0, y1)| x >= x0 - 2.0 && x <= x1 + 2.0 && y >= y0 && y <= y1)
+    };
+    // A line OUTSIDE the figure's ink is claimed whole or not at all.
+    //
+    // `near_fig_label` decides span by span, and a span is not a unit of meaning. On
+    // `econ_EM_2606_02234.pdf` p25 the figure is the 58pt band of a booktabs table's header
+    // rules; the margin below it reaches the first two data rows, and of each row it takes
+    // only the numeric spans — every `0.33`, every `0.50` — while "Sim1a CIA-∇D only (α = 1,
+    // γ = 2)" stays in the body, because a scenario name is not axis-shaped. The reader gets
+    // an SVG of Bias/RMSE numbers with no row context, which is worse than either half alone.
+    //
+    // So: find the lines that lie outside every figure's ink and are NOT label lines when
+    // judged AS A WHOLE, and refuse every span on that row. Judging the whole line is the
+    // point — `is_axis_label_text` says yes to "0.33" and no to the row it belongs to.
+    //
+    // The refusal spans the CLAIMING FIGURE'S WIDTH, not just the rejected line's own. A
+    // table row breaks into one line per column group the moment its cells are far enough
+    // apart, so the numeric cells to the right of "Sim1a CIA-∇D only …" are lines of their
+    // own and would each pass the whole-line test. What the figure may not do is take part
+    // of a row it cannot take all of — so one rejected fragment closes the whole row, across
+    // that figure's own x-span and no further (a second column's labels are untouched).
+    //
+    // Spans that belong to no line keep today's behaviour, so this only ever removes a claim
+    // the line-level reading contradicts.
+    let split_rows: Vec<(f32, f32, f32, f32)> = lines
+        .iter()
+        .filter(|l| {
+            let cx = (l.x0 + l.x1) * 0.5;
+            !in_figure(cx, l.y) && !near_fig_label(cx, l.y, l.size, &l.text())
+        })
+        .map(|l| {
+            let (mut x0, mut x1, y0, y1) = band_of(l);
+            for &(xl, xr, yb, yt) in &fig_boxes {
+                let in_margin = l.y >= yb - axis_margin && l.y <= yt + axis_margin;
+                let overlaps = l.x1 > xl - axis_margin && l.x0 < xr + axis_margin;
+                if in_margin && overlaps {
+                    x0 = x0.min(xl);
+                    x1 = x1.max(xr);
+                }
+            }
+            (x0, x1, y0, y1)
+        })
+        .collect();
+    let on_split_row = |x: f32, y: f32| {
+        split_rows.iter().any(|&(x0, x1, y0, y1)| x >= x0 - 2.0 && x <= x1 + 2.0 && y >= y0 && y <= y1)
+    };
+    // The same question asked of a whole LINE, by overlap rather than by centre. The body
+    // side works in lines and the figure side in spans, and a centre test answers the two
+    // differently for a line that straddles the band's edge — the figure refuses its spans
+    // while the body still drops it as a label, and the row is emitted NEITHER place.
+    let line_on_split_row = |l: &Line| {
+        split_rows
+            .iter()
+            .any(|&(x0, x1, y0, y1)| l.x1 >= x0 - 2.0 && l.x0 <= x1 + 2.0 && l.y >= y0 && l.y <= y1)
+    };
+    // A figure caption ("Figure N …", "Table N …") sits just outside the figure ink,
+    // within `near_fig_label`'s margin. Its numeric fragments (the "5.6"/"-" in
+    // "Figure 5.6: …") otherwise read as axis ticks and get scooped INTO the SVG — and
+    // duplicated, since the caption is also emitted normally. Exclude any span on a
+    // caption line from figure-label capture.
+    //
+    // A caption is a PARAGRAPH, not a line. Excluding only the "Figure N …" line left its
+    // continuation lines claimable, and the neighbouring figure ate them — `cs_LG_2606_02576`
+    // p1 rendered "continual tuning streams." (Figure 1's last caption line) across the top of
+    // Figure 2's SVG, and `cs_DS_2606_02492` p34 swept two whole lines of Figure 3's caption
+    // into the figure. So the band runs from the caption line through the lines that continue
+    // it: same type size, the next baseline down, and horizontally inside the caption's own
+    // column. The first line that breaks any of those ends the caption, which is what keeps
+    // the following body paragraph — and a second caption — out of the band.
+    let mut caption_bands: Vec<(f32, f32, f32, f32)> = Vec::new();
+    for l in lines.iter().filter(|l| caption_label(&l.text()).is_some()) {
+        let mut block = vec![band_of(l)];
+        let mut prev = l;
+        // Walk DOWN the caption by nearest baseline rather than by index: `lines` is in
+        // reading order, but a page header or a neighbouring column can sit between two
+        // lines of the same caption, and an index walk would stop at the first of them.
+        loop {
+            let next = lines
+                .iter()
+                .filter(|nxt| {
+                    let drop = prev.y - nxt.y;
+                    (nxt.size - l.size).abs() < 0.6
+                        && drop > 0.5
+                        // Within 1.6 line-heights — a caption's own leading. The gap to
+                        // whatever follows it is larger: `physics_higgs_cms_discovery.pdf`
+                        // p11 sets its caption at a 13.4pt pitch and then leaves 19.3pt
+                        // before the table's header row, and at a looser bound the block
+                        // ran straight on into the table and took its column headings out
+                        // of the figure.
+                        && drop < prev.size * 1.6
+                        // A caption's FIRST line is indented by its marker ("Figure 3 "),
+                        // so the lines that continue it start further LEFT, not further
+                        // right — `cs_DS_2606_02492` p34 hangs its caption by 14pt. Bound
+                        // the overhang rather than forbidding it, and hold the right edge
+                        // to the caption's own column so a wider block below is not taken.
+                        && nxt.x0 >= l.x0 - prev.size * 4.0
+                        && nxt.x1 <= l.x1.max(nxt.x0) + prev.size * 2.0
+                        && caption_label(&nxt.text()).is_none()
+                        && detect_header(nxt, body, Some(profile)).is_none()
+                })
+                .max_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
+            match next {
+                Some(n) => {
+                    block.push(band_of(n));
+                    prev = n;
+                }
+                None => break,
+            }
+        }
+        // Every line of the block gets the block's FULL column width. A caption's last
+        // line often ends mid-column with a display fragment set beside it (a `⋁` and a
+        // `kPunch[u, v]` on `cs_DS_2606_02492` p34 are lines of their own, to the right of
+        // the text they belong to); keyed on the line's own x-extent, those fragments fall
+        // outside the band and get scooped onto the figure alone.
+        let bx0 = block.iter().map(|b| b.0).fold(f32::INFINITY, f32::min);
+        let bx1 = block.iter().map(|b| b.1).fold(f32::NEG_INFINITY, f32::max);
+        caption_bands.extend(block.into_iter().map(|(_, _, y0, y1)| (bx0, bx1, y0, y1)));
+    }
+    let in_caption = |x: f32, y: f32| {
+        caption_bands.iter().any(|&(x0, x1, y0, y1)| x >= x0 - 2.0 && x <= x1 + 2.0 && y >= y0 && y <= y1)
+    };
+    // Render the figures' text as SVG <text>: a figure's labels (axis ticks, DAG
+    // node labels) are the spans that fall within its bbox — whether drawn in the
+    // page content OR inside a Form XObject (`extract_spans` now captures both into
+    // `spans`). They're collected here and removed from the prose flow below (the
+    // in_figure / fig_label filter), so each shows on its figure, not in the body.
+    if !vectors.is_empty() {
+        let mk = |s: text::Span| vector::LabelSpan { x: s.x, y: s.y, size: s.size, width: s.width, text: s.text, bold: s.bold, italic: s.italic, angle: s.angle };
+        // A captioned figure's labels routinely sit just OUTSIDE its (tight) vector-ink
+        // box — node labels above/beside a DAG, a pipeline diagram's stage captions. Claim
+        // them onto the SVG within the same margin axis ticks use, so a label split between
+        // form-internal text (inside the box) and page-direct text (just outside) is
+        // reunited on the figure instead of leaking to a body <aside>.
+        let cap_m = axis_margin;
+        let in_captioned_fig_pt = |x: f32, y: f32| {
+            captioned_fig_boxes
+                .iter()
+                .any(|&(xl, xr, yb, yt)| x >= xl - cap_m && x <= xr + cap_m && y >= yb - cap_m && y <= yt + cap_m)
+        };
+        let mut labels: Vec<vector::LabelSpan> = Vec::new();
+        // Parallel to `labels`: does this span sit inside a table the page emits? A
+        // figure whose text is almost entirely a table's cells is a callout panel
+        // REPRODUCING that table, and must not print the numbers a second time — see
+        // `vector::PlacedSvg::attach`. Display space, like every other box test here.
+        let mut label_in_table: Vec<bool> = Vec::new();
+        let in_table = |x: f32, y: f32| {
+            tables.iter().any(|t| x >= t.bbox.x0 && x <= t.bbox.x1 && y >= t.bbox.y0 && y <= t.bbox.y1)
+        };
+        // Which spans a figure claims is decided in DISPLAY space (`ds`), against the
+        // display-space figure boxes; what is HANDED to the figure is the PAGE-space span
+        // (`s`), because `PlacedSvg` maps page space to its own turned local space itself
+        // (`to_local`) — turning a label here as well would turn it twice.
+        for (s, ds) in spans.iter().zip(dspans) {
+            let (cx, cy) = (ds.x + ds.width * 0.5, ds.y + ds.size * 0.5);
+            // Inside a CAPTIONED figure, all interior text is the diagram's labels — render
+            // it on the SVG even if the in-figure "prose" gate flagged it (that gate guards
+            // an UNcaptioned framed block). This keeps the labels visible (figure_text) while
+            // the body flow drops them as figure content. A caption line is still excluded.
+            let take =
+                (in_figure(cx, cy) || (near_fig_label(cx, cy, s.size, &s.text) && !on_split_row(cx, cy))) && !in_prose(cx, cy);
+            // The same wholeness rule binds the captioned-figure blanket claim: it also
+            // reaches outside the ink, and on `arxiv_nerf.pdf` p18 its margin catches the
+            // page's RUNNING HEADER ("18 B. Mildenhall, P. P. Srinivasan, M. Tancik et
+            // al."), which then renders across the top of the architecture diagram at
+            // figure scale. A claim from outside the ink is a claim on a whole line or on
+            // nothing; `in_figure` — the tight 4pt box — stays unconditional.
+            if (take || (in_captioned_fig_pt(cx, cy) && !on_split_row(cx, cy))) && !in_caption(cx, cy) {
+                labels.push(mk(clone_span(s)));
+                label_in_table.push(in_table(cx, cy));
+            }
+        }
+        vector::attach_labels(&mut vectors, &labels, &label_in_table);
+    }
+
+    // Page x-extent (from text lines), used to give full-width boxes to
+    // images whose horizontal position we don't track.
+    let (mut px0, mut px1) = (f32::INFINITY, f32::NEG_INFINITY);
+    for l in &lines {
+        px0 = px0.min(l.x0);
+        px1 = px1.max(l.x1);
+    }
+    if !px0.is_finite() {
+        (px0, px1) = (0.0, 1.0);
+    }
+
+    // Opportunistic caption linking: each "Figure N"/"Table N" caption line is
+    // anchored to its nearest (by y) figure/table on the page. Captions are
+    // enrichment — a region with no caption is still emitted as a region.
+    // A line beginning "Table N"/"Figure N" is only a CAPTION if it starts a
+    // fresh block — not when it is the wrapped continuation of a prose sentence
+    // that merely *references* the table (e.g. "…are shown in" ⏎ "Table 6. In this
+    // table we report…"). Such a line is adjacent in the same column to a previous
+    // prose line that does not end a sentence; treat it as body text, not a caption.
+    let ends_sentence = |t: &str| {
+        let t = t.trim_end();
+        t.ends_with(['.', '!', '?', ':']) || t.ends_with(".\"") || t.ends_with(".)") || t.ends_with(".\u{201d}")
+    };
+    // Words that introduce an in-text reference ("…are shown in" ⏎ "Table 6"):
+    // when the previous line ends on one of these, the "Table N" is a reference,
+    // not a caption. Deliberately narrow so real captions (which follow a sentence
+    // end or a vertical gap) are never suppressed.
+    let ref_lead = |w: &str| {
+        matches!(
+            w,
+            "in" | "see" | "from" | "of" | "to" | "and" | "via" | "using" | "per" | "cf"
+                | "table" | "tables" | "figure" | "figures" | "fig"
+                | "shown" | "presented" | "listed" | "reported" | "summarized" | "given"
+        )
+    };
+    let is_ref_continuation = |idx: usize| -> bool {
+        if idx == 0 {
+            return false;
+        }
+        let (prev, cur) = (&lines[idx - 1], &lines[idx]);
+        if in_table(prev.x0, prev.x1, prev.y) {
+            return false; // a caption right after a table's last row is legitimate
+        }
+        let dy = prev.y - cur.y; // reading order top->down
+        let adjacent = dy > -cur.size && dy < cur.size * 1.8 && (prev.x0 - cur.x0).abs() < cur.size * 1.5;
+        if !adjacent {
+            return false;
+        }
+        let pt = prev.text();
+        let pt = pt.trim_end();
+        if ends_sentence(pt) {
+            return false;
+        }
+        let last: String = pt.rsplit(char::is_whitespace).next().unwrap_or("").chars().filter(|c| c.is_alphabetic()).flat_map(char::to_lowercase).collect();
+        ref_lead(&last)
+    };
+    // (line idx, is_figure, number, tail-is-bare) — bare meaning the line is just the
+    // label ("Figure 5.13") with nothing alphanumeric after the number.
+    let mut cap_lines: Vec<(usize, bool, String, bool)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, l)| {
+            let t = l.text();
+            caption_parts(&t).and_then(|(f, n, tail)| {
+                // Drop multi-page "Figure N—Continued" markers — re-emitting them would
+                // duplicate the original figure's id and pollute the output with empty
+                // continuation captions.
+                let bare = !tail.chars().any(|c| c.is_alphanumeric());
+                (!inside_table_frame(l.x0, l.x1, l.y)
+                    && !is_ref_continuation(idx)
+                    && !is_inline_xref(&t)
+                    && !caption_is_continued(&t)
+                    && !is_dotleader_toc(&lines, idx))
+                    .then_some((idx, f, n, bare))
+            })
+        })
+        .collect();
+    let mut consumed_caption = std::collections::HashSet::new();
+    // A bare label that SHARES its number with a descriptive caption on the same page
+    // is a cross-reference artifact (Word writes the field as its own hyperlinked
+    // "Figure 5.13" line hovering at the figure's edge), not a second caption. Left in,
+    // it out-anchors the real caption — it hugs the graphic — and exiles the
+    // descriptive one to a duplicate "fig-N-2" empty shell. Suppress it entirely: its
+    // number survives in the caption that wins, and the in-prose cross-reference keeps
+    // the link. A LONE bare caption (no descriptive twin) still anchors as before.
+    let descriptive: std::collections::HashSet<(bool, &str)> = cap_lines
+        .iter()
+        .filter(|(_, _, _, bare)| !bare)
+        .map(|(_, f, n, _)| (*f, n.as_str()))
+        .collect();
+    let suppressed: Vec<usize> = cap_lines
+        .iter()
+        .filter(|(_, f, n, bare)| *bare && descriptive.contains(&(*f, n.as_str())))
+        .map(|(idx, ..)| *idx)
+        .collect();
+    cap_lines.retain(|(idx, ..)| !suppressed.contains(idx));
+    consumed_caption.extend(suppressed);
+    let mut img_cap: Vec<Option<(String, String)>> = vec![None; images.len()]; // (num, html)
+    let mut svg_cap: Vec<Option<(String, String)>> = vec![None; vectors.len()]; // (num, html)
+    let mut tab_cap: Vec<Option<(String, String, bool)>> = vec![None; tables.len()]; // (num, html, below)
+    // Captions with no raster image / detected table (e.g. vector figures) are
+    // still figure/table regions — emit the caption standalone so the number +
+    // description and its anchor id survive.
+    let mut standalone: Vec<(f32, f32, String)> = Vec::new(); // (x0, y, html)
+    // Parallel to `standalone`: the structured projection for each standalone caption —
+    // (id without the `fig-`/`tab-` prefix slug, caption inner html, is_figure).
+    let mut standalone_meta: Vec<(String, String, bool)> = Vec::new();
+    // Each caption is gathered as its full (multi-line) block and anchored to the
+    // nearest figure (image) / table by y; unanchored captions stand alone.
+    for &(idx, is_fig, ref num, _) in &cap_lines {
+        if consumed_caption.contains(&idx) {
+            continue; // already swallowed as a previous caption's continuation
+        }
+        let cy = lines[idx].y;
+        let (html, used) = gather_caption(&lines, idx, body, &profile);
+        let anchored = if is_fig {
+            // Anchor a "Figure N" caption to the nearest unclaimed figure REGION
+            // by y — whether it is a raster <img> OR a vector <svg> (a figure is
+            // a figure regardless of how it's drawn). This merges the caption and
+            // its graphic into one <figure> instead of leaving a caption-less SVG
+            // plus a graphic-less standalone caption.
+            // Distance from the caption to a figure is the gap to its NEAREST edge
+            // (the figure's [y_bottom, y_top] interval), not to its top: a caption
+            // sits just below its figure, so for a tall raster the top edge is far
+            // away while a lower figure's top is deceptively near — measuring to the
+            // top swaps the two captions. Edge distance binds each caption to the
+            // figure it actually abuts (0 when the caption is inside the figure box).
+            let edge = |yb: f32, yt: f32| if cy < yb { yb - cy } else if cy > yt { cy - yt } else { 0.0 };
+            let img_best = images.iter().enumerate()
+                .filter(|(j, _)| !table_image_owned[*j] && img_cap[*j].is_none())
+                .map(|(j, im)| {
+                    let (_, _, yb, yt) = dibox(im);
+                    (j, edge(yb, yt))
+                })
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let svg_best = vectors.iter().enumerate()
+                .filter(|(j, _)| svg_cap[*j].is_none())
+                .map(|(j, v)| {
+                    let (_, _, yb, yt) = dvbox(v);
+                    (j, edge(yb, yt))
+                })
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            match (img_best, svg_best) {
+                (Some((j, di)), Some((k, ds))) => {
+                    if di <= ds {
+                        img_cap[j] = Some((num.clone(), html.clone()));
+                    } else {
+                        svg_cap[k] = Some((num.clone(), html.clone()));
+                    }
+                    true
+                }
+                (Some((j, _)), None) => {
+                    img_cap[j] = Some((num.clone(), html.clone()));
+                    true
+                }
+                (None, Some((k, _))) => {
+                    svg_cap[k] = Some((num.clone(), html.clone()));
+                    true
+                }
+                (None, None) => tables
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, table)| {
+                        tab_cap[*j].is_none() && table.table.has_image_sidecar()
+                    })
+                    .map(|(j, table)| (j, edge(table.bbox.y0, table.bbox.y1)))
+                    .filter(|(_, distance)| *distance <= body * 6.0)
+                    .min_by(|a, b| {
+                        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(j, _)| {
+                        let table = &tables[j];
+                        let below = cy < (table.bbox.y1 + table.bbox.y0) * 0.5;
+                        tab_cap[j] = Some((num.clone(), html.clone(), below));
+                    })
+                    .is_some(),
+            }
+        } else {
+            tables.iter().enumerate()
+                .filter(|(j, _)| tab_cap[*j].is_none())
+                .min_by(|(_, a), (_, b)| (a.bbox.y1 - cy).abs().partial_cmp(&(b.bbox.y1 - cy).abs()).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(j, t)| {
+                    let below = cy < (t.bbox.y1 + t.bbox.y0) * 0.5; // caption sits below the table (y up)
+                    tab_cap[j] = Some((num.clone(), html.clone(), below));
+                })
+                .is_some()
+        };
+        if !anchored {
+            // An unanchored FIGURE caption stays a `<figure>` (the figure exists;
+            // its graphic was dropped — an honest content-loss marker, and it keeps the
+            // caption as a semantic `<figcaption>`). An unanchored TABLE caption is NOT a
+            // figure: emit it as a caption `<div>` (the table itself was not detected
+            // nearby) — same element table captions use, keeping the `tab-N` id so
+            // cross-refs still resolve. Spurious empties (List-of-Figures entries) and
+            // recoverable small vectors are already handled upstream (dot-leader
+            // suppression + caption-aware weak-vector promotion), so what remains here is
+            // a genuine figure whose graphic we could not extract.
+            let nid = num_id(num);
+            let (block, full_id) = if is_fig {
+                (format!("<figure id=\"fig-{nid}\"><figcaption>{html}</figcaption></figure>"), format!("fig-{nid}"))
+            } else {
+                (format!("<div id=\"tab-{nid}\">{html}</div>"), format!("tab-{nid}"))
+            };
+            standalone.push((lines[idx].x0, cy, block));
+            standalone_meta.push((full_id, html.clone(), is_fig));
+        }
+        for u in used {
+            consumed_caption.insert(u);
+        }
+    }
+
+    // Build items with bounding boxes, then order them column-aware via the
+    // shared XY-cut so two-column pages don't interleave left/right blocks.
+    let mut items: Vec<Item> = Vec::new();
+    let mut boxes: Vec<text::BBox> = Vec::new();
+    for (idx, l) in lines.iter().enumerate() {
+        // A line whose text sits inside a vector figure is that figure's label
+        // (now rendered as SVG <text>) — keep it out of the prose flow. But never
+        // swallow a section heading that merely overlaps a figure's bbox.
+        let fig_cx = (l.x0 + l.x1) * 0.5;
+        // An axis tick/title is part of the figure even when it's bold/short enough to
+        // look like a heading (a plot's "Vp (m/s)" title); a merely-contained line is a
+        // figure label only when it isn't a real section heading.
+        // `!on_split_row` here is the OTHER half of the exactly-once invariant. The figure
+        // side refuses a claim on a row it cannot take whole (see `split_rows`); if the body
+        // side kept dropping that row as a figure label, the row would be emitted NEITHER
+        // place — which is how `econ_EM_2606_02234.pdf` p25 could lose "0.33 0.34 0.50 0.50"
+        // entirely. Both sides ask the same question, so exactly one of them keeps it.
+        let axis_label = near_fig_label(fig_cx, l.y, l.size, &l.text()) && !line_on_split_row(l);
+        // Text sitting INSIDE a CAPTIONED figure's ink box is that diagram's own label
+        // ("Image Semantics", "Group 2", "Outputs") — a figure carries a caption, so its
+        // interior is figure content, never a section heading. (A real heading sits OUTSIDE
+        // the ink box; this is why we use the tight box with no margin, distinct from the
+        // generic in_figure path below that deliberately spares a heading overlapping a
+        // figure.) Without this, such labels — now visible via Form-XObject text — promote
+        // to spurious <h4>s and drag heading precision down.
+        // A SHORT line sitting INSIDE a CAPTIONED figure's ink box is that diagram's own
+        // label ("Image Semantics", "Group 2", "Outputs", a plot's axis title) — figure
+        // content, never a section heading. A figure carries a caption, so its interior is
+        // figure text; this holds even when the figure's wall of small labels tripped the
+        // in-figure "prose" gate (that gate exists for an UNcaptioned framed certificate,
+        // not a captioned diagram). The ≤6-word bound keeps any genuine wrapped sentence
+        // that overlaps the box out of this branch. Without it these labels — now visible
+        // via Form-XObject text — leak into the body as spurious <h4>s.
+        let label_words = l.text().split_whitespace().count();
+        let in_captioned_fig = label_words <= 6
+            && captioned_fig_boxes
+                .iter()
+                .any(|&(xl, xr, yb, yt)| fig_cx >= xl && fig_cx <= xr && l.y >= yb && l.y <= yt);
+        let fig_label = ((in_figure(fig_cx, l.y) || axis_label)
+            && !in_prose(fig_cx, l.y)
+            && (axis_label || detect_header(l, body, Some(profile)).is_none()))
+            || in_captioned_fig;
+        if !consumed_caption.contains(&idx) && !fig_label {
+            items.push(Item::L(l));
+            boxes.push((l.x0, l.x1.max(l.x0 + 0.1), l.y, l.y + l.size.max(1.0)));
+        }
+    }
+    for (j, t) in tables.iter().enumerate() {
+        items.push(Item::T(j));
+        boxes.push((t.bbox.x0, t.bbox.x1.max(t.bbox.x0 + 0.1), t.bbox.y0, t.bbox.y1));
+    }
+    // Pair an overlapping raster + vector into ONE composite figure (only inline, so
+    // the raster actually renders). The direction depends on which mostly contains the
+    // other — and BOTH are common:
+    //  - vector mostly inside raster (a location map: a base photo with vector lines/
+    //    labels on top) → the raster is the base, the vector overlays it.
+    //  - raster mostly inside vector (a plot whose data points are a raster within the
+    //    axes/legend frame, e.g. a Vp-depth crossplot) → the vector is the base, the
+    //    raster is embedded in its SVG.
+    // Either way the composite is one `<svg>` (raster `<image>` + vector ink + labels),
+    // registered pixel-for-pixel in the figure's own coordinate space.
+    let mut vec_owner: Vec<Option<usize>> = vec![None; vectors.len()]; // vector → base image
+    let mut img_overlays: Vec<Vec<usize>> = vec![Vec::new(); images.len()]; // image → overlay vectors
+    let mut img_owner: Vec<Option<usize>> = vec![None; images.len()]; // image → base vector
+    let mut svg_rasters: Vec<Vec<usize>> = vec![Vec::new(); vectors.len()]; // vector → embedded images
+    if inline_images {
+        for (vi, v) in vectors.iter().enumerate() {
+            let (vxl, vxr, vyb, vyt) = dvbox(v);
+            let vr = Rect::new(vxl, vyb, vxr, vyt);
+            let varea = vr.area().max(1.0);
+            for (ii, im) in images.iter().enumerate() {
+                if table_image_owned[ii]
+                    || vec_owner[vi].is_some()
+                    || img_owner[ii].is_some()
+                {
+                    continue;
+                }
+                let (ixl, ixr, iyb, iyt) = dibox(im);
+                let ir = Rect::new(ixl, iyb, ixr, iyt);
+                let overlap = vr.overlap_area(ir);
+                let imarea = ir.area().max(1.0);
+                if overlap / varea > 0.6 {
+                    vec_owner[vi] = Some(ii); // vector mostly inside image → raster base
+                    img_overlays[ii].push(vi);
+                } else if overlap / imarea > 0.6 {
+                    img_owner[ii] = Some(vi); // image mostly inside vector → vector base
+                    svg_rasters[vi].push(ii);
+                }
+            }
+        }
+    }
+    for (j, im) in images.iter().enumerate() {
+        if table_image_owned[j] {
+            continue;
+        }
+        let (_, _, _, iyt) = dibox(im);
+        items.push(Item::Img(j));
+        boxes.push((px0, px1, iyt - 1.0, iyt + 1.0)); // full-width separator
+    }
+    for (j, v) in vectors.iter().enumerate() {
+        if vec_owner[j].is_some() {
+            continue; // overlaid onto its image, not emitted separately
+        }
+        let (vxl, vxr, vyb, vyt) = dvbox(v);
+        items.push(Item::Svg(j));
+        boxes.push((vxl, vxr.max(vxl + 0.1), vyb, vyt));
+    }
+    for (j, (cx0, cy, _)) in standalone.iter().enumerate() {
+        items.push(Item::Cap(j));
+        boxes.push((*cx0, *cx0 + 0.1, *cy, *cy + body.max(1.0)));
+    }
+    let order = text::xy_cut_order(&boxes, body);
+    // The non-text items (tables/figures/captions) carry their positioned box onto the
+    // emitted [`PageElement`] so the block projection records it; text runs get their box
+    // inside `emit_lines` (unioned over the run's lines). `boxes` is `(x_left, x_right,
+    // y_bottom, y_top)`; the [`Bbox`] form is `[x0, y0, x1, y1]` = `[x_left, y_bottom,
+    // x_right, y_top]`.
+    let item_box = |bi: usize| -> Option<Bbox> {
+        let (xl, xr, yb, yt) = boxes[bi];
+        Some([xl, yb, xr, yt])
+    };
+    let items: Vec<(&Item, Option<Bbox>)> = order.iter().map(|&i| (&items[i], item_box(i))).collect();
+
+    // Emit, grouping consecutive lines into text blocks. `page_promote` lists the
+    // PDF-outline titles whose target page is this one, so body-size section titles
+    // still become headings.
+    let page_promote: &[(String, u8)] = facts.promote;
+    // The accepted tables' rects, for the grid-residue heading guard in `emit_lines`.
+    let table_interiors: Vec<(f32, f32, f32, f32)> =
+        tables.iter().map(|t| (t.bbox.x0, t.bbox.x1, t.bbox.y0 - body, t.bbox.y1 + body)).collect();
+    let prose_ctx = ProseCtx { body, title_sz, promote: page_promote, profile: &profile, plan: &head_plan, table_interiors: &table_interiors };
+    let mut run: Vec<&Line> = Vec::new();
+    let flush = |run: &mut Vec<&Line>, out: &mut Vec<PageElement>| {
+        if !run.is_empty() {
+            emit_lines(run, prose_ctx, out);
+            run.clear();
+        }
+    };
+    for (it, ibox) in &items {
+        let ibox = *ibox;
+        match it {
+            Item::L(l) => run.push(l),
+            Item::T(j) => {
+                flush(&mut run, &mut els);
+                let caption = tab_cap[*j].as_ref().map(|(n, c, b)| (n.clone(), c.clone(), *b));
+                els.push(PageElement::at(ElKind::Table(tables[*j].table.clone().with_caption(caption)), ibox));
+            }
+            Item::Img(j) => {
+                flush(&mut run, &mut els);
+                // This raster is embedded inside a larger vector figure (a plot whose
+                // data points are a raster within the axes) — emitted by that vector's
+                // Item::Svg composite, not here.
+                if img_owner[*j].is_some() {
+                    continue;
+                }
+                // A raster overlaid by EXACTLY ONE vector figure (a location map: a base
+                // photo with vector lines/labels on top), in inline mode, is composited
+                // into ONE `<svg>` with the raster embedded as an `<image>` in the
+                // figure's own coordinate space. Both share that space, so the polygons
+                // register with the raster pixel-for-pixel, and the union viewBox keeps
+                // the marginal axis labels the CSS-overlay path used to clip.
+                if inline_images && img_overlays[*j].len() == 1 {
+                    let idx = img_uris.len();
+                    // A codec placeholder is SVG, not pixels; the figure pastes it in
+                    // rather than referencing it (see `vector::Raster::placeholder`).
+                    let ph = vector::inline_svg_payload(&images[*j].uri);
+                    img_uris.push(std::mem::take(&mut images[*j].uri));
+                    let href = format!("\u{0}{idx}\u{0}");
+                    let im = &images[*j];
+                    let vi = img_overlays[*j][0];
+                    let svg = vectors[vi].composite_svg(&[vector::Raster {
+                        href: &href,
+                        placeholder: ph.as_deref(),
+                        rect: (im.x_left, im.x_right, im.y_bottom, im.y_top),
+                        ctm: im.ctm,
+                        clip: im.clip,
+                        seq: &im.seq,
+                    }]);
+                    // Caption may have attached to the image OR its overlay vector.
+                    let cap = img_cap[*j].as_ref().or(svg_cap[vi].as_ref());
+                    let (html, id, caption) = match cap {
+                        Some((num, cap)) => (
+                            format!("<figure id=\"fig-{}\">{svg}<figcaption>{cap}</figcaption></figure>", num_id(num)),
+                            num.clone(),
+                            Some(cap.clone()),
+                        ),
+                        None => (format!("<figure>{svg}</figure>"), String::new(), None),
+                    };
+                    els.push(PageElement::at(ElKind::Figure { html, id, caption, image: None, svg: Some(svg) }, ibox));
+                    continue;
+                }
+                // Both the inline data URI (often megabytes) and the `<image N>`
+                // number are DEFERRED behind a tiny page-local `\0<idx>\0` sentinel:
+                // the string post-processing passes never re-scan the payload, and the
+                // global index/number is resolved once at the very end (after the
+                // sequential merge fixes up page offsets). See substitute_images.
+                let idx = img_uris.len();
+                let graphic = if inline_images {
+                    img_uris.push(std::mem::take(&mut images[*j].uri));
+                    format!("<img src=\"\u{0}{idx}\u{0}\" />")
+                } else {
+                    img_uris.push(String::new()); // keep the index aligned for numbering
+                    format!("<image \u{0}{idx}\u{0}>")
+                };
+                // Vector overlays annotating this image, each positioned over the exact
+                // page region it occupies WITHIN the image (so the polygons line up
+                // with the raster), and clipped to the vector ink so stray prose the
+                // figure picked up below the map doesn't render.
+                let im = &images[*j];
+                let rect = (im.x_left, im.x_right, im.y_bottom, im.y_top);
+                let overlays: String = img_overlays[*j]
+                    .iter()
+                    .map(|&vi| {
+                        let v = &vectors[vi];
+                        v.overlay_svg(&v.overlay_style(rect))
+                    })
+                    .collect();
+                let rel = if overlays.is_empty() { "" } else { " style=\"position:relative\"" };
+                let svg_field = (!overlays.is_empty()).then(|| overlays.clone());
+                let (html, id, caption) = match &img_cap[*j] {
+                    Some((num, cap)) => (
+                        format!(
+                            "<figure{rel} id=\"fig-{nid}\">{graphic}{overlays}<figcaption>{cap}</figcaption></figure>",
+                            nid = num_id(num)
+                        ),
+                        num.clone(),
+                        Some(cap.clone()),
+                    ),
+                    None => (format!("<figure{rel}>{graphic}{overlays}</figure>"), String::new(), None),
+                };
+                // The figure carries a raster placeholder (`<image N>`/`<img>`): mint the
+                // asset id keyed on the figure number so block projection can name it.
+                let image = (!id.is_empty()).then(|| format!("img/fig_{}.png", num_id(&id)));
+                els.push(PageElement::at(ElKind::Figure { html, id, caption, image, svg: svg_field }, ibox));
+            }
+            Item::Svg(j) => {
+                flush(&mut run, &mut els);
+                // A vector frame containing raster image(s) (a plot whose data points
+                // are a raster within the axes): composite into ONE `<svg>` with each
+                // raster embedded as an `<image>` in the figure's coordinate space.
+                let svg = if !svg_rasters[*j].is_empty() {
+                    // Codec placeholders are SVG, not pixels — read before the URIs are
+                    // taken (see `vector::Raster::placeholder`).
+                    let phs: Vec<Option<String>> =
+                        svg_rasters[*j].iter().map(|&ii| vector::inline_svg_payload(&images[ii].uri)).collect();
+                    let hrefs: Vec<String> = svg_rasters[*j]
+                        .iter()
+                        .map(|&ii| {
+                            let idx = img_uris.len();
+                            img_uris.push(std::mem::take(&mut images[ii].uri));
+                            format!("\u{0}{idx}\u{0}")
+                        })
+                        .collect();
+                    let refs: Vec<vector::Raster<'_>> = svg_rasters[*j]
+                        .iter()
+                        .zip(&hrefs)
+                        .zip(&phs)
+                        .map(|((&ii, href), ph)| {
+                            let im = &images[ii];
+                            vector::Raster {
+                                href: href.as_str(),
+                                placeholder: ph.as_deref(),
+                                rect: (im.x_left, im.x_right, im.y_bottom, im.y_top),
+                                ctm: im.ctm,
+                                clip: im.clip,
+                                seq: &im.seq,
+                            }
+                        })
+                        .collect();
+                    vectors[*j].composite_svg(&refs)
+                } else if facts.emit_svg {
+                    vectors[*j].svg()
+                } else {
+                    String::from("<svg></svg>")
+                };
+                // Caption may have attached to the vector OR to one of its embedded
+                // rasters — use whichever has it so the composite keeps its caption.
+                let cap = svg_cap[*j].as_ref().or_else(|| svg_rasters[*j].iter().find_map(|&ii| img_cap[ii].as_ref()));
+                let (html, id, caption) = match cap {
+                    Some((num, cap)) => (
+                        format!("<figure id=\"fig-{nid}\">{svg}<figcaption>{cap}</figcaption></figure>", nid = num_id(num)),
+                        num.clone(),
+                        Some(cap.clone()),
+                    ),
+                    None => (format!("<figure>{svg}</figure>"), String::new(), None),
+                };
+                els.push(PageElement::at(ElKind::Figure { html, id, caption, image: None, svg: Some(svg) }, ibox));
+            }
+            Item::Cap(j) => {
+                flush(&mut run, &mut els);
+                let (.., html) = &standalone[*j];
+                let meta = &standalone_meta[*j];
+                els.push(PageElement::at(ElKind::Caption {
+                    html: html.clone(),
+                    id: meta.0.clone(),
+                    text: meta.1.clone(),
+                    is_figure: meta.2,
+                }, ibox));
+            }
+        }
+    }
+    flush(&mut run, &mut els);
+    // Return the page's typed element IR (NOT yet rendered to HTML) plus its image-URI
+    // list. The cross-page element transforms run on the assembled `Vec<Vec<PageElement>>`
+    // below, then each page is emitted and the bodies merged. Keeping the IR un-rendered
+    // here is what lets the cross-page passes operate on the elements, not on a string.
+    (els, img_uris)
+}
+
+/// One page's heading verdicts as the render would reach them on its prose, without its tables
+/// and figures. This is the first pass's reading of what headings a document has: `on_heading`
+/// gets each heading's level and inner HTML, in the same form [`ElKind::Heading`] carries.
+pub(crate) fn scan_page_headings(
+    access: &dyn crate::access::DocumentAccess,
+    plan: &DocPlan,
+    promote: &[(String, u8)],
+    pidx: usize,
+    pid: ObjectId,
+    spans: &[Span],
+    style_scan: &mut HeadingScan,
+    on_heading: &mut dyn FnMut(u8, &str),
+) {
+    let (body, title_sz) = (plan.body, plan.title_sz);
+    let (turn, dbox) = crate::chrome::display_box(access, pid);
+    let turned: Option<Vec<Span>> = (!turn.is_identity()).then(|| spans.iter().map(|s| turn_span(turn, s)).collect());
+    let dspans: &[Span] = turned.as_deref().unwrap_or(spans);
+    let mask = plan.chrome.drop_mask(dspans, dbox);
+    let kept: Vec<Span> = match &mask {
+        Some(mask) => dspans.iter().zip(mask).filter(|(_, d)| !**d).map(|(s, _)| clone_span(s)).collect(),
+        None => dspans.iter().map(clone_span).collect(),
+    };
+    let mut lines = lines_of(kept, &[]);
+    // The style counts read page-space spans with chrome still in. On an upright page that is
+    // these lines plus the chrome's own, which spares assembling every line twice; a turned page
+    // reads differently in page space, so it gets the real thing.
+    if turned.is_some() {
+        style_scan.add_page(spans, body, &plan.profile);
+    } else {
+        style_scan.add_empty_page();
+        style_scan.add_lines(&lines, body, &plan.profile);
+        if let Some(mask) = &mask {
+            let chrome: Vec<Span> = dspans.iter().zip(mask).filter(|(_, d)| **d).map(|(s, _)| clone_span(s)).collect();
+            style_scan.add_lines(&lines_of(chrome, &[]), body, &plan.profile);
+        }
+    }
+    merge_heading_continuations(&mut lines, &plan.profile);
+    let mut els: Vec<PageElement> = Vec::new();
+    if pidx == 0 && !lines.is_empty() {
+        let (fm, consumed) = detect_front_matter(&lines, body);
+        if is_paper_front_matter(&fm) {
+            let mut i = 0usize;
+            lines.retain(|_| {
+                let keep = !consumed.contains(&i);
+                i += 1;
+                keep
+            });
+        } else {
+            emit_document_title(&mut lines, body, &mut els);
+        }
+    }
+    let refs: Vec<&Line> = lines.iter().collect();
+    let ctx = ProseCtx { body, title_sz, promote, profile: &plan.profile, plan: &plan.head_plan, table_interiors: &[] };
+    emit_lines(&refs, ctx, &mut els);
+    for e in &els {
+        if let ElKind::Heading { level, text, .. } = &e.kind {
+            on_heading(*level, text);
+        }
+    }
 }
 
 /// One page's post-transform element IR: the page number, the typed [`PageElement`] list (after
@@ -1337,26 +2583,6 @@ pub(crate) fn render_doc_elements(
         .collect();
     page_spans.sort_by_key(|(pno, _, _)| *pno);
     phase("01_spans", t);
-    // BTreeMap: `max_by_key` below returns the LAST maximum in iteration order, so with a
-    // `HashMap` two equally-common body sizes picked a different winner run to run — and
-    // the body size drives every heading/paragraph decision downstream. Ascending key order
-    // makes the tie-break "the larger size wins", deterministically.
-    let mut hist: BTreeMap<i32, usize> = BTreeMap::new();
-    for (_, _, spans) in &page_spans {
-        for s in spans {
-            if s.angle.abs() < 0.01 {
-                *hist.entry(s.size.round() as i32).or_insert(0) += 1; // body size ignores rotated labels
-            }
-        }
-    }
-    let body = hist.iter().max_by_key(|(_, c)| **c).map(|(s, _)| *s as f32).unwrap_or(10.0);
-    // The document title is the largest text on the FIRST page; reserve <h1> for it.
-    // (Scoped to page 1 — a large figure label or display equation on a later page
-    // must not inflate the threshold and demote the real title to <h2>.)
-    let title_sz = page_spans
-        .first()
-        .map(|(_, _, s)| s.iter().map(|sp| sp.size).fold(body, f32::max))
-        .unwrap_or(body);
 
     // Hyperlinks, grouped by the page that carries the clickable rectangle. External
     // URIs link out; an internal link prefers its SEMANTIC named destination
@@ -1364,15 +2590,10 @@ pub(crate) fn render_doc_elements(
     // target — and only falls back to "#page-N" when there is no name.
     let mut links_by_page: std::collections::HashMap<u32, Vec<LinkBox>> = std::collections::HashMap::new();
     for lk in links::extract_links(access) {
-        let href = match (&lk.uri, &lk.dest_name, lk.dest_page) {
-            (Some(u), _, _) => u.clone(),
-            (None, Some(name), _) => format!("#{}", slug(name)),
-            (None, None, Some(p)) => format!("#page-{p}"),
-            _ => continue,
-        };
-        links_by_page.entry(lk.page).or_default().push(LinkBox { rect: lk.rect, href });
+        if let Some(href) = link_href(&lk) {
+            links_by_page.entry(lk.page).or_default().push(LinkBox { rect: lk.rect, href });
+        }
     }
-    let no_links: Vec<LinkBox> = Vec::new();
 
     // Named-destination targets, grouped by page: each becomes an anchor id at (or
     // near) its position so the semantic links above actually resolve.
@@ -1395,15 +2616,18 @@ pub(crate) fn render_doc_elements(
         }
     }
 
-    // Document-wide style profile: the body/heading size·weight·font tiers, numbering,
-    // outline presence and column layout — drives heading classification per-document.
-    let mut profile = build_doc_profile(&page_spans, body, title_sz, !outline.is_empty());
-    // Document-wide page chrome (running headers / footers / page numbers): detected once
-    // over the same materialized spans, then filtered out per page at the SPAN level below —
-    // before table detection, the footnote mask and paragraph assembly, the stages that
-    // were previously absorbing chrome into `<td>`s, `<aside>`s and glued paragraphs.
-    let chrome = crate::chrome::plan_chrome(access, &page_spans, body);
-    profile.running_heads = chrome.running_heads.clone();
+    // The document-wide typography profile and page chrome (running headers / footers / page
+    // numbers), folded page by page. Chrome is filtered out per page at the SPAN level below —
+    // before table detection, the footnote mask and paragraph assembly, the stages that were
+    // previously absorbing chrome into `<td>`s, `<aside>`s and glued paragraphs.
+    let mut typography = crate::docscan::TypographyScan::default();
+    let mut chrome_scan = crate::chrome::ChromeScan::new(access, page_spans.iter().map(|(_, pid, _)| *pid));
+    for (pno, pid, spans) in &page_spans {
+        typography.add_page(*pno, spans);
+        chrome_scan.add_page(access, *pid, spans);
+    }
+    let (body, title_sz, profile) = typography.finish(page_spans.len(), !outline.is_empty());
+    let chrome = chrome_scan.finish(body);
     // L0 evidence: the tables the document DECLARES (`/StructTreeRoot`), keyed by page. Read
     // once for the whole document — the tree is document-wide and a table may straddle a page
     // break — and empty for the untagged majority.
@@ -1411,6 +2635,7 @@ pub(crate) fn render_doc_elements(
     // Global heading pre-detection: distrust over-used emphasis/label styles so a filing's
     // line-item flood doesn't read as hundreds of headings (see plan_headings).
     let head_plan = plan_headings(&page_spans, body, &profile);
+    let plan = DocPlan { body, title_sz, profile, chrome, head_plan };
 
     // Render every page IN PARALLEL into its own (html_fragment, image_uris). Each page
     // is independent and reads the document immutably; image data URIs are deferred as
@@ -1421,1271 +2646,22 @@ pub(crate) fn render_doc_elements(
     let renders: Vec<(u32, Vec<PageElement>, Vec<String>)> = page_spans
         .par_iter()
         .enumerate()
-        .map(|(pidx, (pno, _pid, spans))| {
-        let pno = pno;
-        // The page's typed element IR — the single-stream in-memory representation. The walk
-        // below pushes one [`PageElement`] per construct; the page body HTML is then a pure
-        // `emit_page_elements` of this list (byte-identical to the legacy string-building),
-        // and the model build path projects the same list into blocks.
-        let mut els: Vec<PageElement> = Vec::new();
-        // Per-page deferred inline-image data URIs (placeholder mode stores empty strings
-        // to keep the index aligned for `<image N>` numbering). The leading `\0<idx>\0`
-        // sentinel is rewritten to a global index at merge time.
-        let mut img_uris: Vec<String> = Vec::new();
-        // Anchor targets for this page's named destinations, so the semantic links
-        // (#cite.x / #figure.n / #equation.n / #section.x) resolve. Empty <a id> at
-        // the section head land the reader on the correct page + the exact target id.
-        if let Some(ds) = dests_by_page.get(pno) {
-            let mut anchors = String::new();
-            for (sl, _y) in ds {
-                anchors.push_str(&format!("<a id=\"{sl}\"></a>"));
-            }
-            anchors.push('\n');
-            els.push(PageElement::new(ElKind::DestAnchors(anchors)));
-        }
-        // The page's `/Rotate`, as the page→display map. EVERYTHING this closure reasons
-        // about geometrically — spans, lines, tables, figure boxes, link rects, the reading
-        // order — is expressed in DISPLAY space from here on, i.e. the way a viewer sees the
-        // page. On an upright page (`is_identity`) that is literally the page space it always
-        // was, unchanged value for value.
-        //
-        // This is the boundary the turn belongs at, and it is not the one `vector.rs` chose
-        // for the figure path. There, the walk and its clustering thresholds stay page-space
-        // and the turn happens at the page→SVG-local emit, because those thresholds are
-        // orientation-sensitive and folding the turn in earlier would change which clusters
-        // become figures. Here the orientation-sensitivity is the POINT: `lines_of` bands by
-        // y and orders by x, so a quarter-turned page's body only groups into lines at all
-        // once it is read in display orientation — and every consumer of a `Line` compares it
-        // against a table/figure/image box, so those must be turned with it or the two
-        // spaces meet. Hence: one turn, applied to every page-space quantity this closure
-        // touches, and the page-space originals kept only for the SVG emitters (which do
-        // their own turn from page space — see `PlacedSvg::rot`).
-        let pbox = crate::pdfobj::page_box(access, *_pid).unwrap_or([0.0, 0.0, crate::pdfobj::DEFAULT_PAGE_PTS.0, crate::pdfobj::DEFAULT_PAGE_PTS.1]);
-        let turn = geom::PageTurn::new(crate::pdfobj::page_rotation(access, *_pid), pbox);
-        // Display-space spans. `turned` owns them only on a turned page; upright, `dspans` IS
-        // `spans`, so no page in any upright document allocates or copies anything here.
-        let turned: Option<Vec<Span>> = (!turn.is_identity()).then(|| spans.iter().map(|s| turn_span(turn, s)).collect());
-        let dspans: &[Span] = turned.as_deref().unwrap_or(spans.as_slice());
-        // Chrome rows (running headers/footers/page numbers) removed before ANY consumer
-        // reads the spans; a chrome-free page keeps its borrows, allocation-free. The SAME
-        // mask filters both space representations — `spans` (page space, what the SVG
-        // emitters are handed) and `dspans` (display space) correspond POSITIONALLY, and
-        // the figure-label pass zips them, so filtering only one would misalign every
-        // pairing after the first dropped span.
-        let chrome_mask = chrome.drop_mask(dspans, turn.rect(pbox[0], pbox[2], pbox[1], pbox[3]));
-        let keep = |src: &[Span], mask: &[bool]| -> Vec<Span> {
-            src.iter().zip(mask).filter(|(_, d)| !**d).map(|(s, _)| clone_span(s)).collect()
-        };
-        let dechromed_p: Option<Vec<Span>> = chrome_mask.as_ref().map(|m| keep(spans, m));
-        let dechromed_d: Option<Vec<Span>> = chrome_mask.as_ref().map(|m| keep(dspans, m));
-        let spans: &[Span] = dechromed_p.as_deref().unwrap_or(spans.as_slice());
-        let dspans: &[Span] = dechromed_d.as_deref().unwrap_or(dspans);
-        // A vector figure's / raster's box in display space. Every layout comparison below
-        // goes through these; `v.x_left`/`im.x_left` stay page-space for the SVG emitters.
-        let dvbox = |v: &vector::PlacedSvg| turn.rect(v.x_left, v.x_right, v.y_bottom, v.y_top);
-        let dibox = |im: &img::Placed| turn.rect(im.x_left, im.x_right, im.y_bottom, im.y_top);
-        let mut images = img::positioned_images(access, *_pid, inline_images);
-        // One vector walk, two answers: the figures, and the page's RULING — L1's second
-        // evidence source for tables (`extract::detect_tables_pos`). The ruling arrives in
-        // page space like every other geometry the walk produces, so it takes the same turn
-        // the spans did, or a rotated page's lattice lands nowhere.
-        let (raw_vectors, weak_vectors, page_rules) = vector::positioned_vectors_ruled(access, *_pid);
-        let page_rules = turn_rules(turn, page_rules);
-        let mut tables = extract::detect_tables_pos(dspans, &page_rules);
-        let image_rects: Vec<(usize, Rect)> = images
-            .iter()
-            .enumerate()
-            .map(|(index, image)| {
-                let (x0, x1, y0, y1) = dibox(image);
-                (index, Rect::new(x0, y0, x1, y1))
-            })
-            .collect();
-        for table in &mut tables {
-            table.extend_image_sidecar(dspans, &image_rects);
-        }
-        // Vector figures that carry a "Figure N" caption — their *internal* text (a diagram's
-        // node labels: "E[CLS] E1 … EN", "Trm Trm … Trm") now lands in the page span stream
-        // (extract_spans recurses into Form XObjects), where detect_tables_pos reads the
-        // regular label grid as a data TABLE. That false table overlaps the figure and the
-        // not_in_table filter below would then drop the diagram, leaving an empty <figure>.
-        // We mark these figure regions so a label grid sitting inside one is dropped as a
-        // false table (below) — letting the diagram render as SVG with its labels intact.
-        // The "Figure N" caption is the discriminator that keeps a real ruled FORM safe: a
-        // form's table cells sit inside a large border vector too, but that vector carries no
-        // figure caption (it's a "Table N"/uncaptioned form region), so its table survives.
-        let captioned_fig_boxes: Vec<(f32, f32, f32, f32)> = {
-            let cap_lines = lines_of(dspans.iter().map(clone_span).collect(), &no_links);
-            raw_vectors
-                .iter()
-                .map(&dvbox)
-                .filter(|&(xl, xr, yb, yt)| {
-                    cap_lines.iter().any(|l| {
-                        let cx = (l.x0 + l.x1) * 0.5;
-                        opens_figure_caption(&l.text())
-                            && !caption_is_continued(&l.text())
-                            && (l.y - yb).abs().min((l.y - yt).abs()) < body * 4.0
-                            && cx >= xl - 40.0
-                            && cx <= xr + 40.0
-                    })
-                })
-                .collect()
-        };
-        // Drop FALSE tables — a "table" that is really a figure's own structure, not a data
-        // table — BEFORE filtering vectors, so the real plot vector survives the vector
-        // filter below while a genuine ruled form table is preserved:
-        //   (a) a region largely covered by a raster image (a plot's data scatter/heatmap
-        //       reads as a grid), or
-        //   (b) a thin strip mostly inside a MUCH larger COMPOSITE-PLOT vector — a vector
-        //       that itself contains a substantial raster (the plot's data scatter/heatmap),
-        //       so the strip is the plot's axis-number row / legend. Requiring the vector to
-        //       contain a raster is what protects a ruled form (e.g. the IRS W-9): its cell
-        //       borders are a large vector with NO raster, so its real table is never dropped.
-        //   (c) a label grid sitting inside a CAPTIONED vector figure — a diagram's own node
-        //       labels, read as a table now that Form-XObject text reaches the span stream.
-        //       The captioned-figure marker (not a raster) is what tells this from a ruled form.
-        // Left in, such a false table both consumes the figure's labels as cells AND
-        // suppresses the overlapping vector, fragmenting a raster+vector plot (a Vp-depth
-        // crossplot) into a lone raster plus loose axis text.
-        tables.retain(|t| {
-            let tr = t.bbox;
-            let ta = tr.area().max(1.0);
-            let raster_covered = images.iter().any(|im| {
-                let (ixl, ixr, iyb, iyt) = dibox(im);
-                let ir = Rect::new(ixl, iyb, ixr, iyt);
-                let ia = ir.area().max(1.0);
-                ia >= ta * 0.15
-                    && tr.overlap_area(ir) >= ia * 0.5
-                    && t.table.image_owner(ir).is_none()
-            });
-            let strip_in_plot = raw_vectors.iter().any(|v| {
-                let (vxl, vxr, vyb, vyt) = dvbox(v);
-                let vr = Rect::new(vxl, vyb, vxr, vyt);
-                let va = vr.area().max(1.0);
-                if !(vr.overlap_area(tr) >= ta * 0.6 && ta < va * 0.5) {
-                    return false;
-                }
-                // …and the vector is a composite plot: it contains a substantial raster.
-                images.iter().any(|im| {
-                    let (ixl, ixr, iyb, iyt) = dibox(im);
-                    let ir = Rect::new(ixl, iyb, ixr, iyt);
-                    vr.overlap_area(ir) >= ir.area().max(1.0) * 0.5
-                })
-            });
-            // A label grid belonging to a captioned vector figure — a diagram's node labels
-            // / a scatter's point legend — read as a data table now that Form-XObject text
-            // reaches the span stream. It is the figure's own content, so it must NOT block
-            // the figure (the not_in_table filter would otherwise drop the diagram). Two
-            // shapes, both keyed on the figure CARRYING A CAPTION (the discriminator that
-            // keeps a real ruled FORM — no figure caption — safe):
-            //   • the table sits inside the figure's ink box (center within it), or
-            //   • the table is column-aligned with the figure (its x-center within the figure's
-            //     x-span) and vertically OVERLAPS the figure's ink — i.e. label text the
-            //     vector-ink bbox didn't quite cover (a scatter's top-edge legend).
-            // A REAL data table that merely sits near a figure is column-offset or vertically
-            // separated from the ink, so neither shape matches and it survives.
-            let (tcx, tcy) = ((t.bbox.x0 + t.bbox.x1) * 0.5, (t.bbox.y0 + t.bbox.y1) * 0.5);
-            let label_grid_in_fig = captioned_fig_boxes.iter().any(|&(xl, xr, yb, yt)| {
-                let fr = Rect::new(xl, yb, xr, yt);
-                let center_in = fr.contains(tcx, tcy);
-                let v_overlap = yt.min(t.bbox.y1) > yb.max(t.bbox.y0);
-                let x_aligned = tcx >= xl && tcx <= xr;
-                let va = fr.area().max(1.0);
-                // The table blankets the figure horizontally: its x-extent covers most of the
-                // figure's width within the figure's y-band (the figure's labels mis-clustered
-                // into a row wider than the figure, often spanning into the neighbouring column).
-                // Bound the height so a genuine full-column data table that merely crosses the
-                // figure's y-band isn't swallowed.
-                let fw = fr.width().max(1.0);
-                let xcov = fr.overlap_w(tr) / fw;
-                let blankets = xcov >= 0.6 && v_overlap && tr.height() < fr.height() * 1.2;
-                center_in || (x_aligned && v_overlap && ta < va) || blankets
-            });
-            !(raster_covered
-                || strip_in_plot
-                || (label_grid_in_fig && !t.table.has_image_sidecar()))
-        });
-        // ── L0: the tables this page DECLARES ──────────────────────────────────────────
-        // A tagged PDF states its table structure in `/StructTreeRoot`; where a declaration
-        // resolves to content the page actually paints, it is exact evidence and outranks
-        // every heuristic above. It engages only inside its own region: the declared table
-        // replaces whatever inference found there, and the rest of the page is detected
-        // exactly as it was — a page carrying one declared and one undeclared table (IRS
-        // f1040 p1, measured) keeps both. A document with no structure tree reaches an empty
-        // map and nothing below this point runs, which is why L0 cannot move an untagged
-        // document by so much as a byte.
-        //
-        // Placed AFTER the false-table filters above deliberately. Those filters answer "is
-        // this grid of text really a figure's own labels", a question the declaration has
-        // already answered; running them over a declared table would let a heuristic overrule
-        // the file's own statement.
-        if let Some(decl) = declared_tables.get(_pid) {
-            let annots: Vec<(ObjectId, Rect)> = crate::walker::annot_rects(access, *_pid)
-                .into_iter()
-                .map(|(id, r)| {
-                    let (x0, x1, y0, y1) = turn.rect(r.x0, r.x1, r.y0, r.y1);
-                    (id, Rect::new(x0, y0, x1, y1))
-                })
-                .collect();
-            let found = extract::declared_pos_tables(decl, dspans, &annots);
-            // Per-page L0 trace, off unless asked for (`DPDF_L0=1`), same idiom as
-            // `DPDF_PROFILE`: which declarations were accepted and which the trust rule
-            // refused, and why. A refusal that is never visible is a refusal nobody audits.
-            if std::env::var_os("DPDF_L0").is_some() {
-                eprintln!("  L0 page {pno}: declared={} accepted={} refused={:?}", decl.len(), found.tables.len(), found.refused);
-            }
-            if !found.tables.is_empty() {
-                let regions: Vec<Rect> = found.tables.iter().map(|t| t.bbox).collect();
-                // An inferred table that substantially coincides with a declared region is
-                // the same table read worse — the USGS grid inference splits six ways is
-                // declared once — so it goes. "Substantially" is measured against the
-                // SMALLER of the two, which is what makes the rule work in both directions:
-                // inference over-splits a declared table (fragments inside the region) and it
-                // also over-merges one (a declared block plus its neighbours read as a single
-                // wide grid). Either way the declaration owns the structure there. A table
-                // that merely clips a corner of the region is a different table and survives.
-                tables.retain(|t| {
-                    let tr = t.bbox;
-                    !regions.iter().any(|r| r.overlap_area(tr) >= 0.5 * tr.area().min(r.area()).max(1.0))
-                });
-                tables.extend(found.tables);
-            }
-        }
-        // A raster belongs to a table only when exact ruled geometry gives it one and only
-        // one containing cell. Multi-cell plot rasters continue through figure arbitration;
-        // cell-contained assets are attached to the table and removed from standalone figure
-        // emission. The URI stays deferred behind the same page-local sentinel every other
-        // raster uses, while `asset` is a stable model/API reference.
-        let mut table_image_owned = vec![false; images.len()];
-        for (image_index, image) in images.iter_mut().enumerate() {
-            let (ixl, ixr, iyb, iyt) = dibox(image);
-            let rect = Rect::new(ixl, iyb, ixr, iyt);
-            let owners: Vec<(usize, usize, usize)> = tables
-                .iter()
-                .enumerate()
-                .filter_map(|(table_index, table)| {
-                    table
-                        .table
-                        .image_owner(rect)
-                        .map(|(row, col)| (table_index, row, col))
-                })
-                .collect();
-            let [(table_index, row, col)] = owners.as_slice() else {
-                continue;
+        .map(|(pidx, (pno, pid, spans))| {
+            let facts = PageFacts {
+                links: links_by_page.get(pno).map_or(&[], Vec::as_slice),
+                dests: dests_by_page.get(pno).map(Vec::as_slice),
+                promote: promote_by_page.get(pno).map_or(&[], Vec::as_slice),
+                declared: declared_tables.get(pid).map(Vec::as_slice),
+                emit_svg: true,
             };
-            let asset_key = image.asset_key;
-            let asset_ext = img::asset_extension(&image.uri);
-            let uri_index = img_uris.len();
-            if inline_images {
-                img_uris.push(std::mem::take(&mut image.uri));
-            } else {
-                img_uris.push(String::new());
-            }
-            let source = format!("\u{0}{uri_index}\u{0}");
-            let asset = format!("img/table_p{pno}_{asset_key:016x}.{asset_ext}");
-            let (display_x0, display_x1, display_y0, display_y1) =
-                turn.rect(pbox[0], pbox[2], pbox[1], pbox[3]);
-            let (display_w, display_h) =
-                (display_x1 - display_x0, display_y1 - display_y0);
-            let bbox_norm = (display_w > 0.0 && display_h > 0.0).then_some([
-                (rect.x0 - display_x0) / display_w,
-                1.0 - (rect.y1 - display_y0) / display_h,
-                (rect.x1 - display_x0) / display_w,
-                1.0 - (rect.y0 - display_y0) / display_h,
-            ]);
-            if tables[*table_index].table.attach_image(
-                *row,
-                *col,
-                crate::TableCellImage {
-                    asset,
-                    source: Some(source),
-                    bbox_norm,
-                    order: image_index as u32,
-                },
-            ) {
-                table_image_owned[image_index] = true;
-            }
-        }
-        // Complete ruled continuation evidence against the FINAL accepted owner set. Caption
-        // text deliberately remains unclaimed here, so it is an exact boundary barrier shared
-        // by raw, rich and rendered grouping without caption-label interpretation.
-        crate::table::finalize_continuation_proofs(*pno, dspans, &mut tables, turn, true);
-        // Link rectangles are page-space too, and they are hit-tested against the spans in
-        // `lines_of` — so they take the same turn, or a turned page's links land nowhere.
-        let page_links = links_by_page.get(pno).unwrap_or(&no_links);
-        let turned_links: Option<Vec<LinkBox>> = (!turn.is_identity()).then(|| {
-            page_links
-                .iter()
-                .map(|l| {
-                    let (x0, x1, y0, y1) = turn.rect(l.rect[0], l.rect[2], l.rect[1], l.rect[3]);
-                    LinkBox { rect: [x0, y0, x1, y1], href: l.href.clone() }
-                })
-                .collect()
-        });
-        let plinks: &[LinkBox] = turned_links.as_deref().unwrap_or(page_links.as_slice());
-        // The final accepted table set owns exact painted source intervals. Remove precisely
-        // that union before prose line assembly: a partial ruled-cell cut keeps its unclaimed
-        // Unicode fragments, while neighbouring prose inside the table bbox/margin survives.
-        // This happens only after declared-table replacement and false-table filtering, so a
-        // rejected/stale candidate can never consume a surface.
-        let table_claims = TableClaimIndex::new(&tables);
-        debug_assert!(
-            tables.iter().all(|table| !table.claim.slices.is_empty()),
-            "every accepted table must carry exact source ownership"
-        );
-        let prose_spans = prose_spans_without_table_claims(dspans, &table_claims);
-        let mut lines = lines_of(prose_spans, plinks);
-        // Drop running page numbers: a line that is just a 1–4 digit number sitting
-        // in the top or bottom margin band of the page (a running footer/header
-        // number). Structural — keyed on position + lone-number shape, not per-doc.
-        if !lines.is_empty() {
-            let ymax = lines.iter().map(|l| l.y).fold(f32::MIN, f32::max);
-            let ymin = lines.iter().map(|l| l.y).fold(f32::MAX, f32::min);
-            let band = (ymax - ymin).max(1.0) * 0.07;
-            lines.retain(|l| {
-                let t = l.text();
-                let t = t.trim();
-                let lone_num = !t.is_empty() && t.len() <= 4 && t.bytes().all(|b| b.is_ascii_digit());
-                !(lone_num && (l.y >= ymax - band || l.y <= ymin + band))
-            });
-        }
-
-        // Fold a heading that wraps onto a second line (same heading tier, adjacent) into
-        // one Line, so a two-line section title — incl. a first line ending ':' — becomes a
-        // single <h2> instead of a heading plus an orphaned body paragraph.
-        merge_heading_continuations(&mut lines, &profile);
-
-        // Document front-matter (first page only): title, authors+organisations,
-        // abstract, keywords. Emitted as a semantic <header>; the lines it consumes are
-        // dropped from the normal page flow so the body intro still renders, and the
-        // title <h1> stays out of the section/TOC machinery (build_* skip <header>).
-        // Front-matter (first page only). A real paper (authors detected) is restructured
-        // into a semantic <header> — title/authors+orgs/abstract/keywords — with those
-        // lines consumed. Anything else keeps the proven title-only heuristic: the topmost
-        // prominent phrase becomes a bare <h1> that flows into the section/TOC machinery.
-        if pidx == 0 && !lines.is_empty() {
-            let (fm, consumed) = detect_front_matter(&lines, body);
-            if is_paper_front_matter(&fm) {
-                let mut hdr = String::new();
-                emit_header_block(&fm, &mut hdr);
-                els.push(PageElement::new(ElKind::Header(hdr)));
-                let mut i = 0usize;
-                lines.retain(|_| {
-                    let keep = !consumed.contains(&i);
-                    i += 1;
-                    keep
-                });
-            } else {
-                emit_document_title(&mut lines, body, &mut els);
-            }
-        }
-
-        // Ordered items by y (top -> bottom). Img/T carry an index so a caption
-        // can be attached opportunistically (see below).
-        enum Item<'a> {
-            L(&'a Line),
-            T(usize),
-            Img(usize),
-            Svg(usize), // vector figure transcoded to inline SVG
-            Cap(usize), // standalone caption (e.g. a vector figure with no raster)
-        }
-        // Vector figures (diagrams/plots drawn as paths). A figure's AREA is the
-        // detected vector-ink cluster; we drop any that overlap a detected table
-        // (tables own their region) so table rules aren't re-emitted as a figure.
-        // A figure overlapping a (remaining, real) table is dropped — a ruled table's
-        // borders read as vector ink and the table owns its region. The false tables that
-        // would wrongly suppress a real plot vector were already removed above, so this
-        // simple any-overlap test no longer fragments raster+vector crossplots.
-        //
-        // …with one proportionality guard. The rule's whole justification is that the ink IS
-        // the table's rules, so it only holds while the table can plausibly ACCOUNT for the
-        // ink. `geology_usgs_fs.pdf` p1 is the counterexample: its cover map draws place
-        // names one glyph at a time, and two of those label grids (5% and 9% of the map's
-        // area) were deleting a 1,574-path map — county boundary, shaded study areas, both
-        // pie charts, every city label. The page still emitted an `<svg>` (the USGS banner),
-        // so no count could see the loss.
-        //
-        // So: a table that covers less than HALF of a figure that carries GRAPHIC INK
-        // (curves or slanted lines — `vector::has_graphic_ink`, which no ruled table, TOC
-        // dot-leader row or filing-chrome card can produce) is a label grid sitting *on* the
-        // figure, not the figure's source. It no longer suppresses it. A real ruled form is
-        // untouched twice over: its vector has no graphic ink, and its table coincides with
-        // that vector rather than covering a corner of it.
-        //
-        // Half, not a quarter: `geology_usgs_volcanic_hazards_california.pdf` p30's Cal OES
-        // county map has a label grid over 38% of it. A quarter was tuned on one document
-        // and a fraction of a large diagram is still not that diagram's ink; the conjunction
-        // with graphic ink is what carries the rule, not the size of the share.
-        let not_in_table = |v: &vector::PlacedSvg| {
-            let (vxl, vxr, vyb, vyt) = dvbox(v);
-            let vr = Rect::new(vxl, vyb, vxr, vyt);
-            let va = vr.area().max(1.0);
-            !tables.iter().any(|t| {
-                if !(vxl < t.bbox.x1 && vxr > t.bbox.x0 && vyb < t.bbox.y1 && vyt > t.bbox.y0) {
-                    return false;
-                }
-                let tr = t.bbox;
-                !(v.graphic_ink() && vr.overlap_area(tr) < va * 0.5)
-            })
-        };
-        let mut vectors: Vec<vector::PlacedSvg> = raw_vectors.into_iter().filter(&not_in_table).collect();
-        // Caption-aware recovery: a small vector diagram below the figure filter's strong bar
-        // (a few ellipse curves, a TikZ sketch) is held aside as a WEAK candidate. Promote one
-        // into `vectors` only when a FIGURE CAPTION sits right next to it AND no strong figure
-        // already serves that caption — so a stray mark with no caption is never resurrected,
-        // and a caption with a real graphic isn't given a spurious second figure. Done here,
-        // before fig_boxes/labels/emit are built, so a promoted candidate flows through the
-        // identical machinery as a strong figure.
-        let mut weak: Vec<vector::PlacedSvg> = weak_vectors.into_iter().filter(&not_in_table).collect();
-        if !weak.is_empty() {
-            let gap = body * 6.0; // a caption sits within a few lines of its figure
-            let mut claimed = vec![false; weak.len()];
-            let mut promote: Vec<usize> = Vec::new();
-            for l in &lines {
-                let t = l.text();
-                let is_fig = matches!(caption_label(&t), Some((true, _)));
-                if !is_fig || is_inline_xref(&t) || caption_is_continued(&t) || dotleader_tail(&t) {
-                    continue;
-                }
-                let cy = l.y;
-                let edge = |yb: f32, yt: f32| if cy < yb { yb - cy } else if cy > yt { cy - yt } else { 0.0 };
-                let strong_near = images
-                    .iter()
-                    .map(|im| {
-                        let (_, _, yb, yt) = dibox(im);
-                        edge(yb, yt)
-                    })
-                    .chain(vectors.iter().map(|v| {
-                        let (_, _, yb, yt) = dvbox(v);
-                        edge(yb, yt)
-                    }))
-                    .fold(f32::INFINITY, f32::min);
-                if strong_near <= gap {
-                    continue; // caption already has a (strong) graphic
-                }
-                let mut best: Option<(usize, f32)> = None;
-                for (j, v) in weak.iter().enumerate() {
-                    if claimed[j] {
-                        continue;
-                    }
-                    let (vxl, vxr, vyb, vyt) = dvbox(v);
-                    let e = edge(vyb, vyt);
-                    let x_overlap = vxr > l.x0 - body && vxl < l.x1 + body;
-                    if e <= gap && x_overlap && best.is_none_or(|(_, be)| e < be) {
-                        best = Some((j, e));
-                    }
-                }
-                if let Some((j, _)) = best {
-                    claimed[j] = true;
-                    promote.push(j);
-                }
-            }
-            promote.sort_unstable();
-            promote.dedup();
-            for &j in promote.iter().rev() {
-                vectors.push(weak.remove(j));
-            }
-        }
-        // Mark lines consumed by a table (within its y-range). A line belongs to a table
-        // only if it overlaps in BOTH axes — the x-overlap is essential on two-column pages
-        // so a table in one column doesn't swallow the other column's prose. Defined after
-        // all table filtering so it sees the final table set.
-        let in_table = |x0: f32, x1: f32, y: f32| {
-            tables.iter().any(|t| {
-                y <= t.bbox.y1 + body && y >= t.bbox.y0 - body && x1 > t.bbox.x0 && x0 < t.bbox.x1
-            })
-        };
-        // Caption recognition must see a label just outside the drawn frame even though the
-        // broader body-sized ownership band consumes ordinary grid residue. A label whose
-        // baseline is actually inside the frame remains table content, never a caption.
-        let inside_table_frame = |x0: f32, x1: f32, y: f32| {
-            tables.iter().any(|t| {
-                y <= t.bbox.y1 && y >= t.bbox.y0 && x1 > t.bbox.x0 && x0 < t.bbox.x1
-            })
-        };
-        // A vector figure's bbox — used to attach its labels and to keep that text
-        // out of the body flow (it belongs to the figure, not the prose).
-        let fig_boxes: Vec<(f32, f32, f32, f32)> = vectors.iter().map(&dvbox).collect();
-        let in_figure = |x: f32, y: f32| fig_boxes.iter().any(|&(xl, xr, yb, yt)| x >= xl - 4.0 && x <= xr + 4.0 && y >= yb - 4.0 && y <= yt + 4.0);
-        // A vector region that is really a FRAMED TEXT BLOCK — a bordered certificate / form
-        // whose frame and rules are vector ink but whose content is a wall of body text — must
-        // not scoop that text into the SVG. Tell it from a real chart/diagram by text density:
-        // a chart carries a handful of short labels, a framed document many lines of multi-word
-        // prose (often in smaller-than-body print). Mark such boxes so all their text stays in
-        // the prose flow regardless of font size (these forms are routinely set below the
-        // document body size, which the body-size prose gate below would otherwise miss).
-        const FRAMED_DOC_MIN_PROSE_LINES: usize = 8;
-        // Precompute, once per line, whether it is a multi-word non-axis "prose line" plus its
-        // center — so the per-box scan below is a cheap point/flag test, not a fresh `l.text()`
-        // build for every (box, line) pair (that nested rebuild dominated render time on a
-        // form-heavy doc with many vector boxes).
-        let line_is_prose: Vec<bool> = lines
-            .iter()
-            .map(|l| l.text().split_whitespace().count() >= 4 && !is_axis_label_text(&l.text()))
-            .collect();
-        let line_centers: Vec<(f32, f32)> = lines.iter().map(|l| ((l.x0 + l.x1) * 0.5, l.y)).collect();
-        let framed_doc_boxes: Vec<(f32, f32, f32, f32)> = fig_boxes
-            .iter()
-            .copied()
-            .filter(|&(xl, xr, yb, yt)| {
-                // A CAPTIONED figure ("Figure N") is a diagram, never a framed certificate —
-                // its many short node labels must NOT make it read as a wall of prose (which
-                // would scoop them into the body and out of the SVG). Only an UNcaptioned
-                // bordered text block qualifies as a framed document.
-                let captioned = captioned_fig_boxes
-                    .iter()
-                    .any(|&(cxl, cxr, cyb, cyt)| (xl - cxl).abs() < 1.0 && (xr - cxr).abs() < 1.0 && (yb - cyb).abs() < 1.0 && (yt - cyt).abs() < 1.0);
-                !captioned
-                    && line_centers
-                        .iter()
-                        .zip(&line_is_prose)
-                        .filter(|&(&(cx, cy), &prose)| prose && cx >= xl && cx <= xr && cy >= yb && cy <= yt)
-                        .count()
-                        >= FRAMED_DOC_MIN_PROSE_LINES
-            })
-            .collect();
-        let in_framed_doc = |x: f32, y: f32| {
-            framed_doc_boxes
-                .iter()
-                .any(|&(xl, xr, yb, yt)| x >= xl - 4.0 && x <= xr + 4.0 && y >= yb - 4.0 && y <= yt + 4.0)
-        };
-        // Axis tick labels and axis titles sit just OUTSIDE the plotted ink (left of the
-        // y-axis, below the x-axis) — beyond `in_figure`'s tight 4pt margin, so without
-        // this they leak into the prose ("84 82 80 78 76", "Pre-training Steps …"). They
-        // are SMALL-FONT (tick/label size, well under body); claim small-font text within
-        // a wider margin of the figure as a figure label too. The font gate keeps body
-        // prose and the body-size "Figure N:" caption (just below the plot) out.
-        let axis_margin = body * 2.2;
-        let near_fig_label = |x: f32, y: f32, size: f32, text: &str| {
-            let near = fig_boxes.iter().any(|&(xl, xr, yb, yt)| {
-                x >= xl - axis_margin && x <= xr + axis_margin && y >= yb - axis_margin && y <= yt + axis_margin
-            });
-            if !near {
-                return false;
-            }
-            // Small-font text just outside the ink is a tick/label (the common case); a
-            // BODY-size run is a label only when it is axis-shaped (a numeric tick row or a
-            // unit-bearing axis title — see `is_axis_label_text`), which excludes the
-            // multi-word "Figure N:" caption and ordinary prose.
-            size < body * 0.82 || is_axis_label_text(text)
-        };
-        // A body-size, multi-word line that merely OVERLAPS a figure's ink box (a
-        // description paragraph the box happens to span — e.g. a location map with a
-        // descriptive blurb beside it) is PROSE, not a figure label: keep it in the body
-        // flow and out of the SVG. Real map/axis labels are short or small-font, so they
-        // are unaffected.
-        let mut prose_rows: Vec<(f32, f32, f32, f32)> = Vec::new();
-        for l in &lines {
-            let cx = (l.x0 + l.x1) * 0.5;
-            let body_prose = l.size >= body * 0.95
-                && l.text().split_whitespace().count() > 5
-                && !is_axis_label_text(&l.text()) // a body-size numeric tick row is a figure label, not prose
-                && detect_header(l, body, Some(&profile)).is_none()
-                && in_figure(cx, l.y);
-            // Inside a framed text block, keep ALL multi-word text as prose — including the
-            // small print these forms use, which the body-size gate above would miss.
-            let framed_prose = in_framed_doc(cx, l.y)
-                && l.text().split_whitespace().count() >= 2
-                && !is_axis_label_text(&l.text());
-            if body_prose || framed_prose {
-                prose_rows.push((l.x0, l.x1, l.y - 1.0, l.y + l.size + 1.0));
-            }
-        }
-        // The y-band one line occupies, as the point tests below want it.
-        let band_of = |l: &Line| (l.x0, l.x1, l.y - 1.0, l.y + l.size + 1.0);
-        let in_prose = |x: f32, y: f32| {
-            prose_rows.iter().any(|&(x0, x1, y0, y1)| x >= x0 - 2.0 && x <= x1 + 2.0 && y >= y0 && y <= y1)
-        };
-        // A line OUTSIDE the figure's ink is claimed whole or not at all.
-        //
-        // `near_fig_label` decides span by span, and a span is not a unit of meaning. On
-        // `econ_EM_2606_02234.pdf` p25 the figure is the 58pt band of a booktabs table's header
-        // rules; the margin below it reaches the first two data rows, and of each row it takes
-        // only the numeric spans — every `0.33`, every `0.50` — while "Sim1a CIA-∇D only (α = 1,
-        // γ = 2)" stays in the body, because a scenario name is not axis-shaped. The reader gets
-        // an SVG of Bias/RMSE numbers with no row context, which is worse than either half alone.
-        //
-        // So: find the lines that lie outside every figure's ink and are NOT label lines when
-        // judged AS A WHOLE, and refuse every span on that row. Judging the whole line is the
-        // point — `is_axis_label_text` says yes to "0.33" and no to the row it belongs to.
-        //
-        // The refusal spans the CLAIMING FIGURE'S WIDTH, not just the rejected line's own. A
-        // table row breaks into one line per column group the moment its cells are far enough
-        // apart, so the numeric cells to the right of "Sim1a CIA-∇D only …" are lines of their
-        // own and would each pass the whole-line test. What the figure may not do is take part
-        // of a row it cannot take all of — so one rejected fragment closes the whole row, across
-        // that figure's own x-span and no further (a second column's labels are untouched).
-        //
-        // Spans that belong to no line keep today's behaviour, so this only ever removes a claim
-        // the line-level reading contradicts.
-        let split_rows: Vec<(f32, f32, f32, f32)> = lines
-            .iter()
-            .filter(|l| {
-                let cx = (l.x0 + l.x1) * 0.5;
-                !in_figure(cx, l.y) && !near_fig_label(cx, l.y, l.size, &l.text())
-            })
-            .map(|l| {
-                let (mut x0, mut x1, y0, y1) = band_of(l);
-                for &(xl, xr, yb, yt) in &fig_boxes {
-                    let in_margin = l.y >= yb - axis_margin && l.y <= yt + axis_margin;
-                    let overlaps = l.x1 > xl - axis_margin && l.x0 < xr + axis_margin;
-                    if in_margin && overlaps {
-                        x0 = x0.min(xl);
-                        x1 = x1.max(xr);
-                    }
-                }
-                (x0, x1, y0, y1)
-            })
-            .collect();
-        let on_split_row = |x: f32, y: f32| {
-            split_rows.iter().any(|&(x0, x1, y0, y1)| x >= x0 - 2.0 && x <= x1 + 2.0 && y >= y0 && y <= y1)
-        };
-        // The same question asked of a whole LINE, by overlap rather than by centre. The body
-        // side works in lines and the figure side in spans, and a centre test answers the two
-        // differently for a line that straddles the band's edge — the figure refuses its spans
-        // while the body still drops it as a label, and the row is emitted NEITHER place.
-        let line_on_split_row = |l: &Line| {
-            split_rows
-                .iter()
-                .any(|&(x0, x1, y0, y1)| l.x1 >= x0 - 2.0 && l.x0 <= x1 + 2.0 && l.y >= y0 && l.y <= y1)
-        };
-        // A figure caption ("Figure N …", "Table N …") sits just outside the figure ink,
-        // within `near_fig_label`'s margin. Its numeric fragments (the "5.6"/"-" in
-        // "Figure 5.6: …") otherwise read as axis ticks and get scooped INTO the SVG — and
-        // duplicated, since the caption is also emitted normally. Exclude any span on a
-        // caption line from figure-label capture.
-        //
-        // A caption is a PARAGRAPH, not a line. Excluding only the "Figure N …" line left its
-        // continuation lines claimable, and the neighbouring figure ate them — `cs_LG_2606_02576`
-        // p1 rendered "continual tuning streams." (Figure 1's last caption line) across the top of
-        // Figure 2's SVG, and `cs_DS_2606_02492` p34 swept two whole lines of Figure 3's caption
-        // into the figure. So the band runs from the caption line through the lines that continue
-        // it: same type size, the next baseline down, and horizontally inside the caption's own
-        // column. The first line that breaks any of those ends the caption, which is what keeps
-        // the following body paragraph — and a second caption — out of the band.
-        let mut caption_bands: Vec<(f32, f32, f32, f32)> = Vec::new();
-        for l in lines.iter().filter(|l| caption_label(&l.text()).is_some()) {
-            let mut block = vec![band_of(l)];
-            let mut prev = l;
-            // Walk DOWN the caption by nearest baseline rather than by index: `lines` is in
-            // reading order, but a page header or a neighbouring column can sit between two
-            // lines of the same caption, and an index walk would stop at the first of them.
-            loop {
-                let next = lines
-                    .iter()
-                    .filter(|nxt| {
-                        let drop = prev.y - nxt.y;
-                        (nxt.size - l.size).abs() < 0.6
-                            && drop > 0.5
-                            // Within 1.6 line-heights — a caption's own leading. The gap to
-                            // whatever follows it is larger: `physics_higgs_cms_discovery.pdf`
-                            // p11 sets its caption at a 13.4pt pitch and then leaves 19.3pt
-                            // before the table's header row, and at a looser bound the block
-                            // ran straight on into the table and took its column headings out
-                            // of the figure.
-                            && drop < prev.size * 1.6
-                            // A caption's FIRST line is indented by its marker ("Figure 3 "),
-                            // so the lines that continue it start further LEFT, not further
-                            // right — `cs_DS_2606_02492` p34 hangs its caption by 14pt. Bound
-                            // the overhang rather than forbidding it, and hold the right edge
-                            // to the caption's own column so a wider block below is not taken.
-                            && nxt.x0 >= l.x0 - prev.size * 4.0
-                            && nxt.x1 <= l.x1.max(nxt.x0) + prev.size * 2.0
-                            && caption_label(&nxt.text()).is_none()
-                            && detect_header(nxt, body, Some(&profile)).is_none()
-                    })
-                    .max_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
-                match next {
-                    Some(n) => {
-                        block.push(band_of(n));
-                        prev = n;
-                    }
-                    None => break,
-                }
-            }
-            // Every line of the block gets the block's FULL column width. A caption's last
-            // line often ends mid-column with a display fragment set beside it (a `⋁` and a
-            // `kPunch[u, v]` on `cs_DS_2606_02492` p34 are lines of their own, to the right of
-            // the text they belong to); keyed on the line's own x-extent, those fragments fall
-            // outside the band and get scooped onto the figure alone.
-            let bx0 = block.iter().map(|b| b.0).fold(f32::INFINITY, f32::min);
-            let bx1 = block.iter().map(|b| b.1).fold(f32::NEG_INFINITY, f32::max);
-            caption_bands.extend(block.into_iter().map(|(_, _, y0, y1)| (bx0, bx1, y0, y1)));
-        }
-        let in_caption = |x: f32, y: f32| {
-            caption_bands.iter().any(|&(x0, x1, y0, y1)| x >= x0 - 2.0 && x <= x1 + 2.0 && y >= y0 && y <= y1)
-        };
-        // Render the figures' text as SVG <text>: a figure's labels (axis ticks, DAG
-        // node labels) are the spans that fall within its bbox — whether drawn in the
-        // page content OR inside a Form XObject (`extract_spans` now captures both into
-        // `spans`). They're collected here and removed from the prose flow below (the
-        // in_figure / fig_label filter), so each shows on its figure, not in the body.
-        if !vectors.is_empty() {
-            let mk = |s: text::Span| vector::LabelSpan { x: s.x, y: s.y, size: s.size, width: s.width, text: s.text, bold: s.bold, italic: s.italic, angle: s.angle };
-            // A captioned figure's labels routinely sit just OUTSIDE its (tight) vector-ink
-            // box — node labels above/beside a DAG, a pipeline diagram's stage captions. Claim
-            // them onto the SVG within the same margin axis ticks use, so a label split between
-            // form-internal text (inside the box) and page-direct text (just outside) is
-            // reunited on the figure instead of leaking to a body <aside>.
-            let cap_m = axis_margin;
-            let in_captioned_fig_pt = |x: f32, y: f32| {
-                captioned_fig_boxes
-                    .iter()
-                    .any(|&(xl, xr, yb, yt)| x >= xl - cap_m && x <= xr + cap_m && y >= yb - cap_m && y <= yt + cap_m)
-            };
-            let mut labels: Vec<vector::LabelSpan> = Vec::new();
-            // Parallel to `labels`: does this span sit inside a table the page emits? A
-            // figure whose text is almost entirely a table's cells is a callout panel
-            // REPRODUCING that table, and must not print the numbers a second time — see
-            // `vector::PlacedSvg::attach`. Display space, like every other box test here.
-            let mut label_in_table: Vec<bool> = Vec::new();
-            let in_table = |x: f32, y: f32| {
-                tables.iter().any(|t| x >= t.bbox.x0 && x <= t.bbox.x1 && y >= t.bbox.y0 && y <= t.bbox.y1)
-            };
-            // Which spans a figure claims is decided in DISPLAY space (`ds`), against the
-            // display-space figure boxes; what is HANDED to the figure is the PAGE-space span
-            // (`s`), because `PlacedSvg` maps page space to its own turned local space itself
-            // (`to_local`) — turning a label here as well would turn it twice.
-            for (s, ds) in spans.iter().zip(dspans) {
-                let (cx, cy) = (ds.x + ds.width * 0.5, ds.y + ds.size * 0.5);
-                // Inside a CAPTIONED figure, all interior text is the diagram's labels — render
-                // it on the SVG even if the in-figure "prose" gate flagged it (that gate guards
-                // an UNcaptioned framed block). This keeps the labels visible (figure_text) while
-                // the body flow drops them as figure content. A caption line is still excluded.
-                let take =
-                    (in_figure(cx, cy) || (near_fig_label(cx, cy, s.size, &s.text) && !on_split_row(cx, cy))) && !in_prose(cx, cy);
-                // The same wholeness rule binds the captioned-figure blanket claim: it also
-                // reaches outside the ink, and on `arxiv_nerf.pdf` p18 its margin catches the
-                // page's RUNNING HEADER ("18 B. Mildenhall, P. P. Srinivasan, M. Tancik et
-                // al."), which then renders across the top of the architecture diagram at
-                // figure scale. A claim from outside the ink is a claim on a whole line or on
-                // nothing; `in_figure` — the tight 4pt box — stays unconditional.
-                if (take || (in_captioned_fig_pt(cx, cy) && !on_split_row(cx, cy))) && !in_caption(cx, cy) {
-                    labels.push(mk(clone_span(s)));
-                    label_in_table.push(in_table(cx, cy));
-                }
-            }
-            vector::attach_labels(&mut vectors, &labels, &label_in_table);
-        }
-
-        // Page x-extent (from text lines), used to give full-width boxes to
-        // images whose horizontal position we don't track.
-        let (mut px0, mut px1) = (f32::INFINITY, f32::NEG_INFINITY);
-        for l in &lines {
-            px0 = px0.min(l.x0);
-            px1 = px1.max(l.x1);
-        }
-        if !px0.is_finite() {
-            (px0, px1) = (0.0, 1.0);
-        }
-
-        // Opportunistic caption linking: each "Figure N"/"Table N" caption line is
-        // anchored to its nearest (by y) figure/table on the page. Captions are
-        // enrichment — a region with no caption is still emitted as a region.
-        // A line beginning "Table N"/"Figure N" is only a CAPTION if it starts a
-        // fresh block — not when it is the wrapped continuation of a prose sentence
-        // that merely *references* the table (e.g. "…are shown in" ⏎ "Table 6. In this
-        // table we report…"). Such a line is adjacent in the same column to a previous
-        // prose line that does not end a sentence; treat it as body text, not a caption.
-        let ends_sentence = |t: &str| {
-            let t = t.trim_end();
-            t.ends_with(['.', '!', '?', ':']) || t.ends_with(".\"") || t.ends_with(".)") || t.ends_with(".\u{201d}")
-        };
-        // Words that introduce an in-text reference ("…are shown in" ⏎ "Table 6"):
-        // when the previous line ends on one of these, the "Table N" is a reference,
-        // not a caption. Deliberately narrow so real captions (which follow a sentence
-        // end or a vertical gap) are never suppressed.
-        let ref_lead = |w: &str| {
-            matches!(
-                w,
-                "in" | "see" | "from" | "of" | "to" | "and" | "via" | "using" | "per" | "cf"
-                    | "table" | "tables" | "figure" | "figures" | "fig"
-                    | "shown" | "presented" | "listed" | "reported" | "summarized" | "given"
-            )
-        };
-        let is_ref_continuation = |idx: usize| -> bool {
-            if idx == 0 {
-                return false;
-            }
-            let (prev, cur) = (&lines[idx - 1], &lines[idx]);
-            if in_table(prev.x0, prev.x1, prev.y) {
-                return false; // a caption right after a table's last row is legitimate
-            }
-            let dy = prev.y - cur.y; // reading order top->down
-            let adjacent = dy > -cur.size && dy < cur.size * 1.8 && (prev.x0 - cur.x0).abs() < cur.size * 1.5;
-            if !adjacent {
-                return false;
-            }
-            let pt = prev.text();
-            let pt = pt.trim_end();
-            if ends_sentence(pt) {
-                return false;
-            }
-            let last: String = pt.rsplit(char::is_whitespace).next().unwrap_or("").chars().filter(|c| c.is_alphabetic()).flat_map(char::to_lowercase).collect();
-            ref_lead(&last)
-        };
-        // (line idx, is_figure, number, tail-is-bare) — bare meaning the line is just the
-        // label ("Figure 5.13") with nothing alphanumeric after the number.
-        let mut cap_lines: Vec<(usize, bool, String, bool)> = lines
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, l)| {
-                let t = l.text();
-                caption_parts(&t).and_then(|(f, n, tail)| {
-                    // Drop multi-page "Figure N—Continued" markers — re-emitting them would
-                    // duplicate the original figure's id and pollute the output with empty
-                    // continuation captions.
-                    let bare = !tail.chars().any(|c| c.is_alphanumeric());
-                    (!inside_table_frame(l.x0, l.x1, l.y)
-                        && !is_ref_continuation(idx)
-                        && !is_inline_xref(&t)
-                        && !caption_is_continued(&t)
-                        && !is_dotleader_toc(&lines, idx))
-                        .then_some((idx, f, n, bare))
-                })
-            })
-            .collect();
-        let mut consumed_caption = std::collections::HashSet::new();
-        // A bare label that SHARES its number with a descriptive caption on the same page
-        // is a cross-reference artifact (Word writes the field as its own hyperlinked
-        // "Figure 5.13" line hovering at the figure's edge), not a second caption. Left in,
-        // it out-anchors the real caption — it hugs the graphic — and exiles the
-        // descriptive one to a duplicate "fig-N-2" empty shell. Suppress it entirely: its
-        // number survives in the caption that wins, and the in-prose cross-reference keeps
-        // the link. A LONE bare caption (no descriptive twin) still anchors as before.
-        let descriptive: std::collections::HashSet<(bool, &str)> = cap_lines
-            .iter()
-            .filter(|(_, _, _, bare)| !bare)
-            .map(|(_, f, n, _)| (*f, n.as_str()))
-            .collect();
-        let suppressed: Vec<usize> = cap_lines
-            .iter()
-            .filter(|(_, f, n, bare)| *bare && descriptive.contains(&(*f, n.as_str())))
-            .map(|(idx, ..)| *idx)
-            .collect();
-        cap_lines.retain(|(idx, ..)| !suppressed.contains(idx));
-        consumed_caption.extend(suppressed);
-        let mut img_cap: Vec<Option<(String, String)>> = vec![None; images.len()]; // (num, html)
-        let mut svg_cap: Vec<Option<(String, String)>> = vec![None; vectors.len()]; // (num, html)
-        let mut tab_cap: Vec<Option<(String, String, bool)>> = vec![None; tables.len()]; // (num, html, below)
-        // Captions with no raster image / detected table (e.g. vector figures) are
-        // still figure/table regions — emit the caption standalone so the number +
-        // description and its anchor id survive.
-        let mut standalone: Vec<(f32, f32, String)> = Vec::new(); // (x0, y, html)
-        // Parallel to `standalone`: the structured projection for each standalone caption —
-        // (id without the `fig-`/`tab-` prefix slug, caption inner html, is_figure).
-        let mut standalone_meta: Vec<(String, String, bool)> = Vec::new();
-        // Each caption is gathered as its full (multi-line) block and anchored to the
-        // nearest figure (image) / table by y; unanchored captions stand alone.
-        for &(idx, is_fig, ref num, _) in &cap_lines {
-            if consumed_caption.contains(&idx) {
-                continue; // already swallowed as a previous caption's continuation
-            }
-            let cy = lines[idx].y;
-            let (html, used) = gather_caption(&lines, idx, body, &profile);
-            let anchored = if is_fig {
-                // Anchor a "Figure N" caption to the nearest unclaimed figure REGION
-                // by y — whether it is a raster <img> OR a vector <svg> (a figure is
-                // a figure regardless of how it's drawn). This merges the caption and
-                // its graphic into one <figure> instead of leaving a caption-less SVG
-                // plus a graphic-less standalone caption.
-                // Distance from the caption to a figure is the gap to its NEAREST edge
-                // (the figure's [y_bottom, y_top] interval), not to its top: a caption
-                // sits just below its figure, so for a tall raster the top edge is far
-                // away while a lower figure's top is deceptively near — measuring to the
-                // top swaps the two captions. Edge distance binds each caption to the
-                // figure it actually abuts (0 when the caption is inside the figure box).
-                let edge = |yb: f32, yt: f32| if cy < yb { yb - cy } else if cy > yt { cy - yt } else { 0.0 };
-                let img_best = images.iter().enumerate()
-                    .filter(|(j, _)| !table_image_owned[*j] && img_cap[*j].is_none())
-                    .map(|(j, im)| {
-                        let (_, _, yb, yt) = dibox(im);
-                        (j, edge(yb, yt))
-                    })
-                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                let svg_best = vectors.iter().enumerate()
-                    .filter(|(j, _)| svg_cap[*j].is_none())
-                    .map(|(j, v)| {
-                        let (_, _, yb, yt) = dvbox(v);
-                        (j, edge(yb, yt))
-                    })
-                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                match (img_best, svg_best) {
-                    (Some((j, di)), Some((k, ds))) => {
-                        if di <= ds {
-                            img_cap[j] = Some((num.clone(), html.clone()));
-                        } else {
-                            svg_cap[k] = Some((num.clone(), html.clone()));
-                        }
-                        true
-                    }
-                    (Some((j, _)), None) => {
-                        img_cap[j] = Some((num.clone(), html.clone()));
-                        true
-                    }
-                    (None, Some((k, _))) => {
-                        svg_cap[k] = Some((num.clone(), html.clone()));
-                        true
-                    }
-                    (None, None) => tables
-                        .iter()
-                        .enumerate()
-                        .filter(|(j, table)| {
-                            tab_cap[*j].is_none() && table.table.has_image_sidecar()
-                        })
-                        .map(|(j, table)| (j, edge(table.bbox.y0, table.bbox.y1)))
-                        .filter(|(_, distance)| *distance <= body * 6.0)
-                        .min_by(|a, b| {
-                            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .map(|(j, _)| {
-                            let table = &tables[j];
-                            let below = cy < (table.bbox.y1 + table.bbox.y0) * 0.5;
-                            tab_cap[j] = Some((num.clone(), html.clone(), below));
-                        })
-                        .is_some(),
-                }
-            } else {
-                tables.iter().enumerate()
-                    .filter(|(j, _)| tab_cap[*j].is_none())
-                    .min_by(|(_, a), (_, b)| (a.bbox.y1 - cy).abs().partial_cmp(&(b.bbox.y1 - cy).abs()).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(j, t)| {
-                        let below = cy < (t.bbox.y1 + t.bbox.y0) * 0.5; // caption sits below the table (y up)
-                        tab_cap[j] = Some((num.clone(), html.clone(), below));
-                    })
-                    .is_some()
-            };
-            if !anchored {
-                // An unanchored FIGURE caption stays a `<figure>` (the figure exists;
-                // its graphic was dropped — an honest content-loss marker, and it keeps the
-                // caption as a semantic `<figcaption>`). An unanchored TABLE caption is NOT a
-                // figure: emit it as a caption `<div>` (the table itself was not detected
-                // nearby) — same element table captions use, keeping the `tab-N` id so
-                // cross-refs still resolve. Spurious empties (List-of-Figures entries) and
-                // recoverable small vectors are already handled upstream (dot-leader
-                // suppression + caption-aware weak-vector promotion), so what remains here is
-                // a genuine figure whose graphic we could not extract.
-                let nid = num_id(num);
-                let (block, full_id) = if is_fig {
-                    (format!("<figure id=\"fig-{nid}\"><figcaption>{html}</figcaption></figure>"), format!("fig-{nid}"))
-                } else {
-                    (format!("<div id=\"tab-{nid}\">{html}</div>"), format!("tab-{nid}"))
-                };
-                standalone.push((lines[idx].x0, cy, block));
-                standalone_meta.push((full_id, html.clone(), is_fig));
-            }
-            for u in used {
-                consumed_caption.insert(u);
-            }
-        }
-
-        // Build items with bounding boxes, then order them column-aware via the
-        // shared XY-cut so two-column pages don't interleave left/right blocks.
-        let mut items: Vec<Item> = Vec::new();
-        let mut boxes: Vec<text::BBox> = Vec::new();
-        for (idx, l) in lines.iter().enumerate() {
-            // A line whose text sits inside a vector figure is that figure's label
-            // (now rendered as SVG <text>) — keep it out of the prose flow. But never
-            // swallow a section heading that merely overlaps a figure's bbox.
-            let fig_cx = (l.x0 + l.x1) * 0.5;
-            // An axis tick/title is part of the figure even when it's bold/short enough to
-            // look like a heading (a plot's "Vp (m/s)" title); a merely-contained line is a
-            // figure label only when it isn't a real section heading.
-            // `!on_split_row` here is the OTHER half of the exactly-once invariant. The figure
-            // side refuses a claim on a row it cannot take whole (see `split_rows`); if the body
-            // side kept dropping that row as a figure label, the row would be emitted NEITHER
-            // place — which is how `econ_EM_2606_02234.pdf` p25 could lose "0.33 0.34 0.50 0.50"
-            // entirely. Both sides ask the same question, so exactly one of them keeps it.
-            let axis_label = near_fig_label(fig_cx, l.y, l.size, &l.text()) && !line_on_split_row(l);
-            // Text sitting INSIDE a CAPTIONED figure's ink box is that diagram's own label
-            // ("Image Semantics", "Group 2", "Outputs") — a figure carries a caption, so its
-            // interior is figure content, never a section heading. (A real heading sits OUTSIDE
-            // the ink box; this is why we use the tight box with no margin, distinct from the
-            // generic in_figure path below that deliberately spares a heading overlapping a
-            // figure.) Without this, such labels — now visible via Form-XObject text — promote
-            // to spurious <h4>s and drag heading precision down.
-            // A SHORT line sitting INSIDE a CAPTIONED figure's ink box is that diagram's own
-            // label ("Image Semantics", "Group 2", "Outputs", a plot's axis title) — figure
-            // content, never a section heading. A figure carries a caption, so its interior is
-            // figure text; this holds even when the figure's wall of small labels tripped the
-            // in-figure "prose" gate (that gate exists for an UNcaptioned framed certificate,
-            // not a captioned diagram). The ≤6-word bound keeps any genuine wrapped sentence
-            // that overlaps the box out of this branch. Without it these labels — now visible
-            // via Form-XObject text — leak into the body as spurious <h4>s.
-            let label_words = l.text().split_whitespace().count();
-            let in_captioned_fig = label_words <= 6
-                && captioned_fig_boxes
-                    .iter()
-                    .any(|&(xl, xr, yb, yt)| fig_cx >= xl && fig_cx <= xr && l.y >= yb && l.y <= yt);
-            let fig_label = ((in_figure(fig_cx, l.y) || axis_label)
-                && !in_prose(fig_cx, l.y)
-                && (axis_label || detect_header(l, body, Some(&profile)).is_none()))
-                || in_captioned_fig;
-            if !consumed_caption.contains(&idx) && !fig_label {
-                items.push(Item::L(l));
-                boxes.push((l.x0, l.x1.max(l.x0 + 0.1), l.y, l.y + l.size.max(1.0)));
-            }
-        }
-        for (j, t) in tables.iter().enumerate() {
-            items.push(Item::T(j));
-            boxes.push((t.bbox.x0, t.bbox.x1.max(t.bbox.x0 + 0.1), t.bbox.y0, t.bbox.y1));
-        }
-        // Pair an overlapping raster + vector into ONE composite figure (only inline, so
-        // the raster actually renders). The direction depends on which mostly contains the
-        // other — and BOTH are common:
-        //  - vector mostly inside raster (a location map: a base photo with vector lines/
-        //    labels on top) → the raster is the base, the vector overlays it.
-        //  - raster mostly inside vector (a plot whose data points are a raster within the
-        //    axes/legend frame, e.g. a Vp-depth crossplot) → the vector is the base, the
-        //    raster is embedded in its SVG.
-        // Either way the composite is one `<svg>` (raster `<image>` + vector ink + labels),
-        // registered pixel-for-pixel in the figure's own coordinate space.
-        let mut vec_owner: Vec<Option<usize>> = vec![None; vectors.len()]; // vector → base image
-        let mut img_overlays: Vec<Vec<usize>> = vec![Vec::new(); images.len()]; // image → overlay vectors
-        let mut img_owner: Vec<Option<usize>> = vec![None; images.len()]; // image → base vector
-        let mut svg_rasters: Vec<Vec<usize>> = vec![Vec::new(); vectors.len()]; // vector → embedded images
-        if inline_images {
-            for (vi, v) in vectors.iter().enumerate() {
-                let (vxl, vxr, vyb, vyt) = dvbox(v);
-                let vr = Rect::new(vxl, vyb, vxr, vyt);
-                let varea = vr.area().max(1.0);
-                for (ii, im) in images.iter().enumerate() {
-                    if table_image_owned[ii]
-                        || vec_owner[vi].is_some()
-                        || img_owner[ii].is_some()
-                    {
-                        continue;
-                    }
-                    let (ixl, ixr, iyb, iyt) = dibox(im);
-                    let ir = Rect::new(ixl, iyb, ixr, iyt);
-                    let overlap = vr.overlap_area(ir);
-                    let imarea = ir.area().max(1.0);
-                    if overlap / varea > 0.6 {
-                        vec_owner[vi] = Some(ii); // vector mostly inside image → raster base
-                        img_overlays[ii].push(vi);
-                    } else if overlap / imarea > 0.6 {
-                        img_owner[ii] = Some(vi); // image mostly inside vector → vector base
-                        svg_rasters[vi].push(ii);
-                    }
-                }
-            }
-        }
-        for (j, im) in images.iter().enumerate() {
-            if table_image_owned[j] {
-                continue;
-            }
-            let (_, _, _, iyt) = dibox(im);
-            items.push(Item::Img(j));
-            boxes.push((px0, px1, iyt - 1.0, iyt + 1.0)); // full-width separator
-        }
-        for (j, v) in vectors.iter().enumerate() {
-            if vec_owner[j].is_some() {
-                continue; // overlaid onto its image, not emitted separately
-            }
-            let (vxl, vxr, vyb, vyt) = dvbox(v);
-            items.push(Item::Svg(j));
-            boxes.push((vxl, vxr.max(vxl + 0.1), vyb, vyt));
-        }
-        for (j, (cx0, cy, _)) in standalone.iter().enumerate() {
-            items.push(Item::Cap(j));
-            boxes.push((*cx0, *cx0 + 0.1, *cy, *cy + body.max(1.0)));
-        }
-        let order = text::xy_cut_order(&boxes, body);
-        // The non-text items (tables/figures/captions) carry their positioned box onto the
-        // emitted [`PageElement`] so the block projection records it; text runs get their box
-        // inside `emit_lines` (unioned over the run's lines). `boxes` is `(x_left, x_right,
-        // y_bottom, y_top)`; the [`Bbox`] form is `[x0, y0, x1, y1]` = `[x_left, y_bottom,
-        // x_right, y_top]`.
-        let item_box = |bi: usize| -> Option<Bbox> {
-            let (xl, xr, yb, yt) = boxes[bi];
-            Some([xl, yb, xr, yt])
-        };
-        let items: Vec<(&Item, Option<Bbox>)> = order.iter().map(|&i| (&items[i], item_box(i))).collect();
-
-        // Emit, grouping consecutive lines into text blocks. `page_promote` lists the
-        // PDF-outline titles whose target page is this one, so body-size section titles
-        // still become headings.
-        let page_promote: &[(String, u8)] = promote_by_page.get(pno).map(|v| v.as_slice()).unwrap_or(&[]);
-        // The accepted tables' rects, for the grid-residue heading guard in `emit_lines`.
-        let table_interiors: Vec<(f32, f32, f32, f32)> =
-            tables.iter().map(|t| (t.bbox.x0, t.bbox.x1, t.bbox.y0 - body, t.bbox.y1 + body)).collect();
-        let prose_ctx = ProseCtx { body, title_sz, promote: page_promote, profile: &profile, plan: &head_plan, table_interiors: &table_interiors };
-        let mut run: Vec<&Line> = Vec::new();
-        let flush = |run: &mut Vec<&Line>, out: &mut Vec<PageElement>| {
-            if !run.is_empty() {
-                emit_lines(run, prose_ctx, out);
-                run.clear();
-            }
-        };
-        for (it, ibox) in &items {
-            let ibox = *ibox;
-            match it {
-                Item::L(l) => run.push(l),
-                Item::T(j) => {
-                    flush(&mut run, &mut els);
-                    let caption = tab_cap[*j].as_ref().map(|(n, c, b)| (n.clone(), c.clone(), *b));
-                    els.push(PageElement::at(ElKind::Table(tables[*j].table.clone().with_caption(caption)), ibox));
-                }
-                Item::Img(j) => {
-                    flush(&mut run, &mut els);
-                    // This raster is embedded inside a larger vector figure (a plot whose
-                    // data points are a raster within the axes) — emitted by that vector's
-                    // Item::Svg composite, not here.
-                    if img_owner[*j].is_some() {
-                        continue;
-                    }
-                    // A raster overlaid by EXACTLY ONE vector figure (a location map: a base
-                    // photo with vector lines/labels on top), in inline mode, is composited
-                    // into ONE `<svg>` with the raster embedded as an `<image>` in the
-                    // figure's own coordinate space. Both share that space, so the polygons
-                    // register with the raster pixel-for-pixel, and the union viewBox keeps
-                    // the marginal axis labels the CSS-overlay path used to clip.
-                    if inline_images && img_overlays[*j].len() == 1 {
-                        let idx = img_uris.len();
-                        // A codec placeholder is SVG, not pixels; the figure pastes it in
-                        // rather than referencing it (see `vector::Raster::placeholder`).
-                        let ph = vector::inline_svg_payload(&images[*j].uri);
-                        img_uris.push(std::mem::take(&mut images[*j].uri));
-                        let href = format!("\u{0}{idx}\u{0}");
-                        let im = &images[*j];
-                        let vi = img_overlays[*j][0];
-                        let svg = vectors[vi].composite_svg(&[vector::Raster {
-                            href: &href,
-                            placeholder: ph.as_deref(),
-                            rect: (im.x_left, im.x_right, im.y_bottom, im.y_top),
-                            ctm: im.ctm,
-                            clip: im.clip,
-                            seq: &im.seq,
-                        }]);
-                        // Caption may have attached to the image OR its overlay vector.
-                        let cap = img_cap[*j].as_ref().or(svg_cap[vi].as_ref());
-                        let (html, id, caption) = match cap {
-                            Some((num, cap)) => (
-                                format!("<figure id=\"fig-{}\">{svg}<figcaption>{cap}</figcaption></figure>", num_id(num)),
-                                num.clone(),
-                                Some(cap.clone()),
-                            ),
-                            None => (format!("<figure>{svg}</figure>"), String::new(), None),
-                        };
-                        els.push(PageElement::at(ElKind::Figure { html, id, caption, image: None, svg: Some(svg) }, ibox));
-                        continue;
-                    }
-                    // Both the inline data URI (often megabytes) and the `<image N>`
-                    // number are DEFERRED behind a tiny page-local `\0<idx>\0` sentinel:
-                    // the string post-processing passes never re-scan the payload, and the
-                    // global index/number is resolved once at the very end (after the
-                    // sequential merge fixes up page offsets). See substitute_images.
-                    let idx = img_uris.len();
-                    let graphic = if inline_images {
-                        img_uris.push(std::mem::take(&mut images[*j].uri));
-                        format!("<img src=\"\u{0}{idx}\u{0}\" />")
-                    } else {
-                        img_uris.push(String::new()); // keep the index aligned for numbering
-                        format!("<image \u{0}{idx}\u{0}>")
-                    };
-                    // Vector overlays annotating this image, each positioned over the exact
-                    // page region it occupies WITHIN the image (so the polygons line up
-                    // with the raster), and clipped to the vector ink so stray prose the
-                    // figure picked up below the map doesn't render.
-                    let im = &images[*j];
-                    let rect = (im.x_left, im.x_right, im.y_bottom, im.y_top);
-                    let overlays: String = img_overlays[*j]
-                        .iter()
-                        .map(|&vi| {
-                            let v = &vectors[vi];
-                            v.overlay_svg(&v.overlay_style(rect))
-                        })
-                        .collect();
-                    let rel = if overlays.is_empty() { "" } else { " style=\"position:relative\"" };
-                    let svg_field = (!overlays.is_empty()).then(|| overlays.clone());
-                    let (html, id, caption) = match &img_cap[*j] {
-                        Some((num, cap)) => (
-                            format!(
-                                "<figure{rel} id=\"fig-{nid}\">{graphic}{overlays}<figcaption>{cap}</figcaption></figure>",
-                                nid = num_id(num)
-                            ),
-                            num.clone(),
-                            Some(cap.clone()),
-                        ),
-                        None => (format!("<figure{rel}>{graphic}{overlays}</figure>"), String::new(), None),
-                    };
-                    // The figure carries a raster placeholder (`<image N>`/`<img>`): mint the
-                    // asset id keyed on the figure number so block projection can name it.
-                    let image = (!id.is_empty()).then(|| format!("img/fig_{}.png", num_id(&id)));
-                    els.push(PageElement::at(ElKind::Figure { html, id, caption, image, svg: svg_field }, ibox));
-                }
-                Item::Svg(j) => {
-                    flush(&mut run, &mut els);
-                    // A vector frame containing raster image(s) (a plot whose data points
-                    // are a raster within the axes): composite into ONE `<svg>` with each
-                    // raster embedded as an `<image>` in the figure's coordinate space.
-                    let svg = if !svg_rasters[*j].is_empty() {
-                        // Codec placeholders are SVG, not pixels — read before the URIs are
-                        // taken (see `vector::Raster::placeholder`).
-                        let phs: Vec<Option<String>> =
-                            svg_rasters[*j].iter().map(|&ii| vector::inline_svg_payload(&images[ii].uri)).collect();
-                        let hrefs: Vec<String> = svg_rasters[*j]
-                            .iter()
-                            .map(|&ii| {
-                                let idx = img_uris.len();
-                                img_uris.push(std::mem::take(&mut images[ii].uri));
-                                format!("\u{0}{idx}\u{0}")
-                            })
-                            .collect();
-                        let refs: Vec<vector::Raster<'_>> = svg_rasters[*j]
-                            .iter()
-                            .zip(&hrefs)
-                            .zip(&phs)
-                            .map(|((&ii, href), ph)| {
-                                let im = &images[ii];
-                                vector::Raster {
-                                    href: href.as_str(),
-                                    placeholder: ph.as_deref(),
-                                    rect: (im.x_left, im.x_right, im.y_bottom, im.y_top),
-                                    ctm: im.ctm,
-                                    clip: im.clip,
-                                    seq: &im.seq,
-                                }
-                            })
-                            .collect();
-                        vectors[*j].composite_svg(&refs)
-                    } else {
-                        vectors[*j].svg()
-                    };
-                    // Caption may have attached to the vector OR to one of its embedded
-                    // rasters — use whichever has it so the composite keeps its caption.
-                    let cap = svg_cap[*j].as_ref().or_else(|| svg_rasters[*j].iter().find_map(|&ii| img_cap[ii].as_ref()));
-                    let (html, id, caption) = match cap {
-                        Some((num, cap)) => (
-                            format!("<figure id=\"fig-{nid}\">{svg}<figcaption>{cap}</figcaption></figure>", nid = num_id(num)),
-                            num.clone(),
-                            Some(cap.clone()),
-                        ),
-                        None => (format!("<figure>{svg}</figure>"), String::new(), None),
-                    };
-                    els.push(PageElement::at(ElKind::Figure { html, id, caption, image: None, svg: Some(svg) }, ibox));
-                }
-                Item::Cap(j) => {
-                    flush(&mut run, &mut els);
-                    let (.., html) = &standalone[*j];
-                    let meta = &standalone_meta[*j];
-                    els.push(PageElement::at(ElKind::Caption {
-                        html: html.clone(),
-                        id: meta.0.clone(),
-                        text: meta.1.clone(),
-                        is_figure: meta.2,
-                    }, ibox));
-                }
-            }
-        }
-        flush(&mut run, &mut els);
-        // Return the page's typed element IR (NOT yet rendered to HTML) plus its image-URI
-        // list. The cross-page element transforms run on the assembled `Vec<Vec<PageElement>>`
-        // below, then each page is emitted and the bodies merged. Keeping the IR un-rendered
-        // here is what lets the cross-page passes operate on the elements, not on a string.
-        (*pno, els, img_uris)
+            let (els, img_uris) = render_page_elements(access, &plan, &facts, pidx, pno, pid, spans, inline_images);
+            (*pno, els, img_uris)
         })
         .collect();
     phase("02_render", t);
+    // The spans have done their work. Holding them through the cross-page passes, the emit and
+    // the merge was the largest avoidable piece of a whole-document render's peak.
+    drop(page_spans);
 
     // Cross-page element transforms (the single-stream replacement for the legacy HTML-string
     // post-processing passes). They run on the per-page element lists BEFORE emission, so the
@@ -2720,7 +2696,7 @@ pub(crate) fn render_doc_elements(
     }
     phase("04_elem_passes", t);
     if let Some(t0) = prof_start {
-        eprintln!("[DPDF_PROFILE] {} pages, total {:.1}ms", page_spans.len(), t0.elapsed().as_secs_f64() * 1e3);
+        eprintln!("[DPDF_PROFILE] {} pages, total {:.1}ms", pages_els.len(), t0.elapsed().as_secs_f64() * 1e3);
     }
     (pages_els, outline)
 }
@@ -2736,18 +2712,37 @@ pub(crate) fn emit_and_merge(pages_els: &[PageIR], mode: Mode) -> (String, Vec<S
     let mut out = String::from(DOC_SHELL_HEAD);
     let mut img_uris: Vec<String> = Vec::new();
     for (pno, els, uris) in pages_els {
-        let body_inner = emit_page_elements(els);
-        let frag = if mode == Mode::Page {
-            format!("<section data-page=\"{pno}\" id=\"page-{pno}\">\n{body_inner}\n</section>\n")
-        } else {
-            body_inner
-        };
-        append_with_img_offset(&mut out, &frag, img_uris.len());
+        append_page(&mut out, *pno, els, img_uris.len(), mode);
         img_uris.extend(uris.iter().cloned());
     }
     out.push_str("</body>\n</html>\n");
     let out = crate::elem_passes::run_residual_string_passes(out);
     (out, img_uris)
+}
+
+/// [`emit_and_merge`] for a caller done with the IR: each page is freed as it is emitted, so the
+/// elements and the HTML they become are not both resident at the end.
+fn emit_and_merge_consuming(pages_els: Vec<PageIR>, mode: Mode) -> (String, Vec<String>) {
+    let mut out = String::from(DOC_SHELL_HEAD);
+    let mut img_uris: Vec<String> = Vec::new();
+    for (pno, els, uris) in pages_els {
+        append_page(&mut out, pno, &els, img_uris.len(), mode);
+        drop(els);
+        img_uris.extend(uris);
+    }
+    out.push_str("</body>\n</html>\n");
+    let out = crate::elem_passes::run_residual_string_passes(out);
+    (out, img_uris)
+}
+
+fn append_page(out: &mut String, pno: u32, els: &[PageElement], img_offset: usize, mode: Mode) {
+    let body_inner = emit_page_elements(els);
+    let frag = if mode == Mode::Page {
+        format!("<section data-page=\"{pno}\" id=\"page-{pno}\">\n{body_inner}\n</section>\n")
+    } else {
+        body_inner
+    };
+    append_with_img_offset(out, &frag, img_offset);
 }
 
 /// The render-pipeline HEAD: the analysis + per-page render + cross-page transforms + emit +
@@ -2760,7 +2755,7 @@ pub(crate) fn render_doc(
     inline_images: bool,
 ) -> (String, Vec<String>, Vec<links::OutlineEntry>) {
     let (pages_els, outline) = render_doc_elements(access, mode, inline_images);
-    let (body, img_uris) = emit_and_merge(&pages_els, mode);
+    let (body, img_uris) = emit_and_merge_consuming(pages_els, mode);
     (body, img_uris, outline)
 }
 
