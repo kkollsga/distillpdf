@@ -253,7 +253,8 @@ fn differences_map(access: &dyn DocumentAccess, dict: &Dictionary) -> Option<Has
                         if let Some(text) = glyph_to_str(&String::from_utf8_lossy(name)) {
                             map.insert(code, text);
                         }
-                        code += 1;
+                        // The array's numbers are a file's, so this can pass the range.
+                        code = code.wrapping_add(1);
                     }
                     _ => {}
                 }
@@ -354,7 +355,8 @@ fn font_info(
                     if let Ok(array) = value.as_array() {
                         for (index, width) in array.iter().enumerate() {
                             if let Some(width) = obj_i64(width) {
-                                widths.insert(first as u32 + index as u32, width as f32);
+                                // `/FirstChar` is a file's integer, so this can pass the range.
+                                widths.insert((first as u32).wrapping_add(index as u32), width as f32);
                             }
                         }
                     }
@@ -2996,6 +2998,27 @@ mod tests {
         // a single column reads top-to-bottom (higher y first)
         let single: Vec<BBox> = vec![(0.0, 40.0, 30.0, 40.0), (0.0, 40.0, 90.0, 100.0), (0.0, 40.0, 60.0, 70.0)];
         assert_eq!(xy_cut_order(&single, body), vec![1, 2, 0], "top-to-bottom");
+    }
+
+    /// Catches a font's own integers overflowing a character code, a panic in a debug build and a
+    /// fuzzer's find: `/FirstChar` past the range, and a `/Differences` run past `u32::MAX`.
+    #[test]
+    fn font_tables_at_the_end_of_the_code_range_do_not_overflow() {
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.7");
+        let page = doc.add_object(dictionary! { "Type" => "Page" });
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+            "FirstChar" => i64::from(u32::MAX),
+            "Widths" => vec![Object::Integer(500), Object::Integer(600)],
+            "Encoding" => dictionary! {
+                "Differences" => vec![Object::Integer(i64::from(u32::MAX)), Object::Name(b"a".to_vec()), Object::Name(b"b".to_vec())],
+            },
+        });
+        let resources = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font } });
+        doc.get_object_mut(page).unwrap().as_dict_mut().unwrap().set("Resources", resources);
+        let access = test_adapter(&doc);
+        assert!(build_fonts(&access, page).unwrap().contains_key(&b"F1"[..]));
     }
 
     #[test]
