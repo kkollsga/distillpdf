@@ -1817,6 +1817,9 @@ fn widest_gap(mut intervals: Vec<(f32, f32)>) -> Option<(f32, f32)> {
     best
 }
 
+/// The most positions [`tolerant_vgap`] tests across a page.
+const MAX_GUTTER_STEPS: f32 = 65_536.0;
+
 /// Widest INTERIOR vertical lane crossed by at most `tol` intervals — a crossing-tolerant
 /// gutter detector. Unlike [`widest_gap`] (which needs a fully empty lane) this ignores a
 /// handful of stray boxes (a centered page number, a running header) that would otherwise
@@ -1828,10 +1831,20 @@ fn tolerant_vgap(intervals: &[(f32, f32)], tol: usize) -> Option<(f32, f32)> {
     if !(xmax - xmin > 2.0) {
         return None;
     }
-    let crossings = |x: f32| intervals.iter().filter(|(lo, hi)| *lo < x && x < *hi).count();
+    // Counted from two sorted lists: an interval crosses `x` when it starts before and has not
+    // ended by then. An interval with no width crosses nothing, so it is left out. Scanning every
+    // interval per step made a page flooding one row cost its span count times its width, and
+    // that page was out of reach of a cancel.
+    let mut starts: Vec<f32> = intervals.iter().filter(|(lo, hi)| lo < hi).map(|v| v.0).collect();
+    let mut ends: Vec<f32> = intervals.iter().filter(|(lo, hi)| lo < hi).map(|v| v.1).collect();
+    starts.sort_unstable_by(f32::total_cmp);
+    ends.sort_unstable_by(f32::total_cmp);
+    let crossings = |x: f32| starts.partition_point(|&lo| lo < x) - ends.partition_point(|&hi| hi <= x);
     // Sweep the interior at 1pt resolution, tracking the widest contiguous run of x whose
-    // crossing count stays within tolerance.
-    let step = 1.0f32;
+    // crossing count stays within tolerance. No real page is wider than 14,400pt. Past
+    // MAX_GUTTER_STEPS the step widens: at 2^24 adding 1.0 to an f32 changes nothing, and a
+    // hostile coordinate there turned this loop into a hang.
+    let step = 1.0f32.max((xmax - xmin) / MAX_GUTTER_STEPS);
     let (mut best_w, mut best_c) = (0.0f32, 0.0f32);
     let (mut run_start, mut in_run) = (0.0f32, false);
     let mut x = xmin + step;
@@ -2841,6 +2854,62 @@ mod tests {
         let g = widest_gap(vec![(0.0, 10.0), (2.0, 8.0), (40.0, 50.0), (42.0, 48.0)]).unwrap();
         assert!((g.0 - 30.0).abs() < 0.01, "gap width");
         assert!((g.1 - 25.0).abs() < 0.01, "cut at midpoint");
+    }
+
+    /// Catches the counting shortcut disagreeing with counting directly, whose answer every
+    /// document's reading order was tuned against.
+    #[test]
+    fn tolerant_vgap_counts_crossings_as_a_direct_count_would() {
+        let direct = |intervals: &[(f32, f32)], tol: usize| -> Option<(f32, f32)> {
+            let xmin = intervals.iter().map(|v| v.0).fold(f32::INFINITY, f32::min);
+            let xmax = intervals.iter().map(|v| v.1).fold(f32::NEG_INFINITY, f32::max);
+            let (mut best_w, mut best_c, mut run_start, mut in_run) = (0.0f32, 0.0f32, 0.0f32, false);
+            let mut x = xmin + 1.0;
+            while x < xmax {
+                let clear = intervals.iter().filter(|(lo, hi)| *lo < x && x < *hi).count() <= tol;
+                if clear && !in_run {
+                    run_start = x;
+                    in_run = true;
+                }
+                if in_run && (!clear || x + 1.0 >= xmax) {
+                    let end = if clear { x } else { x - 1.0 };
+                    if end - run_start > best_w {
+                        best_w = end - run_start;
+                        best_c = (run_start + end) * 0.5;
+                    }
+                    in_run = false;
+                }
+                x += 1.0;
+            }
+            (best_w > 0.0).then_some((best_w, best_c))
+        };
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 6000) as f32 / 10.0
+        };
+        for _ in 0..200 {
+            let intervals: Vec<(f32, f32)> = (0..40)
+                .map(|_| {
+                    let (a, b) = (next(), next());
+                    // Some of no width and some reversed, which a real span list can hold.
+                    if a < 60.0 { (a, a) } else { (a, a + b / 8.0) }
+                })
+                .collect();
+            for tol in [0, 1, 3] {
+                assert_eq!(tolerant_vgap(&intervals, tol), direct(&intervals, tol));
+            }
+        }
+    }
+
+    /// Catches a hostile coordinate hanging the gutter sweep: at 2^24 adding one point to an f32
+    /// changes nothing, so the loop never reached the far edge.
+    #[test]
+    fn tolerant_vgap_ends_on_a_far_coordinate() {
+        let intervals = vec![(0.0, 10.0), (1.0e9, 1.0e9 + 10.0), (5.0, 8.0)];
+        assert!(tolerant_vgap(&intervals, 0).is_some());
     }
 
     #[test]
