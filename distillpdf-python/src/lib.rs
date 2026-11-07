@@ -572,8 +572,9 @@ impl Pdf {
     }
 
     /// Extract text from a single 1-indexed page (hybrid).
-    fn extract_page_text(&self, page: i64) -> PyResult<String> {
-        self.inner.extract_page_text(page_arg(page)?).map_err(to_py)
+    fn extract_page_text(&self, py: Python<'_>, page: i64) -> PyResult<String> {
+        let page = page_arg(page)?;
+        guarded(py, || self.inner.extract_page_text(page))?.map_err(to_py)
     }
 }
 

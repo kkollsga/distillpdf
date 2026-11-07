@@ -247,6 +247,29 @@ fn cancelling_stops_the_scan_between_pages() {
     assert_eq!(seen.load(Ordering::Relaxed), 5, "stopped at the next page");
 }
 
+/// Catches an iterator that reads as finished after a cancel and a new token: a host looping with
+/// `for page in stream` would take the pages left for the end of the document.
+#[test]
+fn a_new_token_lets_the_iterator_carry_on_after_a_cancel() {
+    let lines: Vec<&[&str]> = vec![&["A line of text on a page that ends here."]; 6];
+    let doc = open(&pdf_of(&lines));
+    let reference = all_pages(&doc);
+    let stats = doc.scan_document(None, &mut |_| {}).unwrap();
+    let cancel = CancelToken::new();
+    let mut stream = doc.page_stream(stats).unwrap().with_cancel(cancel.clone());
+    assert_eq!(stream.next().unwrap().unwrap().page, 1);
+    cancel.cancel();
+    assert!(matches!(stream.next(), Some(Err(Error::Cancelled))));
+    assert!(stream.next().is_none(), "with no new token it stays ended");
+    let mut stream = stream.with_cancel(CancelToken::new());
+    for n in 2..=6 {
+        let page = stream.next().expect("pages are left").unwrap();
+        assert_eq!(page.page, n);
+        assert_eq!(page.markdown, reference[n as usize - 1].markdown);
+    }
+    assert!(stream.next().is_none());
+}
+
 /// Catches a scan that reports no progress, or reports it out of range: a host's progress bar
 /// must reach the total in each phase.
 #[test]

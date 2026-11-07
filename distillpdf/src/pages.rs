@@ -78,7 +78,10 @@
 //! those caps is slow rather than unbounded: it stops only at the next stage, so a host still needs
 //! its own deadline, and the process limit is the host's.
 //!
-//! //! # Stopping, and what a kill loses
+//! These caps cut silently: text past one is left out, with no error and no flag on [`PageOutput`].
+//! They assume the lazy engine; the eager engine's page content isn't capped.
+//!
+//! # Stopping, and what a kill loses
 //!
 //! A [`CancelToken`] stops the scan and the stream between pages, and inside a heavy page at the
 //! next operator walked. A cancelled page is discarded and never kept, so asking again answers it
@@ -559,6 +562,8 @@ impl<'d> PageStream<'d> {
     /// Stops this stream between pages and inside a heavy page.
     pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
         self.cancel = Some(cancel);
+        // A new token is a decision to carry on, so an iterator ended by the last error resumes.
+        self.failed = false;
         self
     }
 
