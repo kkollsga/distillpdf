@@ -92,7 +92,7 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: ubuntu-latest
+          - os: ubuntu-24.04  # Pinned: maturin finds no manylinux tag on a newer glibc, and PyPI refuses a bare linux tag.
             target: x86_64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
