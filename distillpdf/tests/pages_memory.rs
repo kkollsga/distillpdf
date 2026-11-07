@@ -141,6 +141,21 @@ fn a_page_of_millions_of_operators_stays_small() {
     assert!(page.blocks.is_empty());
 }
 
+/// Catches an unbalanced stream of `q`s saving a graphics state per operator in every walk, which
+/// at the work budget is gigabytes, and catches the balance going wrong past the cap.
+#[cfg_attr(debug_assertions, ignore = "millions of operators through nom: release builds only")]
+#[test]
+fn a_page_of_unbalanced_saves_stays_small() {
+    let _serial = SERIAL.lock().unwrap();
+    let bytes = pdf_with_contents(vec![b"q\n".repeat(4_000_000)]);
+    let doc = open(&bytes);
+    let (peak, stats) = peak_of(|| doc.scan_document(None, &mut |_| {}).unwrap());
+    assert!(peak < 48 * MIB, "scan peaked at {} MiB", peak / MIB);
+    let mut stream = doc.page_stream(stats).unwrap();
+    let (peak, _) = peak_of(|| stream.page(1).unwrap());
+    assert!(peak < 48 * MIB, "page peaked at {} MiB", peak / MIB);
+}
+
 /// Catches hostile text flooding a page: spans grow per painted glyph run, so a page painting
 /// millions of them must hit the page's span cap rather than the machine's memory.
 #[cfg_attr(debug_assertions, ignore = "millions of operators through nom: release builds only")]

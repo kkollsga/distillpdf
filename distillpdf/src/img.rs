@@ -838,6 +838,7 @@ fn mask_extent(
     let mut ctm = base;
     let mut clip = base_clip;
     let mut stack: Vec<(Mat, Option<ClipRect>)> = Vec::new();
+    let mut q_over = 0usize;
     let mut pending_clip = false;
     let mut cur = Rect::EMPTY;
     for op in ops {
@@ -846,7 +847,9 @@ fn mask_extent(
         }
         let o = &op.operands;
         match op.operator.as_str() {
+            "q" if stack.len() >= crate::MAX_GSTATE_NESTING => q_over += 1,
             "q" => stack.push((ctm, clip)),
+            "Q" if q_over > 0 => q_over -= 1,
             "Q" => {
                 if let Some((m, c)) = stack.pop() {
                     ctm = m;
@@ -1017,6 +1020,7 @@ fn walk(
     // graphics state, so `q`/`Q` scopes it and a descended form inherits it.
     let mut smask = base_smask;
     let mut stack: Vec<(Mat, Option<ClipRect>, Option<ClipRect>)> = Vec::new();
+    let mut q_over = 0usize;
     // `W`/`W*` mark the current path as a clip, but it takes effect only after the path's
     // painting operator (`vector::walk` defers it the same way).
     let mut pending_clip = false;
@@ -1034,7 +1038,9 @@ fn walk(
         }
         let o = &op.operands;
         match op.operator.as_str() {
+            "q" if stack.len() >= crate::MAX_GSTATE_NESTING => q_over += 1,
             "q" => stack.push((ctm, clip, smask)),
+            "Q" if q_over > 0 => q_over -= 1,
             "Q" => {
                 if let Some((m, c, s)) = stack.pop() {
                     ctm = m;

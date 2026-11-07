@@ -1449,6 +1449,7 @@ fn walk(
 ) {
     let mut g = base;
     let mut stack: Vec<GState> = Vec::new();
+    let mut q_over = 0usize;
     let mut cur: Vec<Seg> = Vec::new();
     // `W`/`W*` mark the current path as a clip, but it takes effect only after the path's
     // painting operator. Defer it: set this flag on `W`/`W*`, fold it into `g.clip` when the
@@ -1485,7 +1486,9 @@ fn walk(
         }
         let o = &op.operands;
         match op.operator.as_str() {
+            "q" if stack.len() >= crate::MAX_GSTATE_NESTING => q_over += 1,
             "q" => stack.push(g.clone()),
+            "Q" if q_over > 0 => q_over -= 1,
             "Q" => {
                 if let Some(s) = stack.pop() {
                     g = s;

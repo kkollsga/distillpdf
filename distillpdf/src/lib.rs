@@ -82,6 +82,17 @@ pub(crate) const MAX_STRUCT_CELL_REFS: usize = 4_000;
 /// grow once per operator up to [`MAX_FORM_WORK`]. Real nesting is 2-3 deep.
 pub(crate) const MAX_MARKED_NESTING: usize = 512;
 
+/// Graphics-state nesting (`q`) a walk tracks. The specification's own limit was 28 and real
+/// streams stay far below this, but each saved state costs up to a few hundred bytes and an
+/// unbalanced stream of `q`s can push one per operator up to [`MAX_FORM_WORK`], which is gigabytes.
+/// Over the cap a `q` is counted, not saved, so its `Q` still pops in step.
+pub(crate) const MAX_GSTATE_NESTING: usize = 4096;
+
+/// Text runs one page keeps. A span costs about 100 bytes and the render holds up to four copies,
+/// so this bounds a page flooding text at under 500 MiB. The densest page in the corpus is far
+/// below it. Past the cap the page degrades like one over its work budget: what was read stays.
+pub(crate) const MAX_PAGE_SPANS: usize = 1_000_000;
+
 /// Maximum nesting depth of a PDF *function* object ([`crate::function`]): a Type 3
 /// stitching function whose sub-functions are themselves Type 3, or an array of arrays.
 ///

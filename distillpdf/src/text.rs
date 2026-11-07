@@ -1425,6 +1425,7 @@ fn decode_spans(
         font: Option<&'a FontInfo>,
     }
     let mut cstack: Vec<Saved> = Vec::new();
+    let mut q_over = 0usize;
     // The marked-content stack (§14.6): `BDC`/`BMC` push, `EMC` pops, and the innermost
     // entry carrying an `/MCID` is the id every glyph painted here belongs to. Only tracked
     // when `props` says this is the page's own stream. `mc_over` counts pushes refused by
@@ -1438,7 +1439,7 @@ fn decode_spans(
         // Total-work budget (see `crate::WalkBudget`): the depth cap alone lets a
         // self-referential form branch 2x per level. Out of budget → return the spans
         // decoded so far; a page degrades, it never comes back looking blank.
-        if !budget.spend(1) {
+        if !budget.spend(1) || spans.len() >= crate::MAX_PAGE_SPANS {
             return Ok(());
         }
         let o = &op.operands;
@@ -1465,7 +1466,9 @@ fn decode_spans(
                 }
                 mcid = mcstack.iter().rev().find_map(|m| *m);
             }
+            "q" if cstack.len() >= crate::MAX_GSTATE_NESTING => q_over += 1,
             "q" => cstack.push(Saved { ctm, size, tc, tw, ts, th, leading, font: cur }),
+            "Q" if q_over > 0 => q_over -= 1,
             "Q" => {
                 if let Some(g) = cstack.pop() {
                     ctm = g.ctm;
