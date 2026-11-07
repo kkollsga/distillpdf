@@ -41,6 +41,7 @@ SCHEMA = 1
 OPS = ("text", "pages", "markdown", "html", "links")
 ENGINES = ("eager", "lazy")
 OP_TIMEOUT_S = 900
+DIFF_CAP_BYTES = 4 << 20
 
 #: One to three documents per source, under 15 CPU-seconds in all, chosen so the fast sweep still
 #: reaches what the full one exists to catch: two-column papers with many links and tables, a
@@ -501,6 +502,19 @@ def readable_excerpt(diff_text: str, limit: int = 14, width: int = 140) -> list[
     return out
 
 
+def capped_git_diff(a: str, b: str, cap: int = DIFF_CAP_BYTES) -> bytes:
+    """`git diff` stopped at `cap` bytes, with a line saying so. HTML with vector figures is one
+    line per page: two new figures in the 383-page document diffed to 139 MiB."""
+    p = subprocess.Popen(["git", "diff", "--no-index", "--no-color", "-U1", a, b], stdout=subprocess.PIPE)
+    raw = p.stdout.read(cap + 1)
+    p.stdout.close()
+    p.kill()
+    p.wait()
+    if len(raw) > cap:
+        return raw[:cap] + f"\n[diff cut at {cap} bytes by the regression gate]\n".encode()
+    return raw
+
+
 def write_diff(base_root: str, run_root: str, slug: str, engine: str, op: str, diffs: str,
                pages: list[int]) -> dict:
     """A diff file and a short excerpt, or a plain statement that it cannot be produced."""
@@ -523,11 +537,10 @@ def write_diff(base_root: str, run_root: str, slug: str, engine: str, op: str, d
         with open(out, "w", encoding="utf-8", errors="surrogatepass") as f:
             f.write(body)
     else:
-        r = subprocess.run(["git", "diff", "--no-index", "--no-color", "-U1", bp, np_],
-                           capture_output=True)
+        raw = capped_git_diff(bp, np_)
         with open(out, "wb") as f:
-            f.write(r.stdout)
-        body = r.stdout.decode("utf-8", "replace")
+            f.write(raw)
+        body = raw.decode("utf-8", "replace")
     gone, new = word_delta(base_text, now_text)
     excerpt = readable_excerpt(body)
     return {"path": out, "excerpt": excerpt, "words_gone": sum(v for _, v in gone),

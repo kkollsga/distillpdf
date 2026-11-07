@@ -191,3 +191,17 @@ def test_one_repeat_reports_no_noise_figure():
         for o in ops.values():
             o["m"]["n"] = 1
     assert C.noise_summary({"docs": {"x": one}}) == {}
+
+
+def test_diff_is_cut_rather_than_filling_the_disk(tmp_path):
+    """Failure caught: a 139 MiB diff per operation, from one-line-per-page HTML, on every run."""
+    spec = importlib.util.spec_from_file_location(
+        "regression_gate_main", os.path.join(os.path.dirname(_PATH), "gate.py"))
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.write_text("x" * 200_000 + "\n")
+    b.write_text("y" * 200_000 + "\n")
+    out = gate.capped_git_diff(str(a), str(b), cap=1000)
+    assert len(out) < 1100 and b"diff cut at 1000 bytes" in out
+    assert b"diff cut" not in gate.capped_git_diff(str(a), str(b))
