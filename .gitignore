@@ -13,11 +13,13 @@ benchmarking/
 # macOS
 .DS_Store
 
-# Local working notes (not shared)
+# A checkout may still hold the generated instructions copy of doctrine before 0.1.13. Ignored so
+# it can't be committed by accident before it is removed; AGENTS.md is the only instructions file.
 CLAUDE.md
 .build-venv/
+# Workstation-local skills. `.claude/skills` is a symlink, which a trailing slash would not match.
 /.agents/skills/
-/.claude/skills/
+/.claude/skills
 
 # Local dev working folder + cross-project coordination channel — never committed.
 # See dev-docs/README.md and inbox/README.md for the canonical layouts, and the
