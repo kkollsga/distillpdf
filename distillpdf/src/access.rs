@@ -2438,7 +2438,7 @@ pub(crate) mod tests {
         let mut document = Document::with_version("1.7");
         let cmap_conflict = document.add_object(lopdf::Stream::new(
             Dictionary::new(),
-            b"1 begincodespacerange\n<00> <ff>\nendcodespacerange\n1 beginbfchar\n<41> <0058>\nendbfchar\n".to_vec(),
+            cmap("1 begincodespacerange\n<00> <ff>\nendcodespacerange\n1 beginbfchar\n<41> <0058>\nendbfchar\n"),
         ));
         let cmap_unicode = document.add_object(lopdf::Stream::new(
             Dictionary::new(),
@@ -2552,6 +2552,9 @@ pub(crate) mod tests {
         document.save_to(&mut raw).unwrap();
         (document, raw, page)
     }
+
+    /// A CMap the parser refuses, as opposed to one it reads as empty.
+    const UNPARSEABLE_CMAP: &[u8] = b"begincmap\n1 beginbfchar\n<41> <0058\nendcmap\n";
 
     fn cmap(body: &str) -> Vec<u8> {
         format!(
@@ -2712,10 +2715,28 @@ pub(crate) mod tests {
         let eager_fallback = eager.fallback_page_text(1).unwrap();
         let lazy_fallback = lazy.fallback_page_text(1).unwrap();
         assert_eq!(lazy_fallback, eager_fallback);
-        assert!(
-            lazy_fallback.contains('B'),
-            "Encoding differences must beat conflicting ToUnicode"
-        );
+        assert!(lazy_fallback.contains('X'), "`/ToUnicode` decides the text: {lazy_fallback:?}");
+    }
+
+    /// Catches an unparseable `/ToUnicode` losing the font's `/Encoding`, or the two engines settling
+    /// it differently: the CMap is ignored as a whole and the `/Differences` answer.
+    #[test]
+    fn indexed_fallback_reads_encoding_when_the_cmap_cannot_be_parsed() {
+        let _test_lock = indexed_test_lock();
+        let mut document = Document::with_version("1.7");
+        let broken = document.add_object(lopdf::Stream::new(Dictionary::new(), UNPARSEABLE_CMAP.to_vec()));
+        let font = document.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+            "Encoding" => dictionary! {
+                "BaseEncoding" => "StandardEncoding",
+                "Differences" => vec![Object::Integer(65), Object::Name(b"B".to_vec())],
+            },
+            "ToUnicode" => Object::Reference(broken),
+        }));
+        let (document, raw, _) = finish_text_document(document, vec![("F1", font)], b"BT /F1 12 Tf (A) Tj ET".to_vec());
+        let (eager, lazy) = fallback_pair(document, &raw);
+        assert_eq!(lazy.as_ref().unwrap(), eager.as_ref().unwrap());
+        assert_eq!(lazy.unwrap(), "B\n");
     }
 
     #[test]
@@ -2954,10 +2975,11 @@ pub(crate) mod tests {
                 ToUnicodeCase::Stream(cmap("1 beginbfchar\n<41> <0059>\nendbfchar")),
                 "Y\n",
             ),
+            // `/ToUnicode` decides the text, and `/Encoding` only the glyph that's drawn.
             (
                 Some("WinAnsiEncoding"),
                 ToUnicodeCase::Stream(cmap("1 beginbfchar\n<41> <005A>\nendbfchar")),
-                "A\n",
+                "Z\n",
             ),
         ];
         for (encoding, to_unicode, expected) in cases {

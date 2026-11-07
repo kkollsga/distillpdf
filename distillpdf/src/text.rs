@@ -2286,6 +2286,31 @@ fn fallback_to_unicode(
     Ok(FallbackEncoding { owned, object: font.root_id() })
 }
 
+/// A simple font's text, from its `/ToUnicode` and, for the codes that leaves out, its `/Encoding`:
+/// none when it has none, and the standard encoding when it has one that can't be read.
+fn fallback_simple_font_text(
+    access: &dyn DocumentAccess,
+    font: &ObjectHandle,
+    has_encoding: bool,
+) -> Result<FallbackEncoding, AccessError> {
+    let stream = font.dictionary_entry(access, b"ToUnicode")?;
+    let object = stream.root_id();
+    let bytes = stream.decoded_stream_bytes(64 * 1024 * 1024)?;
+    let base = if has_encoding {
+        let encoding = font.dictionary_entry(access, b"Encoding")?;
+        match fallback_encoding_value(access, font, &encoding) {
+            Ok(base) => Some(base.owned),
+            Err(error) if fallback_fatal(&error) => return Err(error),
+            Err(_) => Some(OwnedEncoding::standard()),
+        }
+    } else {
+        None
+    };
+    let owned = OwnedEncoding::for_simple_font_text(bytes, base.as_ref())
+        .map_err(|error| fallback_error(object, error))?;
+    Ok(FallbackEncoding { owned, object: font.root_id() })
+}
+
 fn fallback_named_encoding(
     access: &dyn DocumentAccess,
     font: &ObjectHandle,
@@ -2372,19 +2397,37 @@ fn fallback_font_encoding(
         return Err(fallback_error(font.root_id(), "fallback font dictionary has wrong Type"));
     }
     let result = (|| {
-        let (has_encoding, has_to_unicode) = font.read(|object| {
+        let (has_encoding, has_to_unicode, simple) = font.read(|object| {
             let dictionary = object.as_dict().ok();
             (
                 dictionary.is_some_and(|dictionary| dictionary.has(b"Encoding")),
                 dictionary.is_some_and(|dictionary| dictionary.has(b"ToUnicode")),
+                dictionary.is_some_and(|dictionary| {
+                    matches!(
+                        dictionary.get(b"Subtype").and_then(Object::as_name),
+                        Ok(b"Type1" | b"MMType1" | b"TrueType" | b"Type3")
+                    )
+                }),
             )
         })?;
+        // `/ToUnicode` decides the text and `/Encoding` the glyph that's drawn (ISO 32000-1, 9.10.2),
+        // as `Document` reads a font. `/Encoding` answers the codes the CMap leaves out of a simple
+        // font, and all of them when the CMap can't be parsed.
+        if has_to_unicode {
+            let read = if simple {
+                fallback_simple_font_text(access, font, has_encoding)
+            } else {
+                fallback_to_unicode(access, font)
+            };
+            match read {
+                Ok(encoding) => return Ok(encoding),
+                Err(error) if fallback_fatal(&error) => return Err(error),
+                Err(_) => {}
+            }
+        }
         if has_encoding {
             let encoding = font.dictionary_entry(access, b"Encoding")?;
             return fallback_encoding_value(access, font, &encoding);
-        }
-        if has_to_unicode {
-            return fallback_to_unicode(access, font);
         }
         Ok(FallbackEncoding {
             owned: OwnedEncoding::standard(),
