@@ -89,6 +89,11 @@ The first break passed all 474 Rust unit tests and all 1,912 Python tests: only 
 An unchanged build reports 141 of 141 identical in full mode, exit 0. The verdict logic has its own
 corpus-free tests in `tests/test_regression_gate.py`.
 
+## Baseline and the lopdf 0.47 move
+
+The baseline stays at lopdf 0.45 on purpose, so the move's own changes stay visible: its named entries
+are in `accuracy/regression_gate_named_changes.json`.
+
 ## Not covered
 
 `order` covers `extract_page_text` only: Markdown and HTML reading order are caught by hash and diff,

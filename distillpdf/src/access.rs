@@ -2758,7 +2758,26 @@ pub(crate) mod tests {
                     "Type" => "Encoding", "BaseEncoding" => "WinAnsiEncoding",
                 }),
                 vec![0x80],
-                "\n",
+                // 0x80 is the euro in WinAnsi. This case pinned "\n" while lopdf read a dictionary
+                // without /Differences as StandardEncoding, which lopdf 0.46 fixed (#591).
+                "€\n",
+            ),
+            (
+                // /Type is optional: without it /Differences still applies.
+                Object::Dictionary(dictionary! {
+                    "Differences" => vec![Object::Integer(65), Object::Name(b"B".to_vec())],
+                }),
+                vec![b'A'],
+                "B\n",
+            ),
+            (
+                // A /Type that is not /Encoding is refused, leaving the standard encoding.
+                Object::Dictionary(dictionary! {
+                    "Type" => "Font",
+                    "Differences" => vec![Object::Integer(65), Object::Name(b"B".to_vec())],
+                }),
+                vec![b'A'],
+                "A\n",
             ),
         ];
         for (encoding, bytes, expected) in cases {
