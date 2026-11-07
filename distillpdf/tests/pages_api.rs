@@ -413,3 +413,30 @@ fn page_labels_come_through() {
     assert_eq!(pages[1].label.as_deref(), Some("10"));
     assert_eq!(pages[2].label.as_deref(), Some("11"));
 }
+
+/// Catches hostile `/PageLabels` hanging or exhausting memory. A range opening at the bottom of
+/// the integers used to loop for centuries, and a huge letter counter made a label per page of
+/// hundreds of MiB.
+#[test]
+fn hostile_page_labels_are_cheap() {
+    let mut doc = Document::load_mem(&pdf_of(&[&["One."], &["Two."]])).unwrap();
+    let catalog = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+    let labels = dictionary! { "Nums" => vec![
+        Object::Integer(i64::MIN), Object::Dictionary(dictionary! { "S" => "D" }),
+        0.into(), Object::Dictionary(dictionary! { "S" => "a", "St" => 4_000_000_000i64 }),
+        1.into(), Object::Dictionary(dictionary! { "S" => "D", "St" => i64::MAX }),
+    ]};
+    doc.get_object_mut(catalog).unwrap().as_dict_mut().unwrap().set("PageLabels", labels);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let opened = open(&bytes);
+    let pages = all_pages(&opened);
+    assert_eq!(pages[0].label.as_deref(), Some("4000000000"), "past the cap, digits");
+    assert_eq!(pages[1].label.as_deref(), Some("9223372036854775807"));
+    // The model path walks the same ranges in a loop of its own.
+    let dir = std::env::temp_dir().join(format!("distillpdf-labels-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("labels.dpdf");
+    opened.distill(out.to_str(), &distillpdf::DistillOptions::text_only()).expect("distill");
+    let _ = std::fs::remove_dir_all(dir);
+}

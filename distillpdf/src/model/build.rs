@@ -174,10 +174,8 @@ fn page_labels(
             .get(ri + 1)
             .map(|next| next.0)
             .unwrap_or(page_count as i64);
-        for p0 in range.0..end0 {
-            if p0 < 0 {
-                continue;
-            }
+        // Clamped both ways: `/Nums` is a file's integers, and a range opening at -2^63 is a hang.
+        for p0 in range.0.clamp(0, page_count as i64)..end0.clamp(0, page_count as i64) {
             if let Some(label) = label_in_range(range, p0) {
                 out.insert((p0 + 1) as u32, label); // /Nums is 0-based, pages are 1-based
             }
@@ -186,19 +184,27 @@ fn page_labels(
     out
 }
 
+/// The largest counter spelled out as a roman numeral or repeated letter. Both grow with the
+/// value: `/S /a /St 4000000000` would be a 150 MiB label on every page of the range. Past this
+/// a label is written in digits, which reads worse and costs nothing.
+const MAX_SPELLED_LABEL: i64 = 9_999;
+
 /// One `/PageLabels` range: `(start index, style, prefix, first counter value)`.
 pub(crate) type LabelRange = (i64, String, String, i64);
 
 /// The label of 0-based page `p0` inside `range`, `None` when it comes out empty.
 fn label_in_range((start0, style, prefix, st): &LabelRange, p0: i64) -> Option<String> {
-    let value = st + (p0 - start0); // the running counter within this range
+    // The running counter within this range. `/St` is a file's integer too, so it saturates.
+    let value = st.saturating_add(p0.saturating_sub(*start0));
     let body = match style.as_str() {
+        "" => String::new(), // style-less range → prefix only (or nothing)
+        "r" | "R" | "a" | "A" if !(0..=MAX_SPELLED_LABEL).contains(&value) => value.to_string(),
         "D" => value.to_string(),
         "r" => roman(value as u32, false),
         "R" => roman(value as u32, true),
         "a" => alpha(value as u32, false),
         "A" => alpha(value as u32, true),
-        _ => String::new(), // style-less range → prefix only (or nothing)
+        _ => String::new(),
     };
     let label = format!("{prefix}{body}");
     (!label.is_empty()).then_some(label)
