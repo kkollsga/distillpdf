@@ -170,6 +170,20 @@ fn a_page_opening_a_new_sentence_is_not_joined() {
     assert!(pages[2].markdown.contains("Capitalised sentence"));
 }
 
+/// Catches a stray line of display math being read as the tail of a sentence, because math opens
+/// lowercase too. It would move off the page it is printed on.
+#[test]
+fn display_math_at_a_page_top_stays_on_its_page() {
+    let bytes = pdf_of(&[
+        &["Cover page text that stands alone here."],
+        &["This paragraph has no closing punctuation before the"],
+        &["n n", "", "A paragraph after the equation on this page ends here."],
+    ]);
+    let pages = all_pages(&open(&bytes));
+    assert_eq!(pages[1].continues_on, None, "{}", pages[1].markdown);
+    assert_eq!(pages[2].continued_from, None);
+}
+
 /// Catches a text-free page being treated as an error or losing its page number.
 #[test]
 fn an_empty_page_is_a_page() {

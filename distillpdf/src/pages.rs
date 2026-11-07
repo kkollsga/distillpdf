@@ -41,6 +41,12 @@
 //! a tagged PDF, and at most [`MAX_CACHED_PAGES`] rendered pages, or a table's chain of at most
 //! [`SEGMENT_PAGES`].
 //!
+//! **What the process costs on macOS.** This module's numbers are live heap. The system allocator
+//! keeps freed large blocks dirty and in the footprint: the 383-page NASA report peaks at 42 MiB of
+//! heap and 283 MiB of `phys_footprint`. Pressure relief does not return them. A helper process
+//! started with `MallocLargeCache=0` in its environment peaks at 38 MiB, measured with no visible
+//! time cost. It must be set before the process starts, so it is the host's to set.
+//!
 //! # A page's output is a pure function of the document and its page number
 //!
 //! The order pages are asked for never shows. That makes output cacheable and lets a killed
@@ -761,8 +767,14 @@ fn closing_para(els: &[PageElement]) -> Option<usize> {
     matches!(els[i].kind, ElKind::Para { .. }).then_some(i)
 }
 
+/// Opens lowercase, on a real word, in text with at least three: display math reads lowercase too
+/// (`n n`, `k =0:m`, `a,deg b u=1`), and a stray fragment of it must not join the page before.
 fn starts_mid_sentence(html: &str) -> bool {
-    nav::strip_inline(html).trim_start().chars().next().is_some_and(char::is_lowercase)
+    let text = nav::strip_inline(html);
+    let is_word = |token: &str| token.chars().filter(|c| c.is_alphabetic()).count() >= 2;
+    let mut tokens = text.split_whitespace();
+    let opens = tokens.next().is_some_and(|first| first.chars().next().is_some_and(char::is_lowercase) && is_word(first));
+    opens && tokens.filter(|token| is_word(token)).count() >= 2
 }
 
 fn ends_mid_sentence(html: &str) -> bool {
@@ -781,10 +793,9 @@ fn closing_runs_on(els: &[PageElement]) -> Option<usize> {
     })
 }
 
-/// This page's opening paragraph, when it reads as the tail of one on the page before. Display
-/// math starts lowercase too, so a fragment of it never qualifies. Nor does a page's only block
-/// when that block itself runs on: a paragraph moves one page at most, which keeps a page's answer
-/// a function of its two neighbours.
+/// This page's opening paragraph, when it reads as the tail of one on the page before. A page's
+/// only block does not qualify when it itself runs on: a paragraph moves one page at most, which
+/// keeps a page's answer a function of its two neighbours.
 fn movable_opening(els: &[PageElement]) -> Option<usize> {
     opening_para(els).filter(|&i| {
         let text = para_text(&els[i]);

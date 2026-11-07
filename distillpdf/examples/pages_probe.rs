@@ -85,6 +85,22 @@ fn footprint() -> (u64, u64) {
 
 const MIB: f64 = 1024.0 * 1024.0;
 
+/// With `PROBE_RELIEF` set, hands freed memory back to the system after each page. The gap between
+/// `peak_footprint_mib` and `peak_heap_mib` is what the system allocator keeps after a free, and
+/// this measures how much of it a host can recover by asking.
+fn relieve() {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: a null zone means every zone, and a goal of 0 means as much as possible.
+        unsafe {
+            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
+    }
+}
+
 fn report(mode: &str, path: &str, ms: f64, extra: &str) {
     let (now, peak) = footprint();
     let name = path.rsplit('/').next().unwrap_or(path);
@@ -207,7 +223,14 @@ fn main() {
             );
         }
         "stream" | "pagemd" => {
-            let stats = doc.scan_document(None, &mut |_| {}).expect("scan");
+            let relief = std::env::var_os("PROBE_RELIEF").is_some();
+            let stats = doc
+                .scan_document(None, &mut |_| {
+                    if relief {
+                        relieve();
+                    }
+                })
+                .expect("scan");
             let scan_ms = start.elapsed().as_secs_f64() * 1e3;
             let mut stream = doc.page_stream(stats).expect("stream");
             let mut bytes = 0;
@@ -215,11 +238,23 @@ fn main() {
             let mut most_live = 0usize;
             let mut times = Vec::new();
             let mut out = String::new();
+            let mut last_peak = footprint().1;
+            if std::env::var_os("PROBE_JUMPS").is_some() {
+                eprintln!("after scan: footprint {:.1}, peak {:.1}, live heap {:.1}", footprint().0 as f64 / MIB, last_peak as f64 / MIB, LIVE.load(Ordering::Relaxed) as f64 / MIB);
+            }
             loop {
                 let t = Instant::now();
                 let Some(page) = stream.next() else { break };
                 let page = page.expect("page");
+                if relief {
+                    relieve();
+                }
                 let ms = t.elapsed().as_secs_f64() * 1e3;
+                let peak_now = footprint().1;
+                if std::env::var_os("PROBE_JUMPS").is_some() && peak_now > last_peak + (4 << 20) {
+                    eprintln!("page {} footprint peak {:.1} -> {:.1} MiB, now {:.1}, live heap {:.1}", page.page, last_peak as f64 / MIB, peak_now as f64 / MIB, footprint().0 as f64 / MIB, LIVE.load(Ordering::Relaxed) as f64 / MIB);
+                }
+                last_peak = peak_now;
                 times.push(ms);
                 if ms > worst.0 {
                     worst = (ms, page.page);
@@ -237,6 +272,10 @@ fn main() {
                 print!("{out}");
                 return;
             }
+            if std::env::var_os("PROBE_HOLD").is_some() {
+                eprintln!("holding {}", std::process::id());
+                std::thread::sleep(std::time::Duration::from_secs(20));
+            }
             report(
                 mode,
                 path,
@@ -246,6 +285,18 @@ fn main() {
                     pct(0.5), pct(0.95), worst.0, worst.1, stream.state_bytes(), most_live as f64 / MIB
                 ),
             );
+        }
+        // Each page's Markdown from both paths as JSON, for `scripts/page_score.py`.
+        "bothpages" => {
+            let html = doc.render(Mode::Page, false, false);
+            let whole: Vec<String> = html
+                .split("<section data-page=")
+                .skip(1)
+                .map(|section| markdown::html_to_markdown(&format!("<section data-page={section}"), false, markdown::ImgMode::Placeholder).0)
+                .collect();
+            let stats = doc.scan_document(None, &mut |_| {}).expect("scan");
+            let pages: Vec<String> = doc.page_stream(stats).expect("stream").map(|page| page.expect("page").markdown).collect();
+            println!("{}", serde_json::json!({ "whole": whole, "pages": pages }));
         }
         "wholemd" => {
             let html = doc.render(Mode::Page, false, false);
